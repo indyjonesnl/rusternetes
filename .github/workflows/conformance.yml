@@ -20,17 +20,18 @@ on:
 
 jobs:
   conformance:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install podman compose + xmllint
+      - name: Verify required tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y podman podman-compose libxml2-utils
+          for tool in podman curl xmllint; do
+            command -v "$tool" >/dev/null || { echo "missing: $tool" >&2; exit 1; }
+          done
           podman --version
-          podman compose version || podman-compose --version
+          podman compose version 2>/dev/null || podman-compose --version
 
       - name: Set KUBELET_VOLUMES_PATH
         run: echo "KUBELET_VOLUMES_PATH=$GITHUB_WORKSPACE/.rusternetes/volumes" >> "$GITHUB_ENV"
