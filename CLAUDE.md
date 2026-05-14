@@ -37,9 +37,12 @@ podman compose -f compose.all-in-one.yml up -d        # Embedded SQLite
 podman compose -f compose.all-in-one-redis.yml up -d  # Redis (requires adjacent rhino repo)
 
 # Conformance testing
-bash scripts/run-conformance.sh       # Full conformance lifecycle
-bash scripts/conformance-progress.sh  # Monitor pass/fail progress
-# e2e output is in /tmp/sonobuoy/results/e2e.log inside the e2e container
+bash scripts/run-conformance.sh             # Local: Sonobuoy, full lifecycle (24h timeout)
+bash scripts/conformance-progress.sh        # Local: monitor Sonobuoy pass/fail progress
+bash scripts/run-ci-conformance.sh          # CI / GH Actions: Hydrophone, env-var configurable (MODE=ci|full)
+bash scripts/verify-conformance-parity.sh   # One-shot Sonobuoy<->Hydrophone parity check (run locally; ~6h)
+# Sonobuoy e2e output: /tmp/sonobuoy/results/e2e.log inside e2e container
+# Hydrophone output:   ./conformance-results/{e2e.log,junit_01.xml}
 ```
 
 KUBECONFIG: `~/.kube/rusternetes-config`
