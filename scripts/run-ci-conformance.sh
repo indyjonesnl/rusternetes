@@ -135,6 +135,71 @@ prepull_conformance_image() {
     podman pull "$CONFORMANCE_IMAGE" || fail "could not pull $CONFORMANCE_IMAGE"
 }
 
+resolve_focus_skip() {
+    case "$MODE" in
+        ci)
+            FOCUS="${FOCUS:-\\[sig-api-machinery\\].*\\[Conformance\\]}"
+            SKIP="${SKIP:-\\[Slow\\]|\\[Serial\\]|\\[Disruptive\\]|\\[Flaky\\]}"
+            ;;
+        full)
+            FOCUS="${FOCUS:-\\[Conformance\\]}"
+            SKIP="${SKIP:-}"
+            ;;
+        *)
+            fail "unknown MODE=$MODE (expected: ci | full)"
+            ;;
+    esac
+    log "MODE=$MODE  FOCUS=$FOCUS  SKIP=${SKIP:-<none>}"
+}
+
+run_hydrophone() {
+    mkdir -p "$OUTPUT_DIR"
+    log "running hydrophone -> $OUTPUT_DIR"
+
+    local args=(
+        --kubeconfig "$KUBECONFIG"
+        --focus "$FOCUS"
+        --conformance-image "$CONFORMANCE_IMAGE"
+        --output-dir "$OUTPUT_DIR"
+        --extra-args "--kube-api-content-type=application/json"
+    )
+    if [[ -n "$SKIP" ]]; then
+        args+=(--skip "$SKIP")
+    fi
+
+    local rc=0
+    "$HYDROPHONE_BIN" "${args[@]}" || rc=$?
+    return "$rc"
+}
+
+summarize_results() {
+    local junit="$OUTPUT_DIR/junit_01.xml"
+    if [[ ! -f "$junit" ]]; then
+        fail "expected $junit not found"
+    fi
+
+    command -v xmllint >/dev/null || fail "xmllint not installed (apt: libxml2-utils)"
+
+    local total failed skipped
+    total="$(xmllint --xpath 'string(//testsuite/@tests)' "$junit" 2>/dev/null || echo 0)"
+    failed="$(xmllint --xpath 'string(//testsuite/@failures)' "$junit" 2>/dev/null || echo 0)"
+    skipped="$(xmllint --xpath 'string(//testsuite/@skipped)' "$junit" 2>/dev/null || echo 0)"
+    local passed=$(( total - failed - skipped ))
+
+    log "----- conformance summary -----"
+    log "total:   $total"
+    log "passed:  $passed"
+    log "failed:  $failed"
+    log "skipped: $skipped"
+    log "artifacts in $OUTPUT_DIR"
+
+    if [[ "$failed" -gt 0 ]]; then
+        log "failed testcases:"
+        xmllint --xpath '//testcase[failure]/@name' "$junit" 2>/dev/null \
+            | tr ' ' '\n' | sed 's/name=//; s/"//g' | grep -v '^$' | head -50 || true
+    fi
+}
+
 main() {
     require_env
     install_hydrophone
@@ -152,7 +217,11 @@ main() {
         log "SKIP_BRINGUP=1, assuming cluster already running"
     fi
 
-    log "cluster ready (run_conformance: TODO in Task 3)"
+    resolve_focus_skip
+    local rc=0
+    run_hydrophone || rc=$?
+    summarize_results
+    return "$rc"
 }
 
 main "$@"
