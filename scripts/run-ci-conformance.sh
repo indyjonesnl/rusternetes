@@ -73,7 +73,7 @@ generate_certs_if_missing() {
 
 compose_up() {
     log "bringing up cluster via $COMPOSE_FILE"
-    podman compose -f "$COMPOSE_FILE" up -d --wait
+    docker compose -f "$COMPOSE_FILE" up -d --wait
 }
 
 compose_down() {
@@ -82,7 +82,7 @@ compose_down() {
         return 0
     fi
     log "tearing down cluster"
-    podman compose -f "$COMPOSE_FILE" down -v || true
+    docker compose -f "$COMPOSE_FILE" down -v || true
 }
 
 wait_for_api() {
@@ -132,7 +132,7 @@ wait_for_coredns() {
 
 prepull_conformance_image() {
     log "pre-pulling $CONFORMANCE_IMAGE on host (kubelets share host runtime via mounted socket)"
-    podman pull "$CONFORMANCE_IMAGE" || fail "could not pull $CONFORMANCE_IMAGE"
+    docker pull "$CONFORMANCE_IMAGE" || fail "could not pull $CONFORMANCE_IMAGE"
 }
 
 resolve_focus_skip() {

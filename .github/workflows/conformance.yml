@@ -30,7 +30,7 @@ jobs:
           # Self-hosted runner prerequisites. No sudo / no apt install is
           # performed here — install these once on the runner host.
           missing=()
-          for tool in podman curl tar python3 kubectl openssl jq; do
+          for tool in docker curl tar python3 kubectl openssl jq; do
             command -v "$tool" >/dev/null || missing+=("$tool")
           done
           if [[ ${#missing[@]} -gt 0 ]]; then
@@ -39,22 +39,19 @@ jobs:
 
           This workflow runs on a self-hosted runner and does not install its
           own dependencies. Install the missing packages on the runner host
-          (Debian/Ubuntu): podman, curl, tar, python3, kubectl, openssl, jq.
-          Verify with: command -v podman kubectl openssl jq python3
+          (Debian/Ubuntu): docker, curl, tar, python3, kubectl, openssl, jq.
+          Verify with: command -v docker kubectl openssl jq python3
           EOF
             exit 1
           fi
-          podman --version
-          if ! podman compose version >/dev/null 2>&1; then
-            command -v podman-compose >/dev/null || { echo "podman compose v2 or podman-compose required" >&2; exit 1; }
-            podman-compose --version
-          fi
+          docker --version
+          docker compose version >/dev/null || { echo "docker compose v2 plugin required" >&2; exit 1; }
 
       - name: Set KUBELET_VOLUMES_PATH
         run: echo "KUBELET_VOLUMES_PATH=$GITHUB_WORKSPACE/.rusternetes/volumes" >> "$GITHUB_ENV"
 
       - name: Build cluster images
-        run: podman compose -f compose.sqlite.yml build
+        run: docker compose -f compose.sqlite.yml build
 
       - name: Run conformance
         env:
@@ -72,4 +69,4 @@ jobs:
 
       - name: Tear down cluster
         if: always()
-        run: podman compose -f compose.sqlite.yml down -v || true
+        run: docker compose -f compose.sqlite.yml down -v || true
