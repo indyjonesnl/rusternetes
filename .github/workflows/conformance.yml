@@ -6,7 +6,7 @@ on:
       mode:
         description: 'Test scope (ci | full)'
         required: false
-        default: 'ci'
+        default: 'full'
       focus:
         description: 'Ginkgo focus regex override'
         required: false
@@ -17,6 +17,20 @@ on:
         default: ''
   schedule:
     - cron: '0 3 * * 1'   # Mondays 03:00 UTC
+  pull_request:
+    # Self-hosted runner so PR triggers are free of GH-minute cost.
+    # Limit to changes that can actually affect the conformance run.
+    paths:
+      - '.github/workflows/conformance.yml'
+      - 'scripts/run-ci-conformance.sh'
+      - 'scripts/bootstrap-cluster.sh'
+      - 'scripts/generate-certs.sh'
+      - 'compose.sqlite.yml'
+      - 'compose.yml'
+      - 'Dockerfile.*'
+      - 'crates/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
 
 jobs:
   conformance:
@@ -55,7 +69,11 @@ jobs:
 
       - name: Run conformance
         env:
-          MODE: ${{ github.event.inputs.mode || 'ci' }}
+          # Default to MODE=full so every trigger (PR sync, weekly cron,
+          # manual without input) produces the full ~441-test certified
+          # picture. Override via the workflow_dispatch `mode` input
+          # (e.g. `mode: ci`) for a focused fast run.
+          MODE: ${{ github.event.inputs.mode || 'full' }}
           FOCUS: ${{ github.event.inputs.focus }}
           SKIP: ${{ github.event.inputs.skip }}
         run: bash scripts/run-ci-conformance.sh
