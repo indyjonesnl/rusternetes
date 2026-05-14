@@ -167,7 +167,10 @@ services:
       context: .
       dockerfile: Dockerfile.kube-proxy
     container_name: rusternetes-kube-proxy
-    privileged: true
+    # Host network is required so kube-proxy can program the host's
+    # iptables for Service ClusterIP NAT. privileged is NOT required —
+    # the caps below are sufficient (iptables + raw sockets + kernel
+    # module loading for nf_conntrack/ip_tables).
     network_mode: host
     user: "0:0"
     depends_on:
@@ -175,7 +178,7 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
-      - SYS_ADMIN
+      - SYS_MODULE
     environment:
       - RUST_LOG=info
     command: ["--node-name", "node-1", "--etcd-servers", "http://localhost:2379"]
