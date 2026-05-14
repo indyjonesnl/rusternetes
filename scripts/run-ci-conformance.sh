@@ -56,5 +56,103 @@ install_hydrophone() {
     printf '%s' "$HYDROPHONE_VERSION" > "$marker"
 }
 
-install_hydrophone
-log "ok"
+require_env() {
+    if [[ -z "${KUBELET_VOLUMES_PATH:-}" ]]; then
+        export KUBELET_VOLUMES_PATH="$REPO_ROOT/.rusternetes/volumes"
+        log "KUBELET_VOLUMES_PATH defaulted to $KUBELET_VOLUMES_PATH"
+    fi
+    mkdir -p "$KUBELET_VOLUMES_PATH"
+}
+
+generate_certs_if_missing() {
+    if [[ ! -f "$REPO_ROOT/.rusternetes/certs/server.crt" ]]; then
+        log "generating TLS certs"
+        bash "$REPO_ROOT/scripts/generate-certs.sh"
+    fi
+}
+
+compose_up() {
+    log "bringing up cluster via $COMPOSE_FILE"
+    podman compose -f "$COMPOSE_FILE" up -d --wait
+}
+
+compose_down() {
+    if [[ "${KEEP_CLUSTER:-0}" == "1" ]]; then
+        log "KEEP_CLUSTER=1 set, leaving cluster running"
+        return 0
+    fi
+    log "tearing down cluster"
+    podman compose -f "$COMPOSE_FILE" down -v || true
+}
+
+wait_for_api() {
+    log "waiting for api-server on 6443"
+    local i
+    for i in $(seq 1 60); do
+        if curl -sk --max-time 2 "https://localhost:6443/livez" >/dev/null 2>&1; then
+            log "api-server ready after ${i}s"
+            return 0
+        fi
+        sleep 1
+    done
+    fail "api-server did not become ready within 60s"
+}
+
+bootstrap_cluster() {
+    log "running bootstrap-cluster.sh"
+    bash "$REPO_ROOT/scripts/bootstrap-cluster.sh"
+}
+
+label_nodes() {
+    log "labeling nodes"
+    for node in node-1 node-2; do
+        curl -sk -X PATCH \
+            -H "Content-Type: application/strategic-merge-patch+json" \
+            --data "{\"metadata\":{\"labels\":{\"kubernetes.io/os\":\"linux\",\"kubernetes.io/arch\":\"amd64\",\"kubernetes.io/hostname\":\"$node\"}}}" \
+            "https://localhost:6443/api/v1/nodes/$node" >/dev/null \
+            || fail "failed to label node $node"
+    done
+}
+
+wait_for_coredns() {
+    log "waiting for CoreDNS"
+    local i
+    for i in $(seq 1 60); do
+        local phase
+        phase="$(curl -sk "https://localhost:6443/api/v1/namespaces/kube-system/pods?labelSelector=k8s-app=kube-dns" \
+            | grep -oE '"phase":"[A-Za-z]+"' | head -1 | cut -d'"' -f4 || true)"
+        if [[ "$phase" == "Running" ]]; then
+            log "CoreDNS Running"
+            return 0
+        fi
+        sleep 2
+    done
+    fail "CoreDNS did not reach Running within 120s"
+}
+
+prepull_conformance_image() {
+    log "pre-pulling $CONFORMANCE_IMAGE on host (kubelets share host runtime via mounted socket)"
+    podman pull "$CONFORMANCE_IMAGE" || fail "could not pull $CONFORMANCE_IMAGE"
+}
+
+main() {
+    require_env
+    install_hydrophone
+
+    if [[ "${SKIP_BRINGUP:-0}" != "1" ]]; then
+        generate_certs_if_missing
+        compose_up
+        trap compose_down EXIT
+        wait_for_api
+        bootstrap_cluster
+        wait_for_coredns
+        label_nodes
+        prepull_conformance_image
+    else
+        log "SKIP_BRINGUP=1, assuming cluster already running"
+    fi
+
+    log "cluster ready (run_conformance: TODO in Task 3)"
+}
+
+main "$@"
