@@ -30,14 +30,23 @@ fail() { printf '\033[1;31m[parity ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
 command -v "$SONOBUOY_BIN" >/dev/null || fail "sonobuoy binary not found"
 [[ -x "$HYDROPHONE_BIN" ]] || fail "hydrophone not found at $HYDROPHONE_BIN (run run-ci-conformance.sh once to install)"
-command -v xmllint >/dev/null || fail "xmllint not installed (apt: libxml2-utils)"
+command -v python3 >/dev/null || fail "python3 not installed"
 
 mkdir -p "$OUT" "$REPO_ROOT/tests/conformance"
 
 extract_names() {
     local junit="$1" out="$2"
-    xmllint --xpath '//testcase/@name' "$junit" \
-        | tr ' ' '\n' | sed 's/name=//; s/"//g' | grep -v '^$' | sort -u > "$out"
+    python3 - "$junit" <<'PY' | sort -u > "$out"
+import sys, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+ts = root if root.tag == "testsuite" else root.find("testsuite")
+if ts is None:
+    sys.exit("no testsuite element")
+for tc in ts.findall("testcase"):
+    n = tc.get("name", "")
+    if n:
+        print(n)
+PY
 }
 
 run_sonobuoy() {

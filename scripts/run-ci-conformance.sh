@@ -177,14 +177,20 @@ summarize_results() {
     if [[ ! -f "$junit" ]]; then
         fail "expected $junit not found"
     fi
+    command -v python3 >/dev/null || fail "python3 not installed"
 
-    command -v xmllint >/dev/null || fail "xmllint not installed (apt: libxml2-utils)"
-
-    local total failed skipped
-    total="$(xmllint --xpath 'string(//testsuite/@tests)' "$junit" 2>/dev/null || echo 0)"
-    failed="$(xmllint --xpath 'string(//testsuite/@failures)' "$junit" 2>/dev/null || echo 0)"
-    skipped="$(xmllint --xpath 'string(//testsuite/@skipped)' "$junit" 2>/dev/null || echo 0)"
-    local passed=$(( total - failed - skipped ))
+    local counts total failed skipped passed
+    counts="$(python3 - "$junit" <<'PY'
+import sys, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+ts = root if root.tag == "testsuite" else root.find("testsuite")
+if ts is None:
+    sys.exit("no testsuite element")
+print(ts.get("tests", "0"), ts.get("failures", "0"), ts.get("skipped", "0"))
+PY
+)" || fail "could not parse $junit"
+    read -r total failed skipped <<<"$counts"
+    passed=$(( total - failed - skipped ))
 
     log "----- conformance summary -----"
     log "total:   $total"
@@ -195,8 +201,14 @@ summarize_results() {
 
     if [[ "$failed" -gt 0 ]]; then
         log "failed testcases:"
-        xmllint --xpath '//testcase[failure]/@name' "$junit" 2>/dev/null \
-            | tr ' ' '\n' | sed 's/name=//; s/"//g' | grep -v '^$' | head -50 || true
+        python3 - "$junit" <<'PY' | head -50
+import sys, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+ts = root if root.tag == "testsuite" else root.find("testsuite")
+for tc in ts.findall("testcase"):
+    if tc.find("failure") is not None:
+        print(tc.get("name", ""))
+PY
     fi
 }
 
