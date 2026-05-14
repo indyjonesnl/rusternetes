@@ -64,6 +64,17 @@ jobs:
       - name: Set KUBELET_VOLUMES_PATH
         run: echo "KUBELET_VOLUMES_PATH=$GITHUB_WORKSPACE/.rusternetes/volumes" >> "$GITHUB_ENV"
 
+      - name: Clone rhino adjacent to repo
+        # Dockerfiles for storage / kubelet / controller-manager / scheduler /
+        # kube-proxy pull in the rhino crate via `path = "../../../rhino"`;
+        # cargo needs the repo on disk as a sibling of $GITHUB_WORKSPACE.
+        run: |
+          if [ ! -d ../rhino ]; then
+            git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+          else
+            echo "rhino already present at ../rhino (self-hosted runner workspace persists)"
+          fi
+
       - name: Build cluster images
         run: docker compose -f compose.sqlite.yml build
 
