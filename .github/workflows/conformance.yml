@@ -1,0 +1,57 @@
+name: Conformance (Hydrophone)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Test scope (ci | full)'
+        required: false
+        default: 'ci'
+      focus:
+        description: 'Ginkgo focus regex override'
+        required: false
+        default: ''
+      skip:
+        description: 'Ginkgo skip regex override'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 3 * * 1'   # Mondays 03:00 UTC
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install podman compose + xmllint
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman podman-compose libxml2-utils
+          podman --version
+          podman compose version || podman-compose --version
+
+      - name: Set KUBELET_VOLUMES_PATH
+        run: echo "KUBELET_VOLUMES_PATH=$GITHUB_WORKSPACE/.rusternetes/volumes" >> "$GITHUB_ENV"
+
+      - name: Build cluster images
+        run: podman compose -f compose.sqlite.yml build
+
+      - name: Run conformance
+        env:
+          MODE: ${{ github.event.inputs.mode || 'ci' }}
+          FOCUS: ${{ github.event.inputs.focus }}
+          SKIP: ${{ github.event.inputs.skip }}
+        run: bash scripts/run-ci-conformance.sh
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-results
+          path: conformance-results/
+
+      - name: Tear down cluster
+        if: always()
+        run: podman compose -f compose.sqlite.yml down -v || true
