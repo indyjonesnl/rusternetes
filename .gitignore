@@ -33,3 +33,10 @@ etcd-data/
 
 # Work tracking (local only)
 .work/
+
+# Local tool binaries (hydrophone, etc.)
+.bin/
+
+# Conformance run artifacts
+conformance-results/
+parity/
