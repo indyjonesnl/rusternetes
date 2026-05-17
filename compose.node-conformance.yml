@@ -81,7 +81,10 @@ services:
     networks:
       - nc-net
     ports:
+      # 10250: kubelet HTTP server (lands in PR2 of node-conformance work)
+      # 10249: kubelet metrics — used by run-node-conformance.sh readiness probe in PR1
       - "10250:10250"
+      - "10249:10249"
     volumes:
       - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
       - ${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:rw
