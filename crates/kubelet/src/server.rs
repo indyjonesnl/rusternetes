@@ -9,10 +9,11 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, routing::get, Router};
+use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 
 use crate::kubelet::Kubelet;
-use rusternetes_storage::StorageBackend;
+use rusternetes_common::resources::pod::Pod;
+use rusternetes_storage::{Storage, StorageBackend};
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -28,6 +29,7 @@ pub struct ServerState {
 pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/pods", get(list_pods))
         .with_state(state)
 }
 
@@ -37,4 +39,25 @@ async fn healthz(State(state): State<ServerState>) -> (StatusCode, &'static str)
         Some(_) => (StatusCode::INTERNAL_SERVER_ERROR, "stale"),
         None => (StatusCode::OK, "ok"),
     }
+}
+
+async fn list_pods(
+    State(state): State<ServerState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let all: Vec<Pod> = state
+        .storage
+        .list("/registry/pods/")
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mine: Vec<&Pod> = all
+        .iter()
+        .filter(|p| {
+            p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(state.node_name.as_str())
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "kind": "PodList",
+        "apiVersion": "v1",
+        "items": mine,
+    })))
 }
