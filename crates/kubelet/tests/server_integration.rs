@@ -144,3 +144,16 @@ async fn stats_summary_returns_minimal_cadvisor_shape() {
     assert!(v["pods"].is_array(), "pods must be array");
     assert_eq!(v["pods"].as_array().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn healthz_returns_ok_in_test_state() {
+    let state = fixture("node-1", vec![]).await;
+    let app = router(state);
+    let res = app
+        .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"ok");
+}
