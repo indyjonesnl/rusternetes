@@ -1,3 +1,10 @@
+// `extern crate self as <name>` makes `<name>::...` resolve from inside the
+// lib itself (it's an implicit no-op in Rust 2018+ in most contexts but is
+// required when a `mod`-included source file — like `runtime.rs`, which is
+// also source-included by `src/main.rs` — needs a single path that resolves
+// from both the lib build and the bin build).
+extern crate self as rusternetes_kubelet;
+
 #[allow(dead_code)]
 pub mod cni;
 pub mod config;

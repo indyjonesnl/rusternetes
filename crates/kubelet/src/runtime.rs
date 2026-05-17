@@ -1392,9 +1392,11 @@ impl ContainerRuntime {
     /// (which uses the host's /etc/hosts directly).
     fn create_pod_hosts_file(&self, pod: &Pod, pod_ip: Option<&str>) -> Result<Option<String>> {
         // hostNetwork pods use the host's /etc/hosts directly — skip.
-        let Some(content) =
-            crate::kubelet::build_managed_hosts_content(pod, pod_ip, &self.cluster_domain)
-        else {
+        let Some(content) = rusternetes_kubelet::kubelet::build_managed_hosts_content(
+            pod,
+            pod_ip,
+            &self.cluster_domain,
+        ) else {
             return Ok(None);
         };
 
@@ -8437,7 +8439,8 @@ mod tests {
     /// Delegates to the canonical kubelet helper; returns an empty string for
     /// hostNetwork pods (these tests don't exercise that branch).
     fn build_hosts_content(pod: &Pod, pod_ip: Option<&str>, cluster_domain: &str) -> String {
-        crate::kubelet::build_managed_hosts_content(pod, pod_ip, cluster_domain).unwrap_or_default()
+        rusternetes_kubelet::kubelet::build_managed_hosts_content(pod, pod_ip, cluster_domain)
+            .unwrap_or_default()
     }
 
     // --- hosts file content tests ---

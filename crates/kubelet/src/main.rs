@@ -3,7 +3,6 @@ mod cni;
 mod config;
 #[allow(dead_code)]
 mod eviction;
-mod kubelet;
 mod lifecycle;
 mod runtime;
 
@@ -20,8 +19,9 @@ use bollard::Docker;
 use clap::Parser;
 use config::{KubeletConfiguration, RuntimeConfig};
 use futures::StreamExt;
-use kubelet::Kubelet;
 use rusternetes_common::observability::MetricsRegistry;
+use rusternetes_kubelet::kubelet::Kubelet;
+use rusternetes_kubelet::server;
 use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -234,6 +234,7 @@ async fn main() -> Result<()> {
     });
 
     // Create and run kubelet
+    let storage_for_server = storage.clone();
     let kubelet = Arc::new(
         Kubelet::new(
             runtime_config.node_name.clone(),
@@ -247,6 +248,36 @@ async fn main() -> Result<()> {
         )
         .await?,
     );
+
+    // Optional node-conformance HTTP server on a separate port.
+    // Enabled by setting `RUSTERNETES_KUBELET_SERVER_PORT`. See PR2 of the
+    // node-conformance work and `docs/superpowers/specs/2026-05-17-node-conformance-design.md`.
+    if let Ok(port_str) = std::env::var("RUSTERNETES_KUBELET_SERVER_PORT") {
+        match port_str.parse::<u16>() {
+            Ok(port) => {
+                let server_state = server::ServerState {
+                    node_name: runtime_config.node_name.clone(),
+                    storage: storage_for_server,
+                    kubelet: Some(kubelet.clone()),
+                };
+                let addr = format!("0.0.0.0:{}", port);
+                tokio::spawn(async move {
+                    info!("Starting kubelet node-conformance server on {}", addr);
+                    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+                    axum::serve(listener, server::router(server_state))
+                        .await
+                        .unwrap();
+                });
+            }
+            Err(_) => {
+                warn!(
+                    "RUSTERNETES_KUBELET_SERVER_PORT set to invalid value: {}",
+                    port_str
+                );
+            }
+        }
+    }
+
     kubelet.run().await?;
 
     Ok(())
