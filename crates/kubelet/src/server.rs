@@ -32,6 +32,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/healthz", get(healthz))
         .route("/pods", get(list_pods))
         .route("/runningpods/", get(list_running_pods))
+        .route("/stats/summary", get(stats_summary))
         .with_state(state)
 }
 
@@ -88,5 +89,59 @@ async fn list_running_pods(
         "kind": "PodList",
         "apiVersion": "v1",
         "items": mine,
+    })))
+}
+
+async fn stats_summary(
+    State(state): State<ServerState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let all: Vec<Pod> = state
+        .storage
+        .list("/registry/pods/")
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let zero_cpu = serde_json::json!({
+        "time": now,
+        "usageNanoCores": 0u64,
+        "usageCoreNanoSeconds": 0u64,
+    });
+    let zero_mem = serde_json::json!({
+        "time": now,
+        "availableBytes": 0u64,
+        "usageBytes": 0u64,
+        "workingSetBytes": 0u64,
+        "rssBytes": 0u64,
+    });
+
+    let pods_json: Vec<serde_json::Value> = all
+        .iter()
+        .filter(|p| {
+            p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(state.node_name.as_str())
+        })
+        .map(|p| {
+            serde_json::json!({
+                "podRef": {
+                    "name": p.metadata.name.clone(),
+                    "namespace": p.metadata.namespace.clone(),
+                    "uid": p.metadata.uid.clone(),
+                },
+                "startTime": now,
+                "cpu": zero_cpu,
+                "memory": zero_mem,
+                "containers": [],
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "node": {
+            "nodeName": state.node_name,
+            "startTime": now,
+            "cpu": zero_cpu,
+            "memory": zero_mem,
+        },
+        "pods": pods_json,
     })))
 }

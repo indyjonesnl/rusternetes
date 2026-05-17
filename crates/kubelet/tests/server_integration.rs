@@ -119,3 +119,28 @@ async fn runningpods_returns_only_running_phase() {
     assert!(names.contains(&"running1"));
     assert!(names.contains(&"running2"));
 }
+
+#[tokio::test]
+async fn stats_summary_returns_minimal_cadvisor_shape() {
+    let state = fixture("node-1", vec![pod_on("a", "node-1")]).await;
+    let app = router(state);
+    let res = app
+        .oneshot(Request::get("/stats/summary").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["node"]["nodeName"].as_str(), Some("node-1"));
+    assert!(
+        v["node"]["cpu"].is_object(),
+        "node.cpu must be object, got {:?}",
+        v["node"]["cpu"]
+    );
+    assert!(
+        v["node"]["memory"].is_object(),
+        "node.memory must be object"
+    );
+    assert!(v["pods"].is_array(), "pods must be array");
+    assert_eq!(v["pods"].as_array().unwrap().len(), 1);
+}
