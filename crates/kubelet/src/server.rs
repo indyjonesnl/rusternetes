@@ -13,6 +13,7 @@ use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 
 use crate::kubelet::Kubelet;
 use rusternetes_common::resources::pod::Pod;
+use rusternetes_common::types::Phase;
 use rusternetes_storage::{Storage, StorageBackend};
 
 #[derive(Clone)]
@@ -30,6 +31,7 @@ pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/pods", get(list_pods))
+        .route("/runningpods/", get(list_running_pods))
         .with_state(state)
 }
 
@@ -53,6 +55,33 @@ async fn list_pods(
         .iter()
         .filter(|p| {
             p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(state.node_name.as_str())
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "kind": "PodList",
+        "apiVersion": "v1",
+        "items": mine,
+    })))
+}
+
+async fn list_running_pods(
+    State(state): State<ServerState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let all: Vec<Pod> = state
+        .storage
+        .list("/registry/pods/")
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mine: Vec<&Pod> = all
+        .iter()
+        .filter(|p| {
+            let on_this_node = p.spec.as_ref().and_then(|s| s.node_name.as_deref())
+                == Some(state.node_name.as_str());
+            let is_running = matches!(
+                p.status.as_ref().and_then(|s| s.phase.as_ref()),
+                Some(Phase::Running)
+            );
+            on_this_node && is_running
         })
         .collect();
     Ok(Json(serde_json::json!({

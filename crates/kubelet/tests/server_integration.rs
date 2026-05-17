@@ -44,7 +44,6 @@ fn pod_on(name: &str, node: &str) -> Pod {
     p
 }
 
-#[allow(dead_code)] // used by Task 10's /runningpods test
 fn pod_with_phase(name: &str, node: &str, phase: Phase) -> Pod {
     let mut p = pod_on(name, node);
     p.status = Some(PodStatus {
@@ -88,4 +87,35 @@ async fn pods_returns_only_local_node_pods() {
         .collect();
     assert!(names.contains(&"a"));
     assert!(names.contains(&"c"));
+}
+
+#[tokio::test]
+async fn runningpods_returns_only_running_phase() {
+    let state = fixture(
+        "node-1",
+        vec![
+            pod_with_phase("running1", "node-1", Phase::Running),
+            pod_with_phase("pending1", "node-1", Phase::Pending),
+            pod_with_phase("running2", "node-1", Phase::Running),
+            pod_with_phase("running-elsewhere", "node-2", Phase::Running),
+        ],
+    )
+    .await;
+    let app = router(state);
+    let res = app
+        .oneshot(Request::get("/runningpods/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["kind"].as_str(), Some("PodList"));
+    let items = v["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 2);
+    let names: Vec<_> = items
+        .iter()
+        .filter_map(|i| i["metadata"]["name"].as_str())
+        .collect();
+    assert!(names.contains(&"running1"));
+    assert!(names.contains(&"running2"));
 }
