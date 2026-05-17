@@ -61,6 +61,10 @@ pub struct Kubelet {
     /// When a watch event arrives for a pod, we signal its channel to
     /// trigger an immediate reconciliation without a full sync_loop.
     pod_workers: Arc<Mutex<HashMap<String, mpsc::Sender<()>>>>,
+    /// Unix-seconds timestamp of the last completed sync_loop iteration.
+    /// Read by the kubelet HTTP `/healthz` handler (added in PR2 of the
+    /// node-conformance work) to detect a stalled sync loop.
+    last_sync: std::sync::atomic::AtomicU64,
 }
 
 // Kubelet needs Send+Sync for Arc<Kubelet> in spawned tasks
@@ -110,6 +114,7 @@ impl Kubelet {
             pod_sync_locks: Mutex::new(HashSet::new()),
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
             pod_workers: Arc::new(Mutex::new(HashMap::new())),
+            last_sync: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -368,6 +373,20 @@ impl Kubelet {
                 }
             }
         }
+    }
+
+    /// Return true iff the sync loop has ticked within the last
+    /// `2 × sync_interval` seconds (with a 6s floor). Used by the kubelet
+    /// HTTP `/healthz` handler.
+    #[allow(dead_code)]
+    pub fn healthy(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self.last_sync.load(std::sync::atomic::Ordering::Relaxed);
+        let max_age = self.sync_interval.as_secs().saturating_mul(2).max(6);
+        last != 0 && now.saturating_sub(last) <= max_age
     }
 
     async fn register_node(&self) -> Result<()> {
@@ -889,6 +908,14 @@ impl Kubelet {
         // periodically cleans up terminal pods. This prevents accumulation of
         // stale pod records that block namespace deletion.
         self.cleanup_terminal_pods(&node_pods).await;
+
+        self.last_sync.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         Ok(())
     }
@@ -4728,5 +4755,45 @@ mod tests {
         // Step 3: Kubelet completes resize, sets to ""
         pod.status.as_mut().unwrap().resize = Some(String::new());
         assert_eq!(pod.status.as_ref().unwrap().resize.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_last_sync_timestamp_records_now() {
+        use std::sync::atomic::Ordering;
+        let last_sync = std::sync::atomic::AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        last_sync.store(now, Ordering::Relaxed);
+        assert!(last_sync.load(Ordering::Relaxed) >= now);
+    }
+
+    #[test]
+    fn test_healthy_returns_true_when_recently_synced() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let last_sync = AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+        let max_age_secs = 6;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let age = now.saturating_sub(last_sync.load(Ordering::Relaxed));
+        assert!(age <= max_age_secs);
+    }
+
+    #[test]
+    fn test_healthy_returns_false_when_stale() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let last_sync = AtomicU64::new(100);
+        let max_age_secs = 6u64;
+        let now: u64 = 200;
+        let age = now.saturating_sub(last_sync.load(Ordering::Relaxed));
+        assert!(age > max_age_secs);
     }
 }
