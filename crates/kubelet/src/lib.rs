@@ -7,6 +7,7 @@ pub mod eviction;
 pub mod kubelet;
 pub mod lifecycle;
 pub mod runtime;
+pub mod server;
 
 pub use kubelet::PodWorkerState;
 

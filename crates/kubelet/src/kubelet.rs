@@ -378,7 +378,6 @@ impl Kubelet {
     /// Return true iff the sync loop has ticked within the last
     /// `2 × sync_interval` seconds (with a 6s floor). Used by the kubelet
     /// HTTP `/healthz` handler.
-    #[allow(dead_code)]
     pub fn healthy(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
