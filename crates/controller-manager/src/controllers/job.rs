@@ -1154,10 +1154,8 @@ impl<S: Storage + 'static> JobController<S> {
                         match &status.phase {
                             Some(Phase::Running) | Some(Phase::Pending) => active += 1,
                             Some(Phase::Succeeded) => succeeded += 1,
-                            Some(Phase::Failed) => {
-                                if !ignored_pods.contains(&pod.metadata.name) {
-                                    failed += 1;
-                                }
+                            Some(Phase::Failed) if !ignored_pods.contains(&pod.metadata.name) => {
+                                failed += 1;
                             }
                             _ => {}
                         }
