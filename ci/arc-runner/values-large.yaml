@@ -52,12 +52,15 @@ template:
           requests:
             # Nextest workspace runs peak at ~8 GiB resident on this
             # ARC image (full target/ link + concurrent test binaries).
-            # 4Gi (the previous value) caused repeated kubelet evictions
-            # on PRs that landed multi-crate test changes. Bumped to 8Gi
-            # so the request matches the observed steady-state peak; a
-            # 14 GiB node now fits exactly one large runner plus a small
-            # one with headroom for system pods.
-            memory: 8Gi
+            # 4Gi caused repeated kubelet evictions on PRs that landed
+            # multi-crate test changes; 8Gi matched the steady-state
+            # peak but only fit ONE large runner per 14 GiB node.
+            # Lowered to 6500Mi to fit TWO runners per node during a
+            # /batch queue backlog (2026-05-18). Above the typical
+            # nextest resident set; bursts beyond it may trigger soft
+            # eviction under node-wide memory pressure but normal runs
+            # stay well within budget.
+            memory: 6500Mi
             # 2 cores requested matches the productive parallelism we
             # actually want from CARGO_BUILD_JOBS=4 (cargo will burst
             # to 4 rustc threads when other pods are idle, but the
