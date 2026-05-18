@@ -206,10 +206,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         if !is_pending {
             return Ok(()); // not pending
         }
+        // Go's JSON encoder writes `schedulerName: ""` for an unset
+        // pointer field, so `Some("")` reaches us instead of `None`.
+        // Treat both as the default scheduler — `as_deref().filter(...)`
+        // collapses the empty string to None before unwrap_or.
         let pod_scheduler = pod
             .spec
             .as_ref()
             .and_then(|s| s.scheduler_name.as_deref())
+            .filter(|n| !n.is_empty())
             .unwrap_or("default-scheduler");
         if pod_scheduler != self.scheduler_name {
             return Ok(()); // wrong scheduler
@@ -296,12 +301,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     return false;
                 }
 
-                // Check if pod is assigned to this scheduler
-                // If schedulerName is not specified, defaults to "default-scheduler"
+                // Check if pod is assigned to this scheduler.
+                // Go encodes an unset `schedulerName` as `""` (not omitted),
+                // so accept both `None` and `Some("")` as the default.
                 let pod_scheduler_name = p
                     .spec
                     .as_ref()
                     .and_then(|s| s.scheduler_name.as_deref())
+                    .filter(|n| !n.is_empty())
                     .unwrap_or("default-scheduler");
 
                 pod_scheduler_name == self.scheduler_name
@@ -1929,6 +1936,66 @@ mod tests {
                 .and_then(|s| s.node_name.as_deref())
                 .is_some_and(|n| !n.is_empty()),
             "Pod with nodeName='' must be treated as unscheduled and get assigned a node"
+        );
+    }
+
+    /// Regression test for the silent-skip bug where client-go's
+    /// `schedulerName: ""` (Go encodes unset pointer fields as the
+    /// empty string, not omitted) caused the scheduler to compare
+    /// `"" != "default-scheduler"` and drop the pod from the work
+    /// queue without logging anything.
+    #[tokio::test]
+    async fn test_empty_scheduler_name_treated_as_default() {
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 5, "default-scheduler".to_string());
+
+        let node = make_node("node-1");
+        storage
+            .create("/registry/nodes/node-1", &node)
+            .await
+            .unwrap();
+
+        let pod = Pod {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("test-pod").with_namespace("default"),
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: "test".to_string(),
+                    image: "busybox".to_string(),
+                    ..Default::default()
+                }],
+                // Key: schedulerName is Some("") — what client-go writes
+                // for an unset Pod.Spec.SchedulerName field.
+                scheduler_name: Some(String::new()),
+                ..Default::default()
+            }),
+            status: Some(PodStatus {
+                phase: Some(Phase::Pending),
+                ..Default::default()
+            }),
+        };
+        storage
+            .create("/registry/pods/default/test-pod", &pod)
+            .await
+            .unwrap();
+
+        scheduler.schedule_pending_pods().await.unwrap();
+
+        let scheduled: Pod = storage
+            .get("/registry/pods/default/test-pod")
+            .await
+            .unwrap();
+        assert!(
+            scheduled
+                .spec
+                .as_ref()
+                .and_then(|s| s.node_name.as_deref())
+                .is_some_and(|n| !n.is_empty()),
+            "Pod with schedulerName='' must be claimed by the default scheduler and scheduled"
         );
     }
 }
