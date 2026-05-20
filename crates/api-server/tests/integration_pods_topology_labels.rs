@@ -753,20 +753,22 @@ async fn test_pod_resize() {
 /// `spec.affinity.nodeAffinity` are mutable in this state. Once the gates
 /// are removed (and the pod scheduled), the same fields become immutable.
 ///
-/// Upstream `pkg/apis/core/validation/validation.go:5786-5828` implements
-/// this gated-pod nodeSelector / nodeAffinity mutation surface. We have
-/// not yet ported it — see `TODO(rusternetes)` in
-/// `crates/common/src/validation/pod.rs::validate_pod_spec_update`. The
-/// broader immutability fence in this PR is strict (rejects all gated-pod
-/// scheduling-directive mutations), which is the safer default until the
-/// gated-pod relaxation lands.
+/// Mirrors all three sub-cases of upstream
+/// `TestMutablePodSchedulingDirectives` (`test/integration/pods/pods_test.go:1204`):
+///   1. "adding node selector is allowed for gated pods"
+///   2. "addition to nodeAffinity is allowed for gated pods"
+///   3. "addition to nodeAffinity is allowed for gated pods with nil affinity"
+///
+/// Backed by `validate_node_selector_only_added` + `validate_node_affinity_only_added`
+/// in `crates/common/src/validation/pod.rs` (upstream
+/// `validation.go:9311-9379`).
 #[tokio::test]
-#[ignore = "Gated-pod nodeSelector/nodeAffinity mutation (validation.go:5786-5828) deferred — see TODO in validation::pod"]
 async fn test_mutable_pod_scheduling_directives() {
     let (_, router) = spawn_router();
     let ns = "mutable-pod-scheduling-directives";
     create_namespace(&router, ns).await;
 
+    // Sub-case 1: adding nodeSelector is allowed for gated pods.
     let create_pod = json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -774,6 +776,7 @@ async fn test_mutable_pod_scheduling_directives() {
         "spec": {
             "containers": [{ "name": "fake-name", "image": "fakeimage" }],
             "schedulingGates": [{ "name": "baz" }],
+            "terminationGracePeriodSeconds": 30,
         },
     });
     let (st, body) = post_json(
@@ -789,7 +792,6 @@ async fn test_mutable_pod_scheduling_directives() {
         body
     );
 
-    // Add a nodeSelector — allowed because schedulingGates is non-empty.
     let mut updated = create_pod.clone();
     updated["spec"]["nodeSelector"] = json!({ "foo": "bar" });
     let (st, body) = put_json(
@@ -800,9 +802,167 @@ async fn test_mutable_pod_scheduling_directives() {
     .await;
     assert!(
         st == 200 || st == 201,
-        "adding nodeSelector to a gated pod must be allowed: status={} body={}",
+        "sub-case 1: adding nodeSelector to a gated pod must be allowed: status={} body={}",
         st,
         body
+    );
+
+    // Sub-case 2: addition to nodeAffinity is allowed for gated pods.
+    // Pre-create pod with one required term, then add another MatchExpression
+    // + a MatchField.
+    let create_pod_2 = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "test-pod-2" },
+        "spec": {
+            "containers": [{ "name": "fake-name", "image": "fakeimage" }],
+            "schedulingGates": [{ "name": "baz" }],
+            "terminationGracePeriodSeconds": 30,
+            "affinity": {
+                "nodeAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": {
+                        "nodeSelectorTerms": [
+                            {
+                                "matchExpressions": [
+                                    { "key": "expr", "operator": "In", "values": ["foo"] }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    });
+    let (st, _) = post_json(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods", ns),
+        &create_pod_2,
+    )
+    .await;
+    assert!(st == 201 || st == 200);
+
+    let mut updated_2 = create_pod_2.clone();
+    updated_2["spec"]["affinity"]["nodeAffinity"]
+        ["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]
+        ["matchExpressions"] = json!([
+        { "key": "expr", "operator": "In", "values": ["foo"] },
+        { "key": "expr2", "operator": "In", "values": ["bar"] }
+    ]);
+    updated_2["spec"]["affinity"]["nodeAffinity"]
+        ["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]["matchFields"] = json!([
+        { "key": "metadata.name", "operator": "In", "values": ["node-1"] }
+    ]);
+    let (st, body) = put_json(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods/test-pod-2", ns),
+        &updated_2,
+    )
+    .await;
+    assert!(
+        st == 200 || st == 201,
+        "sub-case 2: appending MatchExpression + MatchField to a gated pod's required NodeAffinity term must be allowed: status={} body={}",
+        st,
+        body
+    );
+
+    // Sub-case 3: addition to nodeAffinity is allowed for gated pods with
+    // nil affinity. Old affinity nil → new affinity with a full required block.
+    let create_pod_3 = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "test-pod-3" },
+        "spec": {
+            "containers": [{ "name": "fake-name", "image": "fakeimage" }],
+            "schedulingGates": [{ "name": "baz" }],
+            "terminationGracePeriodSeconds": 30,
+        },
+    });
+    let (st, _) = post_json(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods", ns),
+        &create_pod_3,
+    )
+    .await;
+    assert!(st == 201 || st == 200);
+
+    let mut updated_3 = create_pod_3.clone();
+    updated_3["spec"]["affinity"] = json!({
+        "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [
+                    {
+                        "matchExpressions": [
+                            { "key": "expr", "operator": "In", "values": ["foo"] }
+                        ]
+                    }
+                ]
+            }
+        }
+    });
+    let (st, body) = put_json(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods/test-pod-3", ns),
+        &updated_3,
+    )
+    .await;
+    assert!(
+        st == 200 || st == 201,
+        "sub-case 3: setting nodeAffinity on a gated pod with nil affinity must be allowed: status={} body={}",
+        st,
+        body
+    );
+}
+
+/// Negative cases for the gated-pod relaxation: ensure the relaxation
+/// does NOT accept deletions or mutations, only additions. Mirrors the
+/// "rejected" branch of upstream `validateNodeSelectorMutation` /
+/// `validateNodeAffinityMutation` (validation.go:9311-9379).
+#[tokio::test]
+async fn test_gated_pod_relaxation_rejects_deletions() {
+    let (_, router) = spawn_router();
+    let ns = "gated-pod-rejections";
+    create_namespace(&router, ns).await;
+
+    // Pod with a populated nodeSelector + scheduling gate.
+    let create_pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "test-pod" },
+        "spec": {
+            "containers": [{ "name": "fake-name", "image": "fakeimage" }],
+            "schedulingGates": [{ "name": "baz" }],
+            "nodeSelector": { "foo": "bar" },
+            "terminationGracePeriodSeconds": 30,
+        },
+    });
+    let (st, _) = post_json(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods", ns),
+        &create_pod,
+    )
+    .await;
+    assert!(st == 201 || st == 200);
+
+    // Attempt to DELETE the existing nodeSelector entry — must be rejected.
+    let mut updated = create_pod.clone();
+    updated["spec"]["nodeSelector"] = json!({});
+    let (st, body) = put_json(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods/test-pod", ns),
+        &updated,
+    )
+    .await;
+    assert!(
+        (400..500).contains(&st),
+        "deleting an existing nodeSelector entry on a gated pod must be rejected: status={} body={}",
+        st,
+        body
+    );
+    let msg = body.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("only additions to spec.nodeSelector are allowed"),
+        "unexpected error message: {}",
+        msg
     );
 }
 
