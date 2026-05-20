@@ -1620,7 +1620,8 @@ fn merge_container_resources_from(
 /// PUT /api/v1/namespaces/{namespace}/pods/{name}/resize
 ///
 /// Subresource handler for in-place pod resize (KEP-1287). Wraps
-/// [`apply_pod_resize_with_retry`] with auth + axum extraction.
+/// [`apply_pod_resize_with_retry`] with auth + axum extraction +
+/// delta-aware ResourceQuota admission.
 pub async fn resize_pod(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -1641,6 +1642,32 @@ pub async fn resize_pod(
 
     let desired: rusternetes_common::resources::Pod = serde_json::from_slice(&body)
         .map_err(|e| Error::InvalidResource(format!("failed to decode resize body: {}", e)))?;
+
+    // Delta-aware ResourceQuota admission. The merged resize target is what
+    // gets persisted; the old pod's contribution is subtracted via
+    // `check_resource_quota_with_old` so an in-budget delta passes even
+    // when the live namespace recount still includes the old pod row.
+    // K8s ref: pkg/quota/v1/evaluator/core/pods.go — PodEvaluator
+    let key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
+    let old_pod: rusternetes_common::resources::Pod = state.storage.get(&key).await?;
+    let mut merged_target = old_pod.clone();
+    merge_container_resources_from(&mut merged_target, &desired);
+    match crate::admission::check_resource_quota_with_old(
+        &state.storage,
+        &namespace,
+        &merged_target,
+        Some(&old_pod),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(Error::Forbidden("exceeded quota".to_string()));
+        }
+        Err(e) => {
+            tracing::warn!("Error checking ResourceQuota on pod resize: {}", e);
+        }
+    }
 
     let updated =
         apply_pod_resize_with_retry(state.storage.as_ref(), &namespace, &name, &desired).await?;
