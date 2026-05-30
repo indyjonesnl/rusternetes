@@ -3,6 +3,7 @@ pub mod admission_webhook;
 pub mod bootstrap;
 pub mod conversion;
 pub mod dynamic_routes;
+pub mod extractors;
 #[allow(dead_code)]
 pub mod flow_control;
 pub mod gnostic;

@@ -1921,6 +1921,179 @@ impl ProtoRegistry {
             },
         );
 
+        // ========== rbac.authorization.k8s.io/v1 types ==========
+        // Field numbers from k8s.io/api/rbac/v1/generated.proto.
+        // Without these, client-go protobuf writes (the default for write
+        // requests) fall back to the brace-scan decoder, which drops the
+        // nested `roleRef.apiGroup` field and produces a body that fails to
+        // deserialize with "roleRef: missing field `apiGroup`".
+
+        // RoleRef: apiGroup(1), kind(2), name(3)
+        schemas.insert(
+            "RoleRef".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("apiGroup".into(), FieldType::String)),
+                    (2, ("kind".into(), FieldType::String)),
+                    (3, ("name".into(), FieldType::String)),
+                ]),
+            },
+        );
+        // Subject: kind(1), apiGroup(2), name(3), namespace(4)
+        schemas.insert(
+            "Subject".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("kind".into(), FieldType::String)),
+                    (2, ("apiGroup".into(), FieldType::String)),
+                    (3, ("name".into(), FieldType::String)),
+                    (4, ("namespace".into(), FieldType::String)),
+                ]),
+            },
+        );
+        // PolicyRule: verbs(1), apiGroups(2), resources(3),
+        //             resourceNames(4), nonResourceURLs(5)
+        schemas.insert(
+            "PolicyRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "verbs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "apiGroups".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "resources".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "resourceNames".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        5,
+                        (
+                            "nonResourceURLs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        // AggregationRule: clusterRoleSelectors(1, repeated LabelSelector)
+        schemas.insert(
+            "AggregationRule".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "clusterRoleSelectors".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("LabelSelector".into()))),
+                    ),
+                )]),
+            },
+        );
+        // RoleBinding: metadata(1), subjects(2, repeated Subject), roleRef(3)
+        schemas.insert(
+            "RoleBinding".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "subjects".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Subject".into()))),
+                        ),
+                    ),
+                    (3, ("roleRef".into(), FieldType::Message("RoleRef".into()))),
+                ]),
+            },
+        );
+        // ClusterRoleBinding: metadata(1), subjects(2), roleRef(3)
+        schemas.insert(
+            "ClusterRoleBinding".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "subjects".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Subject".into()))),
+                        ),
+                    ),
+                    (3, ("roleRef".into(), FieldType::Message("RoleRef".into()))),
+                ]),
+            },
+        );
+        // Role: metadata(1), rules(2, repeated PolicyRule)
+        schemas.insert(
+            "Role".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "rules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("PolicyRule".into()))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        // ClusterRole: metadata(1), rules(2), aggregationRule(3)
+        schemas.insert(
+            "ClusterRole".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "rules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("PolicyRule".into()))),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "aggregationRule".into(),
+                            FieldType::Message("AggregationRule".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
         ProtoRegistry { schemas }
     }
 
