@@ -285,19 +285,35 @@ pub async fn normalize_content_type_middleware(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let _is_watch_request = accept_header.contains("stream=watch")
-        || request.uri().path().contains("/watch/")
+    let request_path = request.uri().path().to_string();
+    let is_watch_request = accept_header.contains("stream=watch")
+        || request_path.contains("/watch/")
         || request
             .uri()
             .query()
             .map(|q| q.contains("watch=true") || q.contains("watch=1"))
             .unwrap_or(false);
-    // Protobuf disabled. K8s protobuf requires Unknown.raw to contain native
-    // protobuf-encoded bytes (e.g., proto.Marshal(NamespaceList)), not JSON.
-    // We can't produce native protobuf for K8s types in Rust. Client-go always
-    // sends "Accept: application/vnd.kubernetes.protobuf, application/json"
-    // and falls back to JSON when protobuf is unavailable.
-    let wants_protobuf = false;
+
+    // Protobuf is disabled for general list/get traffic: K8s protobuf normally
+    // requires Unknown.raw to contain *native* protobuf-encoded bytes, which we
+    // cannot produce for arbitrary K8s types in Rust. Client-go sends
+    // "Accept: application/vnd.kubernetes.protobuf, application/json" and falls
+    // back to JSON when the server replies with Content-Type: application/json.
+    //
+    // The `/scale` subresource is the exception. The polymorphic scale client in
+    // k8s.io/client-go/scale uses a protobuf-only RESTClient: when the server
+    // answers a protobuf `Accept` with a bare JSON body it tries to proto-Unmarshal
+    // the JSON bytes as `autoscaling/v1.Scale`. The leading `{` (0x7b) decodes as a
+    // start-group tag, surfacing the conformance errors
+    //   "proto: illegal wireType 6" / "proto: Scale: wiretype end group".
+    // To satisfy that client we must wrap the Scale response in a proper
+    // runtime.Unknown envelope (raw=JSON, contentType=application/json), which the
+    // client decodes via the envelope's contentType. Limit this to non-watch scale
+    // requests that actually negotiated protobuf.
+    let is_scale_subresource = request_path.ends_with("/scale");
+    let wants_protobuf = is_scale_subresource
+        && !is_watch_request
+        && accept_header.contains("application/vnd.kubernetes.protobuf");
 
     let response = next.run(request).await;
 
