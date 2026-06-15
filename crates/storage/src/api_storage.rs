@@ -675,8 +675,7 @@ mod tests {
     fn delete_forces_zero_grace_period() {
         let q = force_delete_query();
         assert!(
-            q.iter()
-                .any(|(k, v)| k == "gracePeriodSeconds" && v == "0"),
+            q.iter().any(|(k, v)| k == "gracePeriodSeconds" && v == "0"),
             "ApiStorage::delete must send gracePeriodSeconds=0 for a hard delete, got {q:?}"
         );
     }
