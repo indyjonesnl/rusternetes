@@ -151,7 +151,7 @@ async fn run_api_mode(args: Args) -> Result<()> {
     let client = Arc::new(ApiClient::with_tls(
         &args.api_server_url,
         insecure,
-        ca_pem,
+        ca_pem.clone(),
         None,
     )?);
     let config = rusternetes_controller_manager::ControllerManagerConfig {
@@ -159,6 +159,10 @@ async fn run_api_mode(args: Args) -> Result<()> {
         // HPA metric fetches over the api-server in API mode are a follow-up
         // (need a client-cert/token path under the static pod).
         metrics_config: None,
+        // The namespace controller can't read the CA from the api-server's
+        // cert paths in its own container — hand it the kubeconfig-resolved CA
+        // so it can (re)create kube-root-ca.crt in every namespace.
+        ca_cert_pem: ca_pem.and_then(|b| String::from_utf8(b).ok()),
     };
     rusternetes_controller_manager::run_with_api(client, config).await
 }
