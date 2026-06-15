@@ -735,13 +735,26 @@ impl<S: Storage + 'static> NamespaceController<S> {
         if let Some(ref mut fins) = ns.metadata.finalizers {
             fins.retain(|f| f != "kubernetes");
         }
+        let drained = ns.metadata.finalizers.as_ref().is_none_or(|f| f.is_empty());
 
         match self.storage.update(&key, &ns).await {
             Ok(_) => info!(
-                "Namespace {} finalized (kubernetes finalizer cleared, api-server completes removal)",
+                "Namespace {} finalized (kubernetes finalizer cleared)",
                 name
             ),
             Err(e) => warn!("Failed to persist namespace {} finalization: {}", name, e),
+        }
+
+        // Once the finalizer slice is empty, remove the object. Against the
+        // api-server the update above already collected it (the finalize path
+        // removes a drained Terminating namespace — `ShouldDeleteNamespace-
+        // DuringUpdate`), so this `delete` is a harmless NotFound there; but a
+        // direct-storage backend (the all-in-one's StorageBackend, and tests
+        // that drive the controller over `MemoryStorage`) has no finalize hook,
+        // so the explicit delete is what actually collects it. A remaining
+        // custom finalizer leaves `drained` false → not removed.
+        if drained {
+            let _ = self.storage.delete(&key).await;
         }
 
         info!("Namespace {} finalization complete", name);
