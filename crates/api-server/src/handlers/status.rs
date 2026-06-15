@@ -707,6 +707,43 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn test_status_update_preserves_generation() {
+        // A /status write must keep the STORED metadata.generation and ignore
+        // any generation in the incoming body — otherwise a stale status write
+        // (the kubelet's observedGeneration sync, built from an earlier read)
+        // reverts a concurrent spec update's generation bump (#1166). Spec is
+        // preserved from current; only status is taken from the incoming body.
+        let current = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "generation": 7, "resourceVersion": "42"},
+            "spec": {"activeDeadlineSeconds": 100},
+            "status": {"phase": "Pending"}
+        });
+        let incoming = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "generation": 3},
+            "status": {"phase": "Running", "observedGeneration": 3}
+        });
+        let out = build_updated_resource_for_status(&current, &incoming, false, "pods").unwrap();
+        assert_eq!(
+            out.pointer("/metadata/generation").and_then(|v| v.as_i64()),
+            Some(7),
+            "status update must preserve the stored generation, not the incoming one"
+        );
+        assert_eq!(
+            out.pointer("/status/phase").and_then(|v| v.as_str()),
+            Some("Running"),
+            "status must be applied from the incoming body"
+        );
+        assert_eq!(
+            out.pointer("/spec/activeDeadlineSeconds")
+                .and_then(|v| v.as_i64()),
+            Some(100),
+            "spec must be preserved from current"
+        );
+    }
+
+    #[test]
     fn test_status_update_preserves_spec() {
         let current_resource = json!({
             "apiVersion": "apps/v1",
