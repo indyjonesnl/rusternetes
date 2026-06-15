@@ -320,19 +320,44 @@ pub async fn update_status(
     let is_merge_patch =
         content_type.contains("merge-patch") || content_type.contains("strategic-merge-patch");
 
-    // Get the current resource
+    // Get the current resource and write the new status under a CAS-retry loop.
+    // build_updated_resource_for_status preserves the stored metadata
+    // (including generation) and only grafts the incoming status, but it strips
+    // resourceVersion — which made the write a blind last-write-wins. A stale
+    // status write (e.g. the kubelet's observedGeneration sync, built from an
+    // earlier read) could then revert a concurrent spec update's
+    // metadata.generation bump, dropping one increment over rapid updates
+    // (#1166). Re-inject the freshly-read resourceVersion so the write is
+    // CAS-guarded, and retry on conflict so the caller still sees success.
     let key = build_key(&resource_type, Some(&namespace), &name);
-    let current_resource: Value = state.storage.get(&key).await?;
-
-    let updated_resource = build_updated_resource_for_status(
-        &current_resource,
-        &new_resource,
-        is_merge_patch,
-        &resource_type,
-    )?;
-
-    // Save the updated resource
-    let mut saved: Value = state.storage.update(&key, &updated_resource).await?;
+    let mut attempts = 0;
+    let mut saved: Value = loop {
+        let current_resource: Value = state.storage.get(&key).await?;
+        let mut updated_resource = build_updated_resource_for_status(
+            &current_resource,
+            &new_resource,
+            is_merge_patch,
+            &resource_type,
+        )?;
+        if let (Some(rv), Some(obj)) = (
+            current_resource
+                .pointer("/metadata/resourceVersion")
+                .cloned(),
+            updated_resource
+                .get_mut("metadata")
+                .and_then(|m| m.as_object_mut()),
+        ) {
+            obj.insert("resourceVersion".to_string(), rv);
+        }
+        match state.storage.update(&key, &updated_resource).await {
+            Ok(v) => break v,
+            Err(rusternetes_common::Error::Conflict(_)) if attempts < 8 => {
+                attempts += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    };
 
     // Ensure kind/apiVersion are always present in the response — the storage round-trip
     // may strip them if the original stored resource was missing TypeMeta fields.
