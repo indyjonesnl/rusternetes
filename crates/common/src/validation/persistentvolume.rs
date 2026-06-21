@@ -159,6 +159,32 @@ pub fn validate_persistent_volume_update(
         ));
     }
 
+    // nodeAffinity: immutable once set (upstream validatePvNodeAffinity, with the
+    // default-off MutablePVNodeAffinity gate). A nil → set transition is allowed.
+    // The beta→GA topology-label masking carve-out is not modelled.
+    if old.spec.node_affinity.is_some() {
+        let na_eq = serde_json::to_value(&new.spec.node_affinity).ok()
+            == serde_json::to_value(&old.spec.node_affinity).ok();
+        if !na_eq {
+            errs.push(Error::invalid(
+                &Path::new("spec").child("nodeAffinity"),
+                "<nodeAffinity>".to_string(),
+                "field is immutable",
+            ));
+        }
+    }
+
+    // volumeAttributesClassName: with the VolumeAttributesClass feature enabled
+    // (beta-on by 1.35), an existing class may be changed but not cleared.
+    if old.spec.volume_attributes_class_name.is_some()
+        && new.spec.volume_attributes_class_name.is_none()
+    {
+        errs.push(Error::forbidden(
+            &Path::new("spec").child("volumeAttributesClassName"),
+            "update from non-nil value to nil is forbidden",
+        ));
+    }
+
     errs
 }
 
@@ -238,5 +264,60 @@ mod update_tests {
                 .any(|e| e.to_string().contains("persistentvolumesource")),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn node_affinity_immutable_once_set() {
+        let na = serde_json::json!({"required": {"nodeSelectorTerms": [
+            {"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": ["n1"]}]}
+        ]}});
+        let mut old = hostpath_pv("/data");
+        old.spec.node_affinity = serde_json::from_value(na.clone()).unwrap();
+        // unchanged -> ok
+        let mut same = hostpath_pv("/data");
+        same.spec.node_affinity = serde_json::from_value(na).unwrap();
+        assert!(validate_persistent_volume_update(&same, &old).is_empty());
+        // changed -> immutable
+        let mut changed = hostpath_pv("/data");
+        changed.spec.node_affinity = serde_json::from_value(serde_json::json!({"required": {"nodeSelectorTerms": [
+            {"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": ["n2"]}]}
+        ]}})).unwrap();
+        let errs = validate_persistent_volume_update(&changed, &old);
+        assert!(
+            errs.iter()
+                .any(|e| e.field.ends_with("nodeAffinity") && e.detail == "field is immutable"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn node_affinity_may_be_set_when_old_nil() {
+        let old = hostpath_pv("/data"); // no nodeAffinity
+        let mut new = hostpath_pv("/data");
+        new.spec.node_affinity =
+            serde_json::from_value(serde_json::json!({"required": {"nodeSelectorTerms": [
+                {"matchExpressions": [{"key": "k", "operator": "Exists"}]}
+            ]}}))
+            .unwrap();
+        assert!(validate_persistent_volume_update(&new, &old).is_empty());
+    }
+
+    #[test]
+    fn vac_name_may_not_be_cleared() {
+        let mut old = hostpath_pv("/data");
+        old.spec.volume_attributes_class_name = Some("gold".to_string());
+        let new = hostpath_pv("/data"); // VAC cleared
+        let errs = validate_persistent_volume_update(&new, &old);
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("non-nil value to nil is forbidden")),
+            "{errs:?}"
+        );
+        // changing to another class is allowed
+        let mut changed = hostpath_pv("/data");
+        changed.spec.volume_attributes_class_name = Some("silver".to_string());
+        assert!(!validate_persistent_volume_update(&changed, &old)
+            .iter()
+            .any(|e| e.field.ends_with("volumeAttributesClassName")));
     }
 }
