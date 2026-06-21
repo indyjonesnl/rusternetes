@@ -28,3 +28,4 @@ pub mod resourcequota;
 pub mod service;
 pub mod storageclass;
 pub mod volumeattributesclass;
+pub mod webhookconfiguration;
