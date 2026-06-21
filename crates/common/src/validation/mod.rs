@@ -12,6 +12,7 @@ pub mod field;
 pub mod ingress;
 pub mod limitrange;
 pub mod metav1;
+pub mod namespace;
 pub mod networkpolicy;
 pub mod objectmeta;
 pub mod pdb;
