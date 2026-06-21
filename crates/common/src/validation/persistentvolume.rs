@@ -102,3 +102,141 @@ pub fn validate_persistent_volume_spec(spec: &PersistentVolumeSpec, fld_path: &P
 pub fn validate_persistent_volume(pv: &PersistentVolume) -> ErrorList {
     validate_persistent_volume_spec(&pv.spec, &Path::new("spec"))
 }
+
+/// JSON view of just the volume-source union of a `PersistentVolumeSpec`
+/// (`PersistentVolumeSource` upstream) — the fields that are immutable after
+/// creation. Capacity / accessModes / reclaimPolicy etc. are intentionally
+/// excluded.
+fn persistent_volume_source(spec: &PersistentVolumeSpec) -> serde_json::Value {
+    serde_json::json!({
+        "hostPath": spec.host_path,
+        "nfs": spec.nfs,
+        "iscsi": spec.iscsi,
+        "local": spec.local,
+        "csi": spec.csi,
+    })
+}
+
+/// Validate a `PersistentVolume` on update. Mirrors upstream
+/// `ValidatePersistentVolumeUpdate`: re-run create validation, then enforce that
+/// the volume source and `volumeMode` are immutable. The CSI
+/// `controllerExpandSecretRef` may be set when it was previously unset (allowed
+/// for volume expansion), so it is excluded from the source-immutability diff in
+/// that case.
+pub fn validate_persistent_volume_update(
+    new: &PersistentVolume,
+    old: &PersistentVolume,
+) -> ErrorList {
+    let mut errs = validate_persistent_volume(new);
+
+    // Allow first-time setting of csi.controllerExpandSecretRef: normalise the
+    // new spec to drop it before the source diff when old had none.
+    let mut new_spec = new.spec.clone();
+    let old_had_expand_ref = old
+        .spec
+        .csi
+        .as_ref()
+        .map(|c| c.controller_expand_secret_ref.is_some())
+        .unwrap_or(false);
+    if !old_had_expand_ref {
+        if let Some(csi) = new_spec.csi.as_mut() {
+            csi.controller_expand_secret_ref = None;
+        }
+    }
+
+    if persistent_volume_source(&new_spec) != persistent_volume_source(&old.spec) {
+        errs.push(Error::forbidden(
+            &Path::new("spec").child("persistentvolumesource"),
+            "spec.persistentvolumesource is immutable after creation",
+        ));
+    }
+
+    if new.spec.volume_mode != old.spec.volume_mode {
+        errs.push(Error::invalid(
+            &Path::new("spec").child("volumeMode"),
+            format!("{:?}", new.spec.volume_mode),
+            "field is immutable",
+        ));
+    }
+
+    errs
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    fn pv(json: serde_json::Value) -> PersistentVolume {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn hostpath_pv(path: &str) -> PersistentVolume {
+        pv(serde_json::json!({
+            "metadata": {"name": "pv"},
+            "spec": {
+                "capacity": {"storage": "1Gi"},
+                "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Retain",
+                "hostPath": {"path": path}
+            }
+        }))
+    }
+
+    #[test]
+    fn unchanged_passes() {
+        let old = hostpath_pv("/data");
+        let new = hostpath_pv("/data");
+        assert!(validate_persistent_volume_update(&new, &old).is_empty());
+    }
+
+    #[test]
+    fn changed_source_rejected() {
+        let old = hostpath_pv("/data");
+        let new = hostpath_pv("/other");
+        let errs = validate_persistent_volume_update(&new, &old);
+        assert!(
+            errs.iter().any(|e| e
+                .to_string()
+                .contains("persistentvolumesource is immutable")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn changed_volume_mode_rejected() {
+        let mut old = hostpath_pv("/data");
+        old.spec.volume_mode = Some(crate::resources::volume::PersistentVolumeMode::Filesystem);
+        let mut new = hostpath_pv("/data");
+        new.spec.volume_mode = Some(crate::resources::volume::PersistentVolumeMode::Block);
+        let errs = validate_persistent_volume_update(&new, &old);
+        assert!(
+            errs.iter()
+                .any(|e| e.field.ends_with("volumeMode") && e.detail == "field is immutable"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn first_time_csi_expand_secret_ref_allowed() {
+        let old = pv(serde_json::json!({
+            "metadata": {"name": "pv"},
+            "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Delete",
+                "csi": {"driver": "csi.example.com", "volumeHandle": "vol-1"}}
+        }));
+        let new = pv(serde_json::json!({
+            "metadata": {"name": "pv"},
+            "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Delete",
+                "csi": {"driver": "csi.example.com", "volumeHandle": "vol-1",
+                    "controllerExpandSecretRef": {"name": "s", "namespace": "ns"}}}
+        }));
+        let errs = validate_persistent_volume_update(&new, &old);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.to_string().contains("persistentvolumesource")),
+            "{errs:?}"
+        );
+    }
+}
