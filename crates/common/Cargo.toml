@@ -28,6 +28,7 @@ aes-gcm = "0.10"
 base64 = "0.22"
 regex = "1.10"
 once_cell = "1.19"
+cron = "0.12"
 etcd-client.workspace = true
 sha2 = "0.10.9"
 reqwest = { workspace = true }

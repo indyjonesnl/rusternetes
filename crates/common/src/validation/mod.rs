@@ -7,6 +7,7 @@
 
 pub mod apps;
 pub mod certificatesigningrequest;
+pub mod cronjob;
 pub mod csistoragecapacity;
 pub mod endpointslice;
 pub mod events;
