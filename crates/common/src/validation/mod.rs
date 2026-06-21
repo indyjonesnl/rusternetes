@@ -26,5 +26,6 @@ pub mod podtemplate;
 pub mod pvc;
 pub mod resourcequota;
 pub mod service;
+pub mod servicecidr;
 pub mod storageclass;
 pub mod volumeattributesclass;
