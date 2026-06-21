@@ -39,6 +39,7 @@ pub mod prioritylevelconfiguration;
 pub mod pvc;
 pub mod rbac;
 pub mod replicationcontroller;
+pub mod resourceclaim;
 pub mod resourcequota;
 pub mod runtimeclass;
 pub mod secret;
