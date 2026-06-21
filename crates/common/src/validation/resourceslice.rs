@@ -24,6 +24,36 @@ pub fn validate_resource_slice(slice: &ResourceSlice) -> ErrorList {
     validate_resource_slice_spec(&slice.spec, &Path::new("spec"))
 }
 
+/// Validate a `ResourceSlice` on update. Mirrors upstream
+/// `ValidateResourceSliceUpdate`: re-run the create validation, then enforce
+/// that `pool.name`, `driver`, and `nodeName` are immutable.
+pub fn validate_resource_slice_update(new: &ResourceSlice, old: &ResourceSlice) -> ErrorList {
+    let mut errs = validate_resource_slice(new);
+    let spec = Path::new("spec");
+    if new.spec.pool.name != old.spec.pool.name {
+        errs.push(Error::invalid(
+            &spec.child("pool").child("name"),
+            new.spec.pool.name.clone(),
+            "field is immutable",
+        ));
+    }
+    if new.spec.driver != old.spec.driver {
+        errs.push(Error::invalid(
+            &spec.child("driver"),
+            new.spec.driver.clone(),
+            "field is immutable",
+        ));
+    }
+    if new.spec.node_name != old.spec.node_name {
+        errs.push(Error::invalid(
+            &spec.child("nodeName"),
+            new.spec.node_name.clone().unwrap_or_default(),
+            "field is immutable",
+        ));
+    }
+    errs
+}
+
 fn validate_resource_slice_spec(spec: &ResourceSliceSpec, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
@@ -255,6 +285,32 @@ mod tests {
         assert!(
             e.iter().any(|m| m.to_lowercase().contains("duplicate")),
             "{e:?}"
+        );
+    }
+
+    #[test]
+    fn update_immutable_driver_pool_node() {
+        let old = slice(base());
+        // unchanged -> ok
+        assert!(validate_resource_slice_update(&slice(base()), &old).is_empty());
+        // changed driver -> immutable
+        let mut v = base();
+        v["spec"]["driver"] = serde_json::json!("other.example.com");
+        let errs = validate_resource_slice_update(&slice(v), &old);
+        assert!(
+            errs.iter()
+                .any(|e| e.field.ends_with("driver") && e.detail == "field is immutable"),
+            "{errs:?}"
+        );
+        // changed pool name -> immutable
+        let mut v2 = base();
+        v2["spec"]["pool"]["name"] = serde_json::json!("pool-2");
+        let errs2 = validate_resource_slice_update(&slice(v2), &old);
+        assert!(
+            errs2
+                .iter()
+                .any(|e| e.field.ends_with("pool.name") && e.detail == "field is immutable"),
+            "{errs2:?}"
         );
     }
 }
