@@ -336,6 +336,42 @@ impl ApiStorage {
         let (root, namespaced) = self.resolve(&rt).await?;
         build_collection_for_object(&root, namespaced, &rt, &rest)
     }
+
+    /// Mode-correct pod eviction against the api-server.
+    ///
+    /// A full PUT would let the api-server strip the client-set
+    /// `deletionTimestamp` (and `.status`), so the victim would never terminate
+    /// (the #1142/#1131 class of bug). Instead mirror the scheduler's
+    /// `evict_pod_for_preemption`: best-effort PUT the mutated object to the
+    /// `/status` subresource (records the `Evicted`/`DisruptionTarget`
+    /// condition), then issue a real graceful `DELETE ?gracePeriodSeconds=N` —
+    /// the DELETE is what actually frees resources, so a status hiccup must not
+    /// abort it. Honours the caller-supplied grace (the pod's
+    /// `terminationGracePeriodSeconds` / toleration grace).
+    pub async fn evict_pod_graceful<T>(
+        &self,
+        key: &str,
+        mutated_pod: &T,
+        grace_period_seconds: i64,
+    ) -> Result<()>
+    where
+        T: Serialize + Sync,
+    {
+        let path = self.object_path(key).await?;
+        let status_path = format!("{path}/status");
+        let _: std::result::Result<Value, _> = self.client.put(&status_path, mutated_pod).await;
+        let body = serde_json::json!({ "gracePeriodSeconds": grace_period_seconds });
+        let status = self
+            .client
+            .delete_with_options(&path, &[], Some(&body))
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        if status.is_success() || status.as_u16() == 404 {
+            Ok(())
+        } else {
+            Err(Error::Storage(format!("evict {key} failed: HTTP {status}")))
+        }
+    }
 }
 
 /// Reconstruct the `/registry/...` storage key for a watch-event object.

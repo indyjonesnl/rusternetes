@@ -436,6 +436,45 @@ impl StorageBackend {
         StorageBackend::Api(api_storage::ApiStorage::new(client))
     }
 
+    /// Mode-aware pod eviction. Callers (kubelet taint eviction, node-pressure
+    /// eviction) mutate the victim pod — stamping `deletionTimestamp` and
+    /// `status.phase=Failed`/`reason=Evicted` — then route the persist through
+    /// here instead of a raw `update`.
+    ///
+    /// * Storage-backed (etcd/rhino/memory): a full `update` writes the
+    ///   `deletionTimestamp` + status directly — these backends own no `/status`
+    ///   split, so this is byte-for-byte the prior behavior.
+    /// * `Api` (in-cluster / all-in-one as an api-server client): a full PUT
+    ///   would have the api-server strip the client-set `deletionTimestamp` and
+    ///   `.status`, leaving the victim running forever (#1142/#1131). Route to
+    ///   `ApiStorage::evict_pod_graceful`, which records status best-effort then
+    ///   issues a real `DELETE ?gracePeriodSeconds=N`.
+    ///
+    /// `grace_period_seconds` should be the pod's
+    /// `terminationGracePeriodSeconds` (or toleration grace).
+    #[cfg_attr(not(feature = "api-client"), allow(unused_variables))]
+    pub async fn evict_pod<T>(
+        &self,
+        key: &str,
+        mutated_pod: &T,
+        grace_period_seconds: i64,
+    ) -> Result<()>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        match self {
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => {
+                s.evict_pod_graceful(key, mutated_pod, grace_period_seconds)
+                    .await
+            }
+            // Storage-backed: unchanged whole-object update persists
+            // deletionTimestamp + status. (grace is honored by the kubelet's own
+            // termination path, not the write here.)
+            _ => self.update(key, mutated_pod).await.map(|_| ()),
+        }
+    }
+
     /// Attach an in-process event bus to the backend so internal `watch()`
     /// consumers get the in-process fast path. Only valid in a single-writer
     /// (all-in-one) process. No-op for etcd/memory: memory already has an
@@ -750,5 +789,50 @@ pub fn build_prefix(resource_type: &str, namespace: Option<&str>) -> String {
     match namespace {
         Some(ns) => format!("/registry/{}/{}/", resource_type, ns),
         None => format!("/registry/{}/", resource_type),
+    }
+}
+
+#[cfg(test)]
+mod evict_pod_tests {
+    use super::*;
+    use rusternetes_common::resources::{Pod, PodSpec, PodStatus};
+    use rusternetes_common::types::Phase;
+
+    /// Storage-backed eviction must persist the caller's mutated victim
+    /// (deletionTimestamp + phase=Failed/reason=Evicted) verbatim — byte-for-byte
+    /// the prior `update`-based behavior, so no regression for the default
+    /// (non-API) backends. (API-mode DELETE-with-grace needs a live api-server
+    /// and is verified via the compose stack, per #1284.)
+    #[tokio::test]
+    async fn evict_pod_storage_mode_persists_deletion_and_status() {
+        let backend = StorageBackend::new_memory();
+        let key = build_key("pods", Some("default"), "victim");
+
+        let mut pod = Pod::new("victim", PodSpec::default());
+        pod.metadata.namespace = Some("default".to_string());
+        pod.status = Some(PodStatus {
+            phase: Some(Phase::Running),
+            ..Default::default()
+        });
+        Storage::create(&backend, &key, &pod).await.unwrap();
+
+        // Mutate exactly as the kubelet taint-eviction site does.
+        let mut evicted = pod.clone();
+        evicted.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        if let Some(ref mut status) = evicted.status {
+            status.phase = Some(Phase::Failed);
+            status.reason = Some("Evicted".to_string());
+            status.message = Some("Taint-based eviction".to_string());
+        }
+        backend.evict_pod(&key, &evicted, 30).await.unwrap();
+
+        let got: Pod = Storage::get(&backend, &key).await.unwrap();
+        assert!(
+            got.metadata.deletion_timestamp.is_some(),
+            "deletionTimestamp must persist in storage mode"
+        );
+        let st = got.status.expect("status");
+        assert!(matches!(st.phase, Some(Phase::Failed)));
+        assert_eq!(st.reason.as_deref(), Some("Evicted"));
     }
 }

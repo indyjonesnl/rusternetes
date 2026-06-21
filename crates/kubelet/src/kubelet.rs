@@ -1266,7 +1266,17 @@ impl Kubelet {
                                     evicted.metadata.namespace.as_deref(),
                                     &evicted.metadata.name,
                                 );
-                                let _ = self.storage.update(&pod_key, &evicted).await;
+                                // Mode-aware persist: storage backends write the
+                                // deletionTimestamp+status directly (unchanged);
+                                // in API mode a full PUT would be stripped by the
+                                // api-server, so route through a real graceful
+                                // DELETE (#1284). Honor the pod's grace.
+                                let grace = pod
+                                    .spec
+                                    .as_ref()
+                                    .and_then(|s| s.termination_grace_period_seconds)
+                                    .unwrap_or(30);
+                                let _ = self.storage.evict_pod(&pod_key, &evicted, grace).await;
                                 break;
                             }
                         }
