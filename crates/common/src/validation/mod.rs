@@ -19,3 +19,4 @@ pub mod pod;
 pub mod pvc;
 pub mod service;
 pub mod storageclass;
+pub mod volumeattributesclass;
