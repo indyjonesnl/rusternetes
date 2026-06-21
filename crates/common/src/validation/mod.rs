@@ -34,6 +34,7 @@ pub mod podtemplate;
 pub mod priorityclass;
 pub mod prioritylevelconfiguration;
 pub mod pvc;
+pub mod rbac;
 pub mod replicationcontroller;
 pub mod resourcequota;
 pub mod runtimeclass;
