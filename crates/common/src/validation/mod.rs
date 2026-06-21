@@ -24,6 +24,7 @@ pub mod pdb;
 pub mod pod;
 pub mod podtemplate;
 pub mod pvc;
+pub mod replicationcontroller;
 pub mod resourcequota;
 pub mod service;
 pub mod storageclass;
