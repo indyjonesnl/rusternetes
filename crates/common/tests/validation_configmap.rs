@@ -76,3 +76,37 @@ fn invalid_binary_key_rejected() {
 fn empty_configmap_ok() {
     assert!(validate_config_map(&cm()).is_empty());
 }
+
+#[test]
+fn oversize_configmap_rejected() {
+    use rusternetes_common::validation::configmap::MAX_SECRET_SIZE;
+    let mut c = cm();
+    let mut d = HashMap::new();
+    // Split the payload across data + binaryData to prove the cap is on the
+    // combined total, not a single value.
+    d.insert("a".to_string(), "x".repeat(MAX_SECRET_SIZE / 2));
+    c.data = Some(d);
+    let mut b = HashMap::new();
+    b.insert("b".to_string(), vec![0u8; MAX_SECRET_SIZE / 2 + 1]);
+    c.binary_data = Some(b);
+    let errs = validate_config_map(&c);
+    assert!(
+        errs.iter()
+            .any(|e| e.error_type == rusternetes_common::validation::field::ErrorType::TooLong),
+        "expected a TooLong error, got: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn at_limit_configmap_ok() {
+    use rusternetes_common::validation::configmap::MAX_SECRET_SIZE;
+    let mut c = cm();
+    let mut d = HashMap::new();
+    d.insert("a".to_string(), "x".repeat(MAX_SECRET_SIZE));
+    c.data = Some(d);
+    // Exactly at the limit is allowed (upstream uses `>`, not `>=`).
+    assert!(validate_config_map(&c)
+        .iter()
+        .all(|e| e.error_type != rusternetes_common::validation::field::ErrorType::TooLong));
+}
