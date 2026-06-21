@@ -46,6 +46,15 @@ pub async fn create_resourceslice(
     slice.kind = "ResourceSlice".to_string();
     slice.api_version = "resource.k8s.io/v1".to_string();
 
+    // Field validation (upstream resource ValidateResourceSlice): driver, pool,
+    // exactly-one node selection, device set caps + unique names.
+    {
+        let errs = rusternetes_common::validation::resourceslice::validate_resource_slice(&slice);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Ensure metadata exists and set defaults
     let metadata = slice.metadata.get_or_insert_with(Default::default);
 
