@@ -40,8 +40,19 @@ pub fn validate_resource_claim_update(new: &ResourceClaim, old: &ResourceClaim) 
     errs
 }
 
-fn validate_resource_claim_spec(spec: &ResourceClaimSpec, fld_path: &Path) -> ErrorList {
+/// Validate a `ResourceClaimSpec` at the given path. Shared by `ResourceClaim`
+/// and `ResourceClaimTemplate` (upstream `validateResourceClaimSpec`).
+pub fn validate_resource_claim_spec(spec: &ResourceClaimSpec, fld_path: &Path) -> ErrorList {
     validate_device_claim(&spec.devices, &fld_path.child("devices"))
+}
+
+/// Validate a `ResourceClaimTemplate` on create. Mirrors upstream
+/// `ValidateResourceClaimTemplate`: validates the embedded `spec.spec`
+/// (a `ResourceClaimSpec`). ObjectMeta is validated separately.
+pub fn validate_resource_claim_template(
+    template: &crate::resources::ResourceClaimTemplate,
+) -> ErrorList {
+    validate_resource_claim_spec(&template.spec.spec, &Path::new("spec").child("spec"))
 }
 
 fn validate_device_claim(claim: &DeviceClaim, fld_path: &Path) -> ErrorList {
@@ -260,6 +271,29 @@ mod tests {
             e.iter()
                 .any(|x| x.field == "spec" && x.detail == "field is immutable"),
             "{e:?}"
+        );
+    }
+
+    #[test]
+    fn template_validates_embedded_spec() {
+        use crate::resources::ResourceClaimTemplate;
+        let tmpl: ResourceClaimTemplate = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "t"},
+            "spec": {"spec": {"devices": {"requests": [
+                {"name": "r", "exactly": {"deviceClassName": "c.example.com", "allocationMode": "ExactCount", "count": 0}}
+            ]}}}
+        })).unwrap();
+        let errs = validate_resource_claim_template(&tmpl);
+        // count 0 with ExactCount -> error, attached under spec.spec.devices...
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("greater than zero")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.field.starts_with("spec.spec.devices")),
+            "{errs:?}"
         );
     }
 }
