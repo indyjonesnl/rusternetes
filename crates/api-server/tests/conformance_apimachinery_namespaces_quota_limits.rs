@@ -291,6 +291,56 @@ async fn namespace_create_then_list_contains_it() {
     }
 }
 
+/// [sig-api-machinery] ResourceQuota should manage the lifecycle of a
+/// ResourceQuota [Conformance] — the early step: *"Attempt to list all
+/// namespaces with a label selector which MUST succeed. One list MUST be
+/// found."*
+///
+/// Upstream: test/e2e/apimachinery/resource_quota.go (the "manage the lifecycle"
+/// case). Tracked as issue #276. Pairs with
+/// `resource_quota_deletecollection_by_label_selector`.
+///
+/// Locks the `apply_selectors` filtering on the namespace LIST handler: only the
+/// label-matching namespace is returned.
+#[tokio::test]
+async fn namespace_list_by_label_selector_returns_only_matches() {
+    let (router, _mem) = spawn_router();
+
+    let labeled = json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": { "name": "ns-rq-lifecycle", "labels": { "e2e-ns": "rq-lifecycle" } }
+    });
+    let (s, _) = send_json(router.clone(), "POST", "/api/v1/namespaces", Some(&labeled)).await;
+    assert_eq!(s, 201);
+    // A second namespace without the label must be filtered out.
+    let (s, _) = send_json(
+        router.clone(),
+        "POST",
+        "/api/v1/namespaces",
+        Some(&ns_body("ns-rq-other")),
+    )
+    .await;
+    assert_eq!(s, 201);
+
+    let (status, body) = send_json(
+        router,
+        "GET",
+        "/api/v1/namespaces?labelSelector=e2e-ns=rq-lifecycle",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "labelled namespace list MUST succeed");
+    assert_eq!(body["kind"], "NamespaceList");
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["metadata"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["ns-rq-lifecycle"], "exactly one list MUST be found");
+}
+
 /// [sig-api-machinery] Namespaces creating namespaces should auto-create the
 /// default ServiceAccount [Conformance]
 ///
