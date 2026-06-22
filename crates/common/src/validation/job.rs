@@ -907,9 +907,10 @@ mod parity_tests {
     }
 
     fn container() -> Container {
-        let mut c = Container::default();
-        c.name = "main".to_string();
-        c
+        Container {
+            name: "main".to_string(),
+            ..Default::default()
+        }
     }
 
     /// A Job whose auto-generated selector + template labels are consistent,
