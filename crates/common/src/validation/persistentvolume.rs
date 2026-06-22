@@ -62,10 +62,13 @@ pub fn validate_persistent_volume_spec(spec: &PersistentVolumeSpec, fld_path: &P
 
     // capacity is required (upstream line ~2002). Then it must hold exactly the
     // `storage` resource and nothing else (upstream line ~2005-2007).
+    // Upstream uses two independent `if`s (not else-if): an empty capacity is
+    // both Required AND NotSupported (storage absent). Match that exactly.
     let capacity_path = fld_path.child("capacity");
     if spec.capacity.is_empty() {
         errs.push(Error::required(&capacity_path, ""));
-    } else if !spec.capacity.contains_key("storage") || spec.capacity.len() > 1 {
+    }
+    if !spec.capacity.contains_key("storage") || spec.capacity.len() > 1 {
         errs.push(Error::not_supported(
             &capacity_path,
             "<capacity>",
