@@ -497,8 +497,9 @@ mod tests {
 
         apply_container_defaults(&mut c);
 
-        let api_version = c.env.unwrap().remove(0).value_from.unwrap().field_ref.unwrap().api_version;
-        assert_eq!(api_version.as_deref(), Some("v1"));
+        let env_var = c.env.unwrap().remove(0);
+        let field_ref = env_var.value_from.unwrap().field_ref.unwrap();
+        assert_eq!(field_ref.api_version.as_deref(), Some("v1"));
     }
 
     #[test]
