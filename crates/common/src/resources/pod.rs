@@ -788,6 +788,10 @@ pub struct SeccompProfile {
     pub localhost_profile: Option<String>,
 }
 
+fn default_protocol() -> String {
+    "TCP".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerPort {
@@ -796,8 +800,8 @@ pub struct ContainerPort {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<String>, // TCP, UDP, SCTP
+    #[serde(default = "default_protocol")]
+    pub protocol: String, // TCP, UDP, SCTP
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_port: Option<u16>,
