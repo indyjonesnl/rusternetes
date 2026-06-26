@@ -157,11 +157,13 @@ mod port_tests {
     }
 
     // Upstream validateEndpointPort: protocol empty → Required (validation.go:8346).
+    // A *missing* protocol is defaulted to TCP by serde, so the empty case is
+    // exercised with an explicit "" (the String unset sentinel).
     #[test]
-    fn missing_protocol_is_required() {
+    fn empty_protocol_is_required() {
         let errs = validate_endpoints(&ep(serde_json::json!([{
             "addresses": [{"ip": "10.0.0.1"}],
-            "ports": [{"port": 80}]
+            "ports": [{"port": 80, "protocol": ""}]
         }])));
         assert!(
             has(&errs, "subsets[0].ports[0].protocol", ErrorType::Required),

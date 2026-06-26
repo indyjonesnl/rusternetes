@@ -3227,8 +3227,9 @@ mod tests {
 
     #[test]
     fn container_port_protocol_required_and_enum() {
-        // empty protocol -> Required
-        let missing = cports_errs(serde_json::json!([{"containerPort": 80}]));
+        // explicit empty protocol -> Required (a *missing* protocol is defaulted
+        // to TCP by serde before validation, so "" is the only Required case).
+        let missing = cports_errs(serde_json::json!([{"containerPort": 80, "protocol": ""}]));
         assert!(
             missing
                 .iter()

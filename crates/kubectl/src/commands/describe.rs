@@ -158,11 +158,7 @@ fn describe_pod(pod: &Pod) {
                         "    Ports:      {}",
                         ports
                             .iter()
-                            .map(|p| format!(
-                                "{}/{}",
-                                p.container_port,
-                                p.protocol.as_str()
-                            ))
+                            .map(|p| format!("{}/{}", p.container_port, p.protocol.as_str()))
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
