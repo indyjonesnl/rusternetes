@@ -83,12 +83,12 @@ fn validate_port(port: &EndpointPort, require_name: bool, fld_path: &Path) -> Er
     // protocol: required, then must be TCP/UDP/SCTP. Upstream
     // `validateEndpointPort` (validation.go:8346-8350) emits Required when
     // empty, NotSupported otherwise.
-    match port.protocol.as_deref() {
-        None | Some("") => {
+    match port.protocol.as_str() {
+        "" => {
             errs.push(Error::required(&fld_path.child("protocol"), ""));
         }
-        Some("TCP") | Some("UDP") | Some("SCTP") => {}
-        Some(other) => {
+        "TCP" | "UDP" | "SCTP" => {}
+        other => {
             errs.push(Error::not_supported(
                 &fld_path.child("protocol"),
                 other.to_string(),

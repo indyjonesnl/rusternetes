@@ -36,12 +36,12 @@ fn validate_port(port: &EndpointPort, fld_path: &Path) -> ErrorList {
     // protocol: required, then must be TCP/UDP/SCTP. Upstream
     // `validateEndpointSlicePorts` (discovery validation.go:193-197) emits
     // Required when protocol is nil, NotSupported otherwise.
-    match port.protocol.as_deref() {
-        None | Some("") => {
+    match port.protocol.as_str() {
+        "" => {
             errs.push(Error::required(&fld_path.child("protocol"), ""));
         }
-        Some("TCP") | Some("UDP") | Some("SCTP") => {}
-        Some(other) => {
+        "TCP" | "UDP" | "SCTP" => {}
+        other => {
             errs.push(Error::not_supported(
                 &fld_path.child("protocol"),
                 other.to_string(),

@@ -2101,7 +2101,7 @@ mod tests {
                 ports: Some(vec![ContainerPort {
                     container_port: 80,
                     name: Some("http".to_string()),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     host_port: None,
                     host_ip: None,
                 }]),
@@ -3052,14 +3052,14 @@ mod tests {
             ContainerPort {
                 container_port: 8080,
                 name: Some("http".to_string()),
-                protocol: None,
+                protocol: "TCP".to_string(),
                 host_port: None,
                 host_ip: None,
             },
             ContainerPort {
                 container_port: 8443,
                 name: Some("https".to_string()),
-                protocol: None,
+                protocol: "TCP".to_string(),
                 host_port: None,
                 host_ip: None,
             },

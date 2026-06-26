@@ -1110,7 +1110,7 @@ fn accumulate_unique_host_ports(
             }
             let tuple = format!(
                 "{}/{}/{}",
-                p.protocol.as_deref().unwrap_or(""),
+                p.protocol.as_str(),
                 p.host_ip.as_deref().unwrap_or(""),
                 host_port
             );
@@ -1462,11 +1462,11 @@ fn validate_container_ports(ports: &[ContainerPort], fld_path: &Path) -> ErrorLi
         }
 
         // protocol: Required when empty, else enum.
-        match p.protocol.as_deref() {
-            None | Some("") => {
+        match p.protocol.as_str() {
+            "" => {
                 errs.push(Error::required(&ppath.child("protocol"), ""));
             }
-            Some(proto) if !matches!(proto, "TCP" | "UDP" | "SCTP") => {
+            proto if !matches!(proto, "TCP" | "UDP" | "SCTP") => {
                 errs.push(Error::not_supported(
                     &ppath.child("protocol"),
                     proto.to_string(),
