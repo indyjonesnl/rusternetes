@@ -486,6 +486,55 @@ impl CriContainerRuntime {
                 container.name
             ),
         }
+        // Managed /etc/hosts (#1024): the CRI/containerd path otherwise gets
+        // containerd's default hosts file, which omits `spec.hostAliases`.
+        // Generate the kubelet-managed file and bind-mount it at /etc/hosts so
+        // hostAliases (and the pod's own FQDN entry) are present — matching
+        // upstream `makeMounts`. hostNetwork pods start from the node's
+        // /etc/hosts and then get the aliases appended.
+        let host_network = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.host_network)
+            .unwrap_or(false);
+        let hosts_content = if host_network {
+            let mut c = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+            for alias in pod
+                .spec
+                .iter()
+                .flat_map(|s| s.host_aliases.iter().flatten())
+            {
+                match alias.hostnames.as_deref() {
+                    Some(h) if !h.is_empty() => {
+                        c.push_str(&format!("{}\t{}\n", alias.ip, h.join("\t")));
+                    }
+                    _ => {}
+                }
+            }
+            Some(c)
+        } else {
+            let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref());
+            crate::kubelet::build_managed_hosts_content(pod, pod_ip, &self.cluster_domain)
+        };
+        if let Some(content) = hosts_content {
+            let hosts_path = format!("{}/etc-hosts", self.log_dir_for(pod));
+            if let Some(parent) = Path::new(&hosts_path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&hosts_path, content) {
+                Ok(()) => cfg.mounts.push(v1::Mount {
+                    container_path: "/etc/hosts".to_string(),
+                    host_path: hosts_path,
+                    readonly: false,
+                    ..Default::default()
+                }),
+                Err(e) => warn!(
+                    "container {}: managed /etc/hosts setup failed: {e}",
+                    container.name
+                ),
+            }
+        }
+
         let container_id = cri
             .create_container(sandbox_id, cfg, sandbox_cfg.clone())
             .await?;
