@@ -735,6 +735,17 @@ impl CriContainerRuntime {
         }
 
         for container in &spec.containers {
+            // Idempotent: start_pod is retried by the reconcile loop. Skip a
+            // container the runtime already has (any state) — re-creating it
+            // would race a duplicate CreateContainer for the same name and, for
+            // long-running multi-container pods, crash-loop on port collisions.
+            // Restarting an exited container is the reconcile loop's job.
+            if self
+                .container_exists(&pod.metadata.uid, &container.name)
+                .await
+            {
+                continue;
+            }
             self.create_and_start_container(
                 &mut cri,
                 pod,
@@ -1005,8 +1016,15 @@ impl CriContainerRuntime {
         };
         let mut cri = self.cri.clone();
         let containers = cri.list_containers(Some(filter)).await?;
+        // "Alive" = CREATED or RUNNING. Counting CREATED (not just RUNNING) is
+        // essential: during the create→running window a container is CREATED,
+        // and a concurrent reconcile that treated it as dead would start a
+        // duplicate (port collision → crash-loop). Only EXITED is restartable.
+        let created = v1::ContainerState::ContainerCreated as i32;
         let running = v1::ContainerState::ContainerRunning as i32;
-        Ok(containers.iter().any(|c| c.state == running))
+        Ok(containers
+            .iter()
+            .any(|c| c.state == running || c.state == created))
     }
 
     /// True if the pod's sandbox exists on this runtime (the `pause`-equivalent
