@@ -11,14 +11,46 @@ pub async fn execute_enhanced(
     selector: Option<&str>,
     all_namespaces: bool,
 ) -> Result<()> {
-    if let Some(sel) = selector {
-        println!("Selector: {}", sel);
-        println!("Note: Selector-based describe not yet implemented");
-        return Ok(());
-    }
-    if all_namespaces {
-        println!("All namespaces");
-        println!("Note: All-namespaces describe not yet implemented");
+    // -l <selector> and/or --all-namespaces: list the matching resources, then
+    // describe each (upstream `kubectl describe` lists via the label selector /
+    // across namespaces and describes every match).
+    if selector.is_some() || all_namespaces {
+        let mapper = crate::discovery::RestMapper::from_server(client).await?;
+        let mapping = mapper.resolve(resource_type).ok_or_else(|| {
+            anyhow::anyhow!("the server doesn't have a resource type \"{resource_type}\"")
+        })?;
+        let query = crate::ops::label_selector_query(selector);
+        let ns_opt = if all_namespaces {
+            None
+        } else {
+            Some(namespace)
+        };
+        let items = crate::ops::list_value(client, mapping, ns_opt, all_namespaces, &query).await?;
+        if items.is_empty() {
+            println!("No resources found");
+            return Ok(());
+        }
+        let mut first = true;
+        for item in &items {
+            let item_name = item
+                .pointer("/metadata/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if item_name.is_empty() {
+                continue;
+            }
+            // Namespaced items carry their own namespace (needed under
+            // --all-namespaces); cluster-scoped ones fall back to the request ns.
+            let item_ns = item
+                .pointer("/metadata/namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or(namespace);
+            if !first {
+                println!();
+            }
+            first = false;
+            execute(client, resource_type, item_name, Some(item_ns)).await?;
+        }
         return Ok(());
     }
     if let Some(n) = name {
