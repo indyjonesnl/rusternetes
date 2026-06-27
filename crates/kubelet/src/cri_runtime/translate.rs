@@ -1958,11 +1958,11 @@ mod tests {
         };
         // Both normalize to bytes, like memory (not raw passthrough).
         assert_eq!(
-            container_resource_value(&c, "limits.ephemeral-storage").as_deref(),
+            container_resource_value(&c, "limits.ephemeral-storage", None).as_deref(),
             Some("1073741824")
         );
         assert_eq!(
-            container_resource_value(&c, "limits.hugepages-2Mi").as_deref(),
+            container_resource_value(&c, "limits.hugepages-2Mi", None).as_deref(),
             Some("4194304")
         );
     }
