@@ -412,6 +412,42 @@ impl CriContainerRuntime {
         // than silently launching the container with the var missing.
         translate::validate_env_key_refs(pod, container, &config_maps, &secrets)
             .map_err(|msg| anyhow::anyhow!("env for container {}: {msg}", container.name))?;
+
+        // Downward-API `status.podIP`/`hostIP`(`s`) env is resolved at
+        // container-create time. Upstream resolves it from the pod status the
+        // kubelet already built off the sandbox; our sync loop only writes that
+        // status after containers start, so populate the IPs here (pod IP from
+        // the running sandbox, host IP = node InternalIP) on a local copy.
+        let mut eff_pod;
+        let pod = if pod
+            .status
+            .as_ref()
+            .map(|s| s.pod_ip.is_none() || s.host_ip.is_none())
+            .unwrap_or(true)
+        {
+            eff_pod = pod.clone();
+            let pod_ip = self.get_pod_ip(&pod.metadata.name).await.ok().flatten();
+            let st = eff_pod.status.get_or_insert_with(Default::default);
+            if st.pod_ip.is_none() {
+                if let Some(ip) = pod_ip {
+                    st.pod_i_ps = Some(vec![rusternetes_common::resources::pod::PodIP {
+                        ip: ip.clone(),
+                    }]);
+                    st.pod_ip = Some(ip);
+                }
+            }
+            if st.host_ip.is_none() {
+                let nip = node_internal_ip().to_string();
+                st.host_i_ps = Some(vec![rusternetes_common::resources::pod::HostIP {
+                    ip: nip.clone(),
+                }]);
+                st.host_ip = Some(nip);
+            }
+            &eff_pod
+        } else {
+            pod
+        };
+
         let mut cfg = translate::container_config(
             pod,
             container,
@@ -1581,6 +1617,28 @@ fn service_env_vars(host: &str, port: &str) -> Vec<(String, String)> {
         (format!("{pp}_PORT"), port.to_string()),
         (format!("{pp}_ADDR"), host.to_string()),
     ]
+}
+
+/// Memoized node InternalIP, used to fill `status.hostIP`(`s`) for downward-API
+/// env resolution at container-create time. Mirrors the kubelet's
+/// `detect_internal_ip` (resolve our own hostname to its non-loopback IPv4);
+/// stable for the process lifetime.
+fn node_internal_ip() -> &'static str {
+    static NODE_IP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NODE_IP.get_or_init(|| {
+        std::env::var("HOSTNAME")
+            .ok()
+            .and_then(|h| std::net::ToSocketAddrs::to_socket_addrs(&(h.as_str(), 0u16)).ok())
+            .and_then(|addrs| {
+                addrs
+                    .filter_map(|a| match a.ip() {
+                        std::net::IpAddr::V4(ip) if !ip.is_loopback() => Some(ip.to_string()),
+                        _ => None,
+                    })
+                    .next()
+            })
+            .unwrap_or_else(|| "127.0.0.1".to_string())
+    })
 }
 
 /// Format a CRI `VersionResponse` as the k8s `containerRuntimeVersion`

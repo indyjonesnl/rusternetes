@@ -1028,6 +1028,16 @@ impl Kubelet {
         "127.0.0.1".to_string()
     }
 
+    /// Cached node InternalIP used for pod `status.hostIP` / `status.hostIPs`.
+    /// Upstream sets these to the node's address (kubelet `generateAPIPodStatus`
+    /// → `hostIPs`), and conformance reads them via the downward API. Resolving
+    /// the IP shells out / does DNS, so memoize — it is stable for the kubelet's
+    /// lifetime.
+    fn node_internal_ip() -> &'static str {
+        static NODE_IP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        NODE_IP.get_or_init(Self::detect_internal_ip)
+    }
+
     async fn update_node_status(&self) -> Result<()> {
         debug!("Updating node status");
 
@@ -2973,7 +2983,7 @@ impl Kubelet {
                                 phase: Some(Phase::Running),
                                 message: Some("All containers started".to_string()),
                                 reason: None,
-                                host_ip: Some("127.0.0.1".to_string()),
+                                host_ip: Some(Self::node_internal_ip().to_string()),
                                 pod_ip,
                                 conditions: Some(conditions),
                                 container_statuses,
@@ -2983,7 +2993,7 @@ impl Kubelet {
                                 resource_claim_statuses: None,
                                 observed_generation: observed_gen,
                                 host_i_ps: Some(vec![rusternetes_common::resources::pod::HostIP {
-                                    ip: "127.0.0.1".to_string(),
+                                    ip: Self::node_internal_ip().to_string(),
                                 }]),
                                 pod_i_ps,
                                 nominated_node_name: None,
@@ -3175,7 +3185,7 @@ impl Kubelet {
                                     phase: Some(Phase::Pending),
                                     message: Some(err_msg),
                                     reason: Some(reason),
-                                    host_ip: Some("127.0.0.1".to_string()),
+                                    host_ip: Some(Self::node_internal_ip().to_string()),
                                     pod_ip: None,
                                     conditions: None,
                                     container_statuses,
@@ -3186,7 +3196,7 @@ impl Kubelet {
                                     observed_generation: observed_gen,
                                     host_i_ps: Some(vec![
                                         rusternetes_common::resources::pod::HostIP {
-                                            ip: "127.0.0.1".to_string(),
+                                            ip: Self::node_internal_ip().to_string(),
                                         },
                                     ]),
                                     pod_i_ps: None,
@@ -3333,7 +3343,7 @@ impl Kubelet {
                                     phase: Some(phase),
                                     message: Some(status_msg),
                                     reason: Some(reason),
-                                    host_ip: Some("127.0.0.1".to_string()),
+                                    host_ip: Some(Self::node_internal_ip().to_string()),
                                     pod_ip: None,
                                     conditions: Some(failed_conditions),
                                     container_statuses: app_container_statuses,
@@ -3344,7 +3354,7 @@ impl Kubelet {
                                     observed_generation: observed_gen,
                                     host_i_ps: Some(vec![
                                         rusternetes_common::resources::pod::HostIP {
-                                            ip: "127.0.0.1".to_string(),
+                                            ip: Self::node_internal_ip().to_string(),
                                         },
                                     ]),
                                     pod_i_ps: None,
@@ -3467,7 +3477,7 @@ impl Kubelet {
                         phase: Some(Phase::Running),
                         message: Some("All containers started".to_string()),
                         reason: None,
-                        host_ip: Some("127.0.0.1".to_string()),
+                        host_ip: Some(Self::node_internal_ip().to_string()),
                         pod_ip,
                         conditions: Some(conditions),
                         container_statuses,
@@ -3476,7 +3486,9 @@ impl Kubelet {
                         resize: None,
                         resource_claim_statuses: None,
                         observed_generation: observed_gen,
-                        host_i_ps: None,
+                        host_i_ps: Some(vec![rusternetes_common::resources::pod::HostIP {
+                            ip: Self::node_internal_ip().to_string(),
+                        }]),
                         pod_i_ps,
                         nominated_node_name: None,
                         qos_class: Some(qos),
@@ -4050,7 +4062,7 @@ impl Kubelet {
                                             phase: Some(Phase::Running),
                                             message: Some("Liveness probe failed".to_string()),
                                             reason: Some("Restarting".to_string()),
-                                            host_ip: Some("127.0.0.1".to_string()),
+                                            host_ip: Some(Self::node_internal_ip().to_string()),
                                             pod_ip: None,
                                             conditions: None,
                                             container_statuses: None,
@@ -4061,7 +4073,7 @@ impl Kubelet {
                                             observed_generation: new_pod.metadata.generation,
                                             host_i_ps: Some(vec![
                                                 rusternetes_common::resources::pod::HostIP {
-                                                    ip: "127.0.0.1".to_string(),
+                                                    ip: Self::node_internal_ip().to_string(),
                                                 },
                                             ]),
                                             pod_i_ps: None,
