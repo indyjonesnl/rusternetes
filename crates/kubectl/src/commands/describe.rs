@@ -848,19 +848,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_enhanced_with_selector_returns_ok() {
+    async fn test_execute_enhanced_with_selector_errors_without_server() {
         let client = make_test_client();
         let result =
             execute_enhanced(&client, "pod", None, "default", Some("app=nginx"), false).await;
-        // Selector-based describe just prints a message and returns Ok
-        assert!(result.is_ok());
+        // Selector-based describe now lists matching resources from the server
+        // (RestMapper discovery + list), so against an unreachable test client it
+        // fails gracefully instead of the old "not implemented" no-op. The
+        // success path is covered by the ops::label_selector_query unit tests and
+        // end-to-end against a live api-server.
+        assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn test_execute_enhanced_all_namespaces_returns_ok() {
+    async fn test_execute_enhanced_all_namespaces_errors_without_server() {
         let client = make_test_client();
         let result = execute_enhanced(&client, "pod", None, "default", None, true).await;
-        // All-namespaces describe just prints a message and returns Ok
-        assert!(result.is_ok());
+        // All-namespaces describe lists across namespaces from the server; with an
+        // unreachable test client it errors rather than no-op'ing.
+        assert!(result.is_err());
     }
 }
