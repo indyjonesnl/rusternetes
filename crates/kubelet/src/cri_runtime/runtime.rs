@@ -992,18 +992,27 @@ impl CriContainerRuntime {
 
     /// Whether any container named `container_name` is currently RUNNING. CRI
     /// container names are per-pod, so this matches across all pods by label.
-    pub async fn is_container_running(&self, container_name: &str) -> Result<bool> {
+    pub async fn is_container_running(&self, pod_uid: &str, container_name: &str) -> Result<bool> {
         let filter = v1::ContainerFilter {
-            label_selector: std::collections::HashMap::from([(
-                translate::labels::CONTAINER_NAME.to_string(),
-                container_name.to_string(),
-            )]),
+            label_selector: std::collections::HashMap::from([
+                (translate::labels::POD_UID.to_string(), pod_uid.to_string()),
+                (
+                    translate::labels::CONTAINER_NAME.to_string(),
+                    container_name.to_string(),
+                ),
+            ]),
             ..Default::default()
         };
         let mut cri = self.cri.clone();
         let containers = cri.list_containers(Some(filter)).await?;
         let running = v1::ContainerState::ContainerRunning as i32;
         Ok(containers.iter().any(|c| c.state == running))
+    }
+
+    /// True if the pod's sandbox exists on this runtime (the `pause`-equivalent
+    /// PodSandbox has been created), regardless of container state.
+    pub async fn has_sandbox(&self, pod_name: &str) -> bool {
+        self.sandbox_id_for(pod_name).await.ok().flatten().is_some()
     }
 
     /// Execute a single probe attempt against a container, returning whether it
@@ -1467,16 +1476,29 @@ impl CriContainerRuntime {
 
     /// Exit code of the (most recent) container named `container_name`, or 0 if
     /// no such container is known to the runtime.
-    pub async fn get_container_exit_code(&self, container_name: &str) -> Result<i64> {
+    pub async fn get_container_exit_code(
+        &self,
+        pod_uid: &str,
+        container_name: &str,
+    ) -> Result<i64> {
         let filter = v1::ContainerFilter {
-            label_selector: std::collections::HashMap::from([(
-                translate::labels::CONTAINER_NAME.to_string(),
-                container_name.to_string(),
-            )]),
+            label_selector: std::collections::HashMap::from([
+                (translate::labels::POD_UID.to_string(), pod_uid.to_string()),
+                (
+                    translate::labels::CONTAINER_NAME.to_string(),
+                    container_name.to_string(),
+                ),
+            ]),
             ..Default::default()
         };
         let mut cri = self.cri.clone();
-        let Some(container) = cri.list_containers(Some(filter)).await?.into_iter().next() else {
+        // Pick the latest attempt so the exit code reflects the most recent run.
+        let Some(container) = cri
+            .list_containers(Some(filter))
+            .await?
+            .into_iter()
+            .max_by_key(|c| c.metadata.as_ref().map(|m| m.attempt).unwrap_or(0))
+        else {
             return Ok(0);
         };
         let status = cri.container_status(&container.id, false).await?;
@@ -1485,12 +1507,19 @@ impl CriContainerRuntime {
 
     /// Remove every exited container named `container_name` so a restart can
     /// recreate it. Running containers are left alone.
-    pub async fn remove_terminated_container(&self, container_name: &str) -> Result<()> {
+    pub async fn remove_terminated_container(
+        &self,
+        pod_uid: &str,
+        container_name: &str,
+    ) -> Result<()> {
         let filter = v1::ContainerFilter {
-            label_selector: std::collections::HashMap::from([(
-                translate::labels::CONTAINER_NAME.to_string(),
-                container_name.to_string(),
-            )]),
+            label_selector: std::collections::HashMap::from([
+                (translate::labels::POD_UID.to_string(), pod_uid.to_string()),
+                (
+                    translate::labels::CONTAINER_NAME.to_string(),
+                    container_name.to_string(),
+                ),
+            ]),
             ..Default::default()
         };
         let mut cri = self.cri.clone();

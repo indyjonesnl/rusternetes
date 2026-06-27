@@ -463,7 +463,7 @@ fn env_vars(
                 if let Some(fr) = src.field_ref.as_ref() {
                     pod_field_value(pod, &fr.field_path)
                 } else if let Some(rfr) = src.resource_field_ref.as_ref() {
-                    container_resource_value(container, &rfr.resource)
+                    container_resource_value(container, &rfr.resource, rfr.divisor.as_deref())
                 } else if let Some(cmr) = src.config_map_key_ref.as_ref() {
                     config_maps
                         .get(&cmr.name)
@@ -568,7 +568,11 @@ fn phase_str(phase: &rusternetes_common::types::Phase) -> String {
 
 /// Resolve a `resourceFieldRef` (`limits.cpu` / `requests.memory`, etc.) to its
 /// numeric value as a decimal string. `None` if the resource is not set.
-fn container_resource_value(container: &Container, resource: &str) -> Option<String> {
+fn container_resource_value(
+    container: &Container,
+    resource: &str,
+    divisor: Option<&str>,
+) -> Option<String> {
     let req = container.resources.as_ref()?;
     let (kind, name) = resource.split_once('.')?;
     let map = match kind {
@@ -577,12 +581,29 @@ fn container_resource_value(container: &Container, resource: &str) -> Option<Str
         _ => None,
     }?;
     let raw = map.get(name)?;
+    // `divisor` defaults to "1" (cores for cpu, bytes for memory) — matches
+    // upstream `resourcehelper.ExtractContainerResourceValue`. cpu rounds UP
+    // (ceil of milli/divisor-milli); byte quantities truncate (floor).
+    let div = divisor.unwrap_or("1");
     match name {
-        "cpu" => parse_cpu_millicores(raw).map(|m| m.to_string()),
+        "cpu" => {
+            let milli = parse_cpu_millicores(raw)?;
+            let div_milli = parse_cpu_millicores(div).filter(|d| *d > 0)?;
+            // Ceil division (toolchain predates stable `div_ceil`).
+            Some(((milli + div_milli - 1) / div_milli).to_string())
+        }
         // memory, ephemeral-storage and hugepages-<size> are all byte quantities
-        // upstream normalizes to an integer byte count (resource/helpers.go).
-        "memory" | "ephemeral-storage" => parse_memory_bytes(raw).map(|b| b.to_string()),
-        n if n.starts_with("hugepages-") => parse_memory_bytes(raw).map(|b| b.to_string()),
+        // upstream normalizes to an integer count of `divisor` bytes (floor).
+        "memory" | "ephemeral-storage" => {
+            let bytes = parse_memory_bytes(raw)?;
+            let div_bytes = parse_memory_bytes(div).filter(|d| *d > 0)?;
+            Some((bytes / div_bytes).to_string())
+        }
+        n if n.starts_with("hugepages-") => {
+            let bytes = parse_memory_bytes(raw)?;
+            let div_bytes = parse_memory_bytes(div).filter(|d| *d > 0)?;
+            Some((bytes / div_bytes).to_string())
+        }
         _ => Some(raw.clone()),
     }
 }
