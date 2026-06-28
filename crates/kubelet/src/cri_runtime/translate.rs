@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use rusternetes_common::resources::pod::{Container, Pod};
-use rusternetes_common::resources::{ConfigMap, Secret};
+use rusternetes_common::resources::{ConfigMap, Secret, Service};
 use rusternetes_cri::v1;
 
 /// Well-known CRI metadata label keys the runtime indexes sandboxes/containers
@@ -1085,6 +1085,54 @@ pub fn container_config(
     }
 }
 
+/// Build the Docker-link-style service env a container sees, per upstream
+/// kubelet `getServiceEnvVarMap` + `makeLinkVariables`. Each service with a
+/// usable ClusterIP contributes vars keyed by the uppercased ('-'→'_') service
+/// name: `{N}_SERVICE_HOST`, `{N}_SERVICE_PORT`, optional named
+/// `{N}_SERVICE_PORT_{PORTNAME}`, and for each declared port the docker-link
+/// quartet `{N}_PORT_{port}_{PROTO}[ |_PROTO|_PORT|_ADDR]` plus a single
+/// `{N}_PORT` from the first port. Headless ("None") and IP-less services are
+/// skipped. Services are processed in name order for deterministic output.
+pub(crate) fn service_link_env_vars(services: &[Service]) -> Vec<(String, String)> {
+    let mut sorted: Vec<&Service> = services.iter().collect();
+    sorted.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+    let mut out: Vec<(String, String)> = Vec::new();
+    for svc in sorted {
+        let Some(ip) = svc.spec.cluster_ip.as_deref() else {
+            continue;
+        };
+        if ip.is_empty() || ip == "None" {
+            continue;
+        }
+        let Some(first) = svc.spec.ports.first() else {
+            continue;
+        };
+        let n = svc.metadata.name.to_uppercase().replace('-', "_");
+        out.push((format!("{n}_SERVICE_HOST"), ip.to_string()));
+        out.push((format!("{n}_SERVICE_PORT"), first.port.to_string()));
+        for p in &svc.spec.ports {
+            if let Some(name) = p.name.as_deref().filter(|s| !s.is_empty()) {
+                let pn = name.to_uppercase().replace('-', "_");
+                out.push((format!("{n}_SERVICE_PORT_{pn}"), p.port.to_string()));
+            }
+        }
+        let proto0 = first.protocol.to_lowercase();
+        out.push((
+            format!("{n}_PORT"),
+            format!("{proto0}://{ip}:{}", first.port),
+        ));
+        for p in &svc.spec.ports {
+            let proto = p.protocol.to_lowercase();
+            let prefix = format!("{n}_PORT_{}_{}", p.port, p.protocol.to_uppercase());
+            out.push((prefix.clone(), format!("{proto}://{ip}:{}", p.port)));
+            out.push((format!("{prefix}_PROTO"), proto.clone()));
+            out.push((format!("{prefix}_PORT"), p.port.to_string()));
+            out.push((format!("{prefix}_ADDR"), ip.to_string()));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,6 +1143,59 @@ mod tests {
         pod.metadata.uid = "uid-123".to_string();
         pod.metadata.namespace = Some("prod".to_string());
         pod
+    }
+
+    fn svc(name: &str, cluster_ip: Option<&str>, port: u16, proto: &str) -> Service {
+        use rusternetes_common::resources::service::{ServicePort, ServiceSpec};
+        let mut s = Service {
+            type_meta: Default::default(),
+            metadata: Default::default(),
+            spec: ServiceSpec {
+                ports: vec![ServicePort {
+                    name: None,
+                    port,
+                    target_port: None,
+                    protocol: proto.to_string(),
+                    node_port: None,
+                    app_protocol: None,
+                }],
+                cluster_ip: cluster_ip.map(|s| s.to_string()),
+                ..Default::default()
+            },
+            status: None,
+        };
+        s.metadata.name = name.to_string();
+        s
+    }
+
+    #[test]
+    fn service_links_emit_docker_link_vars_and_skip_headless() {
+        // Upstream getServiceEnvVarMap/makeLinkVariables: each service with a
+        // real ClusterIP yields the docker-link env quartet, keyed by the
+        // uppercased, '-'→'_' service name. Headless ("None") and IP-less
+        // services contribute nothing.
+        let services = vec![
+            svc("redis-master", Some("10.0.0.11"), 6379, "TCP"),
+            svc("headless", Some("None"), 80, "TCP"),
+            svc("pending", None, 80, "TCP"),
+        ];
+        let env = service_link_env_vars(&services);
+        let get = |k: &str| env.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("REDIS_MASTER_SERVICE_HOST"), Some("10.0.0.11"));
+        assert_eq!(get("REDIS_MASTER_SERVICE_PORT"), Some("6379"));
+        assert_eq!(get("REDIS_MASTER_PORT"), Some("tcp://10.0.0.11:6379"));
+        assert_eq!(
+            get("REDIS_MASTER_PORT_6379_TCP"),
+            Some("tcp://10.0.0.11:6379")
+        );
+        assert_eq!(get("REDIS_MASTER_PORT_6379_TCP_ADDR"), Some("10.0.0.11"));
+        assert_eq!(get("REDIS_MASTER_PORT_6379_TCP_PROTO"), Some("tcp"));
+        assert_eq!(get("REDIS_MASTER_PORT_6379_TCP_PORT"), Some("6379"));
+        assert!(
+            env.iter()
+                .all(|(k, _)| !k.starts_with("HEADLESS_") && !k.starts_with("PENDING_")),
+            "headless / IP-less services must contribute no env"
+        );
     }
 
     #[test]
