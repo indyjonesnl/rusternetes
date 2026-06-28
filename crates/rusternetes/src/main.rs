@@ -331,12 +331,29 @@ async fn async_main() -> Result<()> {
             }
         });
     // CA cert PEM for the namespace controller's kube-root-ca.crt publisher.
-    // Read from the configured CA file (falling back to the serving cert).
-    let cm_ca_pem = args
-        .client_ca_file
-        .as_ref()
-        .or(args.tls_cert_file.as_ref())
-        .and_then(|p| std::fs::read_to_string(p).ok());
+    // Prefer an explicit client_ca_file, then ca.crt next to tls_cert_file
+    // (matches resolve_ca_cert_pem() logic), then the serving cert itself.
+    // Using the leaf serving cert as the CA makes in-cluster clients reject
+    // the api-server when the cert is CA:FALSE — flannel-rs v0.1.2 symptom.
+    let cm_ca_pem = if let Some(ref p) = args.client_ca_file {
+        std::fs::read_to_string(p).ok()
+    } else if let Some(ref cert) = args.tls_cert_file {
+        // Look for ca.crt next to the serving cert (e.g. /boot/pki/ca.crt).
+        let ca_sibling = std::path::Path::new(cert)
+            .parent()
+            .map(|d| d.join("ca.crt"));
+        let from_sibling = ca_sibling
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .filter(|pem| pem.contains("BEGIN CERTIFICATE"));
+        if from_sibling.is_some() {
+            from_sibling
+        } else {
+            std::fs::read_to_string(cert).ok()
+        }
+    } else {
+        None
+    };
     let cm_config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
         metrics_config,
