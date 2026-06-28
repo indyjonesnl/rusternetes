@@ -142,6 +142,10 @@ pub struct CriContainerRuntime {
     /// `cluster_dns` => pods inherit the node's resolv.conf.
     cluster_dns: Vec<String>,
     cluster_domain: String,
+    /// Node allocatable (`cpu`/`memory`/`ephemeral-storage`/`hugepages-*`),
+    /// used to default unset resourceFieldRef LIMITS into downward-API env
+    /// (upstream `MergeContainerResourceLimits`). Empty leaves such vars unset.
+    node_allocatable: std::collections::HashMap<String, String>,
 }
 
 impl CriContainerRuntime {
@@ -164,6 +168,7 @@ impl CriContainerRuntime {
             service_port: "443".to_string(),
             cluster_dns: Vec::new(),
             cluster_domain: "cluster.local".to_string(),
+            node_allocatable: std::collections::HashMap::new(),
         })
     }
 
@@ -184,6 +189,17 @@ impl CriContainerRuntime {
     pub fn with_service_host(mut self, host: impl Into<String>, port: impl Into<String>) -> Self {
         self.service_host = host.into();
         self.service_port = port.into();
+        self
+    }
+
+    /// Set the node allocatable used to default unset resourceFieldRef LIMITS
+    /// into downward-API env (e.g. `limits.cpu` → node allocatable cpu).
+    #[must_use]
+    pub fn with_node_allocatable(
+        mut self,
+        allocatable: std::collections::HashMap<String, String>,
+    ) -> Self {
+        self.node_allocatable = allocatable;
         self
     }
 
@@ -448,13 +464,19 @@ impl CriContainerRuntime {
             pod
         };
 
-        let mut cfg = translate::container_config(
+        let node_allocatable = if self.node_allocatable.is_empty() {
+            None
+        } else {
+            Some(&self.node_allocatable)
+        };
+        let mut cfg = translate::container_config_with_allocatable(
             pod,
             container,
             &container.image,
             host_paths,
             &config_maps,
             &secrets,
+            node_allocatable,
         );
         self.inject_service_env(&mut cfg);
         self.inject_service_links(pod, &mut cfg).await;

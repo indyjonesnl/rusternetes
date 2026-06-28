@@ -416,6 +416,7 @@ fn env_vars(
     container: &Container,
     config_maps: &HashMap<String, ConfigMap>,
     secrets: &HashMap<String, Secret>,
+    node_allocatable: Option<&HashMap<String, String>>,
 ) -> Vec<v1::KeyValue> {
     let mut out: Vec<v1::KeyValue> = Vec::new();
     // Mirror of `out` for `$(VAR)` lookups: upstream expands each literal env
@@ -463,7 +464,12 @@ fn env_vars(
                 if let Some(fr) = src.field_ref.as_ref() {
                     pod_field_value(pod, &fr.field_path)
                 } else if let Some(rfr) = src.resource_field_ref.as_ref() {
-                    container_resource_value(container, &rfr.resource, rfr.divisor.as_deref())
+                    container_resource_value(
+                        container,
+                        &rfr.resource,
+                        rfr.divisor.as_deref(),
+                        node_allocatable,
+                    )
                 } else if let Some(cmr) = src.config_map_key_ref.as_ref() {
                     config_maps
                         .get(&cmr.name)
@@ -572,15 +578,39 @@ fn container_resource_value(
     container: &Container,
     resource: &str,
     divisor: Option<&str>,
+    node_allocatable: Option<&HashMap<String, String>>,
 ) -> Option<String> {
-    let req = container.resources.as_ref()?;
     let (kind, name) = resource.split_once('.')?;
-    let map = match kind {
-        "limits" => req.limits.as_ref(),
-        "requests" => req.requests.as_ref(),
+    let req = container.resources.as_ref();
+    let explicit = |which: &str| -> Option<String> {
+        match which {
+            "limits" => req.and_then(|r| r.limits.as_ref()),
+            "requests" => req.and_then(|r| r.requests.as_ref()),
+            _ => None,
+        }
+        .and_then(|m| m.get(name).cloned())
+    };
+    // Upstream MergeContainerResourceLimits: an unset cpu/memory/
+    // ephemeral-storage/hugepages LIMIT defaults to the node's allocatable;
+    // an unset REQUEST defaults to the (possibly defaulted) limit. Other
+    // resources have no default — the var is omitted when absent.
+    let defaultable =
+        matches!(name, "cpu" | "memory" | "ephemeral-storage") || name.starts_with("hugepages-");
+    let from_allocatable = || -> Option<String> {
+        if defaultable {
+            node_allocatable.and_then(|a| a.get(name).cloned())
+        } else {
+            None
+        }
+    };
+    let raw = match kind {
+        "limits" => explicit("limits").or_else(from_allocatable),
+        "requests" => explicit("requests")
+            .or_else(|| explicit("limits"))
+            .or_else(from_allocatable),
         _ => None,
     }?;
-    let raw = map.get(name)?;
+    let raw = &raw;
     // `divisor` defaults to "1" (cores for cpu, bytes for memory) — matches
     // upstream `resourcehelper.ExtractContainerResourceValue`. cpu rounds UP
     // (ceil of milli/divisor-milli); byte quantities truncate (floor).
@@ -1040,6 +1070,31 @@ pub fn container_config(
     config_maps: &HashMap<String, ConfigMap>,
     secrets: &HashMap<String, Secret>,
 ) -> v1::ContainerConfig {
+    container_config_with_allocatable(
+        pod,
+        container,
+        image_ref,
+        host_paths,
+        config_maps,
+        secrets,
+        None,
+    )
+}
+
+/// As [`container_config`], but `node_allocatable` lets unset cpu/memory/
+/// ephemeral-storage resourceFieldRef LIMITS default to the node's allocatable
+/// (upstream `MergeContainerResourceLimits`). The kubelet passes its node
+/// allocatable here; the no-allocatable wrapper above keeps `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn container_config_with_allocatable(
+    pod: &Pod,
+    container: &Container,
+    image_ref: &str,
+    host_paths: &HashMap<String, String>,
+    config_maps: &HashMap<String, ConfigMap>,
+    secrets: &HashMap<String, Secret>,
+    node_allocatable: Option<&HashMap<String, String>>,
+) -> v1::ContainerConfig {
     let mut labels = pod_labels(pod);
     labels.insert(labels::CONTAINER_NAME.to_string(), container.name.clone());
 
@@ -1056,7 +1111,7 @@ pub fn container_config(
         }
     };
 
-    let envs = env_vars(pod, container, config_maps, secrets);
+    let envs = env_vars(pod, container, config_maps, secrets, node_allocatable);
     // command/args expand `$(VAR)` against the full container env (upstream
     // `expandContainerCommandAndArgs`).
     let env_map: HashMap<String, String> = envs
@@ -2059,13 +2114,46 @@ mod tests {
         };
         // Both normalize to bytes, like memory (not raw passthrough).
         assert_eq!(
-            container_resource_value(&c, "limits.ephemeral-storage", None).as_deref(),
+            container_resource_value(&c, "limits.ephemeral-storage", None, None).as_deref(),
             Some("1073741824")
         );
         assert_eq!(
-            container_resource_value(&c, "limits.hugepages-2Mi", None).as_deref(),
+            container_resource_value(&c, "limits.hugepages-2Mi", None, None).as_deref(),
             Some("4194304")
         );
+    }
+
+    #[test]
+    fn resource_field_ref_defaults_unset_limits_to_node_allocatable() {
+        use rusternetes_common::types::ResourceRequirements;
+        // upstream MergeContainerResourceLimits: an unset cpu/memory LIMIT
+        // defaults to the node's allocatable for resourceFieldRef extraction
+        // (the "default limits.cpu/memory from node allocatable" NodeConformance
+        // spec). cpu rounds up to whole cores; memory is bytes.
+        let c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            resources: Some(ResourceRequirements {
+                limits: None,
+                requests: None,
+                claims: None,
+            }),
+            ..Default::default()
+        };
+        let alloc = HashMap::from([
+            ("cpu".to_string(), "4".to_string()),
+            ("memory".to_string(), "8Gi".to_string()),
+        ]);
+        assert_eq!(
+            container_resource_value(&c, "limits.cpu", None, Some(&alloc)).as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            container_resource_value(&c, "limits.memory", None, Some(&alloc)).as_deref(),
+            Some("8589934592")
+        );
+        // No node allocatable available → var omitted, as before.
+        assert_eq!(container_resource_value(&c, "limits.cpu", None, None), None);
     }
 
     #[test]
