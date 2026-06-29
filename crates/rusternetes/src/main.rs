@@ -260,7 +260,7 @@ async fn async_main() -> Result<()> {
 
     // --- API Server ---
     let api_storage = storage.clone();
-    let api_config = rusternetes_api_server::ApiServerConfig {
+    let mut api_config = rusternetes_api_server::ApiServerConfig {
         bind_address: args.bind_address.clone(),
         tls: args.tls,
         tls_cert_file: args.tls_cert_file.clone(),
@@ -272,6 +272,11 @@ async fn async_main() -> Result<()> {
         client_ca_file: args.client_ca_file.clone(),
         ..Default::default()
     };
+    let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;
+    let cm_ca_pem = prepared_tls
+        .as_ref()
+        .and_then(|prepared| prepared.ca_cert_pem().map(str::to_string));
+    api_config.prepared_tls = prepared_tls;
     let api_handle = tokio::spawn(async move {
         if let Err(e) = rusternetes_api_server::run(api_storage, api_config).await {
             error!("API server error: {}", e);
@@ -330,30 +335,6 @@ async fn async_main() -> Result<()> {
                 insecure_skip_tls_verify: true,
             }
         });
-    // CA cert PEM for the namespace controller's kube-root-ca.crt publisher.
-    // Prefer an explicit client_ca_file, then ca.crt next to tls_cert_file
-    // (matches resolve_ca_cert_pem() logic), then the serving cert itself.
-    // Using the leaf serving cert as the CA makes in-cluster clients reject
-    // the api-server when the cert is CA:FALSE — flannel-rs v0.1.2 symptom.
-    let cm_ca_pem = if let Some(ref p) = args.client_ca_file {
-        std::fs::read_to_string(p).ok()
-    } else if let Some(ref cert) = args.tls_cert_file {
-        // Look for ca.crt next to the serving cert (e.g. /boot/pki/ca.crt).
-        let ca_sibling = std::path::Path::new(cert)
-            .parent()
-            .map(|d| d.join("ca.crt"));
-        let from_sibling = ca_sibling
-            .as_deref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .filter(|pem| pem.contains("BEGIN CERTIFICATE"));
-        if from_sibling.is_some() {
-            from_sibling
-        } else {
-            std::fs::read_to_string(cert).ok()
-        }
-    } else {
-        None
-    };
     let cm_config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
         metrics_config,
