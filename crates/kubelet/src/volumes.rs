@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use rusternetes_common::resources::{
     ConfigMap, PersistentVolume, PersistentVolumeClaim, Pod, Secret,
 };
-use rusternetes_storage::{build_key, Storage};
+use rusternetes_storage::{Storage, build_key};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -20,8 +20,8 @@ use tracing::{info, warn};
 // shared with non-volume code paths there). Imported so the moved bodies keep
 // calling them by their bare names, verbatim.
 use crate::runtime::{
-    check_host_path_type, mount_tmpfs_for_emptydir, parse_cpu_quantity, parse_memory_quantity,
-    parse_quantity_bytes, pod_dir_key, setup_emptydir_dir, HostPathCheck,
+    HostPathCheck, check_host_path_type, mount_tmpfs_for_emptydir, parse_cpu_quantity,
+    parse_memory_quantity, parse_quantity_bytes, pod_dir_key, setup_emptydir_dir,
 };
 
 /// Provisions and maintains pod volumes on the host filesystem, independent of
@@ -1008,9 +1008,15 @@ impl VolumeManager {
                     if let Ok(ca_content) = std::fs::read(&ca_cert_source) {
                         std::fs::write(&ca_path, ca_content)
                             .context("Failed to write CA certificate")?;
-                        info!("Injected CA certificate into service account secret volume at {} (from {})", ca_path, ca_cert_source);
+                        info!(
+                            "Injected CA certificate into service account secret volume at {} (from {})",
+                            ca_path, ca_cert_source
+                        );
                     } else {
-                        warn!("CA certificate not found at {}, pods may not be able to verify API server", ca_cert_source);
+                        warn!(
+                            "CA certificate not found at {}, pods may not be able to verify API server",
+                            ca_cert_source
+                        );
                     }
                 }
             }
@@ -1353,7 +1359,10 @@ impl VolumeManager {
                                         // Optional configmap not found, skip
                                     }
                                     Err(e) => {
-                                        warn!("Failed to get ConfigMap {} for projected volume: {}. Skipping.", cm_name, e);
+                                        warn!(
+                                            "Failed to get ConfigMap {} for projected volume: {}. Skipping.",
+                                            cm_name, e
+                                        );
                                     }
                                 }
                             }
@@ -1418,7 +1427,10 @@ impl VolumeManager {
                                         // Optional secret not found, skip
                                     }
                                     Err(e) => {
-                                        warn!("Failed to get Secret {} for projected volume: {}. Skipping.", secret_name, e);
+                                        warn!(
+                                            "Failed to get Secret {} for projected volume: {}. Skipping.",
+                                            secret_name, e
+                                        );
                                     }
                                 }
                             }
@@ -1895,7 +1907,7 @@ impl VolumeManager {
                 return Err(anyhow::anyhow!(
                     "Unsupported resource field: {}",
                     resource_ref.resource
-                ))
+                ));
             }
         };
 
@@ -1941,7 +1953,7 @@ impl VolumeManager {
 #[cfg(all(test, unix))]
 mod projected_mode_tests {
     use super::*;
-    use rusternetes_storage::{build_key, Storage, StorageBackend};
+    use rusternetes_storage::{Storage, StorageBackend, build_key};
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;

@@ -388,11 +388,7 @@ pub fn compute_group_add(pod: &Pod) -> Option<Vec<String>> {
             }
         }
     }
-    if gids.is_empty() {
-        None
-    } else {
-        Some(gids)
-    }
+    if gids.is_empty() { None } else { Some(gids) }
 }
 
 /// Runtime observation of a single init container, derived from the

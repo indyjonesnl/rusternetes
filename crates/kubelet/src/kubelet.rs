@@ -1,5 +1,5 @@
 use crate::cri_runtime::CriContainerRuntime;
-use crate::eviction::{get_node_stats, get_pod_stats, EvictionManager, EvictionSignal};
+use crate::eviction::{EvictionManager, EvictionSignal, get_node_stats, get_pod_stats};
 use crate::lifecycle::{phase_is_terminal, should_skip_phase_write};
 use anyhow::Result;
 use rusternetes_common::{
@@ -9,13 +9,13 @@ use rusternetes_common::{
     },
     types::Phase,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage, StorageBackend, WatchEvent};
+use rusternetes_storage::{Storage, StorageBackend, WatchEvent, build_key, build_prefix};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -2089,7 +2089,7 @@ impl Kubelet {
                                 // before retrying.  Use a backoffError-like mechanism: if
                                 // the error carries a BackoffHint, honour it.
                                 let backoff_dur = backoff_from_error(&e);
-                                let backoff_secs = backoff_dur.as_secs() as u64;
+                                let backoff_secs = backoff_dur.as_secs();
                                 backoff_until = Some(
                                     tokio::time::Instant::now()
                                         + Duration::from_secs(backoff_secs.max(10)),
@@ -2102,9 +2102,8 @@ impl Kubelet {
                             Err(_) => {
                                 warn!("Pod worker {}: sync timed out", name);
                                 // Timeout behaves like an error — backoff too
-                                backoff_until = Some(
-                                    tokio::time::Instant::now() + Duration::from_secs(10),
-                                );
+                                backoff_until =
+                                    Some(tokio::time::Instant::now() + Duration::from_secs(10));
                             }
                         }
                     }
@@ -2712,7 +2711,11 @@ impl Kubelet {
                                                 if conflict {
                                                     info!(
                                                         "Pod {}/{} rejected: hostPort {}/{} conflicts with pod {}",
-                                                        namespace, pod_name, port, proto, existing.metadata.name
+                                                        namespace,
+                                                        pod_name,
+                                                        port,
+                                                        proto,
+                                                        existing.metadata.name
                                                     );
                                                     let key = build_key(
                                                         "pods",
@@ -2759,10 +2762,7 @@ impl Kubelet {
         {
             let key = build_key("pods", Some(namespace), pod_name);
             if let Ok(fresh) = self.storage.get::<Pod>(&key).await {
-                let fresh_phase = fresh
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.phase.as_ref());
+                let fresh_phase = fresh.status.as_ref().and_then(|s| s.phase.as_ref());
                 if phase_is_terminal(fresh_phase) && !phase_is_terminal(Some(current_phase)) {
                     warn!(
                         "Pod {}/{} became terminal while syncing (was {:?}, storage now {:?}) — \
@@ -2815,7 +2815,10 @@ impl Kubelet {
 
                         if all_done {
                             // All init containers done — start_pod will skip init and start app containers
-                            info!("All init containers completed for pod {}/{}, starting app containers", namespace, pod_name);
+                            info!(
+                                "All init containers completed for pod {}/{}, starting app containers",
+                                namespace, pod_name
+                            );
                         } else if let Some(idx) = next_idx {
                             let init_containers =
                                 pod.spec.as_ref().unwrap().init_containers.as_ref().unwrap();
@@ -3023,7 +3026,10 @@ impl Kubelet {
                     self.update_pod_status(pod, Phase::Pending, Some(reason), None)
                         .await?;
                 } else {
-                    debug!("Pod {}/{} already has CreateContainer(Config)Error, retrying without status reset", namespace, pod_name);
+                    debug!(
+                        "Pod {}/{} already has CreateContainer(Config)Error, retrying without status reset",
+                        namespace, pod_name
+                    );
                 }
 
                 // Start the pod with timeout
@@ -3195,7 +3201,10 @@ impl Kubelet {
                                         if let Err(e2) =
                                             self.storage.update_status(&key, &retry_pod).await
                                         {
-                                            warn!("Failed to update pod {}/{} status to Running after retry: {}", namespace, pod_name, e2);
+                                            warn!(
+                                                "Failed to update pod {}/{} status to Running after retry: {}",
+                                                namespace, pod_name, e2
+                                            );
                                         }
                                     }
                                 } else {
@@ -3353,9 +3362,9 @@ impl Kubelet {
 
                                 if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                                     warn!(
-                                    "Failed to update pod {}/{} status to container error: {}, retrying",
-                                    namespace, pod_name, e
-                                );
+                                        "Failed to update pod {}/{} status to container error: {}, retrying",
+                                        namespace, pod_name, e
+                                    );
                                     // CAS retry — re-read and apply status
                                     if let Ok(mut retry_pod) = self.storage.get::<Pod>(&key).await {
                                         retry_pod.status = new_pod.status.clone();
@@ -3785,7 +3794,7 @@ impl Kubelet {
                         if let Ok(mut rpod) = self.storage.get::<Pod>(&rkey).await {
                             if let Some(ref mut status) = rpod.status {
                                 status.resize = Some(String::new()); // Empty = resize complete
-                                                                     // Update allocatedResources in container statuses
+                                // Update allocatedResources in container statuses
                                 if let Some(ref spec) = rpod.spec.clone() {
                                     if let Some(ref mut cs_list) = status.container_statuses {
                                         for cs in cs_list.iter_mut() {
@@ -4248,7 +4257,10 @@ impl Kubelet {
                                 }
                             }
                             "Never" => {
-                                warn!("Liveness probe failed but restart policy is Never for pod {}/{}", namespace, pod_name);
+                                warn!(
+                                    "Liveness probe failed but restart policy is Never for pod {}/{}",
+                                    namespace, pod_name
+                                );
                                 self.update_pod_status(
                                     pod,
                                     Phase::Failed,
@@ -5622,7 +5634,7 @@ pub fn build_managed_hosts_content(
 
 #[cfg(test)]
 mod taint_eviction_tests {
-    use super::{noexecute_eviction_due, Taint, Toleration};
+    use super::{Taint, Toleration, noexecute_eviction_due};
 
     fn no_execute_taint(time_added_secs_ago: Option<i64>) -> Taint {
         Taint {
@@ -5847,8 +5859,8 @@ mod tests {
     #[test]
     fn terminal_finalize_backoff_grows_then_caps() {
         use super::{
-            terminal_finalize_backoff, TERMINAL_FINALIZE_BACKOFF_INITIAL,
-            TERMINAL_FINALIZE_BACKOFF_MAX,
+            TERMINAL_FINALIZE_BACKOFF_INITIAL, TERMINAL_FINALIZE_BACKOFF_MAX,
+            terminal_finalize_backoff,
         };
         // First failure → initial; each subsequent doubles.
         assert_eq!(
