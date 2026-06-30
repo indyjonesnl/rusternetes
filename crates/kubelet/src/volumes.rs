@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use rusternetes_common::resources::{
     ConfigMap, PersistentVolume, PersistentVolumeClaim, Pod, Secret,
 };
-use rusternetes_storage::{Storage, build_key};
+use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -20,8 +20,8 @@ use tracing::{info, warn};
 // shared with non-volume code paths there). Imported so the moved bodies keep
 // calling them by their bare names, verbatim.
 use crate::runtime::{
-    HostPathCheck, check_host_path_type, mount_tmpfs_for_emptydir, parse_cpu_quantity,
-    parse_memory_quantity, parse_quantity_bytes, pod_dir_key, setup_emptydir_dir,
+    check_host_path_type, mount_tmpfs_for_emptydir, parse_cpu_quantity, parse_memory_quantity,
+    parse_quantity_bytes, pod_dir_key, setup_emptydir_dir, HostPathCheck,
 };
 
 /// Provisions and maintains pod volumes on the host filesystem, independent of
@@ -1953,7 +1953,7 @@ impl VolumeManager {
 #[cfg(all(test, unix))]
 mod projected_mode_tests {
     use super::*;
-    use rusternetes_storage::{Storage, StorageBackend, build_key};
+    use rusternetes_storage::{build_key, Storage, StorageBackend};
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;

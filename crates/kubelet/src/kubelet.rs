@@ -1,5 +1,5 @@
 use crate::cri_runtime::CriContainerRuntime;
-use crate::eviction::{EvictionManager, EvictionSignal, get_node_stats, get_pod_stats};
+use crate::eviction::{get_node_stats, get_pod_stats, EvictionManager, EvictionSignal};
 use crate::lifecycle::{phase_is_terminal, should_skip_phase_write};
 use anyhow::Result;
 use rusternetes_common::{
@@ -9,13 +9,13 @@ use rusternetes_common::{
     },
     types::Phase,
 };
-use rusternetes_storage::{Storage, StorageBackend, WatchEvent, build_key, build_prefix};
+use rusternetes_storage::{build_key, build_prefix, Storage, StorageBackend, WatchEvent};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -3794,7 +3794,7 @@ impl Kubelet {
                         if let Ok(mut rpod) = self.storage.get::<Pod>(&rkey).await {
                             if let Some(ref mut status) = rpod.status {
                                 status.resize = Some(String::new()); // Empty = resize complete
-                                // Update allocatedResources in container statuses
+                                                                     // Update allocatedResources in container statuses
                                 if let Some(ref spec) = rpod.spec.clone() {
                                     if let Some(ref mut cs_list) = status.container_statuses {
                                         for cs in cs_list.iter_mut() {
@@ -5634,7 +5634,7 @@ pub fn build_managed_hosts_content(
 
 #[cfg(test)]
 mod taint_eviction_tests {
-    use super::{Taint, Toleration, noexecute_eviction_due};
+    use super::{noexecute_eviction_due, Taint, Toleration};
 
     fn no_execute_taint(time_added_secs_ago: Option<i64>) -> Taint {
         Taint {
@@ -5859,8 +5859,8 @@ mod tests {
     #[test]
     fn terminal_finalize_backoff_grows_then_caps() {
         use super::{
-            TERMINAL_FINALIZE_BACKOFF_INITIAL, TERMINAL_FINALIZE_BACKOFF_MAX,
-            terminal_finalize_backoff,
+            terminal_finalize_backoff, TERMINAL_FINALIZE_BACKOFF_INITIAL,
+            TERMINAL_FINALIZE_BACKOFF_MAX,
         };
         // First failure → initial; each subsequent doubles.
         assert_eq!(
