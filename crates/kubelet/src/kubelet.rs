@@ -1,6 +1,6 @@
 use crate::cri_runtime::CriContainerRuntime;
 use crate::eviction::{get_node_stats, get_pod_stats, EvictionManager, EvictionSignal};
-use crate::lifecycle::should_skip_phase_write;
+use crate::lifecycle::{phase_is_terminal, should_skip_phase_write};
 use anyhow::Result;
 use rusternetes_common::{
     resources::{
@@ -242,6 +242,13 @@ fn deadline_exceeded_terminal(status: Option<&PodStatus>) -> bool {
         status.phase == Some(Phase::Failed)
             && status.reason.as_deref() == Some(ACTIVE_DEADLINE_REASON)
     })
+}
+
+/// Extract the longest `BackoffHint` from an anyhow::Error's source chain.
+/// If no hint is found, returns the default backOffPeriod (10s) to match
+/// K8s `podWorkers.completeWork` fallback.
+pub(crate) fn backoff_from_error(err: &anyhow::Error) -> std::time::Duration {
+    crate::lifecycle::BackoffHint::from_anyhow(err)
 }
 
 fn terminal_phase_requires_termination(pod: &Pod) -> bool {
@@ -2003,8 +2010,49 @@ impl Kubelet {
         let node_name = self.node_name.clone();
 
         tokio::spawn(async move {
-            // Per-pod worker loop — stays alive for the lifetime of the pod
+            // Per-pod worker loop — stays alive for the lifetime of the pod.
+            // K8s ref: pkg/kubelet/pod_workers.go:1508-1534 completeWork —
+            // on sync error the pod is requeued with backOffPeriod (10s),
+            // not the regular resync interval.  Track the "backoff-until"
+            // timestamp per worker so a failing sync does not spam the
+            // storage or CRI on every 5s tick.
+            let mut backoff_until: Option<tokio::time::Instant> = None;
+
             loop {
+                // Backoff guard (K8s pkg/kubelet/pod_workers.go:1512-1533):
+                // if the last sync failed, wait at least backOffPeriod (10s)
+                // before retrying.  A new explicit signal can still break
+                // out of the backoff early.
+                if let Some(until) = backoff_until {
+                    let now = tokio::time::Instant::now();
+                    if now < until {
+                        let remaining = until - now;
+                        // Wait out the backoff, but break early if a fresh
+                        // signal arrives (controller update, eviction, etc.)
+                        match tokio::time::timeout(remaining, rx.recv()).await {
+                            Ok(Some(())) => {
+                                // Real signal during backoff — drain extras and
+                                // proceed to sync immediately
+                                while rx.try_recv().is_ok() {}
+                                backoff_until = None;
+                                continue;
+                            }
+                            Ok(None) => {
+                                debug!(
+                                    "Pod worker for {} shutting down (channel closed during backoff)",
+                                    name
+                                );
+                                break;
+                            }
+                            Err(_) => {
+                                // Backoff elapsed — clear and fall through to
+                                // the normal wait/sync path below
+                                backoff_until = None;
+                            }
+                        }
+                    }
+                }
+
                 // Wait for signal (or timeout for periodic re-check)
                 let signaled = tokio::time::timeout(
                     Duration::from_secs(5), // periodic fallback re-sync
@@ -2068,7 +2116,10 @@ impl Kubelet {
                         )
                         .await
                         {
-                            Ok(Ok(())) => {}
+                            Ok(Ok(())) => {
+                                // Success — clear any prior backoff
+                                backoff_until = None;
+                            }
                             Ok(Err(e)) => {
                                 let err_str = e.to_string();
                                 if err_str.contains("Failed to create container")
@@ -2076,10 +2127,27 @@ impl Kubelet {
                                 {
                                     let _ = kubelet.update_pod_status_error(&pod, &err_str).await;
                                 }
-                                debug!("Pod worker {}: sync error: {}", name, err_str);
+                                // K8s ref: completeWork default case (lines 1512-1533):
+                                //   backOffPeriod = 10s with jitter, capped at resyncInterval.
+                                // Set `backoff_until` so the next loop iteration waits
+                                // before retrying.  Use a backoffError-like mechanism: if
+                                // the error carries a BackoffHint, honour it.
+                                let backoff_dur = backoff_from_error(&e);
+                                let backoff_secs = backoff_dur.as_secs();
+                                backoff_until = Some(
+                                    tokio::time::Instant::now()
+                                        + Duration::from_secs(backoff_secs.max(10)),
+                                );
+                                debug!(
+                                    "Pod worker {}: sync error — backing off for {:?}s: {}",
+                                    name, backoff_secs, err_str
+                                );
                             }
                             Err(_) => {
                                 warn!("Pod worker {}: sync timed out", name);
+                                // Timeout behaves like an error — backoff too
+                                backoff_until =
+                                    Some(tokio::time::Instant::now() + Duration::from_secs(10));
                             }
                         }
                     }
@@ -2687,7 +2755,11 @@ impl Kubelet {
                                                 if conflict {
                                                     info!(
                                                         "Pod {}/{} rejected: hostPort {}/{} conflicts with pod {}",
-                                                        namespace, pod_name, port, proto, existing.metadata.name
+                                                        namespace,
+                                                        pod_name,
+                                                        port,
+                                                        proto,
+                                                        existing.metadata.name
                                                     );
                                                     let key = build_key(
                                                         "pods",
@@ -2721,6 +2793,27 @@ impl Kubelet {
                             }
                         }
                     }
+                }
+            }
+        }
+        // Stale-read guard: re-read the pod from storage to detect a concurrent
+        // phase update (e.g., admission controller sets Phase::Failed between
+        // the worker's read and now).  If the phase is terminal, refuse any
+        // container-create or container-stop operations and let the next sync
+        // cycle pick up the terminal state via `needs_terminating`.
+        // K8s equivalent: generateAPIPodStatus forces terminal phases sticky
+        // (pkg/kubelet/kubelet_pods.go:1934-1942).
+        {
+            let key = build_key("pods", Some(namespace), pod_name);
+            if let Ok(fresh) = self.storage.get::<Pod>(&key).await {
+                let fresh_phase = fresh.status.as_ref().and_then(|s| s.phase.as_ref());
+                if phase_is_terminal(fresh_phase) && !phase_is_terminal(Some(current_phase)) {
+                    warn!(
+                        "Pod {}/{} became terminal while syncing (was {:?}, storage now {:?}) — \
+                         skipping container operations",
+                        namespace, pod_name, current_phase, fresh_phase
+                    );
+                    return Ok(());
                 }
             }
         }
@@ -2766,7 +2859,10 @@ impl Kubelet {
 
                         if all_done {
                             // All init containers done — start_pod will skip init and start app containers
-                            info!("All init containers completed for pod {}/{}, starting app containers", namespace, pod_name);
+                            info!(
+                                "All init containers completed for pod {}/{}, starting app containers",
+                                namespace, pod_name
+                            );
                         } else if let Some(idx) = next_idx {
                             let init_containers =
                                 pod.spec.as_ref().unwrap().init_containers.as_ref().unwrap();
@@ -2917,7 +3013,10 @@ impl Kubelet {
                     self.update_pod_status(pod, Phase::Pending, Some(reason), None)
                         .await?;
                 } else {
-                    debug!("Pod {}/{} already has CreateContainer(Config)Error, retrying without status reset", namespace, pod_name);
+                    debug!(
+                        "Pod {}/{} already has CreateContainer(Config)Error, retrying without status reset",
+                        namespace, pod_name
+                    );
                 }
 
                 // Start the pod with timeout
@@ -3089,7 +3188,10 @@ impl Kubelet {
                                         if let Err(e2) =
                                             self.storage.update_status(&key, &retry_pod).await
                                         {
-                                            warn!("Failed to update pod {}/{} status to Running after retry: {}", namespace, pod_name, e2);
+                                            warn!(
+                                                "Failed to update pod {}/{} status to Running after retry: {}",
+                                                namespace, pod_name, e2
+                                            );
                                         }
                                     }
                                 } else {
@@ -3247,9 +3349,9 @@ impl Kubelet {
 
                                 if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                                     warn!(
-                                    "Failed to update pod {}/{} status to container error: {}, retrying",
-                                    namespace, pod_name, e
-                                );
+                                        "Failed to update pod {}/{} status to container error: {}, retrying",
+                                        namespace, pod_name, e
+                                    );
                                     // CAS retry — re-read and apply status
                                     if let Ok(mut retry_pod) = self.storage.get::<Pod>(&key).await {
                                         retry_pod.status = new_pod.status.clone();
@@ -4043,7 +4145,10 @@ impl Kubelet {
                                 }
                             }
                             "Never" => {
-                                warn!("Liveness probe failed but restart policy is Never for pod {}/{}", namespace, pod_name);
+                                warn!(
+                                    "Liveness probe failed but restart policy is Never for pod {}/{}",
+                                    namespace, pod_name
+                                );
                                 self.update_pod_status(
                                     pod,
                                     Phase::Failed,

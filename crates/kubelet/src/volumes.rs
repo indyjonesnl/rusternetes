@@ -562,7 +562,9 @@ impl VolumeManager {
             // reads the previous pod's files.
             let pod_key = pod_dir_key(pod);
             let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_key, volume.name);
-            setup_emptydir_dir(&volume_dir).context("Failed to create emptyDir volume")?;
+            // K8s setupDir does best-effort chmod on emptyDir directories.
+            // A failed chmod must never block the volume mount.
+            let _ = setup_emptydir_dir(&volume_dir);
 
             // Memory-medium emptyDir is a tmpfs. Mount it on the host volume dir
             // (propagated to the host daemon via the kubelet's rshared bind) so
@@ -1006,9 +1008,15 @@ impl VolumeManager {
                     if let Ok(ca_content) = std::fs::read(&ca_cert_source) {
                         std::fs::write(&ca_path, ca_content)
                             .context("Failed to write CA certificate")?;
-                        info!("Injected CA certificate into service account secret volume at {} (from {})", ca_path, ca_cert_source);
+                        info!(
+                            "Injected CA certificate into service account secret volume at {} (from {})",
+                            ca_path, ca_cert_source
+                        );
                     } else {
-                        warn!("CA certificate not found at {}, pods may not be able to verify API server", ca_cert_source);
+                        warn!(
+                            "CA certificate not found at {}, pods may not be able to verify API server",
+                            ca_cert_source
+                        );
                     }
                 }
             }
@@ -1351,7 +1359,10 @@ impl VolumeManager {
                                         // Optional configmap not found, skip
                                     }
                                     Err(e) => {
-                                        warn!("Failed to get ConfigMap {} for projected volume: {}. Skipping.", cm_name, e);
+                                        warn!(
+                                            "Failed to get ConfigMap {} for projected volume: {}. Skipping.",
+                                            cm_name, e
+                                        );
                                     }
                                 }
                             }
@@ -1416,7 +1427,10 @@ impl VolumeManager {
                                         // Optional secret not found, skip
                                     }
                                     Err(e) => {
-                                        warn!("Failed to get Secret {} for projected volume: {}. Skipping.", secret_name, e);
+                                        warn!(
+                                            "Failed to get Secret {} for projected volume: {}. Skipping.",
+                                            secret_name, e
+                                        );
                                     }
                                 }
                             }
@@ -1893,7 +1907,7 @@ impl VolumeManager {
                 return Err(anyhow::anyhow!(
                     "Unsupported resource field: {}",
                     resource_ref.resource
-                ))
+                ));
             }
         };
 

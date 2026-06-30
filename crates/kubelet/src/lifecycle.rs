@@ -262,6 +262,46 @@ impl std::fmt::Display for ImageNeverPullError {
 
 impl std::error::Error for ImageNeverPullError {}
 
+/// Typed error that lets a kubelet subsystem specify how long the pod
+/// worker should back-off before retrying a failed sync.
+///
+/// Mirrors upstream `pkg/kubelet/kuberuntime/backoff_error.go` — the kubelet
+/// worker (`podWorkers.completeWork`) checks for `BackoffError` via
+/// `MinBackoffExpiration` and uses the maximum backoff it finds.
+///
+/// Example callers:
+/// - Volume plugin returns `BackoffHint(30s)` when a PVC is unbound (PV
+///   controller needs time to bind).
+/// - Image pull fails with rate-limit — 429 response headers suggest a
+///   retry-after that the kubelet should honour.
+#[derive(Debug, Clone)]
+pub struct BackoffHint(pub Duration);
+
+impl std::fmt::Display for BackoffHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "backoff for {:?}", self.0)
+    }
+}
+
+impl std::error::Error for BackoffHint {}
+
+impl BackoffHint {
+    /// Recurse through an anyhow::Error's source chain and return the
+    /// longest `BackoffHint` found.  If none is found, the default
+    /// backOffPeriod (10s) is returned.
+    pub fn from_anyhow(err: &anyhow::Error) -> Duration {
+        let mut max_backoff = Duration::from_secs(10);
+        let mut next: Option<&dyn std::error::Error> = Some(err.as_ref());
+        while let Some(e) = next {
+            if let Some(hint) = e.downcast_ref::<BackoffHint>() {
+                max_backoff = max_backoff.max(hint.0);
+            }
+            next = e.source();
+        }
+        max_backoff
+    }
+}
+
 /// Recover the kubelet `containerStatus.waiting.reason` string from an
 /// [`anyhow::Error`] returned by the runtime's `start_pod`.
 ///
