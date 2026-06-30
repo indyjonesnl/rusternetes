@@ -193,6 +193,50 @@ fn active_deadline_elapsed(
     }
 }
 
+fn init_container_completed_successfully(
+    init_statuses: Option<&[ContainerStatus]>,
+    container_name: &str,
+) -> bool {
+    init_statuses
+        .and_then(|statuses| statuses.iter().find(|s| s.name == container_name))
+        .map(|status| {
+            matches!(
+                &status.state,
+                Some(ContainerState::Terminated { exit_code: 0, .. })
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn init_container_failed_terminally(pod: &Pod, init_statuses: Option<&[ContainerStatus]>) -> bool {
+    let restart_policy = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.restart_policy.as_deref())
+        .unwrap_or("Always");
+    if restart_policy != "Never" {
+        return false;
+    }
+
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.init_containers.as_ref())
+        .map(|init_containers| {
+            init_containers.iter().any(|container| {
+                container.restart_policy.as_deref() != Some("Always")
+                    && init_statuses
+                        .and_then(|statuses| statuses.iter().find(|s| s.name == container.name))
+                        .is_some_and(|status| {
+                            matches!(
+                                &status.state,
+                                Some(ContainerState::Terminated { exit_code, .. }) if *exit_code != 0
+                            )
+                        })
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn deadline_exceeded_terminal(status: Option<&PodStatus>) -> bool {
     status.is_some_and(|status| {
         status.phase == Some(Phase::Failed)
@@ -2765,90 +2809,14 @@ impl Kubelet {
                                 let key = build_key("pods", Some(namespace), pod_name);
                                 if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
                                     let init_statuses = self.get_init_container_statuses(&p).await;
-                                    // Names of init containers that did NOT terminate
-                                    // with exit 0 — these are "incomplete" per K8s.
-                                    let incomplete_inits: Vec<String> = p
-                                        .spec
-                                        .as_ref()
-                                        .and_then(|s| s.init_containers.as_ref())
-                                        .map(|ics| {
-                                            ics.iter()
-                                                .filter(|c| {
-                                                    let completed = init_statuses
-                                                        .as_ref()
-                                                        .and_then(|statuses| {
-                                                            statuses
-                                                                .iter()
-                                                                .find(|s| s.name == c.name)
-                                                        })
-                                                        .map(|s| {
-                                                            matches!(
-                                                                &s.state,
-                                                                Some(ContainerState::Terminated {
-                                                                    exit_code: 0,
-                                                                    ..
-                                                                })
-                                                            )
-                                                        })
-                                                        .unwrap_or(false);
-                                                    !completed
-                                                })
-                                                .map(|c| c.name.clone())
-                                                .collect()
-                                        })
-                                        .unwrap_or_default();
-                                    let failed_conditions =
-                                        Self::init_failed_pod_conditions(&incomplete_inits);
-                                    // Ensure app containers stay Waiting/PodInitializing.
-                                    // The conformance watch errors out the moment it
-                                    // sees any app container outside that state.
-                                    let app_container_statuses: Option<Vec<ContainerStatus>> =
-                                        p.spec.as_ref().map(|spec| {
-                                            spec.containers
-                                                .iter()
-                                                .map(|c| ContainerStatus {
-                                                    name: c.name.clone(),
-                                                    ready: false,
-                                                    restart_count: 0,
-                                                    state: Some(ContainerState::Waiting {
-                                                        reason: Some("PodInitializing".to_string()),
-                                                        message: None,
-                                                    }),
-                                                    last_state: None,
-                                                    image: Some(c.image.clone()),
-                                                    image_id: None,
-                                                    container_id: None,
-                                                    started: Some(false),
-                                                    allocated_resources: c
-                                                        .resources
-                                                        .as_ref()
-                                                        .and_then(|r| r.requests.clone()),
-                                                    allocated_resources_status: None,
-                                                    resources: c.resources.clone(),
-                                                    user: None,
-                                                    volume_mounts: None,
-                                                    stop_signal: None,
-                                                })
-                                                .collect()
-                                        });
-                                    let status_msg = if !incomplete_inits.is_empty() {
-                                        format!(
-                                            "containers with incomplete status: [{}]",
-                                            incomplete_inits.join(" ")
-                                        )
-                                    } else {
-                                        "Init container failed".to_string()
-                                    };
-                                    if let Some(ref mut s) = p.status {
-                                        // Pod stays Pending under RestartAlways — never
-                                        // flip to Failed when an init can still retry.
-                                        s.phase = Some(Phase::Pending);
-                                        s.reason = Some("PodInitializing".to_string());
-                                        s.message = Some(status_msg);
-                                        s.init_container_statuses = init_statuses;
-                                        s.container_statuses = app_container_statuses;
-                                        s.conditions = Some(failed_conditions);
-                                    }
+                                    let qos = Self::compute_qos_class(&p);
+                                    p.status = Some(Self::build_init_failure_status(
+                                        &p,
+                                        init_statuses,
+                                        Phase::Pending,
+                                        "PodInitializing",
+                                        Some(qos),
+                                    ));
                                     let _ = self.storage.update_status(&key, &p).await;
                                 }
                                 return Ok(());
@@ -2916,7 +2884,26 @@ impl Kubelet {
                                 return Ok(());
                             }
                         } else {
-                            // No next init container and not all done — pod is terminal or waiting
+                            // No next init container and not all done. When a
+                            // RestartNever init container failed, publish the
+                            // terminal Failed status instead of silently
+                            // returning with no conditions. Otherwise this is
+                            // just the "wait for a running init" case.
+                            let key = build_key("pods", Some(namespace), pod_name);
+                            if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                                let init_statuses = self.get_init_container_statuses(&p).await;
+                                if init_container_failed_terminally(&p, init_statuses.as_deref()) {
+                                    let qos = Self::compute_qos_class(&p);
+                                    p.status = Some(Self::build_init_failure_status(
+                                        &p,
+                                        init_statuses,
+                                        Phase::Failed,
+                                        "FailedToStart",
+                                        Some(qos),
+                                    ));
+                                    let _ = self.storage.update_status(&key, &p).await;
+                                }
+                            }
                             return Ok(());
                         }
                     }
@@ -3280,8 +3267,6 @@ impl Kubelet {
                                 let init_container_statuses =
                                     self.get_init_container_statuses(&fresh_pod).await;
                                 let qos = Self::compute_qos_class(&fresh_pod);
-                                let observed_gen = fresh_pod.metadata.generation;
-
                                 let mut new_pod = fresh_pod;
 
                                 // Determine phase based on restart policy AND error type:
@@ -3311,110 +3296,13 @@ impl Kubelet {
                                         (Phase::Pending, "InitContainerFailed".to_string())
                                     };
 
-                                // Build K8s-style message listing only INCOMPLETE init containers.
-                                // An init container is "incomplete" if it didn't terminate with exit code 0.
-                                // Successfully completed init containers (exit 0) should NOT be listed.
-                                let init_statuses = new_pod
-                                    .status
-                                    .as_ref()
-                                    .and_then(|s| s.init_container_statuses.as_ref());
-                                let incomplete_inits: Vec<String> = new_pod
-                                    .spec
-                                    .as_ref()
-                                    .and_then(|s| s.init_containers.as_ref())
-                                    .map(|ics| {
-                                        ics.iter()
-                                            .filter(|c| {
-                                                // Check if this init container completed successfully
-                                                let completed = init_statuses
-                                                    .and_then(|statuses| {
-                                                        statuses.iter().find(|s| s.name == c.name)
-                                                    })
-                                                    .map(|s| {
-                                                        matches!(
-                                                            &s.state,
-                                                            Some(
-                                                                rusternetes_common::resources::ContainerState::Terminated {
-                                                                    exit_code: 0, ..
-                                                                }
-                                                            )
-                                                        )
-                                                    })
-                                                    .unwrap_or(false);
-                                                !completed
-                                            })
-                                            .map(|c| c.name.clone())
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                let status_msg = if !incomplete_inits.is_empty() {
-                                    format!(
-                                        "containers with incomplete status: [{}]",
-                                        incomplete_inits.join(" ")
-                                    )
-                                } else {
-                                    err_msg.clone()
-                                };
-                                // Set proper conditions for failed init containers
-                                let failed_conditions =
-                                    Self::init_failed_pod_conditions(&incomplete_inits);
-
-                                // Build app container statuses as Waiting/PodInitializing
-                                // since init containers haven't completed, app containers were never started
-                                let app_container_statuses: Option<Vec<ContainerStatus>> =
-                                    new_pod.spec.as_ref().map(|spec| {
-                                        spec.containers
-                                            .iter()
-                                            .map(|c| ContainerStatus {
-                                                name: c.name.clone(),
-                                                ready: false,
-                                                restart_count: 0,
-                                                state: Some(ContainerState::Waiting {
-                                                    reason: Some("PodInitializing".to_string()),
-                                                    message: None,
-                                                }),
-                                                last_state: None,
-                                                image: Some(c.image.clone()),
-                                                image_id: None,
-                                                container_id: None,
-                                                started: Some(false),
-                                                allocated_resources: c
-                                                    .resources
-                                                    .as_ref()
-                                                    .and_then(|r| r.requests.clone()),
-                                                allocated_resources_status: None,
-                                                resources: c.resources.clone(),
-                                                user: None,
-                                                volume_mounts: None,
-                                                stop_signal: None,
-                                            })
-                                            .collect()
-                                    });
-
-                                new_pod.status = Some(PodStatus {
-                                    phase: Some(phase),
-                                    message: Some(status_msg),
-                                    reason: Some(reason),
-                                    host_ip: Some(Self::node_internal_ip().to_string()),
-                                    pod_ip: None,
-                                    conditions: Some(failed_conditions),
-                                    container_statuses: app_container_statuses,
+                                new_pod.status = Some(Self::build_init_failure_status(
+                                    &new_pod,
                                     init_container_statuses,
-                                    ephemeral_container_statuses: None,
-                                    resize: None,
-                                    resource_claim_statuses: None,
-                                    observed_generation: observed_gen,
-                                    host_i_ps: Some(vec![
-                                        rusternetes_common::resources::pod::HostIP {
-                                            ip: Self::node_internal_ip().to_string(),
-                                        },
-                                    ]),
-                                    pod_i_ps: None,
-                                    nominated_node_name: None,
-                                    qos_class: Some(qos),
-                                    start_time: Some(chrono::Utc::now()),
-                                    ..Default::default()
-                                });
+                                    phase,
+                                    &reason,
+                                    Some(qos),
+                                ));
 
                                 if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                                     warn!(
@@ -4876,6 +4764,106 @@ impl Kubelet {
         incoming
     }
 
+    fn incomplete_init_container_names(
+        pod: &Pod,
+        init_statuses: Option<&[ContainerStatus]>,
+    ) -> Vec<String> {
+        pod.spec
+            .as_ref()
+            .and_then(|s| s.init_containers.as_ref())
+            .map(|init_containers| {
+                init_containers
+                    .iter()
+                    .filter(|container| {
+                        !init_container_completed_successfully(init_statuses, &container.name)
+                    })
+                    .map(|container| container.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn pod_initializing_container_statuses(pod: &Pod) -> Option<Vec<ContainerStatus>> {
+        pod.spec.as_ref().map(|spec| {
+            spec.containers
+                .iter()
+                .map(|container| ContainerStatus {
+                    name: container.name.clone(),
+                    ready: false,
+                    restart_count: 0,
+                    state: Some(ContainerState::Waiting {
+                        reason: Some("PodInitializing".to_string()),
+                        message: None,
+                    }),
+                    last_state: None,
+                    image: Some(container.image.clone()),
+                    image_id: None,
+                    container_id: None,
+                    started: Some(false),
+                    allocated_resources: container
+                        .resources
+                        .as_ref()
+                        .and_then(|r| r.requests.clone()),
+                    allocated_resources_status: None,
+                    resources: container.resources.clone(),
+                    user: None,
+                    volume_mounts: None,
+                    stop_signal: None,
+                })
+                .collect()
+        })
+    }
+
+    fn build_init_failure_status(
+        pod: &Pod,
+        init_statuses: Option<Vec<ContainerStatus>>,
+        phase: Phase,
+        reason: &str,
+        qos: Option<String>,
+    ) -> PodStatus {
+        let incomplete_inits = Self::incomplete_init_container_names(pod, init_statuses.as_deref());
+        let message = if !incomplete_inits.is_empty() {
+            format!(
+                "containers with incomplete status: [{}]",
+                incomplete_inits.join(" ")
+            )
+        } else {
+            "Init container failed".to_string()
+        };
+        let prior_status = pod.status.as_ref();
+
+        PodStatus {
+            phase: Some(phase),
+            message: Some(message),
+            reason: Some(reason.to_string()),
+            host_ip: prior_status
+                .and_then(|status| status.host_ip.clone())
+                .or_else(|| Some(Self::node_internal_ip().to_string())),
+            pod_ip: prior_status.and_then(|status| status.pod_ip.clone()),
+            conditions: Some(Self::init_failed_pod_conditions(&incomplete_inits)),
+            container_statuses: Self::pod_initializing_container_statuses(pod),
+            init_container_statuses: init_statuses,
+            ephemeral_container_statuses: prior_status
+                .and_then(|status| status.ephemeral_container_statuses.clone()),
+            resize: prior_status.and_then(|status| status.resize.clone()),
+            resource_claim_statuses: prior_status
+                .and_then(|status| status.resource_claim_statuses.clone()),
+            observed_generation: pod.metadata.generation,
+            host_i_ps: prior_status
+                .and_then(|status| status.host_i_ps.clone())
+                .or_else(|| {
+                    Some(vec![rusternetes_common::resources::pod::HostIP {
+                        ip: Self::node_internal_ip().to_string(),
+                    }])
+                }),
+            pod_i_ps: prior_status.and_then(|status| status.pod_i_ps.clone()),
+            nominated_node_name: prior_status.and_then(|status| status.nominated_node_name.clone()),
+            qos_class: qos.or_else(|| prior_status.and_then(|status| status.qos_class.clone())),
+            start_time: prior_status.and_then(|status| status.start_time),
+            ..Default::default()
+        }
+    }
+
     /// Build the standard pod conditions with ContainersReady and Ready set
     /// independently. ContainersReady reflects only container/sidecar readiness;
     /// Ready additionally requires every spec.readinessGates condition to be True
@@ -5749,6 +5737,188 @@ mod tests {
         };
 
         assert!(!super::terminal_phase_requires_termination(&pod));
+    }
+
+    #[test]
+    fn restart_never_failed_init_is_terminal() {
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("init-fail").with_namespace("default"),
+            spec: Some(PodSpec {
+                restart_policy: Some("Never".to_string()),
+                init_containers: Some(vec![Container {
+                    name: "init1".to_string(),
+                    image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }]),
+                containers: vec![Container {
+                    name: "app".to_string(),
+                    image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: Some(PodStatus {
+                init_container_statuses: Some(vec![ContainerStatus {
+                    name: "init1".to_string(),
+                    ready: false,
+                    restart_count: 0,
+                    state: Some(ContainerState::Terminated {
+                        exit_code: 1,
+                        reason: Some("Error".to_string()),
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
+                        signal: None,
+                    }),
+                    last_state: None,
+                    image: Some("busybox:latest".to_string()),
+                    image_id: None,
+                    container_id: None,
+                    started: Some(false),
+                    allocated_resources: None,
+                    allocated_resources_status: None,
+                    resources: None,
+                    user: None,
+                    volume_mounts: None,
+                    stop_signal: None,
+                }]),
+                ..Default::default()
+            }),
+        };
+
+        assert!(super::init_container_failed_terminally(
+            &pod,
+            pod.status
+                .as_ref()
+                .and_then(|status| status.init_container_statuses.as_deref())
+        ));
+    }
+
+    #[test]
+    fn build_init_failure_status_populates_conditions_without_prior_status() {
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("init-pod").with_namespace("default"),
+            spec: Some(PodSpec {
+                restart_policy: Some("Always".to_string()),
+                init_containers: Some(vec![
+                    Container {
+                        name: "init1".to_string(),
+                        image: "busybox:latest".to_string(),
+                        ..Default::default()
+                    },
+                    Container {
+                        name: "init2".to_string(),
+                        image: "busybox:latest".to_string(),
+                        ..Default::default()
+                    },
+                ]),
+                containers: vec![Container {
+                    name: "app".to_string(),
+                    image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: None,
+        };
+
+        let init_statuses = Some(vec![
+            ContainerStatus {
+                name: "init1".to_string(),
+                ready: false,
+                restart_count: 0,
+                state: Some(ContainerState::Terminated {
+                    exit_code: 1,
+                    reason: Some("Error".to_string()),
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                    signal: None,
+                }),
+                last_state: None,
+                image: Some("busybox:latest".to_string()),
+                image_id: None,
+                container_id: None,
+                started: Some(false),
+                allocated_resources: None,
+                allocated_resources_status: None,
+                resources: None,
+                user: None,
+                volume_mounts: None,
+                stop_signal: None,
+            },
+            ContainerStatus {
+                name: "init2".to_string(),
+                ready: false,
+                restart_count: 0,
+                state: Some(ContainerState::Waiting {
+                    reason: Some("PodInitializing".to_string()),
+                    message: None,
+                }),
+                last_state: None,
+                image: Some("busybox:latest".to_string()),
+                image_id: None,
+                container_id: None,
+                started: Some(false),
+                allocated_resources: None,
+                allocated_resources_status: None,
+                resources: None,
+                user: None,
+                volume_mounts: None,
+                stop_signal: None,
+            },
+        ]);
+
+        let status = Kubelet::build_init_failure_status(
+            &pod,
+            init_statuses,
+            Phase::Pending,
+            "PodInitializing",
+            Some("Burstable".to_string()),
+        );
+
+        assert_eq!(status.phase, Some(Phase::Pending));
+        assert_eq!(status.reason.as_deref(), Some("PodInitializing"));
+        assert_eq!(
+            status.message.as_deref(),
+            Some("containers with incomplete status: [init1 init2]")
+        );
+        let initialized = status
+            .conditions
+            .as_ref()
+            .and_then(|conditions| {
+                conditions
+                    .iter()
+                    .find(|c| c.condition_type == "Initialized")
+            })
+            .expect("Initialized condition must be present");
+        assert_eq!(initialized.status, "False");
+        assert_eq!(
+            initialized.reason.as_deref(),
+            Some("ContainersNotInitialized")
+        );
+        let app_status = status
+            .container_statuses
+            .as_ref()
+            .and_then(|statuses| statuses.iter().find(|s| s.name == "app"))
+            .expect("app container status must be present");
+        assert!(matches!(
+            app_status.state,
+            Some(ContainerState::Waiting {
+                reason: Some(ref reason),
+                ..
+            }) if reason == "PodInitializing"
+        ));
     }
 
     #[test]
