@@ -562,7 +562,9 @@ impl VolumeManager {
             // reads the previous pod's files.
             let pod_key = pod_dir_key(pod);
             let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_key, volume.name);
-            setup_emptydir_dir(&volume_dir).context("Failed to create emptyDir volume")?;
+            // K8s setupDir does best-effort chmod on emptyDir directories.
+            // A failed chmod must never block the volume mount.
+            let _ = setup_emptydir_dir(&volume_dir);
 
             // Memory-medium emptyDir is a tmpfs. Mount it on the host volume dir
             // (propagated to the host daemon via the kubelet's rshared bind) so
