@@ -116,7 +116,7 @@ services:
   api-server-1:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: api-server
     container_name: rusternetes-api-server-1
     ports:
@@ -148,7 +148,7 @@ services:
   api-server-2:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: api-server
     container_name: rusternetes-api-server-2
     ports:
@@ -180,7 +180,7 @@ services:
   api-server-3:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: api-server
     container_name: rusternetes-api-server-3
     ports:
@@ -213,7 +213,7 @@ services:
   scheduler-1:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: scheduler
     container_name: rusternetes-scheduler-1
     depends_on:
@@ -234,7 +234,7 @@ services:
   scheduler-2:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: scheduler
     container_name: rusternetes-scheduler-2
     depends_on:
@@ -256,7 +256,7 @@ services:
   controller-manager-1:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: controller-manager
     container_name: rusternetes-controller-manager-1
     depends_on:
@@ -277,7 +277,7 @@ services:
   controller-manager-2:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: controller-manager
     container_name: rusternetes-controller-manager-2
     depends_on:
@@ -299,7 +299,7 @@ services:
   kubelet:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: kubelet
     container_name: rusternetes-kubelet
     privileged: true
@@ -334,7 +334,7 @@ services:
   kube-proxy:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: kube-proxy
     container_name: rusternetes-kube-proxy
     privileged: true

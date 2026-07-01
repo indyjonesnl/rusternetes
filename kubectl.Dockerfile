@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.6
 # Dockerfile for kubectl CLI tool.
 #
-# Two-stage cargo build (matches Dockerfile.services pattern):
+# Two-stage cargo build (matches services.Dockerfile pattern):
 #   Pass 1 — copy crate manifests + dummy src files, compile dep graph
 #            into cache-mounted target/. Cached until a Cargo.toml /
 #            Cargo.lock / build.rs / proto/ changes.
@@ -18,14 +18,14 @@
 #   middleware, netstack, protobuf, rusternetes, scheduler, storage,
 #   test_support
 #
-# Pin the rust toolchain — see Dockerfile.services for the cache-mount
+# Pin the rust toolchain — see services.Dockerfile for the cache-mount
 # rationale. Keep this version in lock-step with the other Dockerfiles
 # so a shared rustc populates the same /app/target BuildKit cache.
 FROM rust:1.95 AS builder
 
 # sccache wraps rustc so identical (crate, source, flags) compilations
 # hit the BuildKit cache mount below. Shares cache id `sccache-rusternetes`
-# with Dockerfile.services and Dockerfile.all-in-one so a build of any of
+# with services.Dockerfile and all-in-one.Dockerfile so a build of any of
 # them warms the cache for the others.
 ARG SCCACHE_VERSION=v0.8.2
 RUN apt-get update && apt-get install -y \
@@ -50,7 +50,7 @@ WORKDIR /app
 # Pull in the adjacent rhino crate (named build context in compose.yml).
 # kubectl itself doesn't use rhino, but the workspace manifest references it
 # transitively via crates/storage, so cargo metadata fails without it.
-COPY --from=rhino . /rhino
+COPY --from=rhino . /app/rhino
 
 # ----- PASS 1: dependency-only compile (cache-friendly) -----
 
@@ -80,9 +80,10 @@ COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
 COPY crates/streamproxy/Cargo.toml        crates/streamproxy/Cargo.toml
 COPY crates/test_support/Cargo.toml       crates/test_support/Cargo.toml
 
-# build.rs + proto/ (only api-server has these today).
+# build.rs + proto/. common/build.rs stamps the version/SHA metadata.
 COPY crates/api-server/build.rs crates/api-server/build.rs
 COPY crates/api-server/proto    crates/api-server/proto
+COPY crates/common/build.rs     crates/common/build.rs
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate.
 #   - lib only:   common, storage, cloud-providers
@@ -90,7 +91,7 @@ COPY crates/api-server/proto    crates/api-server/proto
 #   - lib + bin:  api-server, controller-manager, kubelet, kube-proxy,
 #                 scheduler
 RUN set -eux; \
-    for c in client common storage cloud-providers; do \
+    for c in client common storage cloud-providers streamproxy test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -102,9 +103,11 @@ RUN set -eux; \
         echo "fn main(){}" > crates/$c/src/main.rs; \
     done
 
-# Dummy bench files — see Dockerfile.services for the detailed rationale.
+# Dummy bench files — see services.Dockerfile for the detailed rationale.
 RUN mkdir -p crates/common/benches \
- && echo "fn main(){}" > crates/common/benches/regex_cache.rs
+ && echo "fn main(){}" > crates/common/benches/regex_cache.rs \
+ && mkdir -p crates/storage/benches \
+ && echo "fn main(){}" > crates/storage/benches/watch_latency.rs
 
 ENV CARGO_BUILD_JOBS=2
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -151,7 +154,7 @@ COPY crates/storage/src              crates/storage/src
 
 # Pass 1 already wiped the dummy workspace artefacts via `cargo
 # clean -p`, so cargo compiles each workspace crate from the real src
-# copied in above. See Dockerfile.services for the rationale.
+# copied in above. See services.Dockerfile for the rationale.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \

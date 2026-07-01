@@ -21,10 +21,10 @@ cd "$PROJECT_ROOT"
 
 # Dockerfiles that enumerate crate manifests by hand.
 DOCKERFILES=(
-    Dockerfile.services
-    Dockerfile.dns
-    Dockerfile.kubectl
-    Dockerfile.all-in-one
+    services.Dockerfile
+    dns.Dockerfile
+    kubectl.Dockerfile
+    all-in-one.Dockerfile
 )
 
 # Workspace members → bare crate dir names (e.g. "api-server").

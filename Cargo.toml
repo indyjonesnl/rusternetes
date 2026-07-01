@@ -107,8 +107,8 @@ strip = "symbols"
 # few percent of runtime perf and ~10% larger binaries for a 2-3× faster
 # link.
 #
-# Used by Dockerfile.all-in-one, Dockerfile.services, Dockerfile.dns and
-# Dockerfile.kubectl via `cargo build --profile release-fast`. Shipped
+# Used by all-in-one.Dockerfile, services.Dockerfile, dns.Dockerfile and
+# kubectl.Dockerfile via `cargo build --profile release-fast`. Shipped
 # release artefacts (the indyjonesnl/rusternetes GitHub releases) still
 # build with the regular `release` profile above.
 [profile.release-fast]

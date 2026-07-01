@@ -33,7 +33,7 @@ services:
   api-server:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: api-server
       additional_contexts:
         rhino: ../rhino
@@ -75,7 +75,7 @@ services:
   scheduler:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: scheduler
       additional_contexts:
         rhino: ../rhino
@@ -93,7 +93,7 @@ services:
   controller-manager:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: controller-manager
       additional_contexts:
         rhino: ../rhino
@@ -114,7 +114,7 @@ services:
   kubelet:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: kubelet
       additional_contexts:
         rhino: ../rhino
@@ -171,7 +171,7 @@ services:
   kubelet2:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: kubelet
       additional_contexts:
         rhino: ../rhino
@@ -200,7 +200,7 @@ services:
   kube-proxy:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: kube-proxy
       additional_contexts:
         rhino: ../rhino

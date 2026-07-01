@@ -13,7 +13,7 @@ services:
   api-server:
     build:
       context: .
-      dockerfile: Dockerfile.local-binary.services
+      dockerfile: local-binary.services.Dockerfile
       target: api-server
     command:
       - "--bind-address"
@@ -32,5 +32,5 @@ services:
   kubelet:
     build:
       context: .
-      dockerfile: Dockerfile.local-binary.services
+      dockerfile: local-binary.services.Dockerfile
       target: kubelet

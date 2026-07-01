@@ -72,7 +72,7 @@ build-images: ## Build all container images
 
 build-image-%: ## Build a specific component image (e.g., make build-image-api-server)
 	@echo "$(GREEN)Building $* image...$(NC)"
-	$(CONTAINER_RUNTIME) build -f Dockerfile.$* -t $(IMAGE_PREFIX)/$*:$(IMAGE_TAG) .
+	$(CONTAINER_RUNTIME) build -f $*.Dockerfile -t $(IMAGE_PREFIX)/$*:$(IMAGE_TAG) .
 
 dev-up: ## Start the development cluster
 	@if [ -z "$$KUBELET_VOLUMES_PATH" ]; then \
