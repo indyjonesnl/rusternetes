@@ -1455,9 +1455,32 @@ impl CriContainerRuntime {
             }
             let cmd: Vec<&str> = exec.command.iter().map(String::as_str).collect();
             let mut cri = self.cri.clone();
-            let resp = cri
-                .exec_sync(container_id, &cmd, HANDLER_TIMEOUT.as_secs() as i64)
-                .await?;
+            // Enforce the handler timeout node-side, mirroring `probe_container`'s
+            // outer `tokio::time::timeout` guard. CRI runtimes may not honour the
+            // `timeout` field of `ExecSyncRequest`, so an outer tokio deadline is
+            // the only reliable bound. Without it a hung exec_sync blocks
+            // `start_pod` indefinitely and `CreateSync` times out after 300 s in
+            // the conformance suite.  Upstream bounds the exec via the ctx
+            // deadline passed down from `startContainer` (handlers.go:82 —
+            // `hr.commandRunner.RunInContainer(ctx, containerID, …)`).
+            let resp = match tokio::time::timeout(
+                HANDLER_TIMEOUT,
+                cri.exec_sync(container_id, &cmd, HANDLER_TIMEOUT.as_secs() as i64),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    anyhow::bail!("exec lifecycle handler {:?} failed: {e}", exec.command)
+                }
+                Err(_elapsed) => {
+                    anyhow::bail!(
+                        "exec lifecycle handler {:?} timed out after {}s",
+                        exec.command,
+                        HANDLER_TIMEOUT.as_secs()
+                    )
+                }
+            };
             if resp.exit_code != 0 {
                 anyhow::bail!(
                     "exec lifecycle handler {:?} exited {}",
@@ -3067,5 +3090,100 @@ mod tests {
             }
             _ => panic!("init2 should be Waiting/PodInitializing after fix"),
         }
+    }
+
+    /// Regression test: an exec postStart lifecycle handler MUST return an error
+    /// within `HANDLER_TIMEOUT` when the CRI runtime is unresponsive (accepts the
+    /// TCP connection but never sends a gRPC response).
+    ///
+    /// Without an outer `tokio::time::timeout` guard in `run_lifecycle_handler`,
+    /// `exec_sync` blocks indefinitely — `start_pod` hangs, and `CreateSync`
+    /// times out after 300 s in the conformance suite, causing the NC test
+    /// "[sig-node] Container Lifecycle Hook … should execute poststart exec hook
+    /// properly [NodeConformance]" to fail.
+    ///
+    /// Upstream ref:
+    ///   `pkg/kubelet/lifecycle/handlers.go:82` — the exec hook is called via
+    ///   `hr.commandRunner.RunInContainer(ctx, containerID, handler.Exec.Command, 0)`;
+    ///   the context carries the deadline that bounds the call.  Our Rust
+    ///   equivalent is the outer `tokio::time::timeout(HANDLER_TIMEOUT, exec_sync)`.
+    #[tokio::test(start_paused = true)]
+    async fn exec_lifecycle_hook_returns_error_when_cri_hangs() {
+        use rusternetes_common::resources::pod::ExecAction;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        // Spawn a Unix socket server that accepts connections but never sends
+        // any data back — simulates a containerd process stuck inside ExecSync
+        // (e.g. waiting for a subprocess that never exits).
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("hanging-cri.sock");
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                // Drain whatever the client sends but never reply.
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+        });
+
+        let runtime = CriContainerRuntime::connect(
+            sock_path.to_str().unwrap(),
+            "",
+            "/tmp/rusternetes-test-logs",
+        )
+        .await
+        .unwrap();
+
+        let (pod, container) = lifecycle_test_pod_and_container();
+        let handler = rusternetes_common::resources::pod::LifecycleHandler {
+            exec: Some(ExecAction {
+                command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+            }),
+            http_get: None,
+            tcp_socket: None,
+            sleep: None,
+        };
+
+        // Spawn the handler call so we can advance simulated time while it is
+        // blocked on the unresponsive CRI socket.
+        let handle = tokio::spawn(async move {
+            runtime
+                .run_lifecycle_handler(&pod, &container, "container-abc123", &handler)
+                .await
+        });
+
+        // Yield enough times to let the spawned task connect to the socket and
+        // reach the exec_sync await point before we advance the clock.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance tokio's simulated time past HANDLER_TIMEOUT (60 s).
+        // With the fix in place, the inner `tokio::time::timeout(HANDLER_TIMEOUT,
+        // exec_sync)` fires here and the handler task returns Err.  Without the
+        // fix there is no timer around exec_sync, so advancing time does not
+        // unblock it and `handle.await` below hangs indefinitely (the test would
+        // deadlock / time-out in CI).
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        // Give the task one more turn to process the fired timeout.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        let result = handle
+            .await
+            .expect("spawned task must complete after HANDLER_TIMEOUT");
+        assert!(
+            result.is_err(),
+            "exec lifecycle handler must return Err when CRI is unresponsive for HANDLER_TIMEOUT"
+        );
     }
 }
