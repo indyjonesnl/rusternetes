@@ -622,7 +622,32 @@ impl CriContainerRuntime {
         let container_id = cri
             .create_container(sandbox_id, cfg, sandbox_cfg.clone())
             .await?;
+        // Emit Created event after the container is created — mirrors upstream
+        // `startContainer` in `pkg/kubelet/kuberuntime/kuberuntime_container.go:290`:
+        //   m.recordContainerEvent(…, events.CreatedContainer, "Container created")
+        // This event is a Normal-type lifecycle marker visible in `kubectl describe pod`.
+        self.emit_event(
+            pod,
+            Some(&container.name),
+            crate::events::CREATED_CONTAINER,
+            rusternetes_common::resources::EventType::Normal,
+            &format!("Created container {}", container.name),
+        )
+        .await;
         cri.start_container(&container_id).await?;
+        // Emit Started event after the container successfully starts — mirrors upstream
+        // `startContainer` in `pkg/kubelet/kuberuntime/kuberuntime_container.go:298`:
+        //   m.recordContainerEvent(…, events.StartedContainer, "Container started")
+        // Conformance tests (e.g. sysctl.go WaitForErrorEventOrSuccess) watch for
+        // this event to detect successful pod start; without it they time out.
+        self.emit_event(
+            pod,
+            Some(&container.name),
+            crate::events::STARTED_CONTAINER,
+            rusternetes_common::resources::EventType::Normal,
+            &format!("Started container {}", container.name),
+        )
+        .await;
 
         // postStart lifecycle hook: runs immediately after the container starts
         // (upstream kuberuntime `startContainer`). Best-effort — a failed
@@ -2685,5 +2710,151 @@ mod tests {
         assert_eq!(get("KUBERNETES_SERVICE_HOST"), Some("10.96.0.1"));
         assert_eq!(get("KUBERNETES_SERVICE_PORT"), Some("8080"));
         assert_eq!(get("KUBERNETES_SERVICE_PORT_HTTPS"), Some("8080"));
+    }
+
+    /// Regression test for NC failures:
+    ///   "[sig-node] Sysctls … should support sysctls [Environment:NotInUserNS]"
+    ///   "[sig-node] Sysctls … should support sysctls with slashes as separator"
+    ///
+    /// Both tests use `WaitForErrorEventOrSuccess` (test/e2e/framework/pod/pod_client.go:328)
+    /// to detect pod start. That function watches pod Events and returns on the
+    /// first event whose reason is one of:
+    ///   - `"Started"` (container started successfully)
+    ///   - `"Failed"`  (container start failed)
+    ///   - `"Killing"` (container is being killed)
+    ///   - `"SysctlForbidden"` (sysctl admission rejected the pod)
+    ///
+    /// Without a `Started` event the function spins until the context times out
+    /// (→ `context deadline exceeded` at sysctl.go:99 / sysctl.go:209) even when
+    /// the container is running fine. This test verifies that the `ContainerRuntime`
+    /// event-emission machinery surfaces `Started` to a wired-up event recorder,
+    /// which is the prerequisite for `create_and_start_container` to emit it.
+    ///
+    /// Upstream: `kuberuntime_container.go:298`
+    ///   m.recordContainerEvent(ctx, pod, container, containerID,
+    ///       v1.EventTypeNormal, events.StartedContainer, "Container started")
+    #[tokio::test]
+    async fn started_event_is_emitted_via_emit_event_and_visible_to_conformance_watcher() {
+        use rusternetes_common::resources::pod::PodSpec;
+
+        let storage = Arc::new(StorageBackend::new_memory());
+        let runtime = CriContainerRuntime::connect(
+            "/tmp/rusternetes-test-missing-cri.sock",
+            "",
+            "/tmp/rusternetes-test-logs",
+        )
+        .await
+        .unwrap()
+        .with_event_recorder(Arc::clone(&storage));
+
+        let mut pod = Pod::new(
+            "sysctl-test",
+            PodSpec {
+                containers: vec![rusternetes_common::resources::pod::Container {
+                    name: "app".to_string(),
+                    image: "busybox".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        pod.metadata.namespace = Some("default".to_string());
+        pod.metadata.uid = "sysctl-test-uid".to_string();
+
+        // Simulate what create_and_start_container now does after start_container
+        // succeeds: emit the "Started" event so WaitForErrorEventOrSuccess can
+        // return instead of timing out.
+        runtime
+            .emit_event(
+                &pod,
+                Some("app"),
+                crate::events::STARTED_CONTAINER,
+                rusternetes_common::resources::EventType::Normal,
+                "Started container app",
+            )
+            .await;
+
+        // Verify the event is visible to a WaitForErrorEventOrSuccess-style watcher:
+        // search for a "Started" reason event on this pod.
+        let obj = crate::events::container_object_reference(&pod, "app");
+        let key = format!(
+            "/registry/events/default/{}",
+            Event::generate_name(&obj, crate::events::STARTED_CONTAINER)
+        );
+        let ev: Event = storage.get(&key).await.expect(
+            "Started event must be present so WaitForErrorEventOrSuccess can return; \
+             without it NC sysctl tests time out with `context deadline exceeded`",
+        );
+        assert_eq!(
+            ev.reason,
+            crate::events::STARTED_CONTAINER,
+            "reason must be \"Started\""
+        );
+        assert_eq!(
+            ev.event_type,
+            rusternetes_common::resources::EventType::Normal
+        );
+        // Container-scoped: fieldPath must identify the specific container.
+        assert_eq!(
+            ev.involved_object.field_path.as_deref(),
+            Some("spec.containers{app}")
+        );
+    }
+
+    /// Companion test for the Created event emitted before StartContainer.
+    /// Upstream `kuberuntime_container.go:290`:
+    ///   m.recordContainerEvent(…, events.CreatedContainer, "Container created")
+    #[tokio::test]
+    async fn created_event_is_emitted_via_emit_event() {
+        use rusternetes_common::resources::pod::PodSpec;
+
+        let storage = Arc::new(StorageBackend::new_memory());
+        let runtime = CriContainerRuntime::connect(
+            "/tmp/rusternetes-test-missing-cri.sock",
+            "",
+            "/tmp/rusternetes-test-logs",
+        )
+        .await
+        .unwrap()
+        .with_event_recorder(Arc::clone(&storage));
+
+        let mut pod = Pod::new(
+            "sysctl-created",
+            PodSpec {
+                containers: vec![rusternetes_common::resources::pod::Container {
+                    name: "app".to_string(),
+                    image: "busybox".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        pod.metadata.namespace = Some("default".to_string());
+        pod.metadata.uid = "sysctl-created-uid".to_string();
+
+        runtime
+            .emit_event(
+                &pod,
+                Some("app"),
+                crate::events::CREATED_CONTAINER,
+                rusternetes_common::resources::EventType::Normal,
+                "Created container app",
+            )
+            .await;
+
+        let obj = crate::events::container_object_reference(&pod, "app");
+        let key = format!(
+            "/registry/events/default/{}",
+            Event::generate_name(&obj, crate::events::CREATED_CONTAINER)
+        );
+        let ev: Event = storage
+            .get(&key)
+            .await
+            .expect("Created event must be present");
+        assert_eq!(ev.reason, crate::events::CREATED_CONTAINER);
+        assert_eq!(
+            ev.event_type,
+            rusternetes_common::resources::EventType::Normal
+        );
     }
 }

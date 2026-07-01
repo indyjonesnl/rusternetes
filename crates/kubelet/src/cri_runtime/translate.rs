@@ -1728,6 +1728,119 @@ mod tests {
         }
     }
 
+    /// Regression test for NC failure: "[sig-node] Sysctls [LinuxOnly]
+    /// [NodeConformance] should support sysctls [Environment:NotInUserNS]"
+    ///
+    /// The test creates a pod with `spec.securityContext.sysctls:
+    /// [{name: kernel.shm_rmid_forced, value: "1"}]` and verifies that
+    /// `LinuxPodSandboxConfig.sysctls` (the CRI sandbox map) contains the
+    /// entry. Upstream: `generatePodSandboxLinuxConfig` copies every sysctl
+    /// from `pod.Spec.SecurityContext.Sysctls` into `lc.Sysctls`
+    /// (`pkg/kubelet/kuberuntime/kuberuntime_sandbox.go:181-183`):
+    ///
+    /// ```go
+    /// for _, c := range pod.Spec.SecurityContext.Sysctls {
+    ///     sysctls[c.Name] = c.Value
+    /// }
+    /// lc.Sysctls = sysctls
+    /// ```
+    #[test]
+    fn nc_sysctl_dot_form_lands_in_cri_sandbox_sysctls_map() {
+        use rusternetes_common::resources::pod::{PodSecurityContext, Sysctl};
+        // Exact sysctl the NC test uses (sysctl.go:83-89 in k8s v1.35):
+        //   pod.Spec.SecurityContext.Sysctls = [{Name: "kernel.shm_rmid_forced", Value: "1"}]
+        let pod = pod_with(PodSpec {
+            security_context: Some(PodSecurityContext {
+                sysctls: Some(vec![Sysctl {
+                    name: "kernel.shm_rmid_forced".to_string(),
+                    value: "1".to_string(),
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let linux = sandbox_config(&pod, "/log/pods/test").linux.unwrap();
+        // CRI wire field is LinuxPodSandboxConfig.sysctls (map<string,string>, tag=3).
+        // NOT security_context.sysctls — the security context carries namespace
+        // options, seccomp, selinux etc; sysctls are a sibling field.
+        assert_eq!(
+            linux
+                .sysctls
+                .get("kernel.shm_rmid_forced")
+                .map(String::as_str),
+            Some("1"),
+            "kernel.shm_rmid_forced must appear in LinuxPodSandboxConfig.sysctls"
+        );
+        // Sysctls must NOT bleed into security_context (wrong CRI field).
+        assert!(
+            linux.security_context.is_some(),
+            "security_context must still be set"
+        );
+    }
+
+    /// Regression test for NC failure: "[sig-node] Sysctls should support
+    /// sysctls with slashes as separator".
+    ///
+    /// Kubernetes accepts `/` as an alternate separator for `.` in sysctl names.
+    /// runc/youki use dot form internally; passing a slash-form name to the CRI
+    /// sandbox would cause RunPodSandbox to fail with "sysctl is not in a
+    /// separate kernel namespace". The kubelet normalizes before the CRI call.
+    ///
+    /// Upstream normalization: `ConvertPodSysctlsVariableToDotsSeparator` calls
+    /// `utilsysctl.NormalizeName` from
+    /// `staging/src/k8s.io/component-helpers/node/util/sysctl/sysctl.go:109-131`:
+    ///
+    /// ```go
+    /// func NormalizeName(val string) string {
+    ///     firstSepIndex := strings.IndexAny(val, "./")
+    ///     if firstSepIndex == -1 || val[firstSepIndex] == '.' {
+    ///         return val
+    ///     }
+    ///     // first separator is `/` → swap `.`↔`/` throughout
+    ///     f := func(r rune) rune {
+    ///         switch r {
+    ///         case '.': return '/'
+    ///         case '/': return '.'
+    ///         }
+    ///         return r
+    ///     }
+    ///     return strings.Map(f, val)
+    /// }
+    /// ```
+    #[test]
+    fn nc_sysctl_slash_form_is_normalized_to_dot_form_in_cri_sandbox() {
+        use rusternetes_common::resources::pod::{PodSecurityContext, Sysctl};
+        // Exact sysctl the NC slash test uses (sysctl.go:192-196 in k8s v1.35):
+        //   pod.Spec.SecurityContext.Sysctls = [{Name: "kernel/shm_rmid_forced", Value: "1"}]
+        let pod = pod_with(PodSpec {
+            security_context: Some(PodSecurityContext {
+                sysctls: Some(vec![Sysctl {
+                    name: "kernel/shm_rmid_forced".to_string(),
+                    value: "1".to_string(),
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let sysctls = sandbox_config(&pod, "/log/pods/test")
+            .linux
+            .unwrap()
+            .sysctls;
+        // Slash form must be normalized to dot form before the CRI call.
+        // runc/youki identify sysctls by dot-form name; passing "kernel/shm_rmid_forced"
+        // causes RunPodSandbox to reject the sandbox with "sysctl not in a separate
+        // kernel namespace" (kuberuntime_manager.go:1529-1537 comment).
+        assert_eq!(
+            sysctls.get("kernel.shm_rmid_forced").map(String::as_str),
+            Some("1"),
+            "slash-form kernel/shm_rmid_forced must be normalized to kernel.shm_rmid_forced"
+        );
+        assert!(
+            !sysctls.contains_key("kernel/shm_rmid_forced"),
+            "slash form must not reach the CRI runtime"
+        );
+    }
+
     #[test]
     fn no_pod_sysctls_yields_empty_sandbox_map() {
         let pod = pod_with(PodSpec::default());
