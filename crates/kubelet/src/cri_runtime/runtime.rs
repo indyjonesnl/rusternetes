@@ -546,6 +546,54 @@ impl CriContainerRuntime {
         self.inject_service_env(&mut cfg);
         self.inject_service_links(pod, &mut cfg).await;
 
+        // Set `attempt` (= restartCount) in the container metadata, matching
+        // upstream `startContainer` (pkg/kubelet/kuberuntime/
+        // kuberuntime_container.go:223-243):
+        // ```go
+        // restartCount := 0
+        // containerStatus := podStatus.FindContainerStatusByName(container.Name)
+        // if containerStatus != nil {
+        //     restartCount = containerStatus.RestartCount + 1
+        // }
+        // ```
+        // Without this, `translate::container_config` always stamps `attempt=0`,
+        // so `map_container_status` always reports `restartCount=0` after a
+        // restart — the monotonic-restart-count NodeConformance failure.
+        //
+        // We derive the next attempt by querying the highest existing `attempt`
+        // for this pod+container from the CRI runtime (covers sandbox recreation
+        // where the in-memory pod status was also reset).
+        {
+            let filter = v1::ContainerFilter {
+                label_selector: std::collections::HashMap::from([
+                    (
+                        translate::labels::POD_UID.to_string(),
+                        pod.metadata.uid.clone(),
+                    ),
+                    (
+                        translate::labels::CONTAINER_NAME.to_string(),
+                        container.name.clone(),
+                    ),
+                ]),
+                ..Default::default()
+            };
+            let next_attempt = cri
+                .list_containers(Some(filter))
+                .await
+                .ok()
+                .map(|cs| {
+                    cs.iter()
+                        .map(|c| c.metadata.as_ref().map(|m| m.attempt).unwrap_or(0))
+                        .max()
+                        .map(|max| max + 1)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            if let Some(meta) = cfg.metadata.as_mut() {
+                meta.attempt = next_attempt;
+            }
+        }
+
         // Bind-mount a per-container host file at the container's
         // terminationMessagePath so it can write a termination message that the
         // kubelet reads back on exit (#442). Best-effort: if the host file can't

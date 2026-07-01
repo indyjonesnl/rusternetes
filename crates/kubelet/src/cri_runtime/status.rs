@@ -372,4 +372,64 @@ mod tests {
         assert_eq!(nanos_to_rfc3339(0), None);
         assert!(nanos_to_rfc3339(1_700_000_000_000_000_000).is_some());
     }
+
+    /// Regression for "[sig-node] Probing container should have monotonically
+    /// increasing restart count".
+    ///
+    /// `map_container_status` derives `restart_count` from `metadata.attempt`
+    /// which is the value the kubelet stamps into the container at creation time
+    /// (matching upstream `startContainer` which passes `restartCount` into
+    /// `generateContainerConfig` → CRI `ContainerMetadata.attempt`):
+    /// ```go
+    /// // pkg/kubelet/kuberuntime/kuberuntime_container.go:371
+    /// Attempt: restartCountUint32,
+    /// ```
+    /// When the kubelet correctly stamps `attempt = prev_max + 1`, the reported
+    /// restartCount is monotonic. This test verifies that `map_container_status`
+    /// faithfully reads the `attempt` field and never resets it.
+    #[test]
+    fn restart_count_is_monotonic_from_cri_attempt() {
+        // First run: attempt=0 → restartCount 0.
+        let mut cri = cri_status(v1::ContainerState::ContainerRunning);
+        cri.metadata = Some(v1::ContainerMetadata {
+            name: "app".to_string(),
+            attempt: 0,
+        });
+        let s0 = map_container_status(&cri);
+        assert_eq!(s0.restart_count, 0, "first run: restartCount must be 0");
+
+        // After one restart: attempt=1 → restartCount 1 (never regresses to 0).
+        cri.metadata = Some(v1::ContainerMetadata {
+            name: "app".to_string(),
+            attempt: 1,
+        });
+        let s1 = map_container_status(&cri);
+        assert_eq!(
+            s1.restart_count, 1,
+            "after first restart: restartCount must be 1"
+        );
+        assert!(
+            s1.restart_count >= s0.restart_count,
+            "restartCount must be monotonically non-decreasing: {} >= {}",
+            s1.restart_count,
+            s0.restart_count
+        );
+
+        // After second restart: attempt=2 → restartCount 2.
+        cri.metadata = Some(v1::ContainerMetadata {
+            name: "app".to_string(),
+            attempt: 2,
+        });
+        let s2 = map_container_status(&cri);
+        assert_eq!(
+            s2.restart_count, 2,
+            "after second restart: restartCount must be 2"
+        );
+        assert!(
+            s2.restart_count >= s1.restart_count,
+            "restartCount must be monotonically non-decreasing: {} >= {}",
+            s2.restart_count,
+            s1.restart_count
+        );
+    }
 }
