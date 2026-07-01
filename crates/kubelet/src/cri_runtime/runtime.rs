@@ -1112,6 +1112,14 @@ impl CriContainerRuntime {
                 == Some("Always");
             st.ready = init_container_ready(&st.state, restartable, st.ready);
         }
+        // Init containers that have not been started yet (not in the CRI) are
+        // synthesised by `statuses_for` as `Waiting{"ContainerCreating"}`.
+        // Upstream always uses `PodInitializing` as the default for containers
+        // in a pod that has init containers (kubelet_pods.go:2431-2433). Fix
+        // that up so the NC test "[sig-node] InitContainer [NodeConformance]
+        // should not start app containers if init containers fail on a
+        // RestartAlways pod" gets the expected `waiting.reason`.
+        fix_not_started_init_waiting_reason(&mut statuses);
         Some(statuses)
     }
 
@@ -2281,6 +2289,41 @@ fn format_runtime_version(v: &v1::VersionResponse) -> String {
     format!("{}://{}", v.runtime_name, v.runtime_version)
 }
 
+/// Replace `Waiting { reason: "ContainerCreating" }` with
+/// `Waiting { reason: "PodInitializing" }` for init container statuses.
+///
+/// Upstream `kubelet_pods.go convertToAPIContainerStatuses` (release-1.35,
+/// line 2431-2433) sets the default waiting reason for **all** containers to
+/// `PodInitializing` when the pod has init containers:
+///
+/// ```go
+/// defaultWaitingState := v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: ContainerCreating}}
+/// if hasInitContainers {
+///     defaultWaitingState = v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: PodInitializing}}
+/// }
+/// ```
+///
+/// Containers **not yet reached** (because an earlier init container has not
+/// succeeded) are never submitted to the CRI and therefore arrive here from
+/// `statuses_for` with the synthesised `ContainerCreating` reason.  That
+/// reason is wrong for them — the NC test "[sig-node] InitContainer
+/// [NodeConformance] should not start app containers if init containers fail
+/// on a RestartAlways pod" asserts `waiting.reason == "PodInitializing"` for
+/// the second init container while the first is still failing/retrying.
+///
+/// The same replacement also covers the brief `ContainerCreated` CRI state
+/// (a container that has been created but not yet started), which upstream
+/// maps to `Waiting{}` with an *empty* reason rather than `ContainerCreating`.
+pub(crate) fn fix_not_started_init_waiting_reason(statuses: &mut [ContainerStatus]) {
+    for st in statuses {
+        if let Some(ContainerState::Waiting { reason, .. }) = &mut st.state {
+            if reason.as_deref() == Some("ContainerCreating") {
+                *reason = Some("PodInitializing".to_string());
+            }
+        }
+    }
+}
+
 /// Readiness of an init container's status, per upstream prober_manager. A
 /// plain (non-restartable) init container is Ready only once it has terminated
 /// successfully (exit 0). A restartable init (sidecar) keeps its existing
@@ -2944,5 +2987,85 @@ mod tests {
             ev.event_type,
             rusternetes_common::resources::EventType::Normal
         );
+    }
+
+    /// Regression test for NC "[sig-node] InitContainer [NodeConformance]
+    /// should not start app containers if init containers fail on a
+    /// RestartAlways pod" (init_container.go:440).
+    ///
+    /// Scenario: pod with init1 (failing/retrying) + init2 (never started).
+    /// `statuses_for` synthesises a `Waiting{"ContainerCreating"}` status for
+    /// init2 because the CRI has never created it.  After
+    /// `fix_not_started_init_waiting_reason` that must become
+    /// `Waiting{"PodInitializing"}`, matching upstream's default
+    /// (`kubelet_pods.go:2431-2433`).
+    #[test]
+    fn second_init_container_not_started_shows_pod_initializing() {
+        // init1 is failing (CrashLoopBackOff), init2 was never submitted to the
+        // CRI so `statuses_for` returns it as Waiting{"ContainerCreating"}.
+        let mut statuses = vec![
+            // init1: already has a real CRI-derived reason — must be unchanged.
+            ContainerStatus {
+                name: "init1".to_string(),
+                ready: false,
+                restart_count: 2,
+                state: Some(ContainerState::Waiting {
+                    reason: Some("CrashLoopBackOff".to_string()),
+                    message: Some("back-off restarting failed container".to_string()),
+                }),
+                last_state: Some(ContainerState::Terminated {
+                    exit_code: 1,
+                    signal: None,
+                    reason: Some("Error".to_string()),
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                }),
+                ..waiting_status("init1")
+            },
+            // init2: synthesised by `waiting_status` — ContainerCreating must
+            // be replaced with PodInitializing.
+            waiting_status("init2"),
+        ];
+
+        // Before the fix, init2 has ContainerCreating — verify the pre-fix
+        // state so the test documents the regression it catches.
+        match &statuses[1].state {
+            Some(ContainerState::Waiting { reason, .. }) => {
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("ContainerCreating"),
+                    "pre-fix: waiting_status produces ContainerCreating"
+                );
+            }
+            _ => panic!("init2 should start as Waiting"),
+        }
+
+        fix_not_started_init_waiting_reason(&mut statuses);
+
+        // After the fix: init1's CrashLoopBackOff reason is preserved.
+        match &statuses[0].state {
+            Some(ContainerState::Waiting { reason, .. }) => {
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("CrashLoopBackOff"),
+                    "init1 CrashLoopBackOff must not be changed"
+                );
+            }
+            _ => panic!("init1 should still be Waiting/CrashLoopBackOff"),
+        }
+
+        // After the fix: init2 reports PodInitializing, not ContainerCreating.
+        match &statuses[1].state {
+            Some(ContainerState::Waiting { reason, .. }) => {
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("PodInitializing"),
+                    "init2 (never started) must be Waiting/PodInitializing, not ContainerCreating"
+                );
+            }
+            _ => panic!("init2 should be Waiting/PodInitializing after fix"),
+        }
     }
 }
