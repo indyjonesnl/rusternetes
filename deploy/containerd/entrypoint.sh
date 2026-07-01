@@ -11,7 +11,7 @@ sysctl -w fs.inotify.max_user_watches=1048576 >/dev/null 2>&1 || true
 # cgroup v2 nesting (the kind/k3d fix): in a private cgroup namespace the
 # container's processes sit directly in the cgroup root, so cgroup v2's
 # "no internal processes" rule forbids enabling controllers in subtree_control.
-# Youki then fails with `+io ... Not supported` when it tries to set up a pod
+# crun then fails with `+io ... Not supported` when it tries to set up a pod
 # cgroup. Move our processes into a leaf cgroup, then delegate every available
 # controller down so the runtime can create pod cgroups.
 if [ -f /sys/fs/cgroup/cgroup.controllers ]; then

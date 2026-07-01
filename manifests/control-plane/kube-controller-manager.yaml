@@ -53,7 +53,7 @@ spec:
     # Node IPAM (--allocate-node-cidrs etc.) is opt-in: bootstrap-cluster.sh
     # replaces the placeholder line at the end of args (the NODE_IPAM_ARGS token)
     # with the allocator flags when ALLOCATE_NODE_CIDRS is set in its environment
-    # (the flannel stack does this — see compose.flannel.yml), and otherwise
+    # (the Calico stack does this — see compose.calico.yml), and otherwise
     # strips it. Off by default, so conformance/sqlite/etcd stacks are unchanged.
     args:
     - "--api-server-url"

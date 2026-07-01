@@ -149,7 +149,11 @@ services:
     # 10.244.0.0/16), so the old bollard-only `--network` flag (which attached
     # pause containers to a Docker bridge) no longer applies — omit it to match
     # the CRI-migrated compose.sqlite.yml kubelet.
-    command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
+    # NodeConformance runs on developer/CI hosts whose backing filesystem may
+    # already be above kubelet's default disk-pressure thresholds. Keep memory
+    # eviction enabled, but disable disk-based eviction for this harness so the
+    # suite exercises pod behavior instead of host free-space variance.
+    command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--eviction-hard", "memory.available<100Mi"]
 
   scheduler:
     build:
@@ -193,7 +197,7 @@ services:
       - RUST_LOG=info
     command: ["--etcd-servers", "http://rhino:2379", "--sync-interval", "2"]
 
-  # Shared CRI runtime: containerd (CRI plugin) + Youki. The kubelet drives pod
+  # Shared CRI runtime: containerd (CRI plugin) + crun. The kubelet drives pod
   # lifecycle over CRI v1 through this service instead of a Docker/Podman socket
   # (the kubelet was cut over to CRI — without a containerd here the kubelet's
   # ListPodSandbox/ListContainers fail with "No such file or directory" and

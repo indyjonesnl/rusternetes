@@ -1,9 +1,10 @@
 #!/bin/sh
 # Entrypoint for a rusternetes node: one container running containerd (CRI +
-# Youki) AND the kubelet, kind-style. Bundling them in a single container means
+# crun) AND the kubelet, kind-style. Bundling them in a single container means
 # the kubelet's hostPath validation and containerd's hostPath mounts share one
-# filesystem — required for flannel's CNI install (/opt/cni/bin, /etc/cni/net.d,
-# /run/flannel) and for pod hostPath volumes to resolve consistently.
+# filesystem — required for Calico's CNI install (/opt/cni/bin, /etc/cni/net.d,
+# /var/lib/calico, /var/run/calico) and for pod hostPath volumes to resolve
+# consistently.
 set -e
 
 # --- containerd prerequisites (see deploy/containerd/entrypoint.sh) -----------
@@ -11,7 +12,7 @@ sysctl -w fs.inotify.max_user_instances=1024 >/dev/null 2>&1 || true
 sysctl -w fs.inotify.max_user_watches=1048576 >/dev/null 2>&1 || true
 
 # cgroup v2 nesting fix (kind/k3d): move our processes into a leaf so controllers
-# can be delegated, else Youki fails with "+io ... Not supported".
+# can be delegated, else crun fails with "+io ... Not supported".
 if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
     mkdir -p /sys/fs/cgroup/init
     while read -r pid; do

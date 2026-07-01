@@ -164,6 +164,7 @@ echo "[4/7] Bootstrapping cluster (kubernetes service, default ServiceAccounts, 
 # misleading "DNS will NOT be functional" warning every run.
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME}" \
 RUSTERNETES_NETWORK_NAME="${RUSTERNETES_NETWORK_NAME:-rusternetes-nc-net}" \
+CONTAINERD_SERVICE_CONTAINER="${CONTAINERD_SERVICE_CONTAINER:-rusternetes-nc-containerd}" \
 SKIP_DNS_WIRING=1 \
 bash "${PROJECT_ROOT}/scripts/bootstrap-cluster.sh" || {
     echo "WARNING: bootstrap-cluster.sh exited non-zero — continuing anyway, some BeforeSuite checks may fail."
