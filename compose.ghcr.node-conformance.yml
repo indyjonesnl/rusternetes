@@ -1,6 +1,6 @@
 # GHCR image-name overlay for the compose.node-conformance.yml single-node
 # stack. Same images as compose.ghcr.yml — both stacks build identical
-# Dockerfile.services targets. Consumed by scripts/run-node-conformance.sh
+# services.Dockerfile targets. Consumed by scripts/run-node-conformance.sh
 # when RUSTERNETES_IMAGE_TAG is set (pull instead of build, with fallback).
 # Keep in sync with compose.node-conformance.yml —
 # scripts/tests/test-ghcr-overlays.sh enforces it.

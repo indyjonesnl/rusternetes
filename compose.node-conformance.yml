@@ -23,7 +23,7 @@ services:
   rhino:
     build:
       context: ./rhino
-      dockerfile: ../Dockerfile.rhino
+      dockerfile: ../rhino.Dockerfile
     container_name: rusternetes-nc-rhino
     ports:
       - "2379:2379"
@@ -48,7 +48,7 @@ services:
   api-server:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: api-server
       additional_contexts:
         rhino: ./rhino
@@ -102,7 +102,7 @@ services:
   kubelet:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: kubelet
       additional_contexts:
         rhino: ./rhino
@@ -154,7 +154,7 @@ services:
   scheduler:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: scheduler
       additional_contexts:
         rhino: ./rhino
@@ -179,7 +179,7 @@ services:
   controller-manager:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: controller-manager
       additional_contexts:
         rhino: ./rhino
@@ -205,7 +205,7 @@ services:
     image: rusternetes-containerd:latest
     build:
       context: .
-      dockerfile: Dockerfile.containerd
+      dockerfile: containerd.Dockerfile
     container_name: rusternetes-nc-containerd
     privileged: true
     networks:

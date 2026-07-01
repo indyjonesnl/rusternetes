@@ -12,11 +12,11 @@
 # Usage (from compose):
 #   build:
 #     context: ..
-#     dockerfile: rusternetes/Dockerfile.all-in-one
+#     dockerfile: rusternetes/all-in-one.Dockerfile
 #     args:
 #       CARGO_FEATURES: redis
 #
-# Two-stage cargo build (matches Dockerfile.services pattern):
+# Two-stage cargo build (matches services.Dockerfile pattern):
 #   Pass 1 — copy crate manifests + dummy src files, compile dep graph
 #            into cache-mounted target/. Cached until a Cargo.toml /
 #            Cargo.lock / build.rs / proto/ changes.
@@ -43,15 +43,15 @@ RUN npm run build
 
 # Stage 2: Build the Rust binary.
 #
-# Pin the toolchain — keep in lock-step with `Dockerfile.services` so
+# Pin the toolchain — keep in lock-step with `services.Dockerfile` so
 # both compose stacks share the same rustc and the BuildKit
 # /app/target cache stays valid. See the comment in
-# Dockerfile.services for the rationale.
+# services.Dockerfile for the rationale.
 FROM rust:1.95 AS builder
 
 # sccache wraps rustc so identical (crate, source, flags) compilations
 # hit the BuildKit cache mount below. Shares cache id `sccache-rusternetes`
-# with Dockerfile.services and Dockerfile.kubectl so a build of any of
+# with services.Dockerfile and kubectl.Dockerfile so a build of any of
 # them warms the cache for the others.
 ARG SCCACHE_VERSION=v0.8.2
 RUN apt-get update && apt-get install -y \
@@ -126,7 +126,7 @@ COPY rusternetes/crates/cri/proto           ./rusternetes/crates/cri/proto
 #                 kube-proxy, scheduler
 RUN set -eux; \
     cd /build/rusternetes; \
-    for c in client common storage cloud-providers netstack protobuf middleware admission-webhook discovery cri streamproxy; do \
+    for c in client common storage cloud-providers netstack protobuf middleware admission-webhook discovery cri streamproxy test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -138,7 +138,7 @@ RUN set -eux; \
         echo "fn main(){}" > crates/$c/src/main.rs; \
     done
 
-# Dummy bench files — see Dockerfile.services for the detailed rationale.
+# Dummy bench files — see services.Dockerfile for the detailed rationale.
 # Path is rooted at /build/rusternetes because this Dockerfile's
 # workspace lives there (rhino sits next to it at /build/rhino).
 RUN mkdir -p /build/rusternetes/crates/common/benches \

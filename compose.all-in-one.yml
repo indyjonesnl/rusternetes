@@ -16,7 +16,7 @@ services:
   rusternetes:
     build:
       context: ..
-      dockerfile: rusternetes/Dockerfile.all-in-one
+      dockerfile: rusternetes/all-in-one.Dockerfile
       args:
         CARGO_FEATURES: sqlite
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
@@ -51,7 +51,7 @@ services:
       - "/etc/kubernetes/pki/api-server.key"
       - "--skip-auth"
       # kube-proxy now runs in-process (no `--disable-proxy`). The image
-      # ships iptables / iproute2 for that — see Dockerfile.all-in-one.
+      # ships iptables / iproute2 for that — see all-in-one.Dockerfile.
       - "--console-dir"
       - "/app/console"
       - "--network"

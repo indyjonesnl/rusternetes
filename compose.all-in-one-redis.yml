@@ -33,7 +33,7 @@ services:
   rusternetes:
     build:
       context: ..
-      dockerfile: rusternetes/Dockerfile.all-in-one
+      dockerfile: rusternetes/all-in-one.Dockerfile
       args:
         CARGO_FEATURES: redis
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"

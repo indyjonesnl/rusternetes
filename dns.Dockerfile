@@ -3,18 +3,18 @@
 # Standalone Dockerfile for the rusternetes-dns binary.
 #
 # This file exists primarily so the DNS image can be built independently
-# of the larger Dockerfile.services pipeline — useful for fast local
+# of the larger services.Dockerfile pipeline — useful for fast local
 # iteration on the DNS code without rebuilding the api-server / kubelet
 # / scheduler / controller-manager / kube-proxy stages alongside it.
 #
 # For the docker-compose flow, prefer the `dns` target in
-# Dockerfile.services: it shares the cargo-builder stage with the other
+# services.Dockerfile: it shares the cargo-builder stage with the other
 # service binaries, so a `docker compose build` populates the BuildKit
 # cache once and reuses it across all six services.
 #
-# Build (rhino must be adjacent — same constraint Dockerfile.services
+# Build (rhino must be adjacent — same constraint services.Dockerfile
 # carries via the compose `additional_contexts: rhino: ../rhino` entry):
-#   docker build -f Dockerfile.dns --build-context rhino=../rhino \
+#   docker build -f dns.Dockerfile --build-context rhino=../rhino \
 #       -t rusternetes-dns:dev .
 #
 # Run (against an etcd reachable from the container):
@@ -81,11 +81,12 @@ COPY crates/test_support/Cargo.toml       crates/test_support/Cargo.toml
 
 COPY crates/api-server/build.rs crates/api-server/build.rs
 COPY crates/api-server/proto    crates/api-server/proto
+COPY crates/common/build.rs     crates/common/build.rs
 
 # Dummy sources so `cargo build` can resolve the workspace before the
 # real source COPY further down.
 RUN set -eux; \
-    for c in client common storage cloud-providers; do \
+    for c in client common storage cloud-providers streamproxy test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -98,11 +99,13 @@ RUN set -eux; \
     done
 
 RUN mkdir -p crates/common/benches \
- && echo "fn main(){}" > crates/common/benches/regex_cache.rs
+ && echo "fn main(){}" > crates/common/benches/regex_cache.rs \
+ && mkdir -p crates/storage/benches \
+ && echo "fn main(){}" > crates/storage/benches/watch_latency.rs
 
 # Pass 1: dependency-only compile, then wipe the dummy workspace
 # artefacts so Pass 2 compiles them from real src (see
-# Dockerfile.services for the rationale).
+# services.Dockerfile for the rationale).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \

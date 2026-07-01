@@ -33,7 +33,7 @@ services:
   api-server:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: api-server
@@ -99,7 +99,7 @@ services:
     profiles: ["build"]
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: scheduler
@@ -116,7 +116,7 @@ services:
     profiles: ["build"]
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: controller-manager
@@ -133,7 +133,7 @@ services:
     image: rusternetes-containerd:latest
     build:
       context: .
-      dockerfile: Dockerfile.containerd
+      dockerfile: containerd.Dockerfile
     container_name: rusternetes-containerd
     restart: unless-stopped
     privileged: true
@@ -152,7 +152,7 @@ services:
   kubelet:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: kubelet
@@ -191,7 +191,7 @@ services:
   kubelet2:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: kubelet
@@ -228,7 +228,7 @@ services:
   kube-proxy:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: kube-proxy
@@ -275,7 +275,7 @@ services:
     image: rusternetes-dns:latest
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: dns

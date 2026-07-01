@@ -354,17 +354,17 @@ Selected flags (run `rusternetes --help` for the complete list):
 
 All runtime images are built **`FROM debian:sid-slim`**. Rust builder stages
 pin `rust:1.95`. The two Dockerfiles that matter for deployment are
-`Dockerfile.services` (per-component) and `Dockerfile.all-in-one` (single
+`services.Dockerfile` (per-component) and `all-in-one.Dockerfile` (single
 binary).
 
 | Dockerfile | Build targets | Produces |
 |---|---|---|
-| **`Dockerfile.services`** | `api-server`, `kubelet`, `scheduler`, `controller-manager`, `kube-proxy`, `dns` | One image per component. A shared `cargo-builder` stage compiles all binaries once; a `console-builder` stage bundles the web console into the `api-server` image. |
-| **`Dockerfile.all-in-one`** | *(single stage)* | The `rusternetes` all-in-one image, built with `CARGO_FEATURES=sqlite` or `redis`, console bundled in. |
-| **`Dockerfile.rhino`** | *(single stage)* | The `rhino-server` image — etcd-compatible gRPC over SQLite/Redis. |
-| **`Dockerfile.dns`** | *(single stage)* | Standalone `rusternetes-dns`. |
-| **`Dockerfile.kubectl`** | *(single stage)* | Standalone `kubectl`. |
-| **`Dockerfile.local-binary.services`** | `api-server`, `kubelet`, `scheduler`, `controller-manager`, `kube-proxy` | Thin images that **bind a host-built `target/release/<bin>`** instead of compiling — fast local iteration. |
+| **`services.Dockerfile`** | `api-server`, `kubelet`, `scheduler`, `controller-manager`, `kube-proxy`, `dns` | One image per component. A shared `cargo-builder` stage compiles all binaries once; a `console-builder` stage bundles the web console into the `api-server` image. |
+| **`all-in-one.Dockerfile`** | *(single stage)* | The `rusternetes` all-in-one image, built with `CARGO_FEATURES=sqlite` or `redis`, console bundled in. |
+| **`rhino.Dockerfile`** | *(single stage)* | The `rhino-server` image — etcd-compatible gRPC over SQLite/Redis. |
+| **`dns.Dockerfile`** | *(single stage)* | Standalone `rusternetes-dns`. |
+| **`kubectl.Dockerfile`** | *(single stage)* | Standalone `kubectl`. |
+| **`local-binary.services.Dockerfile`** | `api-server`, `kubelet`, `scheduler`, `controller-manager`, `kube-proxy` | Thin images that **bind a host-built `target/release/<bin>`** instead of compiling — fast local iteration. |
 
 > Compose stacks build these images locally via `docker compose build` /
 > `podman compose build`. CI builds them the same way; the only image published

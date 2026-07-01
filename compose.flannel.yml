@@ -1,7 +1,7 @@
 # Per-node (kind-style) stack with flannel-rs CNI.
 #
 # Each `node-N` is a single container running its own containerd (CRI + Youki)
-# AND the kubelet (Dockerfile.node), so the kubelet and runtime share a
+# AND the kubelet (node.Dockerfile), so the kubelet and runtime share a
 # filesystem — required for flannel's hostPath CNI install. Pod networking is
 # provided by the flannel-rs DaemonSet (deploy via kubectl after bootstrap),
 # which meshes the nodes over VXLAN.
@@ -25,7 +25,7 @@ x-sccache-args: &sccache-args
 # Shared build config for the two node containers.
 x-node-build: &node-build
   context: .
-  dockerfile: Dockerfile.node
+  dockerfile: node.Dockerfile
   args:
     KUBELET_IMAGE: "${KUBELET_IMAGE:-isolated-work-kubelet:latest}"
     CONTAINERD_IMAGE: "${CONTAINERD_IMAGE:-rusternetes-containerd:latest}"
@@ -34,7 +34,7 @@ services:
   rhino:
     build:
       context: ./rhino
-      dockerfile: ../Dockerfile.rhino
+      dockerfile: ../rhino.Dockerfile
     container_name: rusternetes-rhino
     restart: unless-stopped
     ports:
@@ -54,7 +54,7 @@ services:
   api-server:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       additional_contexts:
         rhino: ./rhino
       args: *sccache-args
@@ -153,7 +153,7 @@ services:
   kube-proxy-1:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       additional_contexts:
         rhino: ./rhino
       args: *sccache-args

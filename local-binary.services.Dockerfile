@@ -9,7 +9,7 @@
 #                  -f compose.local-binary.node-conformance.yml \
 #                  build
 #
-# Why: the cargo-builder stage in Dockerfile.services is slow even with
+# Why: the cargo-builder stage in services.Dockerfile is slow even with
 # the sccache cache mount (sccache server crashes mid-build are not
 # uncommon on a workstation under memory pressure). Host builds use the
 # user's incremental target/ and warm sccache, finishing in seconds for
@@ -65,7 +65,7 @@ COPY target/release/kubelet /app/kubelet
 # Do NOT declare `VOLUME ["/var/run"]` — the runtime socket comes from the
 # compose bind mount, not a volume. A /var/run VOLUME creates a fresh anonymous
 # volume per container start that becomes the copy target for an rshared mount
-# propagation explosion on kubelet restart. See #66 / Dockerfile.services.
+# propagation explosion on kubelet restart. See #66 / services.Dockerfile.
 
 ENTRYPOINT ["/app/kubelet"]
 CMD ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379"]

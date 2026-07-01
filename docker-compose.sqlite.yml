@@ -19,7 +19,7 @@ services:
   rhino:
     build:
       context: ../rhino
-      dockerfile: ../rusternetes/Dockerfile.rhino
+      dockerfile: ../rusternetes/rhino.Dockerfile
     container_name: rusternetes-rhino
     ports:
       - "2379:2379"
@@ -45,7 +45,7 @@ services:
   api-server:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: api-server
     container_name: rusternetes-api-server
     ports:
@@ -83,7 +83,7 @@ services:
   scheduler:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: scheduler
     container_name: rusternetes-scheduler
     depends_on:
@@ -99,7 +99,7 @@ services:
   controller-manager:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: controller-manager
     container_name: rusternetes-controller-manager
     depends_on:
@@ -117,7 +117,7 @@ services:
   kubelet:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: kubelet
     container_name: rusternetes-kubelet
     privileged: true
@@ -142,7 +142,7 @@ services:
   kubelet2:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: kubelet
     container_name: rusternetes-kubelet2
     privileged: true
@@ -167,7 +167,7 @@ services:
   kube-proxy:
     build:
       context: .
-      dockerfile: Dockerfile.services
+      dockerfile: services.Dockerfile
       target: kube-proxy
     container_name: rusternetes-kube-proxy
     privileged: true

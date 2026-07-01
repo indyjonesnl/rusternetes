@@ -3,7 +3,7 @@
 # for flannel's hostPath CNI install and for pod hostPath volumes to resolve).
 #
 # Reuses two already-built images:
-#   - the containerd runtime base (Dockerfile.containerd) for containerd/youki/CNI
+#   - the containerd runtime base (containerd.Dockerfile) for containerd/youki/CNI
 #   - the kubelet image for the kubelet binary
 # Both image refs are ARGs so the build can point at whatever tags exist (the
 # compose build tags them per project).

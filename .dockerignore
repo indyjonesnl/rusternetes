@@ -4,7 +4,7 @@
 
 # Build artifacts
 target/
-# Re-include host-built binaries used by Dockerfile.local-binary.services
+# Re-include host-built binaries used by local-binary.services.Dockerfile
 !target/release/api-server
 !target/release/kubelet
 !target/release/scheduler

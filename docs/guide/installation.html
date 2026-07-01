@@ -298,7 +298,7 @@ cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> 
             <td>Shared multi-stage builder. Compose stacks pick the binary with <code>target: &lt;name&gt;</code>; one cargo invocation builds all five so dependency compile time is paid once.</td>
           </tr>
           <tr>
-            <td><code>Dockerfile.all-in-one</code></td>
+            <td><code>all-in-one.Dockerfile</code></td>
             <td><code>rusternetes</code></td>
             <td>Single binary that runs api-server + scheduler + controller-manager + kubelet as concurrent tokio tasks. Used by <code>compose.all-in-one.yml</code> and <code>compose.all-in-one-redis.yml</code>.</td>
           </tr>
