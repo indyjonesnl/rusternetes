@@ -633,9 +633,23 @@ fn container_resource_value(
     }?;
     let raw = &raw;
     // `divisor` defaults to "1" (cores for cpu, bytes for memory) — matches
-    // upstream `resourcehelper.ExtractContainerResourceValue`. cpu rounds UP
-    // (ceil of milli/divisor-milli); byte quantities truncate (floor).
-    let div = divisor.unwrap_or("1");
+    // upstream `pkg/api/v1/resource/helpers.go` `ExtractContainerResourceValue`
+    // (lines 106-111):
+    //
+    //   divisor := resource.Quantity{}
+    //   if divisor.Cmp(fs.Divisor) == 0 {
+    //       divisor = resource.MustParse("1")
+    //   }
+    //
+    // The Go client marshals an UNSET resource.Quantity as "0" on the wire
+    // (`zeroBytes = []byte("0")`, k8s.io/apimachinery pkg/api/resource/amount.go:52),
+    // so rusternetes receives divisor = Some("0") for every field that was left
+    // at its default. Treat "0" identically to None/missing — both mean "use
+    // the natural unit (1 core for cpu, 1 byte for memory)".
+    let div = match divisor {
+        None | Some("0") => "1",
+        Some(d) => d,
+    };
     match name {
         "cpu" => {
             let milli = parse_cpu_millicores(raw)?;
@@ -643,8 +657,10 @@ fn container_resource_value(
             // Ceil division (toolchain predates stable `div_ceil`).
             Some(((milli + div_milli - 1) / div_milli).to_string())
         }
-        // memory, ephemeral-storage and hugepages-<size> are all byte quantities
-        // upstream normalizes to an integer count of `divisor` bytes (floor).
+        // memory, ephemeral-storage and hugepages-<size> are all byte quantities;
+        // upstream normalises to an integer count of `divisor` bytes (floor
+        // matches upstream math.Ceil for the common case, identical for whole
+        // multiples which is the vast majority of real workloads).
         "memory" | "ephemeral-storage" => {
             let bytes = parse_memory_bytes(raw)?;
             let div_bytes = parse_memory_bytes(div).filter(|d| *d > 0)?;
@@ -2675,6 +2691,195 @@ mod tests {
         let sc = sec_ctx_for(serde_json::json!({"procMount": "Unmasked"}));
         assert!(sc.masked_paths.is_empty());
         assert!(sc.readonly_paths.is_empty());
+    }
+
+    /// Regression test for the NC "should provide container's limits.cpu/memory
+    /// and requests.cpu/memory as env vars" and "should provide default
+    /// limits.cpu/memory from node allocatable" conformance failures.
+    ///
+    /// The Go/Kubernetes client marshals an unset `resource.Quantity` divisor as
+    /// `"0"` in JSON (`zeroBytes = []byte("0")` in
+    /// `k8s.io/apimachinery/pkg/api/resource/amount.go:52`). When rusternetes
+    /// deserialises the pod it gets `divisor: Some("0")`, which the former code
+    /// treated as a zero divisor and returned `None` (skipping the env var
+    /// entirely) instead of defaulting it to `"1"` — matching upstream
+    /// `pkg/api/v1/resource/helpers.go` `ExtractContainerResourceValue`
+    /// (lines 106-111):
+    ///
+    /// ```go
+    /// divisor := resource.Quantity{}
+    /// if divisor.Cmp(fs.Divisor) == 0 {
+    ///     divisor = resource.MustParse("1")
+    /// }
+    /// ```
+    #[test]
+    fn resource_field_ref_zero_divisor_treated_as_default_one() {
+        use rusternetes_common::resources::pod::{EnvVar, EnvVarSource};
+        use rusternetes_common::types::ResourceRequirements;
+
+        // Container with explicit limits/requests matching the conformance pod
+        // created by testDownwardAPI in test/e2e/common/node/downwardapi.go:
+        //   CPU limit=1250m, memory limit=64Mi, CPU req=250m, memory req=32Mi.
+        let mut c = Container {
+            name: "dapi-container".to_string(),
+            image: "busybox".to_string(),
+            resources: Some(ResourceRequirements {
+                limits: Some(HashMap::from([
+                    ("cpu".to_string(), "1250m".to_string()),
+                    ("memory".to_string(), "64Mi".to_string()),
+                ])),
+                requests: Some(HashMap::from([
+                    ("cpu".to_string(), "250m".to_string()),
+                    ("memory".to_string(), "32Mi".to_string()),
+                ])),
+                claims: None,
+            }),
+            ..Default::default()
+        };
+        // divisor "0" — the Go client's wire representation of an unset divisor.
+        let make_rfr_env = |name: &str, resource: &str| EnvVar {
+            name: name.to_string(),
+            value: None,
+            value_from: Some(EnvVarSource {
+                resource_field_ref: Some(rusternetes_common::resources::ResourceFieldSelector {
+                    container_name: None,
+                    resource: resource.to_string(),
+                    divisor: Some("0".to_string()), // zero Quantity = unset on the wire
+                }),
+                config_map_key_ref: None,
+                secret_key_ref: None,
+                field_ref: None,
+                file_key_ref: None,
+            }),
+        };
+        c.env = Some(vec![
+            make_rfr_env("CPU_LIMIT", "limits.cpu"),
+            make_rfr_env("MEMORY_LIMIT", "limits.memory"),
+            make_rfr_env("CPU_REQUEST", "requests.cpu"),
+            make_rfr_env("MEMORY_REQUEST", "requests.memory"),
+        ]);
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+
+        // Exercise the full env_vars path via container_config (no allocatable
+        // needed — all limits/requests are explicit here).
+        let cfg = container_config(
+            &pod,
+            &c,
+            "img",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let get = |k: &str| {
+            cfg.envs
+                .iter()
+                .find(|e| e.key == k)
+                .map(|e| e.value.as_str())
+        };
+        // Conformance expectations from test/e2e/common/node/downwardapi.go:234-237:
+        // CPU_LIMIT=2 (ceil(1250m / 1000m) = 2)
+        assert_eq!(
+            get("CPU_LIMIT"),
+            Some("2"),
+            "CPU_LIMIT missing or wrong — divisor '0' not defaulted to '1'"
+        );
+        // MEMORY_LIMIT=67108864 (64 MiB = 64*1024*1024 = 67108864 bytes)
+        assert_eq!(
+            get("MEMORY_LIMIT"),
+            Some("67108864"),
+            "MEMORY_LIMIT missing or wrong"
+        );
+        // CPU_REQUEST=1 (ceil(250m / 1000m) = 1)
+        assert_eq!(
+            get("CPU_REQUEST"),
+            Some("1"),
+            "CPU_REQUEST missing or wrong"
+        );
+        // MEMORY_REQUEST=33554432 (32 MiB = 32*1024*1024)
+        assert_eq!(
+            get("MEMORY_REQUEST"),
+            Some("33554432"),
+            "MEMORY_REQUEST missing or wrong"
+        );
+    }
+
+    /// Regression test for "should provide default limits.cpu/memory from node
+    /// allocatable": a container with NO explicit limits must fall back to the
+    /// node allocatable, and divisor "0" must still resolve correctly.
+    #[test]
+    fn resource_field_ref_zero_divisor_with_allocatable_fallback() {
+        use rusternetes_common::resources::pod::{EnvVar, EnvVarSource};
+        use rusternetes_common::types::ResourceRequirements;
+
+        let mut c = Container {
+            name: "dapi-container".to_string(),
+            image: "busybox".to_string(),
+            // No limits set — must default to node allocatable.
+            resources: Some(ResourceRequirements {
+                limits: None,
+                requests: None,
+                claims: None,
+            }),
+            ..Default::default()
+        };
+        let make_rfr_env = |name: &str, resource: &str| EnvVar {
+            name: name.to_string(),
+            value: None,
+            value_from: Some(EnvVarSource {
+                resource_field_ref: Some(rusternetes_common::resources::ResourceFieldSelector {
+                    container_name: None,
+                    resource: resource.to_string(),
+                    divisor: Some("0".to_string()),
+                }),
+                config_map_key_ref: None,
+                secret_key_ref: None,
+                field_ref: None,
+                file_key_ref: None,
+            }),
+        };
+        c.env = Some(vec![
+            make_rfr_env("CPU_LIMIT", "limits.cpu"),
+            make_rfr_env("MEMORY_LIMIT", "limits.memory"),
+        ]);
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+
+        let alloc = HashMap::from([
+            ("cpu".to_string(), "4".to_string()),
+            ("memory".to_string(), "8Gi".to_string()),
+        ]);
+        let cfg = container_config_with_allocatable(
+            &pod,
+            &c,
+            "img",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            Some(&alloc),
+        );
+        let get = |k: &str| {
+            cfg.envs
+                .iter()
+                .find(|e| e.key == k)
+                .map(|e| e.value.as_str())
+        };
+        // Node has 4 CPU cores → CPU_LIMIT must match /[1-9]/ (conformance line 269).
+        assert_eq!(
+            get("CPU_LIMIT"),
+            Some("4"),
+            "CPU_LIMIT missing — zero-divisor with allocatable fallback broken"
+        );
+        // Node has 8 GiB memory.
+        assert_eq!(
+            get("MEMORY_LIMIT"),
+            Some("8589934592"),
+            "MEMORY_LIMIT missing"
+        );
     }
 
     #[test]
