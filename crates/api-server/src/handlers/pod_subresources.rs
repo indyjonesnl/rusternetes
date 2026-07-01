@@ -16,7 +16,7 @@ use crate::{
 use axum::{
     body::Body,
     extract::{ws::WebSocketUpgrade, Path, Query, Request, State},
-    http::{StatusCode, Uri},
+    http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
     Extension,
 };
@@ -110,6 +110,7 @@ pub async fn get_logs(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    ws: Option<WebSocketUpgrade>,
     req: Request,
 ) -> Result<Response> {
     debug!("Getting logs for pod {}/{}", namespace, name);
@@ -183,9 +184,70 @@ pub async fn get_logs(
         namespace, name, target_url
     );
 
+    // WebSocket path: the e2e conformance client opens a websocket to the /log
+    // subresource (subprotocol "binary.k8s.io") and reads the log bytes back as
+    // websocket messages. Upstream serves this via
+    // `responsewriters.StreamObject` -> `wsstream.NewReader(out, true, ...)`
+    // (staging/.../endpoints/handlers/responsewriters/writers.go:65-66): the
+    // api-server terminates the websocket and reuses the SAME plain-HTTP kubelet
+    // log fetch, framing each chunk per the single-stream wsstream protocol
+    // (no channel byte).
+    if let Some(ws) = ws {
+        // Decide the framing from the negotiated subprotocol BEFORE consuming
+        // the request. Mirrors upstream `handshake` (wsstream/conn.go:142):
+        // "base64.binary.k8s.io" base64-encodes; everything else is raw binary.
+        let requested_protocol = req
+            .headers()
+            .get(header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let base64 = streaming::log_protocol_is_base64(requested_protocol.as_deref());
+
+        // Fetch the kubelet log stream over plain HTTP (same target URL the
+        // non-upgrade path proxies). We build a fresh GET so the websocket
+        // upgrade headers are not forwarded to the kubelet.
+        let stream = fetch_kubelet_log_stream(&target_url).await?;
+
+        return Ok(ws
+            .protocols(streaming::LOG_WS_PROTOCOLS)
+            .on_upgrade(move |socket| streaming::handle_logs_websocket(socket, stream, base64))
+            .into_response());
+    }
+
     // Plain HTTP proxy (non-upgrade) — handles both follow and non-follow since
     // the kubelet log endpoint is plain HTTP (no WebSocket / SPDY upgrade).
     Ok(rusternetes_streamproxy::proxy_stream(target_url, req).await)
+}
+
+/// Fetch the kubelet `containerLogs` stream over plain HTTP and expose it as a
+/// byte stream for pumping over a websocket. Used only by the websocket log
+/// path; the non-upgrade path uses `rusternetes_streamproxy::proxy_stream`.
+///
+/// The kubelet handles all `follow`/`tailLines`/`limitBytes`/`sinceSeconds`
+/// query parameters server-side — they are already baked into `target_url`.
+type LogByteStream = std::pin::Pin<
+    Box<
+        dyn futures::Stream<Item = std::result::Result<axum::body::Bytes, reqwest::Error>>
+            + Send
+            + 'static,
+    >,
+>;
+
+async fn fetch_kubelet_log_stream(target_url: &Uri) -> Result<LogByteStream> {
+    // `danger_accept_invalid_certs` mirrors the api-server->kubelet trust model
+    // used by the streaming proxy (the kubelet serves a self-signed cert).
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(|e| Error::Internal(format!("failed to build kubelet log client: {e}")))?;
+
+    let resp = client
+        .get(target_url.to_string())
+        .send()
+        .await
+        .map_err(|e| Error::Internal(format!("kubelet log request failed: {e}")))?;
+
+    Ok(Box::pin(resp.bytes_stream()))
 }
 
 /// Build the kubelet stream URL for an exec or attach subresource.
