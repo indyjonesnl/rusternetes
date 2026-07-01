@@ -146,23 +146,38 @@ fn is_https_to_http_error(err: &reqwest::Error) -> bool {
     false
 }
 
-/// Read the last [`status::MAX_TERMINATION_MESSAGE_LENGTH`] bytes of a container
-/// log file for the `FallbackToLogsOnError` path. `None` if the log is absent or
-/// empty. Returns the raw log tail; the CRI log line framing is left intact
-/// (this is only the error-fallback source, not the primary message).
+/// Read the tail of a container log file for the `FallbackToLogsOnError` path,
+/// stripping CRI log framing the same way upstream's `readLastStringFromContainerLogs`
+/// does (pkg/kubelet/kuberuntime/kuberuntime_container.go:591-594):
+/// ```go
+/// value := int64(kubecontainer.MaxContainerTerminationMessageLogLines)
+/// buf, _ := circbuf.NewBuffer(kubecontainer.MaxContainerTerminationMessageLogLength)
+/// if err := m.ReadLogs(ctx, path, "", &v1.PodLogOptions{TailLines: &value}, buf, buf); err != nil {
+///     return fmt.Sprintf("Error on reading termination message from logs: %v", err)
+/// }
+/// return buf.String()
+/// ```
+/// Upstream `MaxContainerTerminationMessageLogLines = 80`,
+/// `MaxContainerTerminationMessageLogLength = 2048`
+/// (`pkg/kubelet/container/runtime.go:800-802`).
+///
+/// Returns `None` if the log is absent or produces no output after CRI-framing
+/// is stripped.
 fn read_log_tail(log_path: &str) -> Option<String> {
-    let data = std::fs::read(log_path).ok()?;
-    if data.is_empty() {
-        return None;
-    }
-    let start = data
-        .len()
-        .saturating_sub(status::MAX_TERMINATION_MESSAGE_LENGTH);
-    let tail = String::from_utf8_lossy(&data[start..]).into_owned();
-    if tail.is_empty() {
+    let opts = rusternetes_cri::stream::LogReadOptions {
+        tail_lines: Some(status::MAX_TERMINATION_MESSAGE_LOG_LINES),
+        limit_bytes: Some(status::MAX_TERMINATION_MESSAGE_LOG_LENGTH as i64),
+        timestamps: false,
+        since_unix: None,
+    };
+    let bytes = rusternetes_cri::stream::read_log_file(std::path::Path::new(log_path), &opts)
+        .ok()
+        .filter(|b| !b.is_empty())?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if text.is_empty() {
         None
     } else {
-        Some(tail)
+        Some(text)
     }
 }
 
@@ -2648,14 +2663,39 @@ mod tests {
     }
 
     #[test]
-    fn read_log_tail_keeps_trailing_bytes() {
+    fn read_log_tail_parses_cri_framing_and_limits_lines() {
+        // Upstream readLastStringFromContainerLogs strips CRI log framing before
+        // returning the tail (pkg/kubelet/kuberuntime/kuberuntime_container.go:591).
+        // read_log_tail must do the same via rusternetes_cri::stream::read_log_file.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("c.log");
-        let big = "a".repeat(status::MAX_TERMINATION_MESSAGE_LENGTH + 50) + "END";
-        std::fs::write(&path, &big).unwrap();
-        let tail = read_log_tail(path.to_str().unwrap()).unwrap();
-        assert_eq!(tail.len(), status::MAX_TERMINATION_MESSAGE_LENGTH);
-        assert!(tail.ends_with("END"));
+
+        // CRI-formatted log: only the message part after stripping framing should appear.
+        let cri_path = dir.path().join("cri.log");
+        let cri_log = "2024-01-01T00:00:00.000000000Z stdout F DONE\n";
+        std::fs::write(&cri_path, cri_log).unwrap();
+        let tail = read_log_tail(cri_path.to_str().unwrap()).unwrap();
+        assert_eq!(tail, "DONE\n", "CRI framing must be stripped");
+
+        // Tail-lines cap: more than MAX_TERMINATION_MESSAGE_LOG_LINES lines → only
+        // the last MAX lines are returned. Build 100 CRI-formatted lines, then ask
+        // for the last 80 (= MAX_TERMINATION_MESSAGE_LOG_LINES).
+        let many_path = dir.path().join("many.log");
+        let mut many_log = String::new();
+        for i in 0..100u32 {
+            many_log.push_str(&format!(
+                "2024-01-01T00:00:00.000000000Z stdout F line{}\n",
+                i
+            ));
+        }
+        std::fs::write(&many_path, &many_log).unwrap();
+        let tail = read_log_tail(many_path.to_str().unwrap()).unwrap();
+        // last 80 lines: line20..line99
+        assert!(
+            tail.starts_with("line20\n"),
+            "tail must start at line20, got: {}",
+            &tail[..20.min(tail.len())]
+        );
+        assert!(tail.ends_with("line99\n"));
 
         // Missing / empty logs yield None.
         assert!(read_log_tail(dir.path().join("nope.log").to_str().unwrap()).is_none());
