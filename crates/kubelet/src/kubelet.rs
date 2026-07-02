@@ -4631,6 +4631,17 @@ impl Kubelet {
             .unwrap_or_default();
 
         let now = Instant::now();
+
+        // App containers must not be (re)started until every plain init
+        // container has completed — a never-started app container reads as
+        // "not running" here and would otherwise be started straight into a
+        // pod whose init sequence is still failing. Upstream `computePodActions`
+        // only adds app containers to the start set once init is complete
+        // ("should not start app containers if init containers fail on a
+        // RestartAlways pod"). Restartable init containers (sidecars) are exempt
+        // — they run alongside init/app and are always eligible for restart.
+        let (all_init_done, _, _) = self.runtime.compute_init_container_actions(pod).await;
+
         // Restart regular containers and restartable init containers (sidecars:
         // restartPolicy=Always) the same way. start_container handles both; the
         // backoff map keys on the (unique) container name. Plain init containers
@@ -4641,7 +4652,12 @@ impl Kubelet {
             .unwrap_or(&[])
             .iter()
             .filter(|ic| ic.restart_policy.as_deref() == Some("Always"));
-        for c in spec.containers.iter().chain(restartable_inits) {
+        for c in spec
+            .containers
+            .iter()
+            .filter(|_| all_init_done)
+            .chain(restartable_inits)
+        {
             if self
                 .runtime
                 .is_container_running(&pod.metadata.uid, &c.name)
