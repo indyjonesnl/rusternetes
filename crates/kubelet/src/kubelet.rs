@@ -4004,19 +4004,6 @@ impl Kubelet {
                                     )
                                     .await;
 
-                                // Capture current restart counts before stopping
-                                let current_restart_counts: HashMap<String, u32> = pod
-                                    .status
-                                    .as_ref()
-                                    .and_then(|s| s.container_statuses.as_ref())
-                                    .map(|statuses| {
-                                        statuses
-                                            .iter()
-                                            .map(|cs| (cs.name.clone(), cs.restart_count))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-
                                 // Stop and restart the pod using the failed
                                 // probe's terminationGracePeriodSeconds (falls
                                 // back to the pod's, then 30) — upstream uses the
@@ -4040,47 +4027,16 @@ impl Kubelet {
                                             "Back-off restarting failed container",
                                         )
                                         .await;
-                                    // Build container statuses with incremented restart counts
-                                    let restarting_statuses: Vec<ContainerStatus> = pod
-                                        .spec
-                                        .as_ref()
-                                        .map(|s| &s.containers)
-                                        .unwrap_or(&vec![])
-                                        .iter()
-                                        .map(|c| {
-                                            let prev_count = current_restart_counts
-                                                .get(&c.name)
-                                                .copied()
-                                                .unwrap_or(0);
-                                            ContainerStatus {
-                                                name: c.name.clone(),
-                                                ready: false,
-                                                restart_count: prev_count + 1,
-                                                state: Some(ContainerState::Waiting {
-                                                    reason: Some("CrashLoopBackOff".to_string()),
-                                                    message: Some(
-                                                        "Liveness probe failed".to_string(),
-                                                    ),
-                                                }),
-                                                last_state: None,
-                                                image: Some(c.image.clone()),
-                                                image_id: None,
-                                                container_id: None,
-                                                started: Some(false),
-                                                allocated_resources: c
-                                                    .resources
-                                                    .as_ref()
-                                                    .and_then(|r| r.requests.clone()),
-                                                allocated_resources_status: None,
-                                                resources: c.resources.clone(),
-                                                user: None,
-                                                volume_mounts: None,
-                                                stop_signal: None,
-                                            }
-                                        })
-                                        .collect();
-
-                                    // Update status with incremented restart counts — re-read for fresh RV
+                                    // Re-read for a fresh RV. The restartCount is
+                                    // NOT written here: it is derived at container
+                                    // (re)create time from the prior (preserved)
+                                    // container status — see
+                                    // `cri_runtime::runtime::next_restart_attempt`.
+                                    // Overwriting container_statuses with a
+                                    // synthetic Waiting status (no container id)
+                                    // erased the "ran before" signal and reset the
+                                    // count, causing the non-monotonic 1 → 0
+                                    // NodeConformance failure.
                                     let key = build_key("pods", Some(namespace), pod_name);
                                     let mut new_pod: Pod = match self.storage.get(&key).await {
                                         Ok(p) => p,
@@ -4101,7 +4057,6 @@ impl Kubelet {
                                         status.phase = Some(Phase::Running);
                                         status.message = Some("Liveness probe failed".to_string());
                                         status.reason = Some("Restarting".to_string());
-                                        status.container_statuses = Some(restarting_statuses);
                                     } else {
                                         new_pod.status = Some(PodStatus {
                                             phase: Some(Phase::Running),
@@ -4731,7 +4686,7 @@ impl Kubelet {
                         if let Some(entry) =
                             map.get(&format!("{}/{}/{}", namespace, pod_name, cs.name))
                         {
-                            cs.restart_count = entry.restart_count;
+                            cs.restart_count = cs.restart_count.max(entry.restart_count);
                         }
                         if matches!(cs.state, Some(ContainerState::Terminated { .. })) {
                             cs.last_state = cs.state.take();
@@ -4754,7 +4709,7 @@ impl Kubelet {
                         if let Some(entry) =
                             map.get(&format!("{}/{}/{}", namespace, pod_name, cs.name))
                         {
-                            cs.restart_count = entry.restart_count;
+                            cs.restart_count = cs.restart_count.max(entry.restart_count);
                         }
                     }
                 }
@@ -4779,20 +4734,21 @@ impl Kubelet {
             .retain(|k, _| !k.starts_with(&prefix));
     }
 
-    /// Overlay the authoritative `restartCount` from the [`RestartBackoff`] map
-    /// onto freshly-read container statuses. The CRI status reports
-    /// `metadata.attempt`, which resets to 0 when a new sandbox is created — so
-    /// without this overlay a status write can report a LOWER count than a prior
-    /// write (non-monotonic `1 → 0`), failing the container_probe NodeConformance
-    /// specs. The backoff map is the single source of truth for restartCount;
-    /// apply it everywhere statuses are published (#1514).
+    /// Monotonicity safety net for `restartCount`. The primary source is now the
+    /// CRI `metadata.attempt`, stamped at container (re)create from the prior
+    /// persisted status (`cri_runtime::runtime::next_restart_attempt`, matching
+    /// upstream `startContainer`). This overlay never LOWERS a count — it only
+    /// raises it to the crash-loop [`RestartBackoff`] tally if that is somehow
+    /// ahead — so a transient CRI read (e.g. mid sandbox recreation) can never
+    /// regress a published count `1 → 0` (the container_probe NodeConformance
+    /// spec). Applied everywhere statuses are published (#1514).
     fn overlay_restart_backoff(&self, statuses: &mut [ContainerStatus], pod: &Pod) {
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
         let pod_name = &pod.metadata.name;
         let map = self.restart_backoff.lock().unwrap();
         for cs in statuses.iter_mut() {
             if let Some(entry) = map.get(&format!("{}/{}/{}", namespace, pod_name, cs.name)) {
-                cs.restart_count = entry.restart_count;
+                cs.restart_count = cs.restart_count.max(entry.restart_count);
             }
         }
     }
