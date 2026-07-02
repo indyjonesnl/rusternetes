@@ -132,6 +132,54 @@ fn is_restartable_init_container(container: &Container) -> bool {
     container.restart_policy.as_deref() == Some("Always")
 }
 
+/// True if the prior status shows a container that actually ran at least once
+/// (as opposed to a pre-start `Waiting`/`PodInitializing` placeholder). Mirrors
+/// upstream's `containerStatus != nil` guard — its runtime-derived `podStatus`
+/// only carries a status once the container exists in the runtime.
+fn container_has_run(cs: &ContainerStatus) -> bool {
+    cs.restart_count > 0
+        || cs.container_id.is_some()
+        || matches!(
+            cs.state,
+            Some(ContainerState::Running { .. }) | Some(ContainerState::Terminated { .. })
+        )
+}
+
+/// Compute the CRI `attempt` (= restartCount) to stamp on a container about to
+/// be (re)created, matching upstream `startContainer`
+/// (`pkg/kubelet/kuberuntime/kuberuntime_container.go:224-227`):
+///
+/// ```text
+/// restartCount := 0
+/// containerStatus := podStatus.FindContainerStatusByName(container.Name)
+/// if containerStatus != nil {
+///     restartCount = containerStatus.RestartCount + 1
+/// }
+/// ```
+///
+/// Upstream reads its runtime-derived `podStatus`; we read the persisted API
+/// pod status instead, because it is the only record of the prior count that
+/// survives the CRI runtime removing the exited container — and, on a
+/// liveness/startup-probe restart, tearing down the whole pod sandbox. Reading
+/// `metadata.attempt` back off surviving CRI containers (what this used to do)
+/// resets to 0 across that teardown, producing the non-monotonic `1 → 0`
+/// NodeConformance failure ("should have monotonically increasing restart
+/// count").
+fn next_restart_attempt(pod: &Pod, container_name: &str) -> u32 {
+    let Some(status) = pod.status.as_ref() else {
+        return 0;
+    };
+    status
+        .container_statuses
+        .iter()
+        .flatten()
+        .chain(status.init_container_statuses.iter().flatten())
+        .find(|cs| cs.name == container_name)
+        .filter(|cs| container_has_run(cs))
+        .map(|cs| cs.restart_count + 1)
+        .unwrap_or(0)
+}
+
 fn is_https_to_http_error(err: &reqwest::Error) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(source) = current {
@@ -560,38 +608,13 @@ impl CriContainerRuntime {
         // so `map_container_status` always reports `restartCount=0` after a
         // restart — the monotonic-restart-count NodeConformance failure.
         //
-        // We derive the next attempt by querying the highest existing `attempt`
-        // for this pod+container from the CRI runtime (covers sandbox recreation
-        // where the in-memory pod status was also reset).
-        {
-            let filter = v1::ContainerFilter {
-                label_selector: std::collections::HashMap::from([
-                    (
-                        translate::labels::POD_UID.to_string(),
-                        pod.metadata.uid.clone(),
-                    ),
-                    (
-                        translate::labels::CONTAINER_NAME.to_string(),
-                        container.name.clone(),
-                    ),
-                ]),
-                ..Default::default()
-            };
-            let next_attempt = cri
-                .list_containers(Some(filter))
-                .await
-                .ok()
-                .map(|cs| {
-                    cs.iter()
-                        .map(|c| c.metadata.as_ref().map(|m| m.attempt).unwrap_or(0))
-                        .max()
-                        .map(|max| max + 1)
-                        .unwrap_or(0)
-                })
-                .unwrap_or(0);
-            if let Some(meta) = cfg.metadata.as_mut() {
-                meta.attempt = next_attempt;
-            }
+        // We derive the next attempt from the persisted API pod status (the
+        // durable equivalent of upstream's `podStatus.FindContainerStatusByName`)
+        // — see `next_restart_attempt`. A CRI query cannot serve here: the
+        // exited container (and, on a probe restart, the whole sandbox) is torn
+        // down before this runs, so `metadata.attempt` would reset to 0.
+        if let Some(meta) = cfg.metadata.as_mut() {
+            meta.attempt = next_restart_attempt(pod, &container.name);
         }
 
         // Bind-mount a per-container host file at the container's
@@ -2377,11 +2400,121 @@ mod tests {
     use super::*;
     use rusternetes_common::resources::pod::HTTPGetAction;
     use rusternetes_common::resources::pod::PodSpec;
+    use rusternetes_common::resources::pod::PodStatus;
     use rusternetes_common::resources::policy::IntOrString;
     use rusternetes_common::resources::Event;
     use rusternetes_storage::{Storage, StorageBackend};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// Build a minimal `ContainerStatus` for the restart-attempt tests.
+    fn test_container_status(
+        name: &str,
+        restart_count: u32,
+        state: Option<ContainerState>,
+        container_id: Option<String>,
+    ) -> ContainerStatus {
+        ContainerStatus {
+            name: name.to_string(),
+            ready: false,
+            restart_count,
+            state,
+            last_state: None,
+            image: None,
+            image_id: None,
+            container_id,
+            started: None,
+            allocated_resources: None,
+            allocated_resources_status: None,
+            resources: None,
+            user: None,
+            volume_mounts: None,
+            stop_signal: None,
+        }
+    }
+
+    fn pod_with_statuses(
+        containers: Vec<ContainerStatus>,
+        init_containers: Vec<ContainerStatus>,
+    ) -> Pod {
+        let mut pod = Pod::new("p", PodSpec::default());
+        pod.metadata.uid = "uid-1".to_string();
+        pod.status = Some(PodStatus {
+            container_statuses: Some(containers),
+            init_container_statuses: Some(init_containers),
+            ..Default::default()
+        });
+        pod
+    }
+
+    #[test]
+    fn next_restart_attempt_is_zero_on_first_start() {
+        // No status at all → first start → attempt 0.
+        let pod = Pod::new("p", PodSpec::default());
+        assert_eq!(next_restart_attempt(&pod, "c"), 0);
+
+        // A pre-start `Waiting`/`PodInitializing` placeholder (no container id,
+        // never ran) must NOT be counted as a prior run — still attempt 0.
+        let waiting = test_container_status(
+            "c",
+            0,
+            Some(ContainerState::Waiting {
+                reason: Some("PodInitializing".to_string()),
+                message: None,
+            }),
+            None,
+        );
+        let pod = pod_with_statuses(vec![waiting], vec![]);
+        assert_eq!(next_restart_attempt(&pod, "c"), 0);
+    }
+
+    #[test]
+    fn next_restart_attempt_is_prior_count_plus_one_after_a_run() {
+        // Prior instance actually ran (has a container id) with restartCount 0
+        // → this (re)start is attempt 1. Reproduces the fix for the
+        // liveness/startup-probe restart that used to reset 1 → 0: the count is
+        // read from the persisted status, which survives sandbox teardown.
+        let terminated = test_container_status(
+            "c",
+            0,
+            Some(ContainerState::Terminated {
+                exit_code: 137,
+                signal: None,
+                reason: None,
+                message: None,
+                started_at: None,
+                finished_at: None,
+                container_id: None,
+            }),
+            Some("cid-0".to_string()),
+        );
+        let pod = pod_with_statuses(vec![terminated], vec![]);
+        assert_eq!(next_restart_attempt(&pod, "c"), 1);
+
+        // Monotonic: a prior status already at restartCount 2 → next is 3.
+        let running = test_container_status(
+            "c",
+            2,
+            Some(ContainerState::Running { started_at: None }),
+            Some("cid-2".to_string()),
+        );
+        let pod = pod_with_statuses(vec![running], vec![]);
+        assert_eq!(next_restart_attempt(&pod, "c"), 3);
+    }
+
+    #[test]
+    fn next_restart_attempt_reads_init_container_statuses() {
+        // Restartable init containers (sidecars) carry their count in
+        // init_container_statuses; a sidecar restart must be counted there too.
+        let sidecar = test_container_status(
+            "side",
+            1,
+            Some(ContainerState::Running { started_at: None }),
+            Some("cid".to_string()),
+        );
+        let pod = pod_with_statuses(vec![], vec![sidecar]);
+        assert_eq!(next_restart_attempt(&pod, "side"), 2);
+    }
 
     #[test]
     fn plain_init_container_ready_only_after_successful_exit() {
