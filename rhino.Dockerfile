@@ -13,7 +13,6 @@ WORKDIR /build
 # Copy manifests first for layer caching
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto/ proto/
-COPY third_party/ third_party/
 
 # Stub source to cache dependency builds
 RUN mkdir -p src/bin && \
