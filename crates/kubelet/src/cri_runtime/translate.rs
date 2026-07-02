@@ -77,6 +77,16 @@ fn pod_labels(pod: &Pod) -> HashMap<String, String> {
     l
 }
 
+fn truncate_hostname_for_kernel(hostname: &str) -> String {
+    const HOSTNAME_MAX_LEN: usize = 63;
+    if hostname.len() <= HOSTNAME_MAX_LEN {
+        return hostname.to_string();
+    }
+    hostname[..HOSTNAME_MAX_LEN]
+        .trim_end_matches(['-', '.'])
+        .to_string()
+}
+
 /// Aggregate every container port into CRI sandbox port mappings.
 fn port_mappings(pod: &Pod) -> Vec<v1::PortMapping> {
     let Some(spec) = pod.spec.as_ref() else {
@@ -330,11 +340,19 @@ fn sandbox_security_context(pod: &Pod) -> v1::LinuxSandboxSecurityContext {
 /// `log_directory` is the kubelet-owned dir the runtime writes container logs
 /// under; it must exist before `RunPodSandbox`.
 pub fn sandbox_config(pod: &Pod, log_directory: &str) -> v1::PodSandboxConfig {
-    let hostname = pod
-        .spec
-        .as_ref()
-        .and_then(|s| s.hostname.clone())
-        .unwrap_or_else(|| pod.metadata.name.clone());
+    // Upstream kubelet does not set a sandbox hostname for hostNetwork pods.
+    // With crun, setting Hostname while the sandbox omits a private UTS
+    // namespace fails OCI create with "hostname requires the UTS namespace".
+    let hostname = if host_network(pod) {
+        String::new()
+    } else {
+        truncate_hostname_for_kernel(
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.hostname.as_deref())
+                .unwrap_or(&pod.metadata.name),
+        )
+    };
 
     v1::PodSandboxConfig {
         metadata: Some(v1::PodSandboxMetadata {
@@ -1374,6 +1392,33 @@ mod tests {
             .namespace_options
             .unwrap();
         assert_eq!(ns.network, v1::NamespaceMode::Node as i32);
+    }
+
+    #[test]
+    fn sandbox_omits_hostname_for_host_network_pods() {
+        let pod = pod_with(PodSpec {
+            host_network: Some(true),
+            hostname: Some("custom-host".to_string()),
+            ..Default::default()
+        });
+
+        let cfg = sandbox_config(&pod, "/var/log/pods/web");
+        assert_eq!(cfg.hostname, "");
+    }
+
+    #[test]
+    fn sandbox_truncates_default_hostname_for_kernel() {
+        let long_name = "termination-message-containerb09028ac-d9a4-4be6-9165-f0df6ecd7244";
+        assert!(long_name.len() > 63);
+
+        let pod = pod_with(PodSpec::default());
+        let mut pod = pod;
+        pod.metadata.name = long_name.to_string();
+
+        let cfg = sandbox_config(&pod, "/var/log/pods/web");
+        assert_eq!(cfg.hostname.len(), 63);
+        assert!(!cfg.hostname.ends_with('-'));
+        assert!(!cfg.hostname.ends_with('.'));
     }
 
     #[test]

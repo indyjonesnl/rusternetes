@@ -16,6 +16,6 @@ services:
     image: "ghcr.io/indyjonesnl/rusternetes/scheduler:${RUSTERNETES_IMAGE_TAG:-main}"
   controller-manager:
     image: "ghcr.io/indyjonesnl/rusternetes/controller-manager:${RUSTERNETES_IMAGE_TAG:-main}"
-  # CRI runtime image (containerd + youki + CNI) the kubelet talks to.
+  # CRI runtime image (containerd + crun + CNI) the kubelet talks to.
   containerd:
     image: "ghcr.io/indyjonesnl/rusternetes/containerd:${RUSTERNETES_IMAGE_TAG:-main}"

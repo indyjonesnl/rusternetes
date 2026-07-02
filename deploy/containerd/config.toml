@@ -2,8 +2,8 @@
 #
 # This is the shared container runtime the kubelets talk to over CRI v1
 # (replacing the Docker/Podman socket the bollard kubelet used). It enables the
-# CRI plugin and registers a Youki runtime handler (a Rust OCI runtime) as the
-# default. Pods the kubelet creates run as containers inside this service.
+# CRI plugin and registers a crun runtime handler as the default. Pods the
+# kubelet creates run as containers inside this service.
 version = 3
 root = "/var/lib/containerd"
 state = "/run/containerd"
@@ -33,13 +33,13 @@ disabled_plugins = []
 
 [plugins.'io.containerd.cri.v1.runtime']
   [plugins.'io.containerd.cri.v1.runtime'.containerd]
-    default_runtime_name = 'youki'
+    default_runtime_name = 'crun'
     [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes]
-      [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.youki]
+      [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.crun]
         runtime_type = 'io.containerd.runc.v2'
         sandboxer = 'podsandbox'
-        [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.youki.options]
-          BinaryName = '/usr/local/bin/youki'
+        [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.crun.options]
+          BinaryName = '/usr/bin/crun'
           SystemdCgroup = false
   # CNI provides pod networking. The bridge config is installed in the image at
   # /etc/cni/net.d; plugins live in /opt/cni/bin.

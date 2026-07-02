@@ -215,7 +215,7 @@ if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
     print_step "Templating control-plane static pod manifests (CERTS_PATH=$CERTS_PATH)..."
     mkdir -p "$PROJECT_ROOT/.rusternetes/manifests"
     # Node IPAM is opt-in (issue #1187). When ALLOCATE_NODE_CIDRS is set (the
-    # flannel stack sets it — see compose.flannel.yml), expand the
+    # Calico stack sets it — see compose.calico.yml), expand the
     # @NODE_IPAM_ARGS@ placeholder in the controller-manager manifest into the
     # allocator flags; otherwise strip the placeholder line so the other stacks
     # (conformance/sqlite/etcd/redis) keep node IPAM off and unchanged.

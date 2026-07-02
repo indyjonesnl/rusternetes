@@ -1,9 +1,9 @@
-# A rusternetes node, kind-style: containerd (CRI + Youki + CNI) AND the kubelet
+# A rusternetes node, kind-style: containerd (CRI + crun + CNI) AND the kubelet
 # in one container, so the kubelet and the runtime share a filesystem (required
-# for flannel's hostPath CNI install and for pod hostPath volumes to resolve).
+# for Calico's hostPath CNI install and for pod hostPath volumes to resolve).
 #
 # Reuses two already-built images:
-#   - the containerd runtime base (containerd.Dockerfile) for containerd/youki/CNI
+#   - the containerd runtime base (containerd.Dockerfile) for containerd/crun/CNI
 #   - the kubelet image for the kubelet binary
 # Both image refs are ARGs so the build can point at whatever tags exist (the
 # compose build tags them per project).
@@ -16,7 +16,7 @@ FROM ${CONTAINERD_IMAGE}
 
 COPY --from=kubeletbin /app/kubelet /usr/local/bin/kubelet
 
-# Pod networking comes from flannel-rs (installed by its DaemonSet into
+# Pod networking comes from Calico (installed by its DaemonSet into
 # /etc/cni/net.d + /opt/cni/bin at runtime), so drop the standalone bridge conf
 # the containerd image ships — otherwise both configs would race.
 RUN rm -f /etc/cni/net.d/10-rusternetes.conflist

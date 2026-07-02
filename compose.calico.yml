@@ -1,22 +1,22 @@
-# Per-node (kind-style) stack with flannel-rs CNI.
+# Per-node (kind-style) stack with Calico CNI.
 #
-# Each `node-N` is a single container running its own containerd (CRI + Youki)
+# Each `node-N` is a single container running its own containerd (CRI + crun)
 # AND the kubelet (node.Dockerfile), so the kubelet and runtime share a
-# filesystem — required for flannel's hostPath CNI install. Pod networking is
-# provided by the flannel-rs DaemonSet (deploy via kubectl after bootstrap),
-# which meshes the nodes over VXLAN.
+# filesystem — required for Calico's hostPath CNI install. Pod networking is
+# provided by the Calico DaemonSet (deploy via kubectl after bootstrap), which
+# overlays the nodes with VXLAN.
 #
 # Usage:
-#   docker compose -f compose.flannel.yml build
-#   docker compose -f compose.flannel.yml up -d
+#   docker compose -f compose.calico.yml build
+#   docker compose -f compose.calico.yml up -d
 #   # Enable node-IPAM so the controller-manager static pod allocates a
-#   # spec.podCIDR per node (flannel --kube-subnet-mgr derives its subnet from
-#   # it). ALLOCATE_NODE_CIDRS toggles the @NODE_IPAM_ARGS@ placeholder in
+#   # spec.podCIDR per node (Calico consumes the allocated pod CIDRs for VXLAN
+#   # routing). ALLOCATE_NODE_CIDRS toggles the @NODE_IPAM_ARGS@ placeholder in
 #   # manifests/control-plane/kube-controller-manager.yaml; CLUSTER_CIDR matches
-#   # deploy/flannel/flannel-rs.yaml net-conf "Network". (#1187/#1194)
+#   # deploy/calico/calico.yaml CALICO_IPV4POOL_CIDR. (#1187/#1194)
 #   ALLOCATE_NODE_CIDRS=1 CLUSTER_CIDR=10.244.0.0/16 \
 #     bash scripts/bootstrap-cluster.sh      # registers nodes + static pods
-#   kubectl apply -f deploy/flannel/flannel-rs.yaml
+#   kubectl apply -f deploy/calico/calico.yaml
 
 x-sccache-args: &sccache-args
   USE_SCCACHE: "${USE_SCCACHE-${GITHUB_ACTIONS:+1}}"
@@ -118,7 +118,7 @@ services:
     # --eviction-hard="" disables the eviction manager: this box shares one
     # ~99%-full host disk across every node container, so the default
     # imagefs.available<15% hard threshold would (correctly, by its own logic)
-    # evict every running pod — including flannel — into Failed, and the
+    # evict every running pod — including calico-node — into Failed, and the
     # DaemonSet controller then GCs and recreates them in a tight loop. kind
     # disables eviction the same way for local clusters.
     command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests", "--eviction-hard", ""]
@@ -149,7 +149,7 @@ services:
     command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--eviction-hard", ""]
 
   # kube-proxy per node, in that node's network namespace, so its Service
-  # iptables apply where the node's pods live (flannel pod network).
+  # iptables apply where the node's pods live (Calico pod network).
   kube-proxy-1:
     build:
       context: .

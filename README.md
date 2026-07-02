@@ -221,7 +221,7 @@ Filter/score plugin architecture with:
 | Events | Event recording and TTL cleanup |
 
 ### Kubelet
-Container runtime integration via the Container Runtime Interface (CRI v1, gRPC) to containerd, which runs containers with [Youki](https://github.com/containers/youki) (a Rust OCI runtime):
+Container runtime integration via the Container Runtime Interface (CRI v1, gRPC) to containerd, which runs containers with [crun](https://github.com/containers/crun) (an OCI runtime):
 - Pod lifecycle: create, start, stop, restart with grace periods
 - Pause container network namespace sharing
 - Liveness, readiness, and startup probes (HTTP, TCP, exec)
