@@ -2903,11 +2903,55 @@ impl Kubelet {
                                     "Init container {} failed for pod {}/{}, will retry next sync",
                                     ic.name, namespace, pod_name
                                 );
-                                // Remove failed container so it can be recreated
-                                let _ = self
-                                    .runtime
-                                    .remove_terminated_container(&pod.metadata.uid, &ic.name)
-                                    .await;
+                                // CrashLoopBackOff gate + monotonic restartCount for
+                                // the failing init container, mirroring
+                                // reconcile_container_restarts for app containers. The
+                                // CRI attempt is reset by the remove/recreate, so the
+                                // backoff map is the source of truth for the reported
+                                // count — the "should not start app containers if init
+                                // containers fail on a RestartAlways pod" spec asserts
+                                // the init container's restartCount climbs to >= 3. The
+                                // gate also spaces retries out (was a hot ~sync-interval
+                                // loop with no backoff).
+                                let bkey = format!("{}/{}/{}", namespace, pod_name, ic.name);
+                                let now = Instant::now();
+                                let (do_restart, init_restart_count) = {
+                                    let mut map = self.restart_backoff.lock().unwrap();
+                                    match map.get_mut(&bkey) {
+                                        None => {
+                                            map.insert(
+                                                bkey.clone(),
+                                                RestartBackoff {
+                                                    restart_count: 1,
+                                                    last_restart: now,
+                                                    backoff: CRASHLOOP_BACKOFF_INITIAL,
+                                                },
+                                            );
+                                            (true, 1)
+                                        }
+                                        Some(entry) => {
+                                            if now.duration_since(entry.last_restart)
+                                                >= entry.backoff
+                                            {
+                                                entry.restart_count += 1;
+                                                entry.last_restart = now;
+                                                entry.backoff =
+                                                    (entry.backoff * 2).min(CRASHLOOP_BACKOFF_MAX);
+                                                (true, entry.restart_count)
+                                            } else {
+                                                (false, entry.restart_count)
+                                            }
+                                        }
+                                    }
+                                };
+                                // Remove the exited container (→ recreate next sync) only
+                                // once the backoff window elapses.
+                                if do_restart {
+                                    let _ = self
+                                        .runtime
+                                        .remove_terminated_container(&pod.metadata.uid, &ic.name)
+                                        .await;
+                                }
                                 // Update status with CrashLoopBackOff AND make sure
                                 // the PodInitialized=False condition + app-container
                                 // Waiting/PodInitializing statuses are present.
@@ -2932,7 +2976,20 @@ impl Kubelet {
                                 //          GeneratePodInitializedCondition
                                 let key = build_key("pods", Some(namespace), pod_name);
                                 if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
-                                    let init_statuses = self.get_init_container_statuses(&p).await;
+                                    let mut init_statuses =
+                                        self.get_init_container_statuses(&p).await;
+                                    // Overlay the monotonic count from the backoff map
+                                    // onto the failing init container — the recreate
+                                    // resets the CRI attempt to 0, so this is the only
+                                    // record that survives across retries.
+                                    if let Some(list) = init_statuses.as_mut() {
+                                        if let Some(st) =
+                                            list.iter_mut().find(|s| s.name == ic.name)
+                                        {
+                                            st.restart_count =
+                                                st.restart_count.max(init_restart_count);
+                                        }
+                                    }
                                     let qos = Self::compute_qos_class(&p);
                                     p.status = Some(Self::build_init_failure_status(
                                         &p,
