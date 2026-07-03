@@ -208,6 +208,47 @@ fn init_container_completed_successfully(
         .unwrap_or(false)
 }
 
+/// The `waiting.reason` an app container should report when it has not started
+/// because `start_pod` errored before reaching the app containers.
+///
+/// Upstream `convertToAPIContainerStatuses` (kubelet_pods.go:2431-2433) uses
+/// `PodInitializing` as the default waiting reason for EVERY container in a pod
+/// that has init containers, until initialization is complete. So an app
+/// container still blocked behind a running or failing init container must
+/// report `PodInitializing`, not `ContainerCreating` — this is what the
+/// NodeConformance spec "should not start app containers if init containers
+/// fail on a RestartAlways pod" asserts for the app container `run1`.
+///
+/// Once every gating init container is satisfied (a plain init container has
+/// terminated with exit 0; a restartable/sidecar init container has started),
+/// a genuine app-container start error surfaces as `ContainerCreating`.
+fn app_container_waiting_reason(
+    pod: &Pod,
+    init_statuses: Option<&[ContainerStatus]>,
+) -> &'static str {
+    let Some(spec) = pod.spec.as_ref() else {
+        return "ContainerCreating";
+    };
+    let init = match spec.init_containers.as_ref() {
+        Some(ic) if !ic.is_empty() => ic,
+        _ => return "ContainerCreating",
+    };
+    // Restartable (sidecar) init containers never terminate; they gate app
+    // start on being *started*, which by the time app containers are attempted
+    // is already true — so they don't hold the reason. Plain init containers
+    // gate until they terminate successfully (exit 0). A still-running or
+    // failed plain init container therefore keeps app containers PodInitializing.
+    let all_init_done = init.iter().all(|c| {
+        c.restart_policy.as_deref() == Some("Always")
+            || init_container_completed_successfully(init_statuses, &c.name)
+    });
+    if all_init_done {
+        "ContainerCreating"
+    } else {
+        "PodInitializing"
+    }
+}
+
 fn init_container_failed_terminally(pod: &Pod, init_statuses: Option<&[ContainerStatus]>) -> bool {
     let restart_policy = pod
         .spec
@@ -3533,6 +3574,23 @@ impl Kubelet {
                                     } else {
                                         Self::not_ready_pod_conditions()
                                     };
+                                    // App containers blocked behind an incomplete
+                                    // init container must report PodInitializing (not
+                                    // ContainerCreating), and carry no init-error
+                                    // message — the failure belongs on the init
+                                    // container's status. Genuine app-container start
+                                    // errors (init already done) keep ContainerCreating
+                                    // + the error message. Mirrors upstream
+                                    // convertToAPIContainerStatuses (kubelet_pods.go).
+                                    let app_reason = app_container_waiting_reason(
+                                        &new_pod,
+                                        init_container_statuses.as_deref(),
+                                    );
+                                    let app_message = if app_reason == "PodInitializing" {
+                                        None
+                                    } else {
+                                        Some(err_msg.clone())
+                                    };
                                     let container_statuses: Option<Vec<ContainerStatus>> =
                                         new_pod.spec.as_ref().map(|spec| {
                                             spec.containers
@@ -3542,10 +3600,8 @@ impl Kubelet {
                                                     ready: false,
                                                     restart_count: 0,
                                                     state: Some(ContainerState::Waiting {
-                                                        reason: Some(
-                                                            "ContainerCreating".to_string(),
-                                                        ),
-                                                        message: Some(err_msg.clone()),
+                                                        reason: Some(app_reason.to_string()),
+                                                        message: app_message.clone(),
                                                     }),
                                                     last_state: None,
                                                     image: Some(c.image.clone()),
@@ -6119,6 +6175,150 @@ mod tests {
                 .as_ref()
                 .and_then(|status| status.init_container_statuses.as_deref())
         ));
+    }
+
+    // Regression for NodeConformance "[sig-node] InitContainer should not start
+    // app containers if init containers fail on a RestartAlways pod": while a
+    // plain init container has failed (and, being RestartAlways, will retry),
+    // the app container must report Waiting{PodInitializing}, not
+    // ContainerCreating. Previously the start-error handler stamped
+    // ContainerCreating + the init-failure message onto app containers.
+    #[test]
+    fn app_container_reason_is_podinitializing_while_init_incomplete() {
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("init-fail-restart-always").with_namespace("default"),
+            spec: Some(PodSpec {
+                restart_policy: Some("Always".to_string()),
+                init_containers: Some(vec![Container {
+                    name: "init1".to_string(),
+                    image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }]),
+                containers: vec![Container {
+                    name: "run1".to_string(),
+                    image: "registry.k8s.io/pause:3.10.1".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: None,
+        };
+        // init1 failed (exit 1) — not yet completed successfully.
+        let init_statuses = vec![ContainerStatus {
+            name: "init1".to_string(),
+            ready: false,
+            restart_count: 0,
+            state: Some(ContainerState::Terminated {
+                exit_code: 1,
+                reason: Some("Error".to_string()),
+                message: None,
+                started_at: None,
+                finished_at: None,
+                container_id: None,
+                signal: None,
+            }),
+            last_state: None,
+            image: Some("busybox:latest".to_string()),
+            image_id: None,
+            container_id: None,
+            started: Some(false),
+            allocated_resources: None,
+            allocated_resources_status: None,
+            resources: None,
+            user: None,
+            volume_mounts: None,
+            stop_signal: None,
+        }];
+        assert_eq!(
+            super::app_container_waiting_reason(&pod, Some(&init_statuses)),
+            "PodInitializing",
+            "app container blocked behind a failed init container must be PodInitializing"
+        );
+    }
+
+    // Once every init container has completed successfully, a genuine
+    // app-container start error keeps the ContainerCreating reason.
+    #[test]
+    fn app_container_reason_is_containercreating_when_init_done() {
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("init-done").with_namespace("default"),
+            spec: Some(PodSpec {
+                init_containers: Some(vec![Container {
+                    name: "init1".to_string(),
+                    image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }]),
+                containers: vec![Container {
+                    name: "run1".to_string(),
+                    image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let init_statuses = vec![ContainerStatus {
+            name: "init1".to_string(),
+            ready: true,
+            restart_count: 0,
+            state: Some(ContainerState::Terminated {
+                exit_code: 0,
+                reason: Some("Completed".to_string()),
+                message: None,
+                started_at: None,
+                finished_at: None,
+                container_id: None,
+                signal: None,
+            }),
+            last_state: None,
+            image: Some("busybox:latest".to_string()),
+            image_id: None,
+            container_id: None,
+            started: Some(true),
+            allocated_resources: None,
+            allocated_resources_status: None,
+            resources: None,
+            user: None,
+            volume_mounts: None,
+            stop_signal: None,
+        }];
+        assert_eq!(
+            super::app_container_waiting_reason(&pod, Some(&init_statuses)),
+            "ContainerCreating"
+        );
+    }
+
+    // A pod with no init containers is unaffected.
+    #[test]
+    fn app_container_reason_no_init_is_containercreating() {
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("no-init").with_namespace("default"),
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: "run1".to_string(),
+                    image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: None,
+        };
+        assert_eq!(
+            super::app_container_waiting_reason(&pod, None),
+            "ContainerCreating"
+        );
     }
 
     #[test]
