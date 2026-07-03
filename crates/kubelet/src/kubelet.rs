@@ -2988,6 +2988,28 @@ impl Kubelet {
                                         {
                                             st.restart_count =
                                                 st.restart_count.max(init_restart_count);
+                                            // Report the crash as CrashLoopBackOff with the
+                                            // prior termination moved into lastState — how
+                                            // upstream surfaces a backing-off container. The
+                                            // spec's watch waits for the init container's
+                                            // LastTerminationState to be set before it checks
+                                            // restartCount, so a plain Terminated status (no
+                                            // lastState) would hang the test.
+                                            if matches!(
+                                                st.state,
+                                                Some(ContainerState::Terminated { .. })
+                                            ) {
+                                                st.last_state = st.state.take();
+                                                st.state = Some(ContainerState::Waiting {
+                                                    reason: Some("CrashLoopBackOff".to_string()),
+                                                    message: Some(
+                                                        "back-off restarting failed container"
+                                                            .to_string(),
+                                                    ),
+                                                });
+                                                st.ready = false;
+                                                st.started = Some(false);
+                                            }
                                         }
                                     }
                                     let qos = Self::compute_qos_class(&p);
