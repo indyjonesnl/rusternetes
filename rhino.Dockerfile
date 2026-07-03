@@ -13,6 +13,9 @@ WORKDIR /build
 # Copy manifests first for layer caching
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto/ proto/
+# Vendored, patched h2 referenced via [patch.crates-io] in Cargo.toml — must be
+# present before any cargo invocation so the patch path resolves during parse.
+COPY third_party/ third_party/
 
 # Stub source to cache dependency builds
 RUN mkdir -p src/bin && \
