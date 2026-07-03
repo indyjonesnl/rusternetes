@@ -1110,7 +1110,23 @@ impl CriContainerRuntime {
             return Ok(Vec::new());
         };
         let names: Vec<String> = spec.containers.iter().map(|c| c.name.clone()).collect();
-        self.statuses_for(pod, &names).await
+        let mut statuses = self.statuses_for(pod, &names).await?;
+        // Upstream `convertToAPIContainerStatuses` (kubelet_pods.go:2431-2433)
+        // uses `PodInitializing` as the default waiting reason for ALL of a
+        // pod's containers — app containers included — when the pod has init
+        // containers. #1550 applied this to init statuses only; a not-yet-started
+        // app container (blocked behind a still-running/failing init container)
+        // must likewise report `PodInitializing`, not `ContainerCreating`
+        // ("should not start app containers if init containers fail on a
+        // RestartAlways pod" asserts this for the app container `run1`).
+        if spec
+            .init_containers
+            .as_ref()
+            .is_some_and(|ic| !ic.is_empty())
+        {
+            fix_not_started_init_waiting_reason(&mut statuses);
+        }
+        Ok(statuses)
     }
 
     /// Statuses for the pod's init containers, in spec order. `None` if the pod
