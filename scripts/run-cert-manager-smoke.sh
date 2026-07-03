@@ -25,6 +25,22 @@ mkdir -p "${RESULTS_DIR}"
 export KUBELET_VOLUMES_PATH="${KUBELET_VOLUMES_PATH:-${PROJECT_ROOT}/.rusternetes/volumes}"
 mkdir -p "${KUBELET_VOLUMES_PATH}"
 
+# CERTS_PATH MUST be exported BEFORE the first `compose up` below (regression
+# #1153). compose.sqlite.yml bind-mounts the certs dir into the node-1 kubelet
+# at ${CERTS_PATH}:${CERTS_PATH} (host-absolute, same path both sides), and
+# bootstrap-cluster.sh later templates that SAME host-absolute path into the
+# control-plane static-pod hostPath volume (kube-controller-manager /
+# kube-scheduler). If CERTS_PATH is unset at `up` time, the kubelet falls back
+# to mounting certs at /etc/rusternetes/certs, so the host-absolute path the
+# static pods hostPath-mount does not exist inside the kubelet container: its
+# `type: Directory` check fails, the static pods stay Pending forever, the
+# controller-manager never runs, and Deployments (rusternetes-dns, then
+# cert-manager) never reconcile — the rollout wait in [6/7] then times out.
+# The canary's ci/actions/bring-up-cluster sets this the same way; the
+# standalone smoke script needs its own copy.
+export CERTS_PATH="${CERTS_PATH:-${PROJECT_ROOT}/.rusternetes/certs}"
+mkdir -p "${CERTS_PATH}"
+
 # Pre-create every host dir that compose bind-mounts, BEFORE `compose up`.
 # bootstrap-cluster.sh templates the control-plane static pod YAML
 # (kube-controller-manager.yaml, kube-scheduler.yaml) into
