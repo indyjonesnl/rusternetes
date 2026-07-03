@@ -2628,6 +2628,34 @@ impl Kubelet {
             .and_then(|s| s.phase.as_ref())
             .unwrap_or(&Phase::Pending);
 
+        // #1560: while a pod's plain (non-sidecar) init containers are unfinished,
+        // drive it through the init state machine and hold it Pending — regardless
+        // of the phase already recorded or whether an init container is momentarily
+        // running. Upstream `getPhase` reports Pending for such a pod and
+        // `computePodActions` recomputes init progress every sync, independent of
+        // phase. Without this, a pod that briefly shows a running init container
+        // flips to Running (the `Pending if is_running` arm) and its failing init
+        // container is never retried again. Cheap short-circuit for the common
+        // (no-init) case so we don't add a CRI round-trip per sync.
+        let has_plain_init = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.init_containers.as_ref())
+            .is_some_and(|ic| {
+                ic.iter()
+                    .any(|c| c.restart_policy.as_deref() != Some("Always"))
+            });
+        let init_incomplete = has_plain_init
+            && !matches!(current_phase, Phase::Succeeded | Phase::Failed)
+            && self.runtime.has_sandbox(pod_name).await
+            && !self.runtime.compute_init_container_actions(pod).await.0;
+        let current_phase = if init_incomplete {
+            &Phase::Pending
+        } else {
+            current_phase
+        };
+        let is_running = if init_incomplete { false } else { is_running };
+
         // K8s kubelet admission: reject a pod whose declared OS does not match
         // this node's OS. Our nodes are Linux, so a pod with spec.os.name set to
         // anything but "linux" is rejected with Phase=Failed and reason
