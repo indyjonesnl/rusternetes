@@ -20,6 +20,8 @@ mod events;
 #[allow(dead_code)]
 mod eviction;
 #[allow(dead_code)]
+mod host_port;
+#[allow(dead_code)]
 mod kubelet;
 #[allow(dead_code)]
 mod labels;

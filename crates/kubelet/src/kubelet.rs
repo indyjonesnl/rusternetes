@@ -2707,121 +2707,39 @@ impl Kubelet {
         }
 
         // K8s kubelet admission: check hostPort conflicts before starting the pod.
-        // K8s ref: pkg/kubelet/kubelet.go:2752 — allocationManager.AddPod
-        // If a pod's hostPorts conflict with already-running pods on this node,
-        // reject it immediately with Phase=Failed. The owning controller (StatefulSet,
-        // etc.) can then delete and recreate it.
-        if matches!(current_phase, Phase::Pending) && !is_running {
-            if let Some(spec) = &pod.spec {
-                // Collect (hostPort, protocol, hostIP) tuples from all containers.
-                // K8s ref: pkg/scheduler/framework/types.go — HostPortInfo.Add
-                let pod_host_ports: Vec<(u16, String, String)> = spec
-                    .containers
-                    .iter()
-                    .flat_map(|c| c.ports.iter().flatten())
-                    .filter_map(|p| {
-                        // hostPort == 0 means "no host port" — it must not be
-                        // treated as an allocated port, or two pods that both
-                        // leave hostPort unset (0) falsely conflict and the
-                        // kubelet rejects the pod with HostPortConflict. The
-                        // conformance netexec pods declare containerPort with
-                        // hostPort: 0.
-                        p.host_port.filter(|&hp| hp != 0).map(|hp| {
-                            let proto = p.protocol.clone();
-                            let ip = p.host_ip.clone().unwrap_or_default();
-                            (hp, proto, ip)
-                        })
-                    })
-                    .collect();
-
-                if !pod_host_ports.is_empty() {
-                    // Get all pods on this node
-                    let all_pods_prefix = build_prefix("pods", None);
-                    let all_pods: Vec<Pod> = self
-                        .storage
-                        .list(&all_pods_prefix)
-                        .await
-                        .unwrap_or_default();
-                    let pod_ns = pod.metadata.namespace.as_deref().unwrap_or("default");
-                    let active_on_node: Vec<&Pod> = all_pods
-                        .iter()
-                        .filter(|p| {
-                            // Filter by namespace+name to avoid matching wrong pod
-                            let same_pod = p.metadata.name == pod.metadata.name
-                                && p.metadata.namespace.as_deref().unwrap_or("default") == pod_ns;
-                            !same_pod
-                                && p.spec.as_ref().and_then(|s| s.node_name.as_deref())
-                                    == Some(&self.node_name)
-                                && !matches!(
-                                    p.status.as_ref().and_then(|s| s.phase.as_ref()),
-                                    Some(Phase::Failed) | Some(Phase::Succeeded)
-                                )
-                                && p.metadata.deletion_timestamp.is_none()
-                        })
-                        .collect();
-
-                    for (port, proto, ip) in &pod_host_ports {
-                        for existing in &active_on_node {
-                            if let Some(existing_spec) = &existing.spec {
-                                for c in &existing_spec.containers {
-                                    for ep in c.ports.iter().flatten() {
-                                        if let Some(ehp) = ep.host_port {
-                                            let eproto = ep.protocol.as_str();
-                                            // Must match port AND protocol to conflict
-                                            // K8s ref: pkg/scheduler/framework/types.go — CheckConflict
-                                            if ehp == *port && eproto == proto {
-                                                let eip = ep.host_ip.clone().unwrap_or_default();
-                                                // Check hostIP overlap:
-                                                // - Empty/"0.0.0.0"/"::" are wildcards that overlap everything
-                                                // - Two specific different IPs do NOT conflict
-                                                let is_wildcard = |s: &str| {
-                                                    s.is_empty() || s == "0.0.0.0" || s == "::"
-                                                };
-                                                let conflict = is_wildcard(ip)
-                                                    || is_wildcard(&eip)
-                                                    || ip == &eip;
-                                                if conflict {
-                                                    info!(
-                                                        "Pod {}/{} rejected: hostPort {}/{} conflicts with pod {}",
-                                                        namespace,
-                                                        pod_name,
-                                                        port,
-                                                        proto,
-                                                        existing.metadata.name
-                                                    );
-                                                    let key = build_key(
-                                                        "pods",
-                                                        Some(namespace),
-                                                        pod_name,
-                                                    );
-                                                    if let Ok(mut p) =
-                                                        self.storage.get::<Pod>(&key).await
-                                                    {
-                                                        if let Some(ref mut status) = p.status {
-                                                            status.phase = Some(Phase::Failed);
-                                                            status.reason = Some(
-                                                                "HostPortConflict".to_string(),
-                                                            );
-                                                            status.message = Some(format!(
-                                                                "Pod was rejected: host port {} is already in use",
-                                                                port
-                                                            ));
-                                                        }
-                                                        let _ = self
-                                                            .storage
-                                                            .update_status(&key, &p)
-                                                            .await;
-                                                    }
-                                                    return Ok(());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+        // K8s ref: pkg/kubelet/kubelet.go:2752 — allocationManager.AddPod, with
+        // the conflict rule in pkg/scheduler/framework/types.go
+        // (HostPortInfo.CheckConflict). If a pod's hostPorts conflict with an
+        // already-active pod on this node, reject it with Phase=Failed; the
+        // owning controller (StatefulSet, etc.) then deletes and recreates it.
+        // The pure rule + its tests live in `crate::host_port`.
+        if matches!(current_phase, Phase::Pending)
+            && !is_running
+            && !crate::host_port::host_ports(pod).is_empty()
+        {
+            let all_pods_prefix = build_prefix("pods", None);
+            let all_pods: Vec<Pod> = self
+                .storage
+                .list(&all_pods_prefix)
+                .await
+                .unwrap_or_default();
+            if let Some(conflict) =
+                crate::host_port::find_host_port_conflict(pod, &all_pods, &self.node_name)
+            {
+                info!(
+                    "Pod {}/{} rejected: hostPort {}/{} conflicts with pod {}",
+                    namespace, pod_name, conflict.port, conflict.protocol, conflict.conflicting_pod
+                );
+                let key = build_key("pods", Some(namespace), pod_name);
+                if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                    if let Some(ref mut status) = p.status {
+                        status.phase = Some(Phase::Failed);
+                        status.reason = Some("HostPortConflict".to_string());
+                        status.message = Some(conflict.message());
                     }
+                    let _ = self.storage.update_status(&key, &p).await;
                 }
+                return Ok(());
             }
         }
         // Stale-read guard: re-read the pod from storage to detect a concurrent

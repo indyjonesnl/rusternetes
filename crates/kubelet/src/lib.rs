@@ -6,6 +6,7 @@ pub mod downward_api;
 pub mod events;
 #[allow(dead_code)]
 pub mod eviction;
+pub mod host_port;
 pub mod kubelet;
 pub mod labels;
 pub mod lifecycle;
