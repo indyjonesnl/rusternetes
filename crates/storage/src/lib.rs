@@ -399,6 +399,24 @@ pub enum StorageBackend {
     Api(api_storage::ApiStorage),
 }
 
+/// True when two stored objects are equal ignoring `metadata.resourceVersion`.
+///
+/// Used to detect no-op updates so the storage layer can short-circuit them
+/// (upstream etcd3 `GuaranteedUpdate` parity — see [`StorageBackend::update`]).
+/// `serde_json::Value` equality is structural (key order independent), so this
+/// is a faithful "byte-identical modulo resourceVersion" check for our
+/// deterministic struct serialization.
+fn objects_equal_ignoring_resource_version(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    fn without_rv(v: &serde_json::Value) -> serde_json::Value {
+        let mut v = v.clone();
+        if let Some(meta) = v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+            meta.remove("resourceVersion");
+        }
+        v
+    }
+    without_rv(a) == without_rv(b)
+}
+
 impl StorageBackend {
     /// Create a new storage backend from the given configuration.
     pub async fn new(config: StorageConfig) -> Result<Self> {
@@ -538,6 +556,46 @@ impl Storage for StorageBackend {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
+        // No-op update short-circuit (upstream parity). Kubernetes' etcd3 store
+        // skips the write when the new object is byte-identical to what is
+        // stored, modulo resourceVersion — no write, no resourceVersion bump,
+        // and crucially no watch event:
+        //   staging/.../apiserver/pkg/storage/etcd3/store.go:
+        //     if !origState.stale && bytes.Equal(data, origState.data) { return }
+        // Without this, an idempotent controller update — e.g. cert-manager's
+        // cainjector re-setting the SAME caBundle on a webhook config every
+        // reconcile — publishes a MODIFIED event each time, which re-triggers
+        // the controller into a ~20/sec hot-loop (#1566). The Api backend
+        // proxies to a real api-server that already applies this semantic, so
+        // skip the extra network round-trip there.
+        let is_api_backend = {
+            #[cfg(feature = "api-client")]
+            {
+                matches!(self, StorageBackend::Api(_))
+            }
+            #[cfg(not(feature = "api-client"))]
+            {
+                false
+            }
+        };
+        if !is_api_backend {
+            if let Ok(incoming) = serde_json::to_value(value) {
+                if let Ok(current) = Storage::get::<serde_json::Value>(self, key).await {
+                    // Only short-circuit when the caller's resourceVersion is
+                    // absent or matches the stored one. A stale RV with
+                    // otherwise-identical content must still surface a Conflict
+                    // (upstream checks the precondition before the no-op
+                    // short-circuit), so let those fall through to the backend.
+                    let cur_rv = current.pointer("/metadata/resourceVersion");
+                    let incoming_rv = incoming.pointer("/metadata/resourceVersion");
+                    let rv_compatible = incoming_rv.is_none() || incoming_rv == cur_rv;
+                    if rv_compatible && objects_equal_ignoring_resource_version(&current, &incoming)
+                    {
+                        return serde_json::from_value(current).map_err(Error::Serialization);
+                    }
+                }
+            }
+        }
         match self {
             StorageBackend::Etcd(s) => Storage::update(s, key, value).await,
             #[cfg(feature = "sqlite")]
