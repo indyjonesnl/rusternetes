@@ -3478,44 +3478,123 @@ impl Kubelet {
                                 let qos = Self::compute_qos_class(&fresh_pod);
                                 let mut new_pod = fresh_pod;
 
-                                // Determine phase based on restart policy AND error type:
-                                // - RestartNever: pod is Failed
-                                // - Permanent failures (port conflict, etc.): pod is Failed
-                                //   K8s kubelet marks unrecoverable pods as Failed via TerminatePod
+                                // We only reach start_pod (and thus this error handler)
+                                // once every init container has completed — the init
+                                // state machine above returns before start_pod is ever
+                                // called while inits are pending/failing. So an
+                                // unclassified error here is almost always an
+                                // app-container / sandbox *creation* hiccup, NOT an init
+                                // failure, and MUST NOT be reported as "Init container
+                                // failed".
+                                //
+                                // Classify the error to decide the phase:
+                                // - A genuinely terminal init failure (Never-policy init
+                                //   container that exited non-zero) → Failed. Normally
+                                //   surfaced by the state machine, kept here defensively.
+                                // - A permanent host-port conflict → Failed: retrying
+                                //   can never bind the port, so the pod is stuck.
                                 //   K8s ref: pkg/kubelet/status/status_manager.go:629
-                                // - Transient failures with RestartAlways: pod stays Pending
-                                let restart_policy = new_pod
-                                    .spec
-                                    .as_ref()
-                                    .and_then(|s| s.restart_policy.as_deref())
-                                    .unwrap_or("Always");
-                                // K8s does NOT transition to TerminatingPod for container
-                                // creation errors. It retries in SyncPod state. The pod stays
-                                // Pending and the controller (StatefulSet, etc.) handles it.
-                                // Only eviction and deletion trigger TerminatingPod.
-                                // K8s ref: pkg/kubelet/pod_workers.go — podWorkerLoop
+                                // - Everything else (transient create/sandbox errors,
+                                //   e.g. CRI contention) → stay Pending with containers
+                                //   Waiting{ContainerCreating} and retry on the next sync
+                                //   cycle. Upstream kubelet retries create errors in
+                                //   syncPod regardless of restartPolicy; restartPolicy
+                                //   Never only prevents restarting a container that has
+                                //   already RUN and exited, not a creation hiccup.
+                                //   K8s ref: pkg/kubelet/kubelet.go — syncPod retry;
+                                //            pkg/kubelet/pod_workers.go — podWorkerLoop
+                                let init_failed = init_container_failed_terminally(
+                                    &new_pod,
+                                    init_container_statuses.as_deref(),
+                                );
                                 let is_port_conflict = err_msg
                                     .contains("port is already allocated")
                                     || err_msg.contains("bind: address already in use");
 
-                                let (phase, reason) =
-                                    if restart_policy == "Never" || is_port_conflict {
-                                        (Phase::Failed, "FailedToStart".to_string())
+                                if init_failed {
+                                    new_pod.status = Some(Self::build_init_failure_status(
+                                        &new_pod,
+                                        init_container_statuses,
+                                        Phase::Failed,
+                                        "FailedToStart",
+                                        Some(qos),
+                                    ));
+                                } else {
+                                    // App-container start error. Waiting{ContainerCreating}
+                                    // carries the error message; phase is Failed only for a
+                                    // permanent port conflict, otherwise Pending to retry.
+                                    let phase = if is_port_conflict {
+                                        Phase::Failed
                                     } else {
-                                        (Phase::Pending, "InitContainerFailed".to_string())
+                                        Phase::Pending
                                     };
-
-                                new_pod.status = Some(Self::build_init_failure_status(
-                                    &new_pod,
-                                    init_container_statuses,
-                                    phase,
-                                    &reason,
-                                    Some(qos),
-                                ));
+                                    let conditions = if is_port_conflict {
+                                        Self::failed_pod_conditions()
+                                    } else {
+                                        Self::not_ready_pod_conditions()
+                                    };
+                                    let container_statuses: Option<Vec<ContainerStatus>> =
+                                        new_pod.spec.as_ref().map(|spec| {
+                                            spec.containers
+                                                .iter()
+                                                .map(|c| ContainerStatus {
+                                                    name: c.name.clone(),
+                                                    ready: false,
+                                                    restart_count: 0,
+                                                    state: Some(ContainerState::Waiting {
+                                                        reason: Some(
+                                                            "ContainerCreating".to_string(),
+                                                        ),
+                                                        message: Some(err_msg.clone()),
+                                                    }),
+                                                    last_state: None,
+                                                    image: Some(c.image.clone()),
+                                                    image_id: None,
+                                                    container_id: None,
+                                                    started: Some(false),
+                                                    allocated_resources: c
+                                                        .resources
+                                                        .as_ref()
+                                                        .and_then(|r| r.requests.clone()),
+                                                    allocated_resources_status: None,
+                                                    resources: c.resources.clone(),
+                                                    user: None,
+                                                    volume_mounts: None,
+                                                    stop_signal: None,
+                                                })
+                                                .collect()
+                                        });
+                                    let prior = new_pod.status.as_ref();
+                                    new_pod.status = Some(PodStatus {
+                                        phase: Some(phase),
+                                        message: Some(err_msg.clone()),
+                                        reason: Some("FailedToStart".to_string()),
+                                        host_ip: prior
+                                            .and_then(|s| s.host_ip.clone())
+                                            .or_else(|| Some(Self::node_internal_ip().to_string())),
+                                        pod_ip: prior.and_then(|s| s.pod_ip.clone()),
+                                        conditions: Some(conditions),
+                                        container_statuses,
+                                        init_container_statuses,
+                                        observed_generation: new_pod.metadata.generation,
+                                        qos_class: Some(qos),
+                                        start_time: prior.and_then(|s| s.start_time),
+                                        host_i_ps: prior.and_then(|s| s.host_i_ps.clone()).or_else(
+                                            || {
+                                                Some(vec![
+                                                    rusternetes_common::resources::pod::HostIP {
+                                                        ip: Self::node_internal_ip().to_string(),
+                                                    },
+                                                ])
+                                            },
+                                        ),
+                                        ..Default::default()
+                                    });
+                                }
 
                                 if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                                     warn!(
-                                        "Failed to update pod {}/{} status after init failure: {}",
+                                        "Failed to update pod {}/{} status after start error: {}",
                                         namespace, pod_name, e
                                     );
                                 }
@@ -5976,6 +6055,65 @@ mod tests {
         };
 
         assert!(super::init_container_failed_terminally(
+            &pod,
+            pod.status
+                .as_ref()
+                .and_then(|status| status.init_container_statuses.as_deref())
+        ));
+    }
+
+    // Regression: a restartPolicy=Never pod with NO init containers must not be
+    // classified as a terminal init failure. A transient app-container start
+    // error (e.g. CRI contention) on such a pod previously took the
+    // `restart_policy == "Never"` fast-fail branch and was reported as
+    // Failed/"Init container failed"; the start-error handler now keys off
+    // init_container_failed_terminally, which is false here, so the pod stays
+    // Pending and retries. Node-conformance "should use the image defaults if
+    // command and args are blank" flaked on exactly this.
+    #[test]
+    fn restart_never_no_init_containers_is_not_terminal_init_failure() {
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("no-init").with_namespace("default"),
+            spec: Some(PodSpec {
+                restart_policy: Some("Never".to_string()),
+                containers: vec![Container {
+                    name: "agnhost-container".to_string(),
+                    image: "registry.k8s.io/e2e-test-images/agnhost:2.59".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            // App container still being created — no init statuses at all.
+            status: Some(PodStatus {
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "agnhost-container".to_string(),
+                    ready: false,
+                    restart_count: 0,
+                    state: Some(ContainerState::Waiting {
+                        reason: Some("ContainerCreating".to_string()),
+                        message: None,
+                    }),
+                    last_state: None,
+                    image: Some("registry.k8s.io/e2e-test-images/agnhost:2.59".to_string()),
+                    image_id: None,
+                    container_id: None,
+                    started: Some(false),
+                    allocated_resources: None,
+                    allocated_resources_status: None,
+                    resources: None,
+                    user: None,
+                    volume_mounts: None,
+                    stop_signal: None,
+                }]),
+                ..Default::default()
+            }),
+        };
+
+        assert!(!super::init_container_failed_terminally(
             &pod,
             pod.status
                 .as_ref()
