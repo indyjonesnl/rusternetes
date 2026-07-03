@@ -2628,6 +2628,34 @@ impl Kubelet {
             .and_then(|s| s.phase.as_ref())
             .unwrap_or(&Phase::Pending);
 
+        // #1560: while a pod's plain (non-sidecar) init containers are unfinished,
+        // drive it through the init state machine and hold it Pending — regardless
+        // of the phase already recorded or whether an init container is momentarily
+        // running. Upstream `getPhase` reports Pending for such a pod and
+        // `computePodActions` recomputes init progress every sync, independent of
+        // phase. Without this, a pod that briefly shows a running init container
+        // flips to Running (the `Pending if is_running` arm) and its failing init
+        // container is never retried again. Cheap short-circuit for the common
+        // (no-init) case so we don't add a CRI round-trip per sync.
+        let has_plain_init = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.init_containers.as_ref())
+            .is_some_and(|ic| {
+                ic.iter()
+                    .any(|c| c.restart_policy.as_deref() != Some("Always"))
+            });
+        let init_incomplete = has_plain_init
+            && !matches!(current_phase, Phase::Succeeded | Phase::Failed)
+            && self.runtime.has_sandbox(pod_name).await
+            && !self.runtime.compute_init_container_actions(pod).await.0;
+        let current_phase = if init_incomplete {
+            &Phase::Pending
+        } else {
+            current_phase
+        };
+        let is_running = if init_incomplete { false } else { is_running };
+
         // K8s kubelet admission: reject a pod whose declared OS does not match
         // this node's OS. Our nodes are Linux, so a pod with spec.os.name set to
         // anything but "linux" is rejected with Phase=Failed and reason
@@ -2875,11 +2903,55 @@ impl Kubelet {
                                     "Init container {} failed for pod {}/{}, will retry next sync",
                                     ic.name, namespace, pod_name
                                 );
-                                // Remove failed container so it can be recreated
-                                let _ = self
-                                    .runtime
-                                    .remove_terminated_container(&pod.metadata.uid, &ic.name)
-                                    .await;
+                                // CrashLoopBackOff gate + monotonic restartCount for
+                                // the failing init container, mirroring
+                                // reconcile_container_restarts for app containers. The
+                                // CRI attempt is reset by the remove/recreate, so the
+                                // backoff map is the source of truth for the reported
+                                // count — the "should not start app containers if init
+                                // containers fail on a RestartAlways pod" spec asserts
+                                // the init container's restartCount climbs to >= 3. The
+                                // gate also spaces retries out (was a hot ~sync-interval
+                                // loop with no backoff).
+                                let bkey = format!("{}/{}/{}", namespace, pod_name, ic.name);
+                                let now = Instant::now();
+                                let (do_restart, init_restart_count) = {
+                                    let mut map = self.restart_backoff.lock().unwrap();
+                                    match map.get_mut(&bkey) {
+                                        None => {
+                                            map.insert(
+                                                bkey.clone(),
+                                                RestartBackoff {
+                                                    restart_count: 1,
+                                                    last_restart: now,
+                                                    backoff: CRASHLOOP_BACKOFF_INITIAL,
+                                                },
+                                            );
+                                            (true, 1)
+                                        }
+                                        Some(entry) => {
+                                            if now.duration_since(entry.last_restart)
+                                                >= entry.backoff
+                                            {
+                                                entry.restart_count += 1;
+                                                entry.last_restart = now;
+                                                entry.backoff =
+                                                    (entry.backoff * 2).min(CRASHLOOP_BACKOFF_MAX);
+                                                (true, entry.restart_count)
+                                            } else {
+                                                (false, entry.restart_count)
+                                            }
+                                        }
+                                    }
+                                };
+                                // Remove the exited container (→ recreate next sync) only
+                                // once the backoff window elapses.
+                                if do_restart {
+                                    let _ = self
+                                        .runtime
+                                        .remove_terminated_container(&pod.metadata.uid, &ic.name)
+                                        .await;
+                                }
                                 // Update status with CrashLoopBackOff AND make sure
                                 // the PodInitialized=False condition + app-container
                                 // Waiting/PodInitializing statuses are present.
@@ -2904,7 +2976,42 @@ impl Kubelet {
                                 //          GeneratePodInitializedCondition
                                 let key = build_key("pods", Some(namespace), pod_name);
                                 if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
-                                    let init_statuses = self.get_init_container_statuses(&p).await;
+                                    let mut init_statuses =
+                                        self.get_init_container_statuses(&p).await;
+                                    // Overlay the monotonic count from the backoff map
+                                    // onto the failing init container — the recreate
+                                    // resets the CRI attempt to 0, so this is the only
+                                    // record that survives across retries.
+                                    if let Some(list) = init_statuses.as_mut() {
+                                        if let Some(st) =
+                                            list.iter_mut().find(|s| s.name == ic.name)
+                                        {
+                                            st.restart_count =
+                                                st.restart_count.max(init_restart_count);
+                                            // Report the crash as CrashLoopBackOff with the
+                                            // prior termination moved into lastState — how
+                                            // upstream surfaces a backing-off container. The
+                                            // spec's watch waits for the init container's
+                                            // LastTerminationState to be set before it checks
+                                            // restartCount, so a plain Terminated status (no
+                                            // lastState) would hang the test.
+                                            if matches!(
+                                                st.state,
+                                                Some(ContainerState::Terminated { .. })
+                                            ) {
+                                                st.last_state = st.state.take();
+                                                st.state = Some(ContainerState::Waiting {
+                                                    reason: Some("CrashLoopBackOff".to_string()),
+                                                    message: Some(
+                                                        "back-off restarting failed container"
+                                                            .to_string(),
+                                                    ),
+                                                });
+                                                st.ready = false;
+                                                st.started = Some(false);
+                                            }
+                                        }
+                                    }
                                     let qos = Self::compute_qos_class(&p);
                                     p.status = Some(Self::build_init_failure_status(
                                         &p,
