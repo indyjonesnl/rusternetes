@@ -94,6 +94,24 @@ cleanup() {
         >"${RESULTS_DIR}/cert-manager-describe.txt" 2>&1 || true
     ${KUBECTL} get certificaterequest -A -o yaml \
         >"${RESULTS_DIR}/cert-manager-certificaterequests.yaml" 2>&1 || true
+    # The webhook admission path (api-server -> webhook svc) fails with
+    # "invalid peer certificate: UnknownIssuer" when the cainjector has not
+    # patched the caBundle into the webhook configs. Capture exactly that: the
+    # cainjector log (why it did/didn't reconcile), the source CA secret it
+    # injects from, and the webhook configs so we can see whether caBundle is
+    # populated. Without these the artifact can't explain a stuck injection.
+    ${KUBECTL} -n cert-manager logs deploy/cert-manager-cainjector --tail=200 \
+        >"${RESULTS_DIR}/cert-manager-cainjector.log" 2>&1 || true
+    ${KUBECTL} -n cert-manager logs deploy/cert-manager-webhook --tail=100 \
+        >"${RESULTS_DIR}/cert-manager-webhook.log" 2>&1 || true
+    ${KUBECTL} -n cert-manager get secret cert-manager-webhook-ca -o yaml \
+        >"${RESULTS_DIR}/cert-manager-webhook-ca-secret.yaml" 2>&1 || true
+    ${KUBECTL} get validatingwebhookconfiguration cert-manager-webhook -o yaml \
+        >"${RESULTS_DIR}/cert-manager-validatingwebhook.yaml" 2>&1 || true
+    ${KUBECTL} get mutatingwebhookconfiguration cert-manager-webhook -o yaml \
+        >"${RESULTS_DIR}/cert-manager-mutatingwebhook.yaml" 2>&1 || true
+    ${KUBECTL} -n cert-manager get lease -o wide \
+        >"${RESULTS_DIR}/cert-manager-leases.txt" 2>&1 || true
     # shellcheck disable=SC2086
     ${COMPOSE} down -v --remove-orphans >/dev/null 2>&1 || true
 }
