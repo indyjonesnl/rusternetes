@@ -108,12 +108,19 @@ adjacent CRI runtime rather than Rusternetes itself, on `containerd-rs`:
   exploits this: it stages a same-size shim, `touch -r`s it to the k0s
   executable's mtime, and k0s's own staging pass then reuses it verbatim on
   every supervisor restart.
-- **Workload swaps (v5 dns/kube-proxy):** these replace an in-cluster
+- **Workload swaps (v5 kube-proxy / v6 dns):** these replace an in-cluster
   DaemonSet/Deployment via `kubectl` instead, and need a way to get a
   locally-built Rusternetes pod image into the node's containerd-rs image
   store — see the containerd-rs#39 note above for why that needed a
   harness-local workaround (a throwaway HTTP registry + a newer
   containerd-rs baked in just for those two variants).
+- **Clean-checkout prerequisites:** v1-v4 are self-contained
+  (`run-variant.sh` invokes `build-swap-binaries.sh` to cross-build the musl
+  binary + extract the genuine k0s binary). v5/v6 additionally require the
+  `kube-proxy`/`rusternetes-dns` musl binaries pre-built in the shared cargo
+  target dir AND an adjacent `../containerd-rs` checkout built static-musl
+  with insecure-registry support. Both are gated with explicit error
+  messages, but v5/v6 do NOT run from a rusternetes-only clone.
 - **Sequential only:** every variant publishes the same host port (26444 for
   the k0s admin API), so exactly one variant's compose stack can be up at a
   time. `run-matrix.sh` tears down each variant (`compose down -v`) before

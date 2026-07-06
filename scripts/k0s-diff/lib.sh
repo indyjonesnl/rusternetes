@@ -7,7 +7,7 @@ VARIANTS=(v0 v1 v2 v3 v4 v5 v6)
 SWAP=( "" api-server kubelet scheduler controller-manager kube-proxy dns )
 # fixed sig order: highest-signal / cheapest-feedback first
 SIGS=(sig-node sig-api-machinery sig-apps sig-storage sig-network sig-auth sig-scheduling sig-cli sig-instrumentation)
-K8S_VERSION=v1.35.0
+K8S_VERSION=v1.35.5
 # Fixed k0s-diff-net subnet/gateway (pinned in compose.k0s.template.yml). Pinning
 # it makes the bridge gateway deterministic BEFORE `up`, so the v5/v6 workload
 # swaps can point CONTAINERD_RS_INSECURE_REGISTRIES at the host-published local

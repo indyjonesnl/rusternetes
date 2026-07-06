@@ -167,10 +167,10 @@ fi
 # Unlike the baked binary swaps (v1..v4), v5/v6 replace an in-cluster workload
 # (DaemonSet/Deployment) with a Rusternetes pod image. The all-Go stack must be
 # healthy (smoke passed) first; only then do we swap the component and re-verify.
-# NB: for these to work the stack was brought up with CONTAINERD_RS_INSECURE_
-# REGISTRIES pointing at the local registry — apply_workload_swap must run
-# BEFORE the compose `up` above on a fresh bring-up. We therefore stage the
-# registry/env in a pre-up hook (see the swap!=baked branch near `up -d`).
+# NB: the swap itself runs here, AFTER smoke. What must precede the compose
+# `up` above is the registry/env staging (CONTAINERD_RS_INSECURE_REGISTRIES
+# pointing at the local registry) so containerd-rs can pull the swap image —
+# that is staged in a pre-up hook (see the swap!=baked branch near `up -d`).
 case "$swap" in
   kube-proxy|dns)
     if ! bash "$here/apply-workload-swap.sh" "$v" "$swap" "$REGISTRY_HOSTPORT"; then

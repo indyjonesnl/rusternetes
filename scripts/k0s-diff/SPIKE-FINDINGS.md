@@ -240,7 +240,7 @@ Inside the container: **`/var/lib/k0s/pki/admin.conf`** (`-rw------- root:root`,
 also exported as `ENV KUBECONFIG` in the stock k0s image). `k0s kubeconfig admin`
 prints an equivalent kubeconfig on stdout.
 
-Extract to the host (server rewritten to the published port `26443`):
+Extract to the host (server rewritten to the published port `26444`):
 ```
 docker exec k0s-diff-v0 k0s kubeconfig admin > /tmp/k0s-diff.kubeconfig
 sed -i 's#server: https://.*:6443#server: https://127.0.0.1:26444#' /tmp/k0s-diff.kubeconfig
