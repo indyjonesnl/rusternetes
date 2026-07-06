@@ -20,11 +20,20 @@
 # snake_case the brief sketched):
 #   --hostname-override=X -> --node-name=X          (required)
 #   --kubeconfig=X        -> --kubeconfig=X          (selects API mode)
-#   --config=X            -> --config=X              (KubeletConfiguration; serde
-#                                                     ignores unknown fields)
 #   --root-dir=X          -> --root-dir=X            (supported 1:1)
 #   (derived)             -> --api-server-url=<server from the kubeconfig>
 #   (derived)             -> --cluster-dns / --cluster-domain from the config file
+#
+# NOTE — --config is DROPPED, not passed through. k0s's generated
+# KubeletConfiguration expresses duration fields as K8s Duration STRINGS
+# (syncFrequency: "0s", ...), but rusternetes-kubelet's KubeletConfiguration
+# (crates/kubelet/src/config.rs) types syncFrequency as u64 and hard-fails the
+# whole file on the type mismatch ("invalid type: string \"0s\", expected u64").
+# rusternetes only reads a handful of fields from --config (rootDir, syncFreq,
+# metricsBindPort, logLevel) — we pass --root-dir explicitly and extract
+# clusterDNS/clusterDomain below — so dropping --config loses nothing reachable
+# and lets the kubelet start. This K8s-Duration parse gap is recorded for a
+# GitHub issue (see task-4-report.md).
 #
 # CRI endpoint is NOT a flag: rusternetes-kubelet reads CONTAINER_RUNTIME_ENDPOINT
 # from the env (default unix:///run/containerd/containerd.sock). We export it to
@@ -82,9 +91,10 @@ fi
 log "derived api-server-url from kubeconfig: '${API_URL:-<none>}'"
 
 # The config file (KubeletConfiguration) carries clusterDNS (a YAML list) and
-# clusterDomain, which rusternetes-kubelet does NOT read from --config; it takes
-# them from --cluster-dns / --cluster-domain flags (else it tries to discover
-# DNS via the api-server). Extract and pass them explicitly.
+# clusterDomain, which rusternetes-kubelet does NOT read from --config anyway; it
+# takes them from --cluster-dns / --cluster-domain flags (else it tries to
+# discover DNS via the api-server). Extract and pass them explicitly. --config
+# itself is NOT forwarded (K8s-Duration parse gap; see header note).
 CLUSTER_DNS=""
 CLUSTER_DOMAIN=""
 if [ -n "$CONFIG_PATH" ] && [ -f "$CONFIG_PATH" ]; then
@@ -99,10 +109,12 @@ log "from config: cluster_dns='${CLUSTER_DNS:-<none>}' cluster_domain='${CLUSTER
 
 [ -n "$NODE_NAME" ] || { log "FATAL no --hostname-override in k0s argv"; echo "kubelet shim: no --hostname-override" >&2; exit 1; }
 
+# --config deliberately omitted (K8s-Duration parse gap — see header note).
+[ -n "$CONFIG_PATH" ] && log "NOTE dropping --config=$CONFIG_PATH (rusternetes-kubelet cannot parse k0s KubeletConfiguration Duration strings)"
+
 set -- --node-name="$NODE_NAME"
 [ -n "$KUBECONFIG_PATH" ] && set -- "$@" --kubeconfig="$KUBECONFIG_PATH"
 [ -n "$API_URL" ]         && set -- "$@" --api-server-url="$API_URL"
-[ -n "$CONFIG_PATH" ]     && set -- "$@" --config="$CONFIG_PATH"
 [ -n "$ROOT_DIR" ]        && set -- "$@" --root-dir="$ROOT_DIR"
 [ -n "$CLUSTER_DNS" ]     && set -- "$@" --cluster-dns="$CLUSTER_DNS"
 [ -n "$CLUSTER_DOMAIN" ]  && set -- "$@" --cluster-domain="$CLUSTER_DOMAIN"
