@@ -21,11 +21,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.k0s-node
-@@BUILD_ARGS@@
-    image: k0s-diff-@@VARIANT@@-node:v1.35.5
-    container_name: k0s-diff-@@VARIANT@@
-    hostname: k0s-diff-@@VARIANT@@
-@@SWAP_LABEL@@
+      args:
+        SWAP_COMPONENT: "kubelet"
+    image: k0s-diff-v2-node:v1.35.5
+    container_name: k0s-diff-v2
+    hostname: k0s-diff-v2
+    labels:
+      com.k0s-diff.variant: "v2"
+      com.k0s-diff.swap: "kubelet"
     restart: unless-stopped
     privileged: true
     cgroup: host
@@ -67,4 +70,4 @@ networks:
 
 volumes:
   k0s-var:
-    name: k0s-diff-@@VARIANT@@-var
+    name: k0s-diff-v2-var

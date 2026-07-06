@@ -21,11 +21,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.k0s-node
-@@BUILD_ARGS@@
-    image: k0s-diff-@@VARIANT@@-node:v1.35.5
-    container_name: k0s-diff-@@VARIANT@@
-    hostname: k0s-diff-@@VARIANT@@
-@@SWAP_LABEL@@
+      args:
+        SWAP_COMPONENT: "kube-proxy"
+    image: k0s-diff-v5-node:v1.35.5
+    container_name: k0s-diff-v5
+    hostname: k0s-diff-v5
+    labels:
+      com.k0s-diff.variant: "v5"
+      com.k0s-diff.swap: "kube-proxy"
     restart: unless-stopped
     privileged: true
     cgroup: host
@@ -67,4 +70,4 @@ networks:
 
 volumes:
   k0s-var:
-    name: k0s-diff-@@VARIANT@@-var
+    name: k0s-diff-v5-var
