@@ -60,6 +60,21 @@ RUN mkdir -p /opt/cni/bin \
 ARG SWAP_COMPONENT=""
 COPY shims/ /opt/k0s-diff/shims/
 COPY .build/ /opt/k0s-diff/.build/
+
+# Optional containerd-rs override (v5/v6 enabler). The pinned v0.1.3 baked above
+# has NO local-image load path AND predates the CONTAINERD_RS_INSECURE_REGISTRIES
+# env feature (added post-v0.1.3) AND uses oci-client defaults (HTTPS + cert
+# verify) — so it cannot pull the local-registry rusternetes-{dns,kube-proxy}
+# images the workload swaps need. When CONTAINERD_RS_BINARY names a file under
+# the build context's .build/ (e.g. ".build/containerd-rs", a newer static-musl
+# build carrying the env feature), install it OVER the v0.1.3 binary. Empty by
+# default => v0..v4 keep the pinned baseline runtime untouched.
+ARG CONTAINERD_RS_BINARY=""
+RUN set -eu; \
+    if [ -n "$CONTAINERD_RS_BINARY" ] && [ -f "/opt/k0s-diff/$CONTAINERD_RS_BINARY" ]; then \
+      install -m0755 "/opt/k0s-diff/$CONTAINERD_RS_BINARY" /usr/local/bin/containerd-rs; \
+      /usr/local/bin/containerd-rs --version || true; \
+    fi
 # NOTE: only the BAKED binary swaps (v1..v4) install the pre-k0s-start stager +
 # marker. v5 (kube-proxy) / v6 (dns) are workload swaps — the Rusternetes binary
 # ships in a pullable pod image (Dockerfile.{kube-proxy,dns}), NOT /var/lib/k0s/bin,

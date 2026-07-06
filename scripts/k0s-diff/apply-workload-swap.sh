@@ -52,10 +52,14 @@ dump_diag() {
 case "$component" in
   dns)
     log "applying coredns -> rusternetes-dns swap (image=$img)"
+    # Delete + recreate rather than `apply`/patch: the k0s coredns Deployment is
+    # server-created (no last-applied annotation) and a strategic merge would
+    # UNION our tcpSocket probes with CoreDNS's httpGet probes ("may not specify
+    # more than 1 handler type"). A clean recreate installs exactly our spec. The
+    # kube-dns Service (10.96.0.10) is a separate object and is left untouched.
+    kubectl -n kube-system delete deploy coredns --ignore-not-found --wait=true
     sed "s#__RUSTERNETES_DNS_IMAGE__#${img}#g" "$here/coredns-rusternetes-dns.yaml" \
       | kubectl apply -f -
-    # Force a clean rollout of the new pod template.
-    kubectl -n kube-system rollout restart deploy/coredns
     if ! kubectl -n kube-system rollout status deploy/coredns --timeout=150s; then
       log "coredns rollout did not complete"; dump_diag "k8s-app=kube-dns"; exit 1
     fi
@@ -85,9 +89,12 @@ case "$component" in
 
   kube-proxy)
     log "applying kube-proxy -> rusternetes-kube-proxy swap (image=$img)"
+    # Delete + recreate (see the dns branch): the k0s kube-proxy DaemonSet is
+    # server-created and a strategic merge would union our args/command with
+    # k0s's. A clean recreate installs exactly our spec.
+    kubectl -n kube-system delete ds kube-proxy --ignore-not-found --wait=true
     sed "s#__RUSTERNETES_KUBE_PROXY_IMAGE__#${img}#g" "$here/kube-proxy-rusternetes.yaml" \
       | kubectl apply -f -
-    kubectl -n kube-system rollout restart ds/kube-proxy
     if ! kubectl -n kube-system rollout status ds/kube-proxy --timeout=150s; then
       log "kube-proxy DaemonSet rollout did not complete"; dump_diag "k8s-app=kube-proxy"; exit 1
     fi

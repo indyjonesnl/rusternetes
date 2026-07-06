@@ -74,6 +74,26 @@ fi
 REGISTRY_HOSTPORT=""
 case "$swap" in
   kube-proxy|dns)
+    # The pinned v0.1.3 runtime baked in the node image cannot pull a local
+    # registry (no load path; predates CONTAINERD_RS_INSECURE_REGISTRIES; oci
+    # defaults = HTTPS+verify). Bake a newer static-musl containerd-rs that
+    # carries the env feature so containerd-rs pulls the pushed image over HTTP.
+    # Path overridable via K0S_DIFF_CONTAINERD_RS_MUSL.
+    crs_musl="${K0S_DIFF_CONTAINERD_RS_MUSL:-$HOME/.cache/containerd-rs-target/x86_64-unknown-linux-musl/release/containerd-rs}"
+    if [ ! -f "$crs_musl" ]; then
+      echo "workload swaps need a newer containerd-rs (env-feature, static-musl) at:" >&2
+      echo "  $crs_musl" >&2
+      echo "build it: (cd ../../../containerd-rs && CARGO_TARGET_DIR=\$HOME/.cache/containerd-rs-target cargo build --release --target x86_64-unknown-linux-musl -p containerd-rs)" >&2
+      exit 1
+    fi
+    if ! strings "$crs_musl" 2>/dev/null | grep -q CONTAINERD_RS_INSECURE_REGISTRIES; then
+      echo "containerd-rs at $crs_musl lacks CONTAINERD_RS_INSECURE_REGISTRIES support — rebuild from a source that has it" >&2
+      exit 1
+    fi
+    install -m0755 "$crs_musl" "$here/.build/containerd-rs"
+    log "baking newer containerd-rs (env-feature) into the $v node image"
+    docker compose -f "$f" build --build-arg CONTAINERD_RS_BINARY=.build/containerd-rs
+
     docker network inspect k0s-diff-net >/dev/null 2>&1 || docker network create k0s-diff-net >/dev/null
     gw="$(docker network inspect k0s-diff-net --format '{{(index .IPAM.Config 0).Gateway}}')"
     [ -n "$gw" ] || { echo "could not resolve k0s-diff-net gateway" >&2; exit 1; }
