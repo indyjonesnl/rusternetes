@@ -33,8 +33,8 @@ RUN wget -qO /usr/local/bin/crun \
     && chmod +x /usr/local/bin/crun \
     && /usr/local/bin/crun --version
 
-# Standard CNI plugins (bridge, host-local, loopback, portmap, flannel, ...) into
-# containerd-rs's cni_bin_dir. k0s's built-in flannel provider writes the CNI
+# Standard CNI plugins (bridge, host-local, loopback, portmap, ...) into
+# containerd-rs's cni_bin_dir. k0s's built-in kuberouter provider writes the CNI
 # conflist to /etc/cni/net.d at runtime; containerd-rs execs these plugins.
 ARG CNI_VERSION=1.6.2
 RUN mkdir -p /opt/cni/bin \

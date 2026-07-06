@@ -5,9 +5,13 @@ metadata:
 spec:
   api:
     port: 6443
-  # Embedded etcd (all-Go) — v0 baseline keeps the whole control plane upstream.
+  # Embedded kine -> SQLite (all-Go) — the fixed datastore for every variant.
+  # kine exposes the etcd v3 gRPC API in-process, so the later v1 variant
+  # (rusternetes-api-server) can point --etcd_servers at kine's endpoint.
   storage:
-    type: etcd
+    type: kine
+    kine:
+      dataSource: "sqlite:///var/lib/k0s/db/state.db?mode=rwc&_journal=WAL"
   network:
     # kuberouter = k0s's default built-in CNI (upstream Go kube-router, CNI-only
     # mode; all-Go). k0s v1.35 does NOT support a "flannel" provider (only

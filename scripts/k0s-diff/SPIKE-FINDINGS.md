@@ -28,7 +28,17 @@ socket, then `exec k0s controller --config=/etc/k0s/k0s.yaml --enable-worker
 --no-taints --cri-socket remote:unix:///run/containerd-rs.sock`. k0s cedes the
 CRI to containerd-rs and launches **no containerd of its own**.
 
-- **Datastore:** embedded etcd (all-Go). apiserver `--etcd-servers=https://127.0.0.1:2379`.
+- **Datastore:** embedded **kine → SQLite** (all-Go). k0s supervises a `kine`
+  binary (`/var/lib/k0s/bin/kine`) that speaks the **etcd v3 gRPC API** over a
+  unix socket and persists to SQLite. Config: `storage.type: kine`,
+  `storage.kine.dataSource: "sqlite:///var/lib/k0s/db/state.db?mode=rwc&_journal=WAL"`.
+  DB at `/var/lib/k0s/db/state.db` (WAL). kine listens on
+  `unix:///run/k0s/kine/kine.sock:2379`; the apiserver uses
+  `--etcd-servers=unix:/run/k0s/kine/kine.sock:2379`. Because kine exposes the
+  etcd v3 gRPC API, the later **v1 variant (rusternetes-api-server) can point
+  its `--etcd_servers` at kine's endpoint** (`/run/k0s/kine/kine.sock`) — no
+  separate etcd needed. kine runs in-process/supervised, so it is **NOT a
+  kube-system pod**; the pod-Ready gate covers only the real workloads.
 - **CNI:** k0s built-in `kuberouter` provider (upstream **Go** kube-router, CNI-only). Pod IPs land in `10.244.0.0/16`.
 - **Service proxy:** upstream **Go** `kube-proxy`, ENABLED (kube-router runs CNI only; kube-proxy is a swap target in a later variant, so the baseline must run it).
 - **CRI socket:** `/run/containerd-rs.sock` (containerd-rs config `/etc/containerd-rs.toml`).
@@ -139,10 +149,14 @@ is stable and unaffected.
 
 Raw, unedited (single space between args; trailing space as emitted).
 
-### kube-apiserver
+### kube-apiserver (kine backend)
 ```
-/var/lib/k0s/bin/kube-apiserver --service-account-signing-key-file=/var/lib/k0s/pki/sa.key --allow-privileged=true --requestheader-username-headers=X-Remote-User --kubelet-client-key=/var/lib/k0s/pki/apiserver-kubelet-client.key --service-account-key-file=/var/lib/k0s/pki/sa.pub --kubelet-certificate-authority=/var/lib/k0s/pki/ca.crt --egress-selector-config-file=/var/lib/k0s/konnectivity.conf --requestheader-extra-headers-prefix=X-Remote-Extra- --service-account-jwks-uri=https://kubernetes.default.svc/openid/v1/jwks --advertise-address=192.168.80.2 --feature-gates= --service-account-issuer=https://kubernetes.default.svc --kubelet-client-certificate=/var/lib/k0s/pki/apiserver-kubelet-client.crt --proxy-client-cert-file=/var/lib/k0s/pki/front-proxy-client.crt --anonymous-auth=false --profiling=false --tls-cert-file=/var/lib/k0s/pki/server.crt --v=1 --tls-min-version=VersionTLS12 --authorization-mode=Node,RBAC --secure-port=6443 --requestheader-client-ca-file=/var/lib/k0s/pki/front-proxy-ca.crt --requestheader-group-headers=X-Remote-Group --api-audiences=https://kubernetes.default.svc,system:konnectivity-server --enable-bootstrap-token-auth=true --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname --requestheader-allowed-names=front-proxy-client --service-cluster-ip-range=10.96.0.0/12 --tls-private-key-file=/var/lib/k0s/pki/server.key --tls-cipher-suites=TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 --enable-admission-plugins=NodeRestriction --client-ca-file=/var/lib/k0s/pki/ca.crt --proxy-client-key-file=/var/lib/k0s/pki/front-proxy-client.key --etcd-servers=https://127.0.0.1:2379 --etcd-cafile=/var/lib/k0s/pki/etcd/ca.crt --etcd-certfile=/var/lib/k0s/pki/apiserver-etcd-client.crt --etcd-keyfile=/var/lib/k0s/pki/apiserver-etcd-client.key
+/var/lib/k0s/bin/kube-apiserver --service-account-jwks-uri=https://kubernetes.default.svc/openid/v1/jwks --secure-port=6443 --proxy-client-cert-file=/var/lib/k0s/pki/front-proxy-client.crt --service-cluster-ip-range=10.96.0.0/12 --tls-cert-file=/var/lib/k0s/pki/server.crt --service-account-signing-key-file=/var/lib/k0s/pki/sa.key --v=1 --api-audiences=https://kubernetes.default.svc,system:konnectivity-server --enable-bootstrap-token-auth=true --kubelet-certificate-authority=/var/lib/k0s/pki/ca.crt --feature-gates= --allow-privileged=true --service-account-issuer=https://kubernetes.default.svc --client-ca-file=/var/lib/k0s/pki/ca.crt --kubelet-client-key=/var/lib/k0s/pki/apiserver-kubelet-client.key --proxy-client-key-file=/var/lib/k0s/pki/front-proxy-client.key --egress-selector-config-file=/var/lib/k0s/konnectivity.conf --authorization-mode=Node,RBAC --tls-min-version=VersionTLS12 --enable-admission-plugins=NodeRestriction --requestheader-extra-headers-prefix=X-Remote-Extra- --requestheader-group-headers=X-Remote-Group --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname --requestheader-allowed-names=front-proxy-client --profiling=false --service-account-key-file=/var/lib/k0s/pki/sa.pub --anonymous-auth=false --requestheader-client-ca-file=/var/lib/k0s/pki/front-proxy-ca.crt --requestheader-username-headers=X-Remote-User --tls-cipher-suites=TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 --advertise-address=172.18.0.2 --kubelet-client-certificate=/var/lib/k0s/pki/apiserver-kubelet-client.crt --tls-private-key-file=/var/lib/k0s/pki/server.key --etcd-servers=unix:/run/k0s/kine/kine.sock:2379
 ```
+Note: with the kine backend the datastore flags collapse to a single
+`--etcd-servers=unix:/run/k0s/kine/kine.sock:2379` (no etcd TLS ca/cert/key flags
+— kine speaks etcd v3 gRPC over a local unix socket). `--advertise-address` is
+the container's docker-network IP (environment-specific).
 
 ### kubelet
 ```
@@ -184,7 +198,7 @@ prints an equivalent kubeconfig on stdout.
 Extract to the host (server rewritten to the published port `26443`):
 ```
 docker exec k0s-diff-v0 k0s kubeconfig admin > /tmp/k0s-diff.kubeconfig
-sed -i 's#server: https://.*:6443#server: https://127.0.0.1:26443#' /tmp/k0s-diff.kubeconfig
+sed -i 's#server: https://.*:6443#server: https://127.0.0.1:26444#' /tmp/k0s-diff.kubeconfig
 ```
 
 Per-component kubeconfigs the API-mode shims (v1–v4) pass as `--kubeconfig`
@@ -192,7 +206,8 @@ Per-component kubeconfigs the API-mode shims (v1–v4) pass as `--kubeconfig`
 - scheduler: `/var/lib/k0s/pki/scheduler.conf`
 - controller-manager: `/var/lib/k0s/pki/ccm.conf`
 - kubelet: `/run/k0s/kubelet-direct.conf` (+ config `/run/k0s/kubelet/config.yaml`)
-- api-server: serves on `:6443`, talks to etcd on `127.0.0.1:2379` (no kubeconfig; it IS the API)
+- api-server: serves on `:6443`, talks to kine (etcd v3 gRPC) on
+  `unix:/run/k0s/kine/kine.sock:2379` (no kubeconfig; it IS the API)
 
 ---
 
@@ -204,7 +219,7 @@ export CONTAINER_RUNTIME=docker
 docker compose -f compose.k0s.template.yml up -d --build     # ~1 min after image cached
 # wait ~100s for control plane + CNI
 docker exec k0s-diff-v0 k0s kubeconfig admin > /tmp/k0s-diff.kubeconfig
-sed -i 's#server: https://.*:6443#server: https://127.0.0.1:26443#' /tmp/k0s-diff.kubeconfig
+sed -i 's#server: https://.*:6443#server: https://127.0.0.1:26444#' /tmp/k0s-diff.kubeconfig
 KUBECONFIG=/tmp/k0s-diff.kubeconfig bash smoke.sh            # exit 0 = healthy
 docker compose -f compose.k0s.template.yml down -v           # teardown
 ```

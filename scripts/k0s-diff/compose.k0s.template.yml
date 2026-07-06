@@ -52,7 +52,7 @@ services:
     tmpfs:
       - /run
     ports:
-      - "26443:6443"
+      - "26444:6443"
     networks:
       - k0s-diff-net
 
