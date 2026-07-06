@@ -55,7 +55,7 @@ spec:
       containers:
       - name: coredns
         image: __RUSTERNETES_DNS_IMAGE__
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         args:
         - --cluster-zone=cluster.local
         - --log-level=info

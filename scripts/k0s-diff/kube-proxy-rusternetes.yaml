@@ -20,7 +20,7 @@
 #                      --node-name=$(NODE_NAME)
 #                      --api-server-url=https://localhost:6443  (hostNetwork =>
 #                        localhost is the k0s container; api-server listens :6443)
-#                      --kubeconfig=/var/lib/kube-proxy/kubeconfig  (CA + server)
+#                      --kubeconfig=/var/lib/kube-proxy/kubeconfig.conf  (CA + server)
 #                      --cluster-cidr / --node-port-range matched to the apiserver
 #
 # KNOWN CAPABILITY GAP (documented, expected to 401): rusternetes-kube-proxy's
@@ -66,13 +66,13 @@ spec:
       containers:
       - name: kube-proxy
         image: __RUSTERNETES_KUBE_PROXY_IMAGE__
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         command:
         - /usr/local/bin/rusternetes-kube-proxy
         args:
         - --node-name=$(NODE_NAME)
         - --api-server-url=https://localhost:6443
-        - --kubeconfig=/var/lib/kube-proxy/kubeconfig
+        - --kubeconfig=/var/lib/kube-proxy/kubeconfig.conf
         - --cluster-cidr=10.244.0.0/16
         - --node-port-range=30000:32767
         - --insecure-skip-tls-verify
