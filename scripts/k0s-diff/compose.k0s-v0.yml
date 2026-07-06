@@ -27,6 +27,12 @@ services:
     restart: unless-stopped
     privileged: true
     cgroup: host
+    # Which staged shim the entrypoint installs for a component swap:
+    #   adapter (default) = map k0s argv -> the Rusternetes binary
+    #   probe             = confirmatory shim (log argv, exec the real Go binary)
+    # Harmless on v0 (no stager present). Set on the host before `up`.
+    environment:
+      K0S_DIFF_SHIM_MODE: "${K0S_DIFF_SHIM_MODE:-adapter}"
     # Skip the k0s image's kind-style resolv.conf rewrite (breaks in-container
     # DNS on an nftables host); give the container real upstream resolvers.
     dns:
@@ -45,6 +51,11 @@ services:
         containerd-rs --config /etc/containerd-rs.toml >/var/log/containerd-rs.log 2>&1 &
         for i in $(seq 1 60); do [ -S /run/containerd-rs.sock ] && break; sleep 1; done
         [ -S /run/containerd-rs.sock ] || { echo "containerd-rs socket never appeared"; tail -n 40 /var/log/containerd-rs.log; exit 1; }
+        # Component-swap interposition (v1..v4): pre-stage the Rusternetes shim
+        # into /var/lib/k0s/bin BEFORE k0s starts, so k0s treats it as
+        # up-to-date (mtime+size match) and execs it instead of re-extracting
+        # the Go binary. No-op on v0 (stager absent). See SPIKE-FINDINGS.md.
+        [ -x /opt/k0s-diff/stage-kube-apiserver.sh ] && /opt/k0s-diff/stage-kube-apiserver.sh || true
         # --cri-socket remote:... cedes the CRI to containerd-rs (k0s launches no
         # containerd of its own). --no-taints so the single node is schedulable.
         exec k0s controller --config=/etc/k0s/k0s.yaml --enable-worker --no-taints --cri-socket remote:unix:///run/containerd-rs.sock

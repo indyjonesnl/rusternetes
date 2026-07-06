@@ -1,0 +1,97 @@
+#!/bin/sh
+# scripts/k0s-diff/shims/kube-apiserver
+#
+# Task 3, Deliverable 2 — the real flag-adapter. k0s launches this file (staged
+# via shims/stage-kube-apiserver.sh) believing it is the upstream Go
+# kube-apiserver. It translates the ~40-flag k0s argv into the ~15 flags
+# rusternetes-api-server (crates/api-server/src/main.rs) actually understands,
+# logs EVERY k0s flag it has to drop, then execs rusternetes-api-server.
+#
+# Written against the VERBATIM k0s v1.35.5-k0s.0 argv in SPIKE-FINDINGS.md
+# ("### kube-apiserver (kine backend)") — it maps only flags k0s really passes.
+#
+# Mapped:
+#   --etcd-servers            -> --etcd_servers   (+ kine unix->TCP bridge, below)
+#   --tls-cert-file           -> --tls_cert_file
+#   --tls-private-key-file    -> --tls_key_file
+#   --client-ca-file          -> --client_ca_file
+#   --secure-port             -> port of --bind_address=0.0.0.0:<port>
+#   --advertise-address       -> folded into --bind_address (rusternetes binds 0.0.0.0)
+#   (implicit)                -> --storage_backend=etcd --tls
+#
+# Everything else is DROPPED and logged — those are the rusternetes-api-server
+# capability gaps this harness exists to surface (SA-token keys, front-proxy /
+# aggregation, authz-mode, admission plugins, kubelet client certs, egress
+# selector, api-audiences, cipher suites, ...).
+set -eu
+
+LOG=/var/lib/k0s/kube-apiserver-shim.log
+: > "$LOG"
+log() { echo "$@" >> "$LOG" 2>&1; }
+log "=== $(date -u +%FT%TZ) rusternetes-api-server adapter shim (pid $$) ==="
+log "raw argv: $*"
+
+ETCD=""
+CERT=""
+KEY=""
+CA=""
+PORT=6443
+DROPPED=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --etcd-servers=*)         ETCD="${1#*=}" ;;
+    --etcd-servers)           ETCD="$2"; shift ;;
+    --tls-cert-file=*)        CERT="${1#*=}" ;;
+    --tls-cert-file)          CERT="$2"; shift ;;
+    --tls-private-key-file=*) KEY="${1#*=}" ;;
+    --tls-private-key-file)   KEY="$2"; shift ;;
+    --client-ca-file=*)       CA="${1#*=}" ;;
+    --client-ca-file)         CA="$2"; shift ;;
+    --secure-port=*)          PORT="${1#*=}" ;;
+    --secure-port)            PORT="$2"; shift ;;
+    --advertise-address=*)    : ;;   # rusternetes binds 0.0.0.0; advertise n/a
+    --advertise-address)      shift ;;
+    *)                        DROPPED="${DROPPED} $1" ;;
+  esac
+  shift
+done
+
+log "mapped: etcd='$ETCD' cert='$CERT' key='$KEY' ca='$CA' port='$PORT'"
+log "DROPPED k0s flags (unsupported by rusternetes-api-server):"
+for f in $DROPPED; do log "  $f"; done
+
+# kine listens ONLY on a unix socket (unix:/run/k0s/kine/kine.sock:2379), but
+# rusternetes' etcd-client dials TCP endpoints. Bridge the socket to a local
+# TCP port and repoint --etcd_servers at it. This is an adapter-side maneuver;
+# rusternetes source stays untouched.
+KINE_SOCK=/run/k0s/kine/kine.sock
+ETCD_TCP=http://127.0.0.1:2379
+case "$ETCD" in
+  unix:*)
+    for _ in $(seq 1 60); do [ -S "$KINE_SOCK" ] && break; sleep 1; done
+    if [ -S "$KINE_SOCK" ]; then
+      # Launch the bridge. On a supervisor restart a prior socat may still hold
+      # :2379 — the duplicate bind then fails harmlessly (logged) while the
+      # first keeps serving, so rusternetes reaches kine either way.
+      log "bridging kine unix socket $KINE_SOCK -> $ETCD_TCP via socat"
+      socat TCP-LISTEN:2379,fork,reuseaddr,bind=127.0.0.1 \
+            "UNIX-CONNECT:${KINE_SOCK}" >> "$LOG" 2>&1 &
+      sleep 1
+      ETCD_ARG="$ETCD_TCP"
+    else
+      log "WARN kine socket $KINE_SOCK never appeared; passing raw endpoint '$ETCD'"
+      ETCD_ARG="$ETCD"
+    fi
+    ;;
+  *) ETCD_ARG="$ETCD" ;;
+esac
+
+set -- --storage_backend=etcd --tls --bind_address="0.0.0.0:${PORT}" \
+       --etcd_servers="$ETCD_ARG"
+[ -n "$CERT" ] && set -- "$@" --tls_cert_file="$CERT"
+[ -n "$KEY" ]  && set -- "$@" --tls_key_file="$KEY"
+[ -n "$CA" ]   && set -- "$@" --client_ca_file="$CA"
+
+log "exec: rusternetes-api-server $*"
+exec rusternetes-api-server "$@"

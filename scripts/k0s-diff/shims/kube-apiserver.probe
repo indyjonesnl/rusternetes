@@ -1,0 +1,28 @@
+#!/bin/sh
+# scripts/k0s-diff/shims/kube-apiserver.probe
+#
+# CONFIRMATORY interposition probe (Task 3, Deliverable 1). Its ONLY job is to
+# prove the baked-image + mtime/size staging trick works end to end: that k0s
+# execs THIS file (staging did not clobber it) and to capture the real runtime
+# argv (which includes environment-specific flags like --advertise-address).
+#
+# It logs its full argv, then execs the genuine k0s kube-apiserver saved aside
+# at build time (/opt/k0s-diff/kube-apiserver.real), so the cluster stays a
+# healthy all-Go control plane. If the log file appears AND the cluster comes
+# up green, the interposition mechanism is proven transparent — only then is it
+# safe to swap in the real rusternetes adapter (shims/kube-apiserver).
+set -eu
+
+LOG=/var/lib/k0s/kube-apiserver-shim-argv.log
+{
+  echo "=== $(date -u +%FT%TZ) kube-apiserver PROBE shim invoked (pid $$) ==="
+  echo "argc=$#"
+  i=0
+  for a in "$@"; do
+    echo "  argv[$i]=$a"
+    i=$((i + 1))
+  done
+  echo "--- exec /opt/k0s-diff/kube-apiserver.real ---"
+} >> "$LOG" 2>&1
+
+exec /opt/k0s-diff/kube-apiserver.real "$@"
