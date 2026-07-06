@@ -62,6 +62,41 @@ if [ "${K0S_DIFF_REBUILD:-0}" = 1 ] || ! docker image inspect "$img" >/dev/null 
   log "building image $img"
   docker compose -f "$f" build
 fi
+
+# --- v5/v6 workload-swap pre-up: local registry + pushed pod image ------------
+# containerd-rs has NO local-image load path (containerd-rs.toml) — it can only
+# PULL. So for the workload swaps we stand up a throwaway HTTP registry on the
+# k0s-diff-net gateway (the host address the in-container containerd-rs reaches),
+# push the rusternetes-<component> image there, and tell containerd-rs to pull it
+# over HTTP via CONTAINERD_RS_INSECURE_REGISTRIES (set BEFORE `up` so the daemon
+# starts trusting it). apply-workload-swap.sh later references the image by this
+# same registry host:port.
+REGISTRY_HOSTPORT=""
+case "$swap" in
+  kube-proxy|dns)
+    docker network inspect k0s-diff-net >/dev/null 2>&1 || docker network create k0s-diff-net >/dev/null
+    gw="$(docker network inspect k0s-diff-net --format '{{(index .IPAM.Config 0).Gateway}}')"
+    [ -n "$gw" ] || { echo "could not resolve k0s-diff-net gateway" >&2; exit 1; }
+    REGISTRY_HOSTPORT="${gw}:5000"
+    if ! docker ps --format '{{.Names}}' | grep -qx k0s-diff-registry; then
+      docker rm -f k0s-diff-registry >/dev/null 2>&1 || true
+      log "starting local registry k0s-diff-registry on :5000"
+      docker run -d --name k0s-diff-registry --restart unless-stopped -p 5000:5000 registry:2 >/dev/null
+      for _ in $(seq 1 30); do curl -fsS "http://localhost:5000/v2/" >/dev/null 2>&1 && break; sleep 1; done
+    fi
+    bash "$here/build-swap-images.sh" "$swap" >/dev/null
+    tag="${K8S_VERSION#v}"
+    local_img="k0s-diff-rusternetes-${swap}:${tag}"
+    # Push via localhost:5000 (docker auto-trusts localhost as an insecure
+    # registry); containerd-rs pulls the SAME repo via the gateway ref.
+    push_img="localhost:5000/rusternetes-${swap}:${tag}"
+    docker tag "$local_img" "$push_img"
+    log "pushing $push_img (pullable by containerd-rs as ${REGISTRY_HOSTPORT}/rusternetes-${swap}:${tag})"
+    docker push "$push_img" >/dev/null
+    export CONTAINERD_RS_INSECURE_REGISTRIES="$REGISTRY_HOSTPORT"
+    ;;
+esac
+
 log "bringing up $v from $(basename "$f")"
 docker compose -f "$f" up -d
 
@@ -85,6 +120,25 @@ if ! bash "$here/smoke.sh"; then
   printf '{"variant":"%s","sig":"%s","smoke":"fail"}\n' "$v" "$sig" > "$resdir/${sig}.json"
   exit 0
 fi
+
+# --- workload swaps (v5 kube-proxy / v6 dns): apply AFTER smoke -------------
+# Unlike the baked binary swaps (v1..v4), v5/v6 replace an in-cluster workload
+# (DaemonSet/Deployment) with a Rusternetes pod image. The all-Go stack must be
+# healthy (smoke passed) first; only then do we swap the component and re-verify.
+# NB: for these to work the stack was brought up with CONTAINERD_RS_INSECURE_
+# REGISTRIES pointing at the local registry — apply_workload_swap must run
+# BEFORE the compose `up` above on a fresh bring-up. We therefore stage the
+# registry/env in a pre-up hook (see the swap!=baked branch near `up -d`).
+case "$swap" in
+  kube-proxy|dns)
+    if ! bash "$here/apply-workload-swap.sh" "$v" "$swap" "$REGISTRY_HOSTPORT"; then
+      log "WORKLOAD-SWAP-FAIL $v ($swap) — writing marker, skipping conformance"
+      printf '{"variant":"%s","sig":"%s","swap":"%s","workloadSwap":"fail"}\n' \
+        "$v" "$sig" "$swap" > "$resdir/${sig}.json"
+      exit 0
+    fi
+    ;;
+esac
 
 # --- conformance image MUST match the running server version exactly ----------
 gitv="$(kubectl get --raw /version | python3 -c 'import json,sys;print(json.load(sys.stdin)["gitVersion"])')"

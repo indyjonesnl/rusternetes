@@ -60,11 +60,18 @@ RUN mkdir -p /opt/cni/bin \
 ARG SWAP_COMPONENT=""
 COPY shims/ /opt/k0s-diff/shims/
 COPY .build/ /opt/k0s-diff/.build/
+# NOTE: only the BAKED binary swaps (v1..v4) install the pre-k0s-start stager +
+# marker. v5 (kube-proxy) / v6 (dns) are workload swaps — the Rusternetes binary
+# ships in a pullable pod image (Dockerfile.{kube-proxy,dns}), NOT /var/lib/k0s/bin,
+# so they must NOT write the marker (stage-swap.sh only knows the baked names and
+# would otherwise error on 'dns'/'kube-proxy').
 RUN set -eu; \
-    if [ -n "$SWAP_COMPONENT" ]; then \
-      install -m0755 /opt/k0s-diff/shims/stage-swap.sh /opt/k0s-diff/stage-swap.sh; \
-      printf '%s' "$SWAP_COMPONENT" > /opt/k0s-diff/swap-component; \
-    fi; \
+    case "$SWAP_COMPONENT" in \
+      api-server|kubelet|scheduler|controller-manager) \
+        install -m0755 /opt/k0s-diff/shims/stage-swap.sh /opt/k0s-diff/stage-swap.sh; \
+        printf '%s' "$SWAP_COMPONENT" > /opt/k0s-diff/swap-component; \
+        ;; \
+    esac; \
     if [ "$SWAP_COMPONENT" = "api-server" ]; then \
       apk add --no-cache socat; \
       install -m0755 /opt/k0s-diff/.build/rusternetes-api-server /usr/local/bin/rusternetes-api-server; \

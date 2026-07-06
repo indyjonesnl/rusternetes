@@ -33,6 +33,12 @@ services:
     # Harmless on v0 (no stager present). Set on the host before `up`.
     environment:
       K0S_DIFF_SHIM_MODE: "${K0S_DIFF_SHIM_MODE:-adapter}"
+      # Extra HTTP-plain registries containerd-rs may pull from (comma-separated
+      # host:port). Empty on v0..v4. The v5/v6 workload swaps set this to the
+      # k0s-diff-net gateway registry (run-variant.sh) so containerd-rs — which
+      # has NO local-image load path — can pull the rusternetes-{dns,kube-proxy}
+      # images over HTTP. Consumed by containerd-rs (crates/images/src/pull.rs).
+      CONTAINERD_RS_INSECURE_REGISTRIES: "${CONTAINERD_RS_INSECURE_REGISTRIES:-}"
     # Skip the k0s image's kind-style resolv.conf rewrite (breaks in-container
     # DNS on an nftables host); give the container real upstream resolvers.
     dns:
