@@ -6,6 +6,7 @@
 # kube-apiserver. It translates the ~40-flag k0s argv into the ~15 flags
 # rusternetes-api-server (crates/api-server/src/main.rs) actually understands,
 # logs EVERY k0s flag it has to drop, then execs rusternetes-api-server.
+# Staged by the generic shims/stage-swap.sh (component marker = api-server).
 #
 # Written against the VERBATIM k0s v1.35.5-k0s.0 argv in SPIKE-FINDINGS.md
 # ("### kube-apiserver (kine backend)") — it maps only flags k0s really passes.

@@ -47,25 +47,35 @@ RUN mkdir -p /opt/cni/bin \
 # Per-variant component swap (v1..v4). SWAP_COMPONENT (build arg set by
 # gen-compose.sh) selects which upstream Go binary is replaced by its
 # Rusternetes build. The replacement is baked here and interposed at runtime by
-# the entrypoint via shims/stage-kube-apiserver.sh — it does NOT bind-mount over
+# the entrypoint via shims/stage-swap.sh — it does NOT bind-mount over
 # /var/lib/k0s/bin (ruled out) but exploits k0s's mtime+size staging-skip
 # condition (see SPIKE-FINDINGS.md, Crux 1 addendum). Empty (v0) => baseline.
 #
 # The build context always carries shims/ (committed) and .build/ (git-ignored;
-# holds the locally-built rusternetes-api-server + the genuine kube-apiserver
-# saved aside for the confirmatory probe). Both dirs are copied; the RUN guard
-# installs only what the selected swap needs, so a v0 build (empty .build/,
-# just .gitkeep) still succeeds.
+# holds the locally-built rusternetes-<component> + the genuine k0s binary saved
+# aside as the pad-size source / probe target). Both dirs are copied; the RUN
+# guard installs only what the selected swap needs, so a v0 build (empty
+# .build/, just .gitkeep) still succeeds. Each branch writes
+# /opt/k0s-diff/swap-component so the generic stage-swap.sh knows what to stage.
 ARG SWAP_COMPONENT=""
 COPY shims/ /opt/k0s-diff/shims/
 COPY .build/ /opt/k0s-diff/.build/
 RUN set -eu; \
+    if [ -n "$SWAP_COMPONENT" ]; then \
+      install -m0755 /opt/k0s-diff/shims/stage-swap.sh /opt/k0s-diff/stage-swap.sh; \
+      printf '%s' "$SWAP_COMPONENT" > /opt/k0s-diff/swap-component; \
+    fi; \
     if [ "$SWAP_COMPONENT" = "api-server" ]; then \
       apk add --no-cache socat; \
       install -m0755 /opt/k0s-diff/.build/rusternetes-api-server /usr/local/bin/rusternetes-api-server; \
       install -m0755 /opt/k0s-diff/shims/kube-apiserver          /opt/k0s-diff/kube-apiserver.adapter; \
       install -m0755 /opt/k0s-diff/shims/kube-apiserver.probe    /opt/k0s-diff/kube-apiserver.probe; \
       install -m0750 /opt/k0s-diff/.build/kube-apiserver.real    /opt/k0s-diff/kube-apiserver.real; \
-      install -m0755 /opt/k0s-diff/shims/stage-kube-apiserver.sh /opt/k0s-diff/stage-kube-apiserver.sh; \
       rusternetes-api-server --help >/dev/null 2>&1 || true; \
+    fi; \
+    if [ "$SWAP_COMPONENT" = "kubelet" ]; then \
+      install -m0755 /opt/k0s-diff/.build/rusternetes-kubelet /usr/local/bin/rusternetes-kubelet; \
+      install -m0755 /opt/k0s-diff/shims/kubelet              /opt/k0s-diff/kubelet.adapter; \
+      install -m0750 /opt/k0s-diff/.build/kubelet.real        /opt/k0s-diff/kubelet.real; \
+      rusternetes-kubelet --help >/dev/null 2>&1 || true; \
     fi

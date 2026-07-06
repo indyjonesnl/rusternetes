@@ -1,0 +1,114 @@
+#!/bin/sh
+# scripts/k0s-diff/shims/kubelet
+#
+# Task 4, Deliverable 1 — the v2 kubelet flag-adapter. k0s launches this file
+# (staged via shims/stage-swap.sh) believing it is the upstream Go kubelet. It
+# translates the k0s kubelet argv into the flags rusternetes-kubelet
+# (crates/kubelet/src/main.rs) understands, logs every dropped k0s flag, points
+# the kubelet at the foundation's containerd-rs CRI socket, and execs it in
+# **API mode** (--kubeconfig present => StorageBackend::Api against k0s's own,
+# still-Go, api-server).
+#
+# Written against the VERBATIM k0s v1.35.5-k0s.0 kubelet argv in
+# SPIKE-FINDINGS.md ("### kubelet"):
+#   /var/lib/k0s/bin/kubelet --node-labels=... --runtime-cgroups=/system.slice/containerd.service \
+#     --hostname-override=k0s-diff-v0 --root-dir=/var/lib/k0s/kubelet \
+#     --config=/run/k0s/kubelet/config.yaml --kubeconfig=/run/k0s/kubelet-direct.conf \
+#     --v=1 --cert-dir=/var/lib/k0s/kubelet/pki
+#
+# rusternetes-kubelet uses clap KEBAB-case flags (verified via --help, NOT the
+# snake_case the brief sketched):
+#   --hostname-override=X -> --node-name=X          (required)
+#   --kubeconfig=X        -> --kubeconfig=X          (selects API mode)
+#   --config=X            -> --config=X              (KubeletConfiguration; serde
+#                                                     ignores unknown fields)
+#   --root-dir=X          -> --root-dir=X            (supported 1:1)
+#   (derived)             -> --api-server-url=<server from the kubeconfig>
+#   (derived)             -> --cluster-dns / --cluster-domain from the config file
+#
+# CRI endpoint is NOT a flag: rusternetes-kubelet reads CONTAINER_RUNTIME_ENDPOINT
+# from the env (default unix:///run/containerd/containerd.sock). We export it to
+# the foundation's containerd-rs socket before exec.
+#
+# Everything else is DROPPED and logged — those are the rusternetes-kubelet
+# capability gaps this harness exists to surface (--node-labels, --cert-dir
+# bootstrap/serving-cert machinery, --runtime-cgroups, --v).
+set -eu
+
+# Point the kubelet at the co-resident Rust CRI runtime (the tested runtime the
+# v0 baseline uses). rusternetes-kubelet's CRI client reads this env var.
+export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd-rs.sock
+
+LOG=/tmp/kubelet-shim.log
+: > "$LOG" 2>/dev/null || true
+log() { echo "$@" >> "$LOG" 2>/dev/null || true; }
+log "=== $(date -u +%FT%TZ) rusternetes-kubelet adapter shim (pid $$) ==="
+log "raw argv: $*"
+log "CONTAINER_RUNTIME_ENDPOINT=$CONTAINER_RUNTIME_ENDPOINT"
+
+NODE_NAME=""
+KUBECONFIG_PATH=""
+CONFIG_PATH=""
+ROOT_DIR=""
+DROPPED=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --hostname-override=*) NODE_NAME="${1#*=}" ;;
+    --hostname-override)   NODE_NAME="$2"; shift ;;
+    --kubeconfig=*)        KUBECONFIG_PATH="${1#*=}" ;;
+    --kubeconfig)          KUBECONFIG_PATH="$2"; shift ;;
+    --config=*)            CONFIG_PATH="${1#*=}" ;;
+    --config)              CONFIG_PATH="$2"; shift ;;
+    --root-dir=*)          ROOT_DIR="${1#*=}" ;;
+    --root-dir)            ROOT_DIR="$2"; shift ;;
+    *)                     DROPPED="${DROPPED} $1" ;;
+  esac
+  shift
+done
+
+log "mapped: node_name='$NODE_NAME' kubeconfig='$KUBECONFIG_PATH' config='$CONFIG_PATH' root_dir='$ROOT_DIR'"
+log "DROPPED k0s flags (unsupported by rusternetes-kubelet):"
+for f in $DROPPED; do log "  $f"; done
+
+# rusternetes-kubelet connects to --api-server-url (default https://api-server:6443,
+# unreachable here), NOT the kubeconfig's server field — the kubeconfig only
+# supplies the CA. Derive the real endpoint from the kubeconfig's `server:` line
+# so the kubelet dials k0s's actual api-server.
+API_URL=""
+if [ -n "$KUBECONFIG_PATH" ] && [ -f "$KUBECONFIG_PATH" ]; then
+  API_URL="$(awk '/^[[:space:]]*server:[[:space:]]*/{print $2; exit}' "$KUBECONFIG_PATH")"
+fi
+log "derived api-server-url from kubeconfig: '${API_URL:-<none>}'"
+
+# The config file (KubeletConfiguration) carries clusterDNS (a YAML list) and
+# clusterDomain, which rusternetes-kubelet does NOT read from --config; it takes
+# them from --cluster-dns / --cluster-domain flags (else it tries to discover
+# DNS via the api-server). Extract and pass them explicitly.
+CLUSTER_DNS=""
+CLUSTER_DOMAIN=""
+if [ -n "$CONFIG_PATH" ] && [ -f "$CONFIG_PATH" ]; then
+  CLUSTER_DOMAIN="$(awk '/^[[:space:]]*clusterDomain:[[:space:]]*/{print $2; exit}' "$CONFIG_PATH")"
+  CLUSTER_DNS="$(awk '
+    /^[[:space:]]*clusterDNS:/ { inlist=1; next }
+    inlist && /^[[:space:]]*-[[:space:]]*/ { sub(/^[[:space:]]*-[[:space:]]*/,""); print; exit }
+    inlist && /^[^[:space:]-]/ { inlist=0 }
+  ' "$CONFIG_PATH")"
+fi
+log "from config: cluster_dns='${CLUSTER_DNS:-<none>}' cluster_domain='${CLUSTER_DOMAIN:-<none>}'"
+
+[ -n "$NODE_NAME" ] || { log "FATAL no --hostname-override in k0s argv"; echo "kubelet shim: no --hostname-override" >&2; exit 1; }
+
+set -- --node-name="$NODE_NAME"
+[ -n "$KUBECONFIG_PATH" ] && set -- "$@" --kubeconfig="$KUBECONFIG_PATH"
+[ -n "$API_URL" ]         && set -- "$@" --api-server-url="$API_URL"
+[ -n "$CONFIG_PATH" ]     && set -- "$@" --config="$CONFIG_PATH"
+[ -n "$ROOT_DIR" ]        && set -- "$@" --root-dir="$ROOT_DIR"
+[ -n "$CLUSTER_DNS" ]     && set -- "$@" --cluster-dns="$CLUSTER_DNS"
+[ -n "$CLUSTER_DOMAIN" ]  && set -- "$@" --cluster-domain="$CLUSTER_DOMAIN"
+
+# Absolute path: the k0s supervisor launches the kubelet with a minimal PATH
+# that excludes /usr/local/bin (a bare name yields exit 127 "not found").
+RUSTERNETES=/usr/local/bin/rusternetes-kubelet
+log "exec: $RUSTERNETES $*"
+exec "$RUSTERNETES" "$@"
