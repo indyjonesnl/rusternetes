@@ -1,0 +1,81 @@
+#!/bin/sh
+# scripts/k0s-diff/shims/kube-scheduler
+#
+# Task 5, v3 — the rusternetes-scheduler flag-adapter. k0s launches this file
+# (staged via shims/stage-swap.sh) believing it is the upstream Go
+# kube-scheduler. It translates the k0s scheduler argv into the flags
+# rusternetes-scheduler (crates/scheduler/src/main.rs) understands, logs every
+# dropped k0s flag, and execs it in **API mode** (--kubeconfig present =>
+# run_api_mode against k0s's own, still-Go, api-server).
+#
+# Written against the VERBATIM k0s v1.35.5-k0s.0 scheduler argv in
+# SPIKE-FINDINGS.md ("### kube-scheduler"):
+#   /var/lib/k0s/bin/kube-scheduler --profiling=false \
+#     --authentication-kubeconfig=/var/lib/k0s/pki/scheduler.conf \
+#     --authorization-kubeconfig=/var/lib/k0s/pki/scheduler.conf \
+#     --kubeconfig=/var/lib/k0s/pki/scheduler.conf --v=1 --feature-gates= \
+#     --bind-address=127.0.0.1 --leader-elect=true
+#
+# rusternetes-scheduler uses clap KEBAB-case flags (verified via
+# crates/scheduler/src/main.rs `Args`):
+#   --kubeconfig=X       -> --kubeconfig=X                 (selects API mode)
+#   (derived)            -> --api-server-url=<server from the kubeconfig>
+#   --leader-elect=true  -> --enable-leader-election
+#
+# Everything else (--authentication-kubeconfig, --authorization-kubeconfig,
+# --profiling, --v, --feature-gates, --bind-address) is DROPPED and logged —
+# rusternetes-scheduler's API-mode path has no analogue for k0s's split
+# authn/authz kubeconfigs, in-process profiling endpoint, klog verbosity, or a
+# separate scheduler bind-address (it always binds its own metrics port).
+#
+# EXPECTED OUTCOME (per task-5 brief): rusternetes' ApiClient has no
+# client-cert/mTLS auth (issue #1578), so the scheduler's API-mode calls
+# against k0s's cert-auth api-server are expected to 401 — this shim's job is
+# correct WIRING, not convergence.
+set -eu
+
+LOG=/tmp/kube-scheduler-shim.log
+: > "$LOG" 2>/dev/null || true
+log() { echo "$@" >> "$LOG" 2>/dev/null || true; }
+log "=== $(date -u +%FT%TZ) rusternetes-scheduler adapter shim (pid $$) ==="
+log "raw argv: $*"
+
+KUBECONFIG_PATH=""
+LEADER_ELECT=""
+DROPPED=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --kubeconfig=*)   KUBECONFIG_PATH="${1#*=}" ;;
+    --kubeconfig)     KUBECONFIG_PATH="$2"; shift ;;
+    --leader-elect=true) LEADER_ELECT=1 ;;
+    --leader-elect=*) : ;;   # false/unset -> no flag, leader election off
+    *)                DROPPED="${DROPPED} $1" ;;
+  esac
+  shift
+done
+
+log "mapped: kubeconfig='$KUBECONFIG_PATH' leader_elect='${LEADER_ELECT:-<unset>}'"
+log "DROPPED k0s flags (unsupported by rusternetes-scheduler):"
+for f in $DROPPED; do log "  $f"; done
+
+# rusternetes-scheduler's --api-server-url defaults to a hostname unreachable
+# here; derive the real endpoint from the kubeconfig's `server:` line so it
+# dials k0s's actual api-server (same technique as the v2 kubelet shim).
+API_URL=""
+if [ -n "$KUBECONFIG_PATH" ] && [ -f "$KUBECONFIG_PATH" ]; then
+  API_URL="$(awk '/^[[:space:]]*server:[[:space:]]*/{print $2; exit}' "$KUBECONFIG_PATH")"
+fi
+log "derived api-server-url from kubeconfig: '${API_URL:-<none>}'"
+
+[ -n "$KUBECONFIG_PATH" ] || { log "FATAL no --kubeconfig in k0s argv"; echo "kube-scheduler shim: no --kubeconfig" >&2; exit 1; }
+
+set -- --kubeconfig="$KUBECONFIG_PATH"
+[ -n "$API_URL" ]      && set -- "$@" --api-server-url="$API_URL"
+[ -n "$LEADER_ELECT" ] && set -- "$@" --enable-leader-election
+
+# Absolute path: the k0s supervisor launches components with a minimal PATH
+# that excludes /usr/local/bin (a bare name yields exit 127 "not found").
+RUSTERNETES=/usr/local/bin/rusternetes-scheduler
+log "exec: $RUSTERNETES $*"
+exec "$RUSTERNETES" "$@"

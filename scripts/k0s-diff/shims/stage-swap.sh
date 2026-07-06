@@ -58,6 +58,18 @@ REAL_SIZE="$(stat -c %s "$REAL")"
 case "$REAL_SIZE" in
   ''|*[!0-9]*) echo "[stage] could not read size of $REAL" >&2; exit 1 ;;
 esac
+# Per-component size-drift sanity check (restores the Task-3 stager's
+# hardcoded-constant guard, generically): every k0s-staged Go control-plane
+# binary is tens of MB. A .real under 1 MiB almost certainly means
+# build-swap-binaries.sh extracted a truncated/wrong file (bad k0s image pin,
+# interrupted docker cp, ...) rather than the genuine binary — fail loudly
+# instead of padding the shim to a bogus size.
+MIN_REAL_SIZE=1048576
+if [ "$REAL_SIZE" -lt "$MIN_REAL_SIZE" ]; then
+  echo "[stage] $REAL is suspiciously small (${REAL_SIZE} B < ${MIN_REAL_SIZE} B) —" \
+       "re-run build-swap-binaries.sh $COMPONENT" >&2
+  exit 1
+fi
 
 mkdir -p "$(dirname "$TARGET")"
 cp "$SRC" "$TARGET"

@@ -78,4 +78,16 @@ RUN set -eu; \
       install -m0755 /opt/k0s-diff/shims/kubelet              /opt/k0s-diff/kubelet.adapter; \
       install -m0750 /opt/k0s-diff/.build/kubelet.real        /opt/k0s-diff/kubelet.real; \
       rusternetes-kubelet --help >/dev/null 2>&1 || true; \
+    fi; \
+    if [ "$SWAP_COMPONENT" = "scheduler" ]; then \
+      install -m0755 /opt/k0s-diff/.build/rusternetes-scheduler /usr/local/bin/rusternetes-scheduler; \
+      install -m0755 /opt/k0s-diff/shims/kube-scheduler          /opt/k0s-diff/kube-scheduler.adapter; \
+      install -m0750 /opt/k0s-diff/.build/kube-scheduler.real    /opt/k0s-diff/kube-scheduler.real; \
+      rusternetes-scheduler --help >/dev/null 2>&1 || true; \
+    fi; \
+    if [ "$SWAP_COMPONENT" = "controller-manager" ]; then \
+      install -m0755 /opt/k0s-diff/.build/rusternetes-controller-manager /usr/local/bin/rusternetes-controller-manager; \
+      install -m0755 /opt/k0s-diff/shims/kube-controller-manager          /opt/k0s-diff/kube-controller-manager.adapter; \
+      install -m0750 /opt/k0s-diff/.build/kube-controller-manager.real    /opt/k0s-diff/kube-controller-manager.real; \
+      rusternetes-controller-manager --help >/dev/null 2>&1 || true; \
     fi
