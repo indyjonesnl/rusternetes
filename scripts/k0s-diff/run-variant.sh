@@ -34,6 +34,12 @@ for x in "${VARIANTS[@]}"; do [ "$x" = "$v" ] && known=1; done
 f="$here/compose.k0s-${v}.yml"
 [ -f "$f" ] || { echo "no compose file for $v: $f — run gen-compose.sh first" >&2; exit 1; }
 
+# Resolve the swapped component for this variant (SWAP is index-aligned with
+# VARIANTS in lib.sh). Baked swaps (v1..v4) need their .build/ inputs produced
+# from source before the image build so a clean checkout works end-to-end.
+swap=""
+for i in "${!VARIANTS[@]}"; do [ "${VARIANTS[$i]}" = "$v" ] && swap="${SWAP[$i]}"; done
+
 resdir="$here/results/${v}"
 mkdir -p "$resdir"
 
@@ -44,6 +50,15 @@ mkdir -p "$resdir"
 # variant reused in place — no recreate.
 img="$(awk '/^[[:space:]]*image:/{print $2; exit}' "$f")"
 if [ "${K0S_DIFF_REBUILD:-0}" = 1 ] || ! docker image inspect "$img" >/dev/null 2>&1; then
+  # Baked component swaps (v1..v4) bake .build/rusternetes-<component> +
+  # .build/<k0s-binary>.real; produce them from source first (idempotent).
+  # v5 (kube-proxy) / v6 (dns) are workload swaps — same base image, no bake.
+  case "$swap" in
+    api-server|kubelet|scheduler|controller-manager)
+      log "producing swap binaries for '$swap' (build-swap-binaries.sh)"
+      bash "$here/build-swap-binaries.sh" "$swap"
+      ;;
+  esac
   log "building image $img"
   docker compose -f "$f" build
 fi

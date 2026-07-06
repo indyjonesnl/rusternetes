@@ -66,9 +66,16 @@ CRI to containerd-rs and launches **no containerd of its own**.
 
 **Verdict: k0s re-stages its supervised binaries from embedded assets before
 EVERY launch — on k0s-process start AND on supervisor restart of an individual
-component. The trigger is content-based (not just size); a running binary is
-additionally mmap-locked. Neither runtime bind-mount nor pre-staged file
-replacement survives.**
+component. A running binary is additionally mmap-locked, and neither runtime
+bind-mount nor a naive pre-staged file replacement survives.**
+
+> **CORRECTION (see "Crux 1 addendum" below).** The original claim that the
+> re-extraction trigger is *content-based* is WRONG. Reading the k0s source, the
+> skip condition is **mtime + size**: Exp D matched size only (it never set the
+> file's mtime to the k0s executable's mtime), so it still re-extracted. A shim
+> padded to the exact original size AND stamped with the k0s exe's mtime IS
+> reused verbatim — this is exactly how the v1 swap interposes
+> (`shims/stage-kube-apiserver.sh`).
 
 The k0s-supervised binaries live in `/var/lib/k0s/bin/` (no stamp/marker files
 in that dir): `etcd`, `konnectivity-server`, `kube-apiserver`,
@@ -100,6 +107,44 @@ it.** No size-padding loophole.
 
 There is **no CLI flag or env var to disable asset extraction** (`k0s controller
 --help` exposes only `--data-dir` to relocate the whole tree).
+
+### Crux 1 addendum — the skip condition is mtime + size, NOT content (corrected 2026-07-06, Task 3)
+
+Exp D's "content-based, no size loophole" conclusion was wrong: it padded to the
+right size but never set the file's **mtime**. k0s's staging
+(`pkg/assets/stage.go`, tag `v1.35.5+k0s.0`) skips re-extraction only when BOTH
+the on-disk mtime equals the **k0s executable's** mtime AND the on-disk size
+equals the embedded uncompressed `originalSize`:
+
+```go
+// pkg/assets/stage.go (k0s v1.35.5+k0s.0), func stage(...)
+// exinfo, _ := os.Stat(selfexe)   // selfexe == the running /usr/local/bin/k0s
+//
+// Skip extraction if the path is up to date, i.e. if its modification time
+// matches the one of the k0s executable and its file size matches the one
+// of the to-be-staged file.
+if info, err := os.Stat(path); err == nil {
+    if !exinfo.IsDir() && exinfo.ModTime().Equal(info.ModTime()) && info.Size() == bin.originalSize {
+        log.Debug("Re-use existing file")
+        return nil
+    }
+}
+```
+
+Verified live on v0 — the staged `kube-apiserver` (85881016 B) carries the
+**identical** mtime (`1781605209`, 2026-06-16 10:20:09 UTC) as `/usr/local/bin/k0s`.
+
+**Consequence / the v1–v4 override mechanism (used now).** Pre-stage the
+Rusternetes shim at `/var/lib/k0s/bin/<name>` BEFORE `k0s controller` starts,
+padded (NUL, via `truncate`) to exactly `originalSize` and stamped
+(`touch -r /usr/local/bin/k0s`) with the k0s exe's mtime. k0s then treats it as
+"up to date", skips extraction, and execs the shim verbatim — surviving every
+supervisor restart. This defeats the earlier "no override survives" conclusion
+without a bind-mount or a k0s rebuild. Implemented in
+`shims/stage-kube-apiserver.sh` (pad size derived from the genuine
+`kube-apiserver.real` extracted by `build-swap-binaries.sh`, so a base-image
+bump can't silently regress it). Confirmed end-to-end for v1 (probe shim exec'd
+by k0s; see task-3-report.md, Deliverable 1).
 
 ### Chosen override mechanism for later variants (v1–v6)
 

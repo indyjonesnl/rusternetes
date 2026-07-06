@@ -27,14 +27,27 @@ K0S_BIN=/usr/local/bin/k0s
 TARGET=/var/lib/k0s/bin/kube-apiserver
 MODE="${K0S_DIFF_SHIM_MODE:-adapter}"          # adapter | probe
 SRC="/opt/k0s-diff/kube-apiserver.${MODE}"
-
-# k0s v1.35.5-k0s.0 embedded kube-apiserver uncompressed size (bin.originalSize).
-# Verified against the v0 stack: `stat -c %s /var/lib/k0s/bin/kube-apiserver`.
-# MUST equal what k0s would extract or k0s re-extracts over the shim.
-APISERVER_SIZE=85881016
+# The genuine upstream kube-apiserver, extracted from the SAME pinned k0s image
+# at build time (build-swap-binaries.sh). Its size IS bin.originalSize — exactly
+# what k0s would stage — so it is the authoritative pad-target. Deriving it here
+# (instead of a magic constant) means a base-image bump can't silently make k0s
+# re-extract the real Go binary over our shim: if the size drifts, the padded
+# shim would fail the skip check, so we assert loudly instead.
+REAL=/opt/k0s-diff/kube-apiserver.real
 
 [ -x "$K0S_BIN" ] || { echo "[stage] $K0S_BIN missing" >&2; exit 1; }
 [ -f "$SRC" ]     || { echo "[stage] shim $SRC missing (mode=$MODE)" >&2; exit 1; }
+[ -f "$REAL" ]    || { echo "[stage] genuine $REAL missing — cannot derive pad size (run build-swap-binaries.sh api-server)" >&2; exit 1; }
+
+APISERVER_SIZE="$(stat -c %s "$REAL")"
+case "$APISERVER_SIZE" in
+  ''|*[!0-9]*) echo "[stage] could not read size of $REAL" >&2; exit 1 ;;
+esac
+# Cross-check against the value verified live on v0 (2026-07-06). A mismatch is
+# not fatal (the .real is authoritative) but flags that the base image changed.
+if [ "$APISERVER_SIZE" != "85881016" ]; then
+  echo "[stage] NOTE: genuine kube-apiserver size $APISERVER_SIZE != last-verified 85881016 (base image bumped?)" >&2
+fi
 
 mkdir -p "$(dirname "$TARGET")"
 cp "$SRC" "$TARGET"

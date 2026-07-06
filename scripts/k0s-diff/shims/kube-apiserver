@@ -82,7 +82,16 @@ case "$ETCD" in
       log "bridging kine unix socket $KINE_SOCK -> $ETCD_TCP via socat"
       socat TCP-LISTEN:2379,fork,reuseaddr,bind=127.0.0.1 \
             "UNIX-CONNECT:${KINE_SOCK}" >> "$LOG" 2>&1 &
-      sleep 1
+      # Poll the bridge port (bounded ~5s) instead of a blind sleep, so we only
+      # hand off to rusternetes once 127.0.0.1:2379 actually accepts. socat is
+      # guaranteed present; a null-source connect returns 0 iff the port is up.
+      for _ in 1 2 3 4 5; do
+        if socat -T1 /dev/null TCP:127.0.0.1:2379 >/dev/null 2>&1; then
+          log "kine TCP bridge is accepting on 127.0.0.1:2379"
+          break
+        fi
+        sleep 1
+      done
       ETCD_ARG="$ETCD_TCP"
     else
       log "WARN kine socket $KINE_SOCK never appeared; passing raw endpoint '$ETCD'"
