@@ -84,6 +84,14 @@ services:
 networks:
   k0s-diff-net:
     name: k0s-diff-net
+    # Pinned subnet/gateway (see lib.sh K0S_DIFF_NET_GATEWAY): makes the bridge
+    # gateway deterministic before `up` so the v5/v6 swaps can address the local
+    # registry over the gateway. 10.201.0.0/24 avoids the busy 172.x docker pool
+    # and the k0s pod/service CIDRs.
+    ipam:
+      config:
+        - subnet: 10.201.0.0/24
+          gateway: 10.201.0.1
 
 volumes:
   k0s-var:

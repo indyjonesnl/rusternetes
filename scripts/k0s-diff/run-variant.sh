@@ -86,7 +86,10 @@ case "$swap" in
       echo "build it: (cd ../../../containerd-rs && CARGO_TARGET_DIR=\$HOME/.cache/containerd-rs-target cargo build --release --target x86_64-unknown-linux-musl -p containerd-rs)" >&2
       exit 1
     fi
-    if ! strings "$crs_musl" 2>/dev/null | grep -q CONTAINERD_RS_INSECURE_REGISTRIES; then
+    # NB: grep -c (not -q) — a -q closes the pipe on first match, `strings` then
+    # dies with SIGPIPE, and `set -o pipefail` turns that into a false negative.
+    crs_feat="$(strings "$crs_musl" 2>/dev/null | grep -c CONTAINERD_RS_INSECURE_REGISTRIES || true)"
+    if [ "${crs_feat:-0}" -eq 0 ]; then
       echo "containerd-rs at $crs_musl lacks CONTAINERD_RS_INSECURE_REGISTRIES support — rebuild from a source that has it" >&2
       exit 1
     fi
@@ -94,10 +97,9 @@ case "$swap" in
     log "baking newer containerd-rs (env-feature) into the $v node image"
     docker compose -f "$f" build --build-arg CONTAINERD_RS_BINARY=.build/containerd-rs
 
-    docker network inspect k0s-diff-net >/dev/null 2>&1 || docker network create k0s-diff-net >/dev/null
-    gw="$(docker network inspect k0s-diff-net --format '{{(index .IPAM.Config 0).Gateway}}')"
-    [ -n "$gw" ] || { echo "could not resolve k0s-diff-net gateway" >&2; exit 1; }
-    REGISTRY_HOSTPORT="${gw}:5000"
+    # Local throwaway HTTP registry, host-published on :5000 (independent of the
+    # k0s-diff-net). Push via localhost:5000 — docker auto-trusts localhost as an
+    # insecure registry, so no daemon config is needed.
     if ! docker ps --format '{{.Names}}' | grep -qx k0s-diff-registry; then
       docker rm -f k0s-diff-registry >/dev/null 2>&1 || true
       log "starting local registry k0s-diff-registry on :5000"
@@ -106,14 +108,19 @@ case "$swap" in
     fi
     bash "$here/build-swap-images.sh" "$swap" >/dev/null
     tag="${K8S_VERSION#v}"
-    local_img="k0s-diff-rusternetes-${swap}:${tag}"
-    # Push via localhost:5000 (docker auto-trusts localhost as an insecure
-    # registry); containerd-rs pulls the SAME repo via the gateway ref.
     push_img="localhost:5000/rusternetes-${swap}:${tag}"
-    docker tag "$local_img" "$push_img"
-    log "pushing $push_img (pullable by containerd-rs as ${REGISTRY_HOSTPORT}/rusternetes-${swap}:${tag})"
+    docker tag "k0s-diff-rusternetes-${swap}:${tag}" "$push_img"
+    log "pushing $push_img"
     docker push "$push_img" >/dev/null
+
+    # The k0s-diff-net gateway is PINNED (lib.sh / compose template), so we know
+    # the host address the in-container containerd-rs reaches the host-published
+    # registry through BEFORE `up` — no recreate needed. Export the insecure-
+    # registry env so the single `up` below starts containerd-rs already trusting
+    # the registry over HTTP (same repo, pulled by the gateway ref).
+    REGISTRY_HOSTPORT="${K0S_DIFF_NET_GATEWAY}:5000"
     export CONTAINERD_RS_INSECURE_REGISTRIES="$REGISTRY_HOSTPORT"
+    log "insecure registry for containerd-rs: $REGISTRY_HOSTPORT (image ref ${REGISTRY_HOSTPORT}/rusternetes-${swap}:${tag})"
     ;;
 esac
 
@@ -133,6 +140,19 @@ done
 [ -s "$kc" ] || { echo "could not obtain kubeconfig from $cname" >&2; exit 1; }
 sed -i 's#server: https://.*:6443#server: https://127.0.0.1:26444#' "$kc"
 export KUBECONFIG="$kc"
+
+# --- readiness pre-gate: wait for the node to register AND kube-system pods to
+# be created before invoking smoke. `k0s kubeconfig admin` succeeds as soon as
+# the api-server answers — which is BEFORE the worker registers and the addon
+# controllers create the kube-system pods. smoke.sh's `kubectl wait --all` errors
+# ("no matching resources found") on an empty set, so gate on non-empty first.
+log "waiting for node + kube-system pods to appear"
+for _ in $(seq 1 90); do
+  n="$(kubectl get nodes --no-headers 2>/dev/null | wc -l)"
+  p="$(kubectl -n kube-system get pods --no-headers 2>/dev/null | wc -l)"
+  [ "${n:-0}" -ge 1 ] && [ "${p:-0}" -ge 1 ] && break
+  sleep 5
+done
 
 # --- smoke gate ---------------------------------------------------------------
 if ! bash "$here/smoke.sh"; then
