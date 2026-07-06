@@ -1079,15 +1079,16 @@ async fn main() -> Result<()> {
             };
             let token = cli.token.or_else(|| config.get_token().ok().flatten());
             // Client cert/key for mTLS auth (#1578), sourced from the kubeconfig
-            // user. Ignored in insecure mode (no client identity is presented).
-            let (client_cert, client_key) = if skip_tls {
-                (None, None)
-            } else {
-                (
-                    config.get_client_cert_pem().unwrap_or(None),
-                    config.get_client_key_pem().unwrap_or(None),
-                )
-            };
+            // user. Resolved regardless of insecure mode: upstream client-go
+            // presents the client identity independent of
+            // insecure-skip-tls-verify (that flag governs SERVER verification
+            // only), and the daemon components (kubelet/scheduler/etc.) do the
+            // same — so kubectl must too, or `--insecure-skip-tls-verify`
+            // against a client-cert-auth apiserver would 401.
+            let (client_cert, client_key) = (
+                config.get_client_cert_pem().unwrap_or(None),
+                config.get_client_key_pem().unwrap_or(None),
+            );
             let namespace = config
                 .get_namespace()
                 .unwrap_or_else(|_| "default".to_string());
