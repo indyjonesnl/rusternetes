@@ -13,7 +13,10 @@
 # safe to swap in the real rusternetes adapter (shims/kube-apiserver).
 set -eu
 
-LOG=/var/lib/k0s/kube-apiserver-shim-argv.log
+# k0s runs the apiserver as the unprivileged `kube-api` user, which cannot write
+# under /var/lib/k0s — log to world-writable /tmp, best-effort (never abort the
+# exec under `set -e` if logging fails).
+LOG=/tmp/kube-apiserver-shim-argv.log
 {
   echo "=== $(date -u +%FT%TZ) kube-apiserver PROBE shim invoked (pid $$) ==="
   echo "argc=$#"
@@ -23,6 +26,6 @@ LOG=/var/lib/k0s/kube-apiserver-shim-argv.log
     i=$((i + 1))
   done
   echo "--- exec /opt/k0s-diff/kube-apiserver.real ---"
-} >> "$LOG" 2>&1
+} >> "$LOG" 2>&1 || true
 
 exec /opt/k0s-diff/kube-apiserver.real "$@"
