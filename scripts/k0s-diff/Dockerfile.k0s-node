@@ -1,0 +1,44 @@
+# v0 baseline node image for the k0s differential conformance harness.
+#
+# Base: the stock k0s v1.35 (all-Go control plane) image. We bake in ONLY the
+# node container runtime (containerd-rs, the Rust CRI) + its OCI runtime (crun)
+# + the standard CNI plugins. The k0s-supervised control-plane binaries
+# (kube-apiserver / kube-controller-manager / kube-scheduler / kube-proxy /
+# kubelet) stay 100% upstream Go for v0 — later variants swap ONE of them.
+#
+# Staging note (Crux 1): k0s re-extracts its own supervised binaries into
+# /var/lib/k0s/bin on start, so per-variant component swaps must be baked into
+# the image (or injected before k0s starts), NOT bind-mounted over a running
+# tree. containerd-rs sits OUTSIDE /var/lib/k0s/bin (it is an external CRI k0s
+# never manages), so baking it here is stable. See SPIKE-FINDINGS.md.
+FROM k0sproject/k0s:v1.35.5-k0s.0
+
+USER root
+
+# The Rust CRI runtime: lift the static musl binary out of the published release
+# image (pinned, immutable). It runs natively on the Alpine-based k0s image.
+COPY --from=ghcr.io/indyjonesnl/containerd-rs:v0.1.3 /usr/local/bin/containerd-rs /usr/local/bin/containerd-rs
+
+# iproute2: the k0s base ships BusyBox `ip` which lacks `netns`; containerd-rs
+# calls `ip netns add/del` to manage pod network namespaces.
+RUN apk add --no-cache iproute2 ca-certificates
+
+# crun (the OCI runtime containerd-rs shells out to). Pinned static binary —
+# matches the version validated in the rustified-kubernetes-stack k0s stack.
+ARG CRUN_VERSION=1.28
+ARG CRUN_SHA256=2aa6b7024a9c9f153895c0d11ae233d3758f54844011c3a039e3e89048d01d42
+RUN wget -qO /usr/local/bin/crun \
+      "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-amd64" \
+    && echo "${CRUN_SHA256}  /usr/local/bin/crun" | sha256sum -c - \
+    && chmod +x /usr/local/bin/crun \
+    && /usr/local/bin/crun --version
+
+# Standard CNI plugins (bridge, host-local, loopback, portmap, flannel, ...) into
+# containerd-rs's cni_bin_dir. k0s's built-in flannel provider writes the CNI
+# conflist to /etc/cni/net.d at runtime; containerd-rs execs these plugins.
+ARG CNI_VERSION=1.6.2
+RUN mkdir -p /opt/cni/bin \
+    && wget -qO /tmp/cni.tgz \
+      "https://github.com/containernetworking/plugins/releases/download/v${CNI_VERSION}/cni-plugins-linux-amd64-v${CNI_VERSION}.tgz" \
+    && tar -xzf /tmp/cni.tgz -C /opt/cni/bin \
+    && rm -f /tmp/cni.tgz

@@ -1,0 +1,65 @@
+# v0 baseline for the k0s differential conformance harness.
+#
+# ONE k0s container (kind-style): the stock k0s all-Go control plane + kubelet,
+# with the node container runtime swapped to containerd-rs (Rust CRI) + crun.
+# k0s cedes the CRI via `--cri-socket remote:...` and does NOT launch its own
+# containerd. containerd-rs runs co-resident in the SAME container (started by
+# the entrypoint before k0s) because the CRI runtime and the kubelet must share
+# a filesystem + mount/pid namespaces — a separate compose service cannot see
+# the pod netns/bundles the kubelet expects. This is why the brief's two-service
+# sketch is collapsed to one baked image here (see SPIKE-FINDINGS.md, Crux 1).
+#
+# Later variants (v1..v6) swap ONE upstream Go component (api-server, kubelet,
+# scheduler, controller-manager, kube-proxy, dns) for its Rusternetes build.
+# Those swaps are baked into the image / injected pre-k0s-start (Crux 1), never
+# bind-mounted over /var/lib/k0s/bin.
+services:
+  k0s:
+    build:
+      context: .
+      dockerfile: Dockerfile.k0s-node
+    image: k0s-diff-v0-node:v1.35.5
+    container_name: k0s-diff-v0
+    hostname: k0s-diff-v0
+    restart: unless-stopped
+    privileged: true
+    cgroup: host
+    # Skip the k0s image's kind-style resolv.conf rewrite (breaks in-container
+    # DNS on an nftables host); give the container real upstream resolvers.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    entrypoint:
+      - /bin/sh
+      - -c
+    command:
+      - |
+        set -e
+        [ -f /etc/machine-id ] || dd if=/dev/urandom status=none bs=16 count=1 | md5sum | cut -d' ' -f1 > /etc/machine-id
+        crun --version
+        # Start the Rust CRI daemon and wait for its socket before launching k0s,
+        # so the kubelet's first CRI dial succeeds.
+        containerd-rs --config /etc/containerd-rs.toml >/var/log/containerd-rs.log 2>&1 &
+        for i in $(seq 1 60); do [ -S /run/containerd-rs.sock ] && break; sleep 1; done
+        [ -S /run/containerd-rs.sock ] || { echo "containerd-rs socket never appeared"; tail -n 40 /var/log/containerd-rs.log; exit 1; }
+        # --cri-socket remote:... cedes the CRI to containerd-rs (k0s launches no
+        # containerd of its own). --no-taints so the single node is schedulable.
+        exec k0s controller --config=/etc/k0s/k0s.yaml --enable-worker --no-taints --cri-socket remote:unix:///run/containerd-rs.sock
+    volumes:
+      - ./k0s-config.yaml:/etc/k0s/k0s.yaml:ro
+      - ./containerd-rs.toml:/etc/containerd-rs.toml:ro
+      - k0s-var:/var/lib/k0s
+    tmpfs:
+      - /run
+    ports:
+      - "26443:6443"
+    networks:
+      - k0s-diff-net
+
+networks:
+  k0s-diff-net:
+    name: k0s-diff-net
+
+volumes:
+  k0s-var:
+    name: k0s-diff-v0-var
