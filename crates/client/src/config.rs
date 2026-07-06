@@ -12,6 +12,13 @@ pub struct ClientConfig {
     pub base_url: String,
     pub token: Option<String>,
     pub ca_pem: Option<String>,
+    /// Client certificate PEM for mTLS auth (#1578). Paired with
+    /// `client_key_pem`; both must be present or both absent. Mirrors upstream
+    /// `rest.TLSClientConfig.CertData`.
+    pub client_cert_pem: Option<String>,
+    /// Client private-key PEM for mTLS auth (#1578). See `client_cert_pem`.
+    /// Mirrors upstream `rest.TLSClientConfig.KeyData`.
+    pub client_key_pem: Option<String>,
 }
 
 impl ClientConfig {
@@ -41,6 +48,9 @@ impl ClientConfig {
             base_url: format!("https://{}:{}", host, port),
             token: Some(token.trim().to_string()),
             ca_pem,
+            // In-cluster auth uses the bearer SA token, not a client cert.
+            client_cert_pem: None,
+            client_key_pem: None,
         })
     }
 }

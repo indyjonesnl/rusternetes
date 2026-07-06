@@ -89,7 +89,7 @@ impl ApiClient {
         insecure_skip_tls_verify: bool,
         token: Option<String>,
     ) -> Result<Self> {
-        Self::with_tls(base_url, insecure_skip_tls_verify, None, token)
+        Self::with_tls(base_url, insecure_skip_tls_verify, None, None, None, token)
     }
 
     /// Build a client from a resolved [`crate::config::ClientConfig`]
@@ -100,23 +100,67 @@ impl ApiClient {
             &config.base_url,
             false,
             config.ca_pem.as_ref().map(|pem| pem.as_bytes().to_vec()),
+            config
+                .client_cert_pem
+                .as_ref()
+                .map(|pem| pem.as_bytes().to_vec()),
+            config
+                .client_key_pem
+                .as_ref()
+                .map(|pem| pem.as_bytes().to_vec()),
             config.token.clone(),
         )
     }
 
-    /// Build a client, optionally trusting a kubeconfig-supplied CA certificate.
+    /// Build a client, optionally trusting a kubeconfig-supplied CA certificate
+    /// and presenting a client certificate for mTLS auth (#1578).
     ///
     /// TLS precedence mirrors upstream kubectl:
     ///   1. `insecure_skip_tls_verify` — accept any cert (skips CA entirely).
     ///   2. `ca_pem` present — verify against that CA (added to the default
     ///      roots), which is how we trust the api-server's self-signed cert.
     ///   3. neither — verify against the system roots only.
+    ///
+    /// When both `client_cert_pem` and `client_key_pem` are present, they are
+    /// concatenated (cert then key) and installed as a rustls `Identity` so the
+    /// client authenticates via mTLS. This mirrors upstream client-go, which
+    /// builds the identity from the cert+key DATA pair
+    /// (`transport.go`: `tls.X509KeyPair(c.TLS.CertData, c.TLS.KeyData)`).
+    /// Supplying exactly one of the two is a misconfiguration and errors, per
+    /// upstream's pair guard (`config.go` `HasCertAuth`: both cert AND key).
     pub fn with_tls(
         base_url: &str,
         insecure_skip_tls_verify: bool,
         ca_pem: Option<Vec<u8>>,
+        client_cert_pem: Option<Vec<u8>>,
+        client_key_pem: Option<Vec<u8>>,
         token: Option<String>,
     ) -> Result<Self> {
+        // Resolve the optional client identity up front so a cert/key mismatch
+        // fails fast (and only once, not per build_client call). A client cert
+        // and its key must be supplied together.
+        let identity = match (client_cert_pem.as_ref(), client_key_pem.as_ref()) {
+            (Some(cert), Some(key)) => {
+                // reqwest/rustls wants the cert PEM followed by the key PEM in a
+                // single buffer (equivalent to Go's X509KeyPair(cert, key)).
+                let mut combined = cert.clone();
+                if !combined.ends_with(b"\n") {
+                    combined.push(b'\n');
+                }
+                combined.extend_from_slice(key);
+                let id = reqwest::Identity::from_pem(&combined)
+                    .context("building client identity from client cert + key PEM (mTLS)")?;
+                Some(id)
+            }
+            (Some(_), None) => {
+                anyhow::bail!("client certificate supplied without a client key (mTLS misconfig)")
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("client key supplied without a client certificate (mTLS misconfig)")
+            }
+            (None, None) => None,
+        };
+
         // Build a reqwest client with the shared TLS config. `total_timeout`
         // is applied only to the CRUD client — the stream client must stay open
         // for long-lived watches. Both get a connect-timeout and TCP keepalive
@@ -132,6 +176,9 @@ impl ApiClient {
                 let cert = reqwest::Certificate::from_pem(ca)
                     .context("parsing kubeconfig CA certificate (certificate-authority-data)")?;
                 builder = builder.add_root_certificate(cert);
+            }
+            if let Some(ref id) = identity {
+                builder = builder.identity(id.clone());
             }
             if let Some(t) = total_timeout {
                 builder = builder.timeout(t);
@@ -480,5 +527,103 @@ mod tests {
             err.to_string(),
             "request failed with status 503 Service Unavailable: <html>503</html>"
         );
+    }
+
+    // Throwaway self-signed client cert + key (RSA-2048, CN=test-client),
+    // generated once with `openssl req -x509 -newkey rsa:2048 -nodes` for the
+    // mTLS identity test (#1578). Not used by any live endpoint.
+    const TEST_CLIENT_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIDDTCCAfWgAwIBAgIUbg0wEZz4PWxhG6150TKdtY3RToUwDQYJKoZIhvcNAQEL
+BQAwFjEUMBIGA1UEAwwLdGVzdC1jbGllbnQwHhcNMjYwNzA2MjIxNzU5WhcNMzYw
+NzAzMjIxNzU5WjAWMRQwEgYDVQQDDAt0ZXN0LWNsaWVudDCCASIwDQYJKoZIhvcN
+AQEBBQADggEPADCCAQoCggEBALx2Re8hobRJCZXb7KE5QWGTezVNKWz2Fc2dQhl5
+ep/8KwjxpRTCLFulTyKdRompRs4PJwsszG4yxujW2ORdiXENmn4Hzph5r3BIU4kc
+N3yOd7ATSe2wlsQPIf2QYVR4gSOvlDRkAugUt4QnUqVVn2gkRLa4pYfqJvcusEtP
+T9xqxk6bJExwkU2n2lo/AWq5zl6WVPOUORh7/eXJjWtyzln5cGVulu0w56VZHDID
+DKdSA6S9D04/jBEsL7W20AYYxi+rEttb6+TiJH0GrxEuZAK+Blwid5x8XcRyQ6Tz
+TsOOBouR/jshSSVIXfVWEPqkD2+EWrFqtnUBgV5mblpSH1kCAwEAAaNTMFEwHQYD
+VR0OBBYEFJlz3rKIHbaw0y3IrRu0jFbrku0YMB8GA1UdIwQYMBaAFJlz3rKIHbaw
+0y3IrRu0jFbrku0YMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEB
+AJoTqX4QPacZo4DE5eLEvM5RTYfXfk7PHGNveeCOUPT/EGMWXYD/6UrIZCALkhzx
+2IHmrHPhAZnGGzY6/erbztorscz1Wew94+dKgQBJH5T6oaIkli777AfK7Lpq+kiw
+XTsO4gVnylljtfBvudQAXZ6dsg3zRrYO++H2YgcsWLimi7cCKP6HZHnKCKD1etx/
+4MVDaXxd6gaS+O3g9rYPIcbGLsF9p4hRWFjqjKJM7kmRp4WXzdt7C/aXI+wYVhCF
+NoU2uWEbSHUCaOYCC+3NNmWCXS8JKT2zvfijPiW/eLgWM9gVYVX5YQtkZaq1fTBC
+Ue8KW7NRFZVYv2Rw1Pg1g0g=
+-----END CERTIFICATE-----
+";
+    const TEST_CLIENT_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQC8dkXvIaG0SQmV
+2+yhOUFhk3s1TSls9hXNnUIZeXqf/CsI8aUUwixbpU8inUaJqUbODycLLMxuMsbo
+1tjkXYlxDZp+B86Yea9wSFOJHDd8jnewE0ntsJbEDyH9kGFUeIEjr5Q0ZALoFLeE
+J1KlVZ9oJES2uKWH6ib3LrBLT0/casZOmyRMcJFNp9paPwFquc5ellTzlDkYe/3l
+yY1rcs5Z+XBlbpbtMOelWRwyAwynUgOkvQ9OP4wRLC+1ttAGGMYvqxLbW+vk4iR9
+Bq8RLmQCvgZcInecfF3EckOk807DjgaLkf47IUklSF31VhD6pA9vhFqxarZ1AYFe
+Zm5aUh9ZAgMBAAECggEAK4ILgZoMTIRrCdV4krzW1vm3ATZj2KOUI4CJTLvCfzI2
+Vi2BLKJqHqsycn2IFgpGDhap7xbDyDIBQSoubsQYUYjwMGXJgGJhSeTsohPpTGBQ
+ic3eLJkuqSsMMA9XpOpf99bWOmUXVbBIsKHqXsB+WUq8MUm97ztzjO+SpAQ2nd4D
+ZaV7s77gNQtiTnERTyeML50UblxTbkm3LDxxcFFlFqn5wXWHxNJWrfyN12Du5Lpc
+wzD8KkJsjV597bIPMuyLTBZhZGM3n+/SI9B18sZdHViUaoxQMXfFmrkKHlkjjD3I
+IJBUz6c6jnplWPi7qFP4nc9iL2QKVEFVmk9fodAtXQKBgQD4RPlAlJGWfA32gP0H
+KfSvo9yq+J1WUVO/MgHXVGa8nikAmMIDEbTeZpbjJbwyCakG/qtuiROePUEvbvRM
+HaQkKxMKajEivdwdvhcLmVdLq4rHEGak5mPix5sKvkKHUVvX44as4RXVKwVaK9gj
++QeemIxRJSMh3KgGNSJSIWBjhQKBgQDCVI65wZlPqr8P7ujNpKHANs00yGgKKYrF
+xPkyLMaP7skZURMtrq+qB3JMZ+qvOJP+QmvF+3aPKHA5/hzZr5C/F+Az4WKODBVG
+REDy6MG/bNNFVY984NhqKRbPvCCcg0jAfsJlyZmCFes34OQtYOmcat10oLHCloT1
+0XrMMuyCxQKBgQDC2A7uOitQeSfUMENkne7k8as7m0aP+d/KDAsZ3amLmmz/hOOu
+2PSkHsuIlZLvillXngMZCweUhupjuaaNHi42HIAjClhptavMw+T+O2ghgQ23UQ3d
+mNsHnjP16H/6B0YXVv/ZKgWieNMIg6RsBwON2pc1D/pUlwJfbM/0uTEWqQKBgQDC
+CKX96cWHm2hso1LGSlTLVKyuwE/JndMXR2a+Z6DXhEg9RAuPOHXjos3IZpYY4Lg8
+TtvHch7eMDVmYkkyPi+b7l4Jz0iVppDzeSEUqb0Swrls6FJ+EQ9laKODRkeVnyxc
+L/UwpwvkrLgRMjcC7Fo1uSpn0i/LqHkX7VLcYxhuNQKBgQDsVFcFNZVKSQIkR0p9
+lq2scfEWl+7k3MBexUAC3xDPw2ItVOeJR1PXpJqqRUICTp8jc4MBRjzPR27ZKfBb
+o2Wx1kwClW9YuBRA6HmLA3xFZqtKWCLy+LLDEMjlnGxuANyz6OeYCo9VPIiDCBHk
+pYMXass1aOZuRtmE5ibX9iPpBQ==
+-----END PRIVATE KEY-----
+";
+
+    // #1578: a client cert + key pair yields a usable client (reqwest parses the
+    // combined cert+key PEM into a rustls Identity). Mirrors upstream client-go
+    // `tls.X509KeyPair(c.TLS.CertData, c.TLS.KeyData)` (transport.go:137).
+    #[test]
+    fn test_with_tls_client_identity_ok() {
+        let client = ApiClient::with_tls(
+            "https://localhost:6443",
+            false,
+            None,
+            Some(TEST_CLIENT_CERT_PEM.as_bytes().to_vec()),
+            Some(TEST_CLIENT_KEY_PEM.as_bytes().to_vec()),
+            None,
+        );
+        assert!(
+            client.is_ok(),
+            "cert+key pair must build a client: {:?}",
+            client.err()
+        );
+    }
+
+    // #1578: cert without key (or vice-versa) is a misconfig. Mirrors upstream's
+    // pair guard (config.go `HasCertAuth`: both cert AND key must be present).
+    #[test]
+    fn test_with_tls_cert_without_key_errs() {
+        let cert_only = ApiClient::with_tls(
+            "https://localhost:6443",
+            false,
+            None,
+            Some(TEST_CLIENT_CERT_PEM.as_bytes().to_vec()),
+            None,
+            None,
+        );
+        assert!(cert_only.is_err(), "cert without key must error");
+
+        let key_only = ApiClient::with_tls(
+            "https://localhost:6443",
+            false,
+            None,
+            None,
+            Some(TEST_CLIENT_KEY_PEM.as_bytes().to_vec()),
+            None,
+        );
+        assert!(key_only.is_err(), "key without cert must error");
     }
 }
