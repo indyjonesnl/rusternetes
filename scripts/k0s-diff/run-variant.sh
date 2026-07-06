@@ -11,8 +11,10 @@
 # On smoke failure: writes {"smoke":"fail"} to results/<vN>/<sig>.json and
 # exits 0 WITHOUT running conformance (the gate).
 #
-# NOTE: this deliberately does NOT call results-diff.sh (built in Task 7); it
-# inlines a minimal pass/fail count parsed from Hydrophone's own output.
+# NOTE: pass/fail counting is delegated to parse-results.py, the same shared
+# parser results-diff.sh (Task 7) uses for its grid + regression report — kept
+# in one file so this per-run summary and the later cross-variant report never
+# diverge.
 #
 # Env knobs:
 #   K0S_DIFF_FOCUS   override the ginkgo --focus regex (e.g. a single test, to
@@ -204,48 +206,8 @@ hydro_args=(--conformance-image "$conf_image"
 log "hydrophone --focus '$focus' ${skip:+--skip '$skip'}"
 hydrophone "${hydro_args[@]}" || true
 
-# --- minimal pass/fail count (results-diff.sh is Task 7) ----------------------
-read -r pass fail < <(python3 - "$outdir" <<'PY'
-import glob, os, re, sys, xml.etree.ElementTree as ET
-d = sys.argv[1]
-passed = failed = 0
-found = False
-
-# PRIMARY: the ginkgo summary line in e2e.log — its own authoritative count,
-# which (unlike raw junit) excludes the synthetic [ReportBeforeSuite]/
-# [ReportAfterSuite]/[SynchronizedBeforeSuite] pseudo-specs.
-for lf in glob.glob(os.path.join(d, "**", "e2e.log"), recursive=True):
-    try:
-        txt = open(lf, encoding="utf-8", errors="replace").read()
-    except Exception:
-        continue
-    m = re.search(r"(\d+)\s+Passed\s*\|\s*(\d+)\s+Failed", txt)
-    if m:
-        passed, failed, found = int(m.group(1)), int(m.group(2)), True
-
-# FALLBACK: junit, skipping ginkgo's synthetic report/suite nodes.
-if not found:
-    SYNTH = ("[ReportBeforeSuite", "[ReportAfterSuite", "[SynchronizedBeforeSuite",
-             "[SynchronizedAfterSuite", "[BeforeSuite", "[AfterSuite", "[DeferCleanup")
-    for jf in glob.glob(os.path.join(d, "**", "junit*.xml"), recursive=True):
-        try:
-            root = ET.parse(jf).getroot()
-        except Exception:
-            continue
-        for tc in root.iter("testcase"):
-            name = tc.get("name", "")
-            if name.startswith(SYNTH):
-                continue
-            kinds = [c.tag for c in tc]
-            if "failure" in kinds or "error" in kinds:
-                failed += 1
-            elif "skipped" in kinds:
-                pass
-            else:
-                passed += 1
-print(passed, failed)
-PY
-)
+# --- pass/fail count (shared parser — see parse-results.py) -------------------
+read -r pass fail < <(python3 "$here/parse-results.py" summarize "$outdir")
 pass="${pass:-0}"; fail="${fail:-0}"
 
 printf '{"variant":"%s","sig":"%s","image":"%s","serverVersion":"%s","pass":%s,"fail":%s}\n' \
