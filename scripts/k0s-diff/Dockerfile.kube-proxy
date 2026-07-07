@@ -1,0 +1,17 @@
+# v5 workload-swap image: rusternetes-kube-proxy as the in-cluster kube-proxy
+# DaemonSet replacement.
+#
+# Like Dockerfile.dns, this only packages the pre-built static-musl binary;
+# run-variant.sh pushes it to a local insecure registry that containerd-rs pulls
+# over HTTP (containerd-rs has no local-image load path).
+#
+# iptables (+ ip6tables) are REQUIRED: rusternetes-kube-proxy shells out to
+# iptables to program service routing. The pod runs hostNetwork + privileged
+# (see kube-proxy-rusternetes.yaml) so these operate on the node's tables.
+FROM alpine:3.20
+
+RUN apk add --no-cache iptables ip6tables ca-certificates
+
+COPY .build/rusternetes-kube-proxy /usr/local/bin/rusternetes-kube-proxy
+
+ENTRYPOINT ["/usr/local/bin/rusternetes-kube-proxy"]

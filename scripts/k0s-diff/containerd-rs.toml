@@ -1,0 +1,23 @@
+# containerd-rs (Rust CRI) daemon config for the k0s v0 baseline node. Mounted
+# AS /etc/containerd-rs.toml; the compose entrypoint runs `containerd-rs --config`
+# against it. Values mirror containerd-rs v0.1.3 defaults, made explicit to
+# document the contract the k0s kubelet + kuberouter CNI depend on.
+root = "/var/lib/containerd-rs"
+state = "/run/containerd-rs"
+# Must match the --cri-socket remote:unix://... path in the compose entrypoint.
+cri_socket = "/run/containerd-rs.sock"
+stream_server_address = "127.0.0.1:10010"
+
+[cri]
+# Pullable from a registry (containerd-rs has no local-image load path).
+sandbox_image = "registry.k8s.io/pause:3.10"
+# crun is the OCI runtime; containerd-rs shells out to it directly.
+default_runtime_name = "crun"
+runtime_type = "io.containerd.crun.v2"
+snapshotter = "overlayfs"
+# cgroupfs (NOT systemd) — matches the k0s kubelet driver under `cgroup: host`.
+systemd_cgroup = false
+# k0s's kuberouter provider installs its conflist here; containerd-rs reads
+# the lexically-first *.conflist and execs plugins from cni_bin_dir.
+cni_conf_dir = "/etc/cni/net.d"
+cni_bin_dir = "/opt/cni/bin"

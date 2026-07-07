@@ -1,0 +1,115 @@
+#!/bin/sh
+# scripts/k0s-diff/shims/kube-apiserver
+#
+# Task 3, Deliverable 2 — the real flag-adapter. k0s launches this file (staged
+# via shims/stage-kube-apiserver.sh) believing it is the upstream Go
+# kube-apiserver. It translates the ~40-flag k0s argv into the ~15 flags
+# rusternetes-api-server (crates/api-server/src/main.rs) actually understands,
+# logs EVERY k0s flag it has to drop, then execs rusternetes-api-server.
+# Staged by the generic shims/stage-swap.sh (component marker = api-server).
+#
+# Written against the VERBATIM k0s v1.35.5-k0s.0 argv in SPIKE-FINDINGS.md
+# ("### kube-apiserver (kine backend)") — it maps only flags k0s really passes.
+#
+# rusternetes-api-server uses clap kebab-case flags (verified via --help):
+#   --etcd-servers            -> --etcd-servers    (+ kine unix->TCP bridge, below)
+#   --tls-cert-file           -> --tls-cert-file
+#   --tls-private-key-file    -> --tls-key-file
+#   --client-ca-file          -> --client-ca-file
+#   --secure-port             -> port of --bind-address=0.0.0.0:<port>
+#   --advertise-address       -> folded into --bind-address (rusternetes binds 0.0.0.0)
+#   (implicit)                -> --storage-backend=etcd --tls
+#
+# Everything else is DROPPED and logged — those are the rusternetes-api-server
+# capability gaps this harness exists to surface (SA-token keys, front-proxy /
+# aggregation, authz-mode, admission plugins, kubelet client certs, egress
+# selector, api-audiences, cipher suites, ...).
+set -eu
+
+# k0s runs the apiserver as the unprivileged `kube-api` user, which cannot write
+# under /var/lib/k0s — log to world-writable /tmp, best-effort (never abort the
+# exec under `set -e` if logging fails).
+LOG=/tmp/kube-apiserver-shim.log
+: > "$LOG" 2>/dev/null || true
+log() { echo "$@" >> "$LOG" 2>/dev/null || true; }
+log "=== $(date -u +%FT%TZ) rusternetes-api-server adapter shim (pid $$) ==="
+log "raw argv: $*"
+
+ETCD=""
+CERT=""
+KEY=""
+CA=""
+PORT=6443
+DROPPED=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --etcd-servers=*)         ETCD="${1#*=}" ;;
+    --etcd-servers)           ETCD="$2"; shift ;;
+    --tls-cert-file=*)        CERT="${1#*=}" ;;
+    --tls-cert-file)          CERT="$2"; shift ;;
+    --tls-private-key-file=*) KEY="${1#*=}" ;;
+    --tls-private-key-file)   KEY="$2"; shift ;;
+    --client-ca-file=*)       CA="${1#*=}" ;;
+    --client-ca-file)         CA="$2"; shift ;;
+    --secure-port=*)          PORT="${1#*=}" ;;
+    --secure-port)            PORT="$2"; shift ;;
+    --advertise-address=*)    : ;;   # rusternetes binds 0.0.0.0; advertise n/a
+    --advertise-address)      shift ;;
+    *)                        DROPPED="${DROPPED} $1" ;;
+  esac
+  shift
+done
+
+log "mapped: etcd='$ETCD' cert='$CERT' key='$KEY' ca='$CA' port='$PORT'"
+log "DROPPED k0s flags (unsupported by rusternetes-api-server):"
+for f in $DROPPED; do log "  $f"; done
+
+# kine listens ONLY on a unix socket, but rusternetes' etcd-client dials TCP
+# endpoints. Bridge the socket to a local TCP port and repoint --etcd-servers at
+# it. Adapter-side only; rusternetes source stays untouched.
+# NB: k0s passes `unix:/run/k0s/kine/kine.sock:2379` and the socket file is
+# LITERALLY named `kine.sock:2379` (the :2379 is part of the filename, not a TCP
+# port). Derive the exact path by stripping the `unix:` scheme prefix.
+ETCD_TCP=http://127.0.0.1:2379
+case "$ETCD" in
+  unix:*)
+    KINE_SOCK="${ETCD#unix:}"
+    for _ in $(seq 1 60); do [ -S "$KINE_SOCK" ] && break; sleep 1; done
+    if [ -S "$KINE_SOCK" ]; then
+      # Launch the bridge. On a supervisor restart a prior socat may still hold
+      # :2379 — the duplicate bind then fails harmlessly (logged) while the
+      # first keeps serving, so rusternetes reaches kine either way.
+      log "bridging kine unix socket $KINE_SOCK -> $ETCD_TCP via socat"
+      socat TCP-LISTEN:2379,fork,reuseaddr,bind=127.0.0.1 \
+            "UNIX-CONNECT:${KINE_SOCK}" >> "$LOG" 2>&1 &
+      # Poll the bridge port (bounded ~5s) instead of a blind sleep, so we only
+      # hand off to rusternetes once 127.0.0.1:2379 actually accepts. socat is
+      # guaranteed present; a null-source connect returns 0 iff the port is up.
+      for _ in 1 2 3 4 5; do
+        if socat -T1 /dev/null TCP:127.0.0.1:2379 >/dev/null 2>&1; then
+          log "kine TCP bridge is accepting on 127.0.0.1:2379"
+          break
+        fi
+        sleep 1
+      done
+      ETCD_ARG="$ETCD_TCP"
+    else
+      log "WARN kine socket $KINE_SOCK never appeared; passing raw endpoint '$ETCD'"
+      ETCD_ARG="$ETCD"
+    fi
+    ;;
+  *) ETCD_ARG="$ETCD" ;;
+esac
+
+set -- --storage-backend=etcd --tls --bind-address="0.0.0.0:${PORT}" \
+       --etcd-servers="$ETCD_ARG"
+[ -n "$CERT" ] && set -- "$@" --tls-cert-file="$CERT"
+[ -n "$KEY" ]  && set -- "$@" --tls-key-file="$KEY"
+[ -n "$CA" ]   && set -- "$@" --client-ca-file="$CA"
+
+# Absolute path: the k0s supervisor launches the apiserver with a minimal PATH
+# that excludes /usr/local/bin (a bare name yields exit 127 "not found").
+RUSTERNETES=/usr/local/bin/rusternetes-api-server
+log "exec: $RUSTERNETES $*"
+exec "$RUSTERNETES" "$@"

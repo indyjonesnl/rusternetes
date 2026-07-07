@@ -1,0 +1,115 @@
+# v0 baseline node image for the k0s differential conformance harness.
+#
+# Base: the stock k0s v1.35 (all-Go control plane) image. We bake in ONLY the
+# node container runtime (containerd-rs, the Rust CRI) + its OCI runtime (crun)
+# + the standard CNI plugins. The k0s-supervised control-plane binaries
+# (kube-apiserver / kube-controller-manager / kube-scheduler / kube-proxy /
+# kubelet) stay 100% upstream Go for v0 — later variants swap ONE of them.
+#
+# Staging note (Crux 1): k0s re-extracts its own supervised binaries into
+# /var/lib/k0s/bin on start, so per-variant component swaps must be baked into
+# the image (or injected before k0s starts), NOT bind-mounted over a running
+# tree. containerd-rs sits OUTSIDE /var/lib/k0s/bin (it is an external CRI k0s
+# never manages), so baking it here is stable. See SPIKE-FINDINGS.md.
+FROM k0sproject/k0s:v1.35.5-k0s.0
+
+USER root
+
+# The Rust CRI runtime: lift the static musl binary out of the published release
+# image (pinned, immutable). It runs natively on the Alpine-based k0s image.
+COPY --from=ghcr.io/indyjonesnl/containerd-rs:v0.1.3 /usr/local/bin/containerd-rs /usr/local/bin/containerd-rs
+
+# iproute2: the k0s base ships BusyBox `ip` which lacks `netns`; containerd-rs
+# calls `ip netns add/del` to manage pod network namespaces.
+RUN apk add --no-cache iproute2 ca-certificates
+
+# crun (the OCI runtime containerd-rs shells out to). Pinned static binary —
+# matches the version validated in the rustified-kubernetes-stack k0s stack.
+ARG CRUN_VERSION=1.28
+ARG CRUN_SHA256=2aa6b7024a9c9f153895c0d11ae233d3758f54844011c3a039e3e89048d01d42
+RUN wget -qO /usr/local/bin/crun \
+      "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-amd64" \
+    && echo "${CRUN_SHA256}  /usr/local/bin/crun" | sha256sum -c - \
+    && chmod +x /usr/local/bin/crun \
+    && /usr/local/bin/crun --version
+
+# Standard CNI plugins (bridge, host-local, loopback, portmap, ...) into
+# containerd-rs's cni_bin_dir. k0s's built-in kuberouter provider writes the CNI
+# conflist to /etc/cni/net.d at runtime; containerd-rs execs these plugins.
+ARG CNI_VERSION=1.6.2
+RUN mkdir -p /opt/cni/bin \
+    && wget -qO /tmp/cni.tgz \
+      "https://github.com/containernetworking/plugins/releases/download/v${CNI_VERSION}/cni-plugins-linux-amd64-v${CNI_VERSION}.tgz" \
+    && tar -xzf /tmp/cni.tgz -C /opt/cni/bin \
+    && rm -f /tmp/cni.tgz
+
+# ---------------------------------------------------------------------------
+# Per-variant component swap (v1..v4). SWAP_COMPONENT (build arg set by
+# gen-compose.sh) selects which upstream Go binary is replaced by its
+# Rusternetes build. The replacement is baked here and interposed at runtime by
+# the entrypoint via shims/stage-swap.sh — it does NOT bind-mount over
+# /var/lib/k0s/bin (ruled out) but exploits k0s's mtime+size staging-skip
+# condition (see SPIKE-FINDINGS.md, Crux 1 addendum). Empty (v0) => baseline.
+#
+# The build context always carries shims/ (committed) and .build/ (git-ignored;
+# holds the locally-built rusternetes-<component> + the genuine k0s binary saved
+# aside as the pad-size source / probe target). Both dirs are copied; the RUN
+# guard installs only what the selected swap needs, so a v0 build (empty
+# .build/, just .gitkeep) still succeeds. Each branch writes
+# /opt/k0s-diff/swap-component so the generic stage-swap.sh knows what to stage.
+ARG SWAP_COMPONENT=""
+COPY shims/ /opt/k0s-diff/shims/
+COPY .build/ /opt/k0s-diff/.build/
+
+# Optional containerd-rs override (v5/v6 enabler). The pinned v0.1.3 baked above
+# has NO local-image load path AND predates the CONTAINERD_RS_INSECURE_REGISTRIES
+# env feature (added post-v0.1.3) AND uses oci-client defaults (HTTPS + cert
+# verify) — so it cannot pull the local-registry rusternetes-{dns,kube-proxy}
+# images the workload swaps need. When CONTAINERD_RS_BINARY names a file under
+# the build context's .build/ (e.g. ".build/containerd-rs", a newer static-musl
+# build carrying the env feature), install it OVER the v0.1.3 binary. Empty by
+# default => v0..v4 keep the pinned baseline runtime untouched.
+ARG CONTAINERD_RS_BINARY=""
+RUN set -eu; \
+    if [ -n "$CONTAINERD_RS_BINARY" ] && [ -f "/opt/k0s-diff/$CONTAINERD_RS_BINARY" ]; then \
+      install -m0755 "/opt/k0s-diff/$CONTAINERD_RS_BINARY" /usr/local/bin/containerd-rs; \
+      /usr/local/bin/containerd-rs --version || true; \
+    fi
+# NOTE: only the BAKED binary swaps (v1..v4) install the pre-k0s-start stager +
+# marker. v5 (kube-proxy) / v6 (dns) are workload swaps — the Rusternetes binary
+# ships in a pullable pod image (Dockerfile.{kube-proxy,dns}), NOT /var/lib/k0s/bin,
+# so they must NOT write the marker (stage-swap.sh only knows the baked names and
+# would otherwise error on 'dns'/'kube-proxy').
+RUN set -eu; \
+    case "$SWAP_COMPONENT" in \
+      api-server|kubelet|scheduler|controller-manager) \
+        install -m0755 /opt/k0s-diff/shims/stage-swap.sh /opt/k0s-diff/stage-swap.sh; \
+        printf '%s' "$SWAP_COMPONENT" > /opt/k0s-diff/swap-component; \
+        ;; \
+    esac; \
+    if [ "$SWAP_COMPONENT" = "api-server" ]; then \
+      apk add --no-cache socat; \
+      install -m0755 /opt/k0s-diff/.build/rusternetes-api-server /usr/local/bin/rusternetes-api-server; \
+      install -m0755 /opt/k0s-diff/shims/kube-apiserver          /opt/k0s-diff/kube-apiserver.adapter; \
+      install -m0755 /opt/k0s-diff/shims/kube-apiserver.probe    /opt/k0s-diff/kube-apiserver.probe; \
+      install -m0750 /opt/k0s-diff/.build/kube-apiserver.real    /opt/k0s-diff/kube-apiserver.real; \
+      rusternetes-api-server --help >/dev/null 2>&1 || true; \
+    fi; \
+    if [ "$SWAP_COMPONENT" = "kubelet" ]; then \
+      install -m0755 /opt/k0s-diff/.build/rusternetes-kubelet /usr/local/bin/rusternetes-kubelet; \
+      install -m0755 /opt/k0s-diff/shims/kubelet              /opt/k0s-diff/kubelet.adapter; \
+      install -m0750 /opt/k0s-diff/.build/kubelet.real        /opt/k0s-diff/kubelet.real; \
+      rusternetes-kubelet --help >/dev/null 2>&1 || true; \
+    fi; \
+    if [ "$SWAP_COMPONENT" = "scheduler" ]; then \
+      install -m0755 /opt/k0s-diff/.build/rusternetes-scheduler /usr/local/bin/rusternetes-scheduler; \
+      install -m0755 /opt/k0s-diff/shims/kube-scheduler          /opt/k0s-diff/kube-scheduler.adapter; \
+      install -m0750 /opt/k0s-diff/.build/kube-scheduler.real    /opt/k0s-diff/kube-scheduler.real; \
+      rusternetes-scheduler --help >/dev/null 2>&1 || true; \
+    fi; \
+    if [ "$SWAP_COMPONENT" = "controller-manager" ]; then \
+      install -m0755 /opt/k0s-diff/.build/rusternetes-controller-manager /usr/local/bin/rusternetes-controller-manager; \
+      install -m0755 /opt/k0s-diff/shims/kube-controller-manager          /opt/k0s-diff/kube-controller-manager.adapter; \
+      install -m0750 /opt/k0s-diff/.build/kube-controller-manager.real    /opt/k0s-diff/kube-controller-manager.real; \
+      rusternetes-controller-manager --help >/dev/null 2>&1 || true; \
+    fi

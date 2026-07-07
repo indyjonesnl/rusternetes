@@ -1,0 +1,108 @@
+# v5 workload swap: point the kube-system kube-proxy DaemonSet at
+# rusternetes-kube-proxy.
+#
+# Applied by run-variant.sh (v5) AFTER the all-Go stack passes the smoke gate.
+# `kubectl apply` updates the existing k0s "kube-proxy" DaemonSet in place — the
+# metadata.name/namespace and spec.selector (k8s-app: kube-proxy) are preserved
+# verbatim so the swap is a pure image/command change.
+#
+# PRESERVED (kube-proxy needs host-level iptables — see CLAUDE.md conventions):
+#   hostNetwork: true          — kube-proxy programs the node's iptables.
+#   securityContext.privileged — grants CAP_NET_ADMIN (+ everything) for iptables
+#                                and the xtables lock; kept from stock k0s.
+#   the xtables-lock / lib-modules hostPath mounts and the kube-proxy configmap
+#   mount (carries the CA-bearing kubeconfig rusternetes-kube-proxy reads).
+#
+# What changes:
+#   image/command -> rusternetes-kube-proxy (placeholder, sed-substituted at
+#                    apply time with the local-registry ref).
+#   args          -> the rusternetes-kube-proxy CLI (crates/kube-proxy/src/main.rs):
+#                      --node-name=$(NODE_NAME)
+#                      --api-server-url=https://localhost:6443  (hostNetwork =>
+#                        localhost is the k0s container; api-server listens :6443)
+#                      --kubeconfig=/var/lib/kube-proxy/kubeconfig.conf  (CA + server)
+#                      --cluster-cidr / --node-port-range matched to the apiserver
+#
+# KNOWN CAPABILITY GAP (documented, expected to 401): rusternetes-kube-proxy's
+# API mode builds its ApiClient with token=None (main.rs ~L113) and its
+# kubeconfig loader extracts ONLY the CA — it has no path to present the pod's
+# ServiceAccount bearer token (nor a client cert). Against k0s's api-server
+# (--anonymous-auth=false --authorization-mode=Node,RBAC) the anonymous reads of
+# Services/EndpointSlices are rejected, so service routing will not converge.
+# This is the same client-auth wall as v3/v4; run-variant.sh captures the pod
+# logs as evidence.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+  labels:
+    k8s-app: kube-proxy
+spec:
+  selector:
+    matchLabels:
+      k8s-app: kube-proxy
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-proxy
+    spec:
+      serviceAccountName: kube-proxy
+      priorityClassName: system-node-critical
+      hostNetwork: true
+      dnsPolicy: ClusterFirst
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+      - effect: NoExecute
+        operator: Exists
+      - effect: NoSchedule
+        operator: Exists
+      containers:
+      - name: kube-proxy
+        image: __RUSTERNETES_KUBE_PROXY_IMAGE__
+        imagePullPolicy: Always
+        command:
+        - /usr/local/bin/rusternetes-kube-proxy
+        args:
+        - --node-name=$(NODE_NAME)
+        - --api-server-url=https://localhost:6443
+        - --kubeconfig=/var/lib/kube-proxy/kubeconfig.conf
+        - --cluster-cidr=10.244.0.0/16
+        - --node-port-range=30000:32767
+        - --insecure-skip-tls-verify
+        - --log-level=info
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /var/lib/kube-proxy
+          name: kube-proxy
+        - mountPath: /run/xtables.lock
+          name: xtables-lock
+        - mountPath: /lib/modules
+          name: lib-modules
+          readOnly: true
+      volumes:
+      - configMap:
+          defaultMode: 420
+          name: kube-proxy
+        name: kube-proxy
+      - hostPath:
+          path: /run/xtables.lock
+          type: FileOrCreate
+        name: xtables-lock
+      - hostPath:
+          path: /lib/modules
+          type: ""
+        name: lib-modules

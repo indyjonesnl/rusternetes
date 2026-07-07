@@ -1,0 +1,26 @@
+# v6 workload-swap image: rusternetes-dns as the in-cluster CoreDNS replacement.
+#
+# containerd-rs has NO local-image load path (see containerd-rs.toml) — it can
+# only PULL. So this image is built here, pushed to a throwaway local insecure
+# registry on the k0s-diff-net gateway, and pulled by containerd-rs over HTTP
+# (CONTAINERD_RS_INSECURE_REGISTRIES). run-variant.sh wires that; this file only
+# packages the pre-built static-musl binary.
+#
+# The binary is copied from .build/ (staged by build-swap-images.sh from the
+# pre-built musl artifact — never committed). rusternetes-dns runs arg-free as a
+# kube-system pod: with no storage/api-server flag it auto-uses the in-cluster
+# ServiceAccount token + KUBERNETES_SERVICE_HOST (crates/dns/src/main.rs,
+# resolve_api_config), which rusternetes' ApiClient sends as a Bearer token.
+FROM alpine:3.20
+
+# ca-certificates: musl Alpine ships no system CA bundle; reqwest/rustls needs
+# one present even though the in-cluster CA is added explicitly from the SA
+# projection. Harmless to include.
+RUN apk add --no-cache ca-certificates
+
+COPY .build/rusternetes-dns /usr/local/bin/rusternetes-dns
+
+# 53/udp + 53/tcp (cluster DNS). Documentation only; hostless pod networking.
+EXPOSE 53/udp 53/tcp
+
+ENTRYPOINT ["/usr/local/bin/rusternetes-dns"]

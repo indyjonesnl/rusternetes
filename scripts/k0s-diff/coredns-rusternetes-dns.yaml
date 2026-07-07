@@ -1,0 +1,97 @@
+# v6 workload swap: point the kube-system CoreDNS Deployment at rusternetes-dns.
+#
+# Applied by run-variant.sh (v6) AFTER the all-Go stack passes the smoke gate.
+# `kubectl apply` updates the existing k0s "coredns" Deployment in place — the
+# metadata.name/namespace and spec.selector (k8s-app: kube-dns) are preserved
+# verbatim from k0s so the ClusterIP Service (kube-dns @ 10.96.0.10) keeps
+# routing to these pods unchanged.
+#
+# What changes vs stock CoreDNS:
+#   image      -> rusternetes-dns (placeholder __RUSTERNETES_DNS_IMAGE__, sed-
+#                 substituted at apply time with the local-registry ref).
+#   args       -> dropped ("-conf /etc/coredns/Corefile"); rusternetes-dns is
+#                 arg-free — with NO storage/api-server flag it auto-uses the
+#                 in-cluster ServiceAccount token + KUBERNETES_SERVICE_HOST and
+#                 reads cluster state via the api-server (crates/dns/src/main.rs
+#                 resolve_api_config). --api-server-url is deliberately UNSET.
+#   probes     -> tcpSocket :53 (rusternetes-dns serves DNS only; it does NOT
+#                 expose CoreDNS's /health:8080 or /ready:8181 HTTP endpoints,
+#                 so the stock httpGet probes would never pass).
+#   security   -> runAsNonRoot/readOnlyRootFilesystem relaxed: the minimal
+#                 alpine image runs as root and binds 53 directly.
+#
+# The coredns ServiceAccount (kept) carries the RBAC the DNS server needs
+# (list/watch services, endpoints/endpointslices, pods, namespaces), so its
+# projected token authorizes rusternetes-dns's api-server reads.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coredns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: kube-dns
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-dns
+    spec:
+      serviceAccountName: coredns
+      priorityClassName: system-cluster-critical
+      dnsPolicy: Default
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+      - effect: NoSchedule
+        key: node-role.kubernetes.io/master
+        operator: Exists
+      - effect: NoSchedule
+        key: node-role.kubernetes.io/control-plane
+        operator: Exists
+      containers:
+      - name: coredns
+        image: __RUSTERNETES_DNS_IMAGE__
+        imagePullPolicy: Always
+        args:
+        - --cluster-zone=cluster.local
+        - --log-level=info
+        - --udp-bind=0.0.0.0:53
+        - --tcp-bind=0.0.0.0:53
+        ports:
+        - containerPort: 53
+          name: dns
+          protocol: UDP
+        - containerPort: 53
+          name: dns-tcp
+          protocol: TCP
+        livenessProbe:
+          tcpSocket:
+            port: 53
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 5
+        readinessProbe:
+          tcpSocket:
+            port: 53
+          initialDelaySeconds: 3
+          periodSeconds: 3
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          runAsNonRoot: false
+          capabilities:
+            add:
+            - NET_BIND_SERVICE
+            drop:
+            - ALL
+        resources:
+          requests:
+            cpu: 100m
+            memory: 70Mi

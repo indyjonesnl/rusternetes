@@ -1,0 +1,98 @@
+# TEMPLATE for the k0s differential conformance harness — DO NOT run directly.
+# gen-compose.sh fills the variant/build-arg/label markers below to emit
+# compose.k0s-v0.yml … compose.k0s-v6.yml (one per variant in lib.sh).
+# v0 (empty swap) resolves to the plain baseline; v1..v6 carry the swap wiring.
+#
+# ONE k0s container (kind-style): the stock k0s all-Go control plane + kubelet,
+# with the node container runtime swapped to containerd-rs (Rust CRI) + crun.
+# k0s cedes the CRI via `--cri-socket remote:...` and does NOT launch its own
+# containerd. containerd-rs runs co-resident in the SAME container (started by
+# the entrypoint before k0s) because the CRI runtime and the kubelet must share
+# a filesystem + mount/pid namespaces — a separate compose service cannot see
+# the pod netns/bundles the kubelet expects. This is why the brief's two-service
+# sketch is collapsed to one baked image here (see SPIKE-FINDINGS.md, Crux 1).
+#
+# Later variants (v1..v6) swap ONE upstream Go component (api-server, kubelet,
+# scheduler, controller-manager, kube-proxy, dns) for its Rusternetes build.
+# Those swaps are baked into the image / injected pre-k0s-start (Crux 1), never
+# bind-mounted over /var/lib/k0s/bin.
+services:
+  k0s:
+    build:
+      context: .
+      dockerfile: Dockerfile.k0s-node
+      args:
+        SWAP_COMPONENT: "api-server"
+    image: k0s-diff-v1-node:v1.35.5
+    container_name: k0s-diff-v1
+    hostname: k0s-diff-v1
+    labels:
+      com.k0s-diff.variant: "v1"
+      com.k0s-diff.swap: "api-server"
+    restart: unless-stopped
+    privileged: true
+    cgroup: host
+    # Which staged shim the entrypoint installs for a component swap:
+    #   adapter (default) = map k0s argv -> the Rusternetes binary
+    #   probe             = confirmatory shim (log argv, exec the real Go binary)
+    # Harmless on v0 (no stager present). Set on the host before `up`.
+    environment:
+      K0S_DIFF_SHIM_MODE: "${K0S_DIFF_SHIM_MODE:-adapter}"
+      # Extra HTTP-plain registries containerd-rs may pull from (comma-separated
+      # host:port). Empty on v0..v4. The v5/v6 workload swaps set this to the
+      # k0s-diff-net gateway registry (run-variant.sh) so containerd-rs — which
+      # has NO local-image load path — can pull the rusternetes-{dns,kube-proxy}
+      # images over HTTP. Consumed by containerd-rs (crates/images/src/pull.rs).
+      CONTAINERD_RS_INSECURE_REGISTRIES: "${CONTAINERD_RS_INSECURE_REGISTRIES:-}"
+    # Skip the k0s image's kind-style resolv.conf rewrite (breaks in-container
+    # DNS on an nftables host); give the container real upstream resolvers.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    entrypoint:
+      - /bin/sh
+      - -c
+    command:
+      - |
+        set -e
+        [ -f /etc/machine-id ] || dd if=/dev/urandom status=none bs=16 count=1 | md5sum | cut -d' ' -f1 > /etc/machine-id
+        crun --version
+        # Start the Rust CRI daemon and wait for its socket before launching k0s,
+        # so the kubelet's first CRI dial succeeds.
+        containerd-rs --config /etc/containerd-rs.toml >/var/log/containerd-rs.log 2>&1 &
+        for i in $(seq 1 60); do [ -S /run/containerd-rs.sock ] && break; sleep 1; done
+        [ -S /run/containerd-rs.sock ] || { echo "containerd-rs socket never appeared"; tail -n 40 /var/log/containerd-rs.log; exit 1; }
+        # Component-swap interposition (v1..v4): pre-stage the Rusternetes shim
+        # into /var/lib/k0s/bin BEFORE k0s starts, so k0s treats it as
+        # up-to-date (mtime+size match) and execs it instead of re-extracting
+        # the Go binary. No-op on v0 (stager absent). See SPIKE-FINDINGS.md.
+        [ -x /opt/k0s-diff/stage-swap.sh ] && /opt/k0s-diff/stage-swap.sh || true
+        # --cri-socket remote:... cedes the CRI to containerd-rs (k0s launches no
+        # containerd of its own). --no-taints so the single node is schedulable.
+        exec k0s controller --config=/etc/k0s/k0s.yaml --enable-worker --no-taints --cri-socket remote:unix:///run/containerd-rs.sock
+    volumes:
+      - ./k0s-config.yaml:/etc/k0s/k0s.yaml:ro
+      - ./containerd-rs.toml:/etc/containerd-rs.toml:ro
+      - k0s-var:/var/lib/k0s
+    tmpfs:
+      - /run
+    ports:
+      - "26444:6443"
+    networks:
+      - k0s-diff-net
+
+networks:
+  k0s-diff-net:
+    name: k0s-diff-net
+    # Pinned subnet/gateway (see lib.sh K0S_DIFF_NET_GATEWAY): makes the bridge
+    # gateway deterministic before `up` so the v5/v6 swaps can address the local
+    # registry over the gateway. 10.201.0.0/24 avoids the busy 172.x docker pool
+    # and the k0s pod/service CIDRs.
+    ipam:
+      config:
+        - subnet: 10.201.0.0/24
+          gateway: 10.201.0.1
+
+volumes:
+  k0s-var:
+    name: k0s-diff-v1-var

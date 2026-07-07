@@ -1,0 +1,36 @@
+apiVersion: k0s.k0sproject.io/v1beta1
+kind: ClusterConfig
+metadata:
+  name: k0s-diff-v0
+spec:
+  api:
+    port: 6443
+  # Embedded kine -> SQLite (all-Go) — the fixed datastore for every variant.
+  # kine exposes the etcd v3 gRPC API in-process, so the later v1 variant
+  # (rusternetes-api-server) can point --etcd_servers at kine's endpoint.
+  storage:
+    type: kine
+    kine:
+      dataSource: "sqlite:///var/lib/k0s/db/state.db?mode=rwc&_journal=WAL"
+  network:
+    # kuberouter = k0s's default built-in CNI (upstream Go kube-router, CNI-only
+    # mode; all-Go). k0s v1.35 does NOT support a "flannel" provider (only
+    # kuberouter/calico/custom), so the repo k0s-config.yaml's flannel/vxlan is
+    # invalid here. kube-proxy stays ENABLED (k0s runs its own kube-proxy
+    # alongside kuberouter-as-CNI) because kube-proxy is a swap target in a later
+    # variant — the baseline must run it.
+    provider: kuberouter
+    podCIDR: 10.244.0.0/16
+    serviceCIDR: 10.96.0.0/12
+  # Single-node dev cluster on a shared, near-full host: keep the kubelet from
+  # tainting node.kubernetes.io/disk-pressure. An EMPTY evictionHard does NOT
+  # disable eviction (kubelet falls back to <10% defaults), so set explicit tiny
+  # positive thresholds — eviction only fires in a true out-of-space emergency.
+  workerProfiles:
+    - name: default
+      values:
+        evictionHard:
+          "memory.available": "100Mi"
+          "nodefs.available": "200Mi"
+          "imagefs.available": "200Mi"
+          "nodefs.inodesFree": "1%"

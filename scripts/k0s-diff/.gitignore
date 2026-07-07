@@ -1,0 +1,8 @@
+results/
+__pycache__/
+# .build/ holds large, locally-built binaries baked into swap images at build
+# time (rusternetes-api-server, the genuine kube-apiserver saved aside for the
+# confirmatory probe). Keep the dir (Docker COPY needs it) but never commit the
+# binaries — see task brief.
+.build/*
+!.build/.gitkeep
