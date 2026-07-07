@@ -286,15 +286,14 @@ pub async fn serve(
 /// Bytes-in / bytes-out DNS responder. The wire-protocol counterpart of
 /// [`DnsHandler::handle_request`] — same lookup logic and response shape,
 /// but without the `hickory_server::RequestHandler` /
-/// `ResponseHandler` plumbing. Used by the in-process netstack
-/// (`rusternetes-netstack`) to short-circuit DNS at the smoltcp UDP
-/// layer so the kernel never sees a socket on `10.96.0.10:53`.
+/// `ResponseHandler` plumbing. A reusable helper for callers that already
+/// hold raw DNS wire bytes and want a raw response without a socket.
 ///
 /// Returns well-formed DNS response bytes for every recognised outcome
 /// (`NoError`-with-records, `NoError`-empty / `NoData`, `NXDOMAIN`,
 /// `FormErr`-on-empty-question). The `Err` arm is reserved for inputs
-/// that aren't valid wire-format DNS at all — callers above the netstack
-/// should drop those silently.
+/// that aren't valid wire-format DNS at all — callers should drop those
+/// silently.
 pub fn respond_bytes(zone: &Zone, query: &[u8]) -> anyhow::Result<Vec<u8>> {
     let req = Message::from_vec(query).map_err(|e| anyhow::anyhow!("malformed DNS query: {e}"))?;
 
