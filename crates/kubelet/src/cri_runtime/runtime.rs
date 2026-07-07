@@ -2820,6 +2820,108 @@ mod tests {
             .expect("HTTPS lifecycle hooks must fall back to HTTP");
     }
 
+    /// Spawn a genuine TLS server (self-signed cert) that captures the first
+    /// request line it receives and replies `200 OK`. Returns `(port, rx)`
+    /// where `rx` yields the captured request line once a request arrives.
+    ///
+    /// This mirrors the NodeConformance `prestop https hook` server: agnhost
+    /// `netexec --tls-cert-file …` speaks real TLS on :9090, so the lifecycle
+    /// handler's httpGet must complete a TLS handshake — not fall back to
+    /// plaintext HTTP (which a TLS-only server never answers).
+    async fn spawn_lifecycle_hook_https_server() -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = certified.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der());
+        // Install a process-default crypto provider for the server side; the
+        // reqwest client bundles its own. Ignore the error if another test
+        // already installed one.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der.into())
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let mut tx = Some(tx);
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let tx = tx.take();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut buf = [0_u8; 1024];
+                    let n = tls.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req.lines().next().unwrap_or("").to_string();
+                    let _ = tls
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
+                    let _ = tls.shutdown().await;
+                    if let Some(tx) = tx {
+                        let _ = tx.send(first_line);
+                    }
+                });
+            }
+        });
+        (port, rx)
+    }
+
+    /// Regression for the NodeConformance `[FeatureGate:SidecarContainers]
+    /// Restartable Init Container Lifecycle Hook … should execute prestop https
+    /// hook properly` failure: the preStop httpGet targets a *real* TLS server
+    /// (scheme `HTTPS`), so the handler must complete the TLS handshake and
+    /// deliver the request. The pre-existing fallback test only covered a
+    /// plaintext server, hiding this path.
+    #[tokio::test]
+    async fn lifecycle_https_hook_reaches_real_tls_server() {
+        let (port, rx) = spawn_lifecycle_hook_https_server().await;
+        let runtime = CriContainerRuntime::connect(
+            "/tmp/rusternetes-test-missing-cri.sock",
+            "",
+            "/tmp/rusternetes-test-logs",
+        )
+        .await
+        .unwrap();
+        let (pod, container) = lifecycle_test_pod_and_container();
+        let handler = rusternetes_common::resources::pod::LifecycleHandler {
+            exec: None,
+            http_get: Some(HTTPGetAction {
+                path: Some("/echo?msg=prestop".to_string()),
+                port: IntOrString::Int(i32::from(port)),
+                host: Some("127.0.0.1".to_string()),
+                scheme: Some("HTTPS".to_string()),
+                http_headers: None,
+            }),
+            tcp_socket: None,
+            sleep: None,
+        };
+
+        runtime
+            .run_lifecycle_handler(&pod, &container, "unused", &handler)
+            .await
+            .expect("HTTPS lifecycle hook must complete a real TLS handshake");
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("TLS server should have received the hook request")
+            .expect("request line channel");
+        assert!(
+            got.contains("GET /echo?msg=prestop"),
+            "TLS server received unexpected request line: {got:?}"
+        );
+    }
+
     #[tokio::test]
     async fn http_probe_follows_local_redirect_to_final_failure() {
         let port = spawn_http_probe_redirect_server().await;
