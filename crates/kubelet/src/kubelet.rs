@@ -531,8 +531,6 @@ impl Kubelet {
             kubernetes_service_host,
             PathBuf::from("/var/lib/kubelet"),
             EvictionManager::new(),
-            None,
-            crate::runtime::PodNetworkMode::Cni,
             10250,
             Vec::new(),
         )
@@ -554,19 +552,16 @@ impl Kubelet {
         kubernetes_service_host: String,
         eviction_root_dir: PathBuf,
         eviction_manager: EvictionManager,
-        netstack: Option<Arc<dyn rusternetes_netstack::manager::NetstackHandle>>,
-        pod_network_mode: crate::runtime::PodNetworkMode,
         metrics_port: u16,
         allowed_unsafe_sysctls: Vec<String>,
     ) -> Result<Self> {
         // CRI runtime backend (containerd + Youki). The endpoint and runtime
         // handler come from the standard kubelet env vars; pod networking is
-        // owned by containerd's CNI plugin, so the netstack/pod-network-mode
-        // knobs from the bollard path are not applied here yet (tracked for the
-        // CRI migration follow-ups). `allowed_unsafe_sysctls` IS wired: it builds
+        // owned entirely by containerd's CNI plugin (CNI is the only
+        // pod-networking path). `allowed_unsafe_sysctls` IS wired: it builds
         // the sysctl admission allowlist below. Cluster DNS is applied via the
         // runtime.
-        let _ = (&network, pod_network_mode, &netstack);
+        let _ = &network;
         let socket = std::env::var("CONTAINER_RUNTIME_ENDPOINT")
             .unwrap_or_else(|_| "unix:///run/containerd/containerd.sock".to_string());
         let runtime_handler = std::env::var("CONTAINER_RUNTIME_HANDLER").unwrap_or_default();

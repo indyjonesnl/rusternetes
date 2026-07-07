@@ -4627,7 +4627,6 @@ dependencies = [
  "rusternetes-client",
  "rusternetes-common",
  "rusternetes-cri",
- "rusternetes-netstack",
  "rusternetes-storage",
  "rusternetes-streamproxy",
  "rustix 0.38.44",
