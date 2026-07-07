@@ -4293,7 +4293,6 @@ dependencies = [
  "rusternetes-dns",
  "rusternetes-kube-proxy",
  "rusternetes-kubelet",
- "rusternetes-netstack",
  "rusternetes-scheduler",
  "rusternetes-storage",
  "tokio",
