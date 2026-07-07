@@ -166,18 +166,24 @@ async fn run_api_mode(args: Args) -> Result<()> {
     use rusternetes_client::http::ApiClient;
     use rusternetes_client::kubeconfig::KubeConfig;
 
-    let (ca_pem, kube_insecure, token) = if let Some(path) = args.kubeconfig.as_deref() {
-        let cfg = KubeConfig::load_from_file(&std::path::PathBuf::from(path))?;
-        let ca = cfg.get_ca_cert_pem().ok().flatten();
-        let insecure = cfg.should_skip_tls_verify().unwrap_or(false);
-        // Bearer token for the HPA metrics client (the data plane runs against
-        // an api-server with --skip-auth today, so the token is usually absent;
-        // pass it through so metrics keep working once authn (#1129) lands).
-        let token = cfg.get_token().ok().flatten();
-        (ca, insecure, token)
-    } else {
-        (None, false, None)
-    };
+    let (ca_pem, kube_insecure, token, client_cert, client_key) =
+        if let Some(path) = args.kubeconfig.as_deref() {
+            let cfg = KubeConfig::load_from_file(&std::path::PathBuf::from(path))?;
+            let ca = cfg.get_ca_cert_pem().ok().flatten();
+            let insecure = cfg.should_skip_tls_verify().unwrap_or(false);
+            // Bearer token for the HPA metrics client (the data plane runs
+            // against an api-server with --skip-auth today, so the token is
+            // usually absent; pass it through so metrics keep working once
+            // authn (#1129) lands).
+            let token = cfg.get_token().ok().flatten();
+            // Client cert/key for mTLS auth (#1578): required when the
+            // api-server authenticates clients by certificate.
+            let cert = cfg.get_client_cert_pem().ok().flatten();
+            let key = cfg.get_client_key_pem().ok().flatten();
+            (ca, insecure, token, cert, key)
+        } else {
+            (None, false, None, None, None)
+        };
     let insecure = args.insecure_skip_tls_verify || kube_insecure;
     info!(
         "Controller-manager API mode: api-server={}, ca={}, insecure={}",
@@ -186,12 +192,14 @@ async fn run_api_mode(args: Args) -> Result<()> {
         insecure
     );
 
-    // The api-server runs with --skip-auth in compose, so the CA only validates
-    // the server's TLS cert; no client credentials are needed (authn is #1129).
+    // The CA validates the server's TLS cert; client cert/key (when the
+    // kubeconfig provides them) authenticate this component via mTLS (#1578).
     let client = Arc::new(ApiClient::with_tls(
         &args.api_server_url,
         insecure,
         ca_pem.clone(),
+        client_cert.map(|p| p.into_bytes()),
+        client_key.map(|p| p.into_bytes()),
         None,
     )?);
     let config = rusternetes_controller_manager::ControllerManagerConfig {

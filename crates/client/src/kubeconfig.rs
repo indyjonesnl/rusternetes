@@ -221,20 +221,61 @@ impl KubeConfig {
         Ok(None)
     }
 
-    /// Get client certificate data if available (base64 encoded)
-    #[allow(dead_code)]
-    pub fn get_client_cert_data(&self) -> Result<Option<String>> {
+    /// Get the client certificate as PEM text, if the kubeconfig user provides
+    /// one for mTLS auth. Prefers inline `client-certificate-data` (base64 PEM);
+    /// otherwise reads the `client-certificate` file path. Returns `None` when
+    /// neither is set (token/anonymous auth). Mirrors upstream client-go
+    /// precedence — "CertData takes precedence over CertFile"
+    /// (`rest/config.go`), resolved via `dataFromSliceOrFile`
+    /// (`transport/transport.go`).
+    pub fn get_client_cert_pem(&self) -> Result<Option<String>> {
         let context = self.get_current_context()?;
         let user = self.get_user(context)?;
-        Ok(user.client_certificate_data.clone())
+        Self::resolve_pem(
+            user.client_certificate_data.as_deref(),
+            user.client_certificate.as_deref(),
+            "client-certificate",
+        )
     }
 
-    /// Get client key data if available (base64 encoded)
-    #[allow(dead_code)]
-    pub fn get_client_key_data(&self) -> Result<Option<String>> {
+    /// Get the client key as PEM text, if the kubeconfig user provides one for
+    /// mTLS auth. Prefers inline `client-key-data` (base64 PEM); otherwise reads
+    /// the `client-key` file path. Returns `None` when neither is set. Same
+    /// upstream precedence as [`Self::get_client_cert_pem`].
+    pub fn get_client_key_pem(&self) -> Result<Option<String>> {
         let context = self.get_current_context()?;
         let user = self.get_user(context)?;
-        Ok(user.client_key_data.clone())
+        Self::resolve_pem(
+            user.client_key_data.as_deref(),
+            user.client_key.as_deref(),
+            "client-key",
+        )
+    }
+
+    /// Resolve PEM text from an inline base64 `*-data` field (preferred) or a
+    /// file path, matching upstream `dataFromSliceOrFile` precedence: inline
+    /// data wins, else the file is read, else `None`.
+    fn resolve_pem(
+        data_b64: Option<&str>,
+        file_path: Option<&str>,
+        field: &str,
+    ) -> Result<Option<String>> {
+        use anyhow::Context as _;
+        if let Some(data) = data_b64 {
+            use base64::Engine;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(data.trim())
+                .with_context(|| format!("decoding {field}-data"))?;
+            let pem = String::from_utf8(decoded)
+                .with_context(|| format!("{field}-data is not valid UTF-8 PEM"))?;
+            return Ok(Some(pem));
+        }
+        if let Some(path) = file_path {
+            let pem =
+                std::fs::read_to_string(path).with_context(|| format!("reading {field} {path}"))?;
+            return Ok(Some(pem));
+        }
+        Ok(None)
     }
 }
 
@@ -384,5 +425,110 @@ users:
         assert!(!compute_skip_tls(false, false));
         // both -> insecure.
         assert!(compute_skip_tls(true, true));
+    }
+
+    // mTLS client-identity resolution (#1578). Mirrors upstream client-go
+    // precedence: inline `*-data` (base64 PEM) wins over the file path
+    // (transport.go `dataFromSliceOrFile`, config.go "CertData takes
+    // precedence over CertFile").
+    #[test]
+    fn test_get_client_cert_key_pem_decodes_inline_data() {
+        use base64::Engine;
+        let cert_pem = "-----BEGIN CERTIFICATE-----\nMIIBcert\n-----END CERTIFICATE-----\n";
+        let key_pem = "-----BEGIN PRIVATE KEY-----\nMIIBkey\n-----END PRIVATE KEY-----\n";
+        let cert_b64 = base64::engine::general_purpose::STANDARD.encode(cert_pem);
+        let key_b64 = base64::engine::general_purpose::STANDARD.encode(key_pem);
+        let yaml = format!(
+            r#"
+apiVersion: v1
+kind: Config
+current-context: c
+contexts:
+- name: c
+  context: {{ cluster: c, user: u }}
+clusters:
+- name: c
+  cluster: {{ server: https://localhost:6443, insecure-skip-tls-verify: true }}
+users:
+- name: u
+  user:
+    client-certificate-data: {cert_b64}
+    client-key-data: {key_b64}
+"#
+        );
+        let config: KubeConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            config.get_client_cert_pem().unwrap().as_deref(),
+            Some(cert_pem),
+            "inline client-certificate-data must base64-decode to the cert PEM",
+        );
+        assert_eq!(
+            config.get_client_key_pem().unwrap().as_deref(),
+            Some(key_pem),
+            "inline client-key-data must base64-decode to the key PEM",
+        );
+    }
+
+    #[test]
+    fn test_get_client_cert_key_pem_reads_file_path() {
+        use std::io::Write;
+        let cert_pem = "-----BEGIN CERTIFICATE-----\nFILEcert\n-----END CERTIFICATE-----\n";
+        let key_pem = "-----BEGIN PRIVATE KEY-----\nFILEkey\n-----END PRIVATE KEY-----\n";
+        let mut cert_file = tempfile::NamedTempFile::new().unwrap();
+        cert_file.write_all(cert_pem.as_bytes()).unwrap();
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        key_file.write_all(key_pem.as_bytes()).unwrap();
+        let yaml = format!(
+            r#"
+apiVersion: v1
+kind: Config
+current-context: c
+contexts:
+- name: c
+  context: {{ cluster: c, user: u }}
+clusters:
+- name: c
+  cluster: {{ server: https://localhost:6443, insecure-skip-tls-verify: true }}
+users:
+- name: u
+  user:
+    client-certificate: {}
+    client-key: {}
+"#,
+            cert_file.path().display(),
+            key_file.path().display(),
+        );
+        let config: KubeConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            config.get_client_cert_pem().unwrap().as_deref(),
+            Some(cert_pem),
+            "client-certificate file path must be read as the cert PEM",
+        );
+        assert_eq!(
+            config.get_client_key_pem().unwrap().as_deref(),
+            Some(key_pem),
+            "client-key file path must be read as the key PEM",
+        );
+    }
+
+    #[test]
+    fn test_get_client_cert_key_pem_none_when_absent() {
+        let yaml = r#"
+apiVersion: v1
+kind: Config
+current-context: c
+contexts:
+- name: c
+  context: { cluster: c, user: u }
+clusters:
+- name: c
+  cluster: { server: https://localhost:6443, insecure-skip-tls-verify: true }
+users:
+- name: u
+  user: { token: anonymous }
+"#;
+        let config: KubeConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.get_client_cert_pem().unwrap().is_none());
+        assert!(config.get_client_key_pem().unwrap().is_none());
     }
 }

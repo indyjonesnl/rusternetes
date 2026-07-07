@@ -101,6 +101,9 @@ fn resolve_api_config(args: &Args) -> Result<Option<ClientConfig>> {
             base_url: url.clone(),
             token,
             ca_pem,
+            // DNS runs in-cluster with the SA bearer token, not a client cert.
+            client_cert_pem: None,
+            client_key_pem: None,
         }));
     }
     if args.etcd_servers.is_none() && args.storage_backend.is_none() {

@@ -102,18 +102,24 @@ async fn main() -> Result<()> {
         let ca_pem = cfg.get_ca_cert_pem().ok().flatten();
         let insecure =
             args.insecure_skip_tls_verify || cfg.should_skip_tls_verify().unwrap_or(false);
+        // Client cert/key for mTLS auth (#1578).
+        let client_cert = cfg.get_client_cert_pem().ok().flatten();
+        let client_key = cfg.get_client_key_pem().ok().flatten();
         info!(
-            "Kube-proxy API mode: api-server={}, ca={}, insecure={}",
+            "Kube-proxy API mode: api-server={}, ca={}, insecure={}, client-cert={}",
             args.api_server_url,
             ca_pem.is_some(),
-            insecure
+            insecure,
+            client_cert.is_some()
         );
-        // --skip-auth on the api-server means the CA only validates TLS; no
-        // client credentials needed (authn tracked in #1129).
+        // The CA validates the server's TLS cert; client cert/key (when the
+        // kubeconfig provides them) authenticate this component via mTLS (#1578).
         let client = Arc::new(ApiClient::with_tls(
             &args.api_server_url,
             insecure,
             ca_pem,
+            client_cert.map(|p| p.into_bytes()),
+            client_key.map(|p| p.into_bytes()),
             None,
         )?);
         return rusternetes_kube_proxy::run_with_api(client, config).await;

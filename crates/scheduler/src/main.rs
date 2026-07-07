@@ -215,23 +215,26 @@ async fn run_api_mode(args: Args) -> Result<()> {
 
     // Resolve connection params. A kubeconfig wins for both server URL and CA;
     // --api-server-url overrides the server URL when provided.
-    let (base_url, ca_pem, kube_insecure) = if let Some(path) = args.kubeconfig.as_deref() {
-        let cfg = KubeConfig::load_from_file(&std::path::PathBuf::from(path))?;
-        let server = args
-            .api_server_url
-            .clone()
-            .or_else(|| cfg.get_server().ok())
-            .ok_or_else(|| anyhow::anyhow!("kubeconfig has no server URL"))?;
-        let ca = cfg.get_ca_cert_pem().ok().flatten();
-        let insecure = cfg.should_skip_tls_verify().unwrap_or(false);
-        (server, ca, insecure)
-    } else {
-        let server = args
-            .api_server_url
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("--api-server-url is required without --kubeconfig"))?;
-        (server, None, false)
-    };
+    let (base_url, ca_pem, kube_insecure, client_cert, client_key) =
+        if let Some(path) = args.kubeconfig.as_deref() {
+            let cfg = KubeConfig::load_from_file(&std::path::PathBuf::from(path))?;
+            let server = args
+                .api_server_url
+                .clone()
+                .or_else(|| cfg.get_server().ok())
+                .ok_or_else(|| anyhow::anyhow!("kubeconfig has no server URL"))?;
+            let ca = cfg.get_ca_cert_pem().ok().flatten();
+            let insecure = cfg.should_skip_tls_verify().unwrap_or(false);
+            // Client cert/key for mTLS auth (#1578).
+            let cert = cfg.get_client_cert_pem().ok().flatten();
+            let key = cfg.get_client_key_pem().ok().flatten();
+            (server, ca, insecure, cert, key)
+        } else {
+            let server = args.api_server_url.clone().ok_or_else(|| {
+                anyhow::anyhow!("--api-server-url is required without --kubeconfig")
+            })?;
+            (server, None, false, None, None)
+        };
 
     let insecure = args.insecure_skip_tls_verify || kube_insecure;
     info!(
@@ -241,10 +244,16 @@ async fn run_api_mode(args: Args) -> Result<()> {
         insecure
     );
 
-    // The api-server runs with --skip-auth in compose, so no client credentials
-    // are needed; the CA only validates the server's TLS cert. (When auth is
-    // later enabled, a bearer token / client-cert path plugs in here.)
-    let client = Arc::new(ApiClient::with_tls(&base_url, insecure, ca_pem, None)?);
+    // The CA validates the server's TLS cert; client cert/key (when the
+    // kubeconfig provides them) authenticate this component via mTLS (#1578).
+    let client = Arc::new(ApiClient::with_tls(
+        &base_url,
+        insecure,
+        ca_pem,
+        client_cert.map(|p| p.into_bytes()),
+        client_key.map(|p| p.into_bytes()),
+        None,
+    )?);
 
     let scheduler_name = "default-scheduler".to_string();
     let backend = data_plane::ApiBackend::new(client, &scheduler_name);

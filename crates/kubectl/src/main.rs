@@ -1027,62 +1027,91 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Load kubeconfig or use CLI flags
-    let (server, skip_tls, ca_pem, token, default_namespace) = if let Some(server_url) = cli.server
-    {
-        // CLI flags override kubeconfig. No CA source on the bare --server path,
-        // so secure mode there relies on the system trust store.
-        (
-            server_url,
-            cli.insecure_skip_tls_verify,
-            None,
-            cli.token,
-            "default".to_string(),
-        )
-    } else {
-        // Try to load from kubeconfig
-        let config = if let Some(path) = &cli.kubeconfig {
-            KubeConfig::load_from_file(&std::path::PathBuf::from(path))?
+    let (server, skip_tls, ca_pem, client_cert, client_key, token, default_namespace) =
+        if let Some(server_url) = cli.server {
+            // CLI flags override kubeconfig. No CA / client-cert source on the
+            // bare --server path, so secure mode there relies on the system
+            // trust store and token auth.
+            (
+                server_url,
+                cli.insecure_skip_tls_verify,
+                None,
+                None,
+                None,
+                cli.token,
+                "default".to_string(),
+            )
         } else {
-            KubeConfig::load_default().unwrap_or_else(|_| {
-                eprintln!("Warning: Could not load kubeconfig, using defaults");
-                // Return a minimal default config
-                KubeConfig {
-                    api_version: Some("v1".to_string()),
-                    kind: Some("Config".to_string()),
-                    current_context: "default".to_string(),
-                    contexts: vec![],
-                    clusters: vec![],
-                    users: vec![],
-                    preferences: std::collections::HashMap::new(),
-                }
-            })
+            // Try to load from kubeconfig
+            let config = if let Some(path) = &cli.kubeconfig {
+                KubeConfig::load_from_file(&std::path::PathBuf::from(path))?
+            } else {
+                KubeConfig::load_default().unwrap_or_else(|_| {
+                    eprintln!("Warning: Could not load kubeconfig, using defaults");
+                    // Return a minimal default config
+                    KubeConfig {
+                        api_version: Some("v1".to_string()),
+                        kind: Some("Config".to_string()),
+                        current_context: "default".to_string(),
+                        contexts: vec![],
+                        clusters: vec![],
+                        users: vec![],
+                        preferences: std::collections::HashMap::new(),
+                    }
+                })
+            };
+
+            let server = config
+                .get_server()
+                .unwrap_or_else(|_| "https://localhost:6443".to_string());
+            // Insecure mode is forced if EITHER the `--insecure-skip-tls-verify`
+            // CLI flag is set OR the kubeconfig cluster has
+            // `insecure-skip-tls-verify: true`. The CLI flag always wins, so it
+            // overrides a kubeconfig that pins a (possibly stale) CA.
+            let skip_tls =
+                cli.insecure_skip_tls_verify || config.should_skip_tls_verify().unwrap_or(false);
+            // Trust the kubeconfig CA in secure mode so the api-server's
+            // self-signed cert verifies. Skipped when insecure (CA is irrelevant).
+            let ca_pem = if skip_tls {
+                None
+            } else {
+                config.get_ca_cert_pem().unwrap_or(None)
+            };
+            let token = cli.token.or_else(|| config.get_token().ok().flatten());
+            // Client cert/key for mTLS auth (#1578), sourced from the kubeconfig
+            // user. Resolved regardless of insecure mode: upstream client-go
+            // presents the client identity independent of
+            // insecure-skip-tls-verify (that flag governs SERVER verification
+            // only), and the daemon components (kubelet/scheduler/etc.) do the
+            // same — so kubectl must too, or `--insecure-skip-tls-verify`
+            // against a client-cert-auth apiserver would 401.
+            let (client_cert, client_key) = (
+                config.get_client_cert_pem().unwrap_or(None),
+                config.get_client_key_pem().unwrap_or(None),
+            );
+            let namespace = config
+                .get_namespace()
+                .unwrap_or_else(|_| "default".to_string());
+
+            (
+                server,
+                skip_tls,
+                ca_pem,
+                client_cert,
+                client_key,
+                token,
+                namespace,
+            )
         };
 
-        let server = config
-            .get_server()
-            .unwrap_or_else(|_| "https://localhost:6443".to_string());
-        // Insecure mode is forced if EITHER the `--insecure-skip-tls-verify`
-        // CLI flag is set OR the kubeconfig cluster has
-        // `insecure-skip-tls-verify: true`. The CLI flag always wins, so it
-        // overrides a kubeconfig that pins a (possibly stale) CA.
-        let skip_tls =
-            cli.insecure_skip_tls_verify || config.should_skip_tls_verify().unwrap_or(false);
-        // Trust the kubeconfig CA in secure mode so the api-server's
-        // self-signed cert verifies. Skipped when insecure (CA is irrelevant).
-        let ca_pem = if skip_tls {
-            None
-        } else {
-            config.get_ca_cert_pem().unwrap_or(None)
-        };
-        let token = cli.token.or_else(|| config.get_token().ok().flatten());
-        let namespace = config
-            .get_namespace()
-            .unwrap_or_else(|_| "default".to_string());
-
-        (server, skip_tls, ca_pem, token, namespace)
-    };
-
-    let client = ApiClient::with_tls(&server, skip_tls, ca_pem, token)?;
+    let client = ApiClient::with_tls(
+        &server,
+        skip_tls,
+        ca_pem,
+        client_cert.map(|p| p.into_bytes()),
+        client_key.map(|p| p.into_bytes()),
+        token,
+    )?;
 
     match cli.command {
         Commands::Get {
