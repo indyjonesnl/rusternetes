@@ -60,3 +60,7 @@ url = "2.5"
 tower = { workspace = true }
 http-body-util = "0.1"
 tokio = { version = "1", features = ["test-util"] }
+# Real-TLS test server for HTTPS lifecycle-hook coverage (NC prestop-https).
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
