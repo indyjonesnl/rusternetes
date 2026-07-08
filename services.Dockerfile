@@ -61,7 +61,7 @@
 #
 # Current workspace members (Cargo.toml [workspace] members):
 #   api-server, cloud-providers, common, controller-manager, dns,
-#   kubectl, kubelet, kube-proxy, netstack, rusternetes, scheduler,
+#   kubectl, kubelet, kube-proxy, rusternetes, scheduler,
 #   storage
 
 # ---------------------------------------------------------------------
@@ -159,7 +159,7 @@ COPY Cargo.toml Cargo.lock* ./
 # CRATE-ENUMERATION (1/3): one COPY per crate's Cargo.toml.
 # Must mirror `[workspace] members` in Cargo.toml.
 # Crates: api-server, cloud-providers, common, controller-manager, dns,
-#         kubectl, kubelet, kube-proxy, netstack, rusternetes, scheduler,
+#         kubectl, kubelet, kube-proxy, rusternetes, scheduler,
 #         storage
 COPY crates/admission-webhook/Cargo.toml  crates/admission-webhook/Cargo.toml
 COPY crates/api-server/Cargo.toml         crates/api-server/Cargo.toml
@@ -174,7 +174,6 @@ COPY crates/kubectl/Cargo.toml            crates/kubectl/Cargo.toml
 COPY crates/kubelet/Cargo.toml            crates/kubelet/Cargo.toml
 COPY crates/kube-proxy/Cargo.toml         crates/kube-proxy/Cargo.toml
 COPY crates/middleware/Cargo.toml         crates/middleware/Cargo.toml
-COPY crates/netstack/Cargo.toml           crates/netstack/Cargo.toml
 COPY crates/protobuf/Cargo.toml           crates/protobuf/Cargo.toml
 COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
 COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
@@ -196,13 +195,13 @@ COPY crates/cri/proto           crates/cri/proto
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate. Lib vs
 # bin choice MUST match each Cargo.toml's [lib] + [[bin]] entries.
-#   - lib only:   common, storage, cloud-providers, netstack, cri, test_support
+#   - lib only:   common, storage, cloud-providers, cri, test_support
 #   - bin only:   kubectl, rusternetes
 #   - lib + bin:  api-server, controller-manager, dns, kubelet, kube-proxy,
 #                 scheduler
 # `echo "fn main(){}"` in every main.rs; empty lib.rs is fine.
 RUN set -eux; \
-    for c in client common storage cloud-providers netstack protobuf middleware admission-webhook discovery cri streamproxy test_support; do \
+    for c in client common storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -299,7 +298,6 @@ COPY crates/kubelet/src              crates/kubelet/src
 COPY crates/kubelet/tests            crates/kubelet/tests
 COPY crates/kube-proxy/src           crates/kube-proxy/src
 COPY crates/kube-proxy/tests         crates/kube-proxy/tests
-COPY crates/netstack/src             crates/netstack/src
 COPY crates/rusternetes/src          crates/rusternetes/src
 COPY crates/scheduler/src            crates/scheduler/src
 COPY crates/scheduler/tests          crates/scheduler/tests
