@@ -24,6 +24,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("pprof", "
 
 [dependencies]
 mimalloc = { version = "0.1", optional = true }
+async-trait.workspace = true
 rusternetes-common = { path = "../common", features = ["axum-support"] }
 rusternetes-middleware = { path = "../middleware" }
 rusternetes-discovery = { path = "../discovery" }
