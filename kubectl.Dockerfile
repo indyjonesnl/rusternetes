@@ -15,7 +15,7 @@
 # enumeration.sh enforces the manifest block stays complete:
 #   admission-webhook, api-server, client, cloud-providers, common,
 #   controller-manager, cri, discovery, dns, kubectl, kubelet, kube-proxy,
-#   middleware, netstack, protobuf, rusternetes, scheduler, storage,
+#   middleware, protobuf, rusternetes, scheduler, storage,
 #   test_support
 #
 # Pin the rust toolchain — see services.Dockerfile for the cache-mount
@@ -72,7 +72,6 @@ COPY crates/kubectl/Cargo.toml            crates/kubectl/Cargo.toml
 COPY crates/kubelet/Cargo.toml            crates/kubelet/Cargo.toml
 COPY crates/kube-proxy/Cargo.toml         crates/kube-proxy/Cargo.toml
 COPY crates/middleware/Cargo.toml         crates/middleware/Cargo.toml
-COPY crates/netstack/Cargo.toml           crates/netstack/Cargo.toml
 COPY crates/protobuf/Cargo.toml           crates/protobuf/Cargo.toml
 COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
 COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
