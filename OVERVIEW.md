@@ -344,9 +344,6 @@ Selected flags (run `rusternetes --help` for the complete list):
 | `--dns-bind` | `0.0.0.0:53` | DNS server bind (UDP+TCP) |
 | `--cluster-cidr` | `10.96.0.0/12` | Service ClusterIP CIDR (kube-proxy scope) |
 | `--node-port-range` | `30000:32767` | NodePort range (`start:end`) |
-| `--pod-network-mode` | `cni` | `cni`, `netstack`/`netstack-shadow`, or `netstack-active` |
-| `--netstack-pod-cidr` | `10.244.0.0/16` | Pod CIDR for the embedded netstack allocator |
-| `--netstack-service-cidr` | `10.96.0.0/12` | Service CIDR the netstack treats as on-link |
 | `--sync-interval` / `--scheduler-interval` / `--kubelet-sync-interval` / `--proxy-sync-interval` | `5` / `2` / `3` / `1` | Per-component loop intervals (seconds) |
 | `--log-level` | `info` | Log level |
 
@@ -566,9 +563,6 @@ the destination. Themes in flight:
   cross-compilation for small-board nodes.
 - **One-command install** — pre-built release binaries and a `curl | sh`-style
   installer for parity with k3s.
-- **Networking** — the embedded `netstack` data plane
-  (`--pod-network-mode netstack-active`) as an alternative to the Docker-bridge
-  CNI path.
 - **Conformance** — closing the remaining gaps toward 100% on the SQLite/Rhino
   backend.
 

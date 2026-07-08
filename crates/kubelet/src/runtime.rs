@@ -1,46 +1,6 @@
 use rusternetes_common::resources::Pod;
 use tracing::{info, warn};
 
-/// Per-pod networking implementation kubelet uses. Picked via the
-/// all-in-one binary's `--pod-network-mode` flag.
-///
-/// Lives in this module (rather than `lib.rs`) because both the
-/// lib AND the standalone `kubelet` bin include `runtime.rs` via
-/// `mod runtime`; defining the enum here keeps
-/// `crate::runtime::PodNetworkMode` resolvable from BOTH compile
-/// contexts. `lib.rs` re-exports it as `kubelet::PodNetworkMode`
-/// for downstream callers (the all-in-one binary, etc.).
-// The standalone `kubelet` bin only ever constructs `Cni` (it
-// has no embedded netstack), so its compile context flags
-// `NetstackShadow` as unused. The lib compile context uses all
-// three variants through the public API. Allowing dead_code here
-// covers both compile units cleanly.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PodNetworkMode {
-    /// CNI plugins + Docker-bridge fallback. The production path
-    /// today, default for safety.
-    #[default]
-    Cni,
-    /// CNI / Docker bridge **plus** every pod is also registered
-    /// with the embedded netstack (IP allocated, TAP opened,
-    /// runtime notified). Pod traffic still rides the legacy path;
-    /// the netstack just observes. Used to validate the netstack
-    /// data plane in staging without breaking pod networking.
-    NetstackShadow,
-    /// Embedded netstack carries pod traffic. The pod's netns is
-    /// configured by `netstack.start_pod_in_netns` (TAP moved into
-    /// netns, IP + default route assigned) instead of by the CNI
-    /// plugin. Pod containers join the netns the same way as in
-    /// CNI mode (`NetworkMode=ns:`). No Docker bridge involved.
-    ///
-    /// Requires `--cap-add NET_ADMIN` on the rusternetes container,
-    /// a working netstack runtime, AND the Service-watcher
-    /// populating Service VIPs before pods can reach
-    /// `kubernetes.default` etc.
-    NetstackActive,
-}
-
 /// Set up an EmptyDir volume directory with mode 0o777, matching upstream
 /// Kubernetes (pkg/volume/emptydir/empty_dir.go setupDir).
 ///
