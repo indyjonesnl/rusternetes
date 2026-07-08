@@ -152,9 +152,11 @@ struct Args {
     #[arg(long, default_value = "./data/rusternetes.db")]
     data_dir: String,
 
-    /// API server URL for API mode (e.g. https://api-server:6443). When
-    /// --kubeconfig is set, the kubelet reads/writes cluster state through the
-    /// api-server (StorageBackend::Api) instead of a storage backend.
+    /// Fallback api-server URL for API mode (e.g. https://api-server:6443).
+    /// When --kubeconfig is set, the kubelet reads/writes cluster state through
+    /// the api-server (StorageBackend::Api) and prefers the kubeconfig's
+    /// `cluster.server` endpoint (upstream behaviour); this flag is used only
+    /// when the kubeconfig omits a server.
     #[arg(long, default_value = "https://api-server:6443")]
     api_server_url: String,
 
@@ -335,22 +337,37 @@ async fn main() -> Result<()> {
         // Client cert/key for mTLS auth (#1578).
         let client_cert = cfg.get_client_cert_pem().ok().flatten();
         let client_key = cfg.get_client_key_pem().ok().flatten();
+        // Bearer token, when the kubeconfig user carries one (token auth).
+        let token = cfg.get_token().ok().flatten();
+        // Upstream kubelet takes the api-server endpoint from the kubeconfig's
+        // `cluster.server`, NOT a separate flag. Honour that: prefer the
+        // kubeconfig server (e.g. an IP literal `https://10.88.0.2:6443` that
+        // resolves in a minimal microVM guest with no DNS / `/etc/hosts`) and
+        // only fall back to `--api-server-url` when the kubeconfig omits it.
+        // Previously the kubelet always used `--api-server-url` (default
+        // `https://api-server:6443`), so a guest that couldn't resolve the
+        // `api-server` hostname failed every request with an opaque
+        // "Failed to send POST request" during node registration (M2b).
+        let server = cfg
+            .get_server()
+            .unwrap_or_else(|_| args.api_server_url.clone());
         info!(
-            "Kubelet API mode: api-server={}, ca={}, insecure={}, client-cert={}",
-            args.api_server_url,
+            "Kubelet API mode: api-server={}, ca={}, insecure={}, client-cert={}, token={}",
+            server,
             ca_pem.is_some(),
             insecure,
-            client_cert.is_some()
+            client_cert.is_some(),
+            token.is_some()
         );
         // The CA validates the server's TLS cert; client cert/key (when the
         // kubeconfig provides them) authenticate the kubelet via mTLS (#1578).
         let client = Arc::new(ApiClient::with_tls(
-            &args.api_server_url,
+            &server,
             insecure,
             ca_pem,
             client_cert.map(|p| p.into_bytes()),
             client_key.map(|p| p.into_bytes()),
-            None,
+            token,
         )?);
         Arc::new(StorageBackend::new_api(client))
     } else {

@@ -106,7 +106,7 @@ impl ApiStorage {
             .client
             .delete_with_options(&path, &query, None)
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(format!("{e:#}")))?;
         if status.is_success() || status.as_u16() == 404 {
             Ok(())
         } else {
@@ -390,7 +390,12 @@ fn storage_key_for(rt: &str, namespaced: bool, obj: &Value) -> Result<String> {
 /// api-server's `Error from server (<Reason>): ...` token. Needed so
 /// optimistic-concurrency conflicts surface as [`Error::Conflict`].
 fn map_write_err(e: anyhow::Error) -> Error {
-    let s = e.to_string();
+    // `{:#}` renders the whole anyhow chain (top context + every `source()`),
+    // so a transport failure keeps its actionable cause — e.g.
+    // `POST https://… failed: error sending request …: dns error: failed to
+    // lookup address` — instead of collapsing to just "Failed to send POST
+    // request" (M2b worker-registration opaque-error hunt).
+    let s = format!("{e:#}");
     if s.contains("(AlreadyExists)") {
         Error::AlreadyExists(s)
     } else if s.contains("(Conflict)") {
@@ -409,7 +414,8 @@ fn map_write_err(e: anyhow::Error) -> Error {
 fn map_get_err(e: GetError) -> Error {
     match e {
         GetError::NotFound => Error::NotFound("resource not found".into()),
-        GetError::Other(e) => Error::Storage(e.to_string()),
+        // Preserve the full source chain (see `map_write_err`).
+        GetError::Other(e) => Error::Storage(format!("{e:#}")),
     }
 }
 
@@ -503,7 +509,7 @@ impl Storage for ApiStorage {
             .client
             .delete_with_options(&path, &force_delete_query(), None)
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(format!("{e:#}")))?;
         if status.is_success() {
             Ok(())
         } else if status.as_u16() == 404 {
@@ -795,5 +801,49 @@ mod tests {
             storage_key_for("nodes", false, &cobj).unwrap(),
             "/registry/nodes/node-1"
         );
+    }
+
+    // A transport failure (e.g. the kubelet POSTing a Node to an unresolvable
+    // api-server host) arrives as an anyhow error whose *source* carries the
+    // actionable detail (DNS / connect / TLS). `map_write_err` must preserve
+    // that full chain, not just the top-level context — otherwise the kubelet
+    // log reads only "Storage error: Failed to send POST request" and the real
+    // cause (e.g. `dns error: failed to lookup address`) is lost. Regression
+    // for the Mikronetes M2b worker-registration opaque-error hunt.
+    #[test]
+    fn map_write_err_preserves_source_chain() {
+        let chained = anyhow::anyhow!("dns error: failed to lookup address information")
+            .context("POST https://api-server:6443/api/v1/nodes failed");
+        match map_write_err(chained) {
+            Error::Storage(s) => {
+                assert!(
+                    s.contains("POST https://api-server:6443/api/v1/nodes failed"),
+                    "top-level context must remain: {s}"
+                );
+                assert!(
+                    s.contains("dns error: failed to lookup address information"),
+                    "underlying source cause must survive into the Storage error: {s}"
+                );
+            }
+            other => panic!("expected Error::Storage, got {other:?}"),
+        }
+    }
+
+    // Same guarantee for the read path (`map_get_err`): a `GetError::Other`
+    // carrying a chained anyhow must surface the full chain.
+    #[test]
+    fn map_get_err_preserves_source_chain() {
+        let chained = anyhow::anyhow!("connection refused")
+            .context("GET https://api-server:6443/api/v1/nodes/node-2 failed");
+        match map_get_err(GetError::Other(chained)) {
+            Error::Storage(s) => {
+                assert!(
+                    s.contains("GET https://api-server:6443"),
+                    "context lost: {s}"
+                );
+                assert!(s.contains("connection refused"), "source lost: {s}");
+            }
+            other => panic!("expected Error::Storage, got {other:?}"),
+        }
     }
 }
