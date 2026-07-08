@@ -4183,13 +4183,16 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "rcgen",
  "reqwest",
  "rusternetes-test-support",
+ "rustls 0.23.40",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tracing",
 ]
 
