@@ -51,6 +51,9 @@ name: Conformance canary
 #         NOSPACE wedge that capped long runs — see Stack note above.
 #   - [x] Retire the known-green.txt ratchet in favour of the two-phase
 #         [Conformance] tag split (conformance-tags-run.sh).
+#   - [x] Split phase 1 (parallel) and phase 2 (serial) into concurrent matrix
+#         legs so neither shares a 300-min step timeout (#1029). The combined
+#         single-step run was measured at 300.2 min → hard timeout.
 
 on:
   workflow_dispatch:
@@ -88,30 +91,44 @@ env:
 
 jobs:
   hydrophone:
-    name: hydrophone (conformance tags)
+    name: hydrophone (phase ${{ matrix.phase }})
     # workflow_run fires for failed publishes too — only run on success.
     # workflow_dispatch has no workflow_run payload and always runs.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
-    # contents:write lets the "Update badge" step push the latest pass-rate
-    # JSON to the orphan `badges` branch (best-effort; never fails the run).
+    # Phase 1 (parallel: [Conformance] minus [Slow]/[Serial]/[Flaky]) and
+    # phase 2 (serial: the [Serial]/[Slow] conformance subset) run as two
+    # independent matrix legs, each on its own runner + cluster,
+    # concurrently. Splitting them (#1029) stops the serial phase's
+    # compounding per-test timeouts from eating into phase 1's budget: the
+    # old single job ran BOTH phases back-to-back inside ONE 300-min step and
+    # routinely hit the ceiling (measured 300.2 min → hard timeout). Each leg
+    # now gets the full 300-min budget of its own. If only one DinD runner is
+    # free the legs serialize on the runner, but never inside a shared step
+    # timeout, so neither phase can starve the other. fail-fast:false so an
+    # infra failure in one leg does not cancel the other.
+    strategy:
+      fail-fast: false
+      matrix:
+        phase: [1, 2]
+    # This job no longer pushes the badge (moved to the `badge` aggregation
+    # job below), so it only needs read access.
     permissions:
-      contents: write
+      contents: read
     # Targets the DinD-enabled scale set. If the scale set isn't
     # deployed on the operator's cluster, this job will sit "queued"
     # forever — operator install of the helm release is a manual
     # one-off (not in this repo by design; see PR #191 policy).
     runs-on: arc-runner-set-conformance
-    # Build is ~12 min (Dockerfile.services shared builder, PR #190). The
-    # two-phase conformance run is the long pole: unlike the old known-green
-    # subset (322 specs that all PASS quickly), the full [Conformance] tag
-    # set includes specs rusternetes does not yet pass, and each FAILING
-    # spec burns its per-test ginkgo timeout before moving on — so wall time
-    # scales with the failure count, not just the spec count. The 300-min
-    # run-step ceiling bounds a wedged run; the job ceiling clears build +
-    # 300 + teardown. If runs routinely hit the ceiling, narrow the focus or
-    # split the phases into separate jobs.
+    # Build is ~12 min (Dockerfile.services shared builder, PR #190). A single
+    # conformance phase is the long pole: unlike the old known-green subset
+    # (322 specs that all PASS quickly), the full [Conformance] tag set
+    # includes specs rusternetes does not yet pass, and each FAILING spec
+    # burns its per-test ginkgo timeout before moving on — so wall time scales
+    # with the failure count, not just the spec count. The 300-min run-step
+    # ceiling bounds a wedged phase; the job ceiling clears build + 300 +
+    # teardown.
     timeout-minutes: 330
 
     steps:
@@ -153,24 +170,73 @@ jobs:
           # an arbitrary / not-yet-published tag is a legitimate input).
           require-prebuilt: ${{ github.event_name == 'workflow_run' }}
 
-      - name: Run conformance tag suite
-        # `scripts/conformance-tags-run.sh` runs the canonical two-phase
-        # [Conformance] split (phase 1: parallel, skip [Slow]/[Serial]/[Flaky];
-        # phase 2: the [Serial]/[Slow] conformance subset, single-threaded),
-        # parses each junit, and prints pass/fail/skip counts. It is
-        # NON-GATING: test failures are expected (rusternetes is not yet 100%
-        # conformant) and do NOT fail this step — only an infra failure
-        # (hydrophone producing no junit) exits non-zero. Pins the conformance
-        # image to v1.35.0 by default — see the script's --help. Self-hosted
-        # runner, no GH minute cost; the long ceiling covers failing specs
-        # each burning their per-test timeout (see job timeout note above).
+      - name: Run conformance tag suite (phase ${{ matrix.phase }})
+        # `scripts/conformance-tags-run.sh --phase N` runs ONE half of the
+        # canonical [Conformance] split (phase 1: parallel, skip
+        # [Slow]/[Serial]/[Flaky]; phase 2: the [Serial]/[Slow] conformance
+        # subset, single-threaded), parses its junit, and prints
+        # pass/fail/skip counts. The two phases run as separate matrix legs
+        # (#1029) so they no longer share a step timeout. It is NON-GATING:
+        # test failures are expected (rusternetes is not yet 100% conformant)
+        # and do NOT fail this step — only an infra failure (hydrophone
+        # producing no junit) exits non-zero. Pins the conformance image to
+        # v1.35.0 by default — see the script's --help. Self-hosted runner, no
+        # GH minute cost; the ceiling covers failing specs each burning their
+        # per-test timeout (see job timeout note above).
         timeout-minutes: 300
         run: |
           bash scripts/conformance-tags-run.sh \
+            --phase ${{ matrix.phase }} \
             --output-dir conformance-out
 
-      - name: Update conformance badge
+      - name: Upload conformance artifacts
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # Per-phase name so both legs' artifacts coexist; the badge job
+          # downloads them with `pattern: conformance-out-phase*`.
+          name: conformance-out-phase${{ matrix.phase }}
+          path: conformance-out/
+          retention-days: 14
+
+      - name: Tear down cluster
+        if: always()
+        run: |
+          docker compose -f compose.sqlite.yml logs --tail=200 || true
+          docker compose -f compose.sqlite.yml down -v || true
+
+  # Aggregate both phases' junit into the single conformance pass-rate badge.
+  # A separate job (needs: hydrophone) because the phases now run on
+  # independent runners — this pulls both artifacts and sums the counts so the
+  # badge still reflects the whole [Conformance] tag set, exactly as the old
+  # single-job in-line step did. Runs even if a phase failed/timed out
+  # (if: always) so a partial run still refreshes the badge from whatever
+  # junit was produced; best-effort, so a missing artifact never blocks.
+  badge:
+    name: Update conformance badge
+    needs: hydrophone
+    if: always()
+    # contents:write lets update-badge.sh push the latest pass-rate JSON to
+    # the orphan `badges` branch.
+    permissions:
+      contents: write
+    # Trivial git/bash work — runs on the light tier, not a scarce DinD runner.
+    runs-on: arc-runner-set-small
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download phase artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          # merge-multiple reconstructs conformance-out/{phase1-parallel,
+          # phase2-serial}/junit_01.xml from the two per-phase artifacts.
+          path: conformance-out
+          pattern: conformance-out-phase*
+          merge-multiple: true
+
+      - name: Update conformance badge
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -183,17 +249,3 @@ jobs:
             passed=$((passed + p)); failed=$((failed + f))
           done
           bash scripts/update-badge.sh conformance "conformance" "$passed" "$((passed + failed))"
-
-      - name: Upload conformance artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: conformance-out
-          path: conformance-out/
-          retention-days: 14
-
-      - name: Tear down cluster
-        if: always()
-        run: |
-          docker compose -f compose.sqlite.yml logs --tail=200 || true
-          docker compose -f compose.sqlite.yml down -v || true
