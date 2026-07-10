@@ -28,6 +28,24 @@ use tracing::{debug, warn};
 
 use super::{probe, status, translate};
 
+/// If `err` is containerd's "sandbox name already reserved" `RunPodSandbox`
+/// failure, return the id of the orphaned sandbox currently holding the
+/// reservation. A cancelled RunPodSandbox (e.g. a pod-start timeout mid
+/// image-pull, #1050) leaves such an orphan in NOT_READY state still holding
+/// the name; removing it by the id containerd reports lets the retry succeed
+/// instead of the pod wedging forever (#1600). Matches the containerd message
+/// `… name "<name>" is reserved for "<sandbox-id>"`.
+fn reserved_sandbox_id(err: &CriError) -> Option<String> {
+    let CriError::Rpc { source, .. } = err else {
+        return None;
+    };
+    let msg = source.message();
+    const MARKER: &str = "is reserved for \"";
+    let start = msg.rfind(MARKER)? + MARKER.len();
+    let rest = &msg[start..];
+    rest.find('"').map(|end| rest[..end].to_string())
+}
+
 /// Per-probe threshold-tracking state for the liveness/startup probe state
 /// machine. Mirrors the bollard runtime's `ProbeState`.
 #[derive(Default)]
@@ -920,7 +938,30 @@ impl CriContainerRuntime {
             None => {
                 // Drop any stale (not-ready) sandbox holding the name first.
                 let _ = self.stop_and_remove_pod(&pod.metadata.name).await;
-                cri.run_pod_sandbox(sandbox_cfg.clone(), &handler).await?
+                match cri.run_pod_sandbox(sandbox_cfg.clone(), &handler).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        // A cancelled prior RunPodSandbox (e.g. a pod-start
+                        // timeout mid image-pull, #1050) can leave an orphaned
+                        // NOT_READY sandbox that keeps the name reserved, which
+                        // the label-filtered stop_and_remove_pod above can miss
+                        // (the reservation predates a fully-listable sandbox).
+                        // containerd names the holder in the error — remove it
+                        // by id and retry once so the pod can't wedge forever
+                        // even if a pull outlasts the timeout (#1600).
+                        if let Some(orphan) = reserved_sandbox_id(&e) {
+                            warn!(
+                                "RunPodSandbox for {} hit reserved name held by {}; removing orphan and retrying",
+                                pod.metadata.name, orphan
+                            );
+                            let _ = cri.stop_pod_sandbox(&orphan).await;
+                            let _ = cri.remove_pod_sandbox(&orphan).await;
+                            cri.run_pod_sandbox(sandbox_cfg.clone(), &handler).await?
+                        } else {
+                            return Err(e.into());
+                        }
+                    }
+                }
             }
         };
 
@@ -2421,6 +2462,31 @@ mod tests {
     use rusternetes_common::resources::Event;
     use rusternetes_storage::{Storage, StorageBackend};
     use std::collections::HashMap;
+
+    #[test]
+    fn reserved_sandbox_id_parses_containerd_reserved_error() {
+        // The exact shape containerd emits on a sandbox-name reservation
+        // conflict (observed live in #1050).
+        let msg = "failed to reserve sandbox name \
+            \"netserver-0_pod-network-test-5426_8f5e84d1_0\": name \
+            \"netserver-0_pod-network-test-5426_8f5e84d1_0\" is reserved for \
+            \"637489deadebe17e8bc434d0bb3bffb2d7fdc1c83b42055b4cc20fddadc93c78\"";
+        let err = CriError::Rpc {
+            rpc: "RunPodSandbox",
+            source: tonic::Status::failed_precondition(msg),
+        };
+        assert_eq!(
+            reserved_sandbox_id(&err).as_deref(),
+            Some("637489deadebe17e8bc434d0bb3bffb2d7fdc1c83b42055b4cc20fddadc93c78")
+        );
+
+        // An unrelated RPC error must not match (we'd wrongly remove a sandbox).
+        let other = CriError::Rpc {
+            rpc: "RunPodSandbox",
+            source: tonic::Status::unavailable("connection refused"),
+        };
+        assert_eq!(reserved_sandbox_id(&other), None);
+    }
     use std::sync::Arc;
 
     /// Build a minimal `ContainerStatus` for the restart-attempt tests.
