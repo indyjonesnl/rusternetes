@@ -19,8 +19,13 @@ use tracing::{debug, error, info, warn};
 #[allow(dead_code)]
 pub struct GarbageCollector<S: Storage> {
     storage: Arc<S>,
-    /// How often to run GC scan
+    /// Base GC scan cadence. Used when the previous scan did work (found
+    /// orphans or processed deletions) — see [`next_scan_interval`].
     scan_interval: Duration,
+    /// Upper bound the scan interval backs off to while the cluster is idle
+    /// (no orphans, nothing being deleted). Keeps an idle controller-manager
+    /// quiet (#1040) without a hard-coded fast poll.
+    max_scan_interval: Duration,
     /// Maximum number of concurrent delete operations
     max_concurrent_deletes: usize,
     /// Batch size for deletion operations
@@ -39,6 +44,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         Self {
             storage,
             scan_interval: Duration::from_secs(5),
+            max_scan_interval: Duration::from_secs(60),
             max_concurrent_deletes: 50,
             delete_batch_size: 100,
             max_retries: 3,
@@ -57,6 +63,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         Self {
             storage,
             scan_interval: Duration::from_secs(scan_interval_secs),
+            max_scan_interval: Duration::from_secs(60),
             max_concurrent_deletes,
             delete_batch_size,
             max_retries: 3,
@@ -64,19 +71,48 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         }
     }
 
-    /// Start the garbage collector
+    /// Start the garbage collector.
+    ///
+    /// The scan cadence adapts to activity: a scan that did work runs again at
+    /// the base [`scan_interval`](Self::scan_interval); a run of idle scans
+    /// backs off exponentially up to [`max_scan_interval`](Self::max_scan_interval)
+    /// so an idle controller-manager stays quiet (#1040). Unlike the other
+    /// controllers this cannot be driven by a single-resource watch — GC scans
+    /// the whole owner/dependent graph — so idle backoff is the scan-based
+    /// analogue of upstream GC's workqueue rate-limiter.
     pub async fn run(&self) {
         info!("Starting Garbage Collector");
+        let base = self.scan_interval;
+        let max = self.max_scan_interval;
+        let mut interval = base;
         loop {
-            if let Err(e) = self.scan_and_collect().await {
-                error!("Garbage collection scan failed: {}", e);
+            match self.scan_and_collect_inner().await {
+                Ok(did_work) => interval = next_scan_interval(interval, did_work, base, max),
+                Err(e) => {
+                    error!("Garbage collection scan failed: {}", e);
+                    // Retry promptly at the base cadence after an error.
+                    interval = base;
+                }
             }
-            sleep(self.scan_interval).await;
+            sleep(interval).await;
         }
     }
 
-    /// Scan all resources and collect orphans
+    /// Scan all resources and collect orphans.
+    ///
+    /// Thin wrapper preserving the historical `Result<()>` API used by tests;
+    /// [`scan_and_collect_inner`](Self::scan_and_collect_inner) carries the
+    /// did-work signal the adaptive [`run`](Self::run) loop needs. Only the
+    /// tests call this now (production `run` uses the inner method directly).
+    #[allow(dead_code)]
     pub async fn scan_and_collect(&self) -> rusternetes_common::Result<()> {
+        self.scan_and_collect_inner().await.map(|_| ())
+    }
+
+    /// Scan all resources and collect orphans, returning whether the scan did
+    /// any work (found orphans to delete, or resources pending deletion). The
+    /// adaptive `run` loop uses this to decide whether to back off.
+    async fn scan_and_collect_inner(&self) -> rusternetes_common::Result<bool> {
         debug!("Running garbage collection scan");
 
         // Get all resources from storage
@@ -163,6 +199,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             .iter()
             .filter(|r| r.metadata.is_being_deleted())
             .collect();
+        let had_being_deleted = !being_deleted.is_empty();
 
         for resource in being_deleted {
             if let Err(e) = self.process_deletion(resource, &dependent_map).await {
@@ -171,7 +208,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         }
 
         debug!("Garbage collection scan complete");
-        Ok(())
+        // "Did work" = something was actionable this scan. Drives idle backoff
+        // in `run`; when both are empty the cluster is quiet and the next scan
+        // waits longer.
+        Ok(!orphans.is_empty() || had_being_deleted)
     }
 
     /// Get all resources from storage
@@ -1113,11 +1153,64 @@ fn kind_to_plural(kind: &str) -> &str {
     }
 }
 
+/// Compute the next GC scan interval with idle exponential backoff.
+///
+/// Mirrors upstream garbage collector's workqueue rate-limiter
+/// (`pkg/controller/garbagecollector/garbagecollector.go`: `Forget` on an
+/// actionable item, `AddRateLimited` otherwise): a scan that did work resets
+/// to `base`; an idle scan doubles the interval, clamped to `max`. Rusternetes
+/// has no dependency-graph informer to make GC fully event-driven (tracked in
+/// #1039), so a scan-based GC approximates "silent when idle" (#1040) by
+/// stretching the poll interval when there is nothing to collect.
+fn next_scan_interval(
+    current: Duration,
+    did_work: bool,
+    base: Duration,
+    max: Duration,
+) -> Duration {
+    if did_work {
+        base
+    } else {
+        // Double, then clamp to [base, max]. saturating_mul avoids overflow.
+        current.saturating_mul(2).min(max).max(base)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusternetes_common::types::OwnerReference;
     use rusternetes_storage::memory::MemoryStorage;
+
+    #[test]
+    fn gc_scan_interval_backs_off_when_idle_and_resets_on_work() {
+        let base = Duration::from_secs(5);
+        let max = Duration::from_secs(60);
+
+        // Idle scans back off exponentially, clamped at max.
+        let mut i = base;
+        i = next_scan_interval(i, false, base, max);
+        assert_eq!(i, Duration::from_secs(10));
+        i = next_scan_interval(i, false, base, max);
+        assert_eq!(i, Duration::from_secs(20));
+        i = next_scan_interval(i, false, base, max);
+        assert_eq!(i, Duration::from_secs(40));
+        i = next_scan_interval(i, false, base, max);
+        assert_eq!(i, max, "must clamp at max (80s -> 60s)");
+        i = next_scan_interval(i, false, base, max);
+        assert_eq!(i, max, "stays at max while idle");
+
+        // A scan that did work resets to the base cadence immediately.
+        i = next_scan_interval(i, true, base, max);
+        assert_eq!(i, base, "work resets to base");
+
+        // Never drops below base; a single idle scan from base doubles it.
+        assert_eq!(
+            next_scan_interval(base, false, base, max),
+            Duration::from_secs(10)
+        );
+        assert_eq!(next_scan_interval(base, true, base, max), base);
+    }
 
     #[tokio::test]
     async fn test_deletion_propagation_policy() {
