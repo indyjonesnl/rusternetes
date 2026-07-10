@@ -147,6 +147,20 @@ const TERMINAL_FINALIZE_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
 const TERMINAL_FINALIZE_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// Attempt count at which the still-present warning escalates to `error!`.
 const TERMINAL_FINALIZE_ERROR_THRESHOLD: u32 = 3;
+
+/// Per-attempt ceiling on `runtime.start_pod` (sandbox creation → image pull →
+/// container start). On expiry the future is dropped, which cancels the
+/// in-flight CRI call — and a cancelled `RunPodSandbox` leaves an orphaned
+/// NOT_READY sandbox that keeps its name reserved in containerd, so every
+/// subsequent retry fails permanently with "failed to reserve sandbox name …
+/// is reserved for <id>" and the pod never starts (#1050). The old 30s value
+/// was shorter than a *cold* `pause`/app image pull from a slow registry, so an
+/// early pod could churn the full 300s e2e deadline (later pods succeeded once
+/// the image cached), surfacing as flaky "Networking Granular Checks" failures.
+/// Upstream imposes no such blanket cap — RunPodSandbox is bounded by the 2-min
+/// `runtimeRequestTimeout` and image pulls run unbounded-with-progress. 4 min
+/// comfortably covers a cold pull while still bounding a genuinely wedged call.
+const POD_START_TIMEOUT: Duration = Duration::from_secs(240);
 const ACTIVE_DEADLINE_REASON: &str = "DeadlineExceeded";
 const ACTIVE_DEADLINE_MESSAGE: &str =
     "Pod was active on the node longer than the specified deadline";
@@ -3080,13 +3094,10 @@ impl Kubelet {
                     );
                 }
 
-                // Start the pod with timeout
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    self.runtime.start_pod(pod),
-                )
-                .await
-                {
+                // Start the pod with a timeout generous enough for a cold image
+                // pull — see POD_START_TIMEOUT (#1050). Too short a cap cancels
+                // RunPodSandbox mid-pull and orphans the reserved sandbox name.
+                match tokio::time::timeout(POD_START_TIMEOUT, self.runtime.start_pod(pod)).await {
                     Err(_timeout) => {
                         warn!(
                             "Timeout starting pod {}/{}, will retry",
