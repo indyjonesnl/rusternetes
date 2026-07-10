@@ -162,12 +162,34 @@ pub trait Storage: Send + Sync {
 
         let start = if let Some(token) = continue_token {
             let decoded = decode_default_token(token)?;
-            if let Some(rv) = decoded.compacted_at {
-                if self.is_revision_compacted(rv).await.unwrap_or(false) {
-                    return Err(Error::Gone(format!(
-                        "continue token expired (resource version {} has been compacted)",
-                        rv
-                    )));
+            // A token with rv == -1 is an "inconsistent" continue token issued
+            // after a compaction: resume from the recorded key at the CURRENT
+            // revision, skipping the compaction check. Mirrors upstream
+            // `ValidateListOptions` (interfaces.go): continueRV < 0 means "read
+            // at the latest resource version".
+            if decoded.compacted_at != Some(INCONSISTENT_CONTINUE_RV) {
+                if let Some(rv) = decoded.compacted_at {
+                    if rv > 0 && self.is_revision_compacted(rv).await.unwrap_or(false) {
+                        // A strict (rv-pinned) token whose revision has been
+                        // compacted. Rather than a dead-end 410, return a fresh
+                        // inconsistent continue token (same start key, rv = -1)
+                        // so the client can resume from the last key at the
+                        // current revision — the list is then inconsistent but
+                        // completes. Mirrors upstream
+                        // `handleCompactedErrorForPaging` (etcd3/errors.go),
+                        // which returns a 410 whose `ListMeta.Continue` is a
+                        // fresh rv=-1 token.
+                        return Err(Error::GoneWithContinue {
+                            message: format!(
+                                "continue token expired (resource version {} has been compacted)",
+                                rv
+                            ),
+                            continue_token: encode_default_token(
+                                &decoded.start_key,
+                                INCONSISTENT_CONTINUE_RV,
+                            ),
+                        });
+                    }
                 }
             }
             indexed
@@ -235,6 +257,13 @@ pub struct ContinueToken {
     /// compaction.
     pub compacted_at: Option<i64>,
 }
+
+/// Resource-version sentinel for an "inconsistent" continue token — one issued
+/// after a compaction to let a client resume from the last key at the *current*
+/// revision. Encoded as `c1:-1:<key>`. Mirrors upstream's use of `rv = -1` in
+/// `handleCompactedErrorForPaging` / `ValidateListOptions` (a negative rv means
+/// "read at the latest revision"; `0` is reserved for an invalid/empty rv).
+pub const INCONSISTENT_CONTINUE_RV: i64 = -1;
 
 /// Encode a continue token. Format: `c1:<rv>:<key>`. The version prefix lets
 /// us evolve the format without breaking existing clients.
