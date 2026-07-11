@@ -3,6 +3,19 @@
 [![Conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fconformance.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-canary.yml)
 [![Node Conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fnode-conformance.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/node-conformance.yml)
 
+<!-- Per-SIG conformance badges. Each shows passed/attempted for that SIG's
+     [Conformance] slice, refreshed after each main image publish by the
+     conformance-sig-<name>.yml workflows. -->
+[![sig-node](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-node.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-node.yml)
+[![sig-api-machinery](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-api-machinery.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-api-machinery.yml)
+[![sig-storage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-storage.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-storage.yml)
+[![sig-apps](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-apps.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-apps.yml)
+[![sig-network](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-network.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-network.yml)
+[![sig-cli](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-cli.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-cli.yml)
+[![sig-scheduling](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-scheduling.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-scheduling.yml)
+[![sig-auth](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-auth.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-auth.yml)
+[![sig-instrumentation](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-instrumentation.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-instrumentation.yml)
+
 **A ground-up reimplementation of Kubernetes in Rust.** [Documentation Site](https://calfonso.github.io/rusternetes/)
 
 This isn't a wrapper around the Go codebase or a partial mock. Every component — API server, scheduler, controller manager, kubelet, kube-proxy — is written from scratch in Rust, implementing the actual Kubernetes API surface, wire format, and behavioral semantics.
@@ -252,6 +265,27 @@ See [Storage Backends](docs/storage/STORAGE_BACKENDS.md) for full details on dep
 ## Conformance
 
 Rusternetes is actively tested against the official Kubernetes v1.35 conformance test suite using [Sonobuoy](https://sonobuoy.io/).
+
+### Per-SIG conformance
+
+Each SIG has its own workflow that runs that SIG's `[Conformance]` slice and
+publishes the passed/attempted badge above. Dispatch a workflow with a `focus`
+input to run one named test (e.g. to prove a PR fixes it) without running the
+whole SIG. The registry lives in [`ci/conformance/sigs.json`](ci/conformance/sigs.json).
+
+| Workflow | Focus tag | Asserts |
+|----------|-----------|---------|
+| `conformance-sig-node.yml` | `[sig-node]` | runtime/CRI on the node: pod lifecycle, exec/attach, probes, security context, env, sysctls, ephemeral containers |
+| `conformance-sig-api-machinery.yml` | `[sig-api-machinery]` | apiserver contract: CRDs, admission webhooks, watch, namespaces, garbage collection, resource quota, server-side apply |
+| `conformance-sig-storage.yml` | `[sig-storage]` | volume/mount path: emptyDir, configMap/secret/projected/downwardAPI volumes, subpaths |
+| `conformance-sig-apps.yml` | `[sig-apps]` | workload controllers: Deployment, ReplicaSet, StatefulSet, DaemonSet, Job, CronJob |
+| `conformance-sig-network.yml` | `[sig-network]` | pod networking, Services/ClusterIP, DNS, hostPort |
+| `conformance-sig-cli.yml` | `[sig-cli]` | kubectl behaviours: create/apply/run/expose/patch/label |
+| `conformance-sig-scheduling.yml` | `[sig-scheduling]` | predicates and basic scheduling: node selectors, taints/tolerations, resource fit |
+| `conformance-sig-auth.yml` | `[sig-auth]` | ServiceAccount tokens, projected SA volumes, related authn/authz |
+| `conformance-sig-instrumentation.yml` | `[sig-instrumentation]` | Events API lifecycle: create/patch/delete/list |
+
+### Full-run history
 
 | Round | Pass | Total | Rate | Notes |
 |-------|------|-------|------|-------|
