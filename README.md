@@ -1,6 +1,5 @@
 # Rūsternetes
 
-[![Conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fconformance.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-canary.yml)
 [![Node Conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fnode-conformance.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/node-conformance.yml)
 
 <!-- Per-SIG conformance badges. Each shows passed/attempted for that SIG's
