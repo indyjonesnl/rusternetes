@@ -271,7 +271,18 @@ Rusternetes is actively tested against the official Kubernetes v1.35 conformance
 Each SIG has its own workflow that runs that SIG's `[Conformance]` slice and
 publishes the passed/attempted badge above. Dispatch a workflow with a `focus`
 input to run one named test (e.g. to prove a PR fixes it) without running the
-whole SIG. The registry lives in [`ci/conformance/sigs.json`](ci/conformance/sigs.json).
+whole SIG — a focused run reports the result but does **not** overwrite the
+badge. The registry lives in [`ci/conformance/sigs.json`](ci/conformance/sigs.json).
+
+```bash
+# Prove a single test in CI (build the PR's code locally, run just that test):
+gh workflow run conformance-sig-node.yml \
+  -f focus='should be able to run with a specific user ID' \
+  -f image-tag=''
+# ...or locally against a running cluster:
+bash scripts/conformance-sig-run.sh --sig sig-node \
+  --focus 'should be able to run with a specific user ID'
+```
 
 | Workflow | Focus tag | Asserts |
 |----------|-----------|---------|
