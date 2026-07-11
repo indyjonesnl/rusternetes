@@ -40,6 +40,94 @@ fn key(o: &Obj) -> String {
     o.name.clone()
 }
 
+/// Mock whose `list` reads a shared, test-mutable source and whose `watch`
+/// ALWAYS fails to establish (mirrors the real reqwest "error sending request"
+/// seen when a CPU-starved co-located client can't sustain the watch to the
+/// api-server). Records how many times `list` is called.
+struct FailingWatchLw {
+    source: Arc<Mutex<(Vec<Obj>, String)>>,
+    list_calls: Arc<Mutex<usize>>,
+}
+
+#[async_trait::async_trait]
+impl ListWatch<Obj> for FailingWatchLw {
+    async fn list(&self) -> anyhow::Result<(Vec<Obj>, String)> {
+        *self.list_calls.lock().unwrap() += 1;
+        Ok(self.source.lock().unwrap().clone())
+    }
+    async fn watch<'a>(
+        &'a self,
+        _rv: Option<String>,
+    ) -> anyhow::Result<BoxStream<'a, WatchItem<Obj>>> {
+        // Watch never establishes — the reflector must recover by re-listing.
+        anyhow::bail!("Failed to send GET request: error sending request")
+    }
+}
+
+/// When the watch keeps failing to establish, the reflector's `run` loop must
+/// keep RE-LISTING so objects created after the initial list still land in the
+/// store. Regression test for the M2d 4-node scheduler stall: the reflector
+/// used to keep `last_rv` on a (non-Expired) watch error, so `sync_once`
+/// skipped the list and only re-watched — freezing the store at the startup
+/// list, and the API-mode scheduler (which reads the reflector store) never
+/// saw newly-created pods. Upstream client-go re-lists whenever ListAndWatch
+/// returns an error.
+#[tokio::test(start_paused = true)]
+async fn relists_when_watch_keeps_failing_so_new_objects_surface() {
+    let source = Arc::new(Mutex::new((
+        vec![Obj {
+            name: "a".into(),
+            v: 1,
+        }],
+        "10".into(),
+    )));
+    let list_calls = Arc::new(Mutex::new(0usize));
+    let lw = Arc::new(FailingWatchLw {
+        source: source.clone(),
+        list_calls: list_calls.clone(),
+    });
+    let r = Arc::new(Reflector::new(lw, key));
+
+    let r_run = Arc::clone(&r);
+    let handle = tokio::spawn(async move { r_run.run().await });
+
+    // Let the initial list + first (failing) watch happen.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(
+        r.store().get("a").is_some(),
+        "initial list must populate the store"
+    );
+
+    // A new object appears AFTER the initial list (as the DNS/PHP pods did,
+    // created after the scheduler started). Only a re-list can surface it,
+    // because the watch never delivers events.
+    {
+        let mut src = source.lock().unwrap();
+        src.0.push(Obj {
+            name: "b".into(),
+            v: 1,
+        });
+        src.1 = "11".into();
+    }
+
+    // Give the run loop time to cycle through its backoff and re-list.
+    tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+
+    assert!(
+        r.store().get("b").is_some(),
+        "reflector must re-list after a failing watch so post-list objects appear \
+         (regression: store frozen at initial list -> scheduler never sees new pods)"
+    );
+    assert!(
+        *list_calls.lock().unwrap() > 1,
+        "watch kept failing, so the reflector must have re-listed more than once \
+         (got {} list calls)",
+        *list_calls.lock().unwrap()
+    );
+
+    handle.abort();
+}
+
 #[tokio::test]
 async fn initial_list_populates_store_and_watch_resumes_from_list_rv() {
     let lw = Arc::new(MockLw {

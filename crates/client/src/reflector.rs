@@ -164,10 +164,20 @@ where
     }
 
     /// Run forever: list+watch with exponential backoff (1s → 30s, reset on
-    /// success). A 410-Gone-style failure (compacted resourceVersion — the
-    /// api-server's in-stream ERROR envelope says `reason:"Expired"`,
-    /// `message:"too old resource version: X (Y)"`) clears the held rv so the
-    /// next cycle re-lists; other errors keep the rv and just retry.
+    /// success). ANY error clears the held rv so the next cycle RE-LISTS, which
+    /// mirrors upstream client-go (`ListAndWatch` always begins with a fresh
+    /// list after it returns). A graceful watch close returns `Ok` and keeps
+    /// the rv, so the efficient resume-from-rv path still applies to the normal
+    /// case; only real failures (watch failed to establish, mid-stream error,
+    /// or a 410-Gone/`Expired` compacted rv) trigger the re-list.
+    ///
+    /// Keeping the rv on a *failing* watch was a latent stall: if the watch
+    /// could not be sustained (e.g. a CPU-starved client on a loaded node whose
+    /// h2 watch to the api-server keeps dropping), `sync_once` skipped the list
+    /// and only re-watched, so the store froze at the last successful list.
+    /// Any store consumer that never re-lists on its own — notably the API-mode
+    /// scheduler, which schedules off the reflector store — then never observed
+    /// objects created after that point.
     pub async fn run(&self) {
         let mut backoff = Duration::from_secs(1);
         loop {
@@ -179,10 +189,13 @@ where
                     let text = format!("{e:#}");
                     if text.contains("Expired") || text.contains("too old resource version") {
                         tracing::warn!("reflector: resourceVersion expired, re-listing: {text}");
-                        *self.last_rv.write().unwrap() = None;
                     } else {
-                        tracing::warn!("reflector: sync failed (will retry): {text}");
+                        tracing::warn!("reflector: sync failed (will re-list + retry): {text}");
                     }
+                    // Clear the held rv so the next cycle re-lists and refreshes
+                    // the store, rather than resuming a watch that may never
+                    // deliver the objects created since the last good list.
+                    *self.last_rv.write().unwrap() = None;
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 }

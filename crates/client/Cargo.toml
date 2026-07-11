@@ -39,6 +39,7 @@ tokio = { workspace = true, features = [
     "net",
     "rt-multi-thread",
     "io-util",
+    "test-util",
 ] }
 # Real-TLS test server for insecure-HTTPS node-registration coverage (M2b):
 # self-signed cert served over tokio-rustls, driven by the reqwest client.
