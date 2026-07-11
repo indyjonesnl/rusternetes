@@ -1072,6 +1072,20 @@ fn linux_security_context(
     let apparmor = apparmor_security_profile(pod, container);
     let selinux_options = selinux_options(pod, container);
     let sc = container.security_context.as_ref();
+    // runAsUser/runAsGroup follow the effective-security-context precedence from
+    // upstream `securitycontext.DetermineEffectiveSecurityContext`: the pod-level
+    // `securityContext.runAsUser`/`runAsGroup` are inherited by each container
+    // that does not set its own, and a container-level value overrides the pod's.
+    // Without the pod fallback, a pod that only sets these at pod level (e.g. the
+    // "RunAsUser And RunAsGroup" conformance spec) would run every container as
+    // the image default UID/GID instead of the requested one.
+    let pod_sc = pod.spec.as_ref().and_then(|s| s.security_context.as_ref());
+    let run_as_user = sc
+        .and_then(|s| s.run_as_user)
+        .or_else(|| pod_sc.and_then(|p| p.run_as_user));
+    let run_as_group = sc
+        .and_then(|s| s.run_as_group)
+        .or_else(|| pod_sc.and_then(|p| p.run_as_group));
     // Always build a security context: the masked/readonly proc paths must be
     // sent for every container (upstream sets them unconditionally), so there is
     // no early-out.
@@ -1091,12 +1105,8 @@ fn linux_security_context(
     Some(v1::LinuxContainerSecurityContext {
         privileged: sc.and_then(|s| s.privileged).unwrap_or(false),
         capabilities,
-        run_as_user: sc
-            .and_then(|s| s.run_as_user)
-            .map(|v| v1::Int64Value { value: v }),
-        run_as_group: sc
-            .and_then(|s| s.run_as_group)
-            .map(|v| v1::Int64Value { value: v }),
+        run_as_user: run_as_user.map(|v| v1::Int64Value { value: v }),
+        run_as_group: run_as_group.map(|v| v1::Int64Value { value: v }),
         readonly_rootfs: sc
             .and_then(|s| s.read_only_root_filesystem)
             .unwrap_or(false),
@@ -2060,6 +2070,74 @@ mod tests {
         assert_eq!(sc.run_as_group.unwrap().value, 2000);
         // allowPrivilegeEscalation unset -> no_new_privs stays false.
         assert!(!sc.no_new_privs);
+    }
+
+    #[test]
+    fn run_as_user_group_inherit_from_pod_and_container_overrides() {
+        use serde_json::json;
+        // Returns (run_as_user, run_as_group) as seen by the container CRI SC.
+        let run_as = |spec: serde_json::Value| -> (Option<i64>, Option<i64>) {
+            let pod: Pod = serde_json::from_value(json!({
+                "metadata": {"name": "p", "namespace": "default"}, "spec": spec
+            }))
+            .unwrap();
+            let c = pod.spec.as_ref().unwrap().containers[0].clone();
+            let sc = container_config(
+                &pod,
+                &c,
+                "img",
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .linux
+            .unwrap()
+            .security_context
+            .unwrap();
+            (
+                sc.run_as_user.map(|v| v.value),
+                sc.run_as_group.map(|v| v.value),
+            )
+        };
+
+        // Pod-level runAsUser/runAsGroup propagate to a container that sets none
+        // of its own (upstream DetermineEffectiveSecurityContext /
+        // securityContextFromPodSecurityContext).
+        assert_eq!(
+            run_as(json!({
+                "securityContext": {"runAsUser": 1000, "runAsGroup": 2000},
+                "containers": [{"name": "app", "image": "busybox"}]
+            })),
+            (Some(1000), Some(2000))
+        );
+
+        // Container-level values override the pod-level ones.
+        assert_eq!(
+            run_as(json!({
+                "securityContext": {"runAsUser": 1000, "runAsGroup": 2000},
+                "containers": [{"name": "app", "image": "busybox",
+                    "securityContext": {"runAsUser": 4000, "runAsGroup": 5000}}]
+            })),
+            (Some(4000), Some(5000))
+        );
+
+        // Mixed: container overrides only runAsUser, pod fills runAsGroup.
+        assert_eq!(
+            run_as(json!({
+                "securityContext": {"runAsUser": 1000, "runAsGroup": 2000},
+                "containers": [{"name": "app", "image": "busybox",
+                    "securityContext": {"runAsUser": 4000}}]
+            })),
+            (Some(4000), Some(2000))
+        );
+
+        // Neither set -> both None.
+        assert_eq!(
+            run_as(json!({
+                "containers": [{"name": "app", "image": "busybox"}]
+            })),
+            (None, None)
+        );
     }
 
     #[test]
