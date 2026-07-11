@@ -1,0 +1,16 @@
+[sig-node] Pods should be submitted and removed [Conformance]
+[sig-node] Probes should be restarted with a exec liveness probe [Conformance]
+[sig-api-machinery] CustomResourceDefinition resources should support simple CRUD [Conformance]
+[sig-api-machinery] Watchers should observe add, update, and delete events [Conformance]
+[sig-storage] EmptyDir volumes should support r/w [Conformance]
+[sig-storage] Projected configMap should be consumable [Conformance]
+[sig-apps] Deployment should run the lifecycle of a Deployment [Conformance]
+[sig-apps] StatefulSet should perform rolling updates [Conformance]
+[sig-network] Services should serve a basic endpoint from pods [Conformance]
+[sig-network] DNS should provide DNS for services [Conformance]
+[sig-cli] Kubectl client kubectl patch should add annotations [Conformance]
+[sig-scheduling] SchedulerPredicates validates resource limits of pods [Conformance]
+[sig-auth] ServiceAccounts should mount an API token into pods [Conformance]
+[sig-instrumentation] Events API should ensure event lifecycle works [Conformance]
+[sig-node] this NON-conformance line must be ignored by the coverage scan
+[sig-storage] [Feature:Foo] non-conformance feature spec ignored too

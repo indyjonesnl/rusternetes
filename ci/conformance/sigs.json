@@ -1,0 +1,56 @@
+[
+  {
+    "name": "sig-node",
+    "focus": "\\[sig-node\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-node\\]",
+    "skip": "\\[Flaky\\]",
+    "description": "runtime/CRI on the node: pod lifecycle, exec/attach, probes, security context, env, sysctls, ephemeral containers"
+  },
+  {
+    "name": "sig-api-machinery",
+    "focus": "\\[sig-api-machinery\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-api-machinery\\]",
+    "skip": "\\[Flaky\\]",
+    "description": "apiserver contract: CRDs, admission webhooks, watch, namespaces, garbage collection, resource quota, server-side apply"
+  },
+  {
+    "name": "sig-storage",
+    "focus": "\\[sig-storage\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-storage\\]",
+    "skip": "\\[Flaky\\]",
+    "description": "volume/mount path: emptyDir, configMap/secret/projected/downwardAPI volumes, subpaths"
+  },
+  {
+    "name": "sig-apps",
+    "focus": "\\[sig-apps\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-apps\\]",
+    "skip": "\\[Flaky\\]",
+    "description": "workload controllers: Deployment, ReplicaSet, StatefulSet, DaemonSet, Job, CronJob (rolling updates, scale, ordered bring-up)"
+  },
+  {
+    "name": "sig-network",
+    "focus": "\\[sig-network\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-network\\]",
+    "skip": "\\[Flaky\\]",
+    "description": "pod networking, Services/ClusterIP, DNS, hostPort"
+  },
+  {
+    "name": "sig-cli",
+    "focus": "\\[sig-cli\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-cli\\]",
+    "skip": "\\[Flaky\\]",
+    "description": "kubectl behaviours: create/apply/run/expose/patch/label"
+  },
+  {
+    "name": "sig-scheduling",
+    "focus": "\\[sig-scheduling\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-scheduling\\]",
+    "skip": "\\[Flaky\\]",
+    "description": "predicates and basic scheduling: node selectors, taints/tolerations, resource fit"
+  },
+  {
+    "name": "sig-auth",
+    "focus": "\\[sig-auth\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-auth\\]",
+    "skip": "\\[Flaky\\]",
+    "description": "ServiceAccount tokens, projected SA volumes, related authn/authz"
+  },
+  {
+    "name": "sig-instrumentation",
+    "focus": "\\[sig-instrumentation\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-instrumentation\\]",
+    "skip": "\\[Flaky\\]",
+    "description": "Events API lifecycle: create/patch/delete/list"
+  }
+]

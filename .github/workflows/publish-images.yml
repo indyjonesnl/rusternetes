@@ -7,8 +7,8 @@ name: Publish images
 #   * main           — moving alias for the latest successful publish.
 #
 # Consumers:
-#   * conformance-canary.yml re-triggers off this workflow (workflow_run) and
-#     pulls the exact sha-tag — 1:1 commit↔result blame.
+#   * conformance-sig-*.yml re-trigger off this workflow (workflow_run) and
+#     pull the exact sha-tag — 1:1 commit↔result blame, one run per SIG.
 #   * feature-conformance.yml + node-conformance.yml nightlies pull :main.
 #   * All consumers auto-fall back to a local compose build when the pull
 #     fails (ci/actions/bring-up-cluster / run-node-conformance.sh).
