@@ -1,0 +1,124 @@
+name: conformance-sig (reusable)
+
+# Reusable per-SIG conformance engine. Brings up the multi-container SQLite
+# (rhino) stack via the shared `bring-up-cluster` action, runs ONE SIG's
+# [Conformance] slice (or a narrowed focus) through Hydrophone, publishes a
+# dynamic passed/total badge, and tears down.
+#
+# The thin per-SIG callers (.github/workflows/conformance-sig-<name>.yml,
+# generated from ci/conformance/sigs.json) invoke this with their `sig`. It is
+# also directly `workflow_dispatch`-able for ad-hoc runs.
+#
+# NON-GATING: test failures do NOT fail the job — only an infra failure (no
+# junit) does (see scripts/conformance-sig-run.sh). A FOCUSED run (non-empty
+# `focus`) runs the tests but does NOT publish the badge — a one-test count is
+# not the SIG's pass rate (FR-011).
+
+on:
+  workflow_call:
+    inputs:
+      sig:
+        description: "SIG name (must exist in ci/conformance/sigs.json)"
+        required: true
+        type: string
+      focus:
+        description: "Ginkgo --focus override. Empty = full SIG run (publishes badge)."
+        required: false
+        type: string
+        default: ''
+      image-tag:
+        description: "GHCR image tag to test (default main). Empty = build locally."
+        required: false
+        type: string
+        default: main
+      publish-badge:
+        description: "Publish the SIG badge on a full run (ignored for focused runs)."
+        required: false
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      sig:
+        description: "SIG name (must exist in ci/conformance/sigs.json)"
+        required: true
+        type: string
+      focus:
+        description: "Ginkgo --focus override. Empty = full SIG run (publishes badge)."
+        required: false
+        type: string
+        default: ''
+      image-tag:
+        description: "GHCR image tag to test (default main). Empty = build locally."
+        required: false
+        type: string
+        default: main
+      publish-badge:
+        description: "Publish the SIG badge on a full run (ignored for focused runs)."
+        required: false
+        type: boolean
+        default: true
+
+env:
+  DOCKER_HOST: unix:///var/run/docker.sock
+  HYDROPHONE_VERSION: v0.7.0
+
+jobs:
+  sig:
+    name: ${{ inputs.sig }}${{ inputs.focus != '' && ' (focused)' || '' }}
+    runs-on: arc-runner-set-conformance
+    # contents:write lets the badge step push to the orphan `badges` branch
+    # (best-effort; never fails the run).
+    permissions:
+      contents: write
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Bring up cluster
+        uses: ./ci/actions/bring-up-cluster
+        with:
+          hydrophone-version: ${{ env.HYDROPHONE_VERSION }}
+          kubectl-version: v1.35.0
+          image-tag: ${{ inputs.image-tag }}
+
+      - name: Run SIG conformance
+        id: run
+        env:
+          SIG: ${{ inputs.sig }}
+          FOCUS: ${{ inputs.focus }}
+        run: |
+          set -euo pipefail
+          args=(--sig "$SIG" --output-dir "sig-out/$SIG")
+          if [ -n "$FOCUS" ]; then
+            args+=(--focus "$FOCUS")
+          fi
+          bash scripts/conformance-sig-run.sh "${args[@]}"
+
+      - name: Update SIG badge
+        # Full runs only (empty focus) — a focused run must not clobber the
+        # SIG's aggregate badge (FR-011). Best-effort: never reddens the run.
+        if: ${{ always() && inputs.publish-badge && inputs.focus == '' }}
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/update-badge.sh \
+            "${{ inputs.sig }}" "${{ inputs.sig }}" \
+            "${{ steps.run.outputs.passed }}" "${{ steps.run.outputs.total }}"
+
+      - name: Upload SIG artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-${{ inputs.sig }}${{ inputs.focus != '' && '-focused' || '' }}
+          path: sig-out/${{ inputs.sig }}/
+          retention-days: 14
+
+      - name: Tear down cluster
+        if: always()
+        run: |
+          docker compose -f compose.sqlite.yml logs --tail=100 || true
+          docker compose -f compose.sqlite.yml down -v || true
