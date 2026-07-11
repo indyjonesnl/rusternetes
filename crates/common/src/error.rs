@@ -64,6 +64,21 @@ pub enum Error {
     #[error("Gone: {0}")]
     Gone(String),
 
+    /// Like [`Error::Gone`] but for a compacted continue token during a
+    /// *paginated* list: carries a fresh "inconsistent" continue token so the
+    /// client can resume from the same key at the current resource version.
+    /// Maps to `410 Gone` (reason `Gone`) with the token attached to the
+    /// response `metadata.continue`, mirroring upstream
+    /// `handleCompactedErrorForPaging` (etcd3/errors.go), which returns a
+    /// ResourceExpired 410 whose `ListMeta.Continue` is a fresh (rv=-1) token
+    /// (`test/e2e/apimachinery/chunking.go` "continue listing from the last
+    /// key ... though the list is inconsistent").
+    #[error("{message}")]
+    GoneWithContinue {
+        message: String,
+        continue_token: String,
+    },
+
     #[error("Unsupported media type: {0}")]
     UnsupportedMediaType(String),
 
@@ -100,6 +115,7 @@ impl Error {
             Error::Conflict(_) => "Conflict",
             Error::TooManyRequests(_) => "TooManyRequests",
             Error::Gone(_) => "Gone",
+            Error::GoneWithContinue { .. } => "Gone",
             Error::UnsupportedMediaType(_) => "UnsupportedMediaType",
             Error::NotAcceptable(_) => "NotAcceptable",
             Error::Internal(_) => "InternalError",
@@ -114,6 +130,11 @@ impl axum::response::IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
         use axum::http::StatusCode;
         use axum::Json;
+
+        // A compacted continue token during pagination carries a fresh
+        // "inconsistent" continue token that must surface in the 410 response's
+        // `metadata.continue` (upstream `handleCompactedErrorForPaging`).
+        let mut continue_meta: Option<String> = None;
 
         // Extract resource name from error message for StatusDetails
         let (status, message, reason, details) = match self {
@@ -168,6 +189,13 @@ impl axum::response::IntoResponse for Error {
                 (StatusCode::TOO_MANY_REQUESTS, msg, "TooManyRequests", None)
             }
             Error::Gone(msg) => (StatusCode::GONE, msg, "Gone", None),
+            Error::GoneWithContinue {
+                message,
+                continue_token,
+            } => {
+                continue_meta = Some(continue_token);
+                (StatusCode::GONE, message, "Gone", None)
+            }
             Error::Storage(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 msg,
@@ -196,11 +224,21 @@ impl axum::response::IntoResponse for Error {
             ),
         };
 
-        let status_obj = if let Some(details) = details {
+        let mut status_obj = if let Some(details) = details {
             crate::types::Status::failure_with_details(&message, reason, status.as_u16(), details)
         } else {
             crate::types::Status::failure(&message, reason, status.as_u16())
         };
+
+        // Attach the fresh inconsistent continue token to `metadata.continue`
+        // so a client can resume the list across the compaction boundary.
+        if let Some(token) = continue_meta {
+            status_obj.metadata = Some(crate::types::ListMeta {
+                resource_version: None,
+                continue_token: Some(token),
+                remaining_item_count: None,
+            });
+        }
 
         (status, Json(status_obj)).into_response()
     }

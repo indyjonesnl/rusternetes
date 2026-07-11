@@ -881,18 +881,72 @@ async fn table_transformation_should_return_406_for_backend_without_metadata() {
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go:214
 /// Sonobuoy (2026-05-29): FAIL — included as GAP stub
 ///
-/// After etcd compaction, a continue token whose resourceVersion is older
-/// than the compaction watermark MUST still allow the client to resume from
-/// the last key (returning a possibly-inconsistent list with
-/// `metadata.remainingItemCount=0`). Rusternetes currently returns 410 Gone
-/// (the strict behaviour), not the lenient resume-from-last-key behaviour
-/// required by this conformance test.
+/// After compaction, a continue token whose resourceVersion is older than the
+/// compaction watermark MUST still let the client resume from the last key
+/// (an inconsistent-but-complete list), rather than dead-ending at 410.
+///
+/// Implemented in `Storage::list_paginated` (#1451): a compacted strict token
+/// yields `Error::GoneWithContinue`, whose fresh `metadata.continue` token
+/// carries the same start key at rv = -1 (the "inconsistent" marker); listing
+/// with that token skips the compaction check and resumes at the current
+/// revision. Mirrors upstream `handleCompactedErrorForPaging` (rv = -1 token)
+/// + `ValidateListOptions` (continueRV < 0 ⇒ read at latest). The companion
+/// GREEN strict-path test lives in
+/// `conformance_apimachinery_watch_chunking_gc.rs`.
 #[tokio::test]
-#[ignore = "GAP (tracked: indyjonesnl/rusternetes#1451): inconsistent continue token after compaction not implemented; server returns plain 410 without a resume token; upstream chunking.go:132-214"]
 async fn chunking_should_continue_from_last_key_after_compaction() {
-    // This test body is a documentation stub only. The corresponding
-    // GREEN (strict 410) test lives in conformance_apimachinery_watch_chunking_gc.rs
-    // as `chunking_continue_after_compaction_returns_410_expired`.
+    use rusternetes_common::resources::ConfigMap;
+    use rusternetes_storage::{build_key, decode_default_token, Storage, INCONSISTENT_CONTINUE_RV};
+
+    let storage = Arc::new(MemoryStorage::new());
+    for n in ["a", "b", "c", "d"] {
+        let c = ConfigMap::new(n, "default");
+        storage
+            .create(&build_key("configmaps", Some("default"), n), &c)
+            .await
+            .unwrap();
+    }
+
+    // Page 1 (limit 2) → a, b + a strict (rv-pinned) continue token.
+    let (page1, token1): (Vec<ConfigMap>, _) = storage
+        .list_paginated("/registry/configmaps/default/", 2, None)
+        .await
+        .unwrap();
+    assert_eq!(page1.len(), 2);
+    let token1 = token1.expect("first page advertises a continue token");
+
+    // Compact past every observable revision so the strict token is stale.
+    let future_rv = storage.current_revision().await.unwrap() + 1_000_000;
+    storage.compact_to(future_rv);
+
+    // Part A: resuming with the compacted strict token returns 410 Gone
+    // carrying a FRESH inconsistent continue token (same start key, rv = -1).
+    let err = storage
+        .list_paginated::<ConfigMap>("/registry/configmaps/default/", 2, Some(&token1))
+        .await
+        .expect_err("compacted strict token must be rejected");
+    assert_eq!(err.reason(), "Gone", "must still map to 410 Gone");
+    let fresh = match &err {
+        rusternetes_common::Error::GoneWithContinue { continue_token, .. } => {
+            continue_token.clone()
+        }
+        other => panic!("expected GoneWithContinue, got {other:?}"),
+    };
+    assert_eq!(
+        decode_default_token(&fresh).unwrap().compacted_at,
+        Some(INCONSISTENT_CONTINUE_RV),
+        "fresh token must be the inconsistent (rv = -1) marker"
+    );
+
+    // Part B: listing with the inconsistent token resumes from the last key at
+    // the current revision (no 410) and completes the list → c, d.
+    let (page2, token2): (Vec<ConfigMap>, _) = storage
+        .list_paginated("/registry/configmaps/default/", 2, Some(&fresh))
+        .await
+        .expect("inconsistent continue token must resume, not 410");
+    let names: Vec<String> = page2.iter().map(|c| c.metadata.name.clone()).collect();
+    assert_eq!(names, vec!["c", "d"], "must resume from the last key");
+    assert!(token2.is_none(), "the list completes — no further pages");
 }
 
 // ===========================================================================
