@@ -3659,7 +3659,16 @@ impl Kubelet {
                     let container_statuses = self.get_container_statuses(&fresh_pod).await.ok();
 
                     // Get pod IP
-                    let pod_ip = self.runtime.get_pod_ip(pod_name).await.ok().flatten();
+                    // Wait briefly for CNI to publish the pod IP so this Running
+                    // write carries it, instead of leaving the pod
+                    // Running-but-unroutable until the next 5s sync tick. Bounded;
+                    // falls back to None on timeout (a later tick refreshes it).
+                    let pod_ip = crate::poll::poll_until_some(
+                        || async { self.runtime.get_pod_ip(pod_name).await.ok().flatten() },
+                        std::time::Duration::from_secs(10),
+                        std::time::Duration::from_millis(150),
+                    )
+                    .await;
                     let pod_i_ps = pod_ip.as_ref().map(|ip| vec![PodIP { ip: ip.clone() }]);
 
                     // Update status to Running
