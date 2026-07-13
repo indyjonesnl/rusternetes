@@ -2,15 +2,13 @@
 # DO NOT EDIT — change the registry and re-run the generator instead.
 name: conformance-sig-storage
 
-# Independent per-SIG conformance run. Full runs auto-fire after each main image
-# publish (refreshing the sig-storage badge); workflow_dispatch with a `focus` runs one
-# named test to prove a PR (that focused run does NOT touch the badge). All logic
-# lives in the reusable .github/workflows/conformance-sig.yml engine.
+# Independent per-SIG conformance run. Full runs fire nightly (refreshing the
+# sig-storage badge against the latest main image); workflow_dispatch with a `focus`
+# runs one named test to prove a PR (that focused run does NOT touch the badge).
+# All logic lives in the reusable .github/workflows/conformance-sig.yml engine.
 on:
-  workflow_run:
-    workflows: ["Publish images"]
-    types: [completed]
-    branches: [main]
+  schedule:
+    - cron: '12 2 * * *'
   workflow_dispatch:
     inputs:
       focus:
@@ -22,18 +20,14 @@ on:
         required: false
         default: main
 
-# Per-SIG group so the newest publish wins for THIS sig without cancelling other
-# SIGs' runs (independence: FR-003).
+# Per-SIG group so a newer run supersedes an older one for THIS sig without
+# cancelling other SIGs' runs (independence: FR-003).
 concurrency:
   group: conformance-sig-storage
   cancel-in-progress: true
 
 jobs:
   run:
-    # workflow_run fires for failed publishes too — only run on success.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
     permissions:
       contents: write
     secrets: inherit
@@ -41,5 +35,4 @@ jobs:
     with:
       sig: sig-storage
       focus: ${{ github.event.inputs.focus || '' }}
-      # workflow_run: test the exact published sha. dispatch: operator's tag (default main).
-      image-tag: ${{ github.event_name == 'workflow_run' && format('sha-{0}', github.event.workflow_run.head_sha) || (github.event.inputs.image-tag || 'main') }}
+      image-tag: ${{ github.event.inputs.image-tag || 'main' }}
