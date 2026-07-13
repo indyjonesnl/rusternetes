@@ -24,6 +24,68 @@ use crate::runtime::{
     parse_quantity_bytes, pod_dir_key, setup_emptydir_dir, HostPathCheck,
 };
 
+/// Apply fsGroup group-ownership to volume trees in-process (no fork/exec).
+///
+/// Mirrors upstream `SetVolumeOwnership` (`pkg/volume/volume_linux.go`): change
+/// the GROUP owner via `lchown` (owner left unchanged, symlinks not followed),
+/// mirror the owner permission bits into the group bits (so a 0440 file becomes
+/// group-readable but not group-writable), and set setgid on each root volume dir
+/// so newly created files inherit the group. Every failure is returned, never
+/// swallowed — the caller fails `start_pod` and the pod is retried rather than a
+/// non-root container starting against a root-owned, unreadable file.
+#[cfg(unix)]
+fn apply_volume_ownership(paths: &[std::path::PathBuf], fs_group: i64) -> std::io::Result<()> {
+    use rustix::fs::{chownat, AtFlags, Gid, CWD};
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: `from_raw` requires the value to be a valid Unix group ID; fsGroup
+    // comes straight from the pod's PodSecurityContext (an i64 GID, validated at
+    // the API layer), so the cast/wrap is a plain reinterpretation, not UB.
+    let gid = unsafe { Gid::from_raw(fs_group as u32) };
+
+    fn chown_group(path: &std::path::Path, gid: Gid) -> std::io::Result<()> {
+        // lchown: group only, do not follow symlinks (upstream os.Lchown).
+        chownat(CWD, path, None, Some(gid), AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from)
+    }
+
+    fn mirror_group_bits(path: &std::path::Path) -> std::io::Result<()> {
+        let mode = std::fs::symlink_metadata(path)?.permissions().mode();
+        let owner_bits = (mode >> 6) & 0o7;
+        let new_mode = (mode & !0o070) | (owner_bits << 3);
+        if new_mode != mode {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(new_mode))?;
+        }
+        Ok(())
+    }
+
+    fn walk(dir: &std::path::Path, gid: Gid) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            chown_group(&path, gid)?;
+            let meta = std::fs::symlink_metadata(&path)?;
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            mirror_group_bits(&path)?;
+            if meta.file_type().is_dir() {
+                walk(&path, gid)?;
+            }
+        }
+        Ok(())
+    }
+
+    for path in paths {
+        chown_group(path, gid)?;
+        walk(path, gid)?;
+        // setgid + owner->group bit mirror on the root dir.
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        let owner_bits = (mode >> 6) & 0o7;
+        let new_mode = (mode & !0o070) | (owner_bits << 3) | 0o2000;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(new_mode))?;
+    }
+    Ok(())
+}
+
 /// Provisions and maintains pod volumes on the host filesystem, independent of
 /// any container runtime. See the module docs.
 #[derive(Clone)]
@@ -88,55 +150,20 @@ impl VolumeManager {
             .and_then(|s| s.security_context.as_ref())
             .and_then(|sc| sc.fs_group)
         {
-            use std::os::unix::fs::PermissionsExt;
-            for path in volume_paths.values() {
-                // Recursively chown to fsGroup
-                let _ = std::process::Command::new("chown")
-                    .args(["-R", &format!(":{}", fs_group), path])
-                    .output();
-
-                // Set group bits to mirror owner bits on each file/directory.
-                // This matches real K8s behavior: if owner=r--, group becomes r--
-                // (not r+w which chmod g+rwX would do).
-                fn apply_fsgroup_permissions(dir: &std::path::Path) {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Ok(entries) = std::fs::read_dir(dir) {
-                        for entry in entries.flatten() {
-                            let fpath = entry.path();
-                            if let Ok(meta) = std::fs::metadata(&fpath) {
-                                let mode = meta.permissions().mode();
-                                // Copy owner bits (bits 8-6) to group bits (bits 5-3)
-                                let owner_bits = (mode >> 6) & 0o7;
-                                let new_mode = (mode & !0o070) | (owner_bits << 3);
-                                if new_mode != mode {
-                                    let _ = std::fs::set_permissions(
-                                        &fpath,
-                                        std::fs::Permissions::from_mode(new_mode),
-                                    );
-                                }
-                                if meta.is_dir() {
-                                    apply_fsgroup_permissions(&fpath);
-                                }
-                            }
-                        }
-                    }
-                }
-                apply_fsgroup_permissions(std::path::Path::new(path));
-
-                // Set setgid bit on the directory itself so new files inherit group
-                if let Ok(meta) = std::fs::metadata(path) {
-                    let mode = meta.permissions().mode();
-                    let owner_bits = (mode >> 6) & 0o7;
-                    let new_mode = (mode & !0o070) | (owner_bits << 3) | 0o2000;
-                    let _ =
-                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(new_mode));
-                }
-            }
-            info!(
-                "Applied fsGroup {} to {} volumes",
-                fs_group,
-                volume_paths.len()
-            );
+            let paths: Vec<std::path::PathBuf> = volume_paths
+                .values()
+                .map(std::path::PathBuf::from)
+                .collect();
+            let n = paths.len();
+            // Blocking recursive lchown syscalls run off the async worker so
+            // concurrent pod setup does not starve the tokio runtime. Errors
+            // propagate: a failed ownership application fails start_pod (retried)
+            // rather than starting a non-root container against a root-owned file.
+            tokio::task::spawn_blocking(move || apply_volume_ownership(&paths, fs_group))
+                .await
+                .context("fsGroup ownership task panicked")?
+                .with_context(|| format!("failed to apply fsGroup {fs_group} to volumes"))?;
+            info!("Applied fsGroup {} to {} volumes", fs_group, n);
         }
 
         Ok(volume_paths)
@@ -2078,5 +2105,54 @@ mod projected_mode_tests {
             "projected secret item mode must be applied on resync"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// fsGroup ownership must be applied IN-PROCESS, return Ok, preserve a 0440
+    /// file's mode (group gets owner's read, not write), and set setgid on the root
+    /// dir. Chowns to the file's OWN current gid so the lchown is permitted without
+    /// root and the assertion is environment-independent (a real cross-group change
+    /// is exercised by the root-privileged integration run, Task 3). Regression
+    /// guard for the flaky fork/exec `chown -R` whose failures were swallowed.
+    #[cfg(unix)]
+    #[test]
+    fn apply_volume_ownership_preserves_mode_and_sets_setgid() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = std::env::temp_dir().join(format!("rn-fsg-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("secret-key");
+        std::fs::write(&file, b"value").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o440)).unwrap();
+
+        // The file's current gid is the process egid — chowning to it is permitted
+        // without CAP_CHOWN, so this exercises the full syscall path hermetically.
+        let gid = std::fs::metadata(&file).unwrap().gid() as i64;
+        apply_volume_ownership(std::slice::from_ref(&tmp), gid).expect("ownership must succeed");
+
+        let meta = std::fs::metadata(&file).unwrap();
+        assert_eq!(meta.gid() as i64, gid, "file group must be the applied gid");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o440,
+            "0440 must be preserved (group gets owner's read, not write)"
+        );
+        let dir_mode = std::fs::metadata(&tmp).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o2000, 0o2000, "root dir must be setgid");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An ownership failure must PROPAGATE (return Err), not be silently swallowed
+    /// like the old `let _ = ...chown...output()`. A non-existent path yields ENOENT
+    /// (returned before the gid is even used).
+    #[cfg(unix)]
+    #[test]
+    fn apply_volume_ownership_propagates_errors() {
+        let missing = std::env::temp_dir().join(format!("rn-fsg-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let err = apply_volume_ownership(&[missing], 0);
+        assert!(
+            err.is_err(),
+            "missing path must return Err, not be swallowed"
+        );
     }
 }
