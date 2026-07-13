@@ -98,7 +98,7 @@ impl ApiClient {
     pub fn from_config(config: &crate::config::ClientConfig) -> Result<Self> {
         Self::with_tls(
             &config.base_url,
-            false,
+            config.insecure_skip_tls_verify,
             config.ca_pem.as_ref().map(|pem| pem.as_bytes().to_vec()),
             config
                 .client_cert_pem

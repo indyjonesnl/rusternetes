@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use rusternetes_client::config::ClientConfig;
 use rusternetes_client::http::ApiClient;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -124,4 +125,52 @@ async fn secure_https_registration_error_names_url_and_cause() {
         lower.contains("certificate") || lower.contains("tls") || lower.contains("handshake"),
         "error must surface the TLS/cert cause, not an opaque send failure: {full}"
     );
+}
+
+/// #1593: `ApiClient::from_config` must honour `insecure_skip_tls_verify` from
+/// the resolved `ClientConfig` (kubeconfig `insecure-skip-tls-verify: true`).
+/// Previously `from_config` hardcoded verification ON, so a self-signed
+/// api-server was always rejected even when the config asked to skip it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn from_config_honours_insecure_skip_tls_verify() {
+    let port = spawn_fake_apiserver_https().await;
+    let cfg = ClientConfig {
+        base_url: format!("https://127.0.0.1:{port}"),
+        token: None,
+        ca_pem: None,
+        client_cert_pem: None,
+        client_key_pem: None,
+        insecure_skip_tls_verify: true,
+    };
+    let client = Arc::new(ApiClient::from_config(&cfg).expect("build client from config"));
+
+    let node = json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-2"}});
+    let created: Value = client
+        .post("/api/v1/nodes", &node)
+        .await
+        .expect("from_config with insecure_skip_tls_verify must accept a self-signed cert");
+    assert_eq!(created["metadata"]["name"], "node-2");
+}
+
+/// The default (`insecure_skip_tls_verify: false`, no CA) still verifies against
+/// the system roots — a self-signed cert is rejected. Guards against the fix
+/// flipping the secure default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn from_config_verifies_by_default() {
+    let port = spawn_fake_apiserver_https().await;
+    let cfg = ClientConfig {
+        base_url: format!("https://127.0.0.1:{port}"),
+        token: None,
+        ca_pem: None,
+        client_cert_pem: None,
+        client_key_pem: None,
+        insecure_skip_tls_verify: false,
+    };
+    let client = Arc::new(ApiClient::from_config(&cfg).expect("build client from config"));
+
+    let node = json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-2"}});
+    client
+        .post::<_, Value>("/api/v1/nodes", &node)
+        .await
+        .expect_err("from_config must verify TLS by default (self-signed cert rejected)");
 }
