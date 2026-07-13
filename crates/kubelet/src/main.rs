@@ -27,6 +27,7 @@ mod kubelet;
 mod labels;
 #[allow(dead_code)]
 mod lifecycle;
+mod poll;
 // The standalone bin no longer uses the bollard ContainerRuntime (the kubelet
 // runs on the CRI backend); runtime.rs is kept only for the still-shared free
 // helpers (volume setup, init-action decisions), which the bin does not all
