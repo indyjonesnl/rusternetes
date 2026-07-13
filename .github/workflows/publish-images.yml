@@ -7,14 +7,14 @@ name: Publish images
 #   * main           — moving alias for the latest successful publish.
 #
 # Consumers:
-#   * conformance-sig-*.yml re-trigger off this workflow (workflow_run) and
-#     pull the exact sha-tag — 1:1 commit↔result blame, one run per SIG.
-#   * feature-conformance.yml + node-conformance.yml nightlies pull :main.
+#   * feature-conformance.yml + node-conformance.yml + conformance-sig-*.yml
+#     nightlies pull :main.
 #   * All consumers auto-fall back to a local compose build when the pull
 #     fails (ci/actions/bring-up-cluster / run-node-conformance.sh).
 #
 # Intentionally NO paths filter: every main sha must get an image so the
-# canary chain never has gaps and the registry history is complete. A push
+# immutable sha-tag history is complete and any past main build is runnable
+# without compilation (#1056). A push
 # that changes no Rust is a warm-cache rebuild (~3-5 min) and the pushed
 # layers dedupe server-side.
 

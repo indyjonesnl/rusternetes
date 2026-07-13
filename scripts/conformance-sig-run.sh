@@ -23,8 +23,9 @@
 # Usage:
 #   bash scripts/conformance-sig-run.sh --sig sig-node [flags]
 #
-# Flags: --sig --focus --skip --kubeconfig --conformance-image --output-dir
-#        --hydrophone -h|--help
+# Flags: --sig --focus --skip --parallel --kubeconfig --conformance-image
+#        --output-dir --hydrophone -h|--help
+#        --parallel N   ginkgo procs (default 2; ginkgo isolates [Serial] specs)
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -75,7 +76,7 @@ fi
 SIG=""; FOCUS=""; SKIP=""; FOCUS_OVERRIDDEN=0
 KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/rusternetes-config}"
 CONFORMANCE_IMAGE="registry.k8s.io/conformance:v1.35.0"
-OUTPUT_DIR=""; HYDROPHONE_BIN=""
+OUTPUT_DIR=""; HYDROPHONE_BIN=""; PARALLEL=2
 
 die() { echo "[conformance-sig-run] ERROR: $*" >&2; exit 2; }
 
@@ -89,6 +90,7 @@ while [[ $# -gt 0 ]]; do
         --conformance-image) [[ $# -ge 2 ]] || die "--conformance-image requires a value"; CONFORMANCE_IMAGE="$2"; shift 2 ;;
         --output-dir) [[ $# -ge 2 ]] || die "--output-dir requires a value"; OUTPUT_DIR="$2"; shift 2 ;;
         --hydrophone) [[ $# -ge 2 ]] || die "--hydrophone requires a value"; HYDROPHONE_BIN="$2"; shift 2 ;;
+        --parallel) [[ $# -ge 2 ]] || die "--parallel requires a value"; PARALLEL="$2"; shift 2 ;;
         *) die "unknown flag: $1 (use --help)" ;;
     esac
 done
@@ -125,13 +127,15 @@ echo "  image : $CONFORMANCE_IMAGE"
 # to deploy into an existing one) — same self-containment as conformance-tags-run.sh.
 "$HYDROPHONE_BIN" --cleanup --kubeconfig "$KUBECONFIG_PATH" >/dev/null 2>&1 || true
 
-# Single ginkgo thread: a per-SIG run may include [Serial] specs, and each SIG
-# owns its cluster for the run, so serial is the safe default.
+# Default 2 ginkgo procs (matches the old canary phase-1). Ginkgo isolates
+# [Serial] specs into a dedicated single-proc phase, so a focus that includes
+# serial specs stays correct at --parallel > 1. Single-threaded (--parallel 1)
+# ran a full SIG slice past the 90-min job timeout (#1616).
 set +e
 "$HYDROPHONE_BIN" \
     --focus "$FOCUS" \
     --skip "$SKIP" \
-    --parallel 1 \
+    --parallel "$PARALLEL" \
     --output-dir "$OUTPUT_DIR" \
     --kubeconfig "$KUBECONFIG_PATH" \
     --conformance-image "$CONFORMANCE_IMAGE" 2>&1 | tee "$OUTPUT_DIR/run.log"

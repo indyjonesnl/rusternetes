@@ -3,8 +3,8 @@
 [![Node Conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fnode-conformance.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/node-conformance.yml)
 
 <!-- Per-SIG conformance badges. Each shows passed/attempted for that SIG's
-     [Conformance] slice, refreshed after each main image publish by the
-     conformance-sig-<name>.yml workflows. -->
+     [Conformance] slice, refreshed nightly by the conformance-sig-<name>.yml
+     workflows (also runnable on demand via workflow_dispatch). -->
 [![sig-node](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-node.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-node.yml)
 [![sig-api-machinery](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-api-machinery.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-api-machinery.yml)
 [![sig-storage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-storage.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-storage.yml)

@@ -70,7 +70,12 @@ jobs:
     # (best-effort; never fails the run).
     permissions:
       contents: write
-    timeout-minutes: 90
+    # A full per-SIG [Conformance] slice is much bigger than a single [Feature]
+    # focus, and every failing spec (rusternetes is not yet 100%) burns its
+    # per-test ginkgo timeout — so this needs the old canary's ~300-min budget,
+    # not the 90 min copied from feature-conformance (which timed out every SIG
+    # run → "cancelled", #1616 follow-up).
+    timeout-minutes: 300
     steps:
       - name: Checkout
         uses: actions/checkout@v4
