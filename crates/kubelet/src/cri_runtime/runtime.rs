@@ -754,10 +754,10 @@ impl CriContainerRuntime {
         .await;
 
         // postStart lifecycle hook: runs immediately after the container starts
-        // (upstream kuberuntime `startContainer`). Best-effort — a failed
-        // postStart upstream restarts the container, but the conformance handler
-        // asserts the hook request was *received*, so executing it is the goal;
-        // log on failure rather than tearing the container down.
+        // (upstream kuberuntime `startContainer`, Step 4). A *successful* hook
+        // just returns; a *failed* hook kills the container and fails the start
+        // (see `fail_post_start_hook`), matching upstream
+        // `kuberuntime_container.go:319-335`.
         if let Some(ps) = container
             .lifecycle
             .as_ref()
@@ -767,10 +767,60 @@ impl CriContainerRuntime {
                 .run_lifecycle_handler(pod, container, &container_id, ps)
                 .await
             {
-                warn!("container {}: postStart hook failed: {e}", container.name);
+                return Err(self
+                    .fail_post_start_hook(cri, pod, container, &container_id, e)
+                    .await);
             }
         }
         Ok(container_id)
+    }
+
+    /// Handle a failed postStart lifecycle hook, mirroring upstream
+    /// `startContainer` (`pkg/kubelet/kuberuntime/kuberuntime_container.go:319-335`):
+    ///
+    /// 1. record a `FailedPostStartHook` **Warning** event with a *generic*
+    ///    message (`"PostStartHook failed"`) — upstream deliberately keeps the
+    ///    handler error out of the event so a hook can't leak Secret data into
+    ///    the event stream;
+    /// 2. kill the container (best-effort) so it does not keep running after its
+    ///    postStart contract was violated;
+    /// 3. return `PostStartHookError` so `create_and_start_container` fails and
+    ///    the pod worker restarts the container per its restart policy
+    ///    (upstream returns `ErrPostStartHook`).
+    async fn fail_post_start_hook(
+        &self,
+        cri: &mut CriClient,
+        pod: &Pod,
+        container: &rusternetes_common::resources::pod::Container,
+        container_id: &str,
+        err: anyhow::Error,
+    ) -> anyhow::Error {
+        warn!("container {}: postStart hook failed: {err}", container.name);
+        self.emit_event(
+            pod,
+            Some(&container.name),
+            crate::events::FAILED_POST_START_HOOK,
+            rusternetes_common::resources::EventType::Warning,
+            "PostStartHook failed",
+        )
+        .await;
+        // gracePeriodOverride is nil upstream → the pod's grace period applies
+        // (default 30s when unset).
+        let grace = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.termination_grace_period_seconds)
+            .unwrap_or(30);
+        if let Err(kill_err) = cri.stop_container(container_id, grace).await {
+            warn!(
+                "container {}: failed to kill after postStart failure: {kill_err}",
+                container.name
+            );
+        }
+        anyhow::anyhow!(
+            "PostStartHookError: container {} postStart hook failed: {err}",
+            container.name
+        )
     }
 
     /// Fetch the ConfigMap/Secret objects a container's env references —
@@ -3326,6 +3376,92 @@ mod tests {
         assert_eq!(
             ev.event_type,
             rusternetes_common::resources::EventType::Normal
+        );
+    }
+
+    /// #1554: a failed postStart lifecycle hook must kill the container and
+    /// record a `FailedPostStartHook` **Warning** event, then fail the container
+    /// start — mirroring upstream `startContainer`
+    /// (`kuberuntime_container.go:319-335`), which records the event, calls
+    /// `killContainer`, and returns `ErrPostStartHook`.
+    ///
+    /// This drives `fail_post_start_hook` directly (the full
+    /// `create_and_start_container` path needs a live CRI): it asserts the
+    /// Warning event lands with the generic, secret-safe message and that the
+    /// returned error is the `PostStartHookError`, which the callers propagate
+    /// via `?` to fail the start.
+    #[tokio::test]
+    async fn failed_post_start_hook_emits_event_and_returns_error() {
+        use rusternetes_common::resources::pod::PodSpec;
+
+        let storage = Arc::new(StorageBackend::new_memory());
+        let runtime = CriContainerRuntime::connect(
+            "/tmp/rusternetes-test-missing-cri.sock",
+            "",
+            "/tmp/rusternetes-test-logs",
+        )
+        .await
+        .unwrap()
+        .with_event_recorder(Arc::clone(&storage));
+
+        let mut pod = Pod::new(
+            "poststart-fail",
+            PodSpec {
+                containers: vec![rusternetes_common::resources::pod::Container {
+                    name: "app".to_string(),
+                    image: "busybox".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        pod.metadata.namespace = Some("default".to_string());
+        pod.metadata.uid = "poststart-fail-uid".to_string();
+        let container = pod.spec.as_ref().unwrap().containers[0].clone();
+
+        // The CRI socket is absent, so the best-effort kill fails silently — the
+        // event + returned error contract is what matters here.
+        let mut cri = runtime.cri.clone();
+        let err = runtime
+            .fail_post_start_hook(
+                &mut cri,
+                &pod,
+                &container,
+                "container-abc123",
+                anyhow::anyhow!("exec hook exited 1"),
+            )
+            .await;
+
+        // Returned error is the PostStartHookError callers propagate to fail the
+        // start (upstream `ErrPostStartHook`).
+        assert!(
+            err.to_string().contains("PostStartHookError"),
+            "must return PostStartHookError, got: {err}"
+        );
+
+        // A FailedPostStartHook Warning event was recorded, with the generic
+        // message (upstream keeps the handler error out to avoid secret leaks).
+        let obj = crate::events::container_object_reference(&pod, "app");
+        let key = format!(
+            "/registry/events/default/{}",
+            Event::generate_name(&obj, crate::events::FAILED_POST_START_HOOK)
+        );
+        let ev: Event = storage
+            .get(&key)
+            .await
+            .expect("FailedPostStartHook event must be recorded");
+        assert_eq!(ev.reason, crate::events::FAILED_POST_START_HOOK);
+        assert_eq!(
+            ev.event_type,
+            rusternetes_common::resources::EventType::Warning
+        );
+        assert_eq!(
+            ev.message, "PostStartHook failed",
+            "message must be generic (no handler output) so a hook can't leak secrets"
+        );
+        assert_eq!(
+            ev.involved_object.field_path.as_deref(),
+            Some("spec.containers{app}")
         );
     }
 
