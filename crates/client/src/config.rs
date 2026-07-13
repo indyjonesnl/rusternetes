@@ -19,6 +19,12 @@ pub struct ClientConfig {
     /// Client private-key PEM for mTLS auth (#1578). See `client_cert_pem`.
     /// Mirrors upstream `rest.TLSClientConfig.KeyData`.
     pub client_key_pem: Option<String>,
+    /// Skip TLS verification of the api-server's certificate, mirroring a
+    /// kubeconfig `cluster.insecure-skip-tls-verify: true` (#1593). When set,
+    /// [`crate::http::ApiClient::from_config`] accepts any server cert. Upstream
+    /// kubectl precedence: insecure wins over any supplied CA. Defaults `false`
+    /// (verify against the CA / system roots).
+    pub insecure_skip_tls_verify: bool,
 }
 
 impl ClientConfig {
@@ -51,6 +57,8 @@ impl ClientConfig {
             // In-cluster auth uses the bearer SA token, not a client cert.
             client_cert_pem: None,
             client_key_pem: None,
+            // In-cluster config always ships a CA (SA `ca.crt`); verify.
+            insecure_skip_tls_verify: false,
         })
     }
 }
