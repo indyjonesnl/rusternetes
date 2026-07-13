@@ -30,6 +30,9 @@ pub const STARTED_CONTAINER: &str = "Started";
 pub const FAILED_CONTAINER: &str = "Failed";
 /// Container is being killed.
 pub const KILLING_CONTAINER: &str = "Killing";
+/// A postStart lifecycle hook failed; the container is killed
+/// (`FailedPostStartHook`). Mirrors upstream `pkg/kubelet/events`.
+pub const FAILED_POST_START_HOOK: &str = "FailedPostStartHook";
 /// Container start is in back-off (`BackOffStartContainer`).
 pub const BACK_OFF_START_CONTAINER: &str = "BackOff";
 /// A liveness/readiness/startup probe failed (`ContainerUnhealthy`).
