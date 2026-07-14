@@ -7,8 +7,7 @@ name: Publish images
 #   * main           — moving alias for the latest successful publish.
 #
 # Consumers:
-#   * feature-conformance.yml + node-conformance.yml + conformance-sig-*.yml
-#     nightlies pull :main.
+#   * node-conformance.yml + the per-target conformance-*.yml nightlies pull :main.
 #   * All consumers auto-fall back to a local compose build when the pull
 #     fails (ci/actions/bring-up-cluster / run-node-conformance.sh).
 #

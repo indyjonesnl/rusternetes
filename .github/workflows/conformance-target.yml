@@ -1,28 +1,28 @@
-name: conformance-sig (reusable)
+name: conformance-target (reusable)
 
-# Reusable per-SIG conformance engine. Brings up the multi-container SQLite
-# (rhino) stack via the shared `bring-up-cluster` action, runs ONE SIG's
-# [Conformance] slice (or a narrowed focus) through Hydrophone, publishes a
-# dynamic passed/total badge, and tears down.
+# Reusable per-target conformance engine. Brings up the multi-container SQLite
+# (rhino) stack via the shared `bring-up-cluster` action, runs ONE target's
+# focus (a SIG's [Conformance] slice, or a curated feature focus) through
+# Hydrophone, publishes a dynamic passed/total badge, and tears down.
 #
-# The thin per-SIG callers (.github/workflows/conformance-sig-<name>.yml,
-# generated from ci/conformance/sigs.json) invoke this with their `sig`. It is
-# also directly `workflow_dispatch`-able for ad-hoc runs.
+# The thin per-target callers (.github/workflows/conformance-<name>.yml,
+# generated from ci/conformance/targets.json) invoke this with their `target`.
+# It is also directly `workflow_dispatch`-able for ad-hoc runs.
 #
 # NON-GATING: test failures do NOT fail the job — only an infra failure (no
-# junit) does (see scripts/conformance-sig-run.sh). A FOCUSED run (non-empty
+# junit) does (see scripts/conformance-target-run.sh). A FOCUSED run (non-empty
 # `focus`) runs the tests but does NOT publish the badge — a one-test count is
-# not the SIG's pass rate (FR-011).
+# not the target's pass rate (FR-011).
 
 on:
   workflow_call:
     inputs:
-      sig:
-        description: "SIG name (must exist in ci/conformance/sigs.json)"
+      target:
+        description: "Target name (must exist in ci/conformance/targets.json)"
         required: true
         type: string
       focus:
-        description: "Ginkgo --focus override. Empty = full SIG run (publishes badge)."
+        description: "Ginkgo --focus override. Empty = full target run (publishes badge)."
         required: false
         type: string
         default: ''
@@ -32,18 +32,18 @@ on:
         type: string
         default: main
       publish-badge:
-        description: "Publish the SIG badge on a full run (ignored for focused runs)."
+        description: "Publish the target badge on a full run (ignored for focused runs)."
         required: false
         type: boolean
         default: true
   workflow_dispatch:
     inputs:
-      sig:
-        description: "SIG name (must exist in ci/conformance/sigs.json)"
+      target:
+        description: "Target name (must exist in ci/conformance/targets.json)"
         required: true
         type: string
       focus:
-        description: "Ginkgo --focus override. Empty = full SIG run (publishes badge)."
+        description: "Ginkgo --focus override. Empty = full target run (publishes badge)."
         required: false
         type: string
         default: ''
@@ -53,7 +53,7 @@ on:
         type: string
         default: main
       publish-badge:
-        description: "Publish the SIG badge on a full run (ignored for focused runs)."
+        description: "Publish the target badge on a full run (ignored for focused runs)."
         required: false
         type: boolean
         default: true
@@ -63,18 +63,18 @@ env:
   HYDROPHONE_VERSION: v0.7.0
 
 jobs:
-  sig:
-    name: ${{ inputs.sig }}${{ inputs.focus != '' && ' (focused)' || '' }}
+  target:
+    name: ${{ inputs.target }}${{ inputs.focus != '' && ' (focused)' || '' }}
     runs-on: arc-runner-set-conformance
     # contents:write lets the badge step push to the orphan `badges` branch
     # (best-effort; never fails the run).
     permissions:
       contents: write
-    # A full per-SIG [Conformance] slice is much bigger than a single [Feature]
-    # focus, and every failing spec (rusternetes is not yet 100%) burns its
-    # per-test ginkgo timeout — so this needs the old canary's ~300-min budget,
-    # not the 90 min copied from feature-conformance (which timed out every SIG
-    # run → "cancelled", #1616 follow-up).
+    # A full SIG [Conformance] slice is much bigger than a single feature focus,
+    # and every failing spec (rusternetes is not yet 100%) burns its per-test
+    # ginkgo timeout — so this needs the old canary's ~300-min budget, not the
+    # 90 min that timed out every SIG run → "cancelled" (#1616). Feature targets
+    # are small and finish well inside this ceiling.
     timeout-minutes: 300
     steps:
       - name: Checkout
@@ -89,37 +89,37 @@ jobs:
           kubectl-version: v1.35.0
           image-tag: ${{ inputs.image-tag }}
 
-      - name: Run SIG conformance
+      - name: Run target conformance
         id: run
         env:
-          SIG: ${{ inputs.sig }}
+          TARGET: ${{ inputs.target }}
           FOCUS: ${{ inputs.focus }}
         run: |
           set -euo pipefail
-          args=(--sig "$SIG" --output-dir "sig-out/$SIG")
+          args=(--target "$TARGET" --output-dir "target-out/$TARGET")
           if [ -n "$FOCUS" ]; then
             args+=(--focus "$FOCUS")
           fi
-          bash scripts/conformance-sig-run.sh "${args[@]}"
+          bash scripts/conformance-target-run.sh "${args[@]}"
 
-      - name: Update SIG badge
+      - name: Update target badge
         # Full runs only (empty focus) — a focused run must not clobber the
-        # SIG's aggregate badge (FR-011). Best-effort: never reddens the run.
+        # target's aggregate badge (FR-011). Best-effort: never reddens the run.
         if: ${{ always() && inputs.publish-badge && inputs.focus == '' }}
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash scripts/update-badge.sh \
-            "${{ inputs.sig }}" "${{ inputs.sig }}" \
+            "${{ inputs.target }}" "${{ inputs.target }}" \
             "${{ steps.run.outputs.passed }}" "${{ steps.run.outputs.total }}"
 
-      - name: Upload SIG artifacts
+      - name: Upload target artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: conformance-${{ inputs.sig }}${{ inputs.focus != '' && '-focused' || '' }}
-          path: sig-out/${{ inputs.sig }}/
+          name: conformance-${{ inputs.target }}${{ inputs.focus != '' && '-focused' || '' }}
+          path: target-out/${{ inputs.target }}/
           retention-days: 14
 
       - name: Tear down cluster
