@@ -58,6 +58,10 @@ case "$ENVIRONMENT" in local|ci|cloud) ;; *) vs_die "unknown --env: $ENVIRONMENT
 vs_require_tools
 vs_validate_registry || vs_die "isolation-target registry is invalid" "$VS_EX_USAGE"
 vs_resolve_target "$MODULE" || vs_die "unknown module: $MODULE" "$VS_EX_USAGE"
+# Optional single-test proof: narrow the scoped subset (mirrors
+# conformance-target-run.sh --focus). Leaves the registry default in place for
+# normal runs.
+VS_FOCUS="${VS_FOCUS_OVERRIDE:-$VS_FOCUS}"
 
 # --- pre-bring-up guard (FR-003): exactly one component --------------------
 vs_guard_recipe "$MODULE"

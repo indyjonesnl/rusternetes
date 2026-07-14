@@ -49,9 +49,12 @@ vs_die() {
 # ---------------------------------------------------------------------------
 
 # vs_count_rusternetes_images  — read image refs on stdin (one per line), print
-# how many contain the substring "rusternetes". Blank lines ignored.
+# how many DISTINCT refs contain the substring "rusternetes". Distinct, not
+# occurrences: a DaemonSet/Deployment legitimately runs one image across N pods,
+# so N copies of the same rusternetes image is still ONE component. Two
+# different rusternetes images means two components (guard violation).
 vs_count_rusternetes_images() {
-  grep -c -E 'rusternetes' 2>/dev/null || true
+  grep -E 'rusternetes' 2>/dev/null | sort -u | grep -c . || true
 }
 
 # vs_validate_registry [registry-path]
@@ -169,12 +172,19 @@ vs_teardown() {
 }
 
 # vs_create_baseline <cluster> <k8s-version>
+# A bare minor version (vX.Y) uses kind's bundled default node image (whose
+# patch version tracks the kind release); a full vX.Y.Z pins kindest/node:vX.Y.Z.
 vs_create_baseline() {
   local cluster="$1" version="$2" root; root="$(vs_repo_root)"
-  local image="kindest/node:${version}"
-  vs_log "creating vanilla baseline cluster '$cluster' (node image $image)"
+  local image_args=()
+  if [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    image_args=(--image "kindest/node:${version}")
+    vs_log "creating vanilla baseline cluster '$cluster' (node image kindest/node:${version})"
+  else
+    vs_log "creating vanilla baseline cluster '$cluster' (kind default node image for $version)"
+  fi
   kind create cluster --name "$cluster" \
-    --image "$image" \
+    "${image_args[@]}" \
     --config "$root/ci/vanilla-swap/kind/base-cluster.yaml" \
     --kubeconfig "$(vs_kubeconfig_path "$cluster")" \
     --wait 120s
@@ -217,17 +227,58 @@ vs_swap_static_pod() {
   done < <(awk '/^extraArgs:/{f=1;next} f&&/^[[:space:]]*-/{gsub(/^[[:space:]]*-[[:space:]]*"?|"?[[:space:]]*$/,"");print} f&&/^[^[:space:]-]/{f=0}' "$root/$recipe")
 }
 
-# vs_swap_daemonset <recipe> <image> <kubeconfig>
+# vs_swap_daemonset <cluster> <recipe> <image> <kubeconfig>
+# Replaces the vanilla kube-proxy DaemonSet with a rusternetes API-mode
+# DaemonSet. The rusternetes component authenticates to the vanilla api-server
+# with client-cert auth from the control-plane admin kubeconfig (kind's
+# kube-proxy uses a projected tokenFile, unsupported by the rusternetes
+# kubeconfig loader), so we copy admin.conf into a Secret and mount it.
 vs_swap_daemonset() {
-  local recipe="$1" image="$2" kubeconfig="$3"
+  local cluster="$1" recipe="$2" image="$3" kubeconfig="$4"
   local root; root="$(vs_repo_root)"
-  local ns name container
+  local ns vanilla secret node
   ns="$(vs_recipe_field "$root/$recipe" namespace)"
-  name="$(vs_recipe_field "$root/$recipe" name)"
-  container="$(vs_recipe_field "$root/$recipe" container)"
-  vs_log "swapping daemonset $ns/$name container $container -> $image"
-  KUBECONFIG="$kubeconfig" kubectl -n "$ns" set image "daemonset/$name" "${container}=${image}"
-  KUBECONFIG="$kubeconfig" kubectl -n "$ns" rollout status "daemonset/$name" --timeout=120s
+  vanilla="$(vs_recipe_field "$root/$recipe" vanillaDaemonSet)"
+  secret="$(vs_recipe_field "$root/$recipe" kubeconfigSecret)"
+  node="$(vs_control_plane_node "$cluster")"
+
+  # api-server URL = the control-plane container IP (kube-proxy is hostNetwork).
+  local api_ip
+  api_ip="$(docker inspect "$node" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' | head -1)"
+  export VS_IMAGE="$image"
+  export VS_APISERVER_URL="https://${api_ip}:6443"
+  export VS_CLUSTER_CIDR="${VS_CLUSTER_CIDR:-$(vs_service_cidr "$cluster" "$kubeconfig")}"
+  export VS_NODEPORT_RANGE="${VS_NODEPORT_RANGE:-30000-32767}"
+
+  vs_log "removing vanilla DaemonSet $ns/$vanilla"
+  KUBECONFIG="$kubeconfig" kubectl -n "$ns" delete daemonset "$vanilla" --ignore-not-found
+
+  vs_log "creating kubeconfig secret $ns/$secret from admin.conf"
+  local tmpkc; tmpkc="$(mktemp)"
+  docker exec "$node" cat /etc/kubernetes/admin.conf >"$tmpkc"
+  KUBECONFIG="$kubeconfig" kubectl -n "$ns" create secret generic "$secret" \
+    --from-file=admin.conf="$tmpkc" --dry-run=client -o yaml \
+    | KUBECONFIG="$kubeconfig" kubectl apply -f -
+  rm -f "$tmpkc"
+
+  vs_log "applying rusternetes API-mode DaemonSet (api=$VS_APISERVER_URL cidr=$VS_CLUSTER_CIDR)"
+  vs_recipe_template "$root/$recipe" | envsubst '${VS_IMAGE} ${VS_APISERVER_URL} ${VS_CLUSTER_CIDR} ${VS_NODEPORT_RANGE}' \
+    | KUBECONFIG="$kubeconfig" kubectl apply -f -
+  KUBECONFIG="$kubeconfig" kubectl -n "$ns" rollout status "daemonset/rusternetes-kube-proxy" --timeout=120s
+}
+
+# vs_service_cidr <cluster> <kubeconfig> — read --service-cluster-ip-range off the
+# vanilla kube-apiserver static pod.
+vs_service_cidr() {
+  local cluster="$1" kubeconfig="$2"
+  KUBECONFIG="$kubeconfig" kubectl -n kube-system get pod -l component=kube-apiserver \
+    -o jsonpath='{.items[0].spec.containers[0].command}' 2>/dev/null \
+    | tr ',' '\n' | sed -nE 's/.*service-cluster-ip-range=([0-9./]+).*/\1/p' | head -1
+}
+
+# vs_recipe_template <recipe> — print the multi-line `template: |` block.
+vs_recipe_template() {
+  awk '/^template: \|/{f=1;next} f{if(/^[^[:space:]]/){f=0;next} sub(/^  /,"");print}' "$1"
 }
 
 # vs_swap_join_worker <cluster> <recipe> <image> <kubeconfig>
@@ -267,7 +318,7 @@ vs_apply_swap() {
   image="$(vs_resolved_image)"
   case "$VS_SWAP" in
     static-pod)  vs_swap_static_pod "$cluster" "$VS_RECIPE" "$image" ;;
-    daemonset)   vs_swap_daemonset "$VS_RECIPE" "$image" "$kubeconfig" ;;
+    daemonset)   vs_swap_daemonset "$cluster" "$VS_RECIPE" "$image" "$kubeconfig" ;;
     join-worker) vs_swap_join_worker "$cluster" "$VS_RECIPE" "$image" "$kubeconfig" ;;
     *) vs_die "unknown swap kind: $VS_SWAP" "$VS_EX_USAGE" ;;
   esac
@@ -343,8 +394,8 @@ vs_readiness_probe() {
       [ -n "$(KUBECONFIG="$kubeconfig" kubectl -n kube-system get lease "$lease" \
         -o 'jsonpath={.spec.holderIdentity}' 2>/dev/null)" ] ;;
     service-programmed)
-      # kube-proxy DaemonSet fully rolled out on every node.
-      KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status daemonset/kube-proxy --timeout=5s >/dev/null 2>&1 ;;
+      # rusternetes kube-proxy DaemonSet fully rolled out on every node.
+      KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status daemonset/rusternetes-kube-proxy --timeout=5s >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
 }
