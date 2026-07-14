@@ -22,7 +22,7 @@ VS_EX_NOTUP=5      # module never reached readiness within timeout
 
 VS_MODULES="api-server kubelet scheduler controller-manager kube-proxy"
 VS_SWAPS="static-pod daemonset join-worker"
-VS_READINESS_KINDS="node-ready readyz lease-held service-programmed"
+VS_READINESS_KINDS="node-ready readyz lease-held service-programmed pod-scheduled"
 
 vs_repo_root() {
   local d
@@ -204,8 +204,11 @@ vs_recipe_field() {
 }
 
 # vs_swap_static_pod <cluster> <recipe> <image>
-# Rewrites one control-plane static-pod manifest's image to the rusternetes
-# build (and appends any extraArgs), then waits for the kubelet to restart it.
+# Replaces one control-plane static-pod manifest. If the recipe carries a
+# `template:` block (preferred), the whole manifest is rendered from it (the
+# rusternetes component runs in API mode using an on-node kubeconfig); otherwise
+# falls back to an in-place image rewrite + extraArgs append. Either way the
+# node kubelet restarts just that static pod.
 vs_swap_static_pod() {
   local cluster="$1" recipe="$2" image="$3"
   local root; root="$(vs_repo_root)"
@@ -215,11 +218,17 @@ vs_swap_static_pod() {
   [ -n "$manifest" ] || vs_die "recipe $recipe has no 'manifest:' field" "$VS_EX_USAGE"
   path="/etc/kubernetes/manifests/$manifest"
 
-  vs_log "swapping static pod $manifest -> $image on $node"
-  # Rewrite the image line in place inside the node container.
-  docker exec "$node" sed -i -E "s#(^[[:space:]]*image:[[:space:]]*).*#\\1${image}#" "$path"
+  if grep -qE '^template: \|' "$root/$recipe"; then
+    vs_log "replacing static pod $manifest with rusternetes manifest ($image) on $node"
+    export VS_IMAGE="$image"
+    vs_recipe_template "$root/$recipe" \
+      | envsubst '${VS_IMAGE}' \
+      | docker exec -i "$node" sh -c "cat >'$path'"
+    return 0
+  fi
 
-  # Append extraArgs (each `  - "..."` line under extraArgs:) to the command.
+  vs_log "swapping static pod $manifest image -> $image on $node"
+  docker exec "$node" sed -i -E "s#(^[[:space:]]*image:[[:space:]]*).*#\\1${image}#" "$path"
   local arg
   while IFS= read -r arg; do
     [ -n "$arg" ] || continue
@@ -396,6 +405,16 @@ vs_readiness_probe() {
     service-programmed)
       # rusternetes kube-proxy DaemonSet fully rolled out on every node.
       KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status daemonset/rusternetes-kube-proxy --timeout=5s >/dev/null 2>&1 ;;
+    pod-scheduled)
+      # The scheduler works iff a pending, unscheduled pod gets a nodeName.
+      # API-mode rusternetes control-plane components do no leader election, so
+      # there is no lease to check — prove scheduling directly with a canary.
+      KUBECONFIG="$kubeconfig" kubectl -n default get pod vanilla-swap-canary >/dev/null 2>&1 || \
+        KUBECONFIG="$kubeconfig" kubectl -n default run vanilla-swap-canary \
+          --image=registry.k8s.io/pause:3.10 --restart=Never \
+          --overrides='{"spec":{"tolerations":[{"operator":"Exists"}]}}' >/dev/null 2>&1 || true
+      [ -n "$(KUBECONFIG="$kubeconfig" kubectl -n default get pod vanilla-swap-canary \
+        -o 'jsonpath={.spec.nodeName}' 2>/dev/null)" ] ;;
     *) return 1 ;;
   esac
 }

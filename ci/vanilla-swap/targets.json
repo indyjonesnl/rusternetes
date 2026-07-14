@@ -27,7 +27,7 @@
     "target": "sig-scheduling",
     "focus": "\\[sig-scheduling\\].*\\[Conformance\\]",
     "skip": "\\[Flaky\\]|\\[Serial\\]",
-    "readiness": "lease-held"
+    "readiness": "pod-scheduled"
   },
   {
     "module": "controller-manager",
