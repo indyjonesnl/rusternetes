@@ -179,6 +179,51 @@ for d in cert-manager cert-manager-webhook cert-manager-cainjector; do
     ${KUBECTL} -n cert-manager rollout status "deploy/${d}" --timeout=300s
 done
 
+# A Deployment being Available does NOT mean the admission path is ready: the
+# webhook only accepts requests once cainjector has injected the webhook's CA
+# into the ValidatingWebhookConfiguration `caBundle`. cainjector injects on
+# watching the `cert-manager-webhook-ca` Secret get created by the webhook. If
+# that one create watch-event is missed (a watch-delivery race under load — see
+# the api-server WatchCache reconnect fix in #1592, still not 100% closed), the
+# caBundle stays empty forever and every admission call fails with
+# `UnknownIssuer`. cainjector's informer resync is 10h, so it never self-heals
+# in the smoke's timescale.
+#
+# Gate explicitly on the caBundle being populated, and if it hasn't landed by
+# the grace deadline, bounce cainjector once — a fresh list-watch sees the
+# now-existing Secret and injects deterministically. This is the same recovery
+# a real operator performs, and it turns a rare missed-event race into a
+# reliable pass instead of a nightly-red flake.
+WEBHOOK_CFG="validatingwebhookconfiguration cert-manager-webhook"
+CABUNDLE_JSONPATH='{.webhooks[0].clientConfig.caBundle}'
+echo "[6b] Waiting for cainjector to inject the webhook caBundle..."
+bounced=0
+injected=0
+for i in $(seq 1 60); do
+    ca="$(${KUBECTL} get ${WEBHOOK_CFG} -o jsonpath="${CABUNDLE_JSONPATH}" 2>/dev/null || true)"
+    if [ -n "${ca}" ]; then
+        echo "caBundle injected after $((i * 2))s"
+        injected=1
+        break
+    fi
+    # Halfway through the ~120s budget, force a fresh cainjector list-watch.
+    if [ "${i}" -eq 30 ] && [ "${bounced}" -eq 0 ]; then
+        echo "caBundle still empty after 60s — restarting cainjector to force a re-list"
+        ${KUBECTL} -n cert-manager rollout restart deploy/cert-manager-cainjector || true
+        ${KUBECTL} -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=120s || true
+        bounced=1
+    fi
+    sleep 2
+done
+if [ "${injected}" -ne 1 ]; then
+    echo "ERROR: cainjector never populated the webhook caBundle."
+    ${KUBECTL} get ${WEBHOOK_CFG} -o yaml \
+        >"${RESULTS_DIR}/cert-manager-validatingwebhook.yaml" 2>&1 || true
+    ${KUBECTL} -n cert-manager logs deploy/cert-manager-cainjector --tail=200 \
+        >"${RESULTS_DIR}/cert-manager-cainjector.log" 2>&1 || true
+    exit 1
+fi
+
 echo "[7/7] Issuing a self-signed Certificate and verifying the Secret..."
 # The webhook may briefly reject requests until cainjector has wired its
 # caBundle, so retry the apply.
