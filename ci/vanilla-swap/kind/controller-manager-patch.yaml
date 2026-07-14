@@ -1,0 +1,5 @@
+# Static-pod swap recipe: kube-controller-manager -> rusternetes controller-manager.
+# See apiserver-patch.yaml for how vs_swap_static_pod() consumes this file.
+manifest: kube-controller-manager.yaml
+component: kube-controller-manager
+extraArgs: []

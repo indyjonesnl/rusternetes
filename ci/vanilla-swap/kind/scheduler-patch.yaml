@@ -1,0 +1,7 @@
+# Static-pod swap recipe: kube-scheduler -> rusternetes scheduler.
+# See apiserver-patch.yaml for how vs_swap_static_pod() consumes this file.
+# The rusternetes scheduler reuses the same --kubeconfig and leader-election
+# lease name kubeadm configured, so vanilla components see an unchanged lease.
+manifest: kube-scheduler.yaml
+component: kube-scheduler
+extraArgs: []

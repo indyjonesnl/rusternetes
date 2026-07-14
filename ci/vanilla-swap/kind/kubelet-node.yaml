@@ -1,0 +1,27 @@
+# Join-worker swap recipe: add ONE extra worker node running the rusternetes
+# kubelet, joined to the otherwise-vanilla kind control plane via `kubeadm join`.
+#
+# Consumed by vs_swap_join_worker() in scripts/vanilla-swap-common.sh, which:
+#   1. reads the join parameters below;
+#   2. starts a node container from the rusternetes kubelet image (imageRepo
+#      from ci/vanilla-swap/targets.json + the resolved tag) with its own
+#      containerd (CRI) and a spec-compliant CNI plugin (bridge);
+#   3. generates a `kubeadm join` bootstrap token on the kind control plane and
+#      joins the node so it registers against the vanilla api-server;
+#   4. labels/taints the node so scoped workloads land on it.
+#
+# The baseline control plane and the upstream worker in base-cluster.yaml are
+# untouched — the rusternetes kubelet is strictly additive.
+nodeName: rusternetes-kubelet
+# Standard interfaces only (CRI/CNI) — no rusternetes-private coupling.
+criSocket: unix:///run/containerd/containerd.sock
+cni: bridge
+labels:
+  rusternetes.io/module-under-test: "kubelet"
+# Taint so only pods that explicitly target this node (via the label/toleration
+# the harness applies to the scoped workloads) schedule here, keeping the run
+# attributable to the rusternetes kubelet.
+taints:
+  - key: "rusternetes.io/module-under-test"
+    value: "kubelet"
+    effect: "NoSchedule"

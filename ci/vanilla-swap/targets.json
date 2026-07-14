@@ -1,0 +1,52 @@
+[
+  {
+    "module": "kubelet",
+    "swap": "join-worker",
+    "recipe": "ci/vanilla-swap/kind/kubelet-node.yaml",
+    "imageRepo": "ghcr.io/indyjonesnl/rusternetes/kubelet",
+    "target": "sig-node",
+    "focus": "\\[NodeConformance\\]",
+    "skip": "\\[Flaky\\]|\\[Serial\\]|\\[Slow\\]",
+    "readiness": "node-ready"
+  },
+  {
+    "module": "api-server",
+    "swap": "static-pod",
+    "recipe": "ci/vanilla-swap/kind/apiserver-patch.yaml",
+    "imageRepo": "ghcr.io/indyjonesnl/rusternetes/api-server",
+    "target": "sig-api-machinery",
+    "focus": "\\[sig-api-machinery\\].*\\[Conformance\\]",
+    "skip": "\\[Flaky\\]|\\[Serial\\]",
+    "readiness": "readyz"
+  },
+  {
+    "module": "scheduler",
+    "swap": "static-pod",
+    "recipe": "ci/vanilla-swap/kind/scheduler-patch.yaml",
+    "imageRepo": "ghcr.io/indyjonesnl/rusternetes/scheduler",
+    "target": "sig-scheduling",
+    "focus": "\\[sig-scheduling\\].*\\[Conformance\\]",
+    "skip": "\\[Flaky\\]|\\[Serial\\]",
+    "readiness": "lease-held"
+  },
+  {
+    "module": "controller-manager",
+    "swap": "static-pod",
+    "recipe": "ci/vanilla-swap/kind/controller-manager-patch.yaml",
+    "imageRepo": "ghcr.io/indyjonesnl/rusternetes/controller-manager",
+    "target": "sig-apps",
+    "focus": "\\[sig-apps\\].*\\[Conformance\\]",
+    "skip": "\\[Flaky\\]|\\[Serial\\]",
+    "readiness": "lease-held"
+  },
+  {
+    "module": "kube-proxy",
+    "swap": "daemonset",
+    "recipe": "ci/vanilla-swap/kind/kube-proxy-daemonset.yaml",
+    "imageRepo": "ghcr.io/indyjonesnl/rusternetes/kube-proxy",
+    "target": "sig-network",
+    "focus": "\\[sig-network\\].*Services.*\\[Conformance\\]",
+    "skip": "\\[Flaky\\]|\\[Serial\\]",
+    "readiness": "service-programmed"
+  }
+]

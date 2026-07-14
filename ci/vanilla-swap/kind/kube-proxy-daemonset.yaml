@@ -1,0 +1,11 @@
+# DaemonSet swap recipe: kube-proxy -> rusternetes kube-proxy.
+#
+# Consumed by vs_swap_daemonset() in scripts/vanilla-swap-common.sh, which sets
+# the image of the named DaemonSet to the rusternetes image (imageRepo from
+# ci/vanilla-swap/targets.json + the resolved tag) via:
+#   kubectl -n <namespace> set image daemonset/<name> <container>=<image>
+# and keeps the existing args/ConfigMap. All other cluster components stay
+# unmodified upstream.
+namespace: kube-system
+name: kube-proxy
+container: kube-proxy

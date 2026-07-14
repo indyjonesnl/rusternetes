@@ -1,0 +1,96 @@
+name: Vanilla Module Swap
+
+# Stand up an UNMODIFIED upstream Kubernetes cluster (kind) and swap in exactly
+# ONE rusternetes component, then run a test subset scoped to that component.
+# One module per job (matrix) so a failure is attributable to a single module
+# and each job fits the runner time budget.
+# See specs/003-vanilla-module-swap/ and docs/testing/vanilla-module-swap.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      module:
+        description: "Which module to isolate (or 'all')"
+        required: false
+        default: "all"
+        type: choice
+        options: ["all", "kubelet", "api-server", "scheduler", "controller-manager", "kube-proxy"]
+      image-tag:
+        description: "GHCR rusternetes image tag to swap in"
+        required: false
+        default: main
+  schedule:
+    # 04:00 UTC nightly (offset from Node Conformance at 03:00). Self-hosted
+    # runner; respects the GH Actions minute budget (project memory).
+    - cron: "0 4 * * *"
+
+jobs:
+  vanilla-swap:
+    # Only run the matrix entry the dispatcher asked for (or all of them).
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.module == 'all' ||
+      inputs.module == matrix.module
+    runs-on: arc-runner-set-conformance
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [kubelet, api-server, scheduler, controller-manager, kube-proxy]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Tool prereqs (fail fast — no apt-get install)
+        run: |
+          set -euo pipefail
+          for t in docker jq curl tar; do
+            command -v "$t" >/dev/null 2>&1 || { echo "missing required tool: $t"; exit 1; }
+          done
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install kind + kubectl + hydrophone (download only, no sudo)
+        run: |
+          set -euo pipefail
+          bin="$HOME/.local/bin"
+          if ! command -v kind >/dev/null 2>&1; then
+            curl -fsSLo "$bin/kind" https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64
+            chmod +x "$bin/kind"
+          fi
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -fsSLo "$bin/kubectl" "https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl"
+            chmod +x "$bin/kubectl"
+          fi
+          if ! command -v hydrophone >/dev/null 2>&1; then
+            go install sigs.k8s.io/hydrophone@latest && cp "$(go env GOPATH)/bin/hydrophone" "$bin/" || {
+              echo "hydrophone install failed"; exit 1; }
+          fi
+          kind version && kubectl version --client && hydrophone version || true
+
+      - name: Isolate module '${{ matrix.module }}' in a vanilla cluster
+        env:
+          RUSTERNETES_IMAGE_TAG: ${{ github.event.inputs.image-tag || 'main' }}
+          CONTAINER_RUNTIME: docker
+        run: |
+          set -euo pipefail
+          bash scripts/vanilla-swap-run.sh --module "${{ matrix.module }}" --env ci
+
+      - name: Publish run result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vanilla-swap-${{ matrix.module }}-result
+          path: /tmp/vanilla-swap-${{ matrix.module }}.*/run-result.json
+          if-no-files-found: warn
+
+      # Teardown is unconditional inside the harness (trap on EXIT); this belt-and-
+      # braces step removes anything left if the runner killed the harness.
+      - name: Ensure teardown
+        if: always()
+        run: |
+          kind delete cluster --name "vanilla-swap-${{ matrix.module }}" >/dev/null 2>&1 || true
+          docker ps -aq --filter "label=rusternetes-swap-cluster=vanilla-swap-${{ matrix.module }}" \
+            | xargs -r docker rm -f >/dev/null 2>&1 || true

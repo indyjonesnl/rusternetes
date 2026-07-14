@@ -1,0 +1,21 @@
+# Vanilla baseline kind cluster for single-module swap testing.
+#
+# Every component here is UNMODIFIED upstream Kubernetes. Exactly one rusternetes
+# component is swapped in afterwards by scripts/vanilla-swap-run.sh; nothing in
+# this file references rusternetes. Node image is pinned to the target
+# Kubernetes version (v1.35) at cluster-create time via `kind create --image`.
+#
+# Topology:
+#   - 1 control-plane node (kube-apiserver / scheduler / controller-manager as
+#     static pods; kube-proxy DaemonSet; kubelet from the node image)
+#   - 1 upstream worker node (keeps an all-vanilla node available so the cluster
+#     is healthy even before/without the rusternetes kubelet node joining)
+#
+# The rusternetes-kubelet node (module=kubelet) is added SEPARATELY as an extra
+# worker via `kubeadm join` — see ci/vanilla-swap/kind/kubelet-node.yaml — so it
+# is not declared here.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
