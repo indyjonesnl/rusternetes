@@ -1,56 +1,86 @@
 [
   {
     "name": "sig-node",
+    "kind": "sig",
     "focus": "\\[sig-node\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-node\\]",
     "skip": "\\[Flaky\\]",
     "description": "runtime/CRI on the node: pod lifecycle, exec/attach, probes, security context, env, sysctls, ephemeral containers"
   },
   {
     "name": "sig-api-machinery",
+    "kind": "sig",
     "focus": "\\[sig-api-machinery\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-api-machinery\\]",
     "skip": "\\[Flaky\\]",
     "description": "apiserver contract: CRDs, admission webhooks, watch, namespaces, garbage collection, resource quota, server-side apply"
   },
   {
     "name": "sig-storage",
+    "kind": "sig",
     "focus": "\\[sig-storage\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-storage\\]",
     "skip": "\\[Flaky\\]",
     "description": "volume/mount path: emptyDir, configMap/secret/projected/downwardAPI volumes, subpaths"
   },
   {
     "name": "sig-apps",
+    "kind": "sig",
     "focus": "\\[sig-apps\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-apps\\]",
     "skip": "\\[Flaky\\]",
     "description": "workload controllers: Deployment, ReplicaSet, StatefulSet, DaemonSet, Job, CronJob (rolling updates, scale, ordered bring-up)"
   },
   {
     "name": "sig-network",
+    "kind": "sig",
     "focus": "\\[sig-network\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-network\\]",
     "skip": "\\[Flaky\\]",
     "description": "pod networking, Services/ClusterIP, DNS, hostPort"
   },
   {
     "name": "sig-cli",
+    "kind": "sig",
     "focus": "\\[sig-cli\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-cli\\]",
     "skip": "\\[Flaky\\]",
     "description": "kubectl behaviours: create/apply/run/expose/patch/label"
   },
   {
     "name": "sig-scheduling",
+    "kind": "sig",
     "focus": "\\[sig-scheduling\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-scheduling\\]",
     "skip": "\\[Flaky\\]",
     "description": "predicates and basic scheduling: node selectors, taints/tolerations, resource fit"
   },
   {
     "name": "sig-auth",
+    "kind": "sig",
     "focus": "\\[sig-auth\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-auth\\]",
     "skip": "\\[Flaky\\]",
     "description": "ServiceAccount tokens, projected SA volumes, related authn/authz"
   },
   {
     "name": "sig-instrumentation",
+    "kind": "sig",
     "focus": "\\[sig-instrumentation\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-instrumentation\\]",
     "skip": "\\[Flaky\\]",
     "description": "Events API lifecycle: create/patch/delete/list"
+  },
+  {
+    "name": "sysctls",
+    "kind": "feature",
+    "focus": "\\[(Feature|NodeFeature):Sysctls\\]",
+    "skip": "\\[Flaky\\]",
+    "description": "sig-node feature-gated sysctls (safe + unsafe allowlist); largely non-[Conformance], additive to the sig-node slice"
+  },
+  {
+    "name": "probe-termination-grace-period",
+    "kind": "feature",
+    "focus": "\\[Feature:ProbeTerminationGracePeriod\\]",
+    "skip": "\\[Flaky\\]",
+    "description": "sig-node feature-gated probe-level terminationGracePeriodSeconds; additive to the sig-node slice"
+  },
+  {
+    "name": "downward-api",
+    "kind": "feature",
+    "focus": "\\[Feature:DownwardAPI\\]",
+    "skip": "\\[Flaky\\]",
+    "description": "sig-node feature-gated Downward API variants; additive to the sig-node slice"
   }
 ]

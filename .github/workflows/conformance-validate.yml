@@ -1,0 +1,63 @@
+name: Conformance validate
+
+# Cheap PR guard for the conformance scaffolding: targets manifest validity,
+# runner unit tests, generated-workflow drift, and SIG coverage (against the
+# committed sample fixture — full-set coverage is proven by the per-target
+# runs themselves, which use the real conformance image).
+#
+# Also runs the GHCR-overlay-sync and Dockerfile-crate-enumeration tests that
+# previously lived in the retired feature-conformance workflow's validate job —
+# they guard the compose overlays / image Dockerfiles and must keep running on PRs.
+#
+# No cluster, no image pull — plain bash + jq on ubuntu-latest.
+
+on:
+  pull_request:
+    paths:
+      # per-target conformance scaffolding
+      - 'ci/conformance/targets.json'
+      - 'scripts/conformance-target-run.sh'
+      - 'scripts/conformance-targets-discover.sh'
+      - 'scripts/gen-target-workflows.sh'
+      - 'scripts/tests/test-targets-manifest.sh'
+      - 'scripts/tests/test-conformance-target-run.sh'
+      - 'scripts/tests/test-target-workflows-sync.sh'
+      - 'scripts/tests/test-target-coverage.sh'
+      - 'scripts/tests/testdata/sig-coverage-sample.txt'
+      - '.github/workflows/conformance-target.yml'
+      - '.github/workflows/conformance-*.yml'
+      - '.github/workflows/conformance-validate.yml'
+      # rehomed guards (compose overlays + image Dockerfiles)
+      - 'scripts/tests/test-ghcr-overlays.sh'
+      - 'scripts/tests/test-dockerfile-crate-enumeration.sh'
+      - 'compose.ghcr.yml'
+      - 'compose.ghcr.node-conformance.yml'
+      - 'compose.sqlite.yml'
+      - 'compose.node-conformance.yml'
+      - 'Dockerfile.services'
+      - 'Dockerfile.dns'
+      - 'Dockerfile.kubectl'
+      - 'Dockerfile.all-in-one'
+      - 'Cargo.toml'
+  workflow_dispatch: {}
+
+jobs:
+  validate:
+    name: manifest + unit tests + drift + coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jq
+        run: command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
+      - name: Targets manifest validity
+        run: bash scripts/tests/test-targets-manifest.sh
+      - name: Runner unit tests
+        run: bash scripts/tests/test-conformance-target-run.sh
+      - name: Per-target workflow drift
+        run: bash scripts/tests/test-target-workflows-sync.sh
+      - name: SIG coverage (sample fixture)
+        run: bash scripts/tests/test-target-coverage.sh
+      - name: GHCR overlay sync test
+        run: bash scripts/tests/test-ghcr-overlays.sh
+      - name: Dockerfile crate-enumeration sync test
+        run: bash scripts/tests/test-dockerfile-crate-enumeration.sh

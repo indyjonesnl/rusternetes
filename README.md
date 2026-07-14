@@ -2,9 +2,10 @@
 
 [![Node Conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fnode-conformance.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/node-conformance.yml)
 
-<!-- Per-SIG conformance badges. Each shows passed/attempted for that SIG's
-     [Conformance] slice, refreshed nightly by the conformance-sig-<name>.yml
-     workflows (also runnable on demand via workflow_dispatch). -->
+<!-- Per-target conformance badges. Each shows passed/attempted for that target's
+     focus (a SIG's [Conformance] slice, or a curated feature focus), refreshed
+     nightly by the conformance-<name>.yml workflows (also runnable on demand via
+     workflow_dispatch). -->
 [![sig-node](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-node.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-node.yml)
 [![sig-api-machinery](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-api-machinery.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-api-machinery.yml)
 [![sig-storage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-storage.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-storage.yml)
@@ -14,6 +15,9 @@
 [![sig-scheduling](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-scheduling.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-scheduling.yml)
 [![sig-auth](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-auth.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-auth.yml)
 [![sig-instrumentation](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-instrumentation.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-instrumentation.yml)
+[![sysctls](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsysctls.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sysctls.yml)
+[![probe-termination-grace-period](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fprobe-termination-grace-period.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-probe-termination-grace-period.yml)
+[![downward-api](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fdownward-api.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-downward-api.yml)
 
 **A ground-up reimplementation of Kubernetes in Rust.** [Documentation Site](https://calfonso.github.io/rusternetes/)
 
@@ -265,13 +269,14 @@ See [Storage Backends](docs/storage/STORAGE_BACKENDS.md) for full details on dep
 
 Rusternetes is actively tested against the official Kubernetes v1.35 conformance test suite using [Sonobuoy](https://sonobuoy.io/).
 
-### Per-SIG conformance
+### Per-target conformance
 
-Each SIG has its own workflow that runs that SIG's `[Conformance]` slice and
+Each **target** — a SIG's `[Conformance]` slice (`kind: sig`) or a curated
+feature focus (`kind: feature`) — has its own workflow that runs that focus and
 publishes the passed/attempted badge above. Dispatch a workflow with a `focus`
 input to run one named test (e.g. to prove a PR fixes it) without running the
-whole SIG — a focused run reports the result but does **not** overwrite the
-badge. The registry lives in [`ci/conformance/sigs.json`](ci/conformance/sigs.json).
+whole target — a focused run reports the result but does **not** overwrite the
+badge. The registry lives in [`ci/conformance/targets.json`](ci/conformance/targets.json).
 
 ```bash
 # Prove a single test in CI (build the PR's code locally, run just that test):
@@ -279,7 +284,7 @@ gh workflow run conformance-sig-node.yml \
   -f focus='should be able to run with a specific user ID' \
   -f image-tag=''
 # ...or locally against a running cluster:
-bash scripts/conformance-sig-run.sh --sig sig-node \
+bash scripts/conformance-target-run.sh --target sig-node \
   --focus 'should be able to run with a specific user ID'
 ```
 
@@ -294,6 +299,14 @@ bash scripts/conformance-sig-run.sh --sig sig-node \
 | `conformance-sig-scheduling.yml` | `[sig-scheduling]` | predicates and basic scheduling: node selectors, taints/tolerations, resource fit |
 | `conformance-sig-auth.yml` | `[sig-auth]` | ServiceAccount tokens, projected SA volumes, related authn/authz |
 | `conformance-sig-instrumentation.yml` | `[sig-instrumentation]` | Events API lifecycle: create/patch/delete/list |
+
+Feature-gated targets (`kind: feature`) — additive `[Feature:*]` focuses that the SIG `[Conformance]` slices don't run:
+
+| Workflow | Focus tag | Asserts |
+|----------|-----------|---------|
+| `conformance-sysctls.yml` | `[Feature:Sysctls]` | feature-gated safe + unsafe sysctls |
+| `conformance-probe-termination-grace-period.yml` | `[Feature:ProbeTerminationGracePeriod]` | probe-level terminationGracePeriodSeconds |
+| `conformance-downward-api.yml` | `[Feature:DownwardAPI]` | feature-gated Downward API variants |
 
 ### Full-run history
 

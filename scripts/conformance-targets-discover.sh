@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Seed / refresh ci/conformance/sigs.json from the conformance image's ginkgo
-# spec list. MAINTENANCE TOOL — not in the CI path. Run it to bootstrap the
-# manifest and on every k8s-version bump to catch new [sig-xxx] labels in the
-# [Conformance] set, then hand-review the printed diff before committing.
+# Seed / refresh the kind:sig entries of ci/conformance/targets.json from the
+# conformance image's ginkgo spec list. MAINTENANCE TOOL — not in the CI path.
+# Run it to bootstrap the SIG targets and on every k8s-version bump to catch new
+# [sig-xxx] labels in the [Conformance] set, then hand-review the printed diff
+# before merging into the manifest. (kind:feature targets are curated by hand
+# and are NOT emitted here.)
 #
 # It lists every spec, keeps the [Conformance] ones, extracts each distinct
-# [sig-xxx] label, and emits a JSON manifest skeleton (one entry per SIG, with
+# [sig-xxx] label, and emits a JSON skeleton (one kind:sig entry per SIG, with
 # the canonical two-order focus regex and default skip) to stdout. It NEVER
-# writes the manifest itself — pipe to the file deliberately after review.
+# writes the manifest itself — merge the sig entries deliberately after review.
 #
 # Usage:
-#   bash scripts/conformance-sigs-discover.sh \
+#   bash scripts/conformance-targets-discover.sh \
 #       [--conformance-image IMG] [--from-file SPEC_DUMP] [--diff]
 #
 #   --from-file F   Read the ginkgo dry-run dump from F instead of running the
@@ -20,11 +22,11 @@ set -euo pipefail
 IFS=$'\n\t'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-MANIFEST="$REPO_ROOT/ci/conformance/sigs.json"
+MANIFEST="$REPO_ROOT/ci/conformance/targets.json"
 
 IMAGE="registry.k8s.io/conformance:v1.35.0"
 FROM_FILE=""; DO_DIFF=0
-die() { echo "[sigs-discover] ERROR: $*" >&2; exit 2; }
+die() { echo "[targets-discover] ERROR: $*" >&2; exit 2; }
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --conformance-image) [[ $# -ge 2 ]] || die "--conformance-image requires a value"; IMAGE="$2"; shift 2 ;;
@@ -57,6 +59,7 @@ get_specs \
 | jq -R -s '
     split("\n") | map(select(length>0)) | map({
         name: .,
+        kind: "sig",
         focus: ("\\[" + . + "\\].*\\[Conformance\\]|\\[Conformance\\].*\\[" + . + "\\]"),
         skip: "\\[Flaky\\]",
         description: ""
@@ -70,7 +73,7 @@ if [ "$DO_DIFF" -eq 1 ] && [ -f "$MANIFEST" ]; then
     new=$(comm -23 <(echo "$emitted" | jq -r '.[].name' | sort) <(jq -r '.[].name' "$MANIFEST" | sort))
     gone=$(comm -13 <(echo "$emitted" | jq -r '.[].name' | sort) <(jq -r '.[].name' "$MANIFEST" | sort))
     {
-        echo "[sigs-discover] diff vs $MANIFEST:"
+        echo "[targets-discover] diff vs $MANIFEST:"
         echo "  added:   ${new:-<none>}"
         echo "  removed: ${gone:-<none>}"
     } >&2

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Coverage guard (FR-016 / FR-002): every [Conformance] spec's [sig-xxx] label
-# must be represented in ci/conformance/sigs.json, so the union of the per-SIG
-# focuses covers the whole [Conformance] set and no spec is silently dropped.
+# must be represented by a kind:sig entry in ci/conformance/targets.json, so the
+# union of the per-SIG focuses covers the whole [Conformance] set and no spec is
+# silently dropped. (kind:feature targets are curated [Feature:*] focuses and are
+# NOT part of this completeness guarantee.)
 #
 # Sources of the spec list, in order of preference:
 #   --from-file F   read a ginkgo dry-run dump from F
@@ -11,14 +13,14 @@
 #                   the conformance runner; this default does NOT prove full coverage.
 #
 # A [Conformance] spec whose [sig-xxx] is absent from the manifest is "uncovered"
-# and fails the check — assign it to an explicit entry (e.g. sig-other) in
-# sigs.json rather than dropping it.
+# and fails the check — add a kind:sig entry (e.g. sig-other) rather than
+# dropping it.
 #
-# Run with: bash scripts/tests/test-sig-coverage.sh [--from-file F | --image IMG]
+# Run with: bash scripts/tests/test-target-coverage.sh [--from-file F | --image IMG]
 set -euo pipefail
 IFS=$'\n\t'
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-MANIFEST="$REPO_ROOT/ci/conformance/sigs.json"
+MANIFEST="$REPO_ROOT/ci/conformance/targets.json"
 FIXTURE="$REPO_ROOT/scripts/tests/testdata/sig-coverage-sample.txt"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -47,8 +49,8 @@ get_specs() {
     fi
 }
 
-# SIGs present in the manifest, one per line.
-manifest_sigs=$(jq -r '.[].name' "$MANIFEST" | sort -u)
+# kind:sig target names in the manifest, one per line.
+manifest_sigs=$(jq -r '.[] | select(.kind=="sig") | .name' "$MANIFEST" | sort -u)
 
 # SIGs that appear on [Conformance] spec lines, one per line.
 conformance_sigs=$(get_specs \
@@ -59,13 +61,13 @@ conformance_sigs=$(get_specs \
 
 [ -n "$conformance_sigs" ] || fail "no [Conformance] specs with a [sig-*] tag found in the spec list ($USING)"
 
-# Any conformance SIG not in the manifest => uncovered.
+# Any conformance SIG not covered by a kind:sig entry => uncovered.
 uncovered=$(comm -23 <(echo "$conformance_sigs") <(echo "$manifest_sigs") || true)
 if [ -n "$uncovered" ]; then
-    echo "uncovered [Conformance] SIGs (not in sigs.json):" >&2
+    echo "uncovered [Conformance] SIGs (no kind:sig entry in targets.json):" >&2
     echo "$uncovered" | sed 's/^/  - /' >&2
-    fail "every [Conformance] SIG must be in sigs.json (add it, or an explicit sig-other) — FR-016"
+    fail "every [Conformance] SIG must have a kind:sig entry in targets.json (add it, or an explicit sig-other) — FR-016"
 fi
 
 n_conf=$(echo "$conformance_sigs" | grep -c .)
-echo "PASS: all $n_conf [Conformance] SIGs covered by sigs.json (source: $USING)"
+echo "PASS: all $n_conf [Conformance] SIGs covered by kind:sig targets (source: $USING)"
