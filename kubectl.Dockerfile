@@ -28,16 +28,24 @@ FROM rust:1.95 AS builder
 # with services.Dockerfile and all-in-one.Dockerfile so a build of any of
 # them warms the cache for the others.
 ARG SCCACHE_VERSION=v0.8.2
+# TARGETARCH (amd64 | arm64) is injected by BuildKit; map it to sccache's
+# release triple so this Dockerfile builds multi-arch.
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     protobuf-compiler \
     curl \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    && case "${TARGETARCH}" in \
+         amd64) SCCACHE_ARCH=x86_64-unknown-linux-musl ;; \
+         arm64) SCCACHE_ARCH=aarch64-unknown-linux-musl ;; \
+         *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}.tar.gz" \
         | tar -xz -C /tmp \
-    && install -m 0755 "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" /usr/local/bin/sccache \
-    && rm -rf "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl"
+    && install -m 0755 "/tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}/sccache" /usr/local/bin/sccache \
+    && rm -rf "/tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}"
 
 ENV RUSTC_WRAPPER=sccache \
     SCCACHE_DIR=/sccache \

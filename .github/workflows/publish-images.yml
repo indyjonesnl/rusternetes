@@ -1,10 +1,22 @@
 name: Publish images
 
-# Build the 7 conformance-stack images once per main push and publish them to
-# GHCR with two tags:
+# Build the 8 conformance-stack images once per main push and publish them to
+# GHCR as multi-arch manifests (linux/amd64 + linux/arm64), each with two tags:
 #   * sha-<full-sha> — immutable, one per main commit. The historic record:
 #     any past main build is runnable without compilation (#1056).
 #   * main           — moving alias for the latest successful publish.
+#
+# Multi-arch strategy (two native runners + digest merge, no QEMU):
+#   * build (matrix)  — one job per arch on a NATIVE runner (amd64 on
+#     ubuntu-latest, arm64 on ubuntu-24.04-arm). Each runs `docker buildx bake`
+#     over compose.sqlite.yml + compose.ghcr.yml (single source of truth for
+#     context/target/build-args — no duplication) and pushes every image
+#     BY DIGEST (no tag yet). The per-image digests are uploaded as an artifact.
+#   * merge           — downloads both arches' digests and runs
+#     `docker buildx imagetools create` per image to stitch the two
+#     per-arch digests into one multi-arch manifest and apply the sha-/main tags.
+# Building on native arm64 hardware (not QEMU emulation on an x86 host) keeps
+# the Rust compile from ballooning to hours.
 #
 # Consumers:
 #   * node-conformance.yml + the per-target conformance-*.yml nightlies pull :main.
@@ -13,9 +25,8 @@ name: Publish images
 #
 # Intentionally NO paths filter: every main sha must get an image so the
 # immutable sha-tag history is complete and any past main build is runnable
-# without compilation (#1056). A push
-# that changes no Rust is a warm-cache rebuild (~3-5 min) and the pushed
-# layers dedupe server-side.
+# without compilation (#1056). A push that changes no Rust is a warm-cache
+# rebuild and the pushed layers dedupe server-side.
 
 on:
   push:
@@ -23,13 +34,19 @@ on:
   workflow_dispatch:
 
 env:
-  DOCKER_HOST: unix:///var/run/docker.sock
+  # GitHub-hosted runners cannot reach the cluster-side sccache→MinIO backend,
+  # and a fresh ephemeral runner has no warm BuildKit cache-mount either — so
+  # sccache buys nothing here and only costs the CARGO_INCREMENTAL=0 tax. Force
+  # it off (compose.sqlite.yml's default flips it ON when GITHUB_ACTIONS is set).
+  USE_SCCACHE: "0"
   # compose.sqlite.yml interpolates ${KUBELET_VOLUMES_PATH} into kubelet bind
-  # mounts; compose validates the volume spec even for `build`/`push`, so an
-  # unset value yields "invalid spec: ::rw,rshared" and exit 15. No container
-  # is ever started here — the path just has to be a non-empty absolute path
-  # (same value the conformance workflows use).
+  # mounts; compose/bake validate the volume spec even for a build-only run, so
+  # an unset value yields "invalid spec: ::rw,rshared". No container is started
+  # here — the path just has to be a non-empty absolute path.
   KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.rusternetes/volumes
+  # scheduler / controller-manager / dns sit behind the `build` compose profile.
+  COMPOSE_PROFILES: build
+  IMAGE_PREFIX: ghcr.io/indyjonesnl/rusternetes
 
 # One publish at a time, never cancelled: every main sha needs its tag.
 concurrency:
@@ -37,9 +54,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: build + push (sqlite stack images)
-    runs-on: arc-runner-set-dind
+  build:
+    name: build ${{ matrix.arch }} (push by digest)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
@@ -50,37 +75,93 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | \
-            docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build images (tagged sha-${{ github.sha }})
+      - name: Build + push by digest (linux/${{ matrix.arch }})
         env:
+          RUSTERNETES_GIT_SHA: ${{ github.sha }}
+          # Value is irrelevant on the digest-push path (bake strips the tag and
+          # pushes by digest), but compose.ghcr.yml requires the var to resolve.
           RUSTERNETES_IMAGE_TAG: sha-${{ github.sha }}
-        run: |
-          # --profile build includes the build-only dns service (it runs as
-          # an in-cluster Deployment, not a compose container).
-          docker compose -f compose.sqlite.yml -f compose.ghcr.yml \
-            --profile build build --parallel
-
-      - name: Push sha tags
-        env:
-          RUSTERNETES_IMAGE_TAG: sha-${{ github.sha }}
-        run: |
-          docker compose -f compose.sqlite.yml -f compose.ghcr.yml \
-            --profile build push
-
-      - name: Retag + push :main
-        # Only the real main branch may move the :main alias — a
-        # workflow_dispatch from a feature branch still publishes its
-        # sha- tag above, but must not clobber :main.
-        if: github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
-          for img in rhino api-server scheduler controller-manager kubelet kube-proxy dns containerd; do
-            docker tag \
-              "ghcr.io/indyjonesnl/rusternetes/${img}:sha-${{ github.sha }}" \
-              "ghcr.io/indyjonesnl/rusternetes/${img}:main"
-            docker push "ghcr.io/indyjonesnl/rusternetes/${img}:main"
+          docker buildx bake \
+            -f compose.sqlite.yml -f compose.ghcr.yml \
+            --set "*.platform=linux/${{ matrix.arch }}" \
+            --set "*.output=type=image,push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file /tmp/bake-meta.json \
+            rhino api-server scheduler controller-manager containerd kubelet kube-proxy dns
+
+      - name: Extract per-image digests
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          for svc in rhino api-server scheduler controller-manager containerd kubelet kube-proxy dns; do
+            digest=$(jq -er --arg s "$svc" '.[$s]["containerimage.digest"]' /tmp/bake-meta.json)
+            echo "$digest" > "/tmp/digests/${svc}"
+          done
+          echo "Digests for ${{ matrix.arch }}:"
+          cat /tmp/digests/* # noqa
+
+      - name: Upload digests
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge multi-arch manifests + tag
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+
+      - name: Create + push multi-arch manifests
+        run: |
+          set -euo pipefail
+          sha_tag="sha-${{ github.sha }}"
+          for svc in rhino api-server scheduler controller-manager containerd kubelet kube-proxy dns; do
+            repo="${IMAGE_PREFIX}/${svc}"
+            amd=$(cat "/tmp/digests/digests-amd64/${svc}")
+            arm=$(cat "/tmp/digests/digests-arm64/${svc}")
+
+            tags=(-t "${repo}:${sha_tag}")
+            # Only the real main branch may move the :main alias — a
+            # workflow_dispatch from a feature branch still gets its sha- tag,
+            # but must not clobber :main.
+            if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              tags+=(-t "${repo}:main")
+            fi
+
+            echo "== ${repo}: amd64=${amd} arm64=${arm} =="
+            docker buildx imagetools create "${tags[@]}" \
+              "${repo}@${amd}" \
+              "${repo}@${arm}"
+            docker buildx imagetools inspect "${repo}:${sha_tag}"
           done

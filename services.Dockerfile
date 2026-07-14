@@ -98,16 +98,26 @@ FROM rust:1.95 AS cargo-builder
 # from upstream releases — installing via `cargo install` would re-compile
 # a 100+ crate dep tree.
 ARG SCCACHE_VERSION=v0.8.2
+# TARGETARCH is injected by BuildKit (amd64 | arm64). Map it to sccache's
+# release triple so multi-arch builds (linux/amd64 + linux/arm64, published by
+# .github/workflows/publish-images.yml) each pull the matching binary instead
+# of a hardcoded x86_64 one that would exec-format-error on arm64.
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     protobuf-compiler \
     curl \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    && case "${TARGETARCH}" in \
+         amd64) SCCACHE_ARCH=x86_64-unknown-linux-musl ;; \
+         arm64) SCCACHE_ARCH=aarch64-unknown-linux-musl ;; \
+         *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}.tar.gz" \
         | tar -xz -C /tmp \
-    && install -m 0755 "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" /usr/local/bin/sccache \
-    && rm -rf "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl"
+    && install -m 0755 "/tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}/sccache" /usr/local/bin/sccache \
+    && rm -rf "/tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}"
 
 # sccache vs cargo-incremental — chosen per-build via USE_SCCACHE (set in
 # the cargo RUN blocks below), NOT baked into ENV. Measured on this repo's
