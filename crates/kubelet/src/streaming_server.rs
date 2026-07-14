@@ -495,8 +495,14 @@ pub async fn handle_container_logs(
     );
 
     if params.follow {
-        // Tailing stream: emit existing backlog then poll for new bytes.
-        let stream = follow_log_stream(log_path, params);
+        // Tailing stream: emit existing backlog then poll for new bytes, closing
+        // (EOF) once the container has exited — see follow_log_stream.
+        let stream = follow_log_stream(
+            log_path,
+            params,
+            std::time::Duration::from_millis(500),
+            cri_container_gone(container_id.clone()),
+        );
         return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; charset=utf-8")
@@ -519,17 +525,54 @@ pub async fn handle_container_logs(
     }
 }
 
+/// Render a run of raw CRI log bytes (one or more `\n`-delimited lines) into the
+/// client-facing output, honoring `timestamps` and the `since_unix` filter.
+fn render_cri_lines(complete: &[u8], timestamps: bool, since_unix: Option<i64>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in complete.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let parsed = rusternetes_cri::stream::parse_cri_log_line(line);
+        if let Some(since) = since_unix {
+            if let Some(ts) = parsed.timestamp_unix {
+                if ts < since {
+                    continue;
+                }
+            }
+        }
+        if timestamps && !parsed.timestamp_prefix.is_empty() {
+            out.extend_from_slice(parsed.timestamp_prefix.as_bytes());
+        }
+        out.extend_from_slice(&parsed.message);
+    }
+    out
+}
+
 /// Build a tailing `Stream` over the container log file.
 ///
-/// Emits the existing backlog first (honoring `tail_lines`/`since_time`),
-/// then polls for new bytes every 500ms — identical to the api-server
-/// `stream_container_logs` approach. The stream ends when the log file
-/// disappears (container removed) or after a bounded wait if the file
-/// never appears (container exited without writing logs).
-fn follow_log_stream(
+/// Emits the existing backlog first (honoring `tail_lines`/`since_time`), then
+/// polls for new bytes every `poll_interval`. The stream ends when:
+///   * the log file disappears (container removed), OR
+///   * the container is no longer running (`container_gone()` returns true) and
+///     all remaining bytes have been drained — this is the EOF that a
+///     `follow=true` reader (e.g. `kubectl logs -f`, hydrophone's completion
+///     detector) blocks on. Upstream kubelet's `ReadLogs` stops following once
+///     the container exits; without this a terminated container's persisted log
+///     file keeps the stream open forever (#log-follow-no-eof).
+///   * a bounded pre-file wait elapses if the file never appears.
+///
+/// `container_gone` is injected so the tail loop is unit-testable without a live
+/// CRI runtime; production wires it to a CRI `ContainerStatus` poll.
+fn follow_log_stream<F>(
     log_path: std::path::PathBuf,
     params: LogParams,
-) -> impl futures::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>> {
+    poll_interval: std::time::Duration,
+    container_gone: F,
+) -> impl futures::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>
+where
+    F: Fn() -> futures::future::BoxFuture<'static, bool> + Send + 'static,
+{
     use std::io::{Read, Seek, SeekFrom};
 
     let opts = log_read_options(&params);
@@ -555,18 +598,26 @@ fn follow_log_stream(
         let mut carry: Vec<u8> = Vec::new();
         let mut seen_file = std::fs::metadata(&log_path).is_ok();
         let mut waited_ticks: u32 = 0;
-        const MAX_PRE_FILE_TICKS: u32 = 240; // 240 × 500ms = 120s
+        // Pre-file wait scaled to the poll interval (~120s at the 500ms default).
+        let max_pre_file_ticks: u32 =
+            (std::time::Duration::from_secs(120).as_millis()
+                / poll_interval.as_millis().max(1)) as u32;
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(poll_interval).await;
             let len = match std::fs::metadata(&log_path) {
                 Ok(m) => {
                     seen_file = true;
                     m.len()
                 }
                 Err(_) if !seen_file => {
+                    // Container may have exited without ever writing a log file;
+                    // don't wait the full pre-file budget in that case.
+                    if container_gone().await {
+                        break;
+                    }
                     waited_ticks += 1;
-                    if waited_ticks >= MAX_PRE_FILE_TICKS {
+                    if waited_ticks >= max_pre_file_ticks {
                         break;
                     }
                     continue;
@@ -579,6 +630,18 @@ fn follow_log_stream(
                 carry.clear();
             }
             if len == offset {
+                // Caught up. If the container has exited there will be no more
+                // output — close the stream so `follow` readers get EOF.
+                if container_gone().await {
+                    // Flush any trailing partial line (no terminating newline).
+                    if !carry.is_empty() {
+                        let out = render_cri_lines(&carry, timestamps, since_unix);
+                        if !out.is_empty() {
+                            yield Ok(bytes::Bytes::from(out));
+                        }
+                    }
+                    break;
+                }
                 continue;
             }
             let mut f = match std::fs::File::open(&log_path) {
@@ -600,28 +663,38 @@ fn follow_log_stream(
             let Some(idx) = last_nl else { continue };
             let complete: Vec<u8> = carry.drain(..=idx).collect();
 
-            let mut out = Vec::new();
-            for line in complete.split(|&b| b == b'\n') {
-                if line.is_empty() {
-                    continue;
-                }
-                let parsed = rusternetes_cri::stream::parse_cri_log_line(line);
-                if let Some(since) = since_unix {
-                    if let Some(ts) = parsed.timestamp_unix {
-                        if ts < since {
-                            continue;
-                        }
-                    }
-                }
-                if timestamps && !parsed.timestamp_prefix.is_empty() {
-                    out.extend_from_slice(parsed.timestamp_prefix.as_bytes());
-                }
-                out.extend_from_slice(&parsed.message);
-            }
+            let out = render_cri_lines(&complete, timestamps, since_unix);
             if !out.is_empty() {
                 yield Ok(bytes::Bytes::from(out));
             }
         }
+    }
+}
+
+/// Production `container_gone` predicate: polls CRI `ContainerStatus` and reports
+/// true once the container is no longer in the RUNNING state. A CRI/RPC error is
+/// treated as "not gone" so a transient blip doesn't prematurely close a live
+/// stream (the file-vanished path still terminates it on removal).
+fn cri_container_gone(
+    container_id: String,
+) -> impl Fn() -> futures::future::BoxFuture<'static, bool> + Send + 'static {
+    move || {
+        let container_id = container_id.clone();
+        Box::pin(async move {
+            let mut cri = match rusternetes_cri::stream::connect().await {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+            match cri.container_status(&container_id, false).await {
+                Ok(resp) => resp
+                    .status
+                    .map(|s| {
+                        s.state != rusternetes_cri::v1::ContainerState::ContainerRunning as i32
+                    })
+                    .unwrap_or(false),
+                Err(_) => false,
+            }
+        })
     }
 }
 
@@ -691,5 +764,62 @@ mod tests {
         assert!(p.stdin);
         assert!(p.stdout);
         assert!(!p.stderr);
+    }
+
+    // Regression: a `follow=true` log stream MUST end (send EOF) once the
+    // container has exited — even though its CRI log file persists on disk.
+    // Before the fix the tail loop only stopped when the file *vanished*, so
+    // `kubectl logs -f` / hydrophone's completion detector blocked forever on a
+    // terminated container, wedging every conformance run.
+    #[tokio::test]
+    async fn follow_stream_ends_when_container_exits() {
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0.log");
+        std::fs::write(
+            &path,
+            b"2024-01-01T00:00:00.000000000Z stdout F hello\n\
+              2024-01-01T00:00:00.000000000Z stdout F world\n",
+        )
+        .unwrap();
+
+        // Report "running" on the first gone-check, "exited" thereafter.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gone = {
+            let calls = calls.clone();
+            move || {
+                let calls = calls.clone();
+                Box::pin(async move { calls.fetch_add(1, Ordering::SeqCst) >= 1 })
+                    as futures::future::BoxFuture<'static, bool>
+            }
+        };
+
+        let params = LogParams::from_query("follow=true");
+        let stream = follow_log_stream(path, params, std::time::Duration::from_millis(10), gone);
+        futures::pin_mut!(stream);
+
+        // The fix guarantees termination; without it this times out.
+        let collected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut buf = Vec::new();
+            while let Some(item) = stream.next().await {
+                buf.extend_from_slice(&item.unwrap());
+            }
+            buf
+        })
+        .await
+        .expect("follow stream must EOF after the container exits (log-follow-no-eof regression)");
+
+        let text = String::from_utf8_lossy(&collected);
+        assert!(
+            text.contains("hello") && text.contains("world"),
+            "got: {text:?}"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "exit must be polled while idle"
+        );
     }
 }
