@@ -47,6 +47,10 @@ env:
   # scheduler / controller-manager / dns sit behind the `build` compose profile.
   COMPOSE_PROFILES: build
   IMAGE_PREFIX: ghcr.io/indyjonesnl/rusternetes
+  # Disable BuildKit's default provenance + SBOM attestations. They turn each
+  # push into a manifest LIST (image + attestation), which push-by-digest can't
+  # emit — the per-arch merge job attaches nothing extra, so we don't need them.
+  BUILDX_NO_DEFAULT_ATTESTATIONS: "1"
 
 # One publish at a time, never cancelled: every main sha needs its tag.
 concurrency:
@@ -88,15 +92,25 @@ jobs:
       - name: Build + push by digest (linux/${{ matrix.arch }})
         env:
           RUSTERNETES_GIT_SHA: ${{ github.sha }}
-          # Value is irrelevant on the digest-push path (bake strips the tag and
-          # pushes by digest), but compose.ghcr.yml requires the var to resolve.
+          # compose.ghcr.yml requires this to resolve during parse, but the
+          # per-target --set below overrides each image ref to a bare repo (no
+          # tag) — push-by-digest rejects a tagged ref ("can't push tagged ref
+          # by digest"), so the sha-/main tags are applied later by the merge
+          # job via imagetools, not here.
           RUSTERNETES_IMAGE_TAG: sha-${{ github.sha }}
         run: |
           set -euo pipefail
+          # One --set per target forcing a tag-less repo name (compose.ghcr.yml
+          # otherwise yields repo:<tag>, which push-by-digest refuses).
+          bare_tags=()
+          for svc in rhino api-server scheduler controller-manager containerd kubelet kube-proxy dns; do
+            bare_tags+=(--set "${svc}.tags=${IMAGE_PREFIX}/${svc}")
+          done
           docker buildx bake \
             -f compose.sqlite.yml -f compose.ghcr.yml \
             --set "*.platform=linux/${{ matrix.arch }}" \
             --set "*.output=type=image,push-by-digest=true,name-canonical=true,push=true" \
+            "${bare_tags[@]}" \
             --metadata-file /tmp/bake-meta.json \
             rhino api-server scheduler controller-manager containerd kubelet kube-proxy dns
 
