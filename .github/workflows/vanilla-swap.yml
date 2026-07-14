@@ -26,11 +26,6 @@ on:
 
 jobs:
   vanilla-swap:
-    # Only run the matrix entry the dispatcher asked for (or all of them).
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.module == 'all' ||
-      inputs.module == matrix.module
     runs-on: arc-runner-set-conformance
     timeout-minutes: 90
     strategy:
@@ -53,6 +48,12 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install kind + kubectl + hydrophone (download only, no sudo)
+        # matrix context is only allowed at step level (not job-level `if`), so
+        # the "run just the dispatched module" filter lives on each real step.
+        if: >-
+          github.event_name != 'workflow_dispatch' ||
+          inputs.module == 'all' ||
+          inputs.module == matrix.module
         run: |
           set -euo pipefail
           bin="$HOME/.local/bin"
@@ -65,12 +66,20 @@ jobs:
             chmod +x "$bin/kubectl"
           fi
           if ! command -v hydrophone >/dev/null 2>&1; then
-            go install sigs.k8s.io/hydrophone@latest && cp "$(go env GOPATH)/bin/hydrophone" "$bin/" || {
-              echo "hydrophone install failed"; exit 1; }
+            if ! go install sigs.k8s.io/hydrophone@latest; then
+              echo "hydrophone install failed"; exit 1
+            fi
+            cp "$(go env GOPATH)/bin/hydrophone" "$bin/"
           fi
-          kind version && kubectl version --client && hydrophone version || true
+          kind version || true
+          kubectl version --client || true
+          hydrophone version || true
 
       - name: Isolate module '${{ matrix.module }}' in a vanilla cluster
+        if: >-
+          github.event_name != 'workflow_dispatch' ||
+          inputs.module == 'all' ||
+          inputs.module == matrix.module
         env:
           RUSTERNETES_IMAGE_TAG: ${{ github.event.inputs.image-tag || 'main' }}
           CONTAINER_RUNTIME: docker
@@ -79,7 +88,9 @@ jobs:
           bash scripts/vanilla-swap-run.sh --module "${{ matrix.module }}" --env ci
 
       - name: Publish run result
-        if: always()
+        if: >-
+          always() && (github.event_name != 'workflow_dispatch' ||
+          inputs.module == 'all' || inputs.module == matrix.module)
         uses: actions/upload-artifact@v4
         with:
           name: vanilla-swap-${{ matrix.module }}-result
@@ -89,7 +100,9 @@ jobs:
       # Teardown is unconditional inside the harness (trap on EXIT); this belt-and-
       # braces step removes anything left if the runner killed the harness.
       - name: Ensure teardown
-        if: always()
+        if: >-
+          always() && (github.event_name != 'workflow_dispatch' ||
+          inputs.module == 'all' || inputs.module == matrix.module)
         run: |
           kind delete cluster --name "vanilla-swap-${{ matrix.module }}" >/dev/null 2>&1 || true
           docker ps -aq --filter "label=rusternetes-swap-cluster=vanilla-swap-${{ matrix.module }}" \
