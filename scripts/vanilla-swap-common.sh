@@ -166,9 +166,10 @@ vs_teardown() {
   fi
   vs_log "tearing down cluster '$cluster'"
   kind delete cluster --name "$cluster" >/dev/null 2>&1 || true
-  # Remove any rusternetes side-containers (the kubelet node) for this cluster.
+  # Remove any rusternetes side-containers (the kubelet node + its CRI runtime).
   docker ps -aq --filter "label=rusternetes-swap-cluster=$cluster" 2>/dev/null \
     | xargs -r docker rm -f >/dev/null 2>&1 || true
+  docker volume rm "vanilla-swap-${cluster}-cri" >/dev/null 2>&1 || true
 }
 
 # vs_create_baseline <cluster> <k8s-version>
@@ -291,32 +292,60 @@ vs_recipe_template() {
 }
 
 # vs_swap_join_worker <cluster> <recipe> <image> <kubeconfig>
-# Adds ONE extra worker running the rusternetes kubelet, joined to the vanilla
-# control plane via kubeadm. Interoperates over CRI/CNI only.
+# Attaches ONE extra node running the rusternetes kubelet to the vanilla control
+# plane, as CONTAINERS on the kind network (the kubelet binary needs a newer
+# glibc than a kind node provides, so it runs from its image with its own CRI
+# runtime). Interoperates over the Kubernetes API + CRI/CNI only.
+#
+# NOTE: currently blocked by rusternetes #1638 (kubelet crashes on a 409 Conflict
+# during node status-update). The node registers and briefly reports Ready; the
+# node-ready readiness signal then flaps until the bug is fixed.
 vs_swap_join_worker() {
   local cluster="$1" recipe="$2" image="$3" kubeconfig="$4"
   local root; root="$(vs_repo_root)"
-  local node_name cri
+  local node_name cri clusterdns cri_repo
   node_name="$(vs_recipe_field "$root/$recipe" nodeName)"
   cri="$(vs_recipe_field "$root/$recipe" criSocket)"
-  local container="vanilla-swap-${cluster}-${node_name}"
+  clusterdns="$(vs_recipe_field "$root/$recipe" clusterDns)"
+  # CRI runtime image = sibling of the kubelet imageRepo (.../rusternetes/containerd).
+  cri_repo="${VS_IMAGE_REPO%/*}/$(vs_recipe_field "$root/$recipe" criImageRepoSuffix)"
+  local cri_image="${cri_repo}:${RUSTERNETES_IMAGE_TAG:-main}"
 
-  vs_log "generating kubeadm join command on $(vs_control_plane_node "$cluster")"
-  local join_cmd
-  join_cmd="$(docker exec "$(vs_control_plane_node "$cluster")" kubeadm token create --print-join-command)"
-  [ -n "$join_cmd" ] || vs_die "failed to create kubeadm join token" "$VS_EX_NOTUP"
+  local cp node_ip vol="vanilla-swap-${cluster}-cri"
+  cp="$(vs_control_plane_node "$cluster")"
+  node_ip="$(docker inspect "$cp" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' | head -1)"
 
-  vs_log "starting rusternetes kubelet node '$node_name' ($image) and joining"
-  # The rusternetes kubelet image is expected to run its own containerd + CNI and
-  # accept a kubeadm join command; it is labelled so teardown can find it.
-  docker run -d --privileged \
-    --name "$container" \
+  vs_log "starting rusternetes CRI runtime ($cri_image)"
+  docker volume create "$vol" >/dev/null
+  docker run -d --privileged --network kind \
+    --name "vanilla-swap-${cluster}-containerd" \
     --label "rusternetes-swap-cluster=$cluster" \
-    --network kind \
-    --hostname "$node_name" \
-    -e "KUBEADM_JOIN_CMD=$join_cmd" \
+    -v "${vol}:/run/containerd" \
+    "$cri_image" >/dev/null
+  local i
+  for (( i=0; i<30; i++ )); do
+    docker exec "vanilla-swap-${cluster}-containerd" test -S /run/containerd/containerd.sock 2>/dev/null && break
+    sleep 2
+  done
+
+  vs_log "exporting admin kubeconfig for the kubelet node"
+  local kc="$VS_WORKDIR/node-admin.conf"
+  docker exec "$cp" cat /etc/kubernetes/admin.conf >"$kc"
+
+  vs_log "starting rusternetes kubelet node '$node_name' ($image) in API mode"
+  docker run -d --privileged --network kind \
+    --name "vanilla-swap-${cluster}-${node_name}" \
+    --label "rusternetes-swap-cluster=$cluster" \
+    -v "${vol}:/run/containerd" \
+    -v "${kc}:/kc/admin.conf:ro" \
     -e "CONTAINER_RUNTIME_ENDPOINT=$cri" \
-    "$image" >/dev/null
+    "$image" \
+    --node-name "$node_name" \
+    --kubeconfig /kc/admin.conf \
+    --api-server-url "https://${node_ip}:6443" \
+    --cluster-dns "$clusterdns" \
+    --insecure-skip-tls-verify \
+    --metrics-port 10250 --sync-interval 3 >/dev/null
 
   vs_log "node '$node_name' launched; readiness is checked separately"
 }
@@ -352,10 +381,12 @@ vs_collect_cluster_images() {
     | xargs -r docker inspect --format '{{.Config.Image}}' 2>/dev/null || true
 }
 
-# vs_guard_cluster <cluster> <kubeconfig> — assert exactly one rusternetes image.
+# vs_guard_cluster <cluster> <kubeconfig> — assert exactly one rusternetes module
+# image. The CRI runtime (*/containerd) is infrastructure the kubelet node needs,
+# not a module under test, so it is excluded from the count.
 vs_guard_cluster() {
   local cluster="$1" kubeconfig="$2" count
-  count="$(vs_collect_cluster_images "$cluster" "$kubeconfig" | vs_count_rusternetes_images)"
+  count="$(vs_collect_cluster_images "$cluster" "$kubeconfig" | grep -v '/containerd' | vs_count_rusternetes_images)"
   count="${count:-0}"
   vs_log "post-swap guard: $count rusternetes image(s) present"
   [ "$count" -eq 1 ] || vs_die "single-module guard: expected exactly 1 rusternetes image in cluster, found $count" "$VS_EX_GUARD"
@@ -386,9 +417,9 @@ vs_readiness_probe() {
   local cluster="$1" kubeconfig="$2"
   case "$VS_READINESS" in
     node-ready)
-      KUBECONFIG="$kubeconfig" kubectl get nodes \
-        -l rusternetes.io/module-under-test=kubelet \
-        -o 'jsonpath={.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null \
+      # The rusternetes kubelet self-registers the node named in the recipe.
+      KUBECONFIG="$kubeconfig" kubectl get node rusternetes-node \
+        -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null \
         | grep -q True ;;
     readyz)
       KUBECONFIG="$kubeconfig" kubectl get --raw='/readyz' >/dev/null 2>&1 ;;

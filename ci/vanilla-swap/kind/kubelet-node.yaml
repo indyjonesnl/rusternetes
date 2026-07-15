@@ -1,27 +1,28 @@
-# Join-worker swap recipe: add ONE extra worker node running the rusternetes
-# kubelet, joined to the otherwise-vanilla kind control plane via `kubeadm join`.
+# Join-worker swap recipe: add ONE extra node running the rusternetes kubelet,
+# attached to the otherwise-vanilla kind control plane.
 #
-# Consumed by vs_swap_join_worker() in scripts/vanilla-swap-common.sh, which:
-#   1. reads the join parameters below;
-#   2. starts a node container from the rusternetes kubelet image (imageRepo
-#      from ci/vanilla-swap/targets.json + the resolved tag) with its own
-#      containerd (CRI) and a spec-compliant CNI plugin (bridge);
-#   3. generates a `kubeadm join` bootstrap token on the kind control plane and
-#      joins the node so it registers against the vanilla api-server;
-#   4. labels/taints the node so scoped workloads land on it.
+# ⚠️ BLOCKED by rusternetes bug #1638: the kubelet registers its Node against a
+# vanilla api-server and briefly reports Ready, then crashes on the first HTTP
+# 409 Conflict during node status-update (no optimistic-concurrency retry). Until
+# that is fixed the node flaps Ready->NotReady and readiness cannot be met. The
+# swap MECHANISM below is validated up to successful node registration.
 #
-# The baseline control plane and the upstream worker in base-cluster.yaml are
-# untouched — the rusternetes kubelet is strictly additive.
-nodeName: rusternetes-kubelet
-# Standard interfaces only (CRI/CNI) — no rusternetes-private coupling.
+# Consumed by vs_swap_join_worker() in scripts/vanilla-swap-common.sh, which runs
+# the rusternetes kubelet + containerd as CONTAINERS on the kind docker network
+# (NOT the kubelet binary on a kind node: the binary needs GLIBC 2.38/2.39 and a
+# stock kind node ships 2.36, so it must run from its image with the correct
+# glibc). Steps:
+#   1. start rusternetes/containerd (CRI + CNI) sharing a /run/containerd volume;
+#   2. copy the control-plane admin.conf into a file the kubelet mounts
+#      (client-cert auth; the kubelet prefers the kubeconfig's cluster.server);
+#   3. start the rusternetes/kubelet image in API mode pointed at the CRI socket
+#      and the vanilla api-server; it self-registers the Node.
+#
+# The CRI runtime (rusternetes/containerd) is INFRASTRUCTURE, not a module under
+# test, so the post-swap guard excludes */containerd images from its
+# "exactly one rusternetes module" count.
+nodeName: rusternetes-node
+criImageRepoSuffix: containerd          # sibling of the kubelet imageRepo: .../rusternetes/containerd
 criSocket: unix:///run/containerd/containerd.sock
-cni: bridge
-labels:
-  rusternetes.io/module-under-test: "kubelet"
-# Taint so only pods that explicitly target this node (via the label/toleration
-# the harness applies to the scoped workloads) schedule here, keeping the run
-# attributable to the rusternetes kubelet.
-taints:
-  - key: "rusternetes.io/module-under-test"
-    value: "kubelet"
-    effect: "NoSchedule"
+clusterDns: "10.96.0.10"
+# Standard interfaces only (CRI/CNI) — no rusternetes-private coupling.
