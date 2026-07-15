@@ -37,7 +37,7 @@
     "target": "sig-apps",
     "focus": "\\[sig-apps\\].*\\[Conformance\\]",
     "skip": "\\[Flaky\\]|\\[Serial\\]",
-    "readiness": "lease-held"
+    "readiness": "deployment-reconciled"
   },
   {
     "module": "kube-proxy",

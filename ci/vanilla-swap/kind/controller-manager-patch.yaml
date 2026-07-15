@@ -1,5 +1,54 @@
-# Static-pod swap recipe: kube-controller-manager -> rusternetes controller-manager.
-# See apiserver-patch.yaml for how vs_swap_static_pod() consumes this file.
+# Static-pod swap recipe: kube-controller-manager -> rusternetes controller-manager (API mode).
+#
+# Same mechanism as scheduler-patch.yaml: vs_swap_static_pod() renders the
+# template below (VS_IMAGE) and writes it over
+# /etc/kubernetes/manifests/kube-controller-manager.yaml inside the control-plane
+# node, so the node kubelet restarts that one static pod as the rusternetes
+# controller-manager. Everything else in the control plane stays vanilla.
+#
+# The rusternetes controller-manager runs in API mode (every controller's
+# Storage calls proxy to the api-server via ApiStorage). Two live-validation
+# findings shaped the flags below:
+#   1. The CM resolves the api-server URL from --api-server-url (NOT from the
+#      kubeconfig), whose default is the compose name; a hostNetwork static pod
+#      reaches the local apiserver at https://127.0.0.1:6443.
+#   2. Unlike the single-identity rusternetes CM, kubeadm's CM fans out to
+#      per-controller ServiceAccounts (--use-service-account-credentials), so
+#      system:kube-controller-manager (controller-manager.conf) cannot create
+#      ReplicaSets/Pods. Use the on-node admin kubeconfig (cluster-admin) so the
+#      one rusternetes CM identity can drive every controller.
+# API mode does no leader election, so readiness is "a canary Deployment gets
+# Pods created" (deployment -> replicaset -> pod chain), not a held lease.
 manifest: kube-controller-manager.yaml
 component: kube-controller-manager
-extraArgs: []
+template: |
+  apiVersion: v1
+  kind: Pod
+  metadata:
+    name: kube-controller-manager
+    namespace: kube-system
+    labels:
+      component: kube-controller-manager
+      tier: control-plane
+      rusternetes.io/module-under-test: controller-manager
+  spec:
+    hostNetwork: true
+    priorityClassName: system-node-critical
+    containers:
+      - name: kube-controller-manager
+        image: ${VS_IMAGE}
+        command: ["/app/controller-manager"]
+        args:
+          - "--kubeconfig=/etc/kubernetes/admin.conf"
+          - "--api-server-url=https://127.0.0.1:6443"
+          - "--insecure-skip-tls-verify"
+          - "--sync-interval=2"
+        volumeMounts:
+          - name: kubeconfig
+            mountPath: /etc/kubernetes/admin.conf
+            readOnly: true
+    volumes:
+      - name: kubeconfig
+        hostPath:
+          path: /etc/kubernetes/admin.conf
+          type: FileOrCreate

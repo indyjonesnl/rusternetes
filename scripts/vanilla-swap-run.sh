@@ -104,10 +104,14 @@ if ! vs_wait_ready "$CLUSTER" "$KUBECONFIG_FILE"; then
 fi
 
 # --- run the scoped subset via the existing conformance runner -------------
+# Bounded by a wall-clock timeout: a module whose post-test cleanup hangs (e.g. a
+# controller-manager that never finalizes namespace deletion) must not wedge the
+# run indefinitely. The junit on disk is authoritative for the verdict even if
+# the runner is killed mid-cleanup.
 vs_log "running scoped subset (target=$VS_TARGET focus=$VS_FOCUS) via conformance-target-run.sh"
 RESULT_OUT="$VS_WORKDIR/target-run.out"
 set +e
-bash "$SCRIPT_DIR/conformance-target-run.sh" \
+timeout "${VS_TEST_TIMEOUT:-1200}" bash "$SCRIPT_DIR/conformance-target-run.sh" \
   --target "$VS_TARGET" \
   --focus "$VS_FOCUS" \
   --skip "$VS_SKIP" \
@@ -115,12 +119,19 @@ bash "$SCRIPT_DIR/conformance-target-run.sh" \
   --output-dir "$VS_WORKDIR" | tee "$RESULT_OUT"
 runner_rc=${PIPESTATUS[0]}
 set -e
+[ "$runner_rc" -eq 124 ] && vs_warn "conformance step hit VS_TEST_TIMEOUT (likely a hung post-test cleanup); using junit on disk for the verdict"
 
-PASSED="$(grep -E '^passed=' "$RESULT_OUT" | tail -1 | cut -d= -f2)"; PASSED="${PASSED:-0}"
-FAILED="$(grep -E '^failed=' "$RESULT_OUT" | tail -1 | cut -d= -f2)"; FAILED="${FAILED:-0}"
-TOTAL="$(grep -E '^total=' "$RESULT_OUT" | tail -1 | cut -d= -f2)"; TOTAL="${TOTAL:-0}"
+# Prefer junit (authoritative); fall back to the runner's stdout counters.
+if counts="$(vs_junit_counts "$VS_WORKDIR")"; then
+  RAN="${counts% *}"; FAILED="${counts#* }"; TOTAL="$RAN"; PASSED="$(( RAN - FAILED ))"
+else
+  PASSED="$(grep -E '^passed=' "$RESULT_OUT" | tail -1 | cut -d= -f2)"; PASSED="${PASSED:-0}"
+  FAILED="$(grep -E '^failed=' "$RESULT_OUT" | tail -1 | cut -d= -f2)"; FAILED="${FAILED:-0}"
+  TOTAL="$(grep -E '^total=' "$RESULT_OUT" | tail -1 | cut -d= -f2)"; TOTAL="${TOTAL:-0}"
+fi
 
-if [ "$runner_rc" -ne 0 ]; then
+# No junit and the runner failed/timed out => the module never produced results.
+if ! [ -n "${counts:-}" ] && [ "$runner_rc" -ne 0 ]; then
   vs_emit_result "module-did-not-come-up" "$PASSED" "$TOTAL" "$VS_K8S_VERSION"
   exit "$VS_EX_NOTUP"
 fi

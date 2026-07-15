@@ -22,7 +22,7 @@ VS_EX_NOTUP=5      # module never reached readiness within timeout
 
 VS_MODULES="api-server kubelet scheduler controller-manager kube-proxy"
 VS_SWAPS="static-pod daemonset join-worker"
-VS_READINESS_KINDS="node-ready readyz lease-held service-programmed pod-scheduled"
+VS_READINESS_KINDS="node-ready readyz lease-held service-programmed pod-scheduled deployment-reconciled"
 
 vs_repo_root() {
   local d
@@ -415,6 +415,14 @@ vs_readiness_probe() {
           --overrides='{"spec":{"tolerations":[{"operator":"Exists"}]}}' >/dev/null 2>&1 || true
       [ -n "$(KUBECONFIG="$kubeconfig" kubectl -n default get pod vanilla-swap-canary \
         -o 'jsonpath={.spec.nodeName}' 2>/dev/null)" ] ;;
+    deployment-reconciled)
+      # The controller-manager works iff its deployment->replicaset->pod chain
+      # creates Pods for a canary Deployment (no lease in API mode).
+      KUBECONFIG="$kubeconfig" kubectl -n default get deploy vanilla-swap-canary >/dev/null 2>&1 || \
+        KUBECONFIG="$kubeconfig" kubectl -n default create deployment vanilla-swap-canary \
+          --image=registry.k8s.io/pause:3.10 >/dev/null 2>&1 || true
+      [ "$(KUBECONFIG="$kubeconfig" kubectl -n default get pods -l app=vanilla-swap-canary \
+        -o 'jsonpath={.items[*].metadata.name}' 2>/dev/null | wc -w)" -ge 1 ] ;;
     *) return 1 ;;
   esac
 }
@@ -422,6 +430,26 @@ vs_readiness_probe() {
 # ---------------------------------------------------------------------------
 # Result emission
 # ---------------------------------------------------------------------------
+
+# vs_junit_counts <dir> — parse the newest junit_*.xml in <dir> and echo
+# "RAN FAILED" where RAN = tests - skipped/disabled and FAILED = failures +
+# errors. Returns 1 (no output) when no junit is present. Junit is authoritative
+# for the test verdict even when the runner is later killed (e.g. a module whose
+# post-test namespace cleanup hangs) — the results are already on disk.
+vs_junit_counts() {
+  local dir="$1" f line tests fail err skip disabled
+  f="$(ls -t "$dir"/junit_*.xml 2>/dev/null | head -1)"
+  [ -n "$f" ] || return 1
+  line="$(grep -oE '<testsuites?[^>]*>' "$f" | head -1)"
+  [ -n "$line" ] || return 1
+  tests="$(printf '%s' "$line" | grep -oE 'tests="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
+  fail="$(printf '%s' "$line" | grep -oE 'failures="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
+  err="$(printf '%s' "$line" | grep -oE 'errors="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
+  skip="$(printf '%s' "$line" | grep -oE 'skipped="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
+  disabled="$(printf '%s' "$line" | grep -oE 'disabled="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
+  tests="${tests:-0}"; fail="${fail:-0}"; err="${err:-0}"; skip="${skip:-0}"; disabled="${disabled:-0}"
+  printf '%s %s\n' "$(( tests - skip - disabled ))" "$(( fail + err ))"
+}
 
 # vs_emit_result <outcome> <passed> <total> [k8s-version]
 # Writes run-result.json to $VS_WORKDIR and prints a stdout summary.
