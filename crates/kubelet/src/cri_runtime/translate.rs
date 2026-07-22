@@ -1102,6 +1102,30 @@ fn linux_security_context(
             drop_capabilities: caps.drop.clone().unwrap_or_default(),
             add_ambient_capabilities: Vec::new(),
         });
+    // Supplemental groups for the workload process, from the POD security
+    // context. In containerd the workload container is a separate OCI container
+    // from the sandbox pause container, so the process's supplementary groups
+    // come from THIS container SC, not the sandbox SC. Upstream
+    // `determineEffectiveSecurityContext` (pkg/kubelet/kuberuntime/
+    // security_context.go): append `fsGroup` first, then the pod's
+    // `supplementalGroups`, then set the policy. Without fsGroup here a non-root
+    // pod cannot read a mode-0440 secret/projected volume chowned to `:fsGroup`.
+    let mut supplemental_groups: Vec<i64> = Vec::new();
+    let mut supplemental_groups_policy = 0;
+    if let Some(psc) = pod_sc {
+        if let Some(fsg) = psc.fs_group {
+            supplemental_groups.push(fsg);
+        }
+        if let Some(sg) = psc.supplemental_groups.as_ref() {
+            supplemental_groups.extend(sg.iter().copied());
+        }
+        if let Some(policy) = psc.supplemental_groups_policy.as_deref() {
+            supplemental_groups_policy = match policy {
+                "Strict" => v1::SupplementalGroupsPolicy::Strict as i32,
+                _ => v1::SupplementalGroupsPolicy::Merge as i32,
+            };
+        }
+    }
     Some(v1::LinuxContainerSecurityContext {
         privileged: sc.and_then(|s| s.privileged).unwrap_or(false),
         capabilities,
@@ -1122,6 +1146,8 @@ fn linux_security_context(
         // procMount → masked/readonly proc paths (upstream ConvertToRuntime*Paths).
         masked_paths: convert_masked_paths(sc.and_then(|s| s.proc_mount.as_deref())),
         readonly_paths: convert_readonly_paths(sc.and_then(|s| s.proc_mount.as_deref())),
+        supplemental_groups,
+        supplemental_groups_policy,
         ..Default::default()
     })
 }
@@ -2298,6 +2324,45 @@ mod tests {
         assert_eq!(
             sc.seccomp.unwrap().profile_type,
             ProfileType::RuntimeDefault as i32
+        );
+    }
+
+    /// Regression: the WORKLOAD container's `LinuxContainerSecurityContext` must
+    /// carry `fsGroup` (then the pod's `supplementalGroups`) in
+    /// `supplemental_groups`, plus `supplementalGroupsPolicy`. In containerd the
+    /// workload container is a separate OCI container from the sandbox pause
+    /// container, so the process's supplementary groups come from the container
+    /// SC, NOT the sandbox SC. Without fsGroup here, a non-root pod cannot read a
+    /// mode-0440 secret/projected volume whose files were chowned to `:fsGroup`
+    /// (`open …: permission denied`) — the two `should be consumable from pods in
+    /// volume as non-root with defaultMode and fsGroup set` conformance specs.
+    /// Mirrors upstream `pkg/kubelet/kuberuntime/security_context.go`
+    /// (`determineEffectiveSecurityContext`): fsGroup appended first, then
+    /// `supplementalGroups`, then the policy.
+    #[test]
+    fn container_security_context_carries_fsgroup_and_supplemental_groups() {
+        use serde_json::json;
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {
+                "securityContext": {
+                    "runAsUser": 1000,
+                    "fsGroup": 2000,
+                    "supplementalGroups": [5, 6],
+                    "supplementalGroupsPolicy": "Strict"
+                },
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        }))
+        .unwrap();
+        let container = pod.spec.as_ref().unwrap().containers[0].clone();
+        let sc = linux_security_context(&pod, &container)
+            .expect("container security context must be built");
+        // fsGroup first, then the pod's supplementalGroups.
+        assert_eq!(sc.supplemental_groups, vec![2000, 5, 6]);
+        assert_eq!(
+            sc.supplemental_groups_policy,
+            v1::SupplementalGroupsPolicy::Strict as i32
         );
     }
 
