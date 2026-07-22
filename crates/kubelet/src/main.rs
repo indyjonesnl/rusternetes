@@ -28,6 +28,7 @@ mod labels;
 #[allow(dead_code)]
 mod lifecycle;
 mod poll;
+mod serving_tls;
 // The standalone bin no longer uses the bollard ContainerRuntime (the kubelet
 // runs on the CRI backend); runtime.rs is kept only for the still-shared free
 // helpers (volume setup, init-action decisions), which the bin does not all
@@ -482,6 +483,7 @@ async fn main() -> Result<()> {
         storage: storage.clone(),
         kubelet: Some(kubelet.clone()),
     };
+    let tls_node_name = runtime_config.node_name.clone();
     tokio::spawn(async move {
         let app = Router::new()
             .route("/metrics", get(|| async move { metrics_clone.gather() }))
@@ -511,8 +513,16 @@ async fn main() -> Result<()> {
             )
             .merge(server::read_only_router(server_state));
 
-        let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        // Serve the kubelet API port over HTTPS (#1644): a vanilla api-server
+        // proxies logs/exec/attach/metrics to `https://<nodeIP>:10250` and will
+        // not talk plain HTTP to a kubelet.
+        let addr: std::net::SocketAddr = metrics_addr.parse().expect("valid metrics addr");
+        let tls = serving_tls::kubelet_serving_tls(&tls_node_name)
+            .expect("build kubelet serving TLS config");
+        axum_server::bind_rustls(addr, tls)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
     });
 
     kubelet.run().await?;

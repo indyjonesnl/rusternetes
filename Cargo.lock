@@ -4408,6 +4408,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "axum-server",
  "bytes",
  "chrono",
  "clap",
