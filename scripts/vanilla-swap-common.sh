@@ -185,6 +185,7 @@ vs_teardown() {
     | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker volume rm "vanilla-swap-${cluster}-cri" >/dev/null 2>&1 || true
   docker volume rm "vanilla-swap-${cluster}-cri-data" >/dev/null 2>&1 || true
+  docker volume rm "vanilla-swap-${cluster}-kubelet-vols" >/dev/null 2>&1 || true
 }
 
 # vs_create_baseline <cluster> <k8s-version>
@@ -338,9 +339,28 @@ vs_swap_join_worker() {
   cp="$(vs_control_plane_node "$cluster")"
   node_ip="$(docker inspect "$cp" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' | head -1)"
 
+  # Shared kubelet-volumes volume, mounted at the SAME path (/app/volumes, the
+  # kubelet's default volume_dir) in BOTH the kubelet and containerd containers.
+  # The kubelet stages every pod volume there — managed /etc/hosts,
+  # configMap/secret/projected/downward-API files, emptyDir — and containerd (a
+  # separate container) bind-mounts those host paths into pod containers. If the
+  # dir is not shared, containerd cannot see the staged files and every such
+  # mount fails ("mount .../etc-hosts to etc/hosts: Not a directory"), so nearly
+  # every pod fails to start. Mirrors compose.sqlite.yml, which shares
+  # ${KUBELET_VOLUMES_PATH} between both services.
+  #
+  # A named volume (not a host bind) is used deliberately: a host-path bind with
+  # `:rshared` is rejected by Docker Desktop ("path ... is mounted on /host_mnt
+  # but it is not a shared mount"). The trade-off is that Memory-medium emptyDir
+  # tmpfs sub-mounts the kubelet makes do not propagate into containerd's mount
+  # namespace (no rshared), so those few specs may fail; the file-based majority
+  # (incl. the universal managed /etc/hosts) works.
+  local volsvol="vanilla-swap-${cluster}-kubelet-vols"
+
   vs_log "starting rusternetes CRI runtime ($cri_image)"
   docker volume create "$vol" >/dev/null
   docker volume create "$datavol" >/dev/null
+  docker volume create "$volsvol" >/dev/null
   # /var/lib/containerd (the overlayfs snapshotter root) MUST live on a real
   # volume, not the container's own overlay rootfs — overlay-on-overlay is
   # rejected by the kernel with EINVAL ("failed to mount rootfs component ...
@@ -352,6 +372,7 @@ vs_swap_join_worker() {
     --label "rusternetes-swap-cluster=$cluster" \
     -v "${vol}:/run/containerd" \
     -v "${datavol}:/var/lib/containerd" \
+    -v "${volsvol}:/app/volumes" \
     "$cri_image" >/dev/null
   local i
   for (( i=0; i<30; i++ )); do
@@ -368,8 +389,10 @@ vs_swap_join_worker() {
     --name "vanilla-swap-${cluster}-${node_name}" \
     --label "rusternetes-swap-cluster=$cluster" \
     -v "${vol}:/run/containerd" \
+    -v "${volsvol}:/app/volumes" \
     -v "${kc}:/kc/admin.conf:ro" \
     -e "CONTAINER_RUNTIME_ENDPOINT=$cri" \
+    -e "KUBELET_VOLUMES_PATH=/app/volumes" \
     "$image" \
     --node-name "$node_name" \
     --kubeconfig /kc/admin.conf \
