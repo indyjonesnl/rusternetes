@@ -12,8 +12,12 @@ pub struct NodeConn {
     pub host: String,
     /// The TCP port of the kubelet API.
     pub port: u16,
-    /// URL scheme. Always `"http"` because the rusternetes kubelet serves plain
-    /// HTTP today (no TLS layer on the metrics listener).
+    /// URL scheme. Always `"https"`: the kubelet serves its `:10250` API over
+    /// TLS (#1644), matching upstream, and a Kubernetes api-server always
+    /// proxies logs/exec/attach/metrics to `https://<nodeIP>:10250`. The
+    /// kubelet's serving cert is self-signed, so the proxy client skips
+    /// verification (see `streamproxy`'s TLS connector and the reqwest
+    /// `danger_accept_invalid_certs` log client).
     pub scheme: &'static str,
 }
 
@@ -60,7 +64,7 @@ pub fn node_conn(
     Ok(NodeConn {
         host,
         port,
-        scheme: "http",
+        scheme: "https",
     })
 }
 
@@ -102,7 +106,7 @@ mod tests {
         let conn = node_conn(&node, None).expect("should resolve");
         assert_eq!(conn.host, "192.168.1.10");
         assert_eq!(conn.port, 10255);
-        assert_eq!(conn.scheme, "http");
+        assert_eq!(conn.scheme, "https");
     }
 
     #[test]
@@ -152,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn scheme_is_always_http() {
+    fn scheme_is_always_https() {
         let node = make_node(
             vec![NodeAddress {
                 address_type: "InternalIP".to_string(),
@@ -161,6 +165,6 @@ mod tests {
             None,
         );
         let conn = node_conn(&node, None).expect("should resolve");
-        assert_eq!(conn.scheme, "http");
+        assert_eq!(conn.scheme, "https");
     }
 }
