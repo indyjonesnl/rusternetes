@@ -201,7 +201,15 @@ vs_control_plane_node() { printf '%s-control-plane\n' "$1"; }
 # vs_recipe_field <recipe-file> <key> — read a scalar `key: value` line.
 vs_recipe_field() {
   local f="$1" key="$2"
-  grep -E "^${key}:" "$f" | head -1 | sed -E "s/^${key}:[[:space:]]*//" | tr -d '"'
+  # Strip the "key:" prefix, then any trailing inline `# comment` (YAML inline
+  # comments require whitespace before the `#`, so a `#` inside a value like a
+  # URL fragment is preserved), then trailing whitespace and quotes. Without
+  # the comment strip, a commented recipe field (e.g. `criImageRepoSuffix:
+  # containerd  # sibling ...`) leaks the comment into the image ref and
+  # `docker run` fails with "invalid reference format".
+  grep -E "^${key}:" "$f" | head -1 \
+    | sed -E "s/^${key}:[[:space:]]*//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//" \
+    | tr -d '"'
 }
 
 # vs_swap_static_pod <cluster> <recipe> <image>
