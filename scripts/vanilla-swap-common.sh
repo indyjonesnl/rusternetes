@@ -93,11 +93,25 @@ vs_resolve_target() {
   local module="$1" reg="${2:-$(vs_registry_path)}"
   case " $VS_MODULES " in *" $module "*) ;; *) vs_warn "unknown module: $module (want one of: $VS_MODULES)"; return 1 ;; esac
 
-  local row
-  row="$(jq -r --arg m "$module" '.[] | select(.module==$m) | [.module,.swap,.recipe,.imageRepo,.target,.focus,.skip,.readiness] | @tsv' "$reg")"
-  [ -n "$row" ] || { vs_warn "no registry entry for module: $module"; return 1; }
+  # Emit one raw field per line, NOT @tsv: jq's @tsv escapes backslashes
+  # (`\[` -> `\\[`), which double-escapes the focus/skip ginkgo regexes and
+  # makes the focus match zero specs (a NodeConformance run then silently
+  # selects nothing yet reports "passed"). `jq -r` on a bare string emits it
+  # verbatim, so `\[NodeConformance\]` survives intact.
+  local vals
+  vals="$(jq -r --arg m "$module" '.[] | select(.module==$m) | (.module,.swap,.recipe,.imageRepo,.target,.focus,.skip,.readiness)' "$reg")"
+  [ -n "$vals" ] || { vs_warn "no registry entry for module: $module"; return 1; }
 
-  IFS=$'\t' read -r VS_MODULE VS_SWAP VS_RECIPE VS_IMAGE_REPO VS_TARGET VS_FOCUS VS_SKIP VS_READINESS <<<"$row"
+  {
+    IFS= read -r VS_MODULE
+    IFS= read -r VS_SWAP
+    IFS= read -r VS_RECIPE
+    IFS= read -r VS_IMAGE_REPO
+    IFS= read -r VS_TARGET
+    IFS= read -r VS_FOCUS
+    IFS= read -r VS_SKIP
+    IFS= read -r VS_READINESS
+  } <<<"$vals"
   return 0
 }
 
