@@ -412,6 +412,19 @@ impl CriContainerRuntime {
         }
     }
 
+    /// Extra supplemental groups the pod's mounted volumes contribute, from the
+    /// `pv.beta.kubernetes.io/gid` annotation on each PVC-bound PV. Filtered and
+    /// de-duplicated per upstream `getExtraSupplementalGID`; empty when no
+    /// VolumeManager is attached. Appended to the sandbox + container security
+    /// contexts so a pod can read a volume whose files are owned by that GID —
+    /// the runtime-helper half of upstream `GetExtraSupplementalGroupsForPod`.
+    async fn pod_extra_supplemental_groups(&self, pod: &Pod) -> Vec<i64> {
+        match self.volumes.as_ref() {
+            Some(vm) => translate::extra_supplemental_gids(&vm.volume_gids(pod).await, pod),
+            None => Vec::new(),
+        }
+    }
+
     /// Ensure an image is present, honoring the pull policy. `Never` requires it
     /// to already exist; `Always` always pulls; `IfNotPresent` (default) pulls
     /// only when absent.
@@ -611,6 +624,18 @@ impl CriContainerRuntime {
         );
         self.inject_service_env(&mut cfg);
         self.inject_service_links(pod, &mut cfg).await;
+
+        // Append volume-derived supplemental groups (PV `pv.beta.kubernetes.io/
+        // gid` annotations) to the container SC, after fsGroup + the pod's
+        // supplementalGroups — upstream `determineEffectiveSecurityContext`
+        // appends `GetExtraSupplementalGroupsForPod` last. Without this a
+        // non-root pod cannot read a volume whose files are owned by that GID.
+        let extra_groups = self.pod_extra_supplemental_groups(pod).await;
+        if !extra_groups.is_empty() {
+            if let Some(sc) = cfg.linux.as_mut().and_then(|l| l.security_context.as_mut()) {
+                sc.supplemental_groups.extend(extra_groups);
+            }
+        }
 
         // Set `attempt` (= restartCount) in the container metadata, matching
         // upstream `startContainer` (pkg/kubelet/kuberuntime/
@@ -976,6 +1001,19 @@ impl CriContainerRuntime {
         let mut sandbox_cfg = translate::sandbox_config(pod, &log_dir);
         sandbox_cfg.dns_config =
             translate::dns_config(pod, &self.cluster_dns, &self.cluster_domain);
+        // Append volume-derived supplemental groups to the sandbox SC too
+        // (upstream `generatePodSandboxLinuxConfig` also applies them), so the
+        // pod's namespace/group set is consistent across sandbox and containers.
+        let extra_groups = self.pod_extra_supplemental_groups(pod).await;
+        if !extra_groups.is_empty() {
+            if let Some(sc) = sandbox_cfg
+                .linux
+                .as_mut()
+                .and_then(|l| l.security_context.as_mut())
+            {
+                sc.supplemental_groups.extend(extra_groups);
+            }
+        }
         let handler = self.runtime_handler.clone();
 
         let mut cri = self.cri.clone();

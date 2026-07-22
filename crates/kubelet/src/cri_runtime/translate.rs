@@ -1152,6 +1152,34 @@ fn linux_security_context(
     })
 }
 
+/// Reduce volume-derived GIDs (read from the `pv.beta.kubernetes.io/gid`
+/// annotation on the PVs a pod mounts) to the "extra" supplemental groups to add
+/// to the pod's security contexts. Mirrors upstream `getExtraSupplementalGID`
+/// (pkg/kubelet/volumemanager/volume_manager.go): de-duplicate, and drop any GID
+/// already present in the pod's `securityContext.supplementalGroups` (fsGroup is
+/// intentionally NOT consulted, matching upstream). Order of the input is
+/// preserved for the survivors.
+pub(crate) fn extra_supplemental_gids(volume_gids: &[i64], pod: &Pod) -> Vec<i64> {
+    let existing: std::collections::HashSet<i64> = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.security_context.as_ref())
+        .and_then(|sc| sc.supplemental_groups.as_ref())
+        .map(|g| g.iter().copied().collect())
+        .unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for &gid in volume_gids {
+        if existing.contains(&gid) {
+            continue;
+        }
+        if seen.insert(gid) {
+            out.push(gid);
+        }
+    }
+    out
+}
+
 /// Translate a single container into a CRI [`ContainerConfig`](v1::ContainerConfig).
 ///
 /// `image_ref` is the canonical reference returned by `PullImage`. `host_paths`
@@ -2364,6 +2392,28 @@ mod tests {
             sc.supplemental_groups_policy,
             v1::SupplementalGroupsPolicy::Strict as i32
         );
+    }
+
+    /// `extra_supplemental_gids` (upstream `getExtraSupplementalGID`) must
+    /// de-duplicate volume GIDs and drop any GID already in the pod's
+    /// `supplementalGroups`, while preserving fsGroup-equal GIDs (upstream does
+    /// not consult fsGroup) and input order.
+    #[test]
+    fn extra_supplemental_gids_dedups_and_skips_supplemental_groups() {
+        use serde_json::json;
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {
+                "securityContext": {"fsGroup": 2000, "supplementalGroups": [5678]},
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        }))
+        .unwrap();
+        // 5678 is already a supplementalGroup → dropped. 1234 is duplicated in
+        // the input → kept once. 2000 equals fsGroup but is NOT a
+        // supplementalGroup → kept (upstream parity).
+        let extra = extra_supplemental_gids(&[1234, 5678, 1234, 2000], &pod);
+        assert_eq!(extra, vec![1234, 2000]);
     }
 
     #[test]
