@@ -184,6 +184,7 @@ vs_teardown() {
   docker ps -aq --filter "label=rusternetes-swap-cluster=$cluster" 2>/dev/null \
     | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker volume rm "vanilla-swap-${cluster}-cri" >/dev/null 2>&1 || true
+  docker volume rm "vanilla-swap-${cluster}-cri-data" >/dev/null 2>&1 || true
 }
 
 # vs_create_baseline <cluster> <k8s-version>
@@ -333,16 +334,24 @@ vs_swap_join_worker() {
   cri_repo="${VS_IMAGE_REPO%/*}/$(vs_recipe_field "$root/$recipe" criImageRepoSuffix)"
   local cri_image="${cri_repo}:${RUSTERNETES_IMAGE_TAG:-main}"
 
-  local cp node_ip vol="vanilla-swap-${cluster}-cri"
+  local cp node_ip vol="vanilla-swap-${cluster}-cri" datavol="vanilla-swap-${cluster}-cri-data"
   cp="$(vs_control_plane_node "$cluster")"
   node_ip="$(docker inspect "$cp" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' | head -1)"
 
   vs_log "starting rusternetes CRI runtime ($cri_image)"
   docker volume create "$vol" >/dev/null
+  docker volume create "$datavol" >/dev/null
+  # /var/lib/containerd (the overlayfs snapshotter root) MUST live on a real
+  # volume, not the container's own overlay rootfs — overlay-on-overlay is
+  # rejected by the kernel with EINVAL ("failed to mount rootfs component ...
+  # overlay ... invalid argument"), so every RunPodSandbox fails and no pod
+  # (kindnet/kube-proxy or a test workload) can start. compose.sqlite.yml mounts
+  # containerd-data:/var/lib/containerd for the same reason.
   docker run -d --privileged --network kind \
     --name "vanilla-swap-${cluster}-containerd" \
     --label "rusternetes-swap-cluster=$cluster" \
     -v "${vol}:/run/containerd" \
+    -v "${datavol}:/var/lib/containerd" \
     "$cri_image" >/dev/null
   local i
   for (( i=0; i<30; i++ )); do
