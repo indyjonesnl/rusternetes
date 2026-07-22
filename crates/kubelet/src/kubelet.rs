@@ -1150,7 +1150,18 @@ impl Kubelet {
         match self.storage.create(&key, &node).await {
             Ok(_) => info!("Node registered successfully"),
             Err(rusternetes_common::Error::AlreadyExists(_)) => {
-                self.storage.update(&key, &node).await?;
+                // Kubelet restart: the Node object already exists. Re-GET it to
+                // carry its current resourceVersion + UID, then graft our
+                // labels/spec onto the fresh object before updating. PUTting the
+                // freshly-built `node` (no resourceVersion/UID) is rejected by a
+                // strict vanilla api-server with a 409 precondition failure
+                // (#1638). Mirrors upstream `tryRegisterWithApiServer`'s
+                // "node already exists → reconcile onto the existing object" path
+                // (pkg/kubelet/kubelet_node_status.go).
+                let mut existing: Node = self.storage.get(&key).await?;
+                existing.metadata.labels = node.metadata.labels.clone();
+                existing.spec = node.spec.clone();
+                self.storage.update(&key, &existing).await?;
                 info!("Node updated successfully");
             }
             Err(e) => return Err(e.into()),
