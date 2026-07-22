@@ -86,6 +86,10 @@ fn apply_volume_ownership(paths: &[std::path::PathBuf], fs_group: i64) -> std::i
     Ok(())
 }
 
+/// PV annotation carrying a supplemental GID granted to pods that mount the
+/// volume. Upstream `pkg/volume/util/util.go` `VolumeGidAnnotationKey`.
+const VOLUME_GID_ANNOTATION_KEY: &str = "pv.beta.kubernetes.io/gid";
+
 /// Provisions and maintains pod volumes on the host filesystem, independent of
 /// any container runtime. See the module docs.
 #[derive(Clone)]
@@ -167,6 +171,57 @@ impl VolumeManager {
         }
 
         Ok(volume_paths)
+    }
+
+    /// Collect the supplemental GIDs contributed by the pod's mounted volumes,
+    /// read from the `pv.beta.kubernetes.io/gid` annotation on each PVC-bound PV
+    /// (`VOLUME_GID_ANNOTATION_KEY`). This is the volume-GID half of upstream
+    /// `GetExtraSupplementalGroupsForPod`; the CRI translation layer then applies
+    /// `translate::extra_supplemental_gids` to drop GIDs already in the pod's
+    /// `supplementalGroups` and de-duplicate, before appending them to the
+    /// container/sandbox security contexts. Volumes with no PVC, unbound PVCs,
+    /// missing PVs, a missing annotation, or a non-numeric annotation value are
+    /// skipped.
+    pub async fn volume_gids(&self, pod: &Pod) -> Vec<i64> {
+        let Some(storage) = self.storage.as_ref() else {
+            return Vec::new();
+        };
+        let Some(volumes) = pod.spec.as_ref().and_then(|s| s.volumes.as_ref()) else {
+            return Vec::new();
+        };
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let mut gids = Vec::new();
+        for volume in volumes {
+            let Some(pvc_source) = volume.persistent_volume_claim.as_ref() else {
+                continue;
+            };
+            let pvc_key = build_key(
+                "persistentvolumeclaims",
+                Some(namespace),
+                &pvc_source.claim_name,
+            );
+            let Ok(pvc) = storage.get::<PersistentVolumeClaim>(&pvc_key).await else {
+                continue;
+            };
+            let Some(pv_name) = pvc.spec.volume_name.as_ref() else {
+                continue;
+            };
+            let pv_key = build_key("persistentvolumes", None, pv_name);
+            let Ok(pv) = storage.get::<PersistentVolume>(&pv_key).await else {
+                continue;
+            };
+            if let Some(val) = pv
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(VOLUME_GID_ANNOTATION_KEY))
+            {
+                if let Ok(gid) = val.parse::<i64>() {
+                    gids.push(gid);
+                }
+            }
+        }
+        gids
     }
 
     /// Resync projected/secret/configmap volumes for a running pod.
@@ -2154,5 +2209,71 @@ mod projected_mode_tests {
             err.is_err(),
             "missing path must return Err, not be swallowed"
         );
+    }
+
+    /// A pod mounting a PVC bound to a PV carrying the
+    /// `pv.beta.kubernetes.io/gid` annotation must surface that GID via
+    /// `volume_gids` (upstream `VolumeGIDValue`). A PVC-backed volume whose PV
+    /// lacks the annotation contributes nothing.
+    #[tokio::test]
+    async fn volume_gids_reads_pv_gid_annotation_for_pvc() {
+        use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim};
+
+        let storage = Arc::new(StorageBackend::new_memory());
+
+        // PV `pv-gid` carries the GID annotation; PV `pv-nogid` does not.
+        for (name, ann) in [
+            ("pv-gid", json!({"pv.beta.kubernetes.io/gid": "7777"})),
+            ("pv-nogid", json!({})),
+        ] {
+            let pv: PersistentVolume = serde_json::from_value(json!({
+                "metadata": {"name": name, "annotations": ann},
+                "spec": {
+                    "capacity": {"storage": "1Gi"},
+                    "accessModes": ["ReadWriteOnce"],
+                    "hostPath": {"path": format!("/tmp/{name}")}
+                }
+            }))
+            .unwrap();
+            Storage::create(
+                storage.as_ref(),
+                &build_key("persistentvolumes", None, name),
+                &pv,
+            )
+            .await
+            .unwrap();
+        }
+
+        for (claim, pv) in [("claim-gid", "pv-gid"), ("claim-nogid", "pv-nogid")] {
+            let pvc: PersistentVolumeClaim = serde_json::from_value(json!({
+                "metadata": {"name": claim, "namespace": "default"},
+                "spec": {"accessModes": ["ReadWriteOnce"], "volumeName": pv,
+                         "resources": {"requests": {"storage": "1Gi"}}}
+            }))
+            .unwrap();
+            Storage::create(
+                storage.as_ref(),
+                &build_key("persistentvolumeclaims", Some("default"), claim),
+                &pvc,
+            )
+            .await
+            .unwrap();
+        }
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"containers": [], "volumes": [
+                {"name": "with-gid", "persistentVolumeClaim": {"claimName": "claim-gid"}},
+                {"name": "no-gid", "persistentVolumeClaim": {"claimName": "claim-nogid"}}
+            ]}
+        }))
+        .unwrap();
+
+        let vm = VolumeManager::new(
+            std::env::temp_dir().to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        assert_eq!(vm.volume_gids(&pod).await, vec![7777]);
     }
 }
