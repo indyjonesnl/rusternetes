@@ -62,9 +62,19 @@ impl ExecParams {
                 "command" if !value.is_empty() => {
                     command.push(value);
                 }
-                "stdin" => stdin = is_true(&value),
-                "stdout" => stdout = is_true(&value),
-                "stderr" => stderr = is_true(&value),
+                // A Kubernetes api-server proxies exec/attach to the kubelet
+                // using the upstream param names — ExecStdinParam="input",
+                // ExecStdoutParam="output", ExecStderrParam="error",
+                // ExecTTYParam="tty" (k8s.io/api/core/v1/types.go). Also accept
+                // the raw stream names (stdin/stdout/stderr) that the
+                // rusternetes api-server forwards verbatim, so the kubelet works
+                // behind BOTH a vanilla control plane and the native stack.
+                // Without "input"/"output"/"error", a vanilla api-server's exec
+                // request parses to all-false streams and the CRI rejects it
+                // with "one of stdin, stdout, or stderr must be set".
+                "input" | "stdin" => stdin = is_true(&value),
+                "output" | "stdout" => stdout = is_true(&value),
+                "error" | "stderr" => stderr = is_true(&value),
                 "tty" => tty = is_true(&value),
                 _ => {}
             }
@@ -753,6 +763,30 @@ mod tests {
         assert!(p.stdin);
         assert!(p.stdout);
         assert!(!p.stderr);
+    }
+
+    // Regression: a Kubernetes api-server proxies exec/attach to the kubelet
+    // with the upstream param names input/output/error/tty (not
+    // stdin/stdout/stderr). Before the fix these parsed to all-false streams
+    // and the CRI rejected the exec with "one of stdin, stdout, or stderr must
+    // be set" — every `kubectl exec` through a vanilla api-server failed.
+    #[test]
+    fn exec_params_parse_upstream_apiserver_names() {
+        // What a vanilla api-server sends to the kubelet (values are "1").
+        let q = "command=echo&command=hi&output=1&error=1&tty=1";
+        let p = ExecParams::from_query(q);
+        assert_eq!(p.command, vec!["echo", "hi"]);
+        assert!(p.stdout, "output=1 must map to stdout");
+        assert!(p.stderr, "error=1 must map to stderr");
+        assert!(p.tty, "tty=1 must map to tty");
+        assert!(!p.stdin, "no input param => stdin false");
+    }
+
+    #[test]
+    fn exec_params_input_maps_to_stdin() {
+        let p = ExecParams::from_query("command=sh&input=1&output=1");
+        assert!(p.stdin, "input=1 must map to stdin");
+        assert!(p.stdout);
     }
 
     #[test]
