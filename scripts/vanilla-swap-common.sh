@@ -420,10 +420,14 @@ vs_swap_join_worker() {
   # pods ready" gate and prevent ANY NodeConformance spec from running. Exclude
   # it via nodeAffinity (before it schedules) and drop any pod already placed
   # there. NodeConformance specs are node-level and do not exercise kube-proxy.
-  kubectl --kubeconfig "$kc" -n kube-system patch daemonset kube-proxy --type=json \
+  # Run kubectl INSIDE the control-plane container: the exported node-admin.conf
+  # ($kc) points at the kind-internal address (https://<cp>:6443), which is not
+  # resolvable from the host where this harness runs. `docker exec "$cp"` uses
+  # the in-container admin.conf where that hostname resolves.
+  docker exec "$cp" kubectl -n kube-system patch daemonset kube-proxy --type=json \
     -p "[{\"op\":\"add\",\"path\":\"/spec/template/spec/affinity\",\"value\":{\"nodeAffinity\":{\"requiredDuringSchedulingIgnoredDuringExecution\":{\"nodeSelectorTerms\":[{\"matchExpressions\":[{\"key\":\"kubernetes.io/hostname\",\"operator\":\"NotIn\",\"values\":[\"$node_name\"]}]}]}}}}]" \
     >/dev/null 2>&1 || true
-  kubectl --kubeconfig "$kc" -n kube-system delete pod -l k8s-app=kube-proxy \
+  docker exec "$cp" kubectl -n kube-system delete pod -l k8s-app=kube-proxy \
     --field-selector "spec.nodeName=$node_name" --force --grace-period=0 \
     >/dev/null 2>&1 || true
 
