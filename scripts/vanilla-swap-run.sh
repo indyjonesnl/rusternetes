@@ -175,9 +175,34 @@ if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
   # This whole block is best-effort diagnostics/bring-up: a Forbidden kubectl in
   # a command substitution must never abort the run under `set -e`/pipefail.
   set +e
+  # Restore as super-admin (O=system:masters), NOT admin.conf. On the fresh
+  # empty store only system:masters is authorized (the api-server seeds a
+  # cluster-admin binding to it at startup); kubeadm's admin.conf identity is
+  # `kubeadm:cluster-admins`, whose binding does not exist until the restore
+  # applies it — a chicken-and-egg that makes an admin.conf-driven apply
+  # Forbidden (0 objects). super-admin.conf exists exactly for this
+  # RBAC-independent bootstrap. Rewrite its in-cluster server to the
+  # host-reachable one from the exported admin kubeconfig.
+  RESTORE_KC="$KUBECONFIG_FILE"
+  _cp_node="$(vs_control_plane_node "$CLUSTER" 2>/dev/null)"
+  if [ -n "$_cp_node" ] && docker exec "$_cp_node" test -f /etc/kubernetes/super-admin.conf 2>/dev/null; then
+    _sa="$VS_WORKDIR/super-admin.kubeconfig"
+    _server="$(awk '/server:/{print $2; exit}' "$KUBECONFIG_FILE")"
+    docker exec "$_cp_node" cat /etc/kubernetes/super-admin.conf >"$_sa" 2>/dev/null
+    if [ -n "$_server" ] && [ -s "$_sa" ]; then
+      # point at the host-reachable endpoint + skip CA verify (server SAN differs)
+      sed -i -E "s#(server:).*#\\1 ${_server}#; /certificate-authority-data:/d" "$_sa"
+      sed -i -E "s#(server: .*)#\\1\n    insecure-skip-tls-verify: true#" "$_sa"
+      RESTORE_KC="$_sa"
+      vs_log "restoring as super-admin (system:masters) via super-admin.conf"
+    fi
+  fi
   vs_log "restoring substrate snapshot into the swapped api-server"
-  KUBECONFIG="$KUBECONFIG_FILE" kubectl apply -f "$APISERVER_RESTORE" >/dev/null 2>&1 \
-    || vs_warn "some snapshot objects failed to apply (continuing)"
+  KUBECONFIG="$RESTORE_KC" kubectl apply -f "$APISERVER_RESTORE" >"$VS_WORKDIR/restore-apply.log" 2>&1 \
+    || vs_warn "some snapshot objects failed to apply (see restore-apply.log)"
+  # Surface distinct apply errors (decode/validation gaps in the api-server).
+  grep -iE "error|invalid|missing field|unable|cannot" "$VS_WORKDIR/restore-apply.log" 2>/dev/null \
+    | sed -E 's/[0-9]+//g' | sort -u | head -10 | sed 's/^/[restore-err] /'
   # Restart ONLY worker kubelets to re-register their Node objects. Never the
   # control-plane node: its kubelet owns the api-server static pod, and bouncing
   # it restarts the api-server (dropping its embedded store) mid-bring-up.
@@ -188,12 +213,12 @@ if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
   vs_log "waiting for a Ready node + running system pods (≤300s)"
   ready=0
   for _ in $(seq 1 60); do
-    ready="$(KUBECONFIG="$KUBECONFIG_FILE" kubectl get nodes --no-headers 2>/dev/null | awk '$2=="Ready"' | wc -l)"
+    ready="$(KUBECONFIG="$RESTORE_KC" kubectl get nodes --no-headers 2>/dev/null | awk '$2=="Ready"' | wc -l)"
     [ "${ready:-0}" -ge 1 ] && break
     sleep 5
   done
-  nodes="$(KUBECONFIG="$KUBECONFIG_FILE" kubectl get nodes --no-headers 2>/dev/null | wc -l)"
-  runpods="$(KUBECONFIG="$KUBECONFIG_FILE" kubectl get pods -A --no-headers 2>/dev/null | grep -c Running)"
+  nodes="$(KUBECONFIG="$RESTORE_KC" kubectl get nodes --no-headers 2>/dev/null | wc -l)"
+  runpods="$(KUBECONFIG="$RESTORE_KC" kubectl get pods -A --no-headers 2>/dev/null | grep -c Running)"
   vs_log "post-restore substrate: ${nodes:-0} nodes (${ready:-0} Ready), ${runpods:-0} running pods"
   set -e
 fi
