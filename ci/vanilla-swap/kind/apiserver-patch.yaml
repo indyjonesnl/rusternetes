@@ -1,18 +1,71 @@
 # Static-pod swap recipe: kube-apiserver -> rusternetes api-server.
 #
-# Consumed by vs_swap_static_pod() in scripts/vanilla-swap-common.sh, which:
-#   1. reads `manifest:` below to locate the static-pod file inside the
-#      control-plane node container (/etc/kubernetes/manifests/<file>);
-#   2. rewrites the container `image:` to the rusternetes image (imageRepo from
-#      ci/vanilla-swap/targets.json + the resolved tag);
-#   3. applies any `extraArgs:` below by appending them to the pod's command;
-#   4. lets the node kubelet restart just this static pod.
+# Same mechanism as scheduler-patch.yaml / controller-manager-patch.yaml: when a
+# recipe carries a `template:` block, vs_swap_static_pod() renders it (VS_IMAGE)
+# and writes it over /etc/kubernetes/manifests/kube-apiserver.yaml inside the
+# control-plane node, so the node kubelet restarts that one static pod as the
+# rusternetes api-server. Everything else in the control plane stays vanilla.
 #
-# Everything else in the control plane stays unmodified upstream.
+# A template (not the image-only rewrite) is REQUIRED here: the vanilla static
+# pod's `command:` is `[kube-apiserver, --<28 kubeadm flags>]`, but a pod
+# `command:` overrides the image ENTRYPOINT and the rusternetes image ships
+# `/app/api-server` (not `kube-apiserver`) — so the image-rewrite path fails with
+# `exec: "kube-apiserver": executable file not found`. The rusternetes api-server
+# also parses flags with clap (rejects unknown flags), so it cannot inherit
+# kubeadm's flag set; the template passes ONLY the flags it supports.
+#
+# The rusternetes api-server authenticates in-cluster clients (kubelet,
+# kube-proxy, kubectl) by x509 client cert against kubeadm's cluster CA
+# (--client-ca-file) and serves TLS with kubeadm's apiserver serving cert.
+#
+# CAVEATS (tracked for full enablement — see the api-server-swap roadmap issue):
+#   * Storage: uses the embedded SQLite backend, so it comes up with EMPTY state
+#     (it does not read kubeadm's etcd — different key layout + encoding). The
+#     vanilla kubelet/scheduler/CM/kube-proxy must re-register against it, and
+#     the api-server's bootstrap seeds the `kubernetes` Service + default RBAC.
+#     REQUIRES the image be built with `--features sqlite` (the default
+#     `cargo build -p rusternetes-api-server` is etcd-only and silently ignores
+#     `--storage-backend=sqlite`).
+#   * ServiceAccount tokens: the api-server verifies HS256 (--jwt-secret), not
+#     the RS256 tokens kubeadm's signer issued (no --service-account-key-file
+#     support yet), so pre-existing pods' projected SA tokens will not verify.
 manifest: kube-apiserver.yaml
 component: kube-apiserver
-# The rusternetes api-server uses its own embedded storage backend rather than
-# the kind cluster's etcd, so it does not need --etcd-servers. These args point
-# it at the same serving cert/kubeconfig paths kubeadm already mounted.
-extraArgs:
-  - "--storage-backend=sqlite"
+template: |
+  apiVersion: v1
+  kind: Pod
+  metadata:
+    name: kube-apiserver
+    namespace: kube-system
+    labels:
+      component: kube-apiserver
+      tier: control-plane
+      rusternetes.io/module-under-test: api-server
+  spec:
+    hostNetwork: true
+    priorityClassName: system-node-critical
+    containers:
+      - name: kube-apiserver
+        image: ${VS_IMAGE}
+        command: ["/app/api-server"]
+        args:
+          - "--bind-address=0.0.0.0:6443"
+          - "--tls"
+          - "--tls-cert-file=/etc/kubernetes/pki/apiserver.crt"
+          - "--tls-key-file=/etc/kubernetes/pki/apiserver.key"
+          - "--client-ca-file=/etc/kubernetes/pki/ca.crt"
+          - "--storage-backend=sqlite"
+          - "--data-dir=/tmp/rusternetes/api-server.db"
+        volumeMounts:
+          - name: pki
+            mountPath: /etc/kubernetes/pki
+            readOnly: true
+          - name: data
+            mountPath: /tmp/rusternetes
+    volumes:
+      - name: pki
+        hostPath:
+          path: /etc/kubernetes/pki
+          type: Directory
+      - name: data
+        emptyDir: {}

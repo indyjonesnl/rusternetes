@@ -257,7 +257,10 @@ vs_swap_static_pod() {
   local arg
   while IFS= read -r arg; do
     [ -n "$arg" ] || continue
-    docker exec "$node" sed -i -E "/^[[:space:]]*- (kube-[a-z-]+|/usr/local/bin/.*)$/a\\    - ${arg}" "$path" || true
+    # Use \% as the address delimiter: the pattern contains `/usr/local/bin/`,
+    # which would prematurely close a default `/.../ ` sed address (sed then
+    # reports "Unmatched ( or \(" and appends nothing).
+    docker exec "$node" sed -i -E "\%^[[:space:]]*- (kube-[a-z-]+|/usr/local/bin/.*)\$%a\\    - ${arg}" "$path" || true
   done < <(awk '/^extraArgs:/{f=1;next} f&&/^[[:space:]]*-/{gsub(/^[[:space:]]*-[[:space:]]*"?|"?[[:space:]]*$/,"");print} f&&/^[^[:space:]-]/{f=0}' "$root/$recipe")
 }
 

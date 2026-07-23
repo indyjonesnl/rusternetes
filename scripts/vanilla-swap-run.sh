@@ -91,6 +91,21 @@ fi
 KUBECONFIG_FILE="$(vs_kubeconfig_path "$CLUSTER")"
 [ -f "$KUBECONFIG_FILE" ] || kind get kubeconfig --name "$CLUSTER" >"$KUBECONFIG_FILE"
 
+# --- load a locally-built image into the kind nodes ------------------------
+# A static-pod / daemonset swap references the rusternetes image by name; the
+# node's containerd must have it. CI publishes :main to ghcr and lets the node
+# pull, but a local run builds the image and it exists only in the host docker
+# daemon. Load it into the kind nodes when present (no-op otherwise, so CI's
+# pull path is unaffected).
+if [ "$ENVIRONMENT" != "cloud" ]; then
+  _vs_img="$(vs_resolved_image)"
+  if docker image inspect "$_vs_img" >/dev/null 2>&1; then
+    vs_log "loading local image $_vs_img into kind cluster $CLUSTER"
+    kind load docker-image "$_vs_img" --name "$CLUSTER" >/dev/null 2>&1 \
+      || vs_log "kind load failed (continuing; the node will try to pull instead)"
+  fi
+fi
+
 # --- swap the one module ---------------------------------------------------
 vs_apply_swap "$CLUSTER" "$KUBECONFIG_FILE"
 
