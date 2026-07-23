@@ -13,6 +13,26 @@
 use rusternetes_protobuf::ProtoRegistry;
 use serde_json::json;
 
+/// The decode must read `spec.expirationSeconds` at protobuf tag **4** — the
+/// upstream `authentication/v1` field number that client-go writes. A symmetric
+/// rusternetes encode↔decode can't catch a wrong tag (it's consistent with
+/// itself); this feeds a hand-built wire payload with expirationSeconds at tag 4
+/// (TokenRequest.spec = field 2 message; spec.expirationSeconds = field 4 varint
+/// 3600 = 0x90 0x1c) and asserts it decodes. Regression for the controller-
+/// manager's "nil pointer of expiration in token request" (#1667).
+#[test]
+fn decodes_expiration_at_upstream_tag_4() {
+    let wire: [u8; 5] = [0x12, 0x03, 0x20, 0x90, 0x1c];
+    let d = ProtoRegistry::new()
+        .decode_message("authentication.k8s.io/v1.TokenRequest", &wire)
+        .expect("decode wire bytes");
+    assert_eq!(
+        d.pointer("/spec/expirationSeconds"),
+        Some(&json!(3600)),
+        "expirationSeconds must decode from upstream protobuf tag 4"
+    );
+}
+
 #[test]
 fn auth_tokenrequest_roundtrips_status() {
     let r = ProtoRegistry::new();

@@ -13176,7 +13176,11 @@ impl ProtoRegistry {
                             FieldType::Repeated(Box::new(FieldType::String)),
                         ),
                     ),
-                    (2, ("expirationSeconds".into(), FieldType::Int)),
+                    // expirationSeconds is protobuf field 4 upstream
+                    // (authentication/v1 generated.proto), NOT 2 — client-go
+                    // writes it at tag 4, so reading tag 2 dropped it and the
+                    // controller-manager saw a nil expiration (#1667).
+                    (4, ("expirationSeconds".into(), FieldType::Int)),
                     (
                         3,
                         (
