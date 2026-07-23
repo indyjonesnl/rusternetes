@@ -295,9 +295,26 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
             }
         }
 
-        // Check resource
+        // Check resource + subresource, mirroring upstream
+        // `pkg/apis/rbac/v1` `resourceMatches`: `*` matches all; an exact rule
+        // resource matches the COMBINED `resource/subresource` (or the bare
+        // resource when there is no subresource); and `*/subresource` matches
+        // that subresource on any resource. A rule on the bare resource does
+        // NOT grant its subresources — so e.g. `system:kube-scheduler`'s
+        // `create` on `pods/binding` requires the rule to name `pods/binding`,
+        // and a request for resource=pods subresource=binding must be tested as
+        // `pods/binding`, not `pods` (otherwise the scheduler's Bind is denied
+        // and no pod is ever scheduled against a swapped api-server — #1667).
         if let Some(ref resources) = rule.resources {
-            if !resources.contains(&attrs.resource) && !resources.contains(&"*".to_string()) {
+            let sub = attrs.subresource.as_deref().filter(|s| !s.is_empty());
+            let combined = match sub {
+                Some(s) => format!("{}/{}", attrs.resource, s),
+                None => attrs.resource.clone(),
+            };
+            let matched = resources.iter().any(|r| {
+                r == "*" || *r == combined || matches!(sub, Some(s) if *r == format!("*/{s}"))
+            });
+            if !matched {
                 return false;
             }
         }
@@ -915,6 +932,65 @@ mod tests {
         // This would need a mock storage implementation to fully test
         // Just testing the rule matching logic
         assert!(rule.verbs.contains(&attrs.verb));
+    }
+
+    struct NoStore;
+    #[async_trait]
+    impl AuthzStorage for NoStore {
+        async fn get<T>(&self, key: &str, _ns: Option<&str>) -> Result<T>
+        where
+            T: DeserializeOwned + Send + Sync,
+        {
+            Err(crate::error::Error::NotFound(key.to_string()))
+        }
+        async fn list<T>(&self, _ns: Option<&str>) -> Result<Vec<T>>
+        where
+            T: serde::Serialize + DeserializeOwned + Send + Sync,
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    fn rule(verbs: &[&str], groups: &[&str], resources: &[&str]) -> PolicyRule {
+        PolicyRule {
+            verbs: verbs.iter().map(|s| s.to_string()).collect(),
+            api_groups: Some(groups.iter().map(|s| s.to_string()).collect()),
+            resources: Some(resources.iter().map(|s| s.to_string()).collect()),
+            resource_names: None,
+            non_resource_urls: None,
+        }
+    }
+
+    /// #1667: a rule on the subresource `pods/binding` must authorize a request
+    /// for resource=pods subresource=binding (the scheduler's Bind), and a rule
+    /// on the bare `pods` must NOT — subresources are granted explicitly. Also
+    /// `*/binding` matches. Mirrors upstream `resourceMatches`.
+    #[test]
+    fn rbac_matches_subresource_combined() {
+        let authz = RBACAuthorizer::new(Arc::new(NoStore));
+        let bind = RequestAttributes::new(mk_user("system:kube-scheduler"), "create", "pods")
+            .with_api_group("")
+            .with_subresource("binding");
+
+        assert!(
+            authz.rule_allows(&rule(&["create"], &[""], &["pods/binding"]), &bind),
+            "a rule on pods/binding must authorize the Bind"
+        );
+        assert!(
+            !authz.rule_allows(&rule(&["create"], &[""], &["pods"]), &bind),
+            "a rule on the bare `pods` must NOT grant pods/binding"
+        );
+        assert!(
+            authz.rule_allows(&rule(&["create"], &[""], &["*/binding"]), &bind),
+            "`*/binding` must match the binding subresource"
+        );
+        assert!(
+            authz.rule_allows(&rule(&["*"], &["*"], &["*"]), &bind),
+            "`*` resources must match everything incl. subresources"
+        );
+        // A bare-resource request still matches a bare-resource rule.
+        let get_pod = RequestAttributes::new(mk_user("x"), "get", "pods").with_api_group("");
+        assert!(authz.rule_allows(&rule(&["get"], &[""], &["pods"]), &get_pod));
     }
 
     fn mk_user(username: &str) -> UserInfo {
