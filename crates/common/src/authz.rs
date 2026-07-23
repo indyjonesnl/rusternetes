@@ -692,6 +692,63 @@ impl Authorizer for NodeAuthorizer {
     }
 }
 
+/// Chains authorizers so a request is allowed if ANY of them allows it,
+/// mirroring upstream `--authorization-mode=Node,RBAC`
+/// (`k8s.io/apiserver/pkg/authorization/union`). Upstream's chain
+/// short-circuits on the first `Allow`/`Deny` and falls through only on
+/// `NoOpinion`; its Node authorizer returns `NoOpinion` (not `Deny`) for
+/// anything it does not cover, which is what lets RBAC take over.
+///
+/// Our [`Decision`] is binary (no `NoOpinion`), and [`NodeAuthorizer`] returns
+/// `Deny` for uncovered requests. So we implement the equivalent as an
+/// *allow-override* chain: a `Deny` is treated as "no opinion — try the next
+/// authorizer", and only when every authorizer denies do we deny (with the
+/// reasons aggregated). This is behaviorally identical to the upstream Node,RBAC
+/// union because both Node and RBAC are allow-lists — neither issues an
+/// overriding explicit deny that must beat another authorizer's allow.
+pub struct UnionAuthorizer {
+    authorizers: Vec<Arc<dyn Authorizer>>,
+}
+
+impl UnionAuthorizer {
+    pub fn new(authorizers: Vec<Arc<dyn Authorizer>>) -> Self {
+        Self { authorizers }
+    }
+}
+
+#[async_trait]
+impl Authorizer for UnionAuthorizer {
+    async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
+        let mut reasons = Vec::new();
+        for authorizer in &self.authorizers {
+            match authorizer.authorize(attrs).await? {
+                Decision::Allow => return Ok(Decision::Allow),
+                Decision::Deny(reason) => reasons.push(reason),
+            }
+        }
+        Ok(Decision::Deny(reasons.join("; ")))
+    }
+
+    async fn get_user_rules(
+        &self,
+        user: &UserInfo,
+        namespace: &str,
+    ) -> Result<(
+        Vec<crate::resources::ResourceRule>,
+        Vec<crate::resources::NonResourceRule>,
+    )> {
+        let mut resource_rules = Vec::new();
+        let mut non_resource_rules = Vec::new();
+        for authorizer in &self.authorizers {
+            if let Ok((rr, nrr)) = authorizer.get_user_rules(user, namespace).await {
+                resource_rules.extend(rr);
+                non_resource_rules.extend(nrr);
+            }
+        }
+        Ok((resource_rules, non_resource_rules))
+    }
+}
+
 /// Webhook Authorizer with full HTTP integration
 pub struct WebhookAuthorizer {
     webhook_url: String,
@@ -858,5 +915,61 @@ mod tests {
         // This would need a mock storage implementation to fully test
         // Just testing the rule matching logic
         assert!(rule.verbs.contains(&attrs.verb));
+    }
+
+    fn mk_user(username: &str) -> UserInfo {
+        UserInfo {
+            username: username.to_string(),
+            uid: String::new(),
+            groups: vec![],
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    /// #1664: the Node,RBAC union is allow-override — a `Deny` from one
+    /// authorizer falls through to the next, any `Allow` wins, and only an
+    /// all-deny chain denies. In particular a kubelet (`system:node:<n>`) is
+    /// authorized for its own Node via the Node authorizer even when the other
+    /// authorizer denies (as an empty RBAC store would).
+    #[tokio::test]
+    async fn union_is_allow_override() {
+        let u = mk_user("alice");
+        let attrs = RequestAttributes::new(u.clone(), "get", "pods").with_namespace("default");
+
+        // Deny then Allow -> Allow (fall-through).
+        let union = UnionAuthorizer::new(vec![
+            Arc::new(AlwaysDenyAuthorizer),
+            Arc::new(AlwaysAllowAuthorizer),
+        ]);
+        assert!(matches!(
+            union.authorize(&attrs).await.unwrap(),
+            Decision::Allow
+        ));
+
+        // All deny -> Deny.
+        let union_deny = UnionAuthorizer::new(vec![Arc::new(AlwaysDenyAuthorizer)]);
+        assert!(matches!(
+            union_deny.authorize(&attrs).await.unwrap(),
+            Decision::Deny(_)
+        ));
+
+        // Node authorizer grants a kubelet its own Node, even chained with a
+        // denying authorizer (models Node + empty-RBAC).
+        let node_union = UnionAuthorizer::new(vec![
+            Arc::new(NodeAuthorizer),
+            Arc::new(AlwaysDenyAuthorizer),
+        ]);
+        let node_attrs =
+            RequestAttributes::new(mk_user("system:node:n1"), "get", "nodes").with_name("n1");
+        assert!(matches!(
+            node_union.authorize(&node_attrs).await.unwrap(),
+            Decision::Allow
+        ));
+        // A non-node user gets no Node grant; with a denying peer the union denies.
+        let denied = RequestAttributes::new(mk_user("mallory"), "get", "nodes").with_name("n1");
+        assert!(matches!(
+            node_union.authorize(&denied).await.unwrap(),
+            Decision::Deny(_)
+        ));
     }
 }
