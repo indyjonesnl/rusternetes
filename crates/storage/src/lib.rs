@@ -483,6 +483,34 @@ impl StorageBackend {
         StorageBackend::Api(api_storage::ApiStorage::new(client))
     }
 
+    /// Request a bound ServiceAccount token from the api-server (TokenRequest
+    /// subresource) when running as an api-server client. Returns `Ok(Some(tok))`
+    /// for the `Api` backend and `Ok(None)` for the storage-direct backends
+    /// (all-in-one/native), where the caller self-mints with the in-process
+    /// signing key the co-located api-server trusts.
+    ///
+    /// Mirrors the upstream kubelet, which always obtains projected SA tokens
+    /// via `serviceaccounts/{name}/token` rather than signing them, so the
+    /// tokens are accepted by the (possibly foreign/vanilla) api-server that
+    /// issued them.
+    #[cfg_attr(not(feature = "api-client"), allow(unused_variables))]
+    pub async fn create_sa_token(
+        &self,
+        namespace: &str,
+        name: &str,
+        audiences: &[String],
+        expiration_seconds: i64,
+    ) -> Result<Option<String>> {
+        #[cfg(feature = "api-client")]
+        if let StorageBackend::Api(s) = self {
+            return s
+                .create_sa_token(namespace, name, audiences, expiration_seconds)
+                .await
+                .map(Some);
+        }
+        Ok(None)
+    }
+
     /// Gracefully evict a pod, in a mode-aware way (#1284). `mutated_pod` is the
     /// victim with `deletionTimestamp` + eviction status already applied.
     ///

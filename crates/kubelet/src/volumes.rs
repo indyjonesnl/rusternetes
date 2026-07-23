@@ -1574,9 +1574,20 @@ impl VolumeManager {
                         } else {
                             String::new()
                         };
-                        let expiration_seconds = sa_token.expiration_seconds.unwrap_or(3600);
+                        // TokenRequest requires expirationSeconds >= 600 (10m).
+                        let expiration_seconds =
+                            sa_token.expiration_seconds.unwrap_or(3600).max(600);
                         let now = chrono::Utc::now();
                         let exp = now.timestamp() + expiration_seconds;
+                        // Audience to REQUEST from the api-server: exactly what the
+                        // projection asked for (empty => the api-server's own
+                        // default api-audience, which it will then accept — do NOT
+                        // force "rusternetes", or a vanilla api-server issues a
+                        // token whose audience it rejects on use).
+                        let requested_audiences: Vec<String> =
+                            sa_token.audience.iter().cloned().collect();
+                        // Audience baked into the self-mint FALLBACK claims (native
+                        // storage-mode only): default to "rusternetes".
                         let mut audiences = vec!["rusternetes".to_string()];
                         if let Some(ref aud) = sa_token.audience {
                             audiences = vec![aud.clone()];
@@ -1602,7 +1613,7 @@ impl VolumeManager {
                             iat: now.timestamp(),
                             exp,
                             iss: "https://kubernetes.default.svc.cluster.local".to_string(),
-                            aud: audiences,
+                            aud: audiences.clone(),
                             kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
                                 namespace: namespace.to_string(),
                                 svcacct: rusternetes_common::auth::KubeRef {
@@ -1625,15 +1636,44 @@ impl VolumeManager {
                             node_name,
                             node_uid,
                         };
-                        let token = match self.token_manager.generate_token(claims) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                warn!(
+                        // Prefer an api-server-issued bound token (TokenRequest),
+                        // matching the upstream kubelet (pkg/kubelet/token) — it
+                        // never self-signs. A vanilla api-server only trusts
+                        // tokens IT signed, so a self-minted token is 401-rejected
+                        // for in-cluster clients (kindnet et al.). Self-mint only
+                        // as a fallback for the storage-direct backends
+                        // (all-in-one), whose co-located api-server trusts our key.
+                        let mut issued: Option<String> = None;
+                        if let Some(st) = storage {
+                            match st
+                                .create_sa_token(
+                                    namespace,
+                                    sa_name,
+                                    &requested_audiences,
+                                    expiration_seconds,
+                                )
+                                .await
+                            {
+                                Ok(Some(t)) => issued = Some(t),
+                                Ok(None) => {}
+                                Err(e) => warn!(
+                                    "TokenRequest for {}/{} failed: {}; self-minting",
+                                    namespace, sa_name, e
+                                ),
+                            }
+                        }
+                        let token = match issued {
+                            Some(t) => t,
+                            None => match self.token_manager.generate_token(claims) {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    warn!(
                                     "Failed to generate SA token for pod {}: {}, using placeholder",
                                     pod_name, e
                                 );
-                                "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder".to_string()
-                            }
+                                    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder".to_string()
+                                }
+                            },
                         };
                         std::fs::write(&token_path, &token)?;
                         #[cfg(unix)]
