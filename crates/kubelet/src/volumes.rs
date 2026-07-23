@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use rusternetes_common::resources::{
-    ConfigMap, PersistentVolume, PersistentVolumeClaim, Pod, Secret,
+    ConfigMap, KeyToPath, PersistentVolume, PersistentVolumeClaim, Pod, Secret,
 };
 use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
@@ -23,6 +23,49 @@ use crate::runtime::{
     check_host_path_type, mount_tmpfs_for_emptydir, parse_cpu_quantity, parse_memory_quantity,
     parse_quantity_bytes, pod_dir_key, setup_emptydir_dir, HostPathCheck,
 };
+
+/// Build the projection payload (relative user-visible path -> bytes) for a
+/// ConfigMap volume, honoring `items` (specific keys → mapped paths) or, when
+/// absent, every key from `data` + `binaryData`. This is the SINGLE source of
+/// truth for what a ConfigMap volume should contain, shared by the initial
+/// mount and every re-projection so they all feed the same bytes to the
+/// AtomicWriter (and therefore no-op identically when unchanged).
+fn build_configmap_payload(
+    configmap: &ConfigMap,
+    items: Option<&Vec<KeyToPath>>,
+    configmap_name: &str,
+    is_optional: bool,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut payload: std::collections::BTreeMap<String, Vec<u8>> =
+        std::collections::BTreeMap::new();
+    if let Some(items) = items {
+        for item in items {
+            if let Some(v) = configmap.data.as_ref().and_then(|d| d.get(&item.key)) {
+                payload.insert(item.path.clone(), v.clone().into_bytes());
+            } else if let Some(v) = configmap
+                .binary_data
+                .as_ref()
+                .and_then(|d| d.get(&item.key))
+            {
+                payload.insert(item.path.clone(), v.clone());
+            } else if !is_optional {
+                warn!("ConfigMap {} missing key {}", configmap_name, item.key);
+            }
+        }
+    } else {
+        if let Some(data) = &configmap.data {
+            for (k, v) in data {
+                payload.insert(k.clone(), v.clone().into_bytes());
+            }
+        }
+        if let Some(bin) = &configmap.binary_data {
+            for (k, v) in bin {
+                payload.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    payload
+}
 
 /// Apply fsGroup group-ownership to volume trees in-process (no fork/exec).
 ///
@@ -306,7 +349,11 @@ impl VolumeManager {
                         }
                     }
                 }
-                // Resync configmap volumes
+                // Resync configmap volumes. Re-project through the AtomicWriter
+                // (same as the initial mount) so an unchanged ConfigMap is a true
+                // no-op — never an in-place rewrite through the `..data` symlinks,
+                // which would fire an fsnotify Write on the user-visible file and
+                // crash a config watcher such as kube-proxy (#1652).
                 if let Some(cm_source) = &volume.config_map {
                     if let Some(cm_name) = &cm_source.name {
                         let key =
@@ -317,67 +364,19 @@ impl VolumeManager {
                         {
                             let volume_dir =
                                 format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
-                            if let Some(ref items) = cm_source.items {
-                                // Only mount the specified keys at their mapped paths
-                                for item in items {
-                                    if let Some(value) =
-                                        cm.data.as_ref().and_then(|d| d.get(&item.key))
-                                    {
-                                        let file_path = format!("{}/{}", volume_dir, item.path);
-                                        if let Ok(existing) = std::fs::read_to_string(&file_path) {
-                                            if existing == *value {
-                                                continue;
-                                            }
-                                        }
-                                        if let Some(parent) =
-                                            std::path::Path::new(&file_path).parent()
-                                        {
-                                            let _ = std::fs::create_dir_all(parent);
-                                        }
-                                        let _ = std::fs::write(&file_path, value);
-                                    } else if let Some(value) =
-                                        cm.binary_data.as_ref().and_then(|d| d.get(&item.key))
-                                    {
-                                        let file_path = format!("{}/{}", volume_dir, item.path);
-                                        if let Ok(existing) = std::fs::read(&file_path) {
-                                            if existing == *value {
-                                                continue;
-                                            }
-                                        }
-                                        if let Some(parent) =
-                                            std::path::Path::new(&file_path).parent()
-                                        {
-                                            let _ = std::fs::create_dir_all(parent);
-                                        }
-                                        let _ = std::fs::write(&file_path, value);
-                                    }
-                                }
-                            } else {
-                                // Mount all keys from data
-                                if let Some(data) = &cm.data {
-                                    for (k, v) in data {
-                                        let file_path = format!("{}/{}", volume_dir, k);
-                                        if let Ok(existing) = std::fs::read_to_string(&file_path) {
-                                            if existing == *v {
-                                                continue;
-                                            }
-                                        }
-                                        let _ = std::fs::write(&file_path, v);
-                                    }
-                                }
-                                // Mount all keys from binaryData
-                                if let Some(binary_data) = &cm.binary_data {
-                                    for (k, v) in binary_data {
-                                        let file_path = format!("{}/{}", volume_dir, k);
-                                        if let Ok(existing) = std::fs::read(&file_path) {
-                                            if existing == *v {
-                                                continue;
-                                            }
-                                        }
-                                        let _ = std::fs::write(&file_path, v);
-                                    }
-                                }
-                            }
+                            let is_optional = cm_source.optional.unwrap_or(false);
+                            let payload = build_configmap_payload(
+                                &cm,
+                                cm_source.items.as_ref(),
+                                cm_name,
+                                is_optional,
+                            );
+                            let mode = cm_source.default_mode.unwrap_or(0o644) as u32;
+                            let _ = crate::atomic_writer::write_payload(
+                                std::path::Path::new(&volume_dir),
+                                &payload,
+                                mode,
+                            );
                         }
                     }
                 }
@@ -737,35 +736,12 @@ impl VolumeManager {
                     // kubelet's periodic re-SetUp. Per-item modes are not honored
                     // individually here; the volume defaultMode applies (matches
                     // the common case, incl. kube-proxy).
-                    let mut payload: std::collections::BTreeMap<String, Vec<u8>> =
-                        std::collections::BTreeMap::new();
-                    if let Some(ref items) = configmap_source.items {
-                        for item in items {
-                            if let Some(v) = configmap.data.as_ref().and_then(|d| d.get(&item.key))
-                            {
-                                payload.insert(item.path.clone(), v.clone().into_bytes());
-                            } else if let Some(v) = configmap
-                                .binary_data
-                                .as_ref()
-                                .and_then(|d| d.get(&item.key))
-                            {
-                                payload.insert(item.path.clone(), v.clone());
-                            } else if !is_optional {
-                                warn!("ConfigMap {} missing key {}", configmap_name, item.key);
-                            }
-                        }
-                    } else {
-                        if let Some(data) = &configmap.data {
-                            for (k, v) in data {
-                                payload.insert(k.clone(), v.clone().into_bytes());
-                            }
-                        }
-                        if let Some(bin) = &configmap.binary_data {
-                            for (k, v) in bin {
-                                payload.insert(k.clone(), v.clone());
-                            }
-                        }
-                    }
+                    let payload = build_configmap_payload(
+                        &configmap,
+                        configmap_source.items.as_ref(),
+                        configmap_name,
+                        is_optional,
+                    );
                     crate::atomic_writer::write_payload(
                         std::path::Path::new(&volume_dir),
                         &payload,
@@ -1777,32 +1753,26 @@ impl VolumeManager {
                     .await
                 {
                     Ok(cm) => {
-                        if let Some(data) = &cm.data {
-                            let items = cm_source.items.as_ref();
-                            if let Some(items) = items {
-                                for item in items {
-                                    if let Some(value) = data.get(&item.key) {
-                                        let file_path = format!("{}/{}", volume_dir, item.path);
-                                        let _ = std::fs::write(&file_path, value);
-                                    }
-                                }
-                            } else {
-                                for (key, value) in data {
-                                    let file_path = format!("{}/{}", volume_dir, key);
-                                    let _ = std::fs::write(&file_path, value);
-                                }
-                                // Delete files for keys removed from ConfigMap
-                                if let Ok(entries) = std::fs::read_dir(&volume_dir) {
-                                    for entry in entries.flatten() {
-                                        if let Some(fname) = entry.file_name().to_str() {
-                                            if !data.contains_key(fname) && fname != "..data" {
-                                                let _ = std::fs::remove_file(entry.path());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        // Re-project through the AtomicWriter (same path as the
+                        // initial mount): an unchanged ConfigMap is a true no-op,
+                        // and key removals are handled by the writer's stale
+                        // user-visible-symlink pruning. This must NOT rewrite the
+                        // user-visible files in place — that follows the `..data`
+                        // symlinks and fires an fsnotify Write, crash-looping a
+                        // config watcher like kube-proxy (#1652).
+                        let is_optional = cm_source.optional.unwrap_or(false);
+                        let payload = build_configmap_payload(
+                            &cm,
+                            cm_source.items.as_ref(),
+                            cm_name,
+                            is_optional,
+                        );
+                        let mode = cm_source.default_mode.unwrap_or(0o644) as u32;
+                        let _ = crate::atomic_writer::write_payload(
+                            std::path::Path::new(&volume_dir),
+                            &payload,
+                            mode,
+                        );
                     }
                     Err(_) => {
                         // ConfigMap deleted — clean up files if optional
@@ -2093,6 +2063,105 @@ mod projected_mode_tests {
             0o400,
             "projected configMap item mode must be applied on resync"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #1652 regression: re-projecting an UNCHANGED ConfigMap volume (via
+    /// `refresh_volumes` on every sync AND `resync_volumes`) must be a true
+    /// no-op — it must NOT rewrite the user-visible file in place through the
+    /// AtomicWriter `..data` symlink. An in-place rewrite bumps the real file's
+    /// ctime and fires an fsnotify Write, which crash-loops a config watcher
+    /// such as kube-proxy ("content of the proxy server's configuration file
+    /// was updated"). The user-visible file must stay a symlink and its target
+    /// inode's ctime must be unchanged across re-projection.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reproject_unchanged_configmap_is_a_noop() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = std::env::temp_dir().join(format!("rn-cm-noop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let storage = Arc::new(StorageBackend::new_memory());
+        let cm: ConfigMap = serde_json::from_value(json!({
+            "metadata": {"name": "kube-proxy", "namespace": "kube-system"},
+            "data": {"config.conf": "apiVersion: v1\nkind: Config\n", "kubeconfig.conf": "x"}
+        }))
+        .unwrap();
+        Storage::create(
+            storage.as_ref(),
+            &build_key("configmaps", Some("kube-system"), "kube-proxy"),
+            &cm,
+        )
+        .await
+        .unwrap();
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "kube-proxy-xyz", "namespace": "kube-system"},
+            "spec": {"containers": [], "volumes": [{
+                "name": "kube-proxy",
+                "configMap": {"name": "kube-proxy"}
+            }]}
+        }))
+        .unwrap();
+
+        let vm = VolumeManager::new(
+            tmp.to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+
+        // Initial projection (AtomicWriter layout: config.conf -> ..data/config.conf).
+        vm.create_pod_volumes(&pod).await.unwrap();
+        let visible = tmp
+            .join("kube-proxy-xyz")
+            .join("kube-proxy")
+            .join("config.conf");
+        assert!(
+            std::fs::symlink_metadata(&visible)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "config.conf must be a symlink (AtomicWriter layout)"
+        );
+        let real = std::fs::canonicalize(&visible).unwrap();
+        let ctime_before = std::fs::metadata(&real).unwrap().ctime();
+        let data_link_before =
+            std::fs::read_link(tmp.join("kube-proxy-xyz").join("kube-proxy").join("..data"))
+                .unwrap();
+
+        // Re-project the UNCHANGED ConfigMap through BOTH sync-loop paths repeatedly.
+        for _ in 0..3 {
+            vm.refresh_volumes(&pod).await.unwrap();
+            vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        }
+
+        // The user-visible file must still be a symlink, the real inode's ctime
+        // must be untouched (no in-place write), and ..data must not have swapped.
+        assert!(
+            std::fs::symlink_metadata(&visible)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "config.conf must remain a symlink after re-projection"
+        );
+        let ctime_after = std::fs::metadata(&real).unwrap().ctime();
+        assert_eq!(
+            ctime_before, ctime_after,
+            "unchanged re-projection must not rewrite the config file in place (would crash kube-proxy)"
+        );
+        let data_link_after =
+            std::fs::read_link(tmp.join("kube-proxy-xyz").join("kube-proxy").join("..data"))
+                .unwrap();
+        assert_eq!(
+            data_link_before, data_link_after,
+            "..data must not swap when the ConfigMap is unchanged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&visible).unwrap(),
+            "apiVersion: v1\nkind: Config\n"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

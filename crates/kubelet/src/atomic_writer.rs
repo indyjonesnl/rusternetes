@@ -81,11 +81,27 @@ pub fn write_payload(
     // (`<first-path-segment>` -> `..data/<first-path-segment>`). Relative so it
     // resolves inside a bind mount. Runs even when should_write is false, per
     // upstream (kubernetes #121472).
+    let mut wanted: std::collections::HashSet<String> = std::collections::HashSet::new();
     for rel in payload.keys() {
         let seg = rel.split('/').next().unwrap_or(rel.as_str());
+        wanted.insert(seg.to_string());
         let link = target_dir.join(seg);
         if std::fs::symlink_metadata(&link).is_err() {
             std::os::unix::fs::symlink(PathBuf::from(DATA_DIR).join(seg), &link)?;
+        }
+    }
+
+    // Prune stale user-visible entries no longer in the payload (a key removed
+    // from the ConfigMap/Secret), mirroring upstream `removeUserVisiblePaths`.
+    // The internal dotfiles (`..data`, `..data_tmp`, timestamped `..` dirs) are
+    // never touched.
+    if let Ok(entries) = std::fs::read_dir(target_dir) {
+        for e in entries.flatten() {
+            if let Some(name) = e.file_name().to_str() {
+                if !name.starts_with("..") && !wanted.contains(name) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
         }
     }
 
