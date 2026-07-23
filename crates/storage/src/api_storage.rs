@@ -114,6 +114,42 @@ impl ApiStorage {
         }
     }
 
+    /// Request a bound ServiceAccount token from the api-server's TokenRequest
+    /// subresource (`POST /api/v1/namespaces/{ns}/serviceaccounts/{name}/token`).
+    ///
+    /// This is how the upstream kubelet obtains projected SA tokens
+    /// (`pkg/kubelet/token`: `CoreV1().ServiceAccounts(ns).CreateToken`) — it
+    /// never self-signs. An api-server only trusts tokens IT signed, so a
+    /// kubelet that self-mints is rejected (401) by a foreign/vanilla api-server
+    /// (breaks in-cluster clients like kindnet). Returns the issued token.
+    pub async fn create_sa_token(
+        &self,
+        namespace: &str,
+        name: &str,
+        audiences: &[String],
+        expiration_seconds: i64,
+    ) -> Result<String> {
+        let path = format!("/api/v1/namespaces/{namespace}/serviceaccounts/{name}/token");
+        let body = serde_json::json!({
+            "apiVersion": "authentication.k8s.io/v1",
+            "kind": "TokenRequest",
+            "spec": { "audiences": audiences, "expirationSeconds": expiration_seconds },
+        });
+        let resp: Value = self
+            .client
+            .post(&path, &body)
+            .await
+            .map_err(map_write_err)?;
+        resp.pointer("/status/token")
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                Error::Internal(format!(
+                    "TokenRequest for {namespace}/{name} returned no status.token"
+                ))
+            })
+    }
+
     /// Resolve a plural to `(api_root, namespaced)`. Built-in types hit the
     /// static table with no network; on a miss, the api-server's discovery is
     /// loaded once and cached, then retried, so CRD/aggregated types map too.
@@ -1017,6 +1053,57 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Conflict(_))),
             "persistent conflict must surface as Error::Conflict, got {result:?}"
+        );
+    }
+
+    /// A minimal server that captures the request and replies to any POST with a
+    /// TokenRequest carrying `status.token`. Returns (base_url, shared capture).
+    async fn spawn_tokenrequest_server(token: &'static str) -> (String, Arc<Mutex<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let cap = captured.clone();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let req = read_request(&mut stream).await;
+                *cap.lock().await = req;
+                let body = format!(
+                    r#"{{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","status":{{"token":"{token}","expirationTimestamp":"2026-01-01T00:00:00Z"}}}}"#
+                );
+                respond(&mut stream, "201 Created", &body).await;
+            }
+        });
+        (format!("http://{addr}"), captured)
+    }
+
+    // Regression for #1648 chain: the kubelet must obtain projected SA tokens
+    // from the api-server's TokenRequest subresource (a vanilla api-server only
+    // trusts tokens it signed; self-minted ones 401 — breaking kindnet/CNI).
+    // Assert create_sa_token POSTs serviceaccounts/<name>/token and returns the
+    // api-server-issued token.
+    #[tokio::test]
+    async fn create_sa_token_posts_tokenrequest_and_extracts_token() {
+        let (base, captured) = spawn_tokenrequest_server("ISSUED-BY-APISERVER").await;
+        let client = Arc::new(ApiClient::new(&base, true, None).unwrap());
+        let storage = ApiStorage::new(client);
+
+        let tok = storage
+            .create_sa_token("kube-system", "kindnet", &[], 3600)
+            .await
+            .expect("token issued");
+        assert_eq!(tok, "ISSUED-BY-APISERVER");
+
+        let req = captured.lock().await.clone();
+        let req_line = req.lines().next().unwrap_or("");
+        assert!(
+            req_line.starts_with("POST")
+                && req_line
+                    .contains("/api/v1/namespaces/kube-system/serviceaccounts/kindnet/token"),
+            "must POST the TokenRequest subresource, got: {req_line}"
+        );
+        assert!(
+            req.contains("\"expirationSeconds\":3600"),
+            "request body must carry expirationSeconds, got: {req}"
         );
     }
 }

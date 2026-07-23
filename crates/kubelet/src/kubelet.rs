@@ -4771,15 +4771,15 @@ impl Kubelet {
             return;
         };
 
-        // Rebuild the per-volume bind paths exactly as the initial start did
-        // (idempotent: re-creates dirs, re-applies fsGroup, keeps the existing
-        // Memory-emptyDir tmpfs). This is what makes emptyDir data survive a
-        // restart — the recreated container binds the same on-disk volume.
-        let volume_paths = self
-            .runtime
-            .create_pod_volumes(pod)
-            .await
-            .unwrap_or_default();
+        // NOTE: volume (re)projection is deferred to an actual restart below —
+        // it must NOT run on every sync of a running pod. Re-projecting churns
+        // the mounted files (write/chmod/chown), and a watcher like kube-proxy
+        // exits on ANY change to its config file ("content ... was updated") →
+        // CrashLoopBackOff. Upstream never re-projects a running pod's volumes
+        // (they stay mounted; re-SetUp is a no-op via AtomicWriter); we rebuild
+        // only when we're about to (re)start a container. `volume_paths` is
+        // computed lazily on the first restart in this pass and reused.
+        let mut volume_paths: Option<std::collections::HashMap<String, String>> = None;
 
         let now = Instant::now();
 
@@ -4866,10 +4866,23 @@ impl Kubelet {
                     .runtime
                     .remove_terminated_container(&pod.metadata.uid, &c.name)
                     .await;
+                // Rebuild volume bind paths now — only because we are actually
+                // restarting a container (idempotent re-create; Memory-emptyDir
+                // tmpfs and on-disk data persist as the same dir). Computed once
+                // per reconcile pass and reused for any further restarts.
+                if volume_paths.is_none() {
+                    volume_paths = Some(
+                        self.runtime
+                            .create_pod_volumes(pod)
+                            .await
+                            .unwrap_or_default(),
+                    );
+                }
+                let vp = volume_paths.as_ref().unwrap();
                 let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref());
                 if let Err(e) = self
                     .runtime
-                    .start_container(pod, c, &volume_paths, None, None, pod_ip)
+                    .start_container(pod, c, vp, None, None, pod_ip)
                     .await
                 {
                     debug!(

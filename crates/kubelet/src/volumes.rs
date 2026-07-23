@@ -726,97 +726,52 @@ impl VolumeManager {
             // Determine the default file mode: spec defaultMode, or 0644 (Kubernetes default)
             let cm_default_mode = configmap_source.default_mode.unwrap_or(0o644);
 
-            // Compute final directory permissions (will be applied after files are written)
-            #[cfg(unix)]
-            let cm_dir_mode = cm_default_mode as u32 | 0o111;
-
             match configmap_result {
                 Ok(configmap) => {
-                    // Helper closure to write a file and set permissions
-                    let write_cm_file =
-                        |file_path: &str, content: &[u8], mode: i32| -> Result<()> {
-                            if let Some(parent) = std::path::Path::new(file_path).parent() {
-                                std::fs::create_dir_all(parent)?;
-                            }
-                            std::fs::write(file_path, content)?;
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                std::fs::set_permissions(
-                                    file_path,
-                                    std::fs::Permissions::from_mode(mode as u32),
-                                )?;
-                            }
-                            Ok(())
-                        };
-
-                    // Check if specific items are requested
+                    // Build the projection payload (relative path -> bytes),
+                    // honoring `items` (specific keys → mapped paths) or all keys
+                    // from data + binaryData, then project it via the upstream
+                    // AtomicWriter. Re-projecting an unchanged payload is a no-op
+                    // (no write, no chmod, no symlink swap), so a running pod's
+                    // config watcher (kube-proxy) is never disturbed by the
+                    // kubelet's periodic re-SetUp. Per-item modes are not honored
+                    // individually here; the volume defaultMode applies (matches
+                    // the common case, incl. kube-proxy).
+                    let mut payload: std::collections::BTreeMap<String, Vec<u8>> =
+                        std::collections::BTreeMap::new();
                     if let Some(ref items) = configmap_source.items {
-                        // Only mount the specified keys (look in both data and binaryData)
                         for item in items {
-                            let mode = item.mode.unwrap_or(cm_default_mode);
-                            let file_path = format!("{}/{}", volume_dir, item.path);
-
-                            // Try data first, then binary_data
-                            if let Some(value) =
-                                configmap.data.as_ref().and_then(|d| d.get(&item.key))
+                            if let Some(v) = configmap.data.as_ref().and_then(|d| d.get(&item.key))
                             {
-                                write_cm_file(&file_path, value.as_bytes(), mode).with_context(
-                                    || {
-                                        format!(
-                                            "Failed to write ConfigMap key {} to file",
-                                            item.key
-                                        )
-                                    },
-                                )?;
-                                info!("Wrote ConfigMap key {} to {}", item.key, file_path);
-                            } else if let Some(value) = configmap
+                                payload.insert(item.path.clone(), v.clone().into_bytes());
+                            } else if let Some(v) = configmap
                                 .binary_data
                                 .as_ref()
                                 .and_then(|d| d.get(&item.key))
                             {
-                                write_cm_file(&file_path, value, mode).with_context(|| {
-                                    format!(
-                                        "Failed to write ConfigMap binaryData key {} to file",
-                                        item.key
-                                    )
-                                })?;
-                                info!(
-                                    "Wrote ConfigMap binaryData key {} to {}",
-                                    item.key, file_path
-                                );
+                                payload.insert(item.path.clone(), v.clone());
                             } else if !is_optional {
                                 warn!("ConfigMap {} missing key {}", configmap_name, item.key);
                             }
                         }
                     } else {
-                        // Mount all keys from data
                         if let Some(data) = &configmap.data {
-                            for (key, value) in data {
-                                let file_path = format!("{}/{}", volume_dir, key);
-                                write_cm_file(&file_path, value.as_bytes(), cm_default_mode)
-                                    .with_context(|| {
-                                        format!("Failed to write ConfigMap key {} to file", key)
-                                    })?;
-                                info!("Wrote ConfigMap key {} to {}", key, file_path);
+                            for (k, v) in data {
+                                payload.insert(k.clone(), v.clone().into_bytes());
                             }
                         }
-                        // Mount all keys from binaryData
-                        if let Some(binary_data) = &configmap.binary_data {
-                            for (key, value) in binary_data {
-                                let file_path = format!("{}/{}", volume_dir, key);
-                                write_cm_file(&file_path, value, cm_default_mode).with_context(
-                                    || {
-                                        format!(
-                                            "Failed to write ConfigMap binaryData key {} to file",
-                                            key
-                                        )
-                                    },
-                                )?;
-                                info!("Wrote ConfigMap binaryData key {} to {}", key, file_path);
+                        if let Some(bin) = &configmap.binary_data {
+                            for (k, v) in bin {
+                                payload.insert(k.clone(), v.clone());
                             }
                         }
                     }
+                    crate::atomic_writer::write_payload(
+                        std::path::Path::new(&volume_dir),
+                        &payload,
+                        cm_default_mode as u32,
+                    )
+                    .with_context(|| format!("failed to project ConfigMap {configmap_name}"))?;
                 }
                 Err(e) => {
                     if is_optional {
@@ -835,17 +790,6 @@ impl VolumeManager {
                         ));
                     }
                 }
-            }
-
-            // Set directory permissions after files are written so that restrictive
-            // defaultMode values don't prevent file creation.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    &volume_dir,
-                    std::fs::Permissions::from_mode(cm_dir_mode),
-                )?;
             }
 
             info!("Created ConfigMap volume {} at {}", volume.name, volume_dir);
@@ -1574,9 +1518,20 @@ impl VolumeManager {
                         } else {
                             String::new()
                         };
-                        let expiration_seconds = sa_token.expiration_seconds.unwrap_or(3600);
+                        // TokenRequest requires expirationSeconds >= 600 (10m).
+                        let expiration_seconds =
+                            sa_token.expiration_seconds.unwrap_or(3600).max(600);
                         let now = chrono::Utc::now();
                         let exp = now.timestamp() + expiration_seconds;
+                        // Audience to REQUEST from the api-server: exactly what the
+                        // projection asked for (empty => the api-server's own
+                        // default api-audience, which it will then accept — do NOT
+                        // force "rusternetes", or a vanilla api-server issues a
+                        // token whose audience it rejects on use).
+                        let requested_audiences: Vec<String> =
+                            sa_token.audience.iter().cloned().collect();
+                        // Audience baked into the self-mint FALLBACK claims (native
+                        // storage-mode only): default to "rusternetes".
                         let mut audiences = vec!["rusternetes".to_string()];
                         if let Some(ref aud) = sa_token.audience {
                             audiences = vec![aud.clone()];
@@ -1602,7 +1557,7 @@ impl VolumeManager {
                             iat: now.timestamp(),
                             exp,
                             iss: "https://kubernetes.default.svc.cluster.local".to_string(),
-                            aud: audiences,
+                            aud: audiences.clone(),
                             kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
                                 namespace: namespace.to_string(),
                                 svcacct: rusternetes_common::auth::KubeRef {
@@ -1625,25 +1580,68 @@ impl VolumeManager {
                             node_name,
                             node_uid,
                         };
-                        let token = match self.token_manager.generate_token(claims) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                warn!(
+                        // Reuse a still-fresh token: re-mint only when the file is
+                        // missing or past ~80% of its lifetime. The per-sync volume
+                        // re-creation would otherwise hit the api-server TokenRequest
+                        // endpoint every few seconds per pod and churn the token file.
+                        let refresh_after = (expiration_seconds * 8 / 10).max(60);
+                        let token_fresh = std::fs::metadata(&token_path)
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|mt| mt.elapsed().ok())
+                            .map(|age| (age.as_secs() as i64) < refresh_after)
+                            .unwrap_or(false);
+                        if !token_fresh {
+                            // Prefer an api-server-issued bound token (TokenRequest),
+                            // matching the upstream kubelet (pkg/kubelet/token) — it
+                            // never self-signs. A vanilla api-server only trusts
+                            // tokens IT signed, so a self-minted token is 401-rejected
+                            // for in-cluster clients (kindnet et al.). Self-mint only
+                            // as a fallback for the storage-direct backends
+                            // (all-in-one), whose co-located api-server trusts our key.
+                            let mut issued: Option<String> = None;
+                            if let Some(st) = storage {
+                                match st
+                                    .create_sa_token(
+                                        namespace,
+                                        sa_name,
+                                        &requested_audiences,
+                                        expiration_seconds,
+                                    )
+                                    .await
+                                {
+                                    Ok(Some(t)) => issued = Some(t),
+                                    Ok(None) => {}
+                                    Err(e) => warn!(
+                                        "TokenRequest for {}/{} failed: {}; self-minting",
+                                        namespace, sa_name, e
+                                    ),
+                                }
+                            }
+                            let token = match issued {
+                                Some(t) => t,
+                                None => match self.token_manager.generate_token(claims) {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        warn!(
                                     "Failed to generate SA token for pod {}: {}, using placeholder",
                                     pod_name, e
                                 );
-                                "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder".to_string()
+                                        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder"
+                                            .to_string()
+                                    }
+                                },
+                            };
+                            std::fs::write(&token_path, &token)?;
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                std::fs::set_permissions(
+                                    &token_path,
+                                    std::fs::Permissions::from_mode(proj_default_mode as u32),
+                                )?;
                             }
-                        };
-                        std::fs::write(&token_path, &token)?;
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            std::fs::set_permissions(
-                                &token_path,
-                                std::fs::Permissions::from_mode(proj_default_mode as u32),
-                            )?;
-                        }
+                        } // end if !token_fresh
                     }
                 }
             }

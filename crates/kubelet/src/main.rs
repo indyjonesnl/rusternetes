@@ -15,6 +15,7 @@ mod cri_runtime;
 // helpers — those are only reached through the lib API now. They stay compiled
 // into the bin (shared modules) but read as dead here; the lib is their real
 // consumer.
+mod atomic_writer;
 #[allow(dead_code)]
 mod events;
 #[allow(dead_code)]
