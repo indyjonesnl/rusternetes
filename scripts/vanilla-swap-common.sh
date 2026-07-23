@@ -349,18 +349,20 @@ vs_swap_join_worker() {
   # every pod fails to start. Mirrors compose.sqlite.yml, which shares
   # ${KUBELET_VOLUMES_PATH} between both services.
   #
-  # A named volume (not a host bind) is used deliberately: a host-path bind with
-  # `:rshared` is rejected by Docker Desktop ("path ... is mounted on /host_mnt
-  # but it is not a shared mount"). The trade-off is that Memory-medium emptyDir
-  # tmpfs sub-mounts the kubelet makes do not propagate into containerd's mount
-  # namespace (no rshared), so those few specs may fail; the file-based majority
-  # (incl. the universal managed /etc/hosts) works.
-  local volsvol="vanilla-swap-${cluster}-kubelet-vols"
+  # Use a host-path bind with `:rshared`, exactly like compose.sqlite.yml's
+  # ${KUBELET_VOLUMES_PATH} (which gets NodeConformance 191/191). rshared lets
+  # the kubelet's Memory-emptyDir tmpfs sub-mounts propagate into containerd's
+  # mount namespace, and — unlike a docker *named* volume — presents the volume
+  # tree to pods without the extra volume-driver bind layer, so inotify behaves
+  # as on a real node (a config watcher like kube-proxy is not spuriously woken).
+  # (rshared host-binds are rejected by Docker Desktop's /host_mnt; the harness
+  # targets native docker / DinD, where / is a shared mount.)
+  local volsdir="$VS_WORKDIR/kubelet-volumes"
+  mkdir -p "$volsdir"
 
   vs_log "starting rusternetes CRI runtime ($cri_image)"
   docker volume create "$vol" >/dev/null
   docker volume create "$datavol" >/dev/null
-  docker volume create "$volsvol" >/dev/null
   # /var/lib/containerd (the overlayfs snapshotter root) MUST live on a real
   # volume, not the container's own overlay rootfs — overlay-on-overlay is
   # rejected by the kernel with EINVAL ("failed to mount rootfs component ...
@@ -372,7 +374,7 @@ vs_swap_join_worker() {
     --label "rusternetes-swap-cluster=$cluster" \
     -v "${vol}:/run/containerd" \
     -v "${datavol}:/var/lib/containerd" \
-    -v "${volsvol}:/app/volumes" \
+    -v "${volsdir}:/app/volumes:rshared" \
     "$cri_image" >/dev/null
   local i
   for (( i=0; i<30; i++ )); do
@@ -399,7 +401,7 @@ vs_swap_join_worker() {
     --name "vanilla-swap-${cluster}-${node_name}" \
     --label "rusternetes-swap-cluster=$cluster" \
     -v "${vol}:/run/containerd" \
-    -v "${volsvol}:/app/volumes" \
+    -v "${volsdir}:/app/volumes:rshared" \
     -v "${kc}:/kc/admin.conf:ro" \
     -e "CONTAINER_RUNTIME_ENDPOINT=$cri" \
     -e "KUBELET_VOLUMES_PATH=/app/volumes" \
