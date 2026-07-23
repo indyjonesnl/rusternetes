@@ -172,22 +172,30 @@ fi
 # just status-updates, which no-ops on an empty store). Wait for a Ready node so
 # test pods can schedule + get a CNI IP.
 if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
+  # This whole block is best-effort diagnostics/bring-up: a Forbidden kubectl in
+  # a command substitution must never abort the run under `set -e`/pipefail.
+  set +e
   vs_log "restoring substrate snapshot into the swapped api-server"
   KUBECONFIG="$KUBECONFIG_FILE" kubectl apply -f "$APISERVER_RESTORE" >/dev/null 2>&1 \
     || vs_warn "some snapshot objects failed to apply (continuing)"
-  vs_log "restarting node kubelets to re-register nodes"
-  for n in $(kind get nodes --name "$CLUSTER" 2>/dev/null); do
-    docker exec "$n" systemctl restart kubelet >/dev/null 2>&1 || true
+  # Restart ONLY worker kubelets to re-register their Node objects. Never the
+  # control-plane node: its kubelet owns the api-server static pod, and bouncing
+  # it restarts the api-server (dropping its embedded store) mid-bring-up.
+  vs_log "restarting worker kubelets to re-register nodes"
+  for n in $(kind get nodes --name "$CLUSTER" 2>/dev/null | grep -v 'control-plane'); do
+    docker exec "$n" systemctl restart kubelet >/dev/null 2>&1
   done
   vs_log "waiting for a Ready node + running system pods (≤300s)"
+  ready=0
   for _ in $(seq 1 60); do
     ready="$(KUBECONFIG="$KUBECONFIG_FILE" kubectl get nodes --no-headers 2>/dev/null | awk '$2=="Ready"' | wc -l)"
     [ "${ready:-0}" -ge 1 ] && break
     sleep 5
   done
   nodes="$(KUBECONFIG="$KUBECONFIG_FILE" kubectl get nodes --no-headers 2>/dev/null | wc -l)"
-  runpods="$(KUBECONFIG="$KUBECONFIG_FILE" kubectl get pods -A --no-headers 2>/dev/null | grep -c Running || true)"
+  runpods="$(KUBECONFIG="$KUBECONFIG_FILE" kubectl get pods -A --no-headers 2>/dev/null | grep -c Running)"
   vs_log "post-restore substrate: ${nodes:-0} nodes (${ready:-0} Ready), ${runpods:-0} running pods"
+  set -e
 fi
 
 # --- run the scoped subset via the existing conformance runner -------------
