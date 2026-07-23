@@ -1,0 +1,18 @@
+# Static-pod swap recipe: kube-apiserver -> rusternetes api-server.
+#
+# Consumed by vs_swap_static_pod() in scripts/vanilla-swap-common.sh, which:
+#   1. reads `manifest:` below to locate the static-pod file inside the
+#      control-plane node container (/etc/kubernetes/manifests/<file>);
+#   2. rewrites the container `image:` to the rusternetes image (imageRepo from
+#      ci/vanilla-swap/targets.json + the resolved tag);
+#   3. applies any `extraArgs:` below by appending them to the pod's command;
+#   4. lets the node kubelet restart just this static pod.
+#
+# Everything else in the control plane stays unmodified upstream.
+manifest: kube-apiserver.yaml
+component: kube-apiserver
+# The rusternetes api-server uses its own embedded storage backend rather than
+# the kind cluster's etcd, so it does not need --etcd-servers. These args point
+# it at the same serving cert/kubeconfig paths kubeadm already mounted.
+extraArgs:
+  - "--storage-backend=sqlite"

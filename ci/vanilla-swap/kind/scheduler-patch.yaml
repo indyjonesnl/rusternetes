@@ -1,0 +1,46 @@
+# Static-pod swap recipe: kube-scheduler -> rusternetes scheduler (API mode).
+#
+# Consumed by vs_swap_static_pod() in scripts/vanilla-swap-common.sh. When a
+# recipe carries a `template:` block, the swap REPLACES the whole static-pod
+# manifest (not just the image): it envsubst-renders the template (VS_IMAGE) and
+# writes it to /etc/kubernetes/manifests/<manifest> inside the control-plane
+# node, so the node kubelet restarts that one static pod as the rusternetes
+# scheduler. Everything else in the control plane stays unmodified upstream.
+#
+# The rusternetes scheduler runs in API mode (reads pods/nodes informers, writes
+# via the binding subresource + status + events) using the kubeconfig kubeadm
+# already mounts on the node (/etc/kubernetes/scheduler.conf, client-cert auth as
+# system:kube-scheduler). API mode does no leader election, so readiness is
+# "a pending pod gets scheduled", not a held lease.
+manifest: kube-scheduler.yaml
+component: kube-scheduler
+template: |
+  apiVersion: v1
+  kind: Pod
+  metadata:
+    name: kube-scheduler
+    namespace: kube-system
+    labels:
+      component: kube-scheduler
+      tier: control-plane
+      rusternetes.io/module-under-test: scheduler
+  spec:
+    hostNetwork: true
+    priorityClassName: system-node-critical
+    containers:
+      - name: kube-scheduler
+        image: ${VS_IMAGE}
+        command: ["/app/scheduler"]
+        args:
+          - "--kubeconfig=/etc/kubernetes/scheduler.conf"
+          - "--insecure-skip-tls-verify"
+          - "--interval=1"
+        volumeMounts:
+          - name: kubeconfig
+            mountPath: /etc/kubernetes/scheduler.conf
+            readOnly: true
+    volumes:
+      - name: kubeconfig
+        hostPath:
+          path: /etc/kubernetes/scheduler.conf
+          type: FileOrCreate

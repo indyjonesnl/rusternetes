@@ -1,0 +1,76 @@
+# DaemonSet swap recipe: kube-proxy -> rusternetes kube-proxy (API mode).
+#
+# Consumed by vs_swap_daemonset() in scripts/vanilla-swap-common.sh, which:
+#   1. deletes the vanilla `kube-system/kube-proxy` DaemonSet;
+#   2. copies the control-plane admin kubeconfig into a Secret
+#      (`rusternetes-kube-proxy-kubeconfig`) so the rusternetes kube-proxy can
+#      authenticate to the vanilla api-server with client-cert auth — kind's
+#      kube-proxy uses a projected `tokenFile`, which the rusternetes kubeconfig
+#      loader does not support (only inline token / client-cert);
+#   3. envsubst-renders the manifest below (VS_IMAGE / VS_APISERVER_URL /
+#      VS_CLUSTER_CIDR / VS_NODEPORT_RANGE) and applies it.
+#
+# The rusternetes kube-proxy reads Services/Endpoints/EndpointSlices from the
+# vanilla api-server via ApiStorage and programs iptables — standard API only.
+# Verified live against a v1.35.0 kind cluster: "sync: N services, M endpoint
+# entries; built NAT rules".
+#
+# manifest-kind: daemonset-template
+namespace: kube-system
+name: rusternetes-kube-proxy
+container: kube-proxy
+vanillaDaemonSet: kube-proxy
+kubeconfigSecret: rusternetes-kube-proxy-kubeconfig
+template: |
+  apiVersion: apps/v1
+  kind: DaemonSet
+  metadata:
+    name: rusternetes-kube-proxy
+    namespace: kube-system
+    labels:
+      k8s-app: rusternetes-kube-proxy
+  spec:
+    selector:
+      matchLabels:
+        k8s-app: rusternetes-kube-proxy
+    template:
+      metadata:
+        labels:
+          k8s-app: rusternetes-kube-proxy
+      spec:
+        hostNetwork: true
+        tolerations:
+          - operator: Exists
+        containers:
+          - name: kube-proxy
+            image: ${VS_IMAGE}
+            securityContext:
+              privileged: true
+            command: ["/app/kube-proxy"]
+            args:
+              - "--node-name"
+              - "$(NODE_NAME)"
+              - "--kubeconfig"
+              - "/kc/admin.conf"
+              - "--api-server-url"
+              - "${VS_APISERVER_URL}"
+              - "--cluster-cidr"
+              - "${VS_CLUSTER_CIDR}"
+              - "--node-port-range"
+              - "${VS_NODEPORT_RANGE}"
+              - "--insecure-skip-tls-verify"
+              - "--sync-interval"
+              - "3"
+            env:
+              - name: NODE_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: spec.nodeName
+            volumeMounts:
+              - name: kubeconfig
+                mountPath: /kc
+                readOnly: true
+        volumes:
+          - name: kubeconfig
+            secret:
+              secretName: rusternetes-kube-proxy-kubeconfig
