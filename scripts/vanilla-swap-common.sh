@@ -413,7 +413,21 @@ vs_swap_join_worker() {
     --insecure-skip-tls-verify \
     --metrics-port 10250 --sync-interval 3 >/dev/null
 
-  vs_log "node '$node_name' launched; readiness is checked separately"
+  # Scope kube-proxy OFF the swapped node. This harness isolates the *kubelet*;
+  # kube-proxy is a separate component and currently crash-loops on the
+  # rusternetes node from a spurious config-watch wakeup specific to the CRI
+  # ConfigMap mount (#1652), which would otherwise wedge the e2e "all system
+  # pods ready" gate and prevent ANY NodeConformance spec from running. Exclude
+  # it via nodeAffinity (before it schedules) and drop any pod already placed
+  # there. NodeConformance specs are node-level and do not exercise kube-proxy.
+  kubectl --kubeconfig "$kc" -n kube-system patch daemonset kube-proxy --type=json \
+    -p "[{\"op\":\"add\",\"path\":\"/spec/template/spec/affinity\",\"value\":{\"nodeAffinity\":{\"requiredDuringSchedulingIgnoredDuringExecution\":{\"nodeSelectorTerms\":[{\"matchExpressions\":[{\"key\":\"kubernetes.io/hostname\",\"operator\":\"NotIn\",\"values\":[\"$node_name\"]}]}]}}}}]" \
+    >/dev/null 2>&1 || true
+  kubectl --kubeconfig "$kc" -n kube-system delete pod -l k8s-app=kube-proxy \
+    --field-selector "spec.nodeName=$node_name" --force --grace-period=0 \
+    >/dev/null 2>&1 || true
+
+  vs_log "node '$node_name' launched; kube-proxy scoped off it (#1652); readiness checked separately"
 }
 
 # vs_apply_swap — dispatch on VS_SWAP.
