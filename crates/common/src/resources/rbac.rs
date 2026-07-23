@@ -131,7 +131,11 @@ pub struct RoleBinding {
 
     pub metadata: ObjectMeta,
 
-    /// Subjects holds references to the objects the role applies to
+    /// Subjects holds references to the objects the role applies to.
+    /// Optional (upstream `rbacv1.RoleBinding.Subjects` is `json:",omitempty"`):
+    /// a binding may legitimately have zero subjects, so a missing `subjects`
+    /// key must decode to an empty list, not error.
+    #[serde(default)]
     pub subjects: Vec<Subject>,
 
     /// RoleRef can reference a Role in the current namespace or a ClusterRole in the global namespace
@@ -176,7 +180,12 @@ pub struct ClusterRoleBinding {
 
     pub metadata: ObjectMeta,
 
-    /// Subjects holds references to the objects the role applies to
+    /// Subjects holds references to the objects the role applies to.
+    /// Optional (upstream `rbacv1.ClusterRoleBinding.Subjects` is
+    /// `json:",omitempty"`): kubeadm seeds subject-less bindings such as
+    /// `system:node`, so a missing `subjects` key must decode to an empty list,
+    /// not error (a decode error here aborts a whole `kubectl apply -f` list).
+    #[serde(default)]
     pub subjects: Vec<Subject>,
 
     /// RoleRef can only reference a ClusterRole in the global namespace
@@ -307,4 +316,36 @@ pub struct AggregationRule {
     /// ClusterRoleSelectors holds a list of selectors which will be used to find ClusterRoles and create the rules
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_role_selectors: Option<Vec<crate::types::LabelSelector>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Upstream `rbacv1.{ClusterRoleBinding,RoleBinding}.Subjects` are
+    /// `json:"subjects,omitempty"` — a binding may have zero subjects (e.g.
+    /// kubeadm's `system:node` ClusterRoleBinding). A missing `subjects` key
+    /// MUST decode to an empty list, not error; otherwise a single such object
+    /// aborts a whole `kubectl apply -f <list>` (blocked the api-server swap
+    /// substrate restore, #1659).
+    #[test]
+    fn binding_without_subjects_decodes_to_empty() {
+        let crb: ClusterRoleBinding = serde_json::from_value(serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "system:node"},
+            "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:node"}
+        }))
+        .expect("ClusterRoleBinding without subjects must decode");
+        assert!(crb.subjects.is_empty());
+
+        let rb: RoleBinding = serde_json::from_value(serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {"name": "x", "namespace": "default"},
+            "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "x"}
+        }))
+        .expect("RoleBinding without subjects must decode");
+        assert!(rb.subjects.is_empty());
+    }
 }
