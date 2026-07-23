@@ -738,14 +738,40 @@ impl VolumeManager {
                             if let Some(parent) = std::path::Path::new(file_path).parent() {
                                 std::fs::create_dir_all(parent)?;
                             }
-                            std::fs::write(file_path, content)?;
+                            // Idempotent write: only rewrite when the content
+                            // actually differs, so the per-sync re-creation of a
+                            // running pod's volumes does not churn the file's
+                            // mtime. A watcher like kube-proxy exits on ANY change
+                            // to its mounted config file ("content of the proxy
+                            // server's configuration file was updated"), so
+                            // rewriting identical bytes every sync interval
+                            // crash-loops it. Mirrors upstream's atomic volume
+                            // writer, which updates only on real change.
+                            let unchanged = std::fs::read(file_path)
+                                .map(|existing| existing == content)
+                                .unwrap_or(false);
+                            if !unchanged {
+                                std::fs::write(file_path, content)?;
+                            }
+                            // chmod only when the mode differs. An unconditional
+                            // set_permissions on every per-sync re-setup churns the
+                            // file's ctime -> a CHMOD inotify event, which makes a
+                            // config watcher like kube-proxy exit ("content of the
+                            // proxy server's configuration file was updated") and
+                            // crash-loop. Idempotent chmod keeps the file inert.
                             #[cfg(unix)]
                             {
                                 use std::os::unix::fs::PermissionsExt;
-                                std::fs::set_permissions(
-                                    file_path,
-                                    std::fs::Permissions::from_mode(mode as u32),
-                                )?;
+                                let want = (mode as u32) & 0o7777;
+                                let cur = std::fs::metadata(file_path)
+                                    .ok()
+                                    .map(|m| m.permissions().mode() & 0o7777);
+                                if cur != Some(want) {
+                                    std::fs::set_permissions(
+                                        file_path,
+                                        std::fs::Permissions::from_mode(mode as u32),
+                                    )?;
+                                }
                             }
                             Ok(())
                         };
@@ -838,14 +864,22 @@ impl VolumeManager {
             }
 
             // Set directory permissions after files are written so that restrictive
-            // defaultMode values don't prevent file creation.
+            // defaultMode values don't prevent file creation. Idempotent chmod
+            // (skip when mode matches) so the per-sync re-setup doesn't churn the
+            // dir's ctime and fire a CHMOD event at watchers in it (kube-proxy).
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    &volume_dir,
-                    std::fs::Permissions::from_mode(cm_dir_mode),
-                )?;
+                let want = cm_dir_mode & 0o7777;
+                let cur = std::fs::metadata(&volume_dir)
+                    .ok()
+                    .map(|m| m.permissions().mode() & 0o7777);
+                if cur != Some(want) {
+                    std::fs::set_permissions(
+                        &volume_dir,
+                        std::fs::Permissions::from_mode(cm_dir_mode),
+                    )?;
+                }
             }
 
             info!("Created ConfigMap volume {} at {}", volume.name, volume_dir);
@@ -1636,54 +1670,68 @@ impl VolumeManager {
                             node_name,
                             node_uid,
                         };
-                        // Prefer an api-server-issued bound token (TokenRequest),
-                        // matching the upstream kubelet (pkg/kubelet/token) — it
-                        // never self-signs. A vanilla api-server only trusts
-                        // tokens IT signed, so a self-minted token is 401-rejected
-                        // for in-cluster clients (kindnet et al.). Self-mint only
-                        // as a fallback for the storage-direct backends
-                        // (all-in-one), whose co-located api-server trusts our key.
-                        let mut issued: Option<String> = None;
-                        if let Some(st) = storage {
-                            match st
-                                .create_sa_token(
-                                    namespace,
-                                    sa_name,
-                                    &requested_audiences,
-                                    expiration_seconds,
-                                )
-                                .await
-                            {
-                                Ok(Some(t)) => issued = Some(t),
-                                Ok(None) => {}
-                                Err(e) => warn!(
-                                    "TokenRequest for {}/{} failed: {}; self-minting",
-                                    namespace, sa_name, e
-                                ),
+                        // Reuse a still-fresh token: re-mint only when the file is
+                        // missing or past ~80% of its lifetime. The per-sync volume
+                        // re-creation would otherwise hit the api-server TokenRequest
+                        // endpoint every few seconds per pod and churn the token file.
+                        let refresh_after = (expiration_seconds * 8 / 10).max(60);
+                        let token_fresh = std::fs::metadata(&token_path)
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|mt| mt.elapsed().ok())
+                            .map(|age| (age.as_secs() as i64) < refresh_after)
+                            .unwrap_or(false);
+                        if !token_fresh {
+                            // Prefer an api-server-issued bound token (TokenRequest),
+                            // matching the upstream kubelet (pkg/kubelet/token) — it
+                            // never self-signs. A vanilla api-server only trusts
+                            // tokens IT signed, so a self-minted token is 401-rejected
+                            // for in-cluster clients (kindnet et al.). Self-mint only
+                            // as a fallback for the storage-direct backends
+                            // (all-in-one), whose co-located api-server trusts our key.
+                            let mut issued: Option<String> = None;
+                            if let Some(st) = storage {
+                                match st
+                                    .create_sa_token(
+                                        namespace,
+                                        sa_name,
+                                        &requested_audiences,
+                                        expiration_seconds,
+                                    )
+                                    .await
+                                {
+                                    Ok(Some(t)) => issued = Some(t),
+                                    Ok(None) => {}
+                                    Err(e) => warn!(
+                                        "TokenRequest for {}/{} failed: {}; self-minting",
+                                        namespace, sa_name, e
+                                    ),
+                                }
                             }
-                        }
-                        let token = match issued {
-                            Some(t) => t,
-                            None => match self.token_manager.generate_token(claims) {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    warn!(
+                            let token = match issued {
+                                Some(t) => t,
+                                None => match self.token_manager.generate_token(claims) {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        warn!(
                                     "Failed to generate SA token for pod {}: {}, using placeholder",
                                     pod_name, e
                                 );
-                                    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder".to_string()
-                                }
-                            },
-                        };
-                        std::fs::write(&token_path, &token)?;
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            std::fs::set_permissions(
-                                &token_path,
-                                std::fs::Permissions::from_mode(proj_default_mode as u32),
-                            )?;
-                        }
+                                        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder"
+                                            .to_string()
+                                    }
+                                },
+                            };
+                            std::fs::write(&token_path, &token)?;
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                std::fs::set_permissions(
+                                    &token_path,
+                                    std::fs::Permissions::from_mode(proj_default_mode as u32),
+                                )?;
+                            }
+                        } // end if !token_fresh
                     }
                 }
             }
