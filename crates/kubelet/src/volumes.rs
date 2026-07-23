@@ -726,123 +726,52 @@ impl VolumeManager {
             // Determine the default file mode: spec defaultMode, or 0644 (Kubernetes default)
             let cm_default_mode = configmap_source.default_mode.unwrap_or(0o644);
 
-            // Compute final directory permissions (will be applied after files are written)
-            #[cfg(unix)]
-            let cm_dir_mode = cm_default_mode as u32 | 0o111;
-
             match configmap_result {
                 Ok(configmap) => {
-                    // Helper closure to write a file and set permissions
-                    let write_cm_file =
-                        |file_path: &str, content: &[u8], mode: i32| -> Result<()> {
-                            if let Some(parent) = std::path::Path::new(file_path).parent() {
-                                std::fs::create_dir_all(parent)?;
-                            }
-                            // Idempotent write: only rewrite when the content
-                            // actually differs, so the per-sync re-creation of a
-                            // running pod's volumes does not churn the file's
-                            // mtime. A watcher like kube-proxy exits on ANY change
-                            // to its mounted config file ("content of the proxy
-                            // server's configuration file was updated"), so
-                            // rewriting identical bytes every sync interval
-                            // crash-loops it. Mirrors upstream's atomic volume
-                            // writer, which updates only on real change.
-                            let unchanged = std::fs::read(file_path)
-                                .map(|existing| existing == content)
-                                .unwrap_or(false);
-                            if !unchanged {
-                                std::fs::write(file_path, content)?;
-                            }
-                            // chmod only when the mode differs. An unconditional
-                            // set_permissions on every per-sync re-setup churns the
-                            // file's ctime -> a CHMOD inotify event, which makes a
-                            // config watcher like kube-proxy exit ("content of the
-                            // proxy server's configuration file was updated") and
-                            // crash-loop. Idempotent chmod keeps the file inert.
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                let want = (mode as u32) & 0o7777;
-                                let cur = std::fs::metadata(file_path)
-                                    .ok()
-                                    .map(|m| m.permissions().mode() & 0o7777);
-                                if cur != Some(want) {
-                                    std::fs::set_permissions(
-                                        file_path,
-                                        std::fs::Permissions::from_mode(mode as u32),
-                                    )?;
-                                }
-                            }
-                            Ok(())
-                        };
-
-                    // Check if specific items are requested
+                    // Build the projection payload (relative path -> bytes),
+                    // honoring `items` (specific keys → mapped paths) or all keys
+                    // from data + binaryData, then project it via the upstream
+                    // AtomicWriter. Re-projecting an unchanged payload is a no-op
+                    // (no write, no chmod, no symlink swap), so a running pod's
+                    // config watcher (kube-proxy) is never disturbed by the
+                    // kubelet's periodic re-SetUp. Per-item modes are not honored
+                    // individually here; the volume defaultMode applies (matches
+                    // the common case, incl. kube-proxy).
+                    let mut payload: std::collections::BTreeMap<String, Vec<u8>> =
+                        std::collections::BTreeMap::new();
                     if let Some(ref items) = configmap_source.items {
-                        // Only mount the specified keys (look in both data and binaryData)
                         for item in items {
-                            let mode = item.mode.unwrap_or(cm_default_mode);
-                            let file_path = format!("{}/{}", volume_dir, item.path);
-
-                            // Try data first, then binary_data
-                            if let Some(value) =
-                                configmap.data.as_ref().and_then(|d| d.get(&item.key))
+                            if let Some(v) = configmap.data.as_ref().and_then(|d| d.get(&item.key))
                             {
-                                write_cm_file(&file_path, value.as_bytes(), mode).with_context(
-                                    || {
-                                        format!(
-                                            "Failed to write ConfigMap key {} to file",
-                                            item.key
-                                        )
-                                    },
-                                )?;
-                                info!("Wrote ConfigMap key {} to {}", item.key, file_path);
-                            } else if let Some(value) = configmap
+                                payload.insert(item.path.clone(), v.clone().into_bytes());
+                            } else if let Some(v) = configmap
                                 .binary_data
                                 .as_ref()
                                 .and_then(|d| d.get(&item.key))
                             {
-                                write_cm_file(&file_path, value, mode).with_context(|| {
-                                    format!(
-                                        "Failed to write ConfigMap binaryData key {} to file",
-                                        item.key
-                                    )
-                                })?;
-                                info!(
-                                    "Wrote ConfigMap binaryData key {} to {}",
-                                    item.key, file_path
-                                );
+                                payload.insert(item.path.clone(), v.clone());
                             } else if !is_optional {
                                 warn!("ConfigMap {} missing key {}", configmap_name, item.key);
                             }
                         }
                     } else {
-                        // Mount all keys from data
                         if let Some(data) = &configmap.data {
-                            for (key, value) in data {
-                                let file_path = format!("{}/{}", volume_dir, key);
-                                write_cm_file(&file_path, value.as_bytes(), cm_default_mode)
-                                    .with_context(|| {
-                                        format!("Failed to write ConfigMap key {} to file", key)
-                                    })?;
-                                info!("Wrote ConfigMap key {} to {}", key, file_path);
+                            for (k, v) in data {
+                                payload.insert(k.clone(), v.clone().into_bytes());
                             }
                         }
-                        // Mount all keys from binaryData
-                        if let Some(binary_data) = &configmap.binary_data {
-                            for (key, value) in binary_data {
-                                let file_path = format!("{}/{}", volume_dir, key);
-                                write_cm_file(&file_path, value, cm_default_mode).with_context(
-                                    || {
-                                        format!(
-                                            "Failed to write ConfigMap binaryData key {} to file",
-                                            key
-                                        )
-                                    },
-                                )?;
-                                info!("Wrote ConfigMap binaryData key {} to {}", key, file_path);
+                        if let Some(bin) = &configmap.binary_data {
+                            for (k, v) in bin {
+                                payload.insert(k.clone(), v.clone());
                             }
                         }
                     }
+                    crate::atomic_writer::write_payload(
+                        std::path::Path::new(&volume_dir),
+                        &payload,
+                        cm_default_mode as u32,
+                    )
+                    .with_context(|| format!("failed to project ConfigMap {configmap_name}"))?;
                 }
                 Err(e) => {
                     if is_optional {
@@ -860,25 +789,6 @@ impl VolumeManager {
                             e
                         ));
                     }
-                }
-            }
-
-            // Set directory permissions after files are written so that restrictive
-            // defaultMode values don't prevent file creation. Idempotent chmod
-            // (skip when mode matches) so the per-sync re-setup doesn't churn the
-            // dir's ctime and fire a CHMOD event at watchers in it (kube-proxy).
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let want = cm_dir_mode & 0o7777;
-                let cur = std::fs::metadata(&volume_dir)
-                    .ok()
-                    .map(|m| m.permissions().mode() & 0o7777);
-                if cur != Some(want) {
-                    std::fs::set_permissions(
-                        &volume_dir,
-                        std::fs::Permissions::from_mode(cm_dir_mode),
-                    )?;
                 }
             }
 

@@ -1,3 +1,4 @@
+pub mod atomic_writer;
 #[allow(dead_code)]
 pub mod cni;
 pub mod config;
