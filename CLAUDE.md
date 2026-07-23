@@ -54,6 +54,23 @@ KUBECONFIG: `~/.kube/rusternetes-config`
 
 ### Local build performance
 
+**Always build via `make` — never `cargo build --release` directly.** The
+`[profile.release]` profile is `lto = "thin"` + `codegen-units = 1` (tuned for
+shipped artifacts), which serialises codegen on one unit and takes *minutes per
+crate* on the big crates (api-server, ~9400-line router). For local iteration,
+building a test/container image, or any functional (non-shipped) binary, use:
+
+```bash
+make build-fast ARGS="-p rusternetes-api-server --bin api-server --features sqlite"
+```
+
+`build-fast` uses the `release-fast` profile (`codegen-units = 16`, `lto = off`)
+— same speed class as CI's test build, output at `target/release-fast/`. Reserve
+`make build` (full `release`) for the shipped `indyjonesnl/rusternetes` release
+artifacts only. `make build-dev` is the debug build. Rule of thumb: if the
+binary just needs to *run* (a swap test, a canary image, local debugging), it
+does NOT need LTO — use `make build-fast`.
+
 The slow part of local iteration is **codegen on every edit**, not linking.
 Two settings dominate; both are machine-local (shell + `~/.cargo/config.toml`),
 not checked in:
