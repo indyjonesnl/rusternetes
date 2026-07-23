@@ -1,3 +1,4 @@
+mod tls;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
@@ -113,9 +114,8 @@ pub async fn proxy_upgrade(target: Uri, req: Request) -> Response {
     };
 
     // 3. Send to backend.
-    let connector = hyper_util::client::legacy::connect::HttpConnector::new();
     let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .build(connector);
+        .build(crate::tls::kubelet_proxy_connector());
 
     let backend_resp = match client.request(backend_req).await {
         Ok(r) => r,
@@ -205,9 +205,8 @@ pub async fn proxy_stream(target: Uri, req: Request) -> Response {
         }
     };
 
-    let connector = hyper_util::client::legacy::connect::HttpConnector::new();
     let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .build(connector);
+        .build(crate::tls::kubelet_proxy_connector());
 
     match client.request(backend_req).await {
         Ok(backend_resp) => {

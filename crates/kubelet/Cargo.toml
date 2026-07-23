@@ -41,6 +41,8 @@ clap.workspace = true
 futures.workspace = true
 chrono.workspace = true
 axum.workspace = true
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { workspace = true }
 futures-util = "0.3"
 async-stream.workspace = true
 bytes = "1"

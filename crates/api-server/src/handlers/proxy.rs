@@ -133,19 +133,12 @@ pub async fn proxy_node(
     // lookup, `port` as the kubelet-endpoint override. The upstream e2e
     // framework constructs URLs of the form `<node>:10250` so the raw
     // path parameter from axum (`node_name`) is the *id*, not the name.
-    let (scheme, actual_node_name, port_str) =
+    let (_scheme, actual_node_name, port_str) =
         split_scheme_name_port(&node_name).unwrap_or(("", node_name.as_str(), ""));
 
-    // Rusternetes kubelet only serves plain HTTP today (see PR #188 note
-    // below); reject `https` requests early rather than 502-ing on the
-    // TLS handshake, matching the explicit-scheme contract upstream
-    // sets in `SplitSchemeNamePort`.
-    if scheme == "https" {
-        return Err(rusternetes_common::Error::InvalidResource(format!(
-            "invalid node request {:?}: https scheme not supported by rusternetes kubelet yet",
-            node_name
-        )));
-    }
+    // The kubelet serves `:10250` over TLS (#1644), so both `http:` and
+    // `https:` id schemes are accepted; the actual dial scheme comes from
+    // `node_conn` (always https). No early rejection.
 
     // Check authorization - requires permission to proxy to nodes.
     // Verb derives from the HTTP method (matches K8s RBAC semantics).

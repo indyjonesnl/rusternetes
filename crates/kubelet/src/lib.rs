@@ -13,6 +13,7 @@ pub mod lifecycle;
 mod poll;
 pub mod runtime;
 pub mod server;
+pub mod serving_tls;
 pub mod static_pods;
 pub mod sync_locks;
 pub mod sysctl;
@@ -140,6 +141,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         storage: storage.clone(),
         kubelet: Some(k.clone()),
     };
+    let tls_node_name = config.node_name.clone();
     tokio::spawn(async move {
         use axum::{routing::get, Json, Router};
         let app = Router::new()
@@ -149,8 +151,15 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
                 get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
             )
             .merge(server::read_only_router(server_state));
-        let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        // Serve the kubelet API port over HTTPS (#1644) — a Kubernetes
+        // api-server proxies logs/exec/attach/metrics via `https://…:10250`.
+        let addr: std::net::SocketAddr = metrics_addr.parse().expect("valid metrics addr");
+        let tls = serving_tls::kubelet_serving_tls(&tls_node_name)
+            .expect("build kubelet serving TLS config");
+        axum_server::bind_rustls(addr, tls)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
     });
 
     k.run().await?;

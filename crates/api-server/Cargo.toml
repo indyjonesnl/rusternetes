@@ -80,6 +80,7 @@ prost-types = "0.13"
 prost-build = "0.13"
 
 [dev-dependencies]
+tokio-rustls = { workspace = true }
 tokio-test = "0.4"
 rusternetes-controller-manager = { path = "../controller-manager" }
 rusternetes-test-support = { path = "../test_support", features = ["apiserver-harness"] }

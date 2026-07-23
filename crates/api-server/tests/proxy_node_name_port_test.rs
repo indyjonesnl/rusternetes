@@ -35,37 +35,60 @@
 use rusternetes_common::resources::{
     DaemonEndpoint, Node, NodeAddress, NodeDaemonEndpoints, NodeStatus,
 };
+use rusternetes_common::tls::TlsConfig;
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_storage::{build_key, Storage};
 use rusternetes_test_support::harness::TestApiServer;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
-/// Spawn an HTTP-1.1 backend on a random `127.0.0.1` port that returns
+/// Spawn an HTTPS/1.1 backend on a random `127.0.0.1` port that returns
 /// `200 OK` with a deterministic body for any request. The handler exits
 /// after `max_requests` connections.
+///
+/// TLS (#1644): the kubelet serves `:10250` over TLS and the api-server
+/// proxies to `https://` (skipping cert verification via
+/// `get_proxy_client`'s `danger_accept_invalid_certs`), so this mock must
+/// present a serving cert or the proxy can't complete the handshake. Uses a
+/// self-signed cert with `http/1.1`-only ALPN (the raw response below is
+/// HTTP/1.1).
 async fn spawn_kubelet_backend(
     body: &'static str,
     max_requests: usize,
 ) -> (u16, tokio::task::JoinHandle<()>) {
+    let tlsc = TlsConfig::generate_self_signed("127.0.0.1", vec!["127.0.0.1".to_string()])
+        .expect("generate self-signed serving cert");
+    let mut server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(tlsc.cert, tlsc.key)
+        .expect("build mock kubelet server config");
+    server_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = tokio::spawn(async move {
         for _ in 0..max_requests {
-            let Ok((mut sock, _)) = listener.accept().await else {
+            let Ok((sock, _)) = listener.accept().await else {
                 return;
             };
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(sock).await else {
+                    return;
+                };
                 let mut buf = vec![0u8; 4096];
-                let _ = sock.read(&mut buf).await;
+                let _ = tls.read(&mut buf).await;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
-                let _ = sock.write_all(response.as_bytes()).await;
-                let _ = sock.flush().await;
-                let _ = sock.shutdown().await;
+                let _ = tls.write_all(response.as_bytes()).await;
+                let _ = tls.flush().await;
+                let _ = tls.shutdown().await;
             });
         }
     });
