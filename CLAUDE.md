@@ -2,6 +2,50 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Upstream-first — port, do NOT reinvent (MANDATORY)
+
+Rusternetes reimplements Kubernetes. **Almost every behavior you need already
+exists in a battle-tested upstream implementation.** Before designing ANY
+non-trivial logic — an authorizer rule, a bootstrap step, a controller loop, a
+validation, a CRI/CNI/CSI call sequence, a default, an error string, a status
+transition — you MUST first read how upstream does it and port that, rather than
+deriving it yourself.
+
+**This is not optional and it is not "when in doubt." It is the default first
+step for every behavioral change.** Deriving logic that already exists upstream
+wastes time and tokens and produces subtly-wrong divergences (wrong mechanism,
+wrong defaults, broken invariants) that only surface as failing tests later.
+
+### The rule
+1. **Look first.** Grep the reference checkouts for the exact concept BEFORE
+   writing code. This is usually a 2-second `grep`/`rg`, not an investigation.
+2. **Port the mechanism, not just the outcome.** If upstream achieves an effect
+   via a seeded object, a reconciler, or a post-start hook, replicate *that
+   mechanism* — do not fake the effect with a shortcut (e.g. an authorizer
+   hard-code). Shortcuts break the invariants the real mechanism preserves.
+3. **Cite it.** In the code comment and the commit/PR, name the upstream file
+   (and ideally the symbol/line) you ported from. Reviewers verify against it.
+4. **Only invent when upstream genuinely has no equivalent** (a Rust-specific
+   concern, a Rusternetes-only feature). Say so explicitly when you do.
+
+### Reference checkouts (read these — they are on this machine)
+- **`../kubernetes`** — upstream Kubernetes (Go). The primary source of truth
+  for api-server, kubelet, scheduler, controller-manager, kube-proxy, RBAC,
+  validation, bootstrap policy, conformance expectations. Pinned to the target
+  version.
+- **`../containerd`**, **`../containerd-rs`** — CRI runtime + a Rust CRI client
+  to mirror for kubelet↔runtime work.
+- **k3s / k0s / rke2 / kind** — distributions that *embed or ship the upstream
+  kube-apiserver/kubelet/etc.* Consult them (via `gh`/web or a clone) for how a
+  real distro wires bootstrap, addons (CNI, kube-proxy, CoreDNS), node
+  registration, and cluster bring-up. They rarely reimplement core behavior —
+  which is itself the signal that you shouldn't either.
+
+### CRI / CNI / CSI
+The interface contracts are a hard constraint, not a suggestion — match the
+upstream call sequence and the published specs exactly. See CLAUDE.local.md for
+the full statement; the upstream-first rule above is how you satisfy it.
+
 ## Build & Development Commands
 
 ```bash
