@@ -385,7 +385,17 @@ vs_swap_join_worker() {
   docker exec "$cp" cat /etc/kubernetes/admin.conf >"$kc"
 
   vs_log "starting rusternetes kubelet node '$node_name' ($image) in API mode"
-  docker run -d --privileged --network kind \
+  # Run the kubelet in the CRI container's network namespace, not its own
+  # `kind` netns. The bridge CNI creates the pod bridge (10.244.0.0/24) inside
+  # the containerd container's netns; a kubelet in a SEPARATE netns has no route
+  # to pod IPs, so every kubelet->pod path fails — HTTP/HTTPS lifecycle hooks
+  # ("PostStartHookError: error sending request for url http://<podIP>:...") and
+  # node->pod connectivity. On a real node the kubelet, the CRI runtime and the
+  # CNI bridge all share the node's root netns; sharing containerd's netns
+  # reproduces that. The node's InternalIP becomes containerd's kind IP (same
+  # network), which the api-server still reaches for the :10250 log/exec proxy.
+  docker run -d --privileged \
+    --network "container:vanilla-swap-${cluster}-containerd" \
     --name "vanilla-swap-${cluster}-${node_name}" \
     --label "rusternetes-swap-cluster=$cluster" \
     -v "${vol}:/run/containerd" \
