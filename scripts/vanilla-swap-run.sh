@@ -91,6 +91,51 @@ fi
 KUBECONFIG_FILE="$(vs_kubeconfig_path "$CLUSTER")"
 [ -f "$KUBECONFIG_FILE" ] || kind get kubeconfig --name "$CLUSTER" >"$KUBECONFIG_FILE"
 
+# --- api-server swap: snapshot the cluster substrate BEFORE the swap --------
+# Swapping the api-server to an empty embedded store drops every object, and the
+# still-running vanilla scheduler/CM/kubelets then tear down the now-unlisted
+# system workloads (kindnet CNI, kube-proxy, CoreDNS) — leaving no schedulable,
+# networked substrate for test pods. Snapshot RBAC + the kube-system addons now;
+# restore them after the swap (below) so the still-running controllers rebuild
+# the substrate. Only the api-server swap needs this (the other modules keep the
+# real api-server + its state).
+APISERVER_RESTORE="$VS_WORKDIR/apiserver-restore.json"
+if [ "$MODULE" = "api-server" ]; then
+  vs_log "snapshotting RBAC + kube-system addons before the api-server swap"
+  {
+    # NOTE: multiple resource TYPES must be comma-separated — `kubectl get A B`
+    # reads B as a *name* of type A (NotFound), capturing 0 objects.
+    KUBECONFIG="$KUBECONFIG_FILE" kubectl get -o json \
+      namespaces,clusterroles.rbac.authorization.k8s.io,clusterrolebindings.rbac.authorization.k8s.io,priorityclasses.scheduling.k8s.io \
+      2>/dev/null
+    KUBECONFIG="$KUBECONFIG_FILE" kubectl get -o json -n kube-system \
+      serviceaccounts,configmaps,daemonsets.apps,deployments.apps,services,roles.rbac.authorization.k8s.io,rolebindings.rbac.authorization.k8s.io \
+      2>/dev/null
+  } | python3 -c '
+import sys, json
+docs=[]
+buf=sys.stdin.read()
+dec=json.JSONDecoder()
+i=0
+while i < len(buf):
+    while i < len(buf) and buf[i] in " \t\r\n": i+=1
+    if i>=len(buf): break
+    o,j=dec.raw_decode(buf,i); i=j
+    docs += o.get("items",[o]) if o.get("kind","").endswith("List") else [o]
+out=[]
+for d in docs:
+    k=d.get("kind","")
+    if not k or k in ("Event",): continue
+    m=d.setdefault("metadata",{})
+    for f in ("resourceVersion","uid","creationTimestamp","generation","managedFields","selfLink","ownerReferences"):
+        m.pop(f,None)
+    d.pop("status",None)
+    out.append(d)
+json.dump({"apiVersion":"v1","kind":"List","items":out}, open(sys.argv[1],"w"))
+print(len(out))
+' "$APISERVER_RESTORE" | { read n; vs_log "snapshot captured $n objects"; } || vs_warn "snapshot failed (continuing)"
+fi
+
 # --- load a locally-built image into the kind nodes ------------------------
 # A static-pod / daemonset swap references the rusternetes image by name; the
 # node's containerd must have it. CI publishes :main to ghcr and lets the node
@@ -116,6 +161,33 @@ vs_guard_cluster "$CLUSTER" "$KUBECONFIG_FILE"
 if ! vs_wait_ready "$CLUSTER" "$KUBECONFIG_FILE"; then
   vs_emit_result "module-did-not-come-up" 0 0 "$VS_K8S_VERSION"
   exit "$VS_EX_NOTUP"
+fi
+
+# --- api-server swap: restore the substrate + re-register nodes ------------
+# The swapped api-server is up (readyz) but its store is empty. Restore the
+# snapshot (RBAC first, so the system components + admin are authorized; then
+# the kube-system addons, which the still-running vanilla controllers turn back
+# into pods) and restart each node kubelet so it re-registers its Node object
+# against the fresh store (a kubelet only registers at startup; steady-state it
+# just status-updates, which no-ops on an empty store). Wait for a Ready node so
+# test pods can schedule + get a CNI IP.
+if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
+  vs_log "restoring substrate snapshot into the swapped api-server"
+  KUBECONFIG="$KUBECONFIG_FILE" kubectl apply -f "$APISERVER_RESTORE" >/dev/null 2>&1 \
+    || vs_warn "some snapshot objects failed to apply (continuing)"
+  vs_log "restarting node kubelets to re-register nodes"
+  for n in $(kind get nodes --name "$CLUSTER" 2>/dev/null); do
+    docker exec "$n" systemctl restart kubelet >/dev/null 2>&1 || true
+  done
+  vs_log "waiting for a Ready node + running system pods (≤300s)"
+  for _ in $(seq 1 60); do
+    ready="$(KUBECONFIG="$KUBECONFIG_FILE" kubectl get nodes --no-headers 2>/dev/null | awk '$2=="Ready"' | wc -l)"
+    [ "${ready:-0}" -ge 1 ] && break
+    sleep 5
+  done
+  nodes="$(KUBECONFIG="$KUBECONFIG_FILE" kubectl get nodes --no-headers 2>/dev/null | wc -l)"
+  runpods="$(KUBECONFIG="$KUBECONFIG_FILE" kubectl get pods -A --no-headers 2>/dev/null | grep -c Running || true)"
+  vs_log "post-restore substrate: ${nodes:-0} nodes (${ready:-0} Ready), ${runpods:-0} running pods"
 fi
 
 # --- run the scoped subset via the existing conformance runner -------------
