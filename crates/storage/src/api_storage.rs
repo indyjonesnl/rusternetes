@@ -460,28 +460,52 @@ impl Storage for ApiStorage {
     {
         // Graft only the caller's `.status` onto a freshly-read object (so a
         // stale spec can't be written back), then PUT the /status subresource.
+        //
+        // Bounded optimistic-concurrency retry: a vanilla api-server enforces
+        // resourceVersion/UID preconditions strictly, so if a concurrent writer
+        // (e.g. the node-lifecycle controller taints/annotates a just-registered
+        // node) bumps the version between our GET and the /status PUT, the PUT
+        // 409s. Re-GET for the fresh version and retry, matching the default
+        // `Storage::update_status` (lib.rs) and upstream kubelet's
+        // `nodeStatusUpdateRetry` loop (pkg/kubelet/kubelet_node_status.go).
+        // Without this the kubelet crashes on the first 409 immediately after
+        // registering against a vanilla control plane (#1638).
         let incoming = serde_json::to_value(value).map_err(Error::Serialization)?;
         let new_status = incoming.get("status").cloned();
 
         let path = self.object_path(key).await?;
-        let mut current: Value = self.client.get(&path).await.map_err(map_get_err)?;
-        if let Some(obj) = current.as_object_mut() {
-            match new_status {
-                Some(status) => {
-                    obj.insert("status".to_string(), status);
+        let status_path = format!("{path}/status");
+
+        const MAX_ATTEMPTS: usize = 8;
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut current: Value = self.client.get(&path).await.map_err(map_get_err)?;
+            if let Some(obj) = current.as_object_mut() {
+                match &new_status {
+                    Some(status) => {
+                        obj.insert("status".to_string(), status.clone());
+                    }
+                    None => {
+                        obj.remove("status");
+                    }
                 }
-                None => {
-                    obj.remove("status");
+            }
+            let put: anyhow::Result<Value> = self.client.put(&status_path, &current).await;
+            match put {
+                Ok(updated) => {
+                    return serde_json::from_value(updated).map_err(Error::Serialization);
+                }
+                Err(e) => {
+                    let mapped = map_write_err(e);
+                    if matches!(mapped, Error::Conflict(_)) && attempt + 1 < MAX_ATTEMPTS {
+                        continue;
+                    }
+                    return Err(mapped);
                 }
             }
         }
-        let status_path = format!("{path}/status");
-        let updated: Value = self
-            .client
-            .put(&status_path, &current)
-            .await
-            .map_err(map_write_err)?;
-        serde_json::from_value(updated).map_err(Error::Serialization)
+        Err(Error::Conflict(format!(
+            "update_status: exhausted {MAX_ATTEMPTS} CAS retries for {key}"
+        )))
     }
 
     async fn update_raw(&self, key: &str, value: &Value) -> Result<()> {
@@ -845,5 +869,154 @@ mod tests {
             }
             other => panic!("expected Error::Storage, got {other:?}"),
         }
+    }
+
+    // ---- update_status optimistic-concurrency retry (#1638) ----------------
+    //
+    // Regression for #1638: running the rusternetes kubelet (API mode) against
+    // a *vanilla* api-server, the node status write 409s when a concurrent
+    // writer (node-lifecycle controller) bumps the node's resourceVersion
+    // between our GET and the /status PUT. `ApiStorage::update_status` must
+    // re-GET the fresh object and retry — mirroring the default
+    // `Storage::update_status` and upstream kubelet's `nodeStatusUpdateRetry`
+    // loop — instead of surfacing the first 409 as fatal (which crash-loops the
+    // kubelet right after "Node registered successfully").
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// A minimal HTTP/1.1 server that fails the first `conflicts_before_ok`
+    /// PUTs to `/status` with a 409 Conflict, then succeeds. Each response sets
+    /// `Connection: close` so reqwest opens a fresh connection per request
+    /// (one request per accepted socket — no keep-alive parsing needed).
+    /// Returns the base URL and a shared counter of PUT-to-status attempts.
+    async fn spawn_conflict_server(conflicts_before_ok: usize) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let put_attempts = Arc::new(AtomicUsize::new(0));
+        let counter = put_attempts.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_request(&mut stream).await;
+                let req_line = req.lines().next().unwrap_or("").to_string();
+                let is_put_status = req_line.starts_with("PUT") && req_line.contains("/status");
+
+                let node = r#"{"apiVersion":"v1","kind":"Node","metadata":{"name":"rusternetes-node","resourceVersion":"1"},"status":{}}"#;
+
+                if is_put_status {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    if n < conflicts_before_ok {
+                        // Kubernetes Status object with reason=Conflict → maps
+                        // to Error::Conflict via format_status_error/map_write_err.
+                        let body = r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Conflict","code":409,"message":"the object has been modified; please apply your changes to the latest version"}"#;
+                        respond(&mut stream, "409 Conflict", body).await;
+                    } else {
+                        respond(&mut stream, "200 OK", node).await;
+                    }
+                } else {
+                    // GET (object read) — hand back a fresh node each time.
+                    respond(&mut stream, "200 OK", node).await;
+                }
+            }
+        });
+
+        (format!("http://{addr}"), put_attempts)
+    }
+
+    /// Read one HTTP request (headers + any Content-Length body) off the socket.
+    async fn read_request(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 2048];
+        loop {
+            let n = stream.read(&mut tmp).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(hdr_end) = find_subslice(&buf, b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..hdr_end]).to_ascii_lowercase();
+                let content_len = headers
+                    .split("\r\n")
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buf.len() >= hdr_end + 4 + content_len {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    async fn respond(stream: &mut TcpStream, status_line: &str, body: &str) {
+        let resp = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        let _ = stream.shutdown().await;
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    #[tokio::test]
+    async fn update_status_retries_on_conflict() {
+        // Three 409s then success: within the retry budget → must succeed.
+        let (base, attempts) = spawn_conflict_server(3).await;
+        let client = Arc::new(ApiClient::new(&base, true, None).unwrap());
+        let storage = ApiStorage::new(client);
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "rusternetes-node"},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+        });
+
+        let result: Result<Value> = storage
+            .update_status("/registry/nodes/rusternetes-node", &node)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "update_status must retry through 409 Conflicts, got {result:?}"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            4,
+            "expected 3 conflicting PUTs + 1 success"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_status_gives_up_after_max_retries() {
+        // A permanently-conflicting api-server must eventually surface Conflict
+        // (bounded retry), not spin forever.
+        let (base, _attempts) = spawn_conflict_server(usize::MAX).await;
+        let client = Arc::new(ApiClient::new(&base, true, None).unwrap());
+        let storage = ApiStorage::new(client);
+
+        let node = serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "rusternetes-node"}, "status": {}
+        });
+
+        let result: Result<Value> = storage
+            .update_status("/registry/nodes/rusternetes-node", &node)
+            .await;
+
+        assert!(
+            matches!(result, Err(Error::Conflict(_))),
+            "persistent conflict must surface as Error::Conflict, got {result:?}"
+        );
     }
 }
