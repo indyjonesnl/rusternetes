@@ -1,10 +1,104 @@
 use anyhow::{Context, Result};
+use rusternetes_common::resources::rbac::{
+    ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
+};
 use rusternetes_common::resources::{EndpointSlice, Endpoints};
 use rusternetes_storage::Storage;
 use rusternetes_storage::StorageBackend;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
+
+const CLUSTER_ADMIN_ROLE_KEY: &str = "/registry/clusterroles/cluster-admin";
+const CLUSTER_ADMIN_BINDING_KEY: &str = "/registry/clusterrolebindings/cluster-admin";
+
+/// Seed the `cluster-admin` ClusterRole and a ClusterRoleBinding granting it to
+/// the `system:masters` group, mirroring upstream bootstrap policy
+/// (`plugin/pkg/auth/authorizer/rbac/bootstrappolicy`: the `cluster-admin`
+/// ClusterRole bound to `SystemPrivilegedGroup`). Without this, a freshly
+/// bootstrapped (empty) store denies the cluster admin — kubeadm's
+/// `CN=kubernetes-admin, O=system:masters` client cert — every request, so
+/// nothing (not even the admin re-seeding RBAC) can bring the cluster up
+/// (#1659). The superuser effect thus comes from a real RBAC rule, so the
+/// privilege-escalation check stays rule-based (it is NOT an authorizer
+/// short-circuit). Idempotent: only creates what is missing.
+pub async fn bootstrap_default_rbac(storage: Arc<StorageBackend>) -> Result<()> {
+    use rusternetes_common::types::{ObjectMeta, TypeMeta};
+
+    if storage
+        .get::<ClusterRole>(CLUSTER_ADMIN_ROLE_KEY)
+        .await
+        .is_err()
+    {
+        let mut metadata = ObjectMeta::new("cluster-admin");
+        metadata.ensure_uid();
+        metadata.ensure_creation_timestamp();
+        let role = ClusterRole {
+            type_meta: TypeMeta {
+                kind: "ClusterRole".to_string(),
+                api_version: "rbac.authorization.k8s.io/v1".to_string(),
+            },
+            metadata,
+            rules: vec![
+                PolicyRule {
+                    verbs: vec!["*".to_string()],
+                    api_groups: Some(vec!["*".to_string()]),
+                    resources: Some(vec!["*".to_string()]),
+                    resource_names: None,
+                    non_resource_urls: None,
+                },
+                PolicyRule {
+                    verbs: vec!["*".to_string()],
+                    api_groups: None,
+                    resources: None,
+                    resource_names: None,
+                    non_resource_urls: Some(vec!["*".to_string()]),
+                },
+            ],
+            aggregation_rule: None,
+        };
+        storage
+            .create(CLUSTER_ADMIN_ROLE_KEY, &role)
+            .await
+            .context("Failed to create cluster-admin ClusterRole")?;
+        info!("Bootstrapped cluster-admin ClusterRole");
+    }
+
+    if storage
+        .get::<ClusterRoleBinding>(CLUSTER_ADMIN_BINDING_KEY)
+        .await
+        .is_err()
+    {
+        let mut metadata = ObjectMeta::new("cluster-admin");
+        metadata.ensure_uid();
+        metadata.ensure_creation_timestamp();
+        let binding = ClusterRoleBinding {
+            type_meta: TypeMeta {
+                kind: "ClusterRoleBinding".to_string(),
+                api_version: "rbac.authorization.k8s.io/v1".to_string(),
+            },
+            metadata,
+            subjects: vec![Subject {
+                kind: "Group".to_string(),
+                name: "system:masters".to_string(),
+                namespace: None,
+                api_group: Some("rbac.authorization.k8s.io".to_string()),
+            }],
+            role_ref: RoleRef {
+                api_group: "rbac.authorization.k8s.io".to_string(),
+                kind: "ClusterRole".to_string(),
+                name: "cluster-admin".to_string(),
+            },
+        };
+        storage
+            .create(CLUSTER_ADMIN_BINDING_KEY, &binding)
+            .await
+            .context("Failed to create cluster-admin ClusterRoleBinding")?;
+        info!("Bootstrapped cluster-admin ClusterRoleBinding -> system:masters");
+    }
+
+    Ok(())
+}
 
 /// How often the `kubernetes` Service endpoint is re-asserted to the live
 /// api-server IP. Mirrors upstream's `DefaultEndpointReconcilerInterval`
@@ -318,6 +412,38 @@ mod tests {
         let es: EndpointSlice = storage.get(ENDPOINTSLICE_KEY).await.unwrap();
         assert_eq!(es.endpoints[0].addresses, vec!["10.89.0.5".to_string()]);
         assert_eq!(es.ports[0].port, Some(6443));
+    }
+
+    /// #1659: bootstrap seeds the cluster-admin ClusterRole + a binding to the
+    /// system:masters group on an empty store, and is idempotent. This is what
+    /// authorizes kubeadm's `O=system:masters` admin cert before any RBAC is
+    /// applied (via a real rule, so the escalation check stays rule-based).
+    #[tokio::test]
+    async fn seeds_cluster_admin_for_system_masters() {
+        let storage = Arc::new(StorageBackend::new_memory());
+
+        bootstrap_default_rbac(storage.clone()).await.unwrap();
+        // Idempotent: a second run must not error or duplicate.
+        bootstrap_default_rbac(storage.clone()).await.unwrap();
+
+        let role: ClusterRole = storage.get(CLUSTER_ADMIN_ROLE_KEY).await.unwrap();
+        assert!(
+            role.rules.iter().any(|r| r.verbs.contains(&"*".to_string())
+                && r.resources
+                    .as_ref()
+                    .is_some_and(|x| x.contains(&"*".to_string()))),
+            "cluster-admin must grant wildcard resource access"
+        );
+
+        let binding: ClusterRoleBinding = storage.get(CLUSTER_ADMIN_BINDING_KEY).await.unwrap();
+        assert_eq!(binding.role_ref.name, "cluster-admin");
+        assert!(
+            binding
+                .subjects
+                .iter()
+                .any(|s| s.kind == "Group" && s.name == "system:masters"),
+            "binding must target the system:masters group"
+        );
     }
 
     #[tokio::test]
