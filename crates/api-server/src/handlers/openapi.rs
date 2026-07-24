@@ -10,7 +10,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::Response,
 };
-use rusternetes_storage::Storage;
+use rusternetes_storage::{build_prefix, Storage};
 use std::sync::Arc;
 
 /// Encode a u64 as a protobuf varint
@@ -95,7 +95,7 @@ pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Respo
     // Dynamically add CRD group/version paths
     if let Ok(crds) = state
         .storage
-        .list::<serde_json::Value>("/registry/customresourcedefinitions")
+        .list::<serde_json::Value>(&build_prefix("customresourcedefinitions", None))
         .await
     {
         for crd in &crds {
@@ -157,7 +157,7 @@ pub async fn get_openapi_spec_path(
     // Query storage for CRDs matching this group/version and inject their schemas.
     if let Ok(crds) = state
         .storage
-        .list::<serde_json::Value>("/registry/customresourcedefinitions")
+        .list::<serde_json::Value>(&build_prefix("customresourcedefinitions", None))
         .await
     {
         // Build a components/schemas map for CRD definitions
@@ -416,7 +416,7 @@ pub async fn get_swagger_spec(
     // K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/customresource_handler.go
     let crds = state
         .storage
-        .list::<serde_json::Value>("/registry/customresourcedefinitions")
+        .list::<serde_json::Value>(&build_prefix("customresourcedefinitions", None))
         .await
         .unwrap_or_default();
 
