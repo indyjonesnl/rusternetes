@@ -1646,6 +1646,20 @@ fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (S
         "csidrivers" => "CSIDriver",
         "csinodes" => "CSINode",
         "apiservices" => "APIService",
+        // Multi-word / irregular-plural kinds the CamelCase fallback below
+        // mangles (e.g. "podtemplates" -> "Podtemplate", "deviceclasses" ->
+        // "Deviceclasse"). A wrong Kind on a watch event/bookmark makes the
+        // client-go informer fail to decode ("no kind X is registered"), so the
+        // informer never syncs. In particular the ResourceQuota QuotaMonitor
+        // watches `podtemplates`; its mangled Kind wedged the whole quota
+        // controller and every ResourceQuota conformance spec timed out (#1670).
+        "podtemplates" => "PodTemplate",
+        "volumeattachments" => "VolumeAttachment",
+        "volumeattributesclasses" => "VolumeAttributesClass",
+        "resourceslices" => "ResourceSlice",
+        "resourceclaims" => "ResourceClaim",
+        "resourceclaimtemplates" => "ResourceClaimTemplate",
+        "deviceclasses" => "DeviceClass",
         other => {
             // CamelCase heuristic: capitalize first letter, remove trailing 's'
             let s = other.strip_suffix('s').unwrap_or(other);

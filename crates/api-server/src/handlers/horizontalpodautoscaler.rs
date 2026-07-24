@@ -16,6 +16,38 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+/// The HorizontalPodAutoscaler API is served exclusively as `autoscaling/v2`
+/// (the LIST handlers emit `autoscaling/v2`), so watch events AND bookmarks must
+/// be stamped v2 too. Without this the generic watch machinery stamps
+/// `autoscaling/v1` (`resource_type_to_kind_and_version` defaults every group to
+/// `/v1`), and the controller-manager's `autoscaling/v2` HPA informer rejects
+/// every event ("Unexpected watch event object type … expected *v2 … actual
+/// *v1") and never syncs. Because the ResourceQuota QuotaMonitor waits on that
+/// HPA informer's cache sync, the whole quota controller wedges and every
+/// ResourceQuota conformance spec times out (#1670).
+fn hpa_v2_watch_gvk() -> (
+    crate::handlers::watch::WatchObjectConverter,
+    Option<(String, String)>,
+) {
+    let converter: crate::handlers::watch::WatchObjectConverter =
+        Arc::new(|mut val: serde_json::Value| {
+            Box::pin(async move {
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("apiVersion".into(), serde_json::json!("autoscaling/v2"));
+                    obj.insert("kind".into(), serde_json::json!("HorizontalPodAutoscaler"));
+                }
+                val
+            })
+        });
+    (
+        converter,
+        Some((
+            "HorizontalPodAutoscaler".to_string(),
+            "autoscaling/v2".to_string(),
+        )),
+    )
+}
+
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -248,13 +280,16 @@ pub async fn list(
 ) -> Result<axum::response::Response> {
     if crate::handlers::watch::is_watch_request(&params) {
         let watch_params = crate::handlers::watch::watch_params_from_query(&params);
-        return crate::handlers::watch::watch_namespaced::<HorizontalPodAutoscaler>(
+        let (converter, bookmark_gvk) = hpa_v2_watch_gvk();
+        return crate::handlers::watch::watch_namespaced_converted::<HorizontalPodAutoscaler>(
             state,
             auth_ctx,
             namespace,
             "horizontalpodautoscalers",
             "autoscaling",
             watch_params,
+            converter,
+            bookmark_gvk,
         )
         .await;
     }
@@ -298,12 +333,15 @@ pub async fn list_all(
 ) -> Result<axum::response::Response> {
     if crate::handlers::watch::is_watch_request(&params) {
         let watch_params = crate::handlers::watch::watch_params_from_query(&params);
-        return crate::handlers::watch::watch_cluster_scoped::<HorizontalPodAutoscaler>(
+        let (converter, bookmark_gvk) = hpa_v2_watch_gvk();
+        return crate::handlers::watch::watch_cluster_scoped_converted::<HorizontalPodAutoscaler>(
             state,
             auth_ctx,
             "horizontalpodautoscalers",
             "autoscaling",
             watch_params,
+            converter,
+            bookmark_gvk,
         )
         .await;
     }
