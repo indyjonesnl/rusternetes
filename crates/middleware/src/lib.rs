@@ -1454,6 +1454,13 @@ fn extract_json_from_k8s_protobuf(data: &[u8]) -> Option<Vec<u8>> {
     // Parse the protobuf Unknown message looking for field 2 (raw bytes)
     // Field 2, wire type 2 (length-delimited) = tag byte 0x12
     let mut pos = 0;
+    // Set once we see a top-level `raw` (field 2) that is present but NOT literal
+    // JSON — i.e. a native-protobuf resource body. Then we must defer to the
+    // schema decoder rather than brace-scanning, because the raw may itself embed
+    // a nested `k8s\0`+JSON Unknown (e.g. a ControllerRevision whose `data`
+    // RawExtension carries a JSON-serialized DaemonSet). A greedy scan would
+    // wrongly surface that inner object as the whole request body (#1667).
+    let mut found_native_raw = false;
     while pos < data.len() {
         // Read tag as varint (supports field numbers > 15)
         let mut tag: u64 = 0;
@@ -1503,6 +1510,11 @@ fn extract_json_from_k8s_protobuf(data: &[u8]) -> Option<Vec<u8>> {
                     if !raw.is_empty() && (raw[0] == b'{' || raw[0] == b'[') {
                         return Some(raw.to_vec());
                     }
+                    // A present-but-non-JSON top-level raw is a native-protobuf
+                    // body: defer to the schema decoder, never brace-scan into it.
+                    if !raw.is_empty() {
+                        found_native_raw = true;
+                    }
                     // Log what field 2 contains if it's not JSON
                     if field_number == 2 && !raw.is_empty() {
                         let preview: String = raw
@@ -1532,6 +1544,13 @@ fn extract_json_from_k8s_protobuf(data: &[u8]) -> Option<Vec<u8>> {
                 break;
             }
         }
+    }
+
+    // If a native-protobuf top-level `raw` was present, do NOT brace-scan: the
+    // schema decoder must handle it, or a nested JSON Unknown inside the raw
+    // (e.g. a ControllerRevision's `data`) would be mis-surfaced (#1667).
+    if found_native_raw {
+        return None;
     }
 
     // Fallback: scan for the first valid JSON object in the data.
