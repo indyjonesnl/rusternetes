@@ -16,16 +16,66 @@ use hyper_util::client::legacy::connect::HttpConnector;
 /// verification of the (self-signed) kubelet serving certificate.
 pub type KubeletProxyConnector = hyper_rustls::HttpsConnector<HttpConnector>;
 
-/// Build the shared kubelet-proxy connector.
+/// Standard kubeadm location of the api-server's kubelet client credential.
+/// Upstream's `--kubelet-client-certificate` / `--kubelet-client-key`. The
+/// kubelet authenticates incoming api-server requests (logs/exec/attach) via
+/// this x509 client cert; without it the request is anonymous and a vanilla
+/// kubelet (`--anonymous-auth=false`) rejects it with 401 (#1670).
+const KUBELET_CLIENT_CERT: &str = "/etc/kubernetes/pki/apiserver-kubelet-client.crt";
+const KUBELET_CLIENT_KEY: &str = "/etc/kubernetes/pki/apiserver-kubelet-client.key";
+
+/// Load the api-server's kubelet client identity (cert chain + key) from the
+/// standard kubeadm path, if present. Returns `None` when the files are absent
+/// (rusternetes' own cluster, whose kubelet accepts the api-server without a
+/// client cert) so the connector falls back to `.with_no_client_auth()`.
+fn load_kubelet_client_identity() -> Option<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    let cert_pem = std::fs::read(KUBELET_CLIENT_CERT).ok()?;
+    let key_pem = std::fs::read(KUBELET_CLIENT_KEY).ok()?;
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .filter_map(Result::ok)
+        .collect();
+    if certs.is_empty() {
+        tracing::warn!("kubelet client cert {KUBELET_CLIENT_CERT} contained no certificates");
+        return None;
+    }
+    let key = match rustls_pemfile::private_key(&mut key_pem.as_slice()) {
+        Ok(Some(k)) => k,
+        _ => {
+            tracing::warn!("kubelet client key {KUBELET_CLIENT_KEY} contained no private key");
+            return None;
+        }
+    };
+    Some((certs, key))
+}
+
+/// Build the shared kubelet-proxy connector. Presents the kubeadm
+/// `apiserver-kubelet-client` cert when it exists so a vanilla kubelet
+/// authenticates the api-server; otherwise no client auth (rusternetes' own
+/// kubelet does not require it).
 pub fn kubelet_proxy_connector() -> KubeletProxyConnector {
-    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .expect("aws-lc-rs supports the default TLS protocol versions")
     .dangerous()
-    .with_custom_certificate_verifier(Arc::new(NoVerify))
-    .with_no_client_auth();
+    .with_custom_certificate_verifier(Arc::new(NoVerify));
+
+    let tls = match load_kubelet_client_identity() {
+        Some((certs, key)) => {
+            tracing::info!(
+                "kubelet proxy: presenting client cert from {}",
+                KUBELET_CLIENT_CERT
+            );
+            builder
+                .with_client_auth_cert(certs, key)
+                .expect("valid kubelet client cert/key")
+        }
+        None => builder.with_no_client_auth(),
+    };
 
     hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls)

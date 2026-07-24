@@ -233,11 +233,38 @@ type LogByteStream = std::pin::Pin<
     >,
 >;
 
+/// Load the api-server's kubelet client identity (kubeadm
+/// `apiserver-kubelet-client` cert+key) as a reqwest [`Identity`], if present.
+/// Mirrors [`rusternetes_streamproxy::tls`]'s connector loading — same paths,
+/// same trust model — but for the reqwest client used by the websocket log
+/// fetch. Returns `None` when the files are absent (rusternetes' own cluster).
+fn load_kubelet_client_identity() -> Option<reqwest::Identity> {
+    const CERT: &str = "/etc/kubernetes/pki/apiserver-kubelet-client.crt";
+    const KEY: &str = "/etc/kubernetes/pki/apiserver-kubelet-client.key";
+    let mut pem = std::fs::read(CERT).ok()?;
+    pem.push(b'\n');
+    pem.extend_from_slice(&std::fs::read(KEY).ok()?);
+    match reqwest::Identity::from_pem(&pem) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!("failed to build kubelet client identity: {e}");
+            None
+        }
+    }
+}
+
 async fn fetch_kubelet_log_stream(target_url: &Uri) -> Result<LogByteStream> {
     // `danger_accept_invalid_certs` mirrors the api-server->kubelet trust model
     // used by the streaming proxy (the kubelet serves a self-signed cert).
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(true);
+    // Present the kubeadm `apiserver-kubelet-client` cert when it exists, so a
+    // vanilla kubelet (`--anonymous-auth=false`) authenticates the api-server's
+    // websocket log fetch instead of returning 401 (#1670). Absent on
+    // rusternetes' own cluster, whose kubelet needs no client cert.
+    if let Some(identity) = load_kubelet_client_identity() {
+        builder = builder.identity(identity);
+    }
+    let client = builder
         .build()
         .map_err(|e| Error::Internal(format!("failed to build kubelet log client: {e}")))?;
 
