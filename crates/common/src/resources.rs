@@ -152,7 +152,7 @@ pub use ipaddress::{IPAddress, IPAddressSpec, ParentReference};
 pub use metrics::{
     ContainerMetrics, NodeMetrics, NodeMetricsMetadata, PodMetrics, PodMetricsMetadata,
 };
-pub use namespace::{Namespace, NamespaceCondition, NamespaceStatus};
+pub use namespace::{Namespace, NamespaceCondition, NamespaceSpec, NamespaceStatus};
 pub use networking::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
     NetworkPolicyPort, NetworkPolicySpec,

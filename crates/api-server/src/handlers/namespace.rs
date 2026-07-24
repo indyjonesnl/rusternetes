@@ -19,6 +19,48 @@ use tracing::{debug, info, warn};
 
 // Removed - using HashMap<String, String> for query params
 
+/// Ensure the `kubernetes` lifecycle finalizer is present in **spec.finalizers**.
+///
+/// Upstream `namespaceStrategy.PrepareForCreate`
+/// (pkg/registry/core/namespace/strategy.go) stores this finalizer in
+/// `NamespaceSpec.Finalizers`, NOT `metadata.finalizers`. The namespace
+/// controller's `finalized()` check is `len(namespace.Spec.Finalizers) == 0`
+/// (pkg/controller/namespace/deletion/namespaced_resources_deleter.go). If the
+/// finalizer lives in `metadata.finalizers`, the controller sees an empty
+/// `spec.finalizers`, treats every namespace as already finalized, and returns
+/// early — never deleting namespace content, never running ordered pod-first
+/// deletion, and never setting deletion conditions. That breaks the
+/// OrderedNamespaceDeletion conformance test and leaks namespaces `Terminating`
+/// forever (the api-server keeps them because `metadata.finalizers` is set, but
+/// the controller's spec-based Finalize call never clears it).
+pub(crate) fn ensure_kubernetes_finalizer(ns: &mut Namespace) {
+    let spec = ns.spec.get_or_insert_with(Default::default);
+    let finalizers = spec.finalizers.get_or_insert_with(Vec::new);
+    if !finalizers.iter().any(|f| f == "kubernetes") {
+        finalizers.push("kubernetes".to_string());
+    }
+}
+
+/// True when a `Terminating` namespace has no finalizers left blocking removal.
+///
+/// Mirrors upstream `ShouldDeleteNamespaceDuringUpdate` (spec.finalizers empty)
+/// combined with the generic `metadata.finalizers` guard. The namespace
+/// controller drains `spec.finalizers` via the `/finalize` subresource once all
+/// content is gone; at that point (with no metadata finalizers either) the
+/// object is removed from storage.
+pub(crate) fn namespace_fully_finalized(ns: &Namespace) -> bool {
+    if ns.metadata.deletion_timestamp.is_none() {
+        return false;
+    }
+    let spec_empty = ns
+        .spec
+        .as_ref()
+        .and_then(|s| s.finalizers.as_ref())
+        .is_none_or(|f| f.is_empty());
+    let meta_empty = ns.metadata.finalizers.as_ref().is_none_or(|f| f.is_empty());
+    spec_empty && meta_empty
+}
+
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -84,11 +126,9 @@ pub async fn create(
         _ => {}
     }
 
-    // Add kubernetes finalizer (prevents immediate deletion; namespace controller cleans up)
-    let finalizers = namespace.metadata.finalizers.get_or_insert_with(Vec::new);
-    if !finalizers.contains(&"kubernetes".to_string()) {
-        finalizers.push("kubernetes".to_string());
-    }
+    // Add the `kubernetes` lifecycle finalizer to spec.finalizers (upstream
+    // namespaceStrategy.PrepareForCreate). See `ensure_kubernetes_finalizer`.
+    ensure_kubernetes_finalizer(&mut namespace);
 
     // Ensure kind/apiVersion
     namespace.type_meta.kind = "Namespace".to_string();
@@ -339,6 +379,16 @@ pub async fn update(
         return Ok(Json(namespace));
     }
 
+    // Preserve spec.finalizers from the stored object (upstream
+    // namespaceStrategy.PrepareForUpdate resets Spec.Finalizers to the old
+    // value — the lifecycle finalizer list is only mutable via the /finalize
+    // subresource, never a plain update). Without this a client PUT that omits
+    // spec.finalizers would silently drop the `kubernetes` finalizer and cause
+    // premature namespace removal.
+    if let Ok(old) = state.storage.get::<Namespace>(&key).await {
+        namespace.spec = old.spec;
+    }
+
     // Try to update first, if not found then create (upsert behavior)
     let result = match state.storage.update(&key, &namespace).await {
         Ok(updated) => updated,
@@ -350,25 +400,76 @@ pub async fn update(
 
     // Namespace finalization removal — mirrors upstream
     // `ShouldDeleteNamespaceDuringUpdate`
-    // (pkg/registry/core/namespace/storage/storage.go, release-1.35):
-    //   len(ns.Spec.Finalizers) == 0 && ShouldDeleteDuringUpdate(...)
-    // i.e. once the finalizer list drains AND the namespace is already
-    // Terminating (deletionTimestamp set), the object is removed from storage.
-    // This route also serves the `/api/v1/namespaces/:name/finalize`
-    // subresource, which is exactly how the namespace controller completes
-    // deletion. Without this, every namespace leaked `Terminating` forever and
-    // the controller spun re-deleting them on false `Ok` (#1161). rusternetes
-    // keeps the lifecycle finalizer in `metadata.finalizers`, so check there.
-    let terminating = result.metadata.deletion_timestamp.is_some();
-    let no_finalizers = result
-        .metadata
-        .finalizers
-        .as_ref()
-        .is_none_or(|f| f.is_empty());
-    if terminating && no_finalizers {
+    // (pkg/registry/core/namespace/storage/storage.go): once the finalizer
+    // list drains AND the namespace is Terminating, the object is removed from
+    // storage. See `namespace_fully_finalized`.
+    if namespace_fully_finalized(&result) {
         match state.storage.delete(&key).await {
             Ok(_) => info!(
                 "Namespace {} finalized (finalizers drained) — removed from storage",
+                name
+            ),
+            Err(e) => warn!("Failed to remove finalized namespace {}: {}", name, e),
+        }
+    }
+
+    Ok(Json(result))
+}
+
+/// PUT `/api/v1/namespaces/:name/finalize`.
+///
+/// The `/finalize` subresource is how the namespace controller completes
+/// deletion (`nsClient.Finalize` in
+/// pkg/controller/namespace/deletion/namespaced_resources_deleter.go). It sends
+/// the namespace with the `kubernetes` finalizer removed from
+/// `spec.finalizers`; the api-server persists the new `spec.finalizers` and, if
+/// the list is now empty and the namespace is Terminating, removes it from
+/// storage. Unlike a plain update this endpoint is *allowed* to mutate
+/// `spec.finalizers` (upstream `namespaceFinalizeStrategy`).
+pub async fn finalize(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    DumpingJson(body): DumpingJson<Namespace>,
+) -> Result<Json<Namespace>> {
+    info!("Finalizing namespace: {}", name);
+
+    let attrs = RequestAttributes::new(auth_ctx.user, "update", "namespaces")
+        .with_api_group("")
+        .with_subresource("finalize")
+        .with_name(&name);
+
+    match state.authorizer.authorize(&attrs).await? {
+        Decision::Allow => {}
+        Decision::Deny(reason) => {
+            return Err(rusternetes_common::Error::Forbidden(reason));
+        }
+    }
+
+    let key = build_key("namespaces", None, &name);
+    let mut namespace: Namespace = state.storage.get(&key).await?;
+
+    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
+    if is_dry_run {
+        info!(
+            "Dry-run: Namespace {} finalize validated (not applied)",
+            name
+        );
+        return Ok(Json(namespace));
+    }
+
+    // Apply the request's spec.finalizers verbatim (the controller has already
+    // stripped its finalizer token). Status is owned by the /status subresource,
+    // so only spec.finalizers is taken from the finalize body.
+    namespace.spec = body.spec;
+
+    let result = state.storage.update(&key, &namespace).await?;
+
+    if namespace_fully_finalized(&result) {
+        match state.storage.delete(&key).await {
+            Ok(_) => info!(
+                "Namespace {} finalized (spec.finalizers drained) — removed from storage",
                 name
             ),
             Err(e) => warn!("Failed to remove finalized namespace {}: {}", name, e),
@@ -452,25 +553,16 @@ pub async fn delete_ns(
     // This matches real K8s behavior where DELETE returns quickly and the
     // namespace controller observes the deletionTimestamp and does cleanup.
     //
-    // Handle finalizers: if the namespace has finalizers, keep it in storage
-    // (the controller will remove finalizers after cleanup). If no finalizers,
-    // also keep it — the namespace controller will delete it after cleanup.
-    let has_finalizers = namespace
-        .metadata
-        .finalizers
-        .as_ref()
-        .map(|f| !f.is_empty())
-        .unwrap_or(false);
-
-    if !has_finalizers {
-        // Add the kubernetes finalizer so the namespace stays in storage
-        // until the controller finishes cleanup
-        namespace
-            .metadata
-            .finalizers
-            .get_or_insert_with(Vec::new)
-            .push("kubernetes".to_string());
-        let _ = state.storage.update(&key, &namespace).await;
+    // The `kubernetes` lifecycle finalizer lives in spec.finalizers (set at
+    // create time) so a normal namespace stays in storage until the controller
+    // finishes content deletion and calls /finalize. If a namespace somehow has
+    // no finalizers at all, upstream removes it immediately on delete.
+    if namespace_fully_finalized(&namespace) {
+        match state.storage.delete(&key).await {
+            Ok(_) => info!("Namespace {} deleted (no finalizers)", name),
+            Err(e) => warn!("Failed to delete finalizer-less namespace {}: {}", name, e),
+        }
+        return Ok(Json(namespace));
     }
 
     info!("Namespace {} marked for deletion (Terminating)", name);
@@ -786,4 +878,93 @@ pub async fn deletecollection_namespaces(
         deleted_count
     );
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusternetes_common::resources::Namespace;
+
+    // Regression: the `kubernetes` lifecycle finalizer MUST land in
+    // spec.finalizers, not metadata.finalizers. The namespace controller's
+    // finalized() check is `len(spec.Finalizers)==0`; a metadata-placed
+    // finalizer makes it skip all content deletion (breaks
+    // OrderedNamespaceDeletion + leaks Terminating namespaces).
+    #[test]
+    fn kubernetes_finalizer_goes_in_spec_not_metadata() {
+        let mut ns = Namespace::new("t");
+        ns.spec = None;
+        ns.metadata.finalizers = None;
+
+        ensure_kubernetes_finalizer(&mut ns);
+
+        let spec_finalizers = ns
+            .spec
+            .as_ref()
+            .and_then(|s| s.finalizers.as_ref())
+            .expect("spec.finalizers set");
+        assert!(
+            spec_finalizers.iter().any(|f| f == "kubernetes"),
+            "kubernetes finalizer must be in spec.finalizers, got {spec_finalizers:?}"
+        );
+        assert!(
+            ns.metadata
+                .finalizers
+                .as_ref()
+                .is_none_or(|f| !f.iter().any(|x| x == "kubernetes")),
+            "kubernetes finalizer must NOT be placed in metadata.finalizers"
+        );
+    }
+
+    #[test]
+    fn ensure_kubernetes_finalizer_is_idempotent() {
+        let mut ns = Namespace::new("t");
+        ensure_kubernetes_finalizer(&mut ns);
+        ensure_kubernetes_finalizer(&mut ns);
+        let f = ns.spec.unwrap().finalizers.unwrap();
+        assert_eq!(f.iter().filter(|x| *x == "kubernetes").count(), 1);
+    }
+
+    // A freshly-created (non-terminating) namespace is never "fully finalized".
+    #[test]
+    fn not_finalized_without_deletion_timestamp() {
+        let mut ns = Namespace::new("t");
+        ensure_kubernetes_finalizer(&mut ns);
+        assert!(!namespace_fully_finalized(&ns));
+    }
+
+    // Terminating + spec.finalizers still holding `kubernetes` => keep it.
+    #[test]
+    fn not_finalized_while_spec_finalizer_remains() {
+        let mut ns = Namespace::new("t");
+        ensure_kubernetes_finalizer(&mut ns);
+        ns.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        assert!(!namespace_fully_finalized(&ns));
+    }
+
+    // Terminating + spec.finalizers drained by the controller's /finalize call
+    // + no metadata finalizers => remove from storage.
+    #[test]
+    fn finalized_when_all_finalizers_drained() {
+        let mut ns = Namespace::new("t");
+        ns.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        ns.spec = Some(rusternetes_common::resources::NamespaceSpec {
+            finalizers: Some(vec![]),
+        });
+        ns.metadata.finalizers = None;
+        assert!(namespace_fully_finalized(&ns));
+    }
+
+    // A lingering metadata finalizer still blocks removal even when
+    // spec.finalizers is empty.
+    #[test]
+    fn not_finalized_while_metadata_finalizer_remains() {
+        let mut ns = Namespace::new("t");
+        ns.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        ns.spec = Some(rusternetes_common::resources::NamespaceSpec {
+            finalizers: Some(vec![]),
+        });
+        ns.metadata.finalizers = Some(vec!["example.com/keep".to_string()]);
+        assert!(!namespace_fully_finalized(&ns));
+    }
 }

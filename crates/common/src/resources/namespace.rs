@@ -32,7 +32,7 @@ impl Namespace {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NamespaceSpec {
     /// Finalizers is a list of finalizers
