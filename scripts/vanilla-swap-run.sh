@@ -105,8 +105,21 @@ if [ "$MODULE" = "api-server" ]; then
   {
     # NOTE: multiple resource TYPES must be comma-separated — `kubectl get A B`
     # reads B as a *name* of type A (NotFound), capturing 0 objects.
+    # Nodes carry spec.podCIDR(s) + the control-plane NoSchedule taint. The
+    # store wipe forces every kubelet to re-register from scratch, and only the
+    # worker kubelet is restarted (the control-plane one owns the api-server
+    # static pod). Without the original Node objects, node-ipam reassigns the
+    # worker 10.244.0.0/24 — colliding with the still-present control-plane
+    # kindnet state on 10.244.0.x — so pod CIDRs overlap, the two nodes route
+    # each other's /24 in a loop, and the hostNetwork api-server can't reach
+    # webhook/aggregator pods (connect timeout → every AdmissionWebhook spec
+    # fails). Restoring nodes preserves the original non-overlapping topology
+    # (CP=10.244.0.0/24 + NoSchedule taint, worker=10.244.1.0/24), exactly as an
+    # etcd restore would. spec is kept; status is stripped below and the worker
+    # kubelet repopulates it on restart (the CP node stays NotReady, which is
+    # fine — its taint already keeps workloads off it).
     KUBECONFIG="$KUBECONFIG_FILE" kubectl get -o json \
-      namespaces,clusterroles.rbac.authorization.k8s.io,clusterrolebindings.rbac.authorization.k8s.io,priorityclasses.scheduling.k8s.io \
+      nodes,namespaces,clusterroles.rbac.authorization.k8s.io,clusterrolebindings.rbac.authorization.k8s.io,priorityclasses.scheduling.k8s.io \
       2>/dev/null
     KUBECONFIG="$KUBECONFIG_FILE" kubectl get -o json -n kube-system \
       serviceaccounts,configmaps,daemonsets.apps,deployments.apps,services,roles.rbac.authorization.k8s.io,rolebindings.rbac.authorization.k8s.io \
