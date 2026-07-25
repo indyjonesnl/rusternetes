@@ -473,6 +473,30 @@ pub async fn resolve_aggregator_target_with_storage<S: Storage + Send + Sync>(
         _ => return Ok(None), // local APIService (no service backend)
     };
 
+    // Upstream gates every proxied request on the APIService's Available
+    // condition BEFORE resolving the backend (kube-aggregator
+    // handler_proxy.go: `if !handlingInfo.serviceAvailable { proxyError(w,
+    // req, "service unavailable", 503) }`, populated from
+    // `IsAPIServiceConditionTrue(apiService, Available)`). This makes
+    // "aggregated API serves 2xx" imply "Available=True / all checks passed" —
+    // an invariant the Aggregator conformance test hard-asserts (it reads the
+    // condition message with NO retry immediately after the aggregated API
+    // starts answering). Proxying on raw endpoint resolution alone races that
+    // assertion.
+    let available = apiservice
+        .pointer("/status/conditions")
+        .and_then(|v| v.as_array())
+        .map(|conds| {
+            conds.iter().any(|c| {
+                c.get("type").and_then(|v| v.as_str()) == Some("Available")
+                    && c.get("status").and_then(|v| v.as_str()) == Some("True")
+            })
+        })
+        .unwrap_or(false);
+    if !available {
+        return Err(service_unavailable_response("service unavailable"));
+    }
+
     let insecure_skip_tls_verify = apiservice
         .pointer("/spec/insecureSkipTLSVerify")
         .and_then(|v| v.as_bool())
@@ -529,6 +553,79 @@ pub async fn resolve_aggregator_target_with_storage<S: Storage + Send + Sync>(
 /// Hop-by-hop headers and the inbound `Authorization` are intentionally
 /// dropped — the backend trusts the X-Remote-* identity, signed via mTLS, not
 /// the original client's bearer token. This matches kube-aggregator behaviour.
+/// Standard kubeadm location of the aggregation-layer proxy client credential
+/// (upstream `--proxy-client-cert-file` / `--proxy-client-key-file`, loaded by
+/// kube-aggregator as `aggregator-proxy-cert`,
+/// staging/src/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go). The
+/// extension apiserver's requestheader authenticator only trusts the
+/// `X-Remote-*` identity headers when the CALLER's TLS client certificate
+/// verifies against the front-proxy CA (kube-system
+/// `extension-apiserver-authentication` ConfigMap). Without presenting this
+/// cert every proxied request is authenticated as `system:anonymous`, its
+/// delegated SubjectAccessReview denies, and the backend returns 403 — which
+/// the Aggregator conformance test tolerates and polls until timeout.
+const PROXY_CLIENT_CERT: &str = "/etc/kubernetes/pki/front-proxy-client.crt";
+const PROXY_CLIENT_KEY: &str = "/etc/kubernetes/pki/front-proxy-client.key";
+
+/// Load a reqwest client identity from a PEM cert + key file pair. Returns
+/// `None` when the files are absent (rusternetes' own cluster, whose backends
+/// don't require front-proxy client auth) or unparsable.
+fn load_proxy_client_identity_from(cert_path: &str, key_path: &str) -> Option<reqwest::Identity> {
+    let mut pem = std::fs::read(cert_path).ok()?;
+    pem.extend_from_slice(&std::fs::read(key_path).ok()?);
+    match reqwest::Identity::from_pem(&pem) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!(
+                "front-proxy client credential {cert_path}/{key_path} unusable: {e} — proxying without client auth"
+            );
+            None
+        }
+    }
+}
+
+/// Cached front-proxy client identity from the standard kubeadm path.
+fn proxy_client_identity() -> Option<reqwest::Identity> {
+    static CACHE: std::sync::OnceLock<Option<reqwest::Identity>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let id = load_proxy_client_identity_from(PROXY_CLIENT_CERT, PROXY_CLIENT_KEY);
+            if id.is_some() {
+                tracing::info!(
+                    "aggregation proxy: presenting front-proxy client cert from {PROXY_CLIENT_CERT}"
+                );
+            }
+            id
+        })
+        .clone()
+}
+
+/// Percent-encode an impersonation extra key so `X-Remote-Extra-<key>` is a
+/// valid HTTP header name. Mirrors upstream `client-go/transport
+/// /round_trippers.go headerKeyEscape`: every byte outside the legal
+/// header-key set (and `%` itself) is emitted as `%XX`. The receiving apiserver
+/// percent-decodes it back (`requestheader` authenticator).
+fn header_key_escape(key: &str) -> String {
+    fn legal_header_byte(b: u8) -> bool {
+        matches!(b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+            | b'^' | b'_' | b'`' | b'|' | b'~'
+            | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+    }
+    let mut out = String::with_capacity(key.len());
+    for &b in key.as_bytes() {
+        // `%` is force-escaped so the receiver's percent-decode never chokes on
+        // a bare `%` not followed by two hex digits.
+        if !legal_header_byte(b) || b == b'%' {
+            out.push('%');
+            out.push_str(&format!("{:02X}", b));
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
 pub fn build_proxy_headers(
     auth_ctx: &AuthContext,
     request_headers: &HeaderMap,
@@ -542,7 +639,13 @@ pub fn build_proxy_headers(
     let mut extras: Vec<(&String, &Vec<String>)> = auth_ctx.user.extra.iter().collect();
     extras.sort_by(|a, b| a.0.cmp(b.0));
     for (k, vs) in extras {
-        let header_name = format!("X-Remote-Extra-{}", k);
+        // The extra KEY becomes part of the header NAME, so any byte that is not
+        // a valid HTTP header-name (token) char must be percent-encoded — else
+        // building the proxied request fails outright. Standard SA identities
+        // carry keys like `authentication.kubernetes.io/pod-name` whose `/`
+        // is illegal in a header name. Upstream `client-go/transport
+        // /round_trippers.go headerKeyEscape` does exactly this.
+        let header_name = format!("X-Remote-Extra-{}", header_key_escape(k));
         for v in vs {
             out.push((header_name.clone(), v.clone()));
         }
@@ -624,6 +727,12 @@ pub async fn forward_to_aggregator(
         // but we accept invalid certs to keep dev clusters functional. Real
         // deployments should populate caBundle or set insecureSkipTLSVerify.
         client_builder = client_builder.danger_accept_invalid_certs(true);
+    }
+    // Present the front-proxy client cert so the backend's requestheader
+    // authenticator trusts our X-Remote-* identity headers (upstream
+    // --proxy-client-cert-file).
+    if let Some(identity) = proxy_client_identity() {
+        client_builder = client_builder.identity(identity);
     }
 
     let client = match client_builder.build() {
@@ -715,6 +824,11 @@ fn build_aggregator_client(target: &AggregatorTarget) -> Option<reqwest::Client>
         }
     } else {
         b = b.danger_accept_invalid_certs(true);
+    }
+    // Present the front-proxy client cert (upstream --proxy-client-cert-file)
+    // so the backend trusts the X-Remote-* headers on discovery calls too.
+    if let Some(identity) = proxy_client_identity() {
+        b = b.identity(identity);
     }
     b.build().ok()
 }
@@ -878,4 +992,76 @@ pub async fn list_registered_apiservice_groups_with_storage<S: Storage + Send + 
         }));
     }
     out
+}
+
+#[cfg(test)]
+mod proxy_header_tests {
+    use super::header_key_escape;
+
+    // Regression: SA identities carry extra keys with `/`, which is illegal in
+    // an HTTP header name. Without escaping, the aggregator proxy fails to build
+    // every request ("builder error" -> 503) and the Aggregator conformance test
+    // can never reach the sample-apiserver.
+    #[test]
+    fn escapes_slash_in_extra_key() {
+        assert_eq!(
+            header_key_escape("authentication.kubernetes.io/pod-name"),
+            "authentication.kubernetes.io%2Fpod-name"
+        );
+    }
+
+    #[test]
+    fn leaves_legal_token_chars_untouched() {
+        // tchar set minus `%` (which is force-escaped).
+        assert_eq!(header_key_escape("Ab9-._~|"), "Ab9-._~|");
+    }
+
+    #[test]
+    fn force_escapes_percent() {
+        assert_eq!(header_key_escape("a%b"), "a%25b");
+    }
+
+    #[test]
+    fn escapes_other_illegal_bytes() {
+        assert_eq!(header_key_escape("a/b c"), "a%2Fb%20c");
+    }
+}
+
+#[cfg(test)]
+mod proxy_client_identity_tests {
+    use super::load_proxy_client_identity_from;
+
+    // Regression: the aggregation proxy MUST be able to load the kubeadm
+    // front-proxy client credential (upstream --proxy-client-cert-file).
+    // Without presenting it, the extension apiserver's requestheader
+    // authenticator treats every proxied request as system:anonymous → 403 →
+    // the Aggregator conformance test polls to timeout.
+    #[test]
+    fn loads_identity_from_pem_pair() {
+        let cert = rcgen::generate_simple_self_signed(vec!["front-proxy-client".to_string()])
+            .expect("generate test cert");
+        let dir = std::env::temp_dir().join(format!("rn-fpc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("front-proxy-client.crt");
+        let key_path = dir.join("front-proxy-client.key");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+        let id = load_proxy_client_identity_from(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        );
+        assert!(id.is_some(), "cert+key PEM pair must load as an identity");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Absent files (rusternetes' own cluster) → None, proxy stays client-auth-less.
+    #[test]
+    fn absent_files_yield_none() {
+        assert!(load_proxy_client_identity_from(
+            "/nonexistent/front-proxy-client.crt",
+            "/nonexistent/front-proxy-client.key"
+        )
+        .is_none());
+    }
 }

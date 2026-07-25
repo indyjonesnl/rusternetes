@@ -62,6 +62,13 @@ async fn seed_apiservice(
         "kind": "APIService",
         "metadata": { "name": name },
         "spec": spec,
+        // The proxy only forwards for Available=True APIServices (upstream
+        // handler_proxy.go serviceAvailable gate) — seed as available so the
+        // resolver tests exercise the resolution logic itself.
+        "status": { "conditions": [{
+            "type": "Available", "status": "True",
+            "reason": "Passed", "message": "all checks passed",
+        }]},
     });
     let key = build_key("apiservices", None, name);
     storage.create::<Value>(&key, &apiservice).await.unwrap();
@@ -242,6 +249,44 @@ async fn resolve_aggregator_target_uses_clusterip_and_apiservice_port() {
     assert_eq!(target.port, 7443);
     assert!(target.insecure_skip_tls_verify);
     assert_eq!(target.scheme, "https");
+}
+
+// Upstream parity (kube-aggregator handler_proxy.go): the proxy MUST return
+// 503 "service unavailable" while the APIService is not Available=True — even
+// if the backend Service/endpoints already resolve. This makes "aggregated API
+// answers 2xx" imply "Available message is `all checks passed`", which the
+// Aggregator conformance test hard-asserts with no retry.
+#[tokio::test]
+async fn resolve_aggregator_target_503_while_not_available() {
+    let storage = MemoryStorage::new();
+    seed_service(&storage, "wardle", "sample-apiserver", "10.96.0.42", 7443).await;
+    // Fresh/unprobed APIService: Available=Unknown.
+    let mut spec = json!({
+        "group": "wardle.example.com",
+        "version": "v1alpha1",
+        "versionPriority": 100,
+        "groupPriorityMinimum": 1000,
+        "insecureSkipTLSVerify": true,
+        "service": { "name": "sample-apiserver", "namespace": "wardle", "port": 7443 },
+    });
+    spec.as_object_mut().unwrap(); // shape sanity
+    let apiservice = json!({
+        "apiVersion": "apiregistration.k8s.io/v1",
+        "kind": "APIService",
+        "metadata": { "name": "v1alpha1.wardle.example.com" },
+        "spec": spec,
+        "status": { "conditions": [{
+            "type": "Available", "status": "Unknown",
+            "reason": "Pending", "message": "waiting for APIService controller probe",
+        }]},
+    });
+    let key = build_key("apiservices", None, "v1alpha1.wardle.example.com");
+    storage.create::<Value>(&key, &apiservice).await.unwrap();
+
+    let err = resolve_aggregator_target_with_storage(&storage, "wardle.example.com", "v1alpha1")
+        .await
+        .expect_err("must 503 while Available!=True");
+    assert_eq!(err.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
