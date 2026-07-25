@@ -529,6 +529,32 @@ pub async fn resolve_aggregator_target_with_storage<S: Storage + Send + Sync>(
 /// Hop-by-hop headers and the inbound `Authorization` are intentionally
 /// dropped — the backend trusts the X-Remote-* identity, signed via mTLS, not
 /// the original client's bearer token. This matches kube-aggregator behaviour.
+/// Percent-encode an impersonation extra key so `X-Remote-Extra-<key>` is a
+/// valid HTTP header name. Mirrors upstream `client-go/transport
+/// /round_trippers.go headerKeyEscape`: every byte outside the legal
+/// header-key set (and `%` itself) is emitted as `%XX`. The receiving apiserver
+/// percent-decodes it back (`requestheader` authenticator).
+fn header_key_escape(key: &str) -> String {
+    fn legal_header_byte(b: u8) -> bool {
+        matches!(b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+            | b'^' | b'_' | b'`' | b'|' | b'~'
+            | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+    }
+    let mut out = String::with_capacity(key.len());
+    for &b in key.as_bytes() {
+        // `%` is force-escaped so the receiver's percent-decode never chokes on
+        // a bare `%` not followed by two hex digits.
+        if !legal_header_byte(b) || b == b'%' {
+            out.push('%');
+            out.push_str(&format!("{:02X}", b));
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
 pub fn build_proxy_headers(
     auth_ctx: &AuthContext,
     request_headers: &HeaderMap,
@@ -542,7 +568,13 @@ pub fn build_proxy_headers(
     let mut extras: Vec<(&String, &Vec<String>)> = auth_ctx.user.extra.iter().collect();
     extras.sort_by(|a, b| a.0.cmp(b.0));
     for (k, vs) in extras {
-        let header_name = format!("X-Remote-Extra-{}", k);
+        // The extra KEY becomes part of the header NAME, so any byte that is not
+        // a valid HTTP header-name (token) char must be percent-encoded — else
+        // building the proxied request fails outright. Standard SA identities
+        // carry keys like `authentication.kubernetes.io/pod-name` whose `/`
+        // is illegal in a header name. Upstream `client-go/transport
+        // /round_trippers.go headerKeyEscape` does exactly this.
+        let header_name = format!("X-Remote-Extra-{}", header_key_escape(k));
         for v in vs {
             out.push((header_name.clone(), v.clone()));
         }
@@ -878,4 +910,37 @@ pub async fn list_registered_apiservice_groups_with_storage<S: Storage + Send + 
         }));
     }
     out
+}
+
+#[cfg(test)]
+mod proxy_header_tests {
+    use super::header_key_escape;
+
+    // Regression: SA identities carry extra keys with `/`, which is illegal in
+    // an HTTP header name. Without escaping, the aggregator proxy fails to build
+    // every request ("builder error" -> 503) and the Aggregator conformance test
+    // can never reach the sample-apiserver.
+    #[test]
+    fn escapes_slash_in_extra_key() {
+        assert_eq!(
+            header_key_escape("authentication.kubernetes.io/pod-name"),
+            "authentication.kubernetes.io%2Fpod-name"
+        );
+    }
+
+    #[test]
+    fn leaves_legal_token_chars_untouched() {
+        // tchar set minus `%` (which is force-escaped).
+        assert_eq!(header_key_escape("Ab9-._~|"), "Ab9-._~|");
+    }
+
+    #[test]
+    fn force_escapes_percent() {
+        assert_eq!(header_key_escape("a%b"), "a%25b");
+    }
+
+    #[test]
+    fn escapes_other_illegal_bytes() {
+        assert_eq!(header_key_escape("a/b c"), "a%2Fb%20c");
+    }
 }
