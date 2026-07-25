@@ -291,7 +291,7 @@ if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
   # reflect BOTH before starting the suite — the same "control plane is warm"
   # invariant a long-running production cluster provides. Times out softly
   # (the suite still runs; specs may flake) rather than failing the run.
-  vs_log "warmup canary: waiting for ResourceQuota usage accounting (≤240s)"
+  vs_log "warmup canary: waiting for ResourceQuota usage accounting (≤480s)"
   KUBECONFIG="$RESTORE_KC" kubectl create ns vs-warmup >/dev/null 2>&1 || true
   KUBECONFIG="$RESTORE_KC" kubectl -n vs-warmup create quota vs-warmup-q \
     --hard=configmaps=10,services=10 >/dev/null 2>&1 || true
@@ -300,7 +300,7 @@ if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
   KUBECONFIG="$RESTORE_KC" kubectl -n vs-warmup create service clusterip vs-warmup-svc \
     --tcp=80:80 >/dev/null 2>&1 || true
   quota_warm=0
-  for _ in $(seq 1 48); do
+  for _ in $(seq 1 96); do
     used_cm="$(KUBECONFIG="$RESTORE_KC" kubectl -n vs-warmup get quota vs-warmup-q \
       -o jsonpath='{.status.used.configmaps}' 2>/dev/null)"
     used_svc="$(KUBECONFIG="$RESTORE_KC" kubectl -n vs-warmup get quota vs-warmup-q \
@@ -314,7 +314,7 @@ if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
   if [ "$quota_warm" -eq 1 ]; then
     vs_log "warmup canary: quota accounting live (configmaps=$used_cm services=$used_svc)"
   else
-    vs_warn "warmup canary: quota usage not observed within 240s — proceeding anyway"
+    vs_warn "warmup canary: quota usage not observed within 480s — proceeding anyway"
   fi
   KUBECONFIG="$RESTORE_KC" kubectl delete ns vs-warmup --wait=false >/dev/null 2>&1 || true
   set -e
