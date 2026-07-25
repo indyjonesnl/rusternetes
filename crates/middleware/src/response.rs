@@ -293,7 +293,20 @@ pub fn encode_native_or_wrapped(json: &[u8], api_version: &str, kind: &str) -> V
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(json) else {
         return wrap_json_in_protobuf_envelope(json, api_version, kind);
     };
-    match rusternetes_protobuf::PROTO_REGISTRY.encode_message(kind, &value) {
+    // Resolve the schema by the group-qualified key `{apiVersion}.{kind}` FIRST,
+    // then the bare kind. Bare kind alone collides across API groups — e.g.
+    // `TokenRequest` exists both as the CSI `{audience, expirationSeconds}` pair
+    // (no status) and `authentication.k8s.io/v1.TokenRequest` (with
+    // status.token + status.expirationTimestamp). Encoding the auth response
+    // under the bare key hit the CSI schema and dropped `status`, so the
+    // controller-manager read a nil expiration ("nil pointer of expiration in
+    // token request", #1667). Kinds registered only under the bare name (Pod, …)
+    // fall through to the second lookup unchanged.
+    let qualified = format!("{api_version}.{kind}");
+    let encoded = rusternetes_protobuf::PROTO_REGISTRY
+        .encode_message(&qualified, &value)
+        .or_else(|| rusternetes_protobuf::PROTO_REGISTRY.encode_message(kind, &value));
+    match encoded {
         Some(raw) => wrap_native_proto_in_envelope(&raw, api_version, kind),
         None => wrap_json_in_protobuf_envelope(json, api_version, kind),
     }
@@ -350,6 +363,43 @@ mod tests {
     struct TestData {
         name: String,
         value: i32,
+    }
+
+    /// #1667: the auth TokenRequest response must encode via the group-qualified
+    /// schema (`authentication.k8s.io/v1.TokenRequest`), which carries
+    /// `status.token` + `status.expirationTimestamp`. Encoding under the bare
+    /// kind `TokenRequest` hit the CSI schema (no status) and dropped it, so the
+    /// controller-manager read a nil expiration.
+    #[test]
+    fn auth_tokenrequest_encodes_via_qualified_schema() {
+        let tr = serde_json::json!({
+            "apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest",
+            "metadata":{"name":"node-controller"},
+            "spec":{"audiences":["api"],"expirationSeconds":3600},
+            "status":{"token":"abc.def.ghi","expirationTimestamp":"2026-07-24T02:00:00Z"}
+        });
+        let json = serde_json::to_vec(&tr).unwrap();
+        let got = encode_native_or_wrapped(&json, "authentication.k8s.io/v1", "TokenRequest");
+
+        let expected_raw = rusternetes_protobuf::PROTO_REGISTRY
+            .encode_message("authentication.k8s.io/v1.TokenRequest", &tr)
+            .expect("auth TokenRequest schema must encode");
+        let expected = wrap_native_proto_in_envelope(
+            &expected_raw,
+            "authentication.k8s.io/v1",
+            "TokenRequest",
+        );
+        assert_eq!(
+            got, expected,
+            "auth TokenRequest must encode via the group-qualified schema, not the bare-kind CSI one"
+        );
+
+        // The qualified schema actually preserves the status the CM reads.
+        let rt = rusternetes_protobuf::PROTO_REGISTRY
+            .decode_message("authentication.k8s.io/v1.TokenRequest", &expected_raw)
+            .expect("decode");
+        assert!(rt.pointer("/status/expirationTimestamp").is_some());
+        assert!(rt.pointer("/status/token").is_some());
     }
 
     /// Parse a `k8s\0`-framed Unknown envelope and return its `contentType`
