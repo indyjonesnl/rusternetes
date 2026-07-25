@@ -223,26 +223,6 @@ if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
   for n in $(kind get nodes --name "$CLUSTER" 2>/dev/null | grep -v 'control-plane'); do
     docker exec "$n" systemctl restart kubelet >/dev/null 2>&1
   done
-  # Restart the control-plane controllers (kube-controller-manager + scheduler)
-  # so their informers reconnect FRESH to the swapped api-server. They kept
-  # running across the swap with informer state (resourceVersions, the
-  # endpointslice controller's generation/UID tracker) from the OLD api-server;
-  # against the fresh empty store those caches never re-sync, and the
-  # endpointslice controller wedges permanently on "EndpointSlice informer cache
-  # is out of date" — so no EndpointSlice endpoint ever flips to ready=true
-  # (breaking APIService availability / the Aggregator test, and endpoint-driven
-  # readiness generally). A real cluster starts all control-plane components
-  # against one api-server; this restores that invariant. Bounce the containers
-  # (crictl), never the control-plane kubelet — it owns the api-server static
-  # pod, whose embedded store must not be dropped.
-  cp_node="$(kind get nodes --name "$CLUSTER" 2>/dev/null | grep 'control-plane' | head -1)"
-  if [ -n "$cp_node" ]; then
-    vs_log "restarting control-plane controllers (KCM + scheduler) to reconnect informers"
-    for comp in kube-controller-manager kube-scheduler; do
-      cid="$(docker exec "$cp_node" crictl ps --name "$comp" -q 2>/dev/null | head -1)"
-      [ -n "$cid" ] && docker exec "$cp_node" crictl stop "$cid" >/dev/null 2>&1
-    done
-  fi
   vs_log "waiting for a Ready node + running system pods (≤300s)"
   ready=0
   for _ in $(seq 1 60); do
@@ -253,6 +233,57 @@ if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
   nodes="$(KUBECONFIG="$RESTORE_KC" kubectl get nodes --no-headers 2>/dev/null | wc -l)"
   runpods="$(KUBECONFIG="$RESTORE_KC" kubectl get pods -A --no-headers 2>/dev/null | grep -c Running)"
   vs_log "post-restore substrate: ${nodes:-0} nodes (${ready:-0} Ready), ${runpods:-0} running pods"
+  # Restart the control-plane controllers (kube-controller-manager + scheduler)
+  # so their informers reconnect FRESH to the swapped api-server. They kept
+  # running across the swap with informer state (resourceVersions, the
+  # endpointslice controller's generation/UID tracker) from the OLD api-server;
+  # against the fresh empty store those caches never re-sync, and the
+  # endpointslice controller wedges permanently on "EndpointSlice informer cache
+  # is out of date" — so no EndpointSlice endpoint ever flips to ready=true
+  # (breaking APIService availability / the Aggregator test, and endpoint-driven
+  # readiness generally). A real cluster starts all control-plane components
+  # against one api-server; this restores that invariant.
+  #
+  # Ordering matters: restart AFTER the substrate settles (nodes Ready + system
+  # pods scheduled), not mid-bring-up — a restart while the store is still being
+  # repopulated leaves the fresh KCM with another inconsistent snapshot and the
+  # wedge recurs. Then gate on actual convergence: the kube-dns EndpointSlice
+  # endpoint flipping ready=true proves the endpointslice controller is live.
+  # Bounce the containers (crictl), never the control-plane kubelet — it owns
+  # the api-server static pod, whose embedded store must not be dropped.
+  cp_node="$(kind get nodes --name "$CLUSTER" 2>/dev/null | grep 'control-plane' | head -1)"
+  if [ -n "$cp_node" ]; then
+    vs_log "restarting control-plane controllers (KCM + scheduler) to reconnect informers"
+    for comp in kube-controller-manager kube-scheduler; do
+      cid="$(docker exec "$cp_node" crictl ps --name "$comp" -q 2>/dev/null | head -1)"
+      [ -n "$cid" ] && docker exec "$cp_node" crictl stop "$cid" >/dev/null 2>&1
+    done
+    vs_log "waiting for endpointslice convergence (kube-dns endpoint ready, ≤180s)"
+    converged=0
+    for _ in $(seq 1 36); do
+      ep_ready="$(KUBECONFIG="$RESTORE_KC" kubectl -n kube-system get endpointslices \
+        -l kubernetes.io/service-name=kube-dns \
+        -o jsonpath='{.items[0].endpoints[0].conditions.ready}' 2>/dev/null)"
+      if [ "$ep_ready" = "true" ]; then converged=1; break; fi
+      sleep 5
+    done
+    if [ "$converged" -eq 1 ]; then
+      vs_log "endpointslice controller converged (kube-dns endpoint ready)"
+    else
+      # One more bounce: a restart that raced residual restore writes can wedge
+      # again; a second restart against the now-quiescent store reliably syncs.
+      vs_warn "endpointslice controller not converged after 180s — restarting KCM once more"
+      cid="$(docker exec "$cp_node" crictl ps --name kube-controller-manager -q 2>/dev/null | head -1)"
+      [ -n "$cid" ] && docker exec "$cp_node" crictl stop "$cid" >/dev/null 2>&1
+      for _ in $(seq 1 24); do
+        ep_ready="$(KUBECONFIG="$RESTORE_KC" kubectl -n kube-system get endpointslices \
+          -l kubernetes.io/service-name=kube-dns \
+          -o jsonpath='{.items[0].endpoints[0].conditions.ready}' 2>/dev/null)"
+        [ "$ep_ready" = "true" ] && { vs_log "endpointslice controller converged after second restart"; break; }
+        sleep 5
+      done
+    fi
+  fi
   set -e
 fi
 
