@@ -164,8 +164,19 @@ async fn main() -> Result<()> {
         warn!("⚠️  This should ONLY be used in development/testing environments");
         Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer)
     } else {
-        info!("Initializing RBAC Authorizer");
-        Arc::new(RBACAuthorizer::new(storage.clone()))
+        // Node,RBAC union (upstream --authorization-mode=Node,RBAC): a kubelet
+        // (system:node:<name>) is authorized for its node's resources by the
+        // Node authorizer; everything else falls through to RBAC. Without the
+        // Node authorizer, vanilla kubelets are Forbidden on an RBAC-only store
+        // (modern clusters do not bind system:nodes to system:node — #1664).
+        info!("Initializing Node,RBAC union Authorizer");
+        let node: Arc<dyn rusternetes_common::authz::Authorizer> =
+            Arc::new(rusternetes_common::authz::NodeAuthorizer);
+        let rbac: Arc<dyn rusternetes_common::authz::Authorizer> =
+            Arc::new(RBACAuthorizer::new(storage.clone()));
+        Arc::new(rusternetes_common::authz::UnionAuthorizer::new(vec![
+            node, rbac,
+        ]))
     };
 
     // Initialize Metrics Registry
