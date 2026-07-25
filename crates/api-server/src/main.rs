@@ -202,6 +202,15 @@ async fn main() -> Result<()> {
             e
         );
     }
+    // Seed the cluster-admin ClusterRole + binding to system:masters so the
+    // cluster admin is authorized on a freshly-bootstrapped (empty) store
+    // (upstream bootstrap policy; #1659). Idempotent.
+    if let Err(e) = bootstrap::bootstrap_default_rbac(storage.clone()).await {
+        warn!(
+            "Failed to bootstrap default RBAC: {}. Continuing anyway.",
+            e
+        );
+    }
     // Keep the kubernetes endpoint tracking the live api-server IP across
     // container recreates / IP changes (upstream EndpointReconciler, #1188).
     bootstrap::spawn_endpoint_reconciler(storage.clone(), api_port);
