@@ -127,7 +127,9 @@ async fn test_namespace_strategy_create_attaches_kubernetes_finalizer() {
     assert_eq!(status, 201);
 
     let saved = stored(&mem, "namespaces", None, "strategy-ns-finalizer").await;
-    let finalizers = saved["metadata"]["finalizers"]
+    // Upstream namespaceStrategy.PrepareForCreate places this in
+    // spec.finalizers, not metadata.finalizers.
+    let finalizers = saved["spec"]["finalizers"]
         .as_array()
         .expect("finalizers array");
     assert!(

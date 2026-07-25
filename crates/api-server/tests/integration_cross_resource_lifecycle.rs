@@ -400,7 +400,10 @@ async fn test_lifecycle_namespace_delete_marks_terminating_and_keeps_children() 
         "deletionTimestamp should be set; metadata={}",
         stored_ns["metadata"]
     );
-    let finalizers: Vec<&str> = stored_ns["metadata"]["finalizers"]
+    // Upstream places the lifecycle finalizer in spec.finalizers, not
+    // metadata.finalizers — the namespace controller's finalized() check
+    // reads spec.Finalizers.
+    let finalizers: Vec<&str> = stored_ns["spec"]["finalizers"]
         .as_array()
         .expect("finalizers array")
         .iter()

@@ -963,7 +963,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/namespaces/:name/finalize",
-            put(handlers::namespace::update),
+            put(handlers::namespace::finalize),
         )
         // Watch namespaces (cluster-scoped)
         .route(

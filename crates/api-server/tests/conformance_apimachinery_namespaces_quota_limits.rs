@@ -194,8 +194,10 @@ async fn namespace_delete_marks_terminating_and_keeps_finalizer() {
     // Server-side defaulting must produce phase=Active.
     assert_eq!(body["status"]["phase"], "Active");
     // And the `kubernetes` finalizer must be injected so the controller
-    // can drive cleanup.
-    let finalizers = body["metadata"]["finalizers"]
+    // can drive cleanup. Upstream `namespaceStrategy.PrepareForCreate`
+    // places this in spec.finalizers, not metadata.finalizers — the
+    // namespace controller's finalized() check reads spec.Finalizers.
+    let finalizers = body["spec"]["finalizers"]
         .as_array()
         .expect("finalizers array");
     assert!(
@@ -389,9 +391,10 @@ async fn namespace_finalize_subresource_removes_finalizer() {
     assert!(!uid.is_empty());
 
     // PUT the namespace back with empty finalizers (simulating the namespace
-    // controller calling `/finalize` after cleanup).
+    // controller calling `/finalize` after cleanup). The lifecycle finalizer
+    // lives in spec.finalizers (upstream namespaceStrategy.PrepareForCreate).
     let mut finalized = created.clone();
-    finalized["metadata"]["finalizers"] = json!([]);
+    finalized["spec"]["finalizers"] = json!([]);
     let (status, body) = send_json(
         router,
         "PUT",
@@ -400,7 +403,7 @@ async fn namespace_finalize_subresource_removes_finalizer() {
     )
     .await;
     assert_eq!(status, 200, "/finalize PUT must return 200: body={}", body);
-    let finalizers = body["metadata"]["finalizers"].as_array();
+    let finalizers = body["spec"]["finalizers"].as_array();
     assert!(
         finalizers.is_none_or(|f| f.is_empty()),
         "finalize must clear finalizers, got {:?}",

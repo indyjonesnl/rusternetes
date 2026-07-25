@@ -14,8 +14,10 @@
 //! `len(ns.Spec.Finalizers) == 0 && genericregistry.ShouldDeleteDuringUpdate(...)`
 //! — the object is removed on the finalize/update path once finalizers drain
 //! and `DeletionTimestamp` is set. rusternetes keeps the namespace lifecycle
-//! finalizer in `metadata.finalizers` (its convention), so this mirror checks
-//! the same condition there.
+//! finalizer in `spec.finalizers` (matching upstream
+//! `namespaceStrategy.PrepareForCreate`; the namespace controller's
+//! `finalized()` check reads `spec.Finalizers`), so this mirror checks the
+//! same condition there.
 //!
 //! Harness mirrors `integration_configmap_lifecycle.rs`: an
 //! `Arc<MemoryStorage>` wired through `build_router` and driven with tower
@@ -65,7 +67,7 @@ async fn delete_keeps_namespace_terminating_until_finalizers_drained() {
         "deletionTimestamp must be set"
     );
     assert!(
-        ns.pointer("/metadata/finalizers")
+        ns.pointer("/spec/finalizers")
             .and_then(|f| f.as_array())
             .map(|f| f.iter().any(|x| x == "kubernetes"))
             .unwrap_or(false),
@@ -97,8 +99,12 @@ async fn finalize_with_drained_finalizers_removes_namespace() {
     );
 
     // Controller drains finalizers and PUTs the /finalize subresource.
-    if let Some(meta) = ns.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-        meta.insert("finalizers".to_string(), json!([]));
+    // The finalize handler applies spec.finalizers verbatim (upstream: only
+    // the /finalize subresource may mutate the lifecycle finalizer list).
+    if let Some(spec) = ns.get_mut("spec").and_then(|s| s.as_object_mut()) {
+        spec.insert("finalizers".to_string(), json!([]));
+    } else {
+        ns["spec"] = json!({"finalizers": []});
     }
     let (sc, _) = state.put("/api/v1/namespaces/ns-gc/finalize", &ns).await;
     assert!(sc.is_success(), "finalize should succeed, got {sc}");
@@ -128,8 +134,10 @@ async fn finalize_with_remaining_custom_finalizer_keeps_namespace() {
 
     let (_, mut ns) = state.get("/api/v1/namespaces/ns-custom").await;
     // Controller removed `kubernetes` but a custom finalizer remains.
-    if let Some(meta) = ns.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-        meta.insert("finalizers".to_string(), json!(["example.com/keep"]));
+    if let Some(spec) = ns.get_mut("spec").and_then(|s| s.as_object_mut()) {
+        spec.insert("finalizers".to_string(), json!(["example.com/keep"]));
+    } else {
+        ns["spec"] = json!({"finalizers": ["example.com/keep"]});
     }
     let (sc, _) = state
         .put("/api/v1/namespaces/ns-custom/finalize", &ns)
