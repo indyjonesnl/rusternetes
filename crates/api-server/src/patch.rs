@@ -573,6 +573,13 @@ enum MergeKeyStrategy {
     /// `(containerPort, protocol)` composite key — applies to
     /// `containers[*].ports`. Defaults `protocol` to `"TCP"`.
     ContainerPort,
+    /// `uid` field — applies to `metadata.ownerReferences` (upstream
+    /// `patchMergeKey:"uid"`). The garbage collector orphans dependents with a
+    /// strategic-merge `$patch: delete` keyed by the owner's uid; without this
+    /// key the array falls back to wholesale replacement and the `$patch`
+    /// directive object leaks into the stored list, breaking OwnerReference
+    /// decode ("missing field `apiVersion`") and blocking orphan deletion.
+    Uid,
 }
 
 /// Pick the merge-key strategy for an array based on the patch items.
@@ -599,6 +606,14 @@ fn detect_merge_key_strategy(patch: &[Value]) -> Option<MergeKeyStrategy> {
     }) {
         return Some(MergeKeyStrategy::ContainerPort);
     }
+    // `uid`-keyed lists (ownerReferences). Checked last so a list that happens
+    // to carry both `name` and `uid` still keys by `name`.
+    if patch
+        .iter()
+        .all(|v| v.as_object().is_some_and(|o| o.contains_key("uid")))
+    {
+        return Some(MergeKeyStrategy::Uid);
+    }
     None
 }
 
@@ -617,6 +632,10 @@ fn merge_key_with(item: &Value, strategy: MergeKeyStrategy) -> Option<String> {
                 .unwrap_or("TCP");
             Some(format!("port:{port}:{protocol}"))
         }
+        MergeKeyStrategy::Uid => obj
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("uid:{s}")),
     }
 }
 
@@ -1121,6 +1140,65 @@ mod tests {
 
         let result = apply_strategic_merge_patch(&original, &patch).unwrap();
         assert!(result["metadata"]["annotations"].is_null());
+    }
+
+    // Regression: the garbage collector orphans a dependent by strategic-merge
+    // `$patch: delete` on ownerReferences, keyed by the owner's `uid`. Without a
+    // uid merge-key the array was replaced wholesale, leaking the `$patch`
+    // directive object into the list and breaking OwnerReference decode
+    // ("missing field `apiVersion`") — blocking GC orphan deletion.
+    #[test]
+    fn test_strategic_merge_owner_reference_delete_by_uid() {
+        let original = json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "rs",
+                "uid": "rs-uid",
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "d",
+                    "uid": "owner-uid",
+                    "controller": true,
+                    "blockOwnerDeletion": true
+                }]
+            }
+        });
+        // Exactly what pkg/controller/garbagecollector sends.
+        let patch = json!({
+            "metadata": {
+                "ownerReferences": [{"$patch": "delete", "uid": "owner-uid"}],
+                "uid": "rs-uid"
+            }
+        });
+
+        let result = apply_strategic_merge_patch(&original, &patch).unwrap();
+        // Top-level TypeMeta must survive.
+        assert_eq!(result["apiVersion"], "apps/v1");
+        assert_eq!(result["kind"], "ReplicaSet");
+        // The ownerReference must be gone and no `$patch` directive must leak.
+        let owners = result["metadata"]["ownerReferences"].as_array().unwrap();
+        assert!(
+            owners.is_empty(),
+            "ownerReferences must be empty after $patch:delete, got {owners:?}"
+        );
+    }
+
+    // A second owner must be preserved when only one is deleted by uid.
+    #[test]
+    fn test_strategic_merge_owner_reference_delete_keeps_others() {
+        let original = json!({
+            "metadata": {"ownerReferences": [
+                {"apiVersion":"apps/v1","kind":"Deployment","name":"d","uid":"a","controller":true},
+                {"apiVersion":"apps/v1","kind":"Deployment","name":"e","uid":"b"}
+            ]}
+        });
+        let patch = json!({"metadata": {"ownerReferences": [{"$patch":"delete","uid":"a"}]}});
+        let result = apply_strategic_merge_patch(&original, &patch).unwrap();
+        let owners = result["metadata"]["ownerReferences"].as_array().unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0]["uid"], "b");
     }
 
     #[test]

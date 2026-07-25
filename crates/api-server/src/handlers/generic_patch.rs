@@ -22,7 +22,36 @@ use rusternetes_storage::{build_key, Storage};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Upstream `ShouldDeleteDuringUpdate`
+/// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go): an
+/// update/patch removes the object from storage when the *new* object has no
+/// finalizers left AND the *existing* object was already pending deletion
+/// (deletionTimestamp set). This is how the garbage collector finishes
+/// orphan/foreground deletion — it PATCHes away the last finalizer (e.g.
+/// `orphan`) and the object must then disappear. Without this a Terminating
+/// object whose finalizers the GC has drained lingers forever, so
+/// `[sig-api-machinery] GarbageCollector should orphan RS ...` times out
+/// waiting for the owner (Deployment) to be deleted.
+pub(crate) fn should_delete_during_update(
+    new_json: &serde_json::Value,
+    existing_json: &serde_json::Value,
+) -> bool {
+    let new_finalizers_empty = new_json
+        .get("metadata")
+        .and_then(|m| m.get("finalizers"))
+        .map(|f| f.as_array().is_none_or(|a| a.is_empty()))
+        .unwrap_or(true);
+    if !new_finalizers_empty {
+        return false;
+    }
+    existing_json
+        .get("metadata")
+        .and_then(|m| m.get("deletionTimestamp"))
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+}
 
 /// Generic PATCH handler for namespaced resources
 ///
@@ -236,6 +265,16 @@ where
         }
     }
 
+    // Whether the existing object was already pending deletion. Combined with
+    // "the patched object has no finalizers left", this triggers removal from
+    // storage — upstream ShouldDeleteDuringUpdate. Captured here because
+    // current_json is consumed by the admission webhook calls below.
+    let existing_terminating = current_json
+        .get("metadata")
+        .and_then(|m| m.get("deletionTimestamp"))
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+
     // Convert back to resource type — use lenient deserialization
     let mut patched_resource: T = serde_json::from_value(patched_json.clone()).map_err(|e| {
         // If strict deserialization fails, try storing as raw JSON and retrieving
@@ -329,8 +368,8 @@ where
     // PATCH operations are idempotent — on rv conflict, re-read the resource,
     // re-apply the patch, and retry. This handles the common case where the
     // kubelet updates pod status between the client's read and patch.
-    match state.storage.update(&key, &patched_resource).await {
-        Ok(updated) => Ok(Json(updated)),
+    let updated = match state.storage.update(&key, &patched_resource).await {
+        Ok(updated) => updated,
         Err(rusternetes_common::Error::Conflict(_)) => {
             // Re-read, re-apply patch, retry once
             let fresh: T = state.storage.get(&key).await?;
@@ -341,11 +380,38 @@ where
             let re_patched_resource: T = serde_json::from_value(re_patched).map_err(|e| {
                 rusternetes_common::Error::InvalidResource(format!("Invalid result: {}", e))
             })?;
-            let updated = state.storage.update(&key, &re_patched_resource).await?;
-            Ok(Json(updated))
+            state.storage.update(&key, &re_patched_resource).await?
         }
-        Err(e) => Err(e),
+        Err(e) => return Err(e),
+    };
+
+    // Upstream ShouldDeleteDuringUpdate: if the patch drained the last finalizer
+    // of an object already pending deletion, remove it now. The garbage
+    // collector finishes orphan/foreground deletion this way — it PATCHes away
+    // the last finalizer and the owner must then disappear.
+    if existing_terminating {
+        let updated_json = serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null);
+        let new_finalizers_empty = updated_json
+            .get("metadata")
+            .and_then(|m| m.get("finalizers"))
+            .map(|f| f.as_array().is_none_or(|a| a.is_empty()))
+            .unwrap_or(true);
+        if new_finalizers_empty {
+            match state.storage.delete(&key).await {
+                Ok(_) => info!(
+                    "{} {}/{} deleted (finalizers drained during patch)",
+                    resource_type, namespace, name
+                ),
+                Err(rusternetes_common::Error::NotFound(_)) => {}
+                Err(e) => warn!(
+                    "failed to remove finalized {} {}/{}: {}",
+                    resource_type, namespace, name, e
+                ),
+            }
+        }
     }
+
+    Ok(Json(updated))
 }
 
 /// Generic PATCH handler for cluster-scoped resources
@@ -555,6 +621,10 @@ where
         }
     }
 
+    // Decide (before consuming patched_json) whether this patch finalizes a
+    // pending deletion — upstream ShouldDeleteDuringUpdate.
+    let finalizes_deletion = should_delete_during_update(&patched_json, &current_json);
+
     // Convert back to resource type
     let patched_resource: T = serde_json::from_value(patched_json).map_err(|e| {
         rusternetes_common::Error::InvalidResource(format!("Invalid result: {}", e))
@@ -572,6 +642,23 @@ where
 
     // Update in storage
     let updated = state.storage.update(&key, &patched_resource).await?;
+
+    // If the patch drained the last finalizer of an object already pending
+    // deletion, remove it now (upstream ShouldDeleteDuringUpdate). The GC drives
+    // orphan/foreground deletion this way.
+    if finalizes_deletion {
+        match state.storage.delete(&key).await {
+            Ok(_) => info!(
+                "{} {} deleted (finalizers drained during patch)",
+                resource_type, name
+            ),
+            Err(rusternetes_common::Error::NotFound(_)) => {}
+            Err(e) => warn!(
+                "failed to remove finalized {} {}: {}",
+                resource_type, name, e
+            ),
+        }
+    }
 
     Ok(Json(updated))
 }
@@ -644,4 +731,42 @@ macro_rules! patch_handler_cluster {
             .await
         }
     };
+}
+
+#[cfg(test)]
+mod finalizer_drain_tests {
+    use super::should_delete_during_update;
+    use serde_json::json;
+
+    // GC removes the last finalizer (orphan) from a Terminating owner → delete.
+    #[test]
+    fn deletes_when_finalizers_drained_and_terminating() {
+        let existing = json!({"metadata":{"deletionTimestamp":"2026-07-25T00:00:00Z","finalizers":["orphan"]}});
+        let new = json!({"metadata":{"deletionTimestamp":"2026-07-25T00:00:00Z","finalizers":[]}});
+        assert!(should_delete_during_update(&new, &existing));
+    }
+
+    // finalizers key absent entirely (== empty) on a Terminating object → delete.
+    #[test]
+    fn deletes_when_finalizers_absent_and_terminating() {
+        let existing = json!({"metadata":{"deletionTimestamp":"2026-07-25T00:00:00Z"}});
+        let new = json!({"metadata":{}});
+        assert!(should_delete_during_update(&new, &existing));
+    }
+
+    // Finalizers remain in the new object → keep.
+    #[test]
+    fn keeps_while_finalizers_remain() {
+        let existing = json!({"metadata":{"deletionTimestamp":"2026-07-25T00:00:00Z","finalizers":["orphan"]}});
+        let new = json!({"metadata":{"finalizers":["orphan"]}});
+        assert!(!should_delete_during_update(&new, &existing));
+    }
+
+    // Not pending deletion → a plain patch that clears finalizers must NOT delete.
+    #[test]
+    fn keeps_when_not_terminating() {
+        let existing = json!({"metadata":{"finalizers":["x"]}});
+        let new = json!({"metadata":{"finalizers":[]}});
+        assert!(!should_delete_during_update(&new, &existing));
+    }
 }
