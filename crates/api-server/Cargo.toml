@@ -75,6 +75,9 @@ cel.workspace = true
 sha2 = "0.10"
 prost.workspace = true
 prost-types = "0.13"
+# Aggregation-layer availability controller runs inside the apiserver (upstream
+# kube-aggregator placement), so this is a runtime dependency, not just dev.
+rusternetes-controller-manager = { path = "../controller-manager" }
 
 [build-dependencies]
 prost-build = "0.13"
@@ -82,7 +85,6 @@ prost-build = "0.13"
 [dev-dependencies]
 tokio-rustls = { workspace = true }
 tokio-test = "0.4"
-rusternetes-controller-manager = { path = "../controller-manager" }
 rusternetes-test-support = { path = "../test_support", features = ["apiserver-harness"] }
 warp.workspace = true
 async-trait.workspace = true
