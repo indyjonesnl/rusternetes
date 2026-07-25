@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{interval, timeout};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 /// Kubernetes watch event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,34 +308,35 @@ where
         }
     }
 
-    // Subscribe to watch events.
-    // If a specific resourceVersion was given, use etcd's watch_from_revision
-    // directly to replay ALL events since that revision from etcd's history.
-    // This is more reliable than the in-memory history buffer which only
-    // captures events while a watcher was active.
+    // Subscribe to watch events — ALWAYS through the shared per-prefix watch
+    // cache, never a per-client storage watch. Upstream serves every watch
+    // from the cacher (ONE storage watch per resource, fanned out in memory;
+    // staging/src/k8s.io/apiserver/pkg/storage/cacher). Per-client
+    // `watch_from_revision` streams to the rhino/SQLite backend proved able to
+    // stall silently under write bursts — open but delivering nothing — which
+    // blinded exactly one informer at a time (the KCM endpointslice tracker
+    // wedge, #1165) with no error for either side to react to. The shared
+    // cache loop has supervised reconnect-with-replay, so a backend hiccup
+    // heals for every subscriber at once. If the requested resourceVersion
+    // predates the cache ring's coverage, reply 410 Expired so the client
+    // relists — upstream "too old resource version" semantics.
     let watch_stream = if let Some(since_rev) = replay_revision {
-        // Use etcd watch_from_revision for reliable history replay.
-        // Add 1 because etcd start_revision is inclusive and we want events AFTER since_rev.
         match state
-            .storage
-            .watch_from_revision(&prefix, since_rev + 1)
+            .watch_cache
+            .subscribe_from_checked(&prefix, since_rev)
             .await
         {
-            Ok(stream) => {
+            Ok((history, rx)) => {
                 debug!(
-                    "Started etcd watch from revision {} for prefix {}",
-                    since_rev + 1,
+                    "Serving watch from cache ring: {} history events since rev {} for prefix {}",
+                    history.len(),
+                    since_rev,
                     prefix
                 );
-                stream
-            }
-            Err(e) => {
-                error!(
-                    "Failed to create watch from revision {}: {}, falling back to cache",
-                    since_rev, e
-                );
-                let (history, rx) = state.watch_cache.subscribe_from(&prefix, since_rev).await;
                 crate::watch_cache::broadcast_to_stream_with_history(history, rx)
+            }
+            Err(floor) => {
+                return build_watch_error_response(resource_expired_status(since_rev, floor));
             }
         }
     } else {
@@ -661,18 +662,33 @@ where
                                 }
                             }
                             Some(Err(e)) => {
+                                if matches!(e, Error::Gone(_)) {
+                                    // Lag termination from the watch cache: events were
+                                    // dropped for this subscriber. Tell the client to
+                                    // relist (410 ERROR event) and END the stream — do
+                                    // NOT resubscribe, the drop would be silently lost.
+                                    let _ = tx.send(Ok(watch_lagged_error_line(&e.to_string()))).await;
+                                    break;
+                                }
                                 // Empty watch responses and transient errors are normal —
                                 // etcd sends keep-alive responses with no events. Don't break.
                                 debug!("Watch stream transient error (continuing): {}", e);
                                 continue;
                             }
                             None => {
-                                // Watch stream ended — resubscribe from cache.
-                                // Small delay to prevent tight loop if channel keeps closing.
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                let new_rx = state.watch_cache.subscribe(&prefix).await;
-                                watch_stream = Box::pin(crate::watch_cache::broadcast_to_stream(new_rx));
-                                continue;
+                                // Watch stream ended. NEVER splice a fresh
+                                // subscription in silently: every event
+                                // committed between the old stream's end and
+                                // the new subscribe would be dropped, leaving
+                                // the client's informer permanently stale
+                                // (KCM endpointslice tracker wedge, #1165).
+                                // Upstream ends the watch; the client relists
+                                // with a fresh resourceVersion. Send 410 so
+                                // reflectors relist immediately.
+                                let _ = tx.send(Ok(watch_lagged_error_line(
+                                    "watch stream ended; please relist",
+                                ))).await;
+                                break;
                             }
                         }
                     }
@@ -897,30 +913,35 @@ where
         }
     }
 
-    // Subscribe to watch events.
-    // If a specific resourceVersion was given, use etcd's watch_from_revision
-    // directly to replay ALL events since that revision from etcd's history.
+    // Subscribe to watch events — ALWAYS through the shared per-prefix watch
+    // cache, never a per-client storage watch. Upstream serves every watch
+    // from the cacher (ONE storage watch per resource, fanned out in memory;
+    // staging/src/k8s.io/apiserver/pkg/storage/cacher). Per-client
+    // `watch_from_revision` streams to the rhino/SQLite backend proved able to
+    // stall silently under write bursts — open but delivering nothing — which
+    // blinded exactly one informer at a time (the KCM endpointslice tracker
+    // wedge, #1165) with no error for either side to react to. The shared
+    // cache loop has supervised reconnect-with-replay, so a backend hiccup
+    // heals for every subscriber at once. If the requested resourceVersion
+    // predates the cache ring's coverage, reply 410 Expired so the client
+    // relists — upstream "too old resource version" semantics.
     let watch_stream = if let Some(since_rev) = replay_revision {
         match state
-            .storage
-            .watch_from_revision(&prefix, since_rev + 1)
+            .watch_cache
+            .subscribe_from_checked(&prefix, since_rev)
             .await
         {
-            Ok(stream) => {
+            Ok((history, rx)) => {
                 debug!(
-                    "Started etcd watch from revision {} for prefix {}",
-                    since_rev + 1,
+                    "Serving watch from cache ring: {} history events since rev {} for prefix {}",
+                    history.len(),
+                    since_rev,
                     prefix
                 );
-                stream
-            }
-            Err(e) => {
-                error!(
-                    "Failed to create watch from revision {}: {}, falling back to cache",
-                    since_rev, e
-                );
-                let (history, rx) = state.watch_cache.subscribe_from(&prefix, since_rev).await;
                 crate::watch_cache::broadcast_to_stream_with_history(history, rx)
+            }
+            Err(floor) => {
+                return build_watch_error_response(resource_expired_status(since_rev, floor));
             }
         }
     } else {
@@ -1235,18 +1256,33 @@ where
                                 }
                             }
                             Some(Err(e)) => {
+                                if matches!(e, Error::Gone(_)) {
+                                    // Lag termination from the watch cache: events were
+                                    // dropped for this subscriber. Tell the client to
+                                    // relist (410 ERROR event) and END the stream — do
+                                    // NOT resubscribe, the drop would be silently lost.
+                                    let _ = tx.send(Ok(watch_lagged_error_line(&e.to_string()))).await;
+                                    break;
+                                }
                                 // Empty watch responses and transient errors are normal —
                                 // etcd sends keep-alive responses with no events. Don't break.
                                 debug!("Watch stream transient error (continuing): {}", e);
                                 continue;
                             }
                             None => {
-                                // Watch stream ended — resubscribe from cache.
-                                // Small delay to prevent tight loop if channel keeps closing.
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                let new_rx = state.watch_cache.subscribe(&prefix).await;
-                                watch_stream = Box::pin(crate::watch_cache::broadcast_to_stream(new_rx));
-                                continue;
+                                // Watch stream ended. NEVER splice a fresh
+                                // subscription in silently: every event
+                                // committed between the old stream's end and
+                                // the new subscribe would be dropped, leaving
+                                // the client's informer permanently stale
+                                // (KCM endpointslice tracker wedge, #1165).
+                                // Upstream ends the watch; the client relists
+                                // with a fresh resourceVersion. Send 410 so
+                                // reflectors relist immediately.
+                                let _ = tx.send(Ok(watch_lagged_error_line(
+                                    "watch stream ended; please relist",
+                                ))).await;
+                                break;
                             }
                         }
                     }
@@ -1730,6 +1766,30 @@ fn resource_expired_status(since_rev: i64, current_rev: i64) -> Status {
         format!("too old resource version: {} ({})", since_rev, current_rev),
         "Expired",
         410,
+    )
+}
+
+/// In-stream `{"type":"ERROR","object":<410 Status>}` line for a watch that
+/// fell behind the event ring (see `watch_cache::broadcast_to_stream` lag
+/// termination). client-go treats an ERROR event whose Status is
+/// `Expired`/410 as `ResourceExpired` and immediately re-lists + re-watches —
+/// upstream cacher semantics for a too-slow watcher. Handlers MUST send this
+/// and then terminate the HTTP stream (never internally resubscribe: the
+/// dropped events would stay silently lost and the client's informer would be
+/// permanently stale — the #1165 wedge).
+fn watch_lagged_error_line(message: &str) -> String {
+    let status = serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "metadata": {},
+        "status": "Failure",
+        "message": message,
+        "reason": "Expired",
+        "code": 410,
+    });
+    format!(
+        "{}\n",
+        serde_json::json!({"type": "ERROR", "object": status})
     )
 }
 
@@ -2660,9 +2720,6 @@ pub async fn watch_cluster_scoped_json(
     let should_send_initial =
         send_initial_events || requested_rv.as_deref() == Some("0") || requested_rv.is_none();
 
-    let prefix_for_reconnect = prefix.clone();
-    let state_for_reconnect = state.clone();
-
     tokio::spawn(async move {
         let mut latest_resource_version: Option<String> = Some(current_rev_str);
 
@@ -2741,15 +2798,23 @@ pub async fn watch_cluster_scoped_json(
                                 }
                             }
                             Some(Err(e)) => {
+                                if matches!(e, Error::Gone(_)) {
+                                    // Lag termination — 410 + end stream (see the
+                                    // namespaced arm for rationale).
+                                    let _ = tx.send(Ok(watch_lagged_error_line(&e.to_string()))).await;
+                                    break;
+                                }
                                 debug!("Watch stream transient error (continuing): {}", e);
                                 continue;
                             }
                             None => {
-                                // Watch stream ended — resubscribe from cache
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                let new_rx = state_for_reconnect.watch_cache.subscribe(&prefix_for_reconnect).await;
-                                watch_stream = Box::pin(crate::watch_cache::broadcast_to_stream(new_rx));
-                                continue;
+                                // Stream ended — 410 + terminate, never a
+                                // silent gap-splicing resubscribe (see the
+                                // namespaced arm for rationale).
+                                let _ = tx.send(Ok(watch_lagged_error_line(
+                                    "watch stream ended; please relist",
+                                ))).await;
+                                break;
                             }
                         }
                     }
@@ -2848,9 +2913,6 @@ pub async fn watch_namespaced_json(
     // client sees the latest status (e.g. CRD Established=True condition).
     let should_send_initial = true;
 
-    let prefix_for_reconnect = prefix.clone();
-    let state_for_reconnect = state.clone();
-
     tokio::spawn(async move {
         let mut latest_resource_version: Option<String> = Some(current_rev_str);
 
@@ -2929,15 +2991,23 @@ pub async fn watch_namespaced_json(
                                 }
                             }
                             Some(Err(e)) => {
+                                if matches!(e, Error::Gone(_)) {
+                                    // Lag termination — 410 + end stream (see the
+                                    // namespaced arm for rationale).
+                                    let _ = tx.send(Ok(watch_lagged_error_line(&e.to_string()))).await;
+                                    break;
+                                }
                                 debug!("Watch stream transient error (continuing): {}", e);
                                 continue;
                             }
                             None => {
-                                // Watch stream ended — resubscribe from cache
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                let new_rx = state_for_reconnect.watch_cache.subscribe(&prefix_for_reconnect).await;
-                                watch_stream = Box::pin(crate::watch_cache::broadcast_to_stream(new_rx));
-                                continue;
+                                // Stream ended — 410 + terminate, never a
+                                // silent gap-splicing resubscribe (see the
+                                // namespaced arm for rationale).
+                                let _ = tx.send(Ok(watch_lagged_error_line(
+                                    "watch stream ended; please relist",
+                                ))).await;
+                                break;
                             }
                         }
                     }

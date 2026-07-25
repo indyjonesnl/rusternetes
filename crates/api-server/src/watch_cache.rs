@@ -36,6 +36,12 @@ pub(crate) trait WatchSource: Send + Sync + 'static {
         prefix: &str,
         revision: i64,
     ) -> rusternetes_common::Result<WatchStream>;
+
+    /// Current storage revision. Recorded as the ring "floor" when a shared
+    /// prefix watch starts: the ring is complete for every revision > floor,
+    /// so a client watch from an older resourceVersion must 410-relist rather
+    /// than risk silently missing events.
+    async fn head_revision(&self) -> i64;
 }
 
 #[async_trait]
@@ -50,6 +56,10 @@ impl WatchSource for StorageBackend {
         revision: i64,
     ) -> rusternetes_common::Result<WatchStream> {
         Storage::watch_from_revision(self, prefix, revision).await
+    }
+
+    async fn head_revision(&self) -> i64 {
+        self.current_revision().await.unwrap_or(0)
     }
 }
 
@@ -73,6 +83,14 @@ const HISTORY_IDLE_CAPACITY: usize = 16;
 /// How often the idle-GC sweep reclaims replay rings for prefixes that have
 /// dropped to zero watchers.
 const IDLE_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Liveness bound for a shared prefix stream: if the backend delivered nothing
+/// for this long WHILE the storage head revision advanced past our resume
+/// point, the stream is presumed silently stalled (rhino/SQLite watches can
+/// stall open under write bursts — no events, no error, no end). We tear it
+/// down and reconnect via `watch_since(resume+1)`, whose replay recovers every
+/// missed event. Bounded staleness instead of a silent forever-wedge (#1165).
+const WATCH_LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A cached watch event with metadata
 #[derive(Debug, Clone)]
@@ -103,6 +121,10 @@ pub struct WatchCache {
     revision: RwLock<i64>,
     /// Ring buffer of recent events per prefix for history replay
     history: Arc<RwLock<HashMap<String, VecDeque<CachedWatchEvent>>>>,
+    /// Per-prefix replay floor: the ring is complete for revisions > floor
+    /// (floor = storage head at shared-watch start, advanced whenever the ring
+    /// trims). RV-watches below the floor must 410 so the client relists.
+    floors: Arc<RwLock<HashMap<String, i64>>>,
 }
 
 impl WatchCache {
@@ -119,6 +141,7 @@ impl WatchCache {
             storage,
             revision: RwLock::new(0), // Will be populated from etcd events
             history: Arc::new(RwLock::new(HashMap::new())),
+            floors: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -126,6 +149,22 @@ impl WatchCache {
     /// Returns a broadcast receiver that will receive all events for this prefix.
     /// If no etcd watch exists for this prefix, one is started.
     pub async fn subscribe(&self, prefix: &str) -> broadcast::Receiver<CachedWatchEvent> {
+        self.subscribe_with_floor(prefix, None).await
+    }
+
+    /// Like [`subscribe`], but when THIS call creates the shared watcher, start
+    /// its replay from `desired_floor` instead of the current storage head.
+    /// The first watcher of an on-demand prefix (e.g. a fresh namespace's
+    /// resourcequotas) arrives with a resourceVersion from its own LIST — a
+    /// GLOBAL revision that is typically older than the global head even
+    /// though nothing for this prefix happened in between. Flooring at head
+    /// would 410 that perfectly valid first watch; flooring at the client's RV
+    /// (and replaying `watch_since(rv+1)` into the ring) serves it exactly.
+    async fn subscribe_with_floor(
+        &self,
+        prefix: &str,
+        desired_floor: Option<i64>,
+    ) -> broadcast::Receiver<CachedWatchEvent> {
         // Check if we already have a watcher for this prefix
         {
             let watchers = self.watchers.read().await;
@@ -136,8 +175,10 @@ impl WatchCache {
 
         // Create a new watcher
         // Buffer size: K8s default watch cache is 1000 events. 16384 used ~1.2GB
-        // of memory with 26 prefixes × 16K events × ~3KB each.
-        let (tx, rx) = broadcast::channel(1000);
+        // of memory with 26 prefixes × 16K events × ~3KB each. 4096 keeps the
+        // lag-termination path (see broadcast_to_stream) rare under conformance
+        // churn while staying well under that ceiling.
+        let (tx, rx) = broadcast::channel(4096);
         {
             let mut watchers = self.watchers.write().await;
             // Double-check after acquiring write lock
@@ -147,111 +188,209 @@ impl WatchCache {
             watchers.insert(prefix.to_string(), tx.clone());
         }
 
-        // Start the etcd watch in a background task
+        // Record the replay floor BEFORE the shared watch starts: the ring is
+        // complete for revisions > floor. Starting the loop with
+        // `watch_since(floor + 1)` (not "from now") closes the boot race where
+        // an event committed between head_revision() and stream establishment
+        // would be invisible to the ring forever.
+        let start_floor = match desired_floor {
+            Some(f) => f,
+            None => self.storage.head_revision().await,
+        };
+        self.floors
+            .write()
+            .await
+            .insert(prefix.to_string(), start_floor);
+
+        // Highest revision we have delivered so far. `None` on the very first
+        // connection (tail from now — the handler's initial LIST covers
+        // pre-existing state). On every reconnect we resume from `last + 1` so
+        // events committed while the stream was down are replayed, not
+        // silently dropped.
+        let mut resume_rev: Option<i64> = if start_floor > 0 {
+            Some(start_floor)
+        } else {
+            None
+        };
+
+        // Perform the FIRST connection synchronously, before this function
+        // returns `rx` to the caller. Without this, there is a window between
+        // "the caller believes it is now watching" (rx handed back) and "the
+        // storage subscription is actually live" (established inside the
+        // spawned task, below) during which a write is invisible to this
+        // watcher forever. For a real backend (etcd/rhino) that window is
+        // harmless: `watch_since` REPLAYS every committed event from the given
+        // revision, so a delayed connect still catches up. But the in-memory
+        // bus backend's `watch_from_revision` has no true replay — it is a
+        // plain "future events only" subscription — so a write landing in that
+        // async gap is lost permanently, not just delayed. Established
+        // live: reflector_lists_then_streams_live_mutations flaked exactly
+        // this way once RV-watches started going through the shared cache.
+        let first_connect = match resume_rev {
+            Some(rev) => self.storage.watch_since(prefix, rev + 1).await,
+            None => self.storage.watch_from_now(prefix).await,
+        };
+
+        // Continue the watch (reconnects included) in a background task.
         let storage = self.storage.clone();
         let prefix_owned = prefix.to_string();
         let tx_clone = tx.clone();
         let history_ref = self.history.clone();
+        let floors_ref = self.floors.clone();
 
         tokio::spawn(async move {
             info!(
                 "WatchCache: starting shared watch for prefix {}",
                 prefix_owned
             );
-            // Highest revision we have delivered so far. `None` on the very
-            // first connection (tail from now — the handler's initial LIST
-            // covers pre-existing state). On every reconnect we resume from
-            // `last + 1` so events committed while the stream was down are
-            // replayed, not silently dropped. Missing this replay let the
-            // cert-manager cainjector miss the webhook-CA secret create that
-            // landed in a reconnect gap, leaving the caBundle empty and every
-            // admission call failing with `UnknownIssuer`.
-            let mut resume_rev: Option<i64> = None;
+            let mut pending_connect = Some(first_connect);
+            // Watchdog cadence with backoff: a genuinely quiet prefix whose
+            // reconnect replays nothing gets a doubling interval (cap 60s) so
+            // hundreds of idle namespaced prefixes don't hammer the backend
+            // every 10s; any real event resets to the 10s base.
+            let mut liveness_interval = WATCH_LIVENESS_INTERVAL;
             loop {
-                let connect = match resume_rev {
-                    Some(rev) => storage.watch_since(&prefix_owned, rev + 1).await,
-                    None => storage.watch_from_now(&prefix_owned).await,
+                let connect = match pending_connect.take() {
+                    Some(c) => c,
+                    None => match resume_rev {
+                        Some(rev) => storage.watch_since(&prefix_owned, rev + 1).await,
+                        None => storage.watch_from_now(&prefix_owned).await,
+                    },
                 };
                 match connect {
                     Ok(mut stream) => {
                         use futures::StreamExt;
-                        while let Some(event_result) = stream.next().await {
-                            // Extract the resourceVersion from the event value's metadata.
-                            // Uses string search instead of full JSON parse since the format
-                            // is controlled by our inject_resource_version() and is always
-                            // "resourceVersion":"<digits>".
-                            fn extract_rv(value: &str) -> i64 {
-                                const NEEDLE: &str = "\"resourceVersion\":\"";
-                                if let Some(start) = value.find(NEEDLE) {
-                                    let num_start = start + NEEDLE.len();
-                                    if let Some(end) = value[num_start..].find('"') {
-                                        return value[num_start..num_start + end]
-                                            .parse::<i64>()
-                                            .unwrap_or(0);
-                                    }
+                        loop {
+                            // Liveness watchdog: a stalled-open backend stream
+                            // is indistinguishable from a quiet prefix except
+                            // by the storage head advancing without us seeing
+                            // events. Reconnect-with-replay heals it for every
+                            // subscriber at once.
+                            let event_result = match tokio::time::timeout(
+                                liveness_interval,
+                                stream.next(),
+                            )
+                            .await
+                            {
+                                Ok(Some(ev)) => {
+                                    // Live stream — restore the fast watchdog.
+                                    liveness_interval = WATCH_LIVENESS_INTERVAL;
+                                    ev
                                 }
-                                0
-                            }
-
-                            let cached = match event_result {
-                                Ok(WatchEvent::Added(key, value)) => {
-                                    let rev = extract_rv(&value);
-                                    CachedWatchEvent {
-                                        event: WatchEventData::Added(key, Arc::new(value)),
-                                        revision: rev,
+                                Ok(None) => break, // stream ended → reconnect
+                                Err(_idle) => {
+                                    if let Some(resume) = resume_rev {
+                                        let head = storage.head_revision().await;
+                                        if head > resume {
+                                            tracing::debug!(
+                                                "WatchCache: {} stream silent for {:?} while storage advanced ({} > {}) — reconnecting with replay",
+                                                prefix_owned,
+                                                liveness_interval,
+                                                head,
+                                                resume
+                                            );
+                                            // Back off for the next round: if this
+                                            // reconnect replays nothing the prefix is
+                                            // just quiet, not stalled.
+                                            liveness_interval = (liveness_interval * 2)
+                                                .min(std::time::Duration::from_secs(30));
+                                            break; // watch_since(resume+1) replays the gap
+                                        }
                                     }
-                                }
-                                Ok(WatchEvent::Modified(key, value)) => {
-                                    let rev = extract_rv(&value);
-                                    CachedWatchEvent {
-                                        event: WatchEventData::Modified(key, Arc::new(value)),
-                                        revision: rev,
-                                    }
-                                }
-                                Ok(WatchEvent::Deleted(key, prev_value)) => {
-                                    let rev = extract_rv(&prev_value);
-                                    CachedWatchEvent {
-                                        event: WatchEventData::Deleted(key, Arc::new(prev_value)),
-                                        revision: rev,
-                                    }
-                                }
-                                Err(_) => {
-                                    // Transient error, continue
                                     continue;
                                 }
                             };
-
-                            // Append to history ring buffer
                             {
-                                let mut hist: tokio::sync::RwLockWriteGuard<
-                                    '_,
-                                    HashMap<String, VecDeque<CachedWatchEvent>>,
-                                > = history_ref.write().await;
-                                let buf = hist.entry(prefix_owned.clone()).or_default();
-                                buf.push_back(cached.clone());
-                                // Retain the full ring only while someone is
-                                // watching; once the last watcher leaves, trim to
-                                // the idle tail so a busy-then-idle prefix doesn't
-                                // pin ~500 events forever (#1089).
-                                let cap = if tx_clone.receiver_count() > 0 {
-                                    HISTORY_CAPACITY
-                                } else {
-                                    HISTORY_IDLE_CAPACITY
-                                };
-                                while buf.len() > cap {
-                                    buf.pop_front();
+                                // Extract the resourceVersion from the event value's metadata.
+                                // Uses string search instead of full JSON parse since the format
+                                // is controlled by our inject_resource_version() and is always
+                                // "resourceVersion":"<digits>".
+                                fn extract_rv(value: &str) -> i64 {
+                                    const NEEDLE: &str = "\"resourceVersion\":\"";
+                                    if let Some(start) = value.find(NEEDLE) {
+                                        let num_start = start + NEEDLE.len();
+                                        if let Some(end) = value[num_start..].find('"') {
+                                            return value[num_start..num_start + end]
+                                                .parse::<i64>()
+                                                .unwrap_or(0);
+                                        }
+                                    }
+                                    0
                                 }
-                            }
 
-                            // Advance the resume point so a reconnect replays
-                            // strictly-later events (no gap, no duplicates).
-                            // Guard on > 0: memory-backend events carry no RV.
-                            if cached.revision > 0 {
-                                resume_rev = Some(cached.revision);
-                            }
+                                let cached = match event_result {
+                                    Ok(WatchEvent::Added(key, value)) => {
+                                        let rev = extract_rv(&value);
+                                        CachedWatchEvent {
+                                            event: WatchEventData::Added(key, Arc::new(value)),
+                                            revision: rev,
+                                        }
+                                    }
+                                    Ok(WatchEvent::Modified(key, value)) => {
+                                        let rev = extract_rv(&value);
+                                        CachedWatchEvent {
+                                            event: WatchEventData::Modified(key, Arc::new(value)),
+                                            revision: rev,
+                                        }
+                                    }
+                                    Ok(WatchEvent::Deleted(key, prev_value)) => {
+                                        let rev = extract_rv(&prev_value);
+                                        CachedWatchEvent {
+                                            event: WatchEventData::Deleted(
+                                                key,
+                                                Arc::new(prev_value),
+                                            ),
+                                            revision: rev,
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Transient error, continue
+                                        continue;
+                                    }
+                                };
 
-                            // Broadcast to live subscribers (Err is OK if no receivers)
-                            let _ = tx_clone.send(cached);
+                                // Append to history ring buffer
+                                {
+                                    let mut hist: tokio::sync::RwLockWriteGuard<
+                                        '_,
+                                        HashMap<String, VecDeque<CachedWatchEvent>>,
+                                    > = history_ref.write().await;
+                                    let buf = hist.entry(prefix_owned.clone()).or_default();
+                                    buf.push_back(cached.clone());
+                                    // Retain the full ring only while someone is
+                                    // watching; once the last watcher leaves, trim to
+                                    // the idle tail so a busy-then-idle prefix doesn't
+                                    // pin ~500 events forever (#1089).
+                                    let cap = if tx_clone.receiver_count() > 0 {
+                                        HISTORY_CAPACITY
+                                    } else {
+                                        HISTORY_IDLE_CAPACITY
+                                    };
+                                    let mut trimmed_to: Option<i64> = None;
+                                    while buf.len() > cap {
+                                        if let Some(popped) = buf.pop_front() {
+                                            trimmed_to = Some(popped.revision);
+                                        }
+                                    }
+                                    if let Some(rev) = trimmed_to {
+                                        let mut floors = floors_ref.write().await;
+                                        let f = floors.entry(prefix_owned.clone()).or_insert(0);
+                                        if rev > *f {
+                                            *f = rev;
+                                        }
+                                    }
+                                }
+
+                                // Advance the resume point so a reconnect replays
+                                // strictly-later events (no gap, no duplicates).
+                                // Guard on > 0: memory-backend events carry no RV.
+                                if cached.revision > 0 {
+                                    resume_rev = Some(cached.revision);
+                                }
+
+                                // Broadcast to live subscribers (Err is OK if no receivers)
+                                let _ = tx_clone.send(cached);
+                            }
                         }
                         // Stream ended, reconnect after brief pause
                         // Don't check subscriber count here — new subscribers may arrive
@@ -315,10 +454,17 @@ impl WatchCache {
             return;
         }
         let mut hist = self.history.write().await;
+        let mut floors = self.floors.write().await;
         for prefix in idle_prefixes {
             if let Some(buf) = hist.get_mut(&prefix) {
                 if buf.len() > HISTORY_IDLE_CAPACITY {
                     let drop_n = buf.len() - HISTORY_IDLE_CAPACITY;
+                    if let Some(last_dropped) = buf.get(drop_n - 1) {
+                        let f = floors.entry(prefix.clone()).or_insert(0);
+                        if last_dropped.revision > *f {
+                            *f = last_dropped.revision;
+                        }
+                    }
                     buf.drain(..drop_n);
                     buf.shrink_to_fit();
                     debug!(
@@ -364,6 +510,31 @@ impl WatchCache {
         let history = self.get_events_since(prefix, since_revision).await;
         (history, rx)
     }
+
+    /// Like [`subscribe_from`], but verifies the ring actually COVERS
+    /// `since_revision`. Returns `Err(floor)` when it does not — the ring only
+    /// holds events with revision > floor, so replaying from an older RV would
+    /// silently skip whatever was trimmed (or predates the shared watch).
+    /// Callers must answer 410 Expired so the client relists — upstream
+    /// cacher "too old resource version" semantics.
+    pub async fn subscribe_from_checked(
+        &self,
+        prefix: &str,
+        since_revision: i64,
+    ) -> Result<(Vec<CachedWatchEvent>, broadcast::Receiver<CachedWatchEvent>), i64> {
+        // Subscribe first: creates the shared watcher if absent, flooring it at
+        // the client's RV so the very first watch of an on-demand prefix is
+        // served (backend replay from rv+1 fills the ring for it).
+        let rx = self
+            .subscribe_with_floor(prefix, Some(since_revision))
+            .await;
+        let floor = self.floors.read().await.get(prefix).copied().unwrap_or(0);
+        if since_revision < floor {
+            return Err(floor);
+        }
+        let history = self.get_events_since(prefix, since_revision).await;
+        Ok((history, rx))
+    }
 }
 
 /// Convert a broadcast receiver into a WatchStream compatible with existing handlers.
@@ -380,8 +551,25 @@ pub fn broadcast_to_stream(mut rx: broadcast::Receiver<CachedWatchEvent>) -> Wat
                     yield Ok(event);
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    debug!("Watch stream lagged by {} events, continuing", n);
-                    continue;
+                    // The subscriber fell behind the broadcast ring and `n`
+                    // events are irretrievably gone for THIS stream. Silently
+                    // continuing would leave the client permanently blind to
+                    // those objects (client-go reflectors never re-list on
+                    // their own) — the exact wedge behind stuck informers
+                    // (#1165: deployment ReadyReplicas, endpointslice
+                    // readiness, quota usage). Upstream's watch cache
+                    // TERMINATES a too-slow watcher so the client re-lists
+                    // (apiserver/pkg/storage/cacher). Mirror that: surface a
+                    // 410-style error and end the stream.
+                    tracing::warn!(
+                        "watch subscriber lagged by {} events — terminating watch so the client relists",
+                        n
+                    );
+                    yield Err(rusternetes_common::Error::Gone(format!(
+                        "too old resource version: watch lagged behind by {} events",
+                        n
+                    )));
+                    break;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     break;
@@ -416,8 +604,16 @@ pub fn broadcast_to_stream_with_history(
         loop {
             match rx.recv().await {
                 Ok(cached) => {
-                    // Skip events we already replayed from history
-                    if cached.revision <= max_history_rev {
+                    // Skip events we already replayed from history. Only
+                    // applies when the event carries a REAL revision (> 0):
+                    // the in-memory backend never stamps a resourceVersion
+                    // onto the raw published object, so `extract_rv` always
+                    // returns 0 for it — indistinguishable from
+                    // `max_history_rev`'s empty-history default of 0. Without
+                    // this guard, `0 <= 0` treated every live MemoryStorage
+                    // event as an already-seen duplicate and silently dropped
+                    // it (reflector_lists_then_streams_live_mutations).
+                    if cached.revision > 0 && cached.revision <= max_history_rev {
                         continue;
                     }
                     let event = match cached.event {
@@ -428,8 +624,18 @@ pub fn broadcast_to_stream_with_history(
                     yield Ok(event);
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    debug!("Watch stream lagged by {} events, continuing", n);
-                    continue;
+                    // See broadcast_to_stream: a lagged subscriber lost events
+                    // permanently — terminate so the client relists (upstream
+                    // cacher parity), never silently continue.
+                    tracing::warn!(
+                        "watch subscriber (with history) lagged by {} events — terminating watch so the client relists",
+                        n
+                    );
+                    yield Err(rusternetes_common::Error::Gone(format!(
+                        "too old resource version: watch lagged behind by {} events",
+                        n
+                    )));
+                    break;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     break;
@@ -447,6 +653,131 @@ mod tests {
     use rusternetes_storage::StorageBackend;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// Mock source with a non-zero head revision: the shared loop must start
+    /// with `watch_since(head+1)` (never from-now) and the floor must gate
+    /// old-RV subscriptions with Err(floor) → 410 → client relists.
+    struct FloorSource {
+        since_revs: std::sync::Mutex<Vec<i64>>,
+    }
+
+    #[async_trait]
+    impl WatchSource for FloorSource {
+        async fn watch_from_now(&self, _prefix: &str) -> rusternetes_common::Result<WatchStream> {
+            panic!("with a non-zero head revision the loop must use watch_since, not from-now");
+        }
+
+        async fn watch_since(
+            &self,
+            _prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<WatchStream> {
+            self.since_revs.lock().unwrap().push(revision);
+            let s = futures::stream::iter(Vec::new()).chain(futures::stream::pending::<
+                Result<WatchEvent, rusternetes_common::Error>,
+            >());
+            Ok(Box::pin(s))
+        }
+
+        async fn head_revision(&self) -> i64 {
+            100
+        }
+    }
+
+    // The FIRST checked subscriber of a prefix defines the ring floor (its
+    // list RV) and the backend replay starts from rv+1 — an on-demand prefix
+    // (fresh namespace) must serve its very first watch instead of 410ing it
+    // just because the GLOBAL head is newer. Later subscribers below the floor
+    // get Err(floor) → 410 → relist.
+    #[tokio::test]
+    async fn subscribe_from_checked_gates_on_ring_floor() {
+        let source = Arc::new(FloorSource {
+            since_revs: std::sync::Mutex::new(Vec::new()),
+        });
+        let cache = WatchCache::from_source(source.clone());
+
+        // First subscriber at RV 50 (global head is 100): must be SERVED —
+        // the watcher is created with floor 50.
+        assert!(
+            cache
+                .subscribe_from_checked("/registry/pods/", 50)
+                .await
+                .is_ok(),
+            "first watch of an on-demand prefix must be served from its own RV"
+        );
+
+        // The shared loop connected via watch_since(first_rv + 1), filling the
+        // ring from exactly where the first client needs it.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if source.since_revs.lock().unwrap().first() == Some(&51) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("shared loop must start from watch_since(first_rv+1)");
+
+        // A LATER subscriber below the established floor must 410-relist.
+        let err = cache
+            .subscribe_from_checked("/registry/pods/", 30)
+            .await
+            .expect_err("RV below the ring floor must 410, not silently under-replay");
+        assert_eq!(err, 50);
+
+        // At/above the floor → served.
+        assert!(cache
+            .subscribe_from_checked("/registry/pods/", 50)
+            .await
+            .is_ok());
+    }
+
+    // Regression (#1165 wedge): a broadcast subscriber that lags must be
+    // TERMINATED with a Gone error (→ handler sends a 410 ERROR event, client
+    // relists), never silently skipped past — a silently dropped MODIFIED
+    // leaves long-lived informers (KCM deployment ReadyReplicas, endpointslice
+    // readiness, quota usage) permanently stale.
+    #[tokio::test]
+    async fn lagged_subscriber_terminates_with_gone() {
+        let (tx, rx) = broadcast::channel::<CachedWatchEvent>(2);
+        // Overflow the 2-slot ring before the stream consumes anything.
+        for rev in 1..=5 {
+            let val = Arc::new(format!(
+                "{{\"metadata\":{{\"name\":\"k{rev}\",\"resourceVersion\":\"{rev}\"}}}}"
+            ));
+            tx.send(CachedWatchEvent {
+                revision: rev,
+                event: WatchEventData::Added(format!("/registry/secrets/ns/k{rev}"), val),
+            })
+            .unwrap();
+        }
+
+        let mut stream = broadcast_to_stream(rx);
+        let mut yielded = Vec::new();
+        let mut got_gone = false;
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("stream must not hang after lag")
+        {
+            match item {
+                Ok(ev) => yielded.push(ev),
+                Err(rusternetes_common::Error::Gone(msg)) => {
+                    assert!(
+                        msg.contains("lagged"),
+                        "Gone error should describe the lag, got: {msg}"
+                    );
+                    got_gone = true;
+                }
+                Err(other) => panic!("unexpected error type: {other}"),
+            }
+        }
+        assert!(
+            got_gone,
+            "lagged subscriber MUST receive Error::Gone before the stream ends (got {} events, then clean end)",
+            yielded.len()
+        );
+    }
 
     fn added(rev: i64) -> Result<WatchEvent, rusternetes_common::Error> {
         // The loop parses the RV out of the JSON via extract_rv, so the value
@@ -490,6 +821,10 @@ mod tests {
                 >());
                 Ok(Box::pin(s))
             }
+        }
+
+        async fn head_revision(&self) -> i64 {
+            0 // from-now first connect, like the memory backend
         }
 
         async fn watch_since(
