@@ -111,10 +111,11 @@ ${COMPOSE} up -d ${UP_BUILD_FLAG}
 
 echo "[3/7] Waiting for kubelet to come up (max 60s)..."
 for i in $(seq 1 60); do
-    # Single HTTP server on :10250 serves both /healthz and /metrics —
+    # Single HTTPS server on :10250 serves both /healthz and /metrics —
     # see compose.node-conformance.yml kubelet block for the rationale.
-    if curl -sfk "http://localhost:10250/healthz" >/dev/null 2>&1 \
-        || curl -sfk "http://localhost:10250/metrics" >/dev/null 2>&1; then
+    # HTTPS-only since #1644/#1645 (self-signed serving cert, -k skips verification).
+    if curl -sfk "https://localhost:10250/healthz" >/dev/null 2>&1 \
+        || curl -sfk "https://localhost:10250/metrics" >/dev/null 2>&1; then
         echo "kubelet is up"
         break
     fi
