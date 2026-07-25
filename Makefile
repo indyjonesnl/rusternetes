@@ -33,6 +33,10 @@ build: ## Build all Rust binaries in release mode
 	@echo "$(GREEN)Building all binaries...$(NC)"
 	cargo build --release
 
+build-fast: ## Fast build for iteration/test-images (release-fast: 16 codegen units, no LTO). Args: ARGS="-p <crate> --bin <bin> --features <f>"
+	@echo "$(GREEN)Building (release-fast: codegen-units=16, lto=off) $(ARGS)...$(NC)"
+	cargo build --profile release-fast $(ARGS)
+
 build-dev: ## Build all Rust binaries in debug mode
 	@echo "$(GREEN)Building all binaries (debug mode)...$(NC)"
 	cargo build
