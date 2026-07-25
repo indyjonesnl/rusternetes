@@ -12464,7 +12464,12 @@ impl ProtoRegistry {
                         ),
                     ),
                     (
-                        2,
+                        // Upstream flowcontrol/v1 generated.proto: field 6,
+                        // NOT sequential. Decoding at 2 dropped every
+                        // nonResourceURL a protobuf client sent, so validation
+                        // rejected the e2e FlowSchema template with
+                        // "nonResourceURLs must contain at least one value".
+                        6,
                         (
                             "nonResourceURLs".into(),
                             FieldType::Repeated(Box::new(FieldType::String)),
@@ -12555,9 +12560,8 @@ impl ProtoRegistry {
             },
         );
         // Upstream LimitedPriorityLevelConfiguration proto:
-        //   1=nominalConcurrencyShares, 2=limitResponse, 3=lendingLimit,
-        //   4=borrowingLimitPercent. Our resource struct names the lending
-        //   field `lendingConcurrencyLimit`, so field 3 maps to that JSON key.
+        //   1=nominalConcurrencyShares, 2=limitResponse, 3=lendablePercent,
+        //   4=borrowingLimitPercent (flowcontrol/v1 generated.proto).
         schemas.insert(
             "LimitedPriorityLevelConfiguration".into(),
             MessageSchema {
@@ -12570,7 +12574,7 @@ impl ProtoRegistry {
                             FieldType::Message("LimitResponse".into()),
                         ),
                     ),
-                    (3, ("lendingConcurrencyLimit".into(), FieldType::Int)),
+                    (3, ("lendablePercent".into(), FieldType::Int)),
                     (4, ("borrowingLimitPercent".into(), FieldType::Int)),
                 ]),
             },
@@ -12580,7 +12584,7 @@ impl ProtoRegistry {
             MessageSchema {
                 fields: HashMap::from([
                     (1, ("nominalConcurrencyShares".into(), FieldType::Int)),
-                    (2, ("lendingConcurrencyLimit".into(), FieldType::Int)),
+                    (2, ("lendablePercent".into(), FieldType::Int)),
                 ]),
             },
         );
