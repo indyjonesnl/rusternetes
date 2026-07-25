@@ -292,6 +292,13 @@ pub struct NodeFeatures {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeRuntimeHandler {
+    /// Runtime handler name. Optional on decode: upstream types it
+    /// `protobuf:",opt,name=name"`, so the CRI's default handler is reported
+    /// with an empty/absent name (protobuf omits the zero value, Go decodes it
+    /// to `""`). Without `#[serde(default)]` serde errors "missing field
+    /// `name`", which rejected the kubelet's entire Node registration POST and
+    /// stopped every node registering against a swapped api-server (#1666).
+    #[serde(default)]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub features: Option<NodeRuntimeHandlerFeatures>,
