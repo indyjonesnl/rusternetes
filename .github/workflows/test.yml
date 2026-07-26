@@ -12,6 +12,29 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Drop debuginfo entirely in CI. `[profile.dev] debug = "line-tables-only"`
+  # (workspace Cargo.toml) is already a 5-10x cut over full DWARF, but this
+  # workspace links ~500 test binaries (api-server alone has 206 test files,
+  # each a separate binary statically linking the whole graph), so even
+  # line-tables ends up at 69 GiB of target/ — 65.5 GiB of it test binaries.
+  # The arc-runner-set node has ~85 GiB allocatable and kubelet holds back a
+  # ~14.5 GiB nodefs eviction threshold, leaving a real ceiling near 65 GiB,
+  # so builds were evicted mid-nextest ("low on resource: ephemeral-storage
+  # ... Container runner was using 69066692Ki"), surfacing as an opaque
+  # exit-130 cancel with the runner's logs never uploaded.
+  #
+  # Measured on this workspace: 69G -> 29G target/ (test binaries 65.5 ->
+  # 26.9 GiB), which puts a full run at well under half the ceiling.
+  #
+  # Set at workflow level, NOT per-step, on purpose: clippy and nextest must
+  # agree on the profile. If they disagreed, cargo would rebuild the whole
+  # graph for the second step and keep BOTH artifact sets on disk — the very
+  # thing we are avoiding.
+  #
+  # Trade-off: CI panic backtraces keep symbol names but lose file:line. To
+  # get lines back when diagnosing a CI-only failure, temporarily set this to
+  # `line-tables-only`, or reproduce locally where the profile still applies.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 # ONE job on the self-hosted ARC `arc-runner-set` scale set (large tier,
 # ~8 GiB), which ships the Rust toolchain (clippy + rustfmt), cargo-nextest,

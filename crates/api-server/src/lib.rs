@@ -246,6 +246,11 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     // container recreates / IP changes (upstream EndpointReconciler, #1188).
     bootstrap::spawn_endpoint_reconciler(storage.clone(), api_port);
 
+    // Aggregation layer: probe aggregated APIService backends and set their
+    // Available condition (upstream kube-aggregator availability controller,
+    // which lives in the apiserver — not KCM).
+    bootstrap::spawn_apiservice_availability_controller(storage.clone());
+
     // Create default ServiceCIDR
     {
         let cidr_key = rusternetes_storage::build_key("servicecidrs", None, "kubernetes");
