@@ -742,10 +742,11 @@ impl<S: Storage + 'static> NamespaceController<S> {
         // and must keep the namespace Terminating until they clear them
         // (upstream pkg/controller/namespace/deletion).
         //
-        // PERSIST the finalizer removal via `update` (the finalize path) — do
-        // NOT call `delete`. The api-server's namespace DELETE is a no-op that
-        // only sets Terminating; the actual storage removal happens on the
-        // update/finalize path once the finalizer slice drains while the
+        // Persist the finalizer removal through the `/finalize` subresource —
+        // do NOT call a normal update. The api-server preserves
+        // `spec.finalizers` on ordinary namespace PUTs, and namespace DELETE is
+        // a no-op that only sets Terminating. Actual storage removal happens on
+        // the finalize path once the finalizer slice drains while the
         // namespace is Terminating (mirrors upstream
         // `ShouldDeleteNamespaceDuringUpdate`). Calling `delete` here returned a
         // false `Ok` and left the namespace stuck Terminating, looping forever
@@ -755,12 +756,16 @@ impl<S: Storage + 'static> NamespaceController<S> {
         let key = build_key("namespaces", None, name);
         let mut ns: Namespace = self.storage.get(&key).await?;
 
-        if let Some(ref mut fins) = ns.metadata.finalizers {
+        if let Some(ref mut fins) = ns.spec.as_mut().and_then(|spec| spec.finalizers.as_mut()) {
             fins.retain(|f| f != "kubernetes");
         }
-        let drained = ns.metadata.finalizers.as_ref().is_none_or(|f| f.is_empty());
+        let drained = ns
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.finalizers.as_ref())
+            .is_none_or(|f| f.is_empty());
 
-        match self.storage.update(&key, &ns).await {
+        match self.storage.update_subresource(&key, "finalize", &ns).await {
             Ok(_) => info!(
                 "Namespace {} finalized (kubernetes finalizer cleared)",
                 name
@@ -986,7 +991,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
         Ok(total)
     }
 
-    /// Remove finalizers from a namespace
+    /// Remove lifecycle finalizers from a namespace through `/finalize`.
     #[allow(dead_code)]
     async fn remove_namespace_finalizers(&self, name: &str) -> Result<()> {
         let key = build_key("namespaces", None, name);
@@ -995,10 +1000,14 @@ impl<S: Storage + 'static> NamespaceController<S> {
         let mut namespace: Namespace = self.storage.get(&key).await?;
 
         // Remove all finalizers
-        namespace.metadata.finalizers = None;
+        namespace
+            .spec
+            .get_or_insert_with(Default::default)
+            .finalizers = None;
 
-        // Update namespace
-        self.storage.update(&key, &namespace).await?;
+        self.storage
+            .update_subresource(&key, "finalize", &namespace)
+            .await?;
 
         Ok(())
     }
@@ -1008,6 +1017,13 @@ impl<S: Storage + 'static> NamespaceController<S> {
 mod tests {
     use super::*;
     use rusternetes_storage::memory::MemoryStorage;
+
+    fn set_namespace_finalizers(namespace: &mut Namespace, finalizers: Vec<String>) {
+        namespace
+            .spec
+            .get_or_insert_with(Default::default)
+            .finalizers = Some(finalizers);
+    }
 
     #[test]
     fn test_namespace_resource_types() {
@@ -1201,7 +1217,7 @@ mod tests {
         // A namespace marked for deletion, with the kubernetes finalizer.
         let mut ns = Namespace::new("term-ns");
         ns.metadata.deletion_timestamp = Some(Utc::now());
-        ns.metadata.finalizers = Some(vec!["kubernetes".to_string()]);
+        set_namespace_finalizers(&mut ns, vec!["kubernetes".to_string()]);
         ns.status = Some(NamespaceStatus {
             phase: Some(Phase::Terminating),
             conditions: None,
@@ -1236,9 +1252,9 @@ mod tests {
         for _ in 0..50 {
             if let Ok(cur) = storage.get::<Namespace>(&key).await {
                 let empty = cur
-                    .metadata
-                    .finalizers
+                    .spec
                     .as_ref()
+                    .and_then(|spec| spec.finalizers.as_ref())
                     .is_none_or(|f| !f.iter().any(|x| x == "kubernetes"));
                 if empty {
                     drained = true;
@@ -1270,7 +1286,7 @@ mod tests {
         // Create a namespace marked for deletion with kubernetes finalizer
         let mut ns = Namespace::new("test-ns");
         ns.metadata.deletion_timestamp = Some(Utc::now());
-        ns.metadata.finalizers = Some(vec!["kubernetes".to_string()]);
+        set_namespace_finalizers(&mut ns, vec!["kubernetes".to_string()]);
         ns.status = Some(NamespaceStatus {
             phase: Some(Phase::Terminating),
             conditions: None,
@@ -1315,7 +1331,7 @@ mod tests {
         // Create a namespace marked for deletion
         let mut ns = Namespace::new("test-ns-resources");
         ns.metadata.deletion_timestamp = Some(Utc::now());
-        ns.metadata.finalizers = Some(vec!["kubernetes".to_string()]);
+        set_namespace_finalizers(&mut ns, vec!["kubernetes".to_string()]);
         ns.status = Some(NamespaceStatus {
             phase: Some(Phase::Terminating),
             conditions: None,
@@ -1375,7 +1391,7 @@ mod tests {
         // Create a namespace marked for deletion
         let mut ns = Namespace::new(ns_name);
         ns.metadata.deletion_timestamp = Some(Utc::now());
-        ns.metadata.finalizers = Some(vec!["kubernetes".to_string()]);
+        set_namespace_finalizers(&mut ns, vec!["kubernetes".to_string()]);
         ns.status = Some(NamespaceStatus {
             phase: Some(Phase::Terminating),
             conditions: None,

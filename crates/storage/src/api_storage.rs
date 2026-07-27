@@ -490,6 +490,16 @@ impl Storage for ApiStorage {
         serde_json::from_value(updated).map_err(Error::Serialization)
     }
 
+    async fn update_subresource<T>(&self, key: &str, subresource: &str, value: &T) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        let path = format!("{}/{}", self.object_path(key).await?, subresource);
+        let body = serde_json::to_value(value).map_err(Error::Serialization)?;
+        let updated: Value = self.client.put(&path, &body).await.map_err(map_write_err)?;
+        serde_json::from_value(updated).map_err(Error::Serialization)
+    }
+
     async fn update_status<T>(&self, key: &str, value: &T) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
@@ -1104,6 +1114,46 @@ mod tests {
         assert!(
             req.contains("\"expirationSeconds\":3600"),
             "request body must carry expirationSeconds, got: {req}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_subresource_puts_namespace_finalize_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let capture = captured.clone();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let request = read_request(&mut stream).await;
+                *capture.lock().await = request;
+                let body = r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"conformance"},"spec":{"finalizers":[]}}"#;
+                respond(&mut stream, "200 OK", body).await;
+            }
+        });
+
+        let client = Arc::new(ApiClient::new(&format!("http://{addr}"), true, None).unwrap());
+        let storage = ApiStorage::new(client);
+        let namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "conformance"},
+            "spec": {"finalizers": []}
+        });
+
+        let updated: Value = storage
+            .update_subresource("/registry/namespaces/conformance", "finalize", &namespace)
+            .await
+            .expect("namespace finalize update should succeed");
+        assert_eq!(updated["metadata"]["name"], "conformance");
+
+        let request = captured.lock().await;
+        let request_line = request.lines().next().unwrap_or("");
+        assert!(
+            request_line.starts_with("PUT ")
+                && request_line.contains("/api/v1/namespaces/conformance/finalize"),
+            "namespace finalization must target /finalize, got: {request_line}"
         );
     }
 }

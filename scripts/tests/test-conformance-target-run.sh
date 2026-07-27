@@ -60,8 +60,14 @@ case "$mode" in
 <testsuite><testcase name="x" status="passed"></testcase><testcase name="y" status="failed"></testcase></testsuite>
 J
   ;;
-  empty) cat > "$out/junit_01.xml" <<'J'
-<testsuite></testsuite>
+  empty) echo "Will run 0 of 7348 specs"
+         cat > "$out/junit_01.xml" <<'J'
+<testsuite>
+  <testcase name="SynchronizedBeforeSuite" status="passed"></testcase>
+  <testcase name="BeforeSuite" status="passed"></testcase>
+  <testcase name="AfterSuite" status="passed"></testcase>
+  <testcase name="skipped-spec" status="skipped"></testcase>
+</testsuite>
 J
   ;;
   nojunit) : ;;  # produce nothing
@@ -70,7 +76,9 @@ exit 0
 EOF
 chmod +x "$FAKE"
 
-run_cli() { GITHUB_OUTPUT="$TMP/gho.$$" ; : > "$GITHUB_OUTPUT"; GITHUB_OUTPUT="$GITHUB_OUTPUT" bash "$RUNNER" "$@"; }
+GITHUB_OUTPUT="$TMP/github-output"
+export GITHUB_OUTPUT
+run_cli() { : > "$GITHUB_OUTPUT"; bash "$RUNNER" "$@"; }
 gho() { grep -E "^$1=" "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-; }
 
 # missing --target => exit 2
@@ -100,10 +108,12 @@ FAKE_MODE=pass run_cli --target sysctls --kubeconfig "$KC" --hydrophone "$FAKE" 
 FAKE_MODE=pass run_cli --target sig-node --focus 'x' --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/o2" >/dev/null 2>&1
 [ "$(gho focused)" = "1" ] && ok "--focus sets focused=1" || bad "--focus focused=$(gho focused)"
 
-# no tests matched (empty junit) => exit 0, passed=0 total=0, "no tests matched" message
+# no tests matched => exit 1, passed=0 total=0, "no tests matched" message
+set +e
 out=$(FAKE_MODE=empty run_cli --target sig-node --focus 'zzz' --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/o3" 2>&1); rc=$?
-[ "$rc" -eq 0 ] && echo "$out" | grep -qi "no tests matched" && [ "$(gho passed)" = "0" ] && [ "$(gho total)" = "0" ] \
-  && ok "empty focus => exit 0 + 'no tests matched' + passed/total 0" \
+set -e
+[ "$rc" -eq 1 ] && echo "$out" | grep -qi "no tests matched" && [ "$(gho passed)" = "0" ] && [ "$(gho total)" = "0" ] \
+  && ok "empty focus => exit 1 + 'no tests matched' + passed/total 0" \
   || bad "empty focus rc=$rc msg/counts wrong (passed=$(gho passed) total=$(gho total))"
 
 # no junit (infra fail) => exit 1

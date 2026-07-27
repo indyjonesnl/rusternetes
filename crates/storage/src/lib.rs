@@ -52,6 +52,18 @@ pub trait Storage: Send + Sync {
     where
         T: Serialize + DeserializeOwned + Send + Sync;
 
+    /// Update a resource through a named API subresource.
+    ///
+    /// Direct storage backends have no HTTP subresources, so their default
+    /// behavior is the same as [`Storage::update`]. API-backed implementations
+    /// override this to target paths such as `/status` or `/finalize`.
+    async fn update_subresource<T>(&self, key: &str, _subresource: &str, value: &T) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        self.update(key, value).await
+    }
+
     /// Atomically update ONLY the `.status` subobject of the stored resource,
     /// preserving the currently-stored spec and metadata.
     ///
@@ -327,6 +339,13 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
         T: Serialize + DeserializeOwned + Send + Sync,
     {
         (**self).update(key, value).await
+    }
+
+    async fn update_subresource<T>(&self, key: &str, subresource: &str, value: &T) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        (**self).update_subresource(key, subresource, value).await
     }
 
     // Must forward (not inherit the trait default), or the inner type's
@@ -662,6 +681,30 @@ impl Storage for StorageBackend {
             StorageBackend::Memory(s) => Storage::update(s.as_ref(), key, value).await,
             #[cfg(feature = "api-client")]
             StorageBackend::Api(s) => Storage::update(s, key, value).await,
+        }
+    }
+
+    async fn update_subresource<T>(&self, key: &str, subresource: &str, value: &T) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        match self {
+            StorageBackend::Etcd(s) => {
+                Storage::update_subresource(s, key, subresource, value).await
+            }
+            #[cfg(feature = "sqlite")]
+            StorageBackend::Sqlite(s) => {
+                Storage::update_subresource(s, key, subresource, value).await
+            }
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => {
+                Storage::update_subresource(s, key, subresource, value).await
+            }
+            StorageBackend::Memory(s) => {
+                Storage::update_subresource(s.as_ref(), key, subresource, value).await
+            }
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::update_subresource(s, key, subresource, value).await,
         }
     }
 
