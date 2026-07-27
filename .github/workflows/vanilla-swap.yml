@@ -66,10 +66,16 @@ jobs:
             chmod +x "$bin/kubectl"
           fi
           if ! command -v hydrophone >/dev/null 2>&1; then
-            if ! go install sigs.k8s.io/hydrophone@latest; then
-              echo "hydrophone install failed"; exit 1
-            fi
-            cp "$(go env GOPATH)/bin/hydrophone" "$bin/"
+            # The ARC runner image intentionally has no Go toolchain. Use the
+            # upstream release artifact, as the other conformance harnesses do,
+            # so this step remains download-only and does not depend on sudo.
+            hydrophone_version="v0.7.0"
+            hydrophone_archive="$bin/hydrophone.tar.gz"
+            curl -fsSLo "$hydrophone_archive" \
+              "https://github.com/kubernetes-sigs/hydrophone/releases/download/${hydrophone_version}/hydrophone_Linux_x86_64.tar.gz"
+            tar -xzf "$hydrophone_archive" -C "$bin" hydrophone
+            rm -f "$hydrophone_archive"
+            chmod +x "$bin/hydrophone"
           fi
           kind version || true
           kubectl version --client || true
