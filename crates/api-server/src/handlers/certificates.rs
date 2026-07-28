@@ -1,7 +1,9 @@
+use crate::patch::{apply_patch, PatchType};
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Extension, Json,
 };
@@ -369,6 +371,111 @@ pub async fn approve_certificate_signing_request(
     DumpingJson(csr): DumpingJson<CertificateSigningRequest>,
 ) -> Result<Json<CertificateSigningRequest>> {
     update_csr_status_inner(state, auth_ctx, name, csr, true).await
+}
+
+/// Shared body for the `/status` and `/approval` subresource PATCH endpoints.
+///
+/// Unlike the generic cluster PATCH handler (which replaces the object wholesale
+/// via a full-object round-trip), this:
+///   * applies the patch document as a genuine merge/JSON patch **onto the
+///     stored object**, so a partial `status` patch (e.g. one that only sets
+///     `status.certificate`) preserves conditions an earlier `/approval` write
+///     added — a full-object replace would drop the Approved condition and trip
+///     `ValidateCertificateSigningRequestStatusUpdate`'s "updates may not remove
+///     a condition of type \"Approved\"" rule;
+///   * never mutates `spec` (subresource writes may not change spec — it is
+///     restored from the stored object); and
+///   * runs the subresource-specific update validator (`…ApprovalUpdate` vs
+///     `…StatusUpdate`) so only the `/approval` path may add Approved/Denied
+///     conditions and only the `/status` path may set the certificate.
+///
+/// Mirrors upstream's subresource PATCH handling, which decodes the patch into
+/// the versioned object, then routes through the subresource's update strategy.
+async fn patch_csr_subresource_inner(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+    approval: bool,
+) -> Result<Json<CertificateSigningRequest>> {
+    let subresource = if approval {
+        "certificatesigningrequests/approval"
+    } else {
+        "certificatesigningrequests/status"
+    };
+    info!("Patching CertificateSigningRequest {subresource}: {name}");
+
+    let attrs = RequestAttributes::new(auth_ctx.user, "patch", subresource)
+        .with_api_group("certificates.k8s.io")
+        .with_name(&name);
+
+    match state.authorizer.authorize(&attrs).await? {
+        Decision::Allow => {}
+        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
+    }
+
+    // Resolve the patch type. `normalize_content_type_middleware` rewrites the
+    // request content-type to `application/json` and stashes the original in
+    // `x-original-content-type`, so consult that first.
+    let content_type = headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get("content-type"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/merge-patch+json");
+    let patch_type = PatchType::from_content_type(content_type)
+        .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
+
+    let key = build_key("certificatesigningrequests", None, &name);
+    let old_csr: CertificateSigningRequest = state.storage.get(&key).await?;
+
+    let current_json = serde_json::to_value(&old_csr)
+        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+    let patch_json: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| rusternetes_common::Error::InvalidResource(format!("Invalid patch: {e}")))?;
+    let patched_json = apply_patch(&current_json, &patch_json, patch_type)
+        .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
+
+    let mut new_csr: CertificateSigningRequest = serde_json::from_value(patched_json)
+        .map_err(|e| rusternetes_common::Error::InvalidResource(format!("Invalid result: {e}")))?;
+
+    // Subresource writes never mutate spec or the object identity.
+    new_csr.spec = old_csr.spec.clone();
+    new_csr.metadata.name = name.clone();
+
+    let errs = if approval {
+        rusternetes_common::validation::certificatesigningrequest::validate_certificate_signing_request_approval_update(&new_csr, &old_csr)
+    } else {
+        rusternetes_common::validation::certificatesigningrequest::validate_certificate_signing_request_status_update(&new_csr, &old_csr)
+    };
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
+    let result = state.storage.update(&key, &new_csr).await?;
+    Ok(Json(result))
+}
+
+/// PATCH `…/certificatesigningrequests/{name}/status`.
+pub async fn patch_certificate_signing_request_status(
+    state: State<Arc<ApiServerState>>,
+    auth_ctx: Extension<AuthContext>,
+    name: Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<CertificateSigningRequest>> {
+    patch_csr_subresource_inner(state, auth_ctx, name, headers, body, false).await
+}
+
+/// PATCH `…/certificatesigningrequests/{name}/approval`.
+pub async fn patch_certificate_signing_request_approval(
+    state: State<Arc<ApiServerState>>,
+    auth_ctx: Extension<AuthContext>,
+    name: Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<CertificateSigningRequest>> {
+    patch_csr_subresource_inner(state, auth_ctx, name, headers, body, true).await
 }
 
 crate::patch_handler_cluster!(
