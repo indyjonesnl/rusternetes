@@ -8,7 +8,7 @@ name: conformance-downward-api
 # All logic lives in the reusable .github/workflows/conformance-target.yml engine.
 on:
   schedule:
-    - cron: '6 2 * * *'
+    - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
       focus:
