@@ -10,7 +10,7 @@ use rusternetes_storage::{Storage, WatchEvent, WatchStream};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// The minimal storage surface the shared per-prefix watch loop needs.
 ///
@@ -42,6 +42,14 @@ pub(crate) trait WatchSource: Send + Sync + 'static {
     /// so a client watch from an older resourceVersion must 410-relist rather
     /// than risk silently missing events.
     async fn head_revision(&self) -> i64;
+
+    /// Whether `revision` is no longer available in the backend's history.
+    /// A compacted resume point can never become valid again (compaction only
+    /// moves forward), so the shared loop must re-base instead of retrying it
+    /// (#1687). Defaults to "available" for test sources that don't compact.
+    async fn is_revision_compacted(&self, _revision: i64) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -60,6 +68,14 @@ impl WatchSource for StorageBackend {
 
     async fn head_revision(&self) -> i64 {
         self.current_revision().await.unwrap_or(0)
+    }
+
+    async fn is_revision_compacted(&self, revision: i64) -> bool {
+        // A probe failure must not be read as "compacted" — that would throw
+        // away replay history the backend still has.
+        Storage::is_revision_compacted(self, revision)
+            .await
+            .unwrap_or(false)
     }
 }
 
@@ -253,6 +269,27 @@ impl WatchCache {
                 let connect = match pending_connect.take() {
                     Some(c) => c,
                     None => match resume_rev {
+                        // A resume point the backend has compacted away can
+                        // never be served: rhino/etcd cancels the watch, the
+                        // stream ends with no events, and retrying the same
+                        // revision reconnects into the same cancellation
+                        // forever — the prefix goes permanently deaf (#1687).
+                        // Idle prefixes (CSRs, namespaces, resourcequotas) are
+                        // the ones that fall below the compaction floor.
+                        // Re-base onto the current tail instead; the history in
+                        // the gap is genuinely gone, and subscribers past the
+                        // ring floor already 410-relist
+                        // (`subscribe_from_checked`), which is upstream's
+                        // "too old resource version" contract.
+                        Some(rev) if storage.is_revision_compacted(rev + 1).await => {
+                            warn!(
+                                "WatchCache: {} resume revision {} is compacted — re-basing to the current tail; history in the gap is unrecoverable",
+                                prefix_owned,
+                                rev + 1
+                            );
+                            resume_rev = None;
+                            storage.watch_from_now(&prefix_owned).await
+                        }
                         Some(rev) => storage.watch_since(&prefix_owned, rev + 1).await,
                         None => storage.watch_from_now(&prefix_owned).await,
                     },
@@ -788,6 +825,80 @@ mod tests {
             format!("/registry/secrets/ns/k{rev}"),
             json,
         ))
+    }
+
+    /// A watch source that models what rhino/etcd does once the resume
+    /// revision has been COMPACTED: the watch is cancelled server-side, so the
+    /// stream ends immediately having delivered nothing. `watch_from_now` still
+    /// works and tails live events.
+    ///
+    /// Retrying the compacted revision can never succeed — compaction only
+    /// moves forward — so a loop that keeps resuming from it leaves the prefix
+    /// permanently deaf (#1687).
+    struct CompactedResumeSource {
+        since_calls: AtomicUsize,
+        from_now_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl WatchSource for CompactedResumeSource {
+        async fn watch_from_now(&self, _prefix: &str) -> rusternetes_common::Result<WatchStream> {
+            self.from_now_calls.fetch_add(1, Ordering::SeqCst);
+            // Re-based stream: a live event arrives and the stream stays open.
+            let s = futures::stream::iter(vec![added(101)]).chain(futures::stream::pending::<
+                Result<WatchEvent, rusternetes_common::Error>,
+            >());
+            Ok(Box::pin(s))
+        }
+
+        async fn watch_since(
+            &self,
+            _prefix: &str,
+            _revision: i64,
+        ) -> rusternetes_common::Result<WatchStream> {
+            self.since_calls.fetch_add(1, Ordering::SeqCst);
+            // Cancelled by the backend: ends at once, no events, no error.
+            let s = futures::stream::iter(Vec::new());
+            Ok(Box::pin(s))
+        }
+
+        async fn head_revision(&self) -> i64 {
+            100
+        }
+
+        async fn is_revision_compacted(&self, _revision: i64) -> bool {
+            true
+        }
+    }
+
+    /// Regression for #1687: when the resume revision has been compacted, the
+    /// shared prefix loop must re-base onto `watch_from_now` instead of
+    /// retrying the dead revision forever. Idle prefixes (CSRs, namespaces,
+    /// resourcequotas) fall below rhino's compaction floor and went
+    /// permanently deaf — no live event reached any subscriber, which is what
+    /// timed out the CSR API-operations conformance watch step.
+    #[tokio::test]
+    async fn compacted_resume_revision_rebases_instead_of_wedging() {
+        let source = Arc::new(CompactedResumeSource {
+            since_calls: AtomicUsize::new(0),
+            from_now_calls: AtomicUsize::new(0),
+        });
+        let cache = WatchCache::from_source(source.clone());
+
+        let mut rx = cache
+            .subscribe("/registry/certificatesigningrequests/")
+            .await;
+
+        // The live event that only a re-based stream can deliver.
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("compacted resume must re-base, not wedge retrying the dead revision")
+            .expect("subscriber must receive the live event");
+        assert_eq!(got.revision, 101);
+        assert!(
+            source.from_now_calls.load(Ordering::SeqCst) >= 1,
+            "loop must reconnect via watch_from_now once the resume revision is compacted"
+        );
     }
 
     /// A watch source that models a storage connection that drops after the
