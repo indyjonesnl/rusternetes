@@ -169,6 +169,11 @@ services:
       - CNI_CONF_FROM_NODE_IPAM=1
     volumes:
       - containerd-run:/run/containerd
+      # The node-network agent runs in kube-proxy, which shares this runtime's
+      # NETWORK namespace but not its MOUNT namespace — so the conflist it writes
+      # must land on a volume both containers see, or containerd never sees a CNI
+      # config at all and every pod stays in ContainerCreating.
+      - cni-conf:/etc/cni/net.d
       # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
       # filesystem, not the container's own overlay rootfs — nested overlay
       # mounts fail with "invalid argument". A named volume is host-fs-backed.
@@ -195,6 +200,8 @@ services:
       - CNI_CONF_FROM_NODE_IPAM=1
     volumes:
       - containerd-run2:/run/containerd
+      # Shared with kube-proxy2 — see the note on node-1's runtime.
+      - cni-conf2:/etc/cni/net.d
       # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
       # filesystem, not the container's own overlay rootfs — nested overlay
       # mounts fail with "invalid argument". A named volume is host-fs-backed.
@@ -253,6 +260,11 @@ services:
       - RUST_MIN_STACK=8388608
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+      # The runtime's CRI streaming server (exec/attach) is reachable on
+      # loopback now that the kubelet shares its netns. The default DNS name
+      # `containerd` would send node-2's exec tokens to node-1's runtime, which
+      # answers "404 page not found" (crates/cri/src/stream.rs stream_target).
+      - CONTAINERD_STREAM_HOST=localhost
     command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests"]
 
   # Kubelet 2
@@ -287,6 +299,8 @@ services:
       - RUST_MIN_STACK=8388608
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+      # Loopback — see the note on node-1's kubelet.
+      - CONTAINERD_STREAM_HOST=localhost
     command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
 
   # Kube-proxy runs INSIDE the containerd service's network namespace
@@ -321,6 +335,9 @@ services:
       - /lib/modules:/lib/modules:ro
       # kube-proxy.conf (CA-only kubeconfig) for API mode — see generate-certs.sh.
       - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      # Same volume as this node's containerd: the node-network agent writes the
+      # per-node conflist here for the runtime to pick up.
+      - cni-conf:/etc/cni/net.d
     environment:
       - RUST_LOG=info
     command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf", "--configure-node-network", "--pod-cidr", "10.244.0.0/16"]
@@ -352,6 +369,7 @@ services:
       - /lib/modules:/lib/modules:ro
       # kube-proxy.conf (CA-only kubeconfig) for API mode — see generate-certs.sh.
       - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      - cni-conf2:/etc/cni/net.d
     environment:
       - RUST_LOG=info
     command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf", "--configure-node-network", "--pod-cidr", "10.244.0.0/16"]
@@ -391,3 +409,9 @@ volumes:
     name: rusternetes-containerd-run2
   containerd-data2:
     name: rusternetes-containerd-data2
+  # Per-node CNI conf dir, shared between a node's runtime and its kube-proxy
+  # (which writes the conflist from the node's podCIDR).
+  cni-conf:
+    name: rusternetes-cni-conf
+  cni-conf2:
+    name: rusternetes-cni-conf2

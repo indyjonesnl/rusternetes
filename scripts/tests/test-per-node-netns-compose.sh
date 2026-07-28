@@ -154,6 +154,48 @@ test_runtimes_drop_the_fallback_cni_conf() {
         "node-2 runtime waits for the per-node conflist"
 }
 
+# A node's runtime and its kube-proxy must share the CNI conf dir. They share a
+# network namespace, NOT a mount namespace: without a shared volume the agent
+# writes the conflist into kube-proxy's own filesystem, containerd never sees a
+# CNI config, and every pod sits in ContainerCreating. (Exactly what happened on
+# the first live bring-up of this topology.)
+test_runtime_and_proxy_share_cni_conf_dir() {
+    local rt1 kp1 rt2 kp2
+    rt1="$(service_block containerd | awk '$1 == "source:" {print $2}' | grep -c '^cni-conf$' || true)"
+    kp1="$(service_block kube-proxy | awk '$1 == "source:" {print $2}' | grep -c '^cni-conf$' || true)"
+    rt2="$(service_block containerd2 | awk '$1 == "source:" {print $2}' | grep -c '^cni-conf2$' || true)"
+    kp2="$(service_block kube-proxy2 | awk '$1 == "source:" {print $2}' | grep -c '^cni-conf2$' || true)"
+
+    assert_eq "1" "$rt1" "node-1 runtime mounts the shared CNI conf volume"
+    assert_eq "1" "$kp1" "node-1 kube-proxy mounts the same CNI conf volume"
+    assert_eq "1" "$rt2" "node-2 runtime mounts its own CNI conf volume"
+    assert_eq "1" "$kp2" "node-2 kube-proxy mounts the same CNI conf volume"
+
+    # And the two nodes must not share one conf dir, or each agent would
+    # overwrite the other's subnet on every tick.
+    local crossed
+    crossed="$(service_block containerd2 | awk '$1 == "source:" {print $2}' | grep -c '^cni-conf$' || true)"
+    assert_eq "0" "$crossed" "node-2 must not share node-1's CNI conf volume"
+}
+
+# Each kubelet must reach ITS OWN runtime's CRI streaming server. The default
+# host is the DNS name `containerd` (crates/cri/src/stream.rs `stream_target`),
+# which sends node-2's exec/attach tokens to node-1's runtime — that runtime does
+# not know the token and answers Go's "404 page not found", so `kubectl exec`
+# fails on node-2 only. With the runtime co-resident, loopback is correct.
+test_kubelets_stream_to_their_own_runtime() {
+    assert_contains "$(service_block kubelet)" "CONTAINERD_STREAM_HOST" \
+        "node-1 kubelet pins the streaming host"
+    assert_contains "$(service_block kubelet2)" "CONTAINERD_STREAM_HOST" \
+        "node-2 kubelet pins the streaming host"
+
+    local h1 h2
+    h1="$(service_block kubelet | grep -o 'CONTAINERD_STREAM_HOST: .*' | awk '{print $2}')"
+    h2="$(service_block kubelet2 | grep -o 'CONTAINERD_STREAM_HOST: .*' | awk '{print $2}')"
+    assert_eq "localhost" "$h1" "node-1 streams over loopback"
+    assert_eq "localhost" "$h2" "node-2 streams over loopback"
+}
+
 # ----- Runner -----
 
 if ! command -v docker >/dev/null 2>&1; then

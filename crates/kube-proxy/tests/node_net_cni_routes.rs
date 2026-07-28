@@ -221,3 +221,41 @@ fn conflist_write_is_a_noop_when_unchanged() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The bridge plugin must NOT masquerade: its own `ipMasq` rule sits in
+/// POSTROUTING and SNATs anything leaving the node, including a pod on node-1
+/// talking to a pod on node-2 — a `RETURN` in our own chain cannot undo that,
+/// because RETURN just continues POSTROUTING traversal into the bridge's rule.
+///
+/// Verified live: with `ipMasq: true`, `curl .../clientip` across nodes reported
+/// the node IP (172.28.0.4) instead of the pod IP.
+///
+/// kindnetd ref: `cni.go:90` — `"ipMasq": false` in the conflist template; the
+/// agent owns masquerading (`masq.go`).
+#[test]
+fn cni_conflist_leaves_masquerade_to_the_agent() {
+    let parsed: serde_json::Value = serde_json::from_str(&cni_conflist("10.244.1.0/24")).unwrap();
+    assert_eq!(
+        parsed["plugins"][0]["ipMasq"], false,
+        "bridge ipMasq must be off; the node-network agent masquerades instead"
+    );
+}
+
+/// The masq chain must be reached only for non-LOCAL destinations, so traffic to
+/// the node's own addresses is never SNAT'd.
+///
+/// kindnetd ref: `masq.go:113` — POSTROUTING gets
+/// `-m addrtype ! --dst-type LOCAL -j KIND-MASQ-AGENT`.
+#[test]
+fn masq_chain_is_hooked_for_non_local_destinations_only() {
+    let args = rusternetes_kube_proxy::node_net::postrouting_hook_args();
+    let joined = args.join(" ");
+    assert!(
+        joined.contains("addrtype") && joined.contains("! --dst-type LOCAL"),
+        "hook must exclude LOCAL destinations: {joined}"
+    );
+    assert!(
+        joined.contains(rusternetes_kube_proxy::node_net::MASQ_CHAIN),
+        "hook must jump to the masq chain: {joined}"
+    );
+}

@@ -44,9 +44,12 @@ pub struct Route {
 ///
 /// Keeps the plugin chain of the committed `deploy/containerd/cni` config
 /// (bridge → portmap → firewall); only the IPAM range is per-node. The bridge
-/// stays `isGateway` (pods route through it) and `ipMasq` stays on so pod egress
-/// to the outside world still works — cluster-internal traffic is exempted by
-/// [`no_masq_rules`] instead.
+/// stays `isGateway` (pods route through it) but `ipMasq` is **off**: its
+/// masquerade rule would SNAT cross-node pod traffic before our own chain could
+/// spare it (a RETURN only continues POSTROUTING traversal). Masquerading is the
+/// agent's job — see [`no_masq_rules`] and [`postrouting_hook_args`].
+///
+/// kindnetd ref: `cni.go:90` — `"ipMasq": false`.
 pub fn cni_conflist(pod_cidr: &str) -> String {
     format!(
         r#"{{
@@ -57,7 +60,7 @@ pub fn cni_conflist(pod_cidr: &str) -> String {
       "type": "bridge",
       "bridge": "cni0",
       "isGateway": true,
-      "ipMasq": true,
+      "ipMasq": false,
       "hairpinMode": true,
       "ipam": {{
         "type": "host-local",
@@ -244,19 +247,43 @@ fn sync_masq_chain(cfg: &NodeNetConfig) {
         }
     }
 
-    // Hook it into POSTROUTING once, ahead of the bridge plugin's own ipMasq
-    // rule (which would otherwise masquerade cross-node pod traffic first).
-    // kindnetd ref: portmap/kindnet both prepend for this reason.
+    // Hook the chain into POSTROUTING for non-LOCAL destinations only, so
+    // traffic to the node's own addresses is never SNAT'd.
+    // kindnetd ref: `masq.go:113`.
+    let hook = postrouting_hook_args();
+    let hook_refs: Vec<&str> = hook.iter().map(String::as_str).collect();
+    let mut check: Vec<&str> = vec!["-t", "nat", "-C", "POSTROUTING"];
+    check.extend(hook_refs.iter().copied());
     let present = Command::new("iptables")
-        .args(["-t", "nat", "-C", "POSTROUTING", "-j", MASQ_CHAIN])
+        .args(&check)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !present {
-        let _ = Command::new("iptables")
-            .args(["-t", "nat", "-I", "POSTROUTING", "1", "-j", MASQ_CHAIN])
-            .output();
+        let mut add: Vec<&str> = vec!["-t", "nat", "-A", "POSTROUTING"];
+        add.extend(hook_refs.iter().copied());
+        let _ = Command::new("iptables").args(&add).output();
     }
+}
+
+/// POSTROUTING hook for the masquerade chain: match everything whose
+/// destination is not one of the node's own addresses.
+///
+/// kindnetd ref: `masq.go:113` —
+/// `-m addrtype ! --dst-type LOCAL -j KIND-MASQ-AGENT`.
+pub fn postrouting_hook_args() -> Vec<String> {
+    [
+        "-m",
+        "addrtype",
+        "!",
+        "--dst-type",
+        "LOCAL",
+        "-j",
+        MASQ_CHAIN,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// Split a rule body into argv, keeping a `"quoted comment"` as one argument.
