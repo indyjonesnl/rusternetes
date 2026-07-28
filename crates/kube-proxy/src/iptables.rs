@@ -138,6 +138,19 @@ fn detect_bridge_network() -> Option<(String, String)> {
 pub const DEFAULT_CLUSTER_CIDR: &str = "10.96.0.0/12";
 pub const DEFAULT_NODEPORT_RANGE: &str = "30000:32767";
 
+/// Masquerade mark, matching upstream kube-proxy's `--iptables-masquerade-bit`
+/// default of 14 (`1 << 14` = `0x4000`).
+/// K8s ref: pkg/proxy/iptables/proxier.go — `masqueradeMark`.
+pub const MASQUERADE_MARK: &str = "0x4000";
+
+/// Chain that sets the masquerade mark on a packet.
+/// K8s ref: pkg/proxy/iptables/proxier.go — `kubeMarkMasqChain`.
+pub const MARK_MASQ_CHAIN: &str = "KUBE-MARK-MASQ";
+
+/// Chain hooked into POSTROUTING that masquerades every marked packet.
+/// K8s ref: pkg/proxy/iptables/proxier.go — `kubePostroutingChain`.
+pub const POSTROUTING_CHAIN: &str = "KUBE-POSTROUTING";
+
 /// IptablesManager handles iptables rule programming for service networking
 pub struct IptablesManager {
     /// Chain names we create
@@ -184,6 +197,24 @@ impl IptablesManager {
     /// crate (which compiles separately from the lib) can call it.
     /// Production code MUST use `IptablesManager::new` so xt_recent
     /// availability is detected from the host kernel.
+    /// Sysctls kube-proxy enables on start, as procfs paths.
+    ///
+    /// - `bridge-nf-call-ip[6]tables`: make iptables apply to bridge-forwarded
+    ///   traffic, so pod→NodePort traffic on the container bridge still hits
+    ///   PREROUTING/OUTPUT DNAT.
+    ///   K8s ref: pkg/proxy/iptables/proxier.go — `ensureBridgeNFCallIPTables`.
+    /// - `route_localnet`: allow a packet originally addressed to 127.0.0.1 to
+    ///   leave a non-loopback interface once DNAT has rewritten it. Required
+    ///   for localhost NodePorts and for `hostIP: 127.0.0.1` hostPorts.
+    ///   K8s ref: pkg/proxy/iptables/proxier.go:240.
+    pub fn required_sysctls() -> &'static [&'static str] {
+        &[
+            "/proc/sys/net/bridge/bridge-nf-call-iptables",
+            "/proc/sys/net/bridge/bridge-nf-call-ip6tables",
+            "/proc/sys/net/ipv4/conf/all/route_localnet",
+        ]
+    }
+
     pub fn for_testing(recent_available: bool) -> Self {
         Self {
             services_chain: "RUSTERNETES-SERVICES".to_string(),
@@ -267,10 +298,11 @@ impl IptablesManager {
         // bridge-forwarded traffic. Without this, pod-to-NodePort traffic
         // within the container bridge bypasses PREROUTING/OUTPUT DNAT rules.
         // K8s ref: k8s.io/kubernetes/pkg/proxy/iptables/proxier.go — ensureBridgeNFCallIPTables
-        for sysctl in [
-            "/proc/sys/net/bridge/bridge-nf-call-iptables",
-            "/proc/sys/net/bridge/bridge-nf-call-ip6tables",
-        ] {
+        // route_localnet lets a packet whose original destination was 127.0.0.1
+        // leave a non-loopback interface after DNAT, which is what makes
+        // localhost NodePorts and localhost hostPorts reachable.
+        // K8s ref: pkg/proxy/iptables/proxier.go:240 — EnsureSysctl(sysctlRouteLocalnet, 1)
+        for sysctl in Self::required_sysctls() {
             if std::path::Path::new(sysctl).exists() {
                 if let Err(e) = std::fs::write(sysctl, "1") {
                     warn!(
@@ -280,7 +312,7 @@ impl IptablesManager {
                 } else {
                     info!("Enabled {}", sysctl);
                 }
-            } else {
+            } else if sysctl.contains("/bridge/") {
                 // Try loading br_netfilter module
                 let _ = Command::new("modprobe").arg("br_netfilter").output();
                 if std::path::Path::new(sysctl).exists() {
@@ -289,6 +321,8 @@ impl IptablesManager {
                 } else {
                     debug!("{} not available (br_netfilter module not loaded)", sysctl);
                 }
+            } else {
+                debug!("{} not available on this kernel", sysctl);
             }
         }
 
@@ -346,6 +380,23 @@ impl IptablesManager {
             "OUTPUT",
             &self.hostports_chain,
             "kubernetes hostport rules",
+        )?;
+
+        // Mark-for-masquerade machinery. The hostPort rules mark the hairpin
+        // and localhost source paths (see build_hostport_chain_block); this
+        // chain pair turns that mark into an actual SNAT in POSTROUTING.
+        // ensure_jump_rule prepends, which matters: the container bridge's own
+        // MASQUERADE rules would otherwise stomp on ours.
+        // K8s ref: pkg/proxy/iptables/proxier.go — kubePostroutingChain /
+        // kubeMarkMasqChain; portmap ref: plugins/meta/portmap
+        // portmap_iptables.go genMarkMasqChain (`prependEntry: true`).
+        self.ensure_chain("nat", MARK_MASQ_CHAIN)?;
+        self.ensure_chain("nat", POSTROUTING_CHAIN)?;
+        self.ensure_jump_rule(
+            "nat",
+            "POSTROUTING",
+            POSTROUTING_CHAIN,
+            "kubernetes postrouting rules",
         )?;
 
         // Add MASQUERADE rule for hairpin NAT (container→ClusterIP→container on same bridge).
@@ -2049,6 +2100,30 @@ impl IptablesManager {
     ) -> String {
         let mut rules = String::new();
         rules.push_str(&format!(":{} - [0:0]\n", self.hostports_chain));
+        rules.push_str(&format!(":{} - [0:0]\n", MARK_MASQ_CHAIN));
+        rules.push_str(&format!(":{} - [0:0]\n", POSTROUTING_CHAIN));
+
+        // KUBE-MARK-MASQ sets the mark; KUBE-POSTROUTING (hooked into
+        // POSTROUTING by initialize()) turns it into a MASQUERADE and clears it
+        // so a packet re-traversing the stack isn't masqueraded twice.
+        // K8s ref: pkg/proxy/iptables/proxier.go — the kubePostroutingChain /
+        // kubeMarkMasqChain rule block.
+        rules.push_str(&format!(
+            "-A {} -j MARK --or-mark {}\n",
+            MARK_MASQ_CHAIN, MASQUERADE_MARK
+        ));
+        rules.push_str(&format!(
+            "-A {} -m mark ! --mark {}/{} -j RETURN\n",
+            POSTROUTING_CHAIN, MASQUERADE_MARK, MASQUERADE_MARK
+        ));
+        rules.push_str(&format!(
+            "-A {} -j MARK --xor-mark {}\n",
+            POSTROUTING_CHAIN, MASQUERADE_MARK
+        ));
+        rules.push_str(&format!(
+            "-A {} -m comment --comment \"kubernetes hostPort traffic requiring SNAT\" -j MASQUERADE\n",
+            POSTROUTING_CHAIN
+        ));
 
         // Track (host_port, protocol, host_ip) to dedupe in case two
         // containers in the same pod declare the same hostPort (only the
@@ -2093,17 +2168,40 @@ impl IptablesManager {
                         pod_ns, pod.metadata.name, host_port
                     );
 
-                    let mut rule = format!("-A {}", self.hostports_chain);
+                    // Match base shared by all three rules for this entry.
                     // Bind to a specific hostIP if requested; otherwise match all.
+                    let mut base = String::new();
                     if !host_ip.is_empty() && host_ip != "0.0.0.0" && host_ip != "::" {
-                        rule.push_str(&format!(" -d {}/32", host_ip));
+                        base.push_str(&format!(" -d {}/32", host_ip));
                     }
-                    rule.push_str(&format!(
-                        " -p {} --dport {} -j DNAT --to-destination {} -m comment --comment \"{}\"",
-                        proto, host_port, dnat_target, comment
+
+                    // Three rules per entry, mark rules FIRST, then the DNAT.
+                    // Without the marks the DNAT'd packet keeps its original
+                    // source — 127.0.0.1 for the localhost path, the pod's own
+                    // IP for hairpin — and the pod's reply is unroutable.
+                    // Portmap ref: plugins/meta/portmap/portmap_iptables.go
+                    // ("For every entry, generate 3 rules: mark hairpin for
+                    // masq, mark localhost for masq (for v4), do dnat / the
+                    // ordering is important here; the mark rules must be
+                    // first.")
+                    //
+                    // hairpin: the pod reaching its own hostPort.
+                    rules.push_str(&format!(
+                        "-A {}{} -s {}/32 -p {} --dport {} -j {} -m comment --comment \"{} hairpin\"\n",
+                        self.hostports_chain, base, pod_ip, proto, host_port, MARK_MASQ_CHAIN, comment
                     ));
-                    rules.push_str(&rule);
-                    rules.push('\n');
+                    // localhost (IPv4 only — v6 has no route_localnet hack, so
+                    // ::1 → hostPort is not a supported path upstream either).
+                    if !pod_ip.contains(':') {
+                        rules.push_str(&format!(
+                            "-A {}{} -s 127.0.0.1/32 -p {} --dport {} -j {} -m comment --comment \"{} localhost\"\n",
+                            self.hostports_chain, base, proto, host_port, MARK_MASQ_CHAIN, comment
+                        ));
+                    }
+                    rules.push_str(&format!(
+                        "-A {}{} -p {} --dport {} -j DNAT --to-destination {} -m comment --comment \"{}\"\n",
+                        self.hostports_chain, base, proto, host_port, dnat_target, comment
+                    ));
                 }
             }
         }
