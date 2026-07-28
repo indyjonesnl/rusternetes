@@ -57,6 +57,22 @@ else
   bad "recipe template should render with only awk available"
 fi
 
+# --- render values in one pass --------------------------------------------
+VS_IMAGE='ghcr.io/example/kube-proxy:${VS_APISERVER_URL}'
+EXPECTED_ONE_PASS_RENDER='image: ghcr.io/example/kube-proxy:${VS_APISERVER_URL}
+server: https://172.18.0.3:6443
+cidr: 10.96.0.0/16
+nodePorts: 30000-32767
+untouched: ${NOT_ALLOWED}'
+
+if RENDERED="$(vs_render_recipe_template "$RENDER_RECIPE" \
+  VS_IMAGE VS_APISERVER_URL VS_CLUSTER_CIDR VS_NODEPORT_RANGE)" \
+  && [ "$RENDERED" = "$EXPECTED_ONE_PASS_RENDER" ]; then
+  ok "recipe template does not recursively render placeholder values"
+else
+  bad "recipe template should render placeholder values in one pass"
+fi
+
 # --- unset requested template variable rejected ---------------------------
 unset VS_UNSET_RENDER_VALUE
 if (set +u; vs_render_recipe_template "$RENDER_RECIPE" VS_UNSET_RENDER_VALUE) \

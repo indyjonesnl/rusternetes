@@ -323,7 +323,8 @@ vs_recipe_template() {
 vs_render_recipe_template() {
   local recipe="$1"
   shift
-  local rendered name placeholder value
+  local rendered name placeholder marker index
+  local -a markers=() values=()
 
   rendered="$(vs_recipe_template "$recipe")" || return 1
   for name in "$@"; do
@@ -332,8 +333,13 @@ vs_render_recipe_template() {
       return 1
     fi
     printf -v placeholder '${%s}' "$name"
-    value="${!name}"
-    rendered="${rendered//"$placeholder"/"$value"}"
+    marker=$'\036vs-render-'${#markers[@]}$'\037'
+    rendered="${rendered//"$placeholder"/"$marker"}"
+    markers+=("$marker")
+    values+=("${!name}")
+  done
+  for index in "${!markers[@]}"; do
+    rendered="${rendered//"${markers[index]}"/"${values[index]}"}"
   done
   printf '%s\n' "$rendered"
 }
