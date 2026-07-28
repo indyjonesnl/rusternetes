@@ -1577,12 +1577,21 @@ impl VolumeManager {
                             // (all-in-one), whose co-located api-server trusts our key.
                             let mut issued: Option<String> = None;
                             if let Some(st) = storage {
+                                // Bind the token to this pod, as upstream's
+                                // projected volume plugin does
+                                // (pkg/volume/projected/projected.go). The
+                                // api-server derives the pod/node claims from
+                                // the ref, and a TokenReview on the mounted
+                                // token then reports the
+                                // authentication.kubernetes.io/pod-name,
+                                // pod-uid and node-name extras (#1684).
                                 match st
                                     .create_sa_token(
                                         namespace,
                                         sa_name,
                                         &requested_audiences,
                                         expiration_seconds,
+                                        Some((pod_name.as_str(), pod.metadata.uid.as_str())),
                                     )
                                     .await
                                 {
