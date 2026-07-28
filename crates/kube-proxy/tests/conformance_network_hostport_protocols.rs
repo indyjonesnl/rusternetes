@@ -489,9 +489,11 @@ fn hostport_dnat_rule_maps_hostport_to_pod() {
 
     // The DNAT rule must live in the KUBE-HOSTPORTS chain and carry every
     // match component the connectivity dial depends on, in one rule.
+    // Each entry emits three rules (two mark-for-masq, then the DNAT); pick the
+    // DNAT one.
     let dnat_line = rules
         .lines()
-        .find(|l| l.contains("--dport 31000"))
+        .find(|l| l.contains("--dport 31000") && l.contains("-j DNAT"))
         .unwrap_or_else(|| panic!("hostPort 31000 DNAT rule missing: {}", rules));
     assert!(
         dnat_line.contains("-A KUBE-HOSTPORTS"),
@@ -870,5 +872,161 @@ async fn services_functioning_nodeport_iptables_rules_present() {
         rules.contains("--to-destination 10.244.61.1:8080"),
         "NodePort DNAT target: {}",
         rules
+    );
+}
+
+// ---------------------------------------------------------------------------
+// hostPort masquerade (SNAT) — [sig-network] HostPort localhost/hairpin paths
+// ---------------------------------------------------------------------------
+
+/// [sig-network] HostPort — DNAT alone is not enough: the localhost and
+/// hairpin source paths need the masquerade mark set BEFORE the DNAT rule.
+///
+/// Upstream: containernetworking/plugins v1.6.2
+/// `plugins/meta/portmap/portmap_iptables.go` (`c.rules` construction):
+///
+/// > For every entry, generate 3 rules:
+/// >  - mark hairpin for masq
+/// >  - mark localhost for masq (for v4)
+/// >  - do dnat
+/// > the ordering is important here; the mark rules must be first.
+///
+/// Without the mark rules the DNAT'd packet keeps its original source
+/// (127.0.0.1 for the localhost case, the pod's own IP for hairpin), so the
+/// pod's SYN/ACK is unroutable and the connection hangs. Verified live: adding
+/// a MASQUERADE for `-s 127.0.0.1` turned a failing `curl 127.0.0.1:<hostPort>`
+/// into a successful one.
+#[test]
+fn hostport_dnat_preceded_by_hairpin_and_localhost_masq_marks() {
+    let mgr = test_iptables();
+    let pods = vec![pod_with_hostport(
+        "hp",
+        "default",
+        "node-1",
+        "10.244.0.30",
+        8080,
+        31000,
+        "TCP",
+    )];
+
+    let rules = mgr.build_hostport_rules(&pods, "node-1");
+    let lines: Vec<&str> = rules.lines().collect();
+
+    let idx = |pred: &dyn Fn(&str) -> bool| -> Option<usize> { lines.iter().position(|l| pred(l)) };
+
+    let hairpin = idx(&|l: &str| {
+        l.starts_with("-A KUBE-HOSTPORTS")
+            && l.contains("-s 10.244.0.30/32")
+            && l.contains("-j KUBE-MARK-MASQ")
+    })
+    .unwrap_or_else(|| panic!("missing hairpin mark-masq rule:\n{}", rules));
+
+    let localhost = idx(&|l: &str| {
+        l.starts_with("-A KUBE-HOSTPORTS")
+            && l.contains("-s 127.0.0.1/32")
+            && l.contains("-j KUBE-MARK-MASQ")
+    })
+    .unwrap_or_else(|| panic!("missing localhost mark-masq rule:\n{}", rules));
+
+    let dnat = idx(&|l: &str| l.starts_with("-A KUBE-HOSTPORTS") && l.contains("-j DNAT"))
+        .unwrap_or_else(|| panic!("missing DNAT rule:\n{}", rules));
+
+    assert!(
+        hairpin < dnat && localhost < dnat,
+        "mark rules must precede DNAT (hairpin={hairpin}, localhost={localhost}, dnat={dnat}):\n{}",
+        rules
+    );
+}
+
+/// [sig-network] HostPort — the mark chains the hostPort rules jump to must be
+/// declared and populated in the same restore blob.
+///
+/// Upstream: k8s.io/kubernetes/pkg/proxy/iptables/proxier.go (KUBE-POSTROUTING
+/// / KUBE-MARK-MASQ construction): `-m mark ! --mark <mark>/<mark> -j RETURN`,
+/// then `-j MARK --xor-mark <mark>` to clear it, then `-j MASQUERADE`;
+/// KUBE-MARK-MASQ is `-j MARK --or-mark <mark>`.
+#[test]
+fn hostport_masq_mark_chains_declared_and_populated() {
+    let mgr = test_iptables();
+    let pods = vec![pod_with_hostport(
+        "hp",
+        "default",
+        "node-1",
+        "10.244.0.30",
+        8080,
+        31000,
+        "TCP",
+    )];
+
+    let rules = mgr.build_hostport_rules(&pods, "node-1");
+
+    for expected in [
+        ":KUBE-MARK-MASQ - [0:0]",
+        ":KUBE-POSTROUTING - [0:0]",
+        "-A KUBE-MARK-MASQ -j MARK --or-mark 0x4000",
+        "-A KUBE-POSTROUTING -m mark ! --mark 0x4000/0x4000 -j RETURN",
+        "-A KUBE-POSTROUTING -j MARK --xor-mark 0x4000",
+    ] {
+        assert!(
+            rules.contains(expected),
+            "missing {expected:?} in restore blob:\n{}",
+            rules
+        );
+    }
+    assert!(
+        rules
+            .lines()
+            .any(|l| l.starts_with("-A KUBE-POSTROUTING") && l.contains("-j MASQUERADE")),
+        "KUBE-POSTROUTING must end in MASQUERADE:\n{}",
+        rules
+    );
+}
+
+/// [sig-network] HostPort — a hostIP-scoped entry must scope its mark rules to
+/// the same destination as its DNAT rule.
+///
+/// Upstream: portmap_iptables.go builds `ruleBase` (`-p <proto> --dport <port>`
+/// plus `-d <hostIP>` when the hostIP is specified and not unspecified) and
+/// copies it into all three rules. A mark rule without the `-d` match would
+/// masquerade traffic aimed at a different hostIP's hostPort.
+#[test]
+fn hostport_masq_marks_scoped_to_host_ip() {
+    let mgr = test_iptables();
+    let pods = vec![pod_with_hostport_ip(
+        "hp-local",
+        "default",
+        "node-1",
+        "10.244.0.31",
+        8080,
+        54323,
+        "TCP",
+        Some("127.0.0.1"),
+    )];
+
+    let rules = mgr.build_hostport_rules(&pods, "node-1");
+    for line in rules.lines().filter(|l| l.starts_with("-A KUBE-HOSTPORTS")) {
+        assert!(
+            line.contains("-d 127.0.0.1/32"),
+            "every hostIP-scoped hostPort rule must carry -d 127.0.0.1/32: {line}"
+        );
+    }
+}
+
+/// [sig-network] HostPort — `route_localnet` must be enabled so a DNAT'd
+/// packet whose destination was 127.0.0.1 can leave a non-loopback interface.
+///
+/// Upstream: k8s.io/kubernetes/pkg/proxy/iptables/proxier.go:240
+/// > // Set the route_localnet sysctl we need for exposing NodePorts on loopback addresses
+/// > if err := proxyutil.EnsureSysctl(sysctl, sysctlRouteLocalnet, 1); err != nil {
+///
+/// Verified live: with `route_localnet=0` the KUBE-HOSTPORTS DNAT rule for
+/// `-d 127.0.0.1/32` never matched a packet (0 counters); setting it to 1 made
+/// the rule match.
+#[test]
+fn route_localnet_is_a_required_sysctl() {
+    assert!(
+        IptablesManager::required_sysctls().contains(&"/proc/sys/net/ipv4/conf/all/route_localnet"),
+        "route_localnet must be in the sysctls kube-proxy enables: {:?}",
+        IptablesManager::required_sysctls()
     );
 }
