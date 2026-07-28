@@ -2,8 +2,9 @@
 #
 # Consumed by vs_swap_static_pod() in scripts/vanilla-swap-common.sh. When a
 # recipe carries a `template:` block, the swap REPLACES the whole static-pod
-# manifest (not just the image): it envsubst-renders the template (VS_IMAGE) and
-# writes it to /etc/kubernetes/manifests/<manifest> inside the control-plane
+# manifest (not just the image): it renders the VS_IMAGE template variable
+# with vs_render_recipe_template and writes it to
+# /etc/kubernetes/manifests/<manifest> inside the control-plane
 # node, so the node kubelet restarts that one static pod as the rusternetes
 # scheduler. Everything else in the control plane stays unmodified upstream.
 #
