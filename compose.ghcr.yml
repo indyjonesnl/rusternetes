@@ -32,8 +32,14 @@ services:
     image: "ghcr.io/indyjonesnl/rusternetes/kubelet:${RUSTERNETES_IMAGE_TAG:-main}"
   kube-proxy:
     image: "ghcr.io/indyjonesnl/rusternetes/kube-proxy:${RUSTERNETES_IMAGE_TAG:-main}"
+  # node-2's kube-proxy — same image, different node (#1691).
+  kube-proxy2:
+    image: "ghcr.io/indyjonesnl/rusternetes/kube-proxy:${RUSTERNETES_IMAGE_TAG:-main}"
   dns:
     image: "ghcr.io/indyjonesnl/rusternetes/dns:${RUSTERNETES_IMAGE_TAG:-main}"
-  # CRI runtime image (containerd + crun + CNI) the kubelet talks to.
+  # CRI runtime image (containerd + crun + CNI) the kubelet talks to. One per
+  # node: each owns its netns, CNI bridge and image store (#1691).
   containerd:
+    image: "ghcr.io/indyjonesnl/rusternetes/containerd:${RUSTERNETES_IMAGE_TAG:-main}"
+  containerd2:
     image: "ghcr.io/indyjonesnl/rusternetes/containerd:${RUSTERNETES_IMAGE_TAG:-main}"
