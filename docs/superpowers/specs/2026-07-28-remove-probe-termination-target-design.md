@@ -25,4 +25,3 @@ Run the manifest validation, generated-workflow synchronization, target
 coverage, and workflow-generation tests. In particular, the workflow-sync
 test must confirm that every remaining manifest entry has a matching generated
 workflow and that no stale generated probe workflow remains.
-
