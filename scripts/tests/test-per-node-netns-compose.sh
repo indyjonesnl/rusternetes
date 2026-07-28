@@ -196,6 +196,45 @@ test_kubelets_stream_to_their_own_runtime() {
     assert_eq "localhost" "$h2" "node-2 streams over loopback"
 }
 
+# Locally-built images must be imported into EVERY node's runtime. Each
+# containerd has its own image store, so importing into one leaves the other
+# node unable to start that pod: `failed to resolve image ... pull access denied`
+# for rusternetes-dns:latest, which then blocks the conformance suite's
+# BeforeSuite ("Error waiting for all pods to be running and ready").
+test_bootstrap_imports_into_every_runtime() {
+    local script="$REPO_ROOT/scripts/bootstrap-cluster.sh"
+    assert_contains "$(cat "$script")" "containerd_service_containers" \
+        "bootstrap must enumerate the runtime containers, not assume one"
+
+    # The enumeration must cover both compose runtimes.
+    local listed
+    listed="$(CONTAINER_RT=docker bash -c "
+        set -euo pipefail
+        source <(sed -n '/^containerd_service_containers()/,/^}/p' \"$script\")
+        containerd_service_containers
+    " 2>/dev/null | tr '\n' ' ')"
+
+    # An explicit single-runtime override must still win — run-node-conformance.sh
+    # passes CONTAINERD_SERVICE_CONTAINER=rusternetes-nc-containerd, and that
+    # runtime is not named rusternetes-containerd*.
+    local overridden
+    overridden="$(CONTAINER_RT=docker CONTAINERD_SERVICE_CONTAINER=rusternetes-nc-containerd bash -c "
+        set -euo pipefail
+        source <(sed -n '/^containerd_service_containers()/,/^}/p' \"$script\")
+        containerd_service_containers
+    " 2>/dev/null | tr -d '\n')"
+    assert_eq "rusternetes-nc-containerd" "$overridden" \
+        "explicit CONTAINERD_SERVICE_CONTAINER must be honoured"
+    case "$listed" in
+        *rusternetes-containerd*) PASS_COUNT=$((PASS_COUNT + 1)) ;;
+        *) fail "enumeration must include node-1's runtime, got: '$listed'" ;;
+    esac
+    case "$listed" in
+        *rusternetes-containerd2*) PASS_COUNT=$((PASS_COUNT + 1)) ;;
+        *) fail "enumeration must include node-2's runtime, got: '$listed'" ;;
+    esac
+}
+
 # ----- Runner -----
 
 if ! command -v docker >/dev/null 2>&1; then
