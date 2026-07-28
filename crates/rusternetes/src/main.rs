@@ -369,6 +369,11 @@ async fn async_main() -> Result<()> {
             cluster_cidr: args.cluster_cidr,
             // Accept hyphen form as a convenience; iptables wants colon.
             nodeport_range: args.node_port_range.replace('-', ":"),
+            // The all-in-one binary is a single node in a single network
+            // namespace: there is no peer pod CIDR to route to and no per-node
+            // conflist to derive, so the node-network agent stays off and the
+            // image's cluster-wide CNI config keeps applying (#1691).
+            node_net: None,
         };
         tokio::spawn(async move {
             if let Err(e) = rusternetes_kube_proxy::run(proxy_storage, proxy_config).await {

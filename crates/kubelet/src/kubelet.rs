@@ -518,6 +518,28 @@ pub async fn finalize_terminated_pod_storage<S: Storage + ?Sized>(
     }
 }
 
+/// Graft the kubelet-owned fields of `desired` onto an existing Node object.
+///
+/// Only the labels the kubelet owns are refreshed; `spec` is left alone unless
+/// the existing object has none. The kubelet does not own `spec`:
+///
+/// * `spec.podCIDR` / `podCIDRs` belong to kube-controller-manager's node-ipam.
+///   Overwriting them with the kubelet's empty spec makes a strict api-server
+///   reject the whole update (`node updates may not change podCIDR except from
+///   "" to valid`), so the kubelet can never re-register after a restart.
+/// * `spec.taints` and `spec.unschedulable` belong to the taint controllers and
+///   to `kubectl taint` / `kubectl cordon`.
+///
+/// Upstream ref: pkg/kubelet/kubelet_node_status.go:110-130
+/// (`tryRegisterWithAPIServer`) re-gets the node and reconciles only the CMAD
+/// annotation, the default labels and extended resources — never the spec.
+pub fn reconcile_existing_node(existing: &mut Node, desired: &Node) {
+    existing.metadata.labels = desired.metadata.labels.clone();
+    if existing.spec.is_none() {
+        existing.spec = desired.spec.clone();
+    }
+}
+
 impl Kubelet {
     /// Construct a Kubelet with upstream-default eviction config and
     /// `root_dir = /var/lib/kubelet`. Kept for library back-compat; the
@@ -1165,8 +1187,7 @@ impl Kubelet {
                 // "node already exists → reconcile onto the existing object" path
                 // (pkg/kubelet/kubelet_node_status.go).
                 let mut existing: Node = self.storage.get(&key).await?;
-                existing.metadata.labels = node.metadata.labels.clone();
-                existing.spec = node.spec.clone();
+                reconcile_existing_node(&mut existing, &node);
                 self.storage.update(&key, &existing).await?;
                 info!("Node updated successfully");
             }

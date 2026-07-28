@@ -79,7 +79,10 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 #     falls back to docker.io for the unqualified local tag).
 CONTROL_PLANE_IMAGE_REGISTRY="${CONTROL_PLANE_IMAGE_REGISTRY:-}"
 CONTROL_PLANE_IMAGE_TAG="${RUSTERNETES_IMAGE_TAG:-main}"
-CONTAINERD_SERVICE_CONTAINER="${CONTAINERD_SERVICE_CONTAINER:-rusternetes-containerd}"
+# Explicit single-runtime override (scripts/run-node-conformance.sh sets this to
+# rusternetes-nc-containerd). Empty means "discover the compose runtimes" — see
+# containerd_service_containers.
+CONTAINERD_SERVICE_CONTAINER="${CONTAINERD_SERVICE_CONTAINER:-}"
 
 # Resolve the image ref for an in-containerd component (scheduler,
 # controller-manager, dns): GHCR ref on the prebuilt path, local :latest tag
@@ -101,22 +104,44 @@ resolve_cluster_image() {
 # rusternetes-X:latest to docker.io/library/rusternetes-X:latest, the exact ref
 # the CRI ImageService resolves the unqualified pod-spec name to, so the lookup
 # matches.
+# Every node's runtime that is currently up. Each containerd keeps its OWN image
+# store, so a local image must be imported into all of them: importing into one
+# leaves pods scheduled to the other node stuck on
+# "failed to resolve image ... pull access denied" (#1691), which then fails the
+# conformance suite's BeforeSuite. Honours an explicit
+# CONTAINERD_SERVICE_CONTAINER (run-node-conformance.sh names its own runtime),
+# else discovers the compose runtimes.
+containerd_service_containers() {
+    if [ -n "${CONTAINERD_SERVICE_CONTAINER:-}" ]; then
+        printf '%s\n' "$CONTAINERD_SERVICE_CONTAINER"
+        return 0
+    fi
+    ${CONTAINER_RT:-docker} ps --format '{{.Names}}' 2>/dev/null \
+        | grep -E '^rusternetes-containerd[0-9]*$' \
+        | sort
+}
+
 import_image_into_containerd() {
     local image="$1"
-    if ! $CONTAINER_RT inspect "$CONTAINERD_SERVICE_CONTAINER" >/dev/null 2>&1; then
+    local runtimes
+    runtimes="$(containerd_service_containers)"
+    if [ -z "$runtimes" ]; then
         return 0   # all-in-one / no separate containerd service
     fi
     if ! $CONTAINER_RT image inspect "$image" >/dev/null 2>&1; then
         print_warning "Local image $image not found — skipping containerd import (build it: $CONTAINER_RT compose --profile build build)"
         return 0
     fi
-    echo "  Importing $image into $CONTAINERD_SERVICE_CONTAINER (k8s.io namespace)..."
-    if $CONTAINER_RT save "$image" \
-        | $CONTAINER_RT exec -i "$CONTAINERD_SERVICE_CONTAINER" ctr -n k8s.io images import -; then
-        print_success "Imported $image into containerd"
-    else
-        print_warning "Failed to import $image into containerd — its pod may stay ImagePullBackOff"
-    fi
+    local rt
+    for rt in $runtimes; do
+        echo "  Importing $image into $rt (k8s.io namespace)..."
+        if $CONTAINER_RT save "$image" \
+            | $CONTAINER_RT exec -i "$rt" ctr -n k8s.io images import -; then
+            print_success "Imported $image into $rt"
+        else
+            print_warning "Failed to import $image into $rt — its pod may stay ImagePullBackOff"
+        fi
+    done
 }
 
 # Discover the Docker bridge gateway (always [subnet].1) so we can
