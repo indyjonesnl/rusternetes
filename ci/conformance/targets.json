@@ -70,13 +70,6 @@
     "description": "sig-node feature-gated sysctls (safe + unsafe allowlist); largely non-[Conformance], additive to the sig-node slice"
   },
   {
-    "name": "probe-termination-grace-period",
-    "kind": "feature",
-    "focus": "\\[Feature:ProbeTerminationGracePeriod\\]",
-    "skip": "\\[Flaky\\]",
-    "description": "sig-node feature-gated probe-level terminationGracePeriodSeconds; additive to the sig-node slice"
-  },
-  {
     "name": "downward-api",
     "kind": "feature",
     "focus": "\\[Feature:DownwardAPI\\]",
