@@ -105,7 +105,7 @@ jobs:
       - name: Update target badge
         # Full runs only (empty focus) — a focused run must not clobber the
         # target's aggregate badge (FR-011). Best-effort: never reddens the run.
-        if: ${{ always() && inputs.publish-badge && inputs.focus == '' }}
+        if: ${{ always() && steps.run.outcome == 'success' && inputs.publish-badge && inputs.focus == '' }}
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

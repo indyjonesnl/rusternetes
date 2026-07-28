@@ -110,7 +110,7 @@ async fn test_namespace_with_finalizer_marked_for_deletion() {
             uid: uuid::Uuid::new_v4().to_string(),
             resource_version: None,
             deletion_grace_period_seconds: None,
-            finalizers: Some(vec!["kubernetes".to_string()]), // Has finalizer
+            finalizers: None,
             owner_references: None,
             creation_timestamp: Some(Utc::now()),
             deletion_timestamp: Some(Utc::now()), // Being deleted
@@ -120,7 +120,9 @@ async fn test_namespace_with_finalizer_marked_for_deletion() {
             generation: None,
             managed_fields: None,
         },
-        spec: Some(NamespaceSpec { finalizers: None }),
+        spec: Some(NamespaceSpec {
+            finalizers: Some(vec!["kubernetes".to_string()]),
+        }),
         status: Some(NamespaceStatus {
             phase: Some(rusternetes_common::types::Phase::Terminating),
             conditions: None,
@@ -163,7 +165,7 @@ async fn test_namespace_deletion_removes_finalizers() {
             uid: uuid::Uuid::new_v4().to_string(),
             resource_version: None,
             deletion_grace_period_seconds: None,
-            finalizers: Some(vec!["kubernetes".to_string()]),
+            finalizers: None,
             owner_references: None,
             creation_timestamp: Some(Utc::now()),
             deletion_timestamp: Some(Utc::now()),
@@ -173,7 +175,9 @@ async fn test_namespace_deletion_removes_finalizers() {
             generation: None,
             managed_fields: None,
         },
-        spec: Some(NamespaceSpec { finalizers: None }),
+        spec: Some(NamespaceSpec {
+            finalizers: Some(vec!["kubernetes".to_string()]),
+        }),
         status: Some(NamespaceStatus {
             phase: Some(rusternetes_common::types::Phase::Terminating),
             conditions: None,
@@ -192,9 +196,11 @@ async fn test_namespace_deletion_removes_finalizers() {
 
     if let Ok(ns) = result {
         // Finalizers should be removed or empty
-        assert!(
-            ns.metadata.finalizers.is_none() || ns.metadata.finalizers.as_ref().unwrap().is_empty()
-        );
+        assert!(ns
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.finalizers.as_ref())
+            .is_none_or(Vec::is_empty));
     }
 
     // Clean up
@@ -221,7 +227,7 @@ fn terminating_ns(name: &str, finalizers: Vec<String>) -> Namespace {
             uid: uuid::Uuid::new_v4().to_string(),
             resource_version: None,
             deletion_grace_period_seconds: None,
-            finalizers: Some(finalizers),
+            finalizers: None,
             owner_references: None,
             creation_timestamp: Some(Utc::now()),
             deletion_timestamp: Some(Utc::now()),
@@ -231,7 +237,9 @@ fn terminating_ns(name: &str, finalizers: Vec<String>) -> Namespace {
             generation: None,
             managed_fields: None,
         },
-        spec: Some(NamespaceSpec { finalizers: None }),
+        spec: Some(NamespaceSpec {
+            finalizers: Some(finalizers),
+        }),
         status: Some(NamespaceStatus {
             phase: Some(rusternetes_common::types::Phase::Terminating),
             conditions: None,
@@ -294,9 +302,9 @@ async fn test_namespace_finalizers_complete_deletion_flow() {
         .await
         .expect("namespace must remain in storage while a custom finalizer is present");
     let finalizers = after_controller
-        .metadata
-        .finalizers
+        .spec
         .as_ref()
+        .and_then(|spec| spec.finalizers.as_ref())
         .expect("finalizers slice must remain set");
     assert!(
         finalizers.contains(&"example.com/keep".to_string()),
@@ -320,7 +328,7 @@ async fn test_namespace_finalizers_complete_deletion_flow() {
     // semantics, so it asserts the controller's half of the contract: the
     // finalizer slice is fully drained, leaving the namespace collectable.
     let mut ns = after_controller.clone();
-    ns.metadata.finalizers = Some(vec![]);
+    ns.spec.get_or_insert_with(Default::default).finalizers = Some(vec![]);
     storage.update(&key, &ns).await.unwrap();
     controller.reconcile_all().await.unwrap();
 
@@ -329,7 +337,10 @@ async fn test_namespace_finalizers_complete_deletion_flow() {
         // A finalize-aware backend (the api-server) would have removed it.
         Err(_) => {}
         Ok(remaining) => {
-            let fins = remaining.metadata.finalizers.unwrap_or_default();
+            let fins = remaining
+                .spec
+                .and_then(|spec| spec.finalizers)
+                .unwrap_or_default();
             assert!(
                 fins.is_empty(),
                 "all finalizers must be drained so the api-server can collect \

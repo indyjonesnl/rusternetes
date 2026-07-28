@@ -16,9 +16,8 @@
 # as key=value lines on stdout): passed, failed, total, focused.
 #
 # Exit codes:
-#   0  hydrophone produced junit (regardless of pass/fail), OR the focus matched
-#      no tests (reported explicitly, not as success)
-#   1  no junit produced — infrastructure failure
+#   0  hydrophone produced junit (regardless of conformance pass/fail)
+#   1  infrastructure failure, including no junit or a focus matching no specs
 #   2  usage / preflight error (unknown target, no kubeconfig, missing hydrophone)
 #
 # Usage:
@@ -143,6 +142,15 @@ set +e
 hydro_exit=${PIPESTATUS[0]}
 set -e
 
+# Ginkgo writes framework setup testcases to junit even when the focus selects
+# zero specs, so junit counts alone can turn an empty run into a false 3/3
+# success. Its suite summary is authoritative for focus matching.
+if grep -Eq 'Will run 0 of [0-9]+ specs' "$OUTPUT_DIR/run.log"; then
+    echo "[conformance-target-run] target=$TARGET — no tests matched (focus selected 0 specs)" >&2
+    emit_output 0 0 0 "$FOCUS_OVERRIDDEN"
+    exit 1
+fi
+
 IFS=' ' read -r HAD_JUNIT PASSED FAILED SKIPPED TOTAL <<<"$(target_counts "$OUTPUT_DIR")"
 
 if [ "$HAD_JUNIT" -eq 0 ]; then
@@ -152,9 +160,9 @@ if [ "$HAD_JUNIT" -eq 0 ]; then
 fi
 
 if [ "$TOTAL" -eq 0 ]; then
-    echo "[conformance-target-run] target=$TARGET — no tests matched (focus selected 0 specs)"
+    echo "[conformance-target-run] target=$TARGET — no tests matched (empty junit)" >&2
     emit_output 0 0 0 "$FOCUS_OVERRIDDEN"
-    exit 0
+    exit 1
 fi
 
 echo "[conformance-target-run] target=$TARGET hydrophone_exit=$hydro_exit passed=$PASSED failed=$FAILED skipped=$SKIPPED total=$((PASSED + FAILED))"

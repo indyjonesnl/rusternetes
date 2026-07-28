@@ -83,6 +83,7 @@ rusternetes-controller-manager = { path = "../controller-manager" }
 prost-build = "0.13"
 
 [dev-dependencies]
+rusternetes-client = { path = "../client" }
 tokio-rustls = { workspace = true }
 tokio-test = "0.4"
 rusternetes-test-support = { path = "../test_support", features = ["apiserver-harness"] }

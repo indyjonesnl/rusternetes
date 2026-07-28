@@ -4143,6 +4143,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rusternetes-admission-webhook",
+ "rusternetes-client",
  "rusternetes-common",
  "rusternetes-controller-manager",
  "rusternetes-cri",
