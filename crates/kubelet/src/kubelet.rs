@@ -794,12 +794,18 @@ impl Kubelet {
                                                 .pointer("/metadata/name")
                                                 .and_then(|v| v.as_str())
                                             {
+                                                // Keyed "<namespace>/<name>": bare
+                                                // names repeat across namespaces.
+                                                let pod_ns = pod
+                                                    .pointer("/metadata/namespace")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("default");
                                                 let cached_pod =
                                                     serde_json::from_value::<Pod>(pod.clone()).ok();
-                                                recently_deleted_clone
-                                                    .lock()
-                                                    .unwrap()
-                                                    .insert(pod_name.to_string(), cached_pod);
+                                                recently_deleted_clone.lock().unwrap().insert(
+                                                    format!("{pod_ns}/{pod_name}"),
+                                                    cached_pod,
+                                                );
                                             }
                                             let _ = watch_tx_clone.try_send(key);
                                         }
@@ -1500,7 +1506,7 @@ impl Kubelet {
             .await
             .unwrap_or_default();
 
-        let pod_names: Vec<String> = all_pods
+        let node_pods: Vec<&Pod> = all_pods
             .iter()
             .filter(|p| {
                 p.spec
@@ -1509,10 +1515,9 @@ impl Kubelet {
                     .map(|n| n == self.node_name)
                     .unwrap_or(false)
             })
-            .map(|p| p.metadata.name.clone())
             .collect();
 
-        let (cpu_millicores, memory_bytes) = self.runtime.collect_node_metrics(&pod_names).await;
+        let (cpu_millicores, memory_bytes) = self.runtime.collect_node_metrics(&node_pods).await;
         let memory_mi = memory_bytes / (1024 * 1024);
 
         let mut usage = BTreeMap::new();
@@ -1575,8 +1580,7 @@ impl Kubelet {
             return;
         }
 
-        let pod_names: Vec<String> = node_pods.iter().map(|p| p.metadata.name.clone()).collect();
-        let per_pod = self.runtime.collect_pod_metrics(&pod_names).await;
+        let per_pod = self.runtime.collect_pod_metrics(&node_pods).await;
 
         for pod in node_pods {
             let name = &pod.metadata.name;
@@ -1804,8 +1808,17 @@ impl Kubelet {
             }
         };
 
-        let existing_pod_names: std::collections::HashSet<String> =
-            all_pods.iter().map(|p| p.metadata.name.clone()).collect();
+        // (namespace, name) — a bare name would match a same-named pod in
+        // another namespace and spare (or worse, remove) the wrong sandbox.
+        let existing_pods: std::collections::HashSet<(String, String)> = all_pods
+            .iter()
+            .map(|p| {
+                (
+                    p.metadata.namespace.clone().unwrap_or_default(),
+                    p.metadata.name.clone(),
+                )
+            })
+            .collect();
 
         // Get all containers from Docker (including exited) so orphan cleanup
         // can remove stopped containers from deleted pods
@@ -1817,10 +1830,10 @@ impl Kubelet {
             }
         };
 
-        // Find orphans — running in Docker but not in etcd
-        let orphans: Vec<String> = running_pods
+        // Find orphans — present in the runtime but not in etcd
+        let orphans: Vec<(String, String)> = running_pods
             .into_iter()
-            .filter(|name| !existing_pod_names.contains(name))
+            .filter(|ns_name| !existing_pods.contains(ns_name))
             .collect();
 
         if orphans.is_empty() {
@@ -1837,15 +1850,21 @@ impl Kubelet {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
         let mut handles = Vec::new();
 
-        for orphan in orphans {
+        for (orphan_ns, orphan_name) in orphans {
             let runtime = self.runtime.clone();
             let sem = semaphore.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await;
-                if let Err(e) = runtime.stop_and_remove_pod(&orphan).await {
-                    warn!("Startup cleanup: failed to remove {}: {}", orphan, e);
+                if let Err(e) = runtime.stop_and_remove_pod(&orphan_ns, &orphan_name).await {
+                    warn!(
+                        "Startup cleanup: failed to remove {}/{}: {}",
+                        orphan_ns, orphan_name, e
+                    );
                 } else {
-                    info!("Startup cleanup: removed stale container {}", orphan);
+                    info!(
+                        "Startup cleanup: removed stale container {}/{}",
+                        orphan_ns, orphan_name
+                    );
                 }
             }));
         }
@@ -1869,46 +1888,53 @@ impl Kubelet {
         // (container_gc method), which runs independently every 60 seconds and removes
         // exited containers. This orphan cleanup only handles containers whose pods
         // have been fully removed from etcd.
-        let existing_pod_names: std::collections::HashSet<String> = all_existing_pods
+        // Keyed on (namespace, name): a bare name matches same-named pods in
+        // other namespaces, which either spares a real orphan or (worse, in the
+        // cleanup below) kills a live pod.
+        let existing_pods: std::collections::HashSet<(String, String)> = all_existing_pods
             .iter()
-            .map(|p| p.metadata.name.clone())
+            .map(|p| {
+                (
+                    p.metadata.namespace.clone().unwrap_or_default(),
+                    p.metadata.name.clone(),
+                )
+            })
             .collect();
 
-        debug!("Found {} pods in etcd", existing_pod_names.len());
+        debug!("Found {} pods in etcd", existing_pods.len());
 
-        // Get all pod names from the container runtime (including exited)
-        // so orphan cleanup removes stopped containers from deleted pods
+        // Get every pod the runtime knows (including exited) so orphan cleanup
+        // removes stopped containers from deleted pods.
         let running_pods = self.runtime.list_all_pods().await?;
         debug!(
             "Found {} running pods in container runtime",
             running_pods.len()
         );
 
-        // Check for orphaned pods — running in the container runtime but not
-        // tracked by any pod worker or found in etcd.
+        // Check for orphaned pods — present in the container runtime but not
+        // found in etcd.
         // K8s ref: pkg/kubelet/kubelet_pods.go:1270 — kills orphaned runtime
         // pods not in workingPods with a 1-second grace period.
         //
-        // IMPORTANT: In a shared Docker daemon, ALL kubelets see ALL containers.
+        // IMPORTANT: In a shared runtime, ALL kubelets see ALL containers.
         // We must not kill containers belonging to other nodes' pods.
-        let known_pod_names: std::collections::HashSet<String> = {
-            let states = self.pod_states.lock().unwrap();
-            states.keys().cloned().collect()
-        };
-        for running_pod_name in &running_pods {
-            if existing_pod_names.contains(running_pod_name) {
+        //
+        // There is no separate "a pod worker still tracks this" check: pod_states
+        // is keyed by pod UID, and an orphan is by definition absent from etcd, so
+        // its UID is unknown here. (The previous check compared UID keys against
+        // pod names and could never match.)
+        for (running_ns, running_pod_name) in &running_pods {
+            if existing_pods.contains(&(running_ns.clone(), running_pod_name.clone())) {
                 continue; // Pod exists in etcd — not an orphan
             }
-            if known_pod_names.contains(running_pod_name) {
-                continue; // Pod worker is still tracking this pod
-            }
+            let deleted_key = format!("{running_ns}/{running_pod_name}");
             // Fast path: if this pod was explicitly deleted (via watch event),
             // skip the grace period and clean up immediately.
             let cached_pod = self
                 .recently_deleted
                 .lock()
                 .unwrap()
-                .get(running_pod_name)
+                .get(&deleted_key)
                 .cloned()
                 .flatten();
             let is_recently_deleted = cached_pod.is_some()
@@ -1916,18 +1942,18 @@ impl Kubelet {
                     .recently_deleted
                     .lock()
                     .unwrap()
-                    .contains_key(running_pod_name);
+                    .contains_key(&deleted_key);
             if !is_recently_deleted {
                 // Check container age — don't kill containers younger than 30s
                 let container_age = self
                     .runtime
-                    .get_container_age(running_pod_name)
+                    .get_container_age(running_ns, running_pod_name)
                     .await
                     .unwrap_or(std::time::Duration::from_secs(0));
                 if container_age < std::time::Duration::from_secs(30) {
                     debug!(
                         "Skipping recently started orphan {} (age {:?})",
-                        running_pod_name, container_age
+                        deleted_key, container_age
                     );
                     continue;
                 }
@@ -1936,10 +1962,10 @@ impl Kubelet {
                 self.recently_deleted
                     .lock()
                     .unwrap()
-                    .remove(running_pod_name.as_str());
+                    .remove(deleted_key.as_str());
                 info!(
                     "Fast-path cleanup for explicitly deleted pod {} — skipping grace period",
-                    running_pod_name
+                    deleted_key
                 );
             }
             // Re-check etcd before cleanup — a new pod with the same name may have
@@ -1951,21 +1977,22 @@ impl Kubelet {
                     .list("/registry/pods/")
                     .await
                     .unwrap_or_default();
-                !fresh_pods
-                    .iter()
-                    .any(|p| p.metadata.name == *running_pod_name)
+                !fresh_pods.iter().any(|p| {
+                    p.metadata.name == *running_pod_name
+                        && p.metadata.namespace.as_deref().unwrap_or_default() == *running_ns
+                })
             };
             if !still_orphaned {
                 debug!(
                     "Pod {} was recreated in etcd — skipping cleanup",
-                    running_pod_name
+                    deleted_key
                 );
                 continue;
             }
 
             info!(
                 "Found orphaned pod {} - not in etcd, stopping and removing containers",
-                running_pod_name
+                deleted_key
             );
             // Stop orphaned containers. K8s HandlePodCleanups kills orphaned
             // runtime pods with a 1-second grace period. Container removal is
@@ -1979,16 +2006,16 @@ impl Kubelet {
                     .and_then(|s| s.termination_grace_period_seconds)
                     .unwrap_or(1); // K8s uses 1s for orphans
                 if let Err(e) = self.runtime.stop_pod_for(pod, grace).await {
-                    warn!("Failed to stop orphaned pod {}: {}", running_pod_name, e);
+                    warn!("Failed to stop orphaned pod {}: {}", deleted_key, e);
                 }
             } else {
                 // No cached spec — stop with 1s grace, no preStop hooks
                 if let Err(e) = self
                     .runtime
-                    .stop_pod_with_grace_period(running_pod_name, 1)
+                    .stop_pod_with_grace_period(running_ns, running_pod_name, 1)
                     .await
                 {
-                    warn!("Failed to stop orphaned pod {}: {}", running_pod_name, e);
+                    warn!("Failed to stop orphaned pod {}: {}", deleted_key, e);
                 }
             }
         }
@@ -2642,7 +2669,10 @@ impl Kubelet {
                         let _ = self.storage.update_status(&key, &failed_pod).await;
                         // Stop the pod
                         if self.runtime.is_pod_running(pod).await.unwrap_or(false) {
-                            let _ = self.runtime.stop_pod_with_grace_period(pod_name, 0).await;
+                            let _ = self
+                                .runtime
+                                .stop_pod_with_grace_period(namespace, pod_name, 0)
+                                .await;
                         }
                         return Ok(());
                     }
@@ -2708,7 +2738,7 @@ impl Kubelet {
             });
         let init_incomplete = has_plain_init
             && !matches!(current_phase, Phase::Succeeded | Phase::Failed)
-            && self.runtime.has_sandbox(pod_name).await
+            && self.runtime.has_sandbox(pod).await
             && !self.runtime.compute_init_container_actions(pod).await.0;
         let current_phase = if init_incomplete {
             &Phase::Pending
@@ -2857,7 +2887,7 @@ impl Kubelet {
                     // For pods with init containers, use the state machine approach.
                     // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go — computeInitContainerActions
                     // Check if the pod sandbox has been created.
-                    let sandbox_exists = self.runtime.has_sandbox(pod_name).await;
+                    let sandbox_exists = self.runtime.has_sandbox(pod).await;
 
                     if has_init_containers && sandbox_exists {
                         // Pod sandbox exists — check init container progress
@@ -3167,7 +3197,9 @@ impl Kubelet {
                             // sync tick. Bounded; falls back to None on timeout
                             // (a later tick refreshes it, as before).
                             let pod_ip = crate::poll::poll_until_some(
-                                || async { self.runtime.get_pod_ip(pod_name).await.ok().flatten() },
+                                || async {
+                                    self.runtime.get_pod_ip(&fresh_pod).await.ok().flatten()
+                                },
                                 std::time::Duration::from_secs(10),
                                 std::time::Duration::from_millis(150),
                             )
@@ -3675,7 +3707,7 @@ impl Kubelet {
                     // Running-but-unroutable until the next 5s sync tick. Bounded;
                     // falls back to None on timeout (a later tick refreshes it).
                     let pod_ip = crate::poll::poll_until_some(
-                        || async { self.runtime.get_pod_ip(pod_name).await.ok().flatten() },
+                        || async { self.runtime.get_pod_ip(&fresh_pod).await.ok().flatten() },
                         std::time::Duration::from_secs(10),
                         std::time::Duration::from_millis(150),
                     )
@@ -4499,7 +4531,7 @@ impl Kubelet {
                             }
 
                             // Get pod IP (important for pods started by docker-compose)
-                            let pod_ip = self.runtime.get_pod_ip(pod_name).await.ok().flatten();
+                            let pod_ip = self.runtime.get_pod_ip(pod).await.ok().flatten();
 
                             // Re-read pod from storage to get latest resourceVersion
                             // to avoid CAS conflicts when other controllers have
