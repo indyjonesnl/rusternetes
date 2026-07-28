@@ -1,0 +1,195 @@
+name: vanilla-swap-module (reusable)
+
+# Reusable single-module vanilla-swap engine. Stands up an UNMODIFIED upstream
+# Kubernetes cluster (kind) and swaps in exactly ONE rusternetes component, then
+# runs the test subset scoped to that component. Because every other participant
+# is known-good upstream software, any failure is attributable to that module.
+#
+# ONE module per workflow run — deliberately not a matrix. The thin per-module
+# callers (.github/workflows/vanilla-swap-<module>.yml, generated from
+# ci/vanilla-swap/targets.json by scripts/gen-vanilla-swap-workflows.sh) invoke
+# this with their `module`. It is also directly workflow_dispatch-able for
+# ad-hoc runs of any module.
+#
+# See specs/003-vanilla-module-swap/ and docs/testing/vanilla-module-swap.md.
+
+on:
+  workflow_call:
+    inputs:
+      module:
+        description: "Module to isolate (must exist in ci/vanilla-swap/targets.json)"
+        required: true
+        type: string
+      image-tag:
+        description: "GHCR rusternetes image tag to swap in"
+        required: false
+        type: string
+        default: main
+      k8s-version:
+        description: "Vanilla baseline Kubernetes version"
+        required: false
+        type: string
+        default: v1.35
+      publish-badge:
+        description: "Publish the module's pass-rate badge"
+        required: false
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      module:
+        description: "Module to isolate (must exist in ci/vanilla-swap/targets.json)"
+        required: true
+        type: choice
+        options: ["kubelet", "api-server", "scheduler", "controller-manager", "kube-proxy"]
+      image-tag:
+        description: "GHCR rusternetes image tag to swap in"
+        required: false
+        type: string
+        default: main
+      k8s-version:
+        description: "Vanilla baseline Kubernetes version"
+        required: false
+        type: string
+        default: v1.35
+      publish-badge:
+        description: "Publish the module's pass-rate badge"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  swap:
+    name: ${{ inputs.module }}
+    runs-on: arc-runner-set-conformance
+    # contents:write lets the badge step push to the orphan `badges` branch
+    # (best-effort; never fails the run).
+    permissions:
+      contents: write
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Tool prereqs (fail fast — no apt-get install)
+        run: |
+          set -euo pipefail
+          for t in docker jq curl tar; do
+            command -v "$t" >/dev/null 2>&1 || { echo "missing required tool: $t"; exit 1; }
+          done
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install kind + kubectl + hydrophone (download only, no sudo)
+        run: |
+          set -euo pipefail
+          bin="$HOME/.local/bin"
+          if ! command -v kind >/dev/null 2>&1; then
+            curl -fsSLo "$bin/kind" https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64
+            chmod +x "$bin/kind"
+          fi
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -fsSLo "$bin/kubectl" "https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl"
+            chmod +x "$bin/kubectl"
+          fi
+          if ! command -v hydrophone >/dev/null 2>&1; then
+            # The ARC runner image intentionally has no Go toolchain. Use the
+            # upstream release artifact, as the other conformance harnesses do,
+            # so this step remains download-only and does not depend on sudo.
+            hydrophone_version="v0.7.0"
+            hydrophone_archive="$bin/hydrophone.tar.gz"
+            curl -fsSLo "$hydrophone_archive" \
+              "https://github.com/kubernetes-sigs/hydrophone/releases/download/${hydrophone_version}/hydrophone_Linux_x86_64.tar.gz"
+            tar -xzf "$hydrophone_archive" -C "$bin" hydrophone
+            rm -f "$hydrophone_archive"
+            chmod +x "$bin/hydrophone"
+          fi
+          kind version || true
+          kubectl version --client || true
+          hydrophone version || true
+
+      - name: Isolate module '${{ inputs.module }}' in a vanilla cluster
+        env:
+          MODULE: ${{ inputs.module }}
+          K8S_VERSION: ${{ inputs.k8s-version }}
+          RUSTERNETES_IMAGE_TAG: ${{ inputs.image-tag }}
+          CONTAINER_RUNTIME: docker
+        run: |
+          set -euo pipefail
+          bash scripts/vanilla-swap-run.sh --module "$MODULE" --env ci --k8s-version "$K8S_VERSION"
+
+      - name: Collect run result
+        id: result
+        if: always()
+        env:
+          MODULE: ${{ inputs.module }}
+        run: |
+          set -uo pipefail
+          # The harness writes run-result.json into a fresh mktemp work dir; take
+          # the newest one for this module (glob + stat, not `ls`: SC2012). A
+          # missing/empty file means the run died before emitting a verdict
+          # (runner OOM, timeout, tool failure).
+          f=""; newest=0
+          for cand in /tmp/vanilla-swap-"$MODULE".*/run-result.json; do
+            [ -f "$cand" ] || continue
+            mtime="$(stat -c %Y "$cand" 2>/dev/null || echo 0)"
+            if [ "$mtime" -ge "$newest" ]; then newest="$mtime"; f="$cand"; fi
+          done
+          if [ -n "$f" ] && [ -s "$f" ]; then
+            outcome="$(jq -r '.outcome // "unknown"' "$f")"
+            passed="$(jq -r '.passed // 0' "$f")"
+            total="$(jq -r '.total // 0' "$f")"
+            cat "$f"
+          else
+            outcome="no-result"; passed=0; total=0
+            echo "no run-result.json found for $MODULE"
+          fi
+          {
+            echo "outcome=$outcome"
+            echo "passed=$passed"
+            echo "total=$total"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update module badge
+        # Best-effort: never reddens the run. A run that produced no counts
+        # (module-did-not-come-up, guard-rejected, no-result) publishes an
+        # explicit red status badge rather than leaving the previous — and by
+        # then misleading — green pass rate in place.
+        if: ${{ always() && inputs.publish-badge }}
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODULE: ${{ inputs.module }}
+          OUTCOME: ${{ steps.result.outputs.outcome }}
+          PASSED: ${{ steps.result.outputs.passed }}
+          TOTAL: ${{ steps.result.outputs.total }}
+        run: |
+          set -uo pipefail
+          slug="vanilla-swap-$MODULE"
+          label="vanilla $MODULE"
+          if [ "${TOTAL:-0}" -gt 0 ]; then
+            bash scripts/update-badge.sh "$slug" "$label" "$PASSED" "$TOTAL"
+          else
+            bash scripts/update-badge.sh --status "$slug" "$label" "${OUTCOME:-no-result}" red
+          fi
+
+      - name: Publish run result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vanilla-swap-${{ inputs.module }}-result
+          path: /tmp/vanilla-swap-${{ inputs.module }}.*/run-result.json
+          if-no-files-found: warn
+
+      # Teardown is unconditional inside the harness (trap on EXIT); this belt-and-
+      # braces step removes anything left if the runner killed the harness.
+      - name: Ensure teardown
+        if: always()
+        env:
+          MODULE: ${{ inputs.module }}
+        run: |
+          kind delete cluster --name "vanilla-swap-$MODULE" >/dev/null 2>&1 || true
+          docker ps -aq --filter "label=rusternetes-swap-cluster=vanilla-swap-$MODULE" \
+            | xargs -r docker rm -f >/dev/null 2>&1 || true
