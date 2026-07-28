@@ -164,12 +164,41 @@ services:
     privileged: true
     networks:
       - rusternetes-net
+    environment:
+      # CNI config comes from kube-proxy's node-network agent (per-node podCIDR).
+      - CNI_CONF_FROM_NODE_IPAM=1
     volumes:
       - containerd-run:/run/containerd
       # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
       # filesystem, not the container's own overlay rootfs — nested overlay
       # mounts fail with "invalid argument". A named volume is host-fs-backed.
       - containerd-data:/var/lib/containerd
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
+      - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
+
+  # node-2's CRI runtime. Each node owns a containerd (and thus a network
+  # namespace, a cni0 bridge and an iptables table) so the two nodes are
+  # really separate nodes (#1691). Pod CIDRs come from node-ipam, and
+  # kube-proxy's node-network agent writes each node's CNI conflist +
+  # host-gw routes to the other node's pod CIDR.
+  containerd2:
+    image: rusternetes-containerd:latest
+    build:
+      context: .
+      dockerfile: containerd.Dockerfile
+    container_name: rusternetes-containerd2
+    restart: unless-stopped
+    privileged: true
+    networks:
+      - rusternetes-net
+    environment:
+      - CNI_CONF_FROM_NODE_IPAM=1
+    volumes:
+      - containerd-run2:/run/containerd
+      # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
+      # filesystem, not the container's own overlay rootfs — nested overlay
+      # mounts fail with "invalid argument". A named volume is host-fs-backed.
+      - containerd-data2:/var/lib/containerd
       - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
       - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
 
@@ -189,8 +218,13 @@ services:
       - rhino
       - api-server
       - containerd
-    networks:
-      - rusternetes-net
+    # One netns per node (#1691): the kubelet shares its runtime's network
+    # namespace, so the InternalIP it advertises is the address pods actually
+    # see. With separate netns the node IP existed nowhere pods could bind it,
+    # and `curl --interface <nodeIP>` from a hostNetwork pod failed with
+    # "Address not available" ([sig-network] HostPort). Upstream co-locates
+    # kubelet, runtime and kube-proxy on the node for the same reason.
+    network_mode: "service:containerd"
     volumes:
       - containerd-run:/run/containerd
       # rshared so tmpfs mounts the kubelet makes for Memory-medium emptyDir
@@ -236,11 +270,11 @@ services:
     depends_on:
       - rhino
       - api-server
-      - containerd
-    networks:
-      - rusternetes-net
+      - containerd2
+    # node-2's own netns, owned by its own containerd (#1691).
+    network_mode: "service:containerd2"
     volumes:
-      - containerd-run:/run/containerd
+      - containerd-run2:/run/containerd
       # rshared so tmpfs mounts the kubelet makes for Memory-medium emptyDir
       # volumes propagate back to the host mount namespace, where the Docker
       # daemon resolves the app-container bind mounts. Without shared
@@ -289,7 +323,38 @@ services:
       - ./.rusternetes/certs:/etc/kubernetes/pki:ro
     environment:
       - RUST_LOG=info
-    command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf"]
+    command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf", "--configure-node-network", "--pod-cidr", "10.244.0.0/16"]
+
+  # node-2's kube-proxy + node-network agent, in node-2's netns (#1691).
+  kube-proxy2:
+    build:
+      context: .
+      dockerfile: services.Dockerfile
+      additional_contexts:
+        rhino: ./rhino
+      args: *sccache-args
+      target: kube-proxy
+    container_name: rusternetes-kube-proxy2
+    restart: unless-stopped
+    privileged: true
+    network_mode: "service:containerd2"
+    user: "0:0"
+    depends_on:
+      - containerd2
+      - api-server
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+    volumes:
+      # Kernel module tree so kube-proxy can `modprobe br_netfilter` + enable the
+      # bridge-nf-call-iptables sysctl (see crates/kube-proxy/src/iptables.rs).
+      - /lib/modules:/lib/modules:ro
+      # kube-proxy.conf (CA-only kubeconfig) for API mode — see generate-certs.sh.
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+    environment:
+      - RUST_LOG=info
+    command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf", "--configure-node-network", "--pod-cidr", "10.244.0.0/16"]
 
   # DNS image, build-only. The dns binary runs as a kube-system Deployment
   # (bootstrap-dns.yaml, applied by bootstrap-cluster.sh) reading cluster
@@ -321,3 +386,8 @@ volumes:
   # overlayfs snapshotter works inside the Docker-hosted containerd.
   containerd-data:
     name: rusternetes-containerd-data
+  # node-2's runtime keeps its own CRI socket and snapshotter root.
+  containerd-run2:
+    name: rusternetes-containerd-run2
+  containerd-data2:
+    name: rusternetes-containerd-data2

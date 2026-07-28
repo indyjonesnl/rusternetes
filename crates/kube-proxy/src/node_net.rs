@@ -152,3 +152,175 @@ pub fn no_masq_rules(no_masq_cidrs: &[&str]) -> Vec<String> {
 fn is_ipv4_cidr(cidr: &str) -> bool {
     !cidr.is_empty() && !cidr.contains(':')
 }
+
+// ---------------------------------------------------------------------------
+// Applying the computed state
+// ---------------------------------------------------------------------------
+
+use std::process::Command;
+use tracing::{debug, info, warn};
+
+/// What the node-network agent needs to know about itself.
+#[derive(Debug, Clone)]
+pub struct NodeNetConfig {
+    /// This node's name, matched against `metadata.name` when picking our Node.
+    pub node_name: String,
+    /// Where to write the CNI conflist (the dir containerd watches).
+    pub cni_conf_path: String,
+    /// CIDRs whose traffic must not be masqueraded — the cluster pod CIDR and
+    /// the Service CIDR.
+    pub no_masq_cidrs: Vec<String>,
+}
+
+/// Chain holding the node's masquerade policy, hooked into POSTROUTING.
+pub const MASQ_CHAIN: &str = "RUSTERNETES-MASQ";
+
+/// Write `conflist` to `path` when it differs from what is already there.
+/// Returns whether a write happened.
+///
+/// Rewriting an identical file would make containerd's CNI fsnotify watcher
+/// reload the network config on every sync tick.
+/// kindnetd ref: `cni.go:123` — "CNIConfigWriter no-ops re-writing config with
+/// the same inputs".
+pub fn write_conflist_if_changed(path: &str, conflist: &str) -> std::io::Result<bool> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if existing == conflist {
+            return Ok(false);
+        }
+    }
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, conflist)?;
+    Ok(true)
+}
+
+/// Install `route` with `ip route replace`, which is idempotent and also
+/// corrects a route to the same destination that points at a stale gateway
+/// (kindnetd deletes-then-adds for the same reason — `routes.go:47-60`).
+fn apply_route(route: &Route) {
+    let out = Command::new("ip")
+        .args(["route", "replace", &route.dst, "via", &route.gw])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            debug!("ensured route {} via {}", route.dst, route.gw);
+        }
+        Ok(o) => warn!(
+            "failed to add route {} via {}: {}",
+            route.dst,
+            route.gw,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => warn!("failed to exec ip route for {}: {}", route.dst, e),
+    }
+}
+
+/// Rebuild the masquerade chain so cluster-internal traffic keeps its source IP.
+/// Flushed and refilled each sync so a changed CIDR list converges.
+fn sync_masq_chain(cfg: &NodeNetConfig) {
+    let cidrs: Vec<&str> = cfg.no_masq_cidrs.iter().map(String::as_str).collect();
+    let _ = Command::new("iptables")
+        .args(["-t", "nat", "-N", MASQ_CHAIN])
+        .output();
+    let _ = Command::new("iptables")
+        .args(["-t", "nat", "-F", MASQ_CHAIN])
+        .output();
+
+    for rule in no_masq_rules(&cidrs) {
+        // Each rule body is a shell-free argv already; split on spaces except
+        // inside the quoted comment.
+        let args = split_rule(&rule);
+        let mut argv: Vec<&str> = vec!["-t", "nat", "-A", MASQ_CHAIN];
+        argv.extend(args.iter().map(String::as_str));
+        if let Ok(o) = Command::new("iptables").args(&argv).output() {
+            if !o.status.success() {
+                warn!(
+                    "failed to add masq rule {:?}: {}",
+                    rule,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+            }
+        }
+    }
+
+    // Hook it into POSTROUTING once, ahead of the bridge plugin's own ipMasq
+    // rule (which would otherwise masquerade cross-node pod traffic first).
+    // kindnetd ref: portmap/kindnet both prepend for this reason.
+    let present = Command::new("iptables")
+        .args(["-t", "nat", "-C", "POSTROUTING", "-j", MASQ_CHAIN])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !present {
+        let _ = Command::new("iptables")
+            .args(["-t", "nat", "-I", "POSTROUTING", "1", "-j", MASQ_CHAIN])
+            .output();
+    }
+}
+
+/// Split a rule body into argv, keeping a `"quoted comment"` as one argument.
+fn split_rule(rule: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for c in rule.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ' ' if !in_quotes => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// One reconcile pass over `nodes`: write our CNI config, install host-gw routes
+/// to the other nodes' pod CIDRs, and refresh the masquerade chain.
+///
+/// A node with no pod CIDR yet is a no-op, not an error: kube-controller-manager
+/// assigns CIDRs asynchronously, and writing a guessed conflist would hand pods
+/// addresses from a subnet no other node routes to.
+///
+/// kindnetd ref: `main.go:313` `makeNodesReconciler`.
+pub fn reconcile_node_network(nodes: &[Node], cfg: &NodeNetConfig) {
+    let Some(self_node) = nodes.iter().find(|n| n.metadata.name == cfg.node_name) else {
+        debug!(
+            "node {} not registered yet; skipping node-network sync",
+            cfg.node_name
+        );
+        return;
+    };
+
+    match pod_cidr_for(self_node) {
+        Some(pod_cidr) => {
+            match write_conflist_if_changed(&cfg.cni_conf_path, &cni_conflist(pod_cidr)) {
+                Ok(true) => info!(
+                    "wrote CNI config for pod CIDR {} to {}",
+                    pod_cidr, cfg.cni_conf_path
+                ),
+                Ok(false) => {}
+                Err(e) => warn!("failed to write CNI config {}: {}", cfg.cni_conf_path, e),
+            }
+        }
+        None => {
+            info!(
+                "node {} has no podCIDR yet (is --allocate-node-cidrs set on the controller-manager?); \
+                 pods stay pending until it is assigned",
+                cfg.node_name
+            );
+        }
+    }
+
+    for route in desired_routes(nodes, &cfg.node_name) {
+        apply_route(&route);
+    }
+
+    sync_masq_chain(cfg);
+}

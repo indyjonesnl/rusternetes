@@ -22,6 +22,11 @@ pub struct KubeProxyConfig {
     /// NodePort range in iptables `start:end` form — must match the
     /// apiserver's `--service-node-port-range`. Defaults to `30000:32767`.
     pub nodeport_range: String,
+    /// When set, kube-proxy also acts as the node's network agent: it writes the
+    /// CNI conflist for this node's `spec.podCIDR`, installs host-gw routes to
+    /// the other nodes' pod CIDRs, and keeps cluster traffic out of the
+    /// masquerade path. Upstream analogue: kindnetd (see [`node_net`]).
+    pub node_net: Option<node_net::NodeNetConfig>,
 }
 
 impl Default for KubeProxyConfig {
@@ -31,6 +36,7 @@ impl Default for KubeProxyConfig {
             sync_interval: 1,
             cluster_cidr: iptables::DEFAULT_CLUSTER_CIDR.to_string(),
             nodeport_range: iptables::DEFAULT_NODEPORT_RANGE.to_string(),
+            node_net: None,
         }
     }
 }
@@ -84,6 +90,40 @@ async fn run_proxy<S: Storage + Send + Sync + 'static>(
 
     info!("Kube-proxy initialized successfully");
     info!("Syncing services every {} seconds", config.sync_interval);
+
+    // Node-network agent (kindnetd equivalent): per-node CNI config + host-gw
+    // routes + masquerade policy, driven by node.spec.podCIDR. Runs on its own
+    // ticker so a slow Service sync never stalls pod networking.
+    if let Some(node_net_cfg) = config.node_net.clone() {
+        let node_storage = Arc::clone(&storage);
+        let tick = tokio::time::Duration::from_secs(config.sync_interval.max(1));
+        info!(
+            "Node-network agent enabled for {} (cni config: {})",
+            node_net_cfg.node_name, node_net_cfg.cni_conf_path
+        );
+        tokio::spawn(async move {
+            loop {
+                match node_storage
+                    .list::<rusternetes_common::resources::Node>("/registry/nodes/")
+                    .await
+                {
+                    Ok(nodes) => {
+                        let cfg = node_net_cfg.clone();
+                        // iptables / ip route are blocking syscalls.
+                        if let Err(e) = tokio::task::spawn_blocking(move || {
+                            node_net::reconcile_node_network(&nodes, &cfg)
+                        })
+                        .await
+                        {
+                            warn!("node-network reconcile task failed: {}", e);
+                        }
+                    }
+                    Err(e) => warn!("node-network: failed to list nodes: {}", e),
+                }
+                tokio::time::sleep(tick).await;
+            }
+        });
+    }
 
     let sync_interval = tokio::time::Duration::from_secs(config.sync_interval);
 

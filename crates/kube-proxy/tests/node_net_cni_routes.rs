@@ -184,3 +184,40 @@ fn no_masq_rules_return_cluster_traffic_before_masquerading() {
         "pod CIDR must be exempt from masquerade: {rules:?}"
     );
 }
+
+/// Rewriting the same conflist must be a no-op: containerd watches the CNI conf
+/// dir with fsnotify and reloads its network config on every write, so a sync
+/// loop that rewrites unconditionally would churn the runtime's CNI state every
+/// tick.
+///
+/// kindnetd ref: `cni.go:123` — "CNIConfigWriter no-ops re-writing config with
+/// the same inputs".
+#[test]
+fn conflist_write_is_a_noop_when_unchanged() {
+    let dir = std::env::temp_dir().join(format!("rn-conflist-{}", std::process::id()));
+    let path = dir.join("10-rusternetes.conflist");
+    let path_str = path.to_string_lossy().to_string();
+    let conf = cni_conflist("10.244.2.0/24");
+
+    // First write creates it (including the parent dir).
+    assert!(
+        rusternetes_kube_proxy::node_net::write_conflist_if_changed(&path_str, &conf).unwrap(),
+        "first write must happen"
+    );
+    // Identical content -> no write.
+    assert!(
+        !rusternetes_kube_proxy::node_net::write_conflist_if_changed(&path_str, &conf).unwrap(),
+        "identical conflist must not be rewritten"
+    );
+    // A reassigned pod CIDR -> write.
+    assert!(
+        rusternetes_kube_proxy::node_net::write_conflist_if_changed(
+            &path_str,
+            &cni_conflist("10.244.3.0/24")
+        )
+        .unwrap(),
+        "changed pod CIDR must be written"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

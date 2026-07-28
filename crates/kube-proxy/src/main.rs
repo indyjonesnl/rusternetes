@@ -72,6 +72,24 @@ struct Args {
     /// kubeconfig CA normally validates the self-signed cert).
     #[arg(long)]
     insecure_skip_tls_verify: bool,
+
+    /// Also run the node-network agent: write this node's CNI conflist from its
+    /// `spec.podCIDR`, install host-gw routes to the other nodes' pod CIDRs, and
+    /// keep cluster traffic out of the masquerade path. Requires the
+    /// controller-manager to run with `--allocate-node-cidrs`.
+    /// Upstream analogue: kindnetd.
+    #[arg(long)]
+    configure_node_network: bool,
+
+    /// Path of the CNI conflist to write when `--configure-node-network` is set.
+    /// Must be in the conf dir the container runtime watches.
+    #[arg(long, default_value = "/etc/cni/net.d/10-rusternetes.conflist")]
+    cni_conf_path: String,
+
+    /// Cluster-wide pod CIDR (the controller-manager's `--cluster-cidr`). Used as
+    /// a no-masquerade CIDR so cross-node pod traffic keeps its source IP.
+    #[arg(long, default_value = "10.244.0.0/16")]
+    pod_cidr: String,
 }
 
 #[tokio::main]
@@ -91,6 +109,15 @@ async fn main() -> Result<()> {
         // Accept hyphen form (`30000-32767`) as a convenience — k8s and Go
         // flags use the hyphen, iptables wants the colon. Normalize here.
         nodeport_range: args.node_port_range.replace('-', ":"),
+        // Cluster pod CIDR and Service CIDR both keep their source IPs; only
+        // egress off-cluster is masqueraded (kindnetd masq.go:105).
+        node_net: args.configure_node_network.then(|| {
+            rusternetes_kube_proxy::node_net::NodeNetConfig {
+                node_name: args.node_name.clone(),
+                cni_conf_path: args.cni_conf_path.clone(),
+                no_masq_cidrs: vec![args.pod_cidr.clone(), args.cluster_cidr.clone()],
+            }
+        }),
     };
 
     // In-cluster path: read cluster state from the api-server (no storage handle).

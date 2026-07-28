@@ -26,4 +26,17 @@ if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
     done
 fi
 
+# Multi-node stacks derive the CNI config from node-ipam: kube-proxy's
+# node-network agent writes /etc/cni/net.d/10-rusternetes.conflist from this
+# node's spec.podCIDR (#1691). Drop the image's cluster-wide fallback first, or
+# a pod scheduled before the agent's first sync would get an address out of the
+# whole 10.244.0.0/16 — i.e. possibly another node's subnet, which nothing
+# routes to. Pods stay Pending (CNI conf absent) until the real config lands,
+# which is the safe failure mode. Single-node stacks leave this unset and keep
+# using the baked conflist.
+if [ -n "${CNI_CONF_FROM_NODE_IPAM:-}" ]; then
+    rm -f /etc/cni/net.d/10-rusternetes.conflist
+    echo "entrypoint: removed fallback CNI conflist; waiting for the node-network agent"
+fi
+
 exec /usr/local/bin/containerd --config /etc/containerd/config.toml
