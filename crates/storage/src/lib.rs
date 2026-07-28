@@ -512,6 +512,11 @@ impl StorageBackend {
     /// via `serviceaccounts/{name}/token` rather than signing them, so the
     /// tokens are accepted by the (possibly foreign/vanilla) api-server that
     /// issued them.
+    ///
+    /// `bound_pod` is the `(name, uid)` of the pod mounting the token; it binds
+    /// the token to that pod via `spec.boundObjectRef` so the api-server stamps
+    /// the pod/node claims a TokenReview reports as
+    /// `authentication.kubernetes.io/pod-name` & friends (#1684).
     #[cfg_attr(not(feature = "api-client"), allow(unused_variables))]
     pub async fn create_sa_token(
         &self,
@@ -519,11 +524,12 @@ impl StorageBackend {
         name: &str,
         audiences: &[String],
         expiration_seconds: i64,
+        bound_pod: Option<(&str, &str)>,
     ) -> Result<Option<String>> {
         #[cfg(feature = "api-client")]
         if let StorageBackend::Api(s) = self {
             return s
-                .create_sa_token(namespace, name, audiences, expiration_seconds)
+                .create_sa_token(namespace, name, audiences, expiration_seconds, bound_pod)
                 .await
                 .map(Some);
         }

@@ -122,18 +122,43 @@ impl ApiStorage {
     /// never self-signs. An api-server only trusts tokens IT signed, so a
     /// kubelet that self-mints is rejected (401) by a foreign/vanilla api-server
     /// (breaks in-cluster clients like kindnet). Returns the issued token.
+    ///
+    /// `bound_pod` is the `(name, uid)` of the pod that mounts the token. When
+    /// set it becomes `spec.boundObjectRef`, matching upstream's projected
+    /// volume plugin (`pkg/volume/projected/projected.go`:
+    /// `BoundObjectRef{APIVersion: "v1", Kind: "Pod", Name, UID}`). The
+    /// api-server derives the token's pod/node claims from that ref, which is
+    /// what surfaces as the `authentication.kubernetes.io/pod-name`,
+    /// `pod-uid` and `node-name` extras on a TokenReview (#1684). Callers with
+    /// no owning pod pass `None`, which omits the ref.
     pub async fn create_sa_token(
         &self,
         namespace: &str,
         name: &str,
         audiences: &[String],
         expiration_seconds: i64,
+        bound_pod: Option<(&str, &str)>,
     ) -> Result<String> {
         let path = format!("/api/v1/namespaces/{namespace}/serviceaccounts/{name}/token");
+        let mut spec = serde_json::json!({
+            "audiences": audiences,
+            "expirationSeconds": expiration_seconds,
+        });
+        if let (Some((pod_name, pod_uid)), Some(spec_obj)) = (bound_pod, spec.as_object_mut()) {
+            spec_obj.insert(
+                "boundObjectRef".to_string(),
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "name": pod_name,
+                    "uid": pod_uid,
+                }),
+            );
+        }
         let body = serde_json::json!({
             "apiVersion": "authentication.k8s.io/v1",
             "kind": "TokenRequest",
-            "spec": { "audiences": audiences, "expirationSeconds": expiration_seconds },
+            "spec": spec,
         });
         let resp: Value = self
             .client
@@ -1098,7 +1123,7 @@ mod tests {
         let storage = ApiStorage::new(client);
 
         let tok = storage
-            .create_sa_token("kube-system", "kindnet", &[], 3600)
+            .create_sa_token("kube-system", "kindnet", &[], 3600, None)
             .await
             .expect("token issued");
         assert_eq!(tok, "ISSUED-BY-APISERVER");
@@ -1114,6 +1139,75 @@ mod tests {
         assert!(
             req.contains("\"expirationSeconds\":3600"),
             "request body must carry expirationSeconds, got: {req}"
+        );
+    }
+
+    // Regression for #1684: a projected SA token must be bound to the pod that
+    // mounts it. Upstream's projected volume plugin sets
+    // `spec.boundObjectRef = {apiVersion: v1, kind: Pod, name, uid}`
+    // (pkg/volume/projected/projected.go), which is what makes the api-server
+    // put `authentication.kubernetes.io/pod-name` / `pod-uid` / `node-name`
+    // into the TokenReview's `status.user.extra`. Without the ref the issued
+    // token carries no pod claims and `[sig-auth] ServiceAccounts should mount
+    // an API token into pods [Conformance]` fails with
+    // "expected single authentication.kubernetes.io/pod-name extra info item".
+    #[tokio::test]
+    async fn create_sa_token_binds_the_token_to_the_pod() {
+        let (base, captured) = spawn_tokenrequest_server("BOUND-TOKEN").await;
+        let client = Arc::new(ApiClient::new(&base, true, None).unwrap());
+        let storage = ApiStorage::new(client);
+
+        let tok = storage
+            .create_sa_token(
+                "svcaccounts-5118",
+                "default",
+                &[],
+                3600,
+                Some(("pod-service-account-601cae9b", "9a1f0e2c-uid")),
+            )
+            .await
+            .expect("token issued");
+        assert_eq!(tok, "BOUND-TOKEN");
+
+        let req = captured.lock().await.clone();
+        let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+        let spec: Value = serde_json::from_str(body).unwrap_or_else(|e| {
+            panic!("TokenRequest body must be JSON ({e}), got: {body}");
+        });
+        let bound = &spec["spec"]["boundObjectRef"];
+        assert_eq!(bound["kind"], "Pod", "boundObjectRef.kind, got: {spec}");
+        assert_eq!(
+            bound["apiVersion"], "v1",
+            "boundObjectRef.apiVersion, got: {spec}"
+        );
+        assert_eq!(
+            bound["name"], "pod-service-account-601cae9b",
+            "boundObjectRef.name, got: {spec}"
+        );
+        assert_eq!(
+            bound["uid"], "9a1f0e2c-uid",
+            "boundObjectRef.uid, got: {spec}"
+        );
+    }
+
+    // A token requested with no owning pod (non-volume callers) must omit the
+    // ref entirely rather than send an empty one — the api-server rejects a
+    // boundObjectRef with no name.
+    #[tokio::test]
+    async fn create_sa_token_without_pod_omits_bound_object_ref() {
+        let (base, captured) = spawn_tokenrequest_server("UNBOUND-TOKEN").await;
+        let client = Arc::new(ApiClient::new(&base, true, None).unwrap());
+        let storage = ApiStorage::new(client);
+
+        storage
+            .create_sa_token("kube-system", "kindnet", &[], 3600, None)
+            .await
+            .expect("token issued");
+
+        let req = captured.lock().await.clone();
+        assert!(
+            !req.contains("boundObjectRef"),
+            "unbound TokenRequest must not carry a boundObjectRef, got: {req}"
         );
     }
 
