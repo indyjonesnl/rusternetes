@@ -1865,13 +1865,13 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             "/apis/certificates.k8s.io/v1/certificatesigningrequests/:name/status",
             get(handlers::certificates::get_certificate_signing_request_status)
                 .put(handlers::certificates::update_certificate_signing_request_status)
-                .patch(handlers::certificates::update_certificate_signing_request_status),
+                .patch(handlers::certificates::patch_certificate_signing_request_status),
         )
         .route(
             "/apis/certificates.k8s.io/v1/certificatesigningrequests/:name/approval",
             get(handlers::certificates::get_certificate_signing_request)
                 .put(handlers::certificates::approve_certificate_signing_request)
-                .patch(handlers::certificates::patch_certificate_signing_request),
+                .patch(handlers::certificates::patch_certificate_signing_request_approval),
         )
         // Discovery API - EndpointSlices (namespace-scoped)
         .route(

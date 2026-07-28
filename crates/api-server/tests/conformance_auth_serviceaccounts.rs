@@ -895,6 +895,253 @@ async fn csr_full_lifecycle_with_signer_issues_certificate() {
     );
 }
 
+/// Full CSR API-operations surface, mirroring the upstream conformance case
+/// `[sig-auth] Certificates API [Privileged:ClusterAdmin] should support CSR
+/// API operations [Conformance]` (test/e2e/auth/certificates.go). Exercises, in
+/// the same order upstream does: create ×3 via `generateName`, get, filtered
+/// list on `spec.signerName`, main-resource patch + update, the `/approval`
+/// get + patch + update, the `/status` get + patch + update, delete, and
+/// deletecollection with a field selector.
+///
+/// Regression guard for #1607: the `/status` and `/approval` PATCH routes used
+/// to reuse the PUT (full-object-replace) handlers, so a partial `/status`
+/// patch that only set `status.certificate` dropped the Approved condition an
+/// earlier `/approval` step had added and was rejected with "updates may not
+/// remove a condition of type \"Approved\"". They now apply a genuine
+/// merge/JSON patch onto the stored object and run the subresource validator.
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/auth/certificates.go
+#[tokio::test]
+async fn csr_api_operations_full_surface() {
+    // A valid base64-encoded PKCS#10 CSR PEM (same fixture the sibling CSR
+    // tests use); the create/update validators base64-decode and parse it.
+    const REQUEST_PEM: &str = "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0KTUlIc01JR1RBZ0VBTURFeEdUQVhCZ05WQkFNTUVIUmxjM1F1WlhoaGJYQnNaUzVqYjIweEZEQVNCZ05WQkFvTQpDM0oxYzNSbGNtNWxkR1Z6TUZrd0V3WUhLb1pJemowQ0FRWUlLb1pJemowREFRY0RRZ0FFL2k2cjBkem16d3dRCnFWTXhSTDlkK2MwOE5VNzNCVTRjNzRFVS9GazgxVGI0UVFJMWhHNVE3U3hocklaUjIzQ3NMTFFEaFNJUitweHgKODhiSkpaNzRJYUFBTUFvR0NDcUdTTTQ5QkFNQ0EwZ0FNRVVDSUgvbE5mWkdDOUtsTlgzRmh5M0tzTFhzVituSApZMlRybGRabWo5Zm5rTVVjQWlFQW4xRTM4S0hLb050NUl6aFVSVWZPRDdlNTB1aDBVcjVBNTdzcDU5b2gyQTA9Ci0tLS0tRU5EIENFUlRJRklDQVRFIFJFUVVFU1QtLS0tLQo=";
+    // A real self-signed leaf's PEM, base64-encoded — the status validator
+    // x509-parses each CERTIFICATE block, so a placeholder would be rejected.
+    const ISSUED_CERT_PEM: &str = "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUJmRENDQVNHZ0F3SUJBZ0lVRmJPakN5UUNnWEMrL0ZvREFWWTgrT0FXSFM0d0NnWUlLb1pJemowRUF3SXcKRXpFUk1BOEdBMVVFQXd3SVpUSmxMV3hsWVdZd0hoY05Nall3TmpJeE1qSXlNRFV6V2hjTk16WXdOakU0TWpJeQpNRFV6V2pBVE1SRXdEd1lEVlFRRERBaGxNbVV0YkdWaFpqQlpNQk1HQnlxR1NNNDlBZ0VHQ0NxR1NNNDlBd0VICkEwSUFCTStKZ3M4elVMZHVlcHZSK2xFMEptVTRkK1Q4c3dndnUwK1FzU0sxM1hCNXE4ZXFjRlFTYkdPKzI2WnQKYjB6QkNsS0pqS2kxM2NabTY1QW5JL3h6OVIyalV6QlJNQjBHQTFVZERnUVdCQlF0YnFBRVozQklobVZkeldGeApwZXdQcEs4eUVqQWZCZ05WSFNNRUdEQVdnQlF0YnFBRVozQklobVZkeldGeHBld1BwSzh5RWpBUEJnTlZIUk1CCkFmOEVCVEFEQVFIL01Bb0dDQ3FHU000OUJBTUNBMGtBTUVZQ0lRRC9RVW85b1BBMGR0TVFta3VTTkN3Q25CUTAKN2gzSDFNQXdlM3pqSFk1ZWpBSWhBS2pMOGlsOUh6WU9VRXJHQk9aa1dSdkV1N21ISjdRM0VUWXRJZWhYRC9BcAotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==";
+    const SIGNER: &str = "example.com/e2e-csr-1607";
+    const COLLECTION: &str = "/apis/certificates.k8s.io/v1/certificatesigningrequests";
+
+    let (state, _) = spawn_state();
+
+    let template = json!({
+        "apiVersion": "certificates.k8s.io/v1",
+        "kind": "CertificateSigningRequest",
+        "metadata": {"generateName": "e2e-example-csr-"},
+        "spec": {
+            "request": REQUEST_PEM,
+            "signerName": SIGNER,
+            "expirationSeconds": 3600,
+            "usages": ["digital signature", "key encipherment", "server auth"]
+        }
+    });
+
+    // create ×3 — every create uses generateName, so each must get a unique,
+    // server-synthesised name.
+    let mut created = Value::Null;
+    for _ in 0..3 {
+        let (s, body) = post_json(state.clone(), COLLECTION, &template).await;
+        assert_eq!(s, 201, "CSR create must return 201: {body}");
+        created = body;
+    }
+    let name = created["metadata"]["name"]
+        .as_str()
+        .expect("created CSR must have a name")
+        .to_string();
+    assert!(
+        name.starts_with("e2e-example-csr-"),
+        "generateName prefix must be honored: {created}"
+    );
+
+    // get
+    let (s, got) = get_json(state.clone(), &format!("{COLLECTION}/{name}")).await;
+    assert_eq!(s, 200, "CSR get: {got}");
+    assert_eq!(got["metadata"]["uid"], created["metadata"]["uid"]);
+    assert_eq!(
+        got["spec"]["expirationSeconds"], 3600,
+        "expirationSeconds must round-trip: {got}"
+    );
+
+    // list filtered by spec.signerName → all three.
+    let (s, list) = get_json(
+        state.clone(),
+        &format!("{COLLECTION}?fieldSelector=spec.signerName%3D{SIGNER}"),
+    )
+    .await;
+    assert_eq!(s, 200, "filtered list: {list}");
+    assert_eq!(
+        list["items"].as_array().map(Vec::len),
+        Some(3),
+        "field-selector list must have 3 items: {list}"
+    );
+
+    // patch (main resource) — merge-patch an annotation.
+    let (s, patched) = patch_merge(
+        state.clone(),
+        &format!("{COLLECTION}/{name}"),
+        &json!({"metadata": {"annotations": {"patched": "true"}}}),
+    )
+    .await;
+    assert_eq!(s, 200, "main patch: {patched}");
+    assert_eq!(patched["metadata"]["annotations"]["patched"], "true");
+
+    // update (main resource) — add a second annotation via PUT.
+    let mut to_update = patched.clone();
+    to_update["metadata"]["annotations"]["updated"] = json!("true");
+    let (s, updated) = state.put(&format!("{COLLECTION}/{name}"), &to_update).await;
+    assert_eq!(s.as_u16(), 200, "main update: {updated}");
+    assert_eq!(updated["metadata"]["annotations"]["updated"], "true");
+
+    // GET /approval — must return a CertificateSigningRequest with the UID.
+    let (s, appr_get) = get_json(state.clone(), &format!("{COLLECTION}/{name}/approval")).await;
+    assert_eq!(s, 200, "get /approval: {appr_get}");
+    assert_eq!(appr_get["kind"], "CertificateSigningRequest");
+    assert_eq!(appr_get["apiVersion"], "certificates.k8s.io/v1");
+    assert_eq!(appr_get["metadata"]["uid"], created["metadata"]["uid"]);
+
+    // PATCH /approval — set an arbitrary condition + annotation.
+    let (s, appr_patched) = patch_merge(
+        state.clone(),
+        &format!("{COLLECTION}/{name}/approval"),
+        &json!({
+            "metadata": {"annotations": {"patchedapproval": "true"}},
+            "status": {"conditions": [{"type": "ApprovalPatch", "status": "True", "reason": "e2e"}]}
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "patch /approval: {appr_patched}");
+    let conds = appr_patched["status"]["conditions"]
+        .as_array()
+        .expect("conditions after /approval patch");
+    assert_eq!(
+        conds.len(),
+        1,
+        "one condition after /approval patch: {appr_patched}"
+    );
+    assert_eq!(conds[0]["type"], "ApprovalPatch");
+    assert_eq!(
+        appr_patched["metadata"]["annotations"]["patchedapproval"],
+        "true"
+    );
+
+    // PUT /approval — append the Approved condition.
+    let mut appr_update = appr_patched.clone();
+    appr_update["status"]["conditions"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "type": "Approved",
+            "status": "True",
+            "reason": "E2E",
+            "message": "Set from an e2e test"
+        }));
+    let (s, appr_updated) = state
+        .put(&format!("{COLLECTION}/{name}/approval"), &appr_update)
+        .await;
+    assert_eq!(s.as_u16(), 200, "update /approval: {appr_updated}");
+    let conds = appr_updated["status"]["conditions"].as_array().unwrap();
+    assert_eq!(
+        conds.len(),
+        2,
+        "two conditions after /approval update: {appr_updated}"
+    );
+    assert_eq!(conds[1]["type"], "Approved");
+
+    // GET /status.
+    let (s, stat_get) = get_json(state.clone(), &format!("{COLLECTION}/{name}/status")).await;
+    assert_eq!(s, 200, "get /status: {stat_get}");
+    assert_eq!(stat_get["kind"], "CertificateSigningRequest");
+    assert_eq!(stat_get["metadata"]["uid"], created["metadata"]["uid"]);
+
+    // PATCH /status — set the certificate; the Approved condition set by the
+    // /approval step above must be preserved (regression: full-object replace
+    // used to drop it and fail validation).
+    let (s, stat_patched) = patch_merge(
+        state.clone(),
+        &format!("{COLLECTION}/{name}/status"),
+        &json!({
+            "metadata": {"annotations": {"patchedstatus": "true"}},
+            "status": {"certificate": ISSUED_CERT_PEM}
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "patch /status: {stat_patched}");
+    assert_eq!(
+        stat_patched["status"]["certificate"], ISSUED_CERT_PEM,
+        "certificate must be applied via /status patch: {stat_patched}"
+    );
+    assert_eq!(
+        stat_patched["metadata"]["annotations"]["patchedstatus"],
+        "true"
+    );
+    assert_eq!(
+        stat_patched["status"]["conditions"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "the ApprovalPatch + Approved conditions must survive the /status patch: {stat_patched}"
+    );
+
+    // PUT /status — append a StatusUpdate condition.
+    let mut stat_update = stat_patched.clone();
+    stat_update["status"]["conditions"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "type": "StatusUpdate",
+            "status": "True",
+            "reason": "E2E",
+            "message": "Set from an e2e test"
+        }));
+    let (s, stat_updated) = state
+        .put(&format!("{COLLECTION}/{name}/status"), &stat_update)
+        .await;
+    assert_eq!(s.as_u16(), 200, "update /status: {stat_updated}");
+    let conds = stat_updated["status"]["conditions"].as_array().unwrap();
+    assert_eq!(
+        conds.len(),
+        3,
+        "three conditions after /status update: {stat_updated}"
+    );
+    assert_eq!(conds[2]["type"], "StatusUpdate");
+
+    // delete one → filtered list has two left.
+    let del = delete(state.clone(), &format!("{COLLECTION}/{name}")).await;
+    assert_eq!(del, 200, "CSR delete must return 200");
+    let (s, _) = get_json(state.clone(), &format!("{COLLECTION}/{name}")).await;
+    assert_eq!(s, 404, "deleted CSR must be gone");
+    let (s, list) = get_json(
+        state.clone(),
+        &format!("{COLLECTION}?fieldSelector=spec.signerName%3D{SIGNER}"),
+    )
+    .await;
+    assert_eq!(s, 200, "list after delete: {list}");
+    assert_eq!(
+        list["items"].as_array().map(Vec::len),
+        Some(2),
+        "two items remain after delete: {list}"
+    );
+
+    // deletecollection with the field selector → none left.
+    let del = delete(
+        state.clone(),
+        &format!("{COLLECTION}?fieldSelector=spec.signerName%3D{SIGNER}"),
+    )
+    .await;
+    assert_eq!(del, 200, "deletecollection must return 200");
+    let (s, list) = get_json(
+        state.clone(),
+        &format!("{COLLECTION}?fieldSelector=spec.signerName%3D{SIGNER}"),
+    )
+    .await;
+    assert_eq!(s, 200, "list after deletecollection: {list}");
+    assert_eq!(
+        list["items"].as_array().map(Vec::len),
+        Some(0),
+        "no items remain after deletecollection: {list}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // [sig-auth] SubjectReview should support SubjectReview API operations
 // [Conformance]
