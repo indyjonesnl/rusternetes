@@ -23,6 +23,49 @@ fi
 # helper: write a registry JSON to $TMP/reg.json and echo the path
 mkreg() { printf '%s' "$1" >"$TMP/reg.json"; printf '%s\n' "$TMP/reg.json"; }
 
+# --- render a recipe without envsubst --------------------------------------
+RENDER_RECIPE="$TMP/render-recipe.yaml"
+cat >"$RENDER_RECIPE" <<'YAML'
+template: |
+  image: ${VS_IMAGE}
+  server: ${VS_APISERVER_URL}
+  cidr: ${VS_CLUSTER_CIDR}
+  nodePorts: ${VS_NODEPORT_RANGE}
+  untouched: ${NOT_ALLOWED}
+nextField: outside-template
+YAML
+
+AWK_ONLY_BIN="$TMP/awk-only-bin"
+mkdir -p "$AWK_ONLY_BIN"
+ln -s "$(command -v awk)" "$AWK_ONLY_BIN/awk"
+
+VS_IMAGE="ghcr.io/indyjonesnl/rusternetes/kube-proxy:test"
+VS_APISERVER_URL="https://172.18.0.3:6443"
+VS_CLUSTER_CIDR="10.96.0.0/16"
+VS_NODEPORT_RANGE="30000-32767"
+EXPECTED_RENDER='image: ghcr.io/indyjonesnl/rusternetes/kube-proxy:test
+server: https://172.18.0.3:6443
+cidr: 10.96.0.0/16
+nodePorts: 30000-32767
+untouched: ${NOT_ALLOWED}'
+
+if RENDERED="$(PATH="$AWK_ONLY_BIN" vs_render_recipe_template "$RENDER_RECIPE" \
+  VS_IMAGE VS_APISERVER_URL VS_CLUSTER_CIDR VS_NODEPORT_RANGE)" \
+  && [ "$RENDERED" = "$EXPECTED_RENDER" ]; then
+  ok "recipe template renders without envsubst and preserves unlisted variables"
+else
+  bad "recipe template should render with only awk available"
+fi
+
+# --- unset requested template variable rejected ---------------------------
+unset VS_UNSET_RENDER_VALUE
+if (set +u; vs_render_recipe_template "$RENDER_RECIPE" VS_UNSET_RENDER_VALUE) \
+  >"$TMP/unset-render.out" 2>"$TMP/unset-render.err"; then
+  bad "unset requested template variable should be rejected"
+else
+  ok "unset requested template variable rejected"
+fi
+
 # --- duplicate module rejected --------------------------------------------
 DUP="$(mkreg '[
  {"module":"kubelet","swap":"join-worker","recipe":"ci/vanilla-swap/kind/kubelet-node.yaml","readiness":"node-ready"},

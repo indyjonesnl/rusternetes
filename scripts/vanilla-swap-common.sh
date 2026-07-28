@@ -246,8 +246,7 @@ vs_swap_static_pod() {
   if grep -qE '^template: \|' "$root/$recipe"; then
     vs_log "replacing static pod $manifest with rusternetes manifest ($image) on $node"
     export VS_IMAGE="$image"
-    vs_recipe_template "$root/$recipe" \
-      | envsubst '${VS_IMAGE}' \
+    vs_render_recipe_template "$root/$recipe" VS_IMAGE \
       | docker exec -i "$node" sh -c "cat >'$path'"
     return 0
   fi
@@ -299,7 +298,8 @@ vs_swap_daemonset() {
   rm -f "$tmpkc"
 
   vs_log "applying rusternetes API-mode DaemonSet (api=$VS_APISERVER_URL cidr=$VS_CLUSTER_CIDR)"
-  vs_recipe_template "$root/$recipe" | envsubst '${VS_IMAGE} ${VS_APISERVER_URL} ${VS_CLUSTER_CIDR} ${VS_NODEPORT_RANGE}' \
+  vs_render_recipe_template "$root/$recipe" \
+    VS_IMAGE VS_APISERVER_URL VS_CLUSTER_CIDR VS_NODEPORT_RANGE \
     | KUBECONFIG="$kubeconfig" kubectl apply -f -
   KUBECONFIG="$kubeconfig" kubectl -n "$ns" rollout status "daemonset/rusternetes-kube-proxy" --timeout=120s
 }
@@ -316,6 +316,26 @@ vs_service_cidr() {
 # vs_recipe_template <recipe> — print the multi-line `template: |` block.
 vs_recipe_template() {
   awk '/^template: \|/{f=1;next} f{if(/^[^[:space:]]/){f=0;next} sub(/^  /,"");print}' "$1"
+}
+
+# vs_render_recipe_template <recipe> <variable-name>...
+# Render only explicitly named ${VARIABLE} tokens without requiring envsubst.
+vs_render_recipe_template() {
+  local recipe="$1"
+  shift
+  local rendered name placeholder value
+
+  rendered="$(vs_recipe_template "$recipe")" || return 1
+  for name in "$@"; do
+    if ! [[ -v "$name" ]]; then
+      vs_warn "template variable is unset: $name"
+      return 1
+    fi
+    printf -v placeholder '${%s}' "$name"
+    value="${!name}"
+    rendered="${rendered//"$placeholder"/"$value"}"
+  done
+  printf '%s\n' "$rendered"
 }
 
 # vs_swap_join_worker <cluster> <recipe> <image> <kubeconfig>
