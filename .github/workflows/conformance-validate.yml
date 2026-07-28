@@ -5,6 +5,9 @@ name: Conformance validate
 # committed sample fixture — full-set coverage is proven by the per-target
 # runs themselves, which use the real conformance image).
 #
+# Also guards the per-module vanilla-swap scaffolding (generated-workflow drift
+# + the badge publisher), which shares the same generator/registry pattern.
+#
 # Also runs the GHCR-overlay-sync and Dockerfile-crate-enumeration tests that
 # previously lived in the retired feature-conformance workflow's validate job —
 # they guard the compose overlays / image Dockerfiles and must keep running on PRs.
@@ -27,6 +30,13 @@ on:
       - '.github/workflows/conformance-target.yml'
       - '.github/workflows/conformance-*.yml'
       - '.github/workflows/conformance-validate.yml'
+      # per-module vanilla-swap scaffolding
+      - 'ci/vanilla-swap/targets.json'
+      - 'scripts/gen-vanilla-swap-workflows.sh'
+      - 'scripts/update-badge.sh'
+      - 'scripts/tests/test-vanilla-swap-workflows-sync.sh'
+      - 'scripts/tests/test-update-badge.sh'
+      - '.github/workflows/vanilla-swap-*.yml'
       # rehomed guards (compose overlays + image Dockerfiles)
       - 'scripts/tests/test-ghcr-overlays.sh'
       - 'scripts/tests/test-dockerfile-crate-enumeration.sh'
@@ -55,6 +65,10 @@ jobs:
         run: bash scripts/tests/test-conformance-target-run.sh
       - name: Per-target workflow drift
         run: bash scripts/tests/test-target-workflows-sync.sh
+      - name: Per-module vanilla-swap workflow drift
+        run: bash scripts/tests/test-vanilla-swap-workflows-sync.sh
+      - name: Badge publisher unit tests
+        run: bash scripts/tests/test-update-badge.sh
       - name: SIG coverage (sample fixture)
         run: bash scripts/tests/test-target-coverage.sh
       - name: GHCR overlay sync test

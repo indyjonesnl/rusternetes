@@ -20,6 +20,10 @@ on:
 jobs:
   cert-manager-smoke:
     runs-on: arc-runner-set-dind
+    # contents:write lets the badge step push to the orphan `badges` branch
+    # (best-effort; never fails the run).
+    permissions:
+      contents: write
     timeout-minutes: 45
     steps:
       - name: Checkout repository
@@ -54,12 +58,29 @@ jobs:
         run: bash scripts/generate-certs.sh
 
       - name: Run cert-manager smoke
+        id: smoke
         env:
           CONTAINER_RUNTIME: docker
           KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.rusternetes/volumes
           KUBECONFIG: ${{ github.workspace }}/.kube/rusternetes-config
           CERT_MANAGER_VERSION: ${{ github.event.inputs.cert_manager_version || 'v1.16.2' }}
         run: bash scripts/run-cert-manager-smoke.sh
+
+      - name: Update smoke badge
+        # The smoke is a single pass/fail signal (no spec counts), so it uses
+        # update-badge.sh's --status mode. Best-effort: never reddens the run.
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
+        run: |
+          set -uo pipefail
+          if [ "$SMOKE_OUTCOME" = "success" ]; then
+            bash scripts/update-badge.sh --status cert-manager-smoke "cert-manager smoke" passing brightgreen
+          else
+            bash scripts/update-badge.sh --status cert-manager-smoke "cert-manager smoke" failing red
+          fi
 
       - name: Upload diagnostics
         if: always()

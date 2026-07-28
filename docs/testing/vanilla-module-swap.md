@@ -53,17 +53,49 @@ A machine-readable `run-result.json` is written to the run's work dir.
 
 ## In CI
 
-`.github/workflows/vanilla-swap.yml` runs one job per module (matrix) on the
-self-hosted DinD runners, nightly and on demand:
+**One workflow per module — never a matrix.** Each module has its own
+`.github/workflows/vanilla-swap-<module>.yml` on the self-hosted DinD runners,
+so a module's run has its own status, its own badge, its own concurrency group,
+and its own dispatch button. A matrix would collapse five independent isolation
+tests into one run status, where a queued-but-unstarted module is
+indistinguishable from a passing one, and "re-run just the kubelet" would mean
+re-running all five.
+
+| Workflow | Module | Nightly (UTC) |
+|----------|--------|---------------|
+| `vanilla-swap-kubelet.yml` | `kubelet` | 04:00 |
+| `vanilla-swap-api-server.yml` | `api-server` | 06:00 |
+| `vanilla-swap-scheduler.yml` | `scheduler` | 08:00 |
+| `vanilla-swap-controller-manager.yml` | `controller-manager` | 10:00 |
+| `vanilla-swap-kube-proxy.yml` | `kube-proxy` | 12:00 |
+
+Run one on demand:
 
 ```bash
-gh workflow run vanilla-swap.yml -f module=kubelet
+gh workflow run vanilla-swap-kubelet.yml                      # latest main image
+gh workflow run vanilla-swap-kubelet.yml -f image-tag=pr-1234 # a specific build
 ```
+
+Those caller files are **generated** — edit `ci/vanilla-swap/targets.json` and
+re-run `scripts/gen-vanilla-swap-workflows.sh`;
+`scripts/tests/test-vanilla-swap-workflows-sync.sh` guards the drift (and fails
+if a matrix ever reappears). All the real logic lives in the reusable engine
+`.github/workflows/vanilla-swap-module.yml`, which is also directly
+`workflow_dispatch`-able with any `module`.
+
+### Badges
+
+Each module publishes a README badge from its nightly run. A run with spec
+counts shows the pass rate (`87% (27/31)`); a run that produced no counts —
+`module-did-not-come-up`, `guard-rejected` — publishes that outcome in red
+instead, so a broken module can't leave a stale green pass rate behind. See
+`scripts/update-badge.sh`.
 
 ## Files
 
 - `scripts/vanilla-swap-run.sh` — driver (see the CLI contract in `specs/003-vanilla-module-swap/contracts/harness-cli.md`)
 - `scripts/vanilla-swap-common.sh` — shared helpers (guard, swap recipes, readiness, result)
+- `scripts/gen-vanilla-swap-workflows.sh` — emits the per-module workflow callers
 - `ci/vanilla-swap/targets.json` — the isolation-target registry (one entry per module)
 - `ci/vanilla-swap/kind/` — the vanilla base cluster config + per-module swap recipes
 
