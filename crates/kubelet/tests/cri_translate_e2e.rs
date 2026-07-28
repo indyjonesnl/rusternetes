@@ -188,9 +188,14 @@ async fn cri_container_runtime_lifecycle() {
 
     let pod = test_pod("runtime-e2e");
     let pod_name = pod.metadata.name.clone();
+    let pod_ns = pod
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
 
     // Clean any leftover from a previous run, then bring the pod up.
-    let _ = runtime.stop_and_remove_pod(&pod_name).await;
+    let _ = runtime.stop_and_remove_pod(&pod_ns, &pod_name).await;
     runtime.start_pod(&pod).await.expect("start_pod");
 
     // Poll until the runtime reports the pod running.
@@ -209,7 +214,7 @@ async fn cri_container_runtime_lifecycle() {
         .await
         .expect("list_running_pods");
     assert!(
-        pods.contains(&pod_name),
+        pods.contains(&(pod_ns.clone(), pod_name.clone())),
         "started pod missing from list_running_pods: {pods:?}"
     );
     // Container status maps to Running/ready for the live container.
@@ -242,18 +247,16 @@ async fn cri_container_runtime_lifecycle() {
             .list_all_pods()
             .await
             .expect("list_all_pods")
-            .contains(&pod_name),
+            .contains(&(pod_ns.clone(), pod_name.clone())),
         "pod missing from list_all_pods"
     );
     // Host-network pod: IP may be the node IP or empty depending on runtime;
     // just assert the call succeeds and log what it returns.
-    let ip = runtime.get_pod_ip(&pod_name).await.expect("get_pod_ip");
+    let ip = runtime.get_pod_ip(&pod).await.expect("get_pod_ip");
     eprintln!("CriContainerRuntime introspection OK (pod_ip={ip:?})");
 
     // Per-pod metrics include the running container.
-    let metrics = runtime
-        .collect_pod_metrics(std::slice::from_ref(&pod_name))
-        .await;
+    let metrics = runtime.collect_pod_metrics(&[&pod]).await;
     let pod_metrics = metrics.get(&pod_name).expect("metrics for pod");
     assert!(
         pod_metrics.iter().any(|(name, _, _)| name == "sleeper"),
@@ -282,11 +285,12 @@ async fn cri_container_runtime_lifecycle() {
         !runtime.has_terminated_containers(&pod).await,
         "running pod should have no terminated containers"
     );
-    let (node_cpu, node_mem) = runtime
-        .collect_node_metrics(std::slice::from_ref(&pod_name))
-        .await;
+    let (node_cpu, node_mem) = runtime.collect_node_metrics(&[&pod]).await;
     eprintln!("node metrics: cpu={node_cpu} mem={node_mem}");
-    let age = runtime.get_container_age(&pod_name).await.expect("age");
+    let age = runtime
+        .get_container_age(&pod_ns, &pod_name)
+        .await
+        .expect("age");
     assert!(age > std::time::Duration::ZERO, "sandbox age should be > 0");
     eprintln!("CriContainerRuntime existence/age introspection OK");
 
@@ -376,8 +380,13 @@ async fn emptydir_volume_provisioned_and_mounted() {
     pod.metadata.namespace = Some("default".to_string());
     pod.metadata.uid = "vol-e2e-uid".to_string();
     let pod_name = pod.metadata.name.clone();
+    let pod_ns = pod
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
 
-    let _ = runtime.stop_and_remove_pod(&pod_name).await;
+    let _ = runtime.stop_and_remove_pod(&pod_ns, &pod_name).await;
     runtime
         .start_pod(&pod)
         .await
@@ -433,7 +442,7 @@ async fn emptydir_volume_provisioned_and_mounted() {
     eprintln!("emptyDir volume mount OK");
 
     runtime
-        .stop_and_remove_pod(&pod_name)
+        .stop_and_remove_pod(&pod_ns, &pod_name)
         .await
         .expect("teardown");
 }
@@ -487,8 +496,13 @@ async fn liveness_probe_drives_check_liveness() {
     pod.metadata.namespace = Some("default".to_string());
     pod.metadata.uid = "live-e2e-uid".to_string();
     let pod_name = pod.metadata.name.clone();
+    let pod_ns = pod
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
 
-    let _ = runtime.stop_and_remove_pod(&pod_name).await;
+    let _ = runtime.stop_and_remove_pod(&pod_ns, &pod_name).await;
     runtime.start_pod(&pod).await.expect("start_pod");
     for _ in 0..50 {
         if runtime.is_pod_running(&pod).await.unwrap_or(false) {
@@ -519,7 +533,7 @@ async fn liveness_probe_drives_check_liveness() {
     eprintln!("check_liveness OK (fail->Some(7), pass->None)");
 
     runtime
-        .stop_and_remove_pod(&pod_name)
+        .stop_and_remove_pod(&pod_ns, &pod_name)
         .await
         .expect("teardown");
 }
@@ -564,8 +578,13 @@ async fn init_container_runs_before_app() {
     pod.metadata.namespace = Some("default".to_string());
     pod.metadata.uid = "init-e2e-uid".to_string();
     let pod_name = pod.metadata.name.clone();
+    let pod_ns = pod
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
 
-    let _ = runtime.stop_and_remove_pod(&pod_name).await;
+    let _ = runtime.stop_and_remove_pod(&pod_ns, &pod_name).await;
     // start_pod blocks on the init container completing successfully.
     runtime.start_pod(&pod).await.expect("start_pod with init");
 
@@ -602,7 +621,7 @@ async fn init_container_runs_before_app() {
     eprintln!("init-container ordering + actions OK");
 
     runtime
-        .stop_and_remove_pod(&pod_name)
+        .stop_and_remove_pod(&pod_ns, &pod_name)
         .await
         .expect("teardown");
 }

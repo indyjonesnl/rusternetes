@@ -247,6 +247,54 @@ fn read_log_tail(log_path: &str) -> Option<String> {
     }
 }
 
+/// A `PodSandboxFilter` selecting one pod's sandboxes by UID, optionally
+/// narrowed to a sandbox state.
+///
+/// The UID is the only unique key: pod names repeat freely across namespaces
+/// (the conformance suite runs `netserver-0` in every concurrent
+/// `pod-network-test-*` namespace), and a name-only selector makes one pod
+/// adopt another's sandbox — both then share a netns, report the same podIP,
+/// and the second container dies with `bind: address already in use`.
+///
+/// K8s ref: pkg/kubelet/kuberuntime/kuberuntime_sandbox.go:339
+/// (`getSandboxIDByPodUID`) —
+/// `LabelSelector: map[string]string{types.KubernetesPodUIDLabel: string(podUID)}`.
+pub fn sandbox_filter_by_uid(pod_uid: &str, state: Option<i32>) -> v1::PodSandboxFilter {
+    v1::PodSandboxFilter {
+        label_selector: std::collections::HashMap::from([(
+            translate::labels::POD_UID.to_string(),
+            pod_uid.to_string(),
+        )]),
+        state: state.map(|state| v1::PodSandboxStateValue { state }),
+        ..Default::default()
+    }
+}
+
+/// A `PodSandboxFilter` selecting sandboxes by `(namespace, name)`, for callers
+/// that only have what the runtime reports and no UID (orphan cleanup). Still
+/// namespace-scoped: without the namespace label, removing `srv` in one
+/// namespace would tear down `srv` in every other namespace.
+pub fn sandbox_filter_by_namespaced_name(
+    namespace: &str,
+    pod_name: &str,
+    state: Option<i32>,
+) -> v1::PodSandboxFilter {
+    v1::PodSandboxFilter {
+        label_selector: std::collections::HashMap::from([
+            (
+                translate::labels::POD_NAMESPACE.to_string(),
+                namespace.to_string(),
+            ),
+            (
+                translate::labels::POD_NAME.to_string(),
+                pod_name.to_string(),
+            ),
+        ]),
+        state: state.map(|state| v1::PodSandboxStateValue { state }),
+        ..Default::default()
+    }
+}
+
 /// Drives a CRI v1 runtime (containerd → Youki) for the kubelet.
 #[derive(Clone)]
 pub struct CriContainerRuntime {
@@ -469,7 +517,7 @@ impl CriContainerRuntime {
         _pod_ip: Option<&str>,
     ) -> anyhow::Result<()> {
         let sandbox_id = self
-            .sandbox_id_for(&pod.metadata.name)
+            .sandbox_id_for_pod(pod)
             .await?
             .ok_or_else(|| anyhow::anyhow!("no sandbox for pod {}", pod.metadata.name))?;
         let log_dir = self.log_dir_for(pod);
@@ -586,7 +634,7 @@ impl CriContainerRuntime {
             .unwrap_or(true)
         {
             eff_pod = pod.clone();
-            let pod_ip = self.get_pod_ip(&pod.metadata.name).await.ok().flatten();
+            let pod_ip = self.get_pod_ip(pod).await.ok().flatten();
             let st = eff_pod.status.get_or_insert_with(Default::default);
             if st.pod_ip.is_none() {
                 if let Some(ip) = pod_ip {
@@ -1021,11 +1069,11 @@ impl CriContainerRuntime {
         // (start_pod is retried by the reconcile loop, and the runtime reserves
         // the sandbox name, so re-running RunPodSandbox would fail with "name
         // reserved"). A non-ready leftover sandbox is removed and recreated.
-        let sandbox_id = match self.ready_sandbox_for(&pod.metadata.name).await {
+        let sandbox_id = match self.ready_sandbox_for_pod(pod).await {
             Some(existing) => existing,
             None => {
-                // Drop any stale (not-ready) sandbox holding the name first.
-                let _ = self.stop_and_remove_pod(&pod.metadata.name).await;
+                // Drop any stale (not-ready) sandbox for THIS pod first.
+                let _ = self.stop_and_remove_pod_for(pod).await;
                 match cri.run_pod_sandbox(sandbox_cfg.clone(), &handler).await {
                     Ok(id) => id,
                     Err(e) => {
@@ -1107,15 +1155,24 @@ impl CriContainerRuntime {
         Ok(())
     }
 
-    /// Find the sandbox id for a pod by its name label, if one exists.
-    pub async fn sandbox_id_for(&self, pod_name: &str) -> Result<Option<String>> {
-        let filter = v1::PodSandboxFilter {
-            label_selector: std::collections::HashMap::from([(
-                translate::labels::POD_NAME.to_string(),
-                pod_name.to_string(),
-            )]),
-            ..Default::default()
-        };
+    /// Find the sandbox id for a pod, if one exists. Keyed on the pod UID, so a
+    /// same-named pod in another namespace can never match.
+    pub async fn sandbox_id_for_pod(&self, pod: &Pod) -> Result<Option<String>> {
+        let filter = sandbox_filter_by_uid(&pod.metadata.uid, None);
+        let mut cri = self.cri.clone();
+        let sandboxes = cri.list_pod_sandbox(Some(filter)).await?;
+        Ok(sandboxes.into_iter().next().map(|s| s.id))
+    }
+
+    /// Find the sandbox id for a `(namespace, name)` pair. For callers that
+    /// only have what the runtime reports (orphan cleanup) and therefore no
+    /// UID; still namespace-scoped so it can't reach into another namespace.
+    pub async fn sandbox_id_for_namespaced(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+    ) -> Result<Option<String>> {
+        let filter = sandbox_filter_by_namespaced_name(namespace, pod_name, None);
         let mut cri = self.cri.clone();
         let sandboxes = cri.list_pod_sandbox(Some(filter)).await?;
         Ok(sandboxes.into_iter().next().map(|s| s.id))
@@ -1124,17 +1181,15 @@ impl CriContainerRuntime {
     /// The id of a READY sandbox for the pod, if one exists — used by `start_pod`
     /// to reuse a running sandbox across reconcile retries instead of trying to
     /// create a new one (which would collide on the reserved sandbox name).
-    async fn ready_sandbox_for(&self, pod_name: &str) -> Option<String> {
-        let filter = v1::PodSandboxFilter {
-            state: Some(v1::PodSandboxStateValue {
-                state: v1::PodSandboxState::SandboxReady as i32,
-            }),
-            label_selector: std::collections::HashMap::from([(
-                translate::labels::POD_NAME.to_string(),
-                pod_name.to_string(),
-            )]),
-            ..Default::default()
-        };
+    ///
+    /// Keyed on UID: keying on the name made a pod adopt a same-named pod's
+    /// sandbox from a different namespace, putting both in one netns (duplicate
+    /// podIP, `bind: address already in use`).
+    async fn ready_sandbox_for_pod(&self, pod: &Pod) -> Option<String> {
+        let filter = sandbox_filter_by_uid(
+            &pod.metadata.uid,
+            Some(v1::PodSandboxState::SandboxReady as i32),
+        );
         let mut cri = self.cri.clone();
         cri.list_pod_sandbox(Some(filter))
             .await
@@ -1158,8 +1213,13 @@ impl CriContainerRuntime {
         Ok(containers.iter().any(|c| c.state == running))
     }
 
-    /// Names of all pods with a READY sandbox on this runtime.
-    pub async fn list_running_pods(&self) -> Result<Vec<String>> {
+    /// `(namespace, name)` of every pod with a READY sandbox on this runtime.
+    ///
+    /// Namespace-qualified: the bare name is ambiguous (the conformance suite
+    /// runs identically-named pods in concurrent namespaces), and orphan
+    /// cleanup compares this list against what the apiserver holds — an
+    /// ambiguous key there either spares a real orphan or kills a live pod.
+    pub async fn list_running_pods(&self) -> Result<Vec<(String, String)>> {
         let filter = v1::PodSandboxFilter {
             state: Some(v1::PodSandboxStateValue {
                 state: v1::PodSandboxState::SandboxReady as i32,
@@ -1170,7 +1230,7 @@ impl CriContainerRuntime {
         let sandboxes = cri.list_pod_sandbox(Some(filter)).await?;
         Ok(sandboxes
             .into_iter()
-            .filter_map(|s| s.metadata.map(|m| m.name))
+            .filter_map(|s| s.metadata.map(|m| (m.namespace, m.name)))
             .collect())
     }
 
@@ -1359,22 +1419,22 @@ impl CriContainerRuntime {
         (action.all_init_done, action.next_index, action.should_retry)
     }
 
-    /// Names of all pods that have a sandbox on this runtime, regardless of
-    /// state (ready or not).
-    pub async fn list_all_pods(&self) -> Result<Vec<String>> {
+    /// `(namespace, name)` of every pod that has a sandbox on this runtime,
+    /// regardless of state (ready or not).
+    pub async fn list_all_pods(&self) -> Result<Vec<(String, String)>> {
         let mut cri = self.cri.clone();
         let sandboxes = cri.list_pod_sandbox(None).await?;
         Ok(sandboxes
             .into_iter()
-            .filter_map(|s| s.metadata.map(|m| m.name))
+            .filter_map(|s| s.metadata.map(|m| (m.namespace, m.name)))
             .collect())
     }
 
     /// The pod's primary IP, read from its sandbox network status. `None` if the
     /// pod has no sandbox or no IP yet (e.g. CNI not done). Host-network pods
     /// report the node IP.
-    pub async fn get_pod_ip(&self, pod_name: &str) -> Result<Option<String>> {
-        let Some(sandbox_id) = self.sandbox_id_for(pod_name).await? else {
+    pub async fn get_pod_ip(&self, pod: &Pod) -> Result<Option<String>> {
+        let Some(sandbox_id) = self.sandbox_id_for_pod(pod).await? else {
             return Ok(None);
         };
         let mut cri = self.cri.clone();
@@ -1414,8 +1474,8 @@ impl CriContainerRuntime {
 
     /// True if the pod's sandbox exists on this runtime (the `pause`-equivalent
     /// PodSandbox has been created), regardless of container state.
-    pub async fn has_sandbox(&self, pod_name: &str) -> bool {
-        self.sandbox_id_for(pod_name).await.ok().flatten().is_some()
+    pub async fn has_sandbox(&self, pod: &Pod) -> bool {
+        self.sandbox_id_for_pod(pod).await.ok().flatten().is_some()
     }
 
     /// Execute a single probe attempt against a container, returning whether it
@@ -1485,7 +1545,7 @@ impl CriContainerRuntime {
             };
             let host = match tcp.host.clone() {
                 Some(h) => h,
-                None => match self.get_pod_ip(&pod.metadata.name).await? {
+                None => match self.get_pod_ip(pod).await? {
                     Some(ip) => ip,
                     None => return Ok(false),
                 },
@@ -1504,7 +1564,7 @@ impl CriContainerRuntime {
             };
             let host = match http.host.clone() {
                 Some(h) => h,
-                None => match self.get_pod_ip(&pod.metadata.name).await? {
+                None => match self.get_pod_ip(pod).await? {
                     Some(ip) => ip,
                     None => return Ok(false),
                 },
@@ -1570,7 +1630,7 @@ impl CriContainerRuntime {
             let Some(port) = probe::resolve_port(container, &grpc.port) else {
                 return Ok(false);
             };
-            let Some(host) = self.get_pod_ip(&pod.metadata.name).await? else {
+            let Some(host) = self.get_pod_ip(pod).await? else {
                 return Ok(false);
             };
             let endpoint = format!("http://{host}:{port}");
@@ -1666,7 +1726,7 @@ impl CriContainerRuntime {
             let host = match http.host.clone() {
                 Some(h) if !h.is_empty() => h,
                 _ => self
-                    .get_pod_ip(&pod.metadata.name)
+                    .get_pod_ip(pod)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("httpGet lifecycle handler: no pod IP"))?,
             };
@@ -1716,7 +1776,7 @@ impl CriContainerRuntime {
             let host = match tcp.host.clone() {
                 Some(h) if !h.is_empty() => h,
                 _ => self
-                    .get_pod_ip(&pod.metadata.name)
+                    .get_pod_ip(pod)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("tcpSocket lifecycle handler: no pod IP"))?,
             };
@@ -2154,14 +2214,15 @@ impl CriContainerRuntime {
     /// Each entry is `(container_name, cpu_nano_cores, working_set_bytes)`.
     pub async fn collect_pod_metrics(
         &self,
-        pod_names: &[String],
+        pods: &[&Pod],
     ) -> std::collections::HashMap<String, Vec<(String, u64, u64)>> {
         let mut out: std::collections::HashMap<String, Vec<(String, u64, u64)>> =
             std::collections::HashMap::new();
         let mut cri = self.cri.clone();
 
-        for pod_name in pod_names {
-            let Ok(Some(sandbox_id)) = self.sandbox_id_for(pod_name).await else {
+        for pod in pods {
+            let pod_name = &pod.metadata.name;
+            let Ok(Some(sandbox_id)) = self.sandbox_id_for_pod(pod).await else {
                 continue;
             };
             let filter = v1::ContainerStatsFilter {
@@ -2241,8 +2302,8 @@ impl CriContainerRuntime {
 
     /// Total CPU (nano-cores) and memory (working-set bytes) across the given
     /// pods — the node-level rollup the kubelet reports.
-    pub async fn collect_node_metrics(&self, pod_names: &[String]) -> (u64, u64) {
-        let per_pod = self.collect_pod_metrics(pod_names).await;
+    pub async fn collect_node_metrics(&self, pods: &[&Pod]) -> (u64, u64) {
+        let per_pod = self.collect_pod_metrics(pods).await;
         let mut cpu = 0u64;
         let mut mem = 0u64;
         for containers in per_pod.values() {
@@ -2279,8 +2340,12 @@ impl CriContainerRuntime {
 
     /// Age of a pod's sandbox (time since it was created). Zero if the pod has
     /// no sandbox or the runtime reports no creation time.
-    pub async fn get_container_age(&self, pod_name: &str) -> Result<std::time::Duration> {
-        let Some(sandbox_id) = self.sandbox_id_for(pod_name).await? else {
+    pub async fn get_container_age(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+    ) -> Result<std::time::Duration> {
+        let Some(sandbox_id) = self.sandbox_id_for_namespaced(namespace, pod_name).await? else {
             return Ok(std::time::Duration::ZERO);
         };
         let mut cri = self.cri.clone();
@@ -2297,7 +2362,7 @@ impl CriContainerRuntime {
     /// Gracefully stop a pod: stop each of its containers with `grace_period_seconds`,
     /// then stop and remove the sandbox. No-op if the pod has no sandbox.
     pub async fn stop_pod_for(&self, pod: &Pod, grace_period_seconds: i64) -> Result<()> {
-        let Some(sandbox_id) = self.sandbox_id_for(&pod.metadata.name).await? else {
+        let Some(sandbox_id) = self.sandbox_id_for_pod(pod).await? else {
             return Ok(());
         };
         let mut cri = self.cri.clone();
@@ -2343,10 +2408,11 @@ impl CriContainerRuntime {
     /// then stop and remove the sandbox. No-op if the pod has no sandbox.
     pub async fn stop_pod_with_grace_period(
         &self,
+        namespace: &str,
         pod_name: &str,
         grace_period_seconds: i64,
     ) -> Result<()> {
-        let Some(sandbox_id) = self.sandbox_id_for(pod_name).await? else {
+        let Some(sandbox_id) = self.sandbox_id_for_namespaced(namespace, pod_name).await? else {
             return Ok(());
         };
         let mut cri = self.cri.clone();
@@ -2405,17 +2471,25 @@ impl CriContainerRuntime {
         Ok(())
     }
 
-    /// Stop and remove every sandbox for a pod name; removing a sandbox tears
-    /// down its containers. Removes all matches (a pod can have a stale sandbox
-    /// alongside a new one), so it is also a no-op when none exist.
-    pub async fn stop_and_remove_pod(&self, pod_name: &str) -> Result<()> {
-        let filter = v1::PodSandboxFilter {
-            label_selector: std::collections::HashMap::from([(
-                translate::labels::POD_NAME.to_string(),
-                pod_name.to_string(),
-            )]),
-            ..Default::default()
-        };
+    /// Stop and remove every sandbox for `(namespace, name)`; removing a
+    /// sandbox tears down its containers. Removes all matches (a pod can have a
+    /// stale sandbox alongside a new one), so it is also a no-op when none
+    /// exist.
+    ///
+    /// Namespace-scoped: a name-only selector here removed the sandboxes of
+    /// same-named pods in *other* namespaces.
+    pub async fn stop_and_remove_pod(&self, namespace: &str, pod_name: &str) -> Result<()> {
+        let filter = sandbox_filter_by_namespaced_name(namespace, pod_name, None);
+        self.stop_and_remove_matching(filter).await
+    }
+
+    /// Stop and remove every sandbox belonging to this exact pod (by UID).
+    pub async fn stop_and_remove_pod_for(&self, pod: &Pod) -> Result<()> {
+        let filter = sandbox_filter_by_uid(&pod.metadata.uid, None);
+        self.stop_and_remove_matching(filter).await
+    }
+
+    async fn stop_and_remove_matching(&self, filter: v1::PodSandboxFilter) -> Result<()> {
         let mut cri = self.cri.clone();
         for sb in cri.list_pod_sandbox(Some(filter)).await? {
             let _ = cri.stop_pod_sandbox(&sb.id).await;
