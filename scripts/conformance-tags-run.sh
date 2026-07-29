@@ -198,11 +198,14 @@ run_phase() {
         return
     fi
 
-    # Count testcase statuses. Junit @status is passed|failed|skipped.
-    local passed failed skipped
-    passed=$(grep -oE 'status="passed"' "$junit" | wc -l | tr -d ' ')
-    failed=$(grep -oE 'status="failed"' "$junit" | wc -l | tr -d ' ')
-    skipped=$(grep -oE 'status="skipped"' "$junit" | wc -l | tr -d ' ')
+    # Count testcase statuses, excluding ginkgo's suite-level nodes. Reuses
+    # target_counts from conformance-target-run.sh so the two runners cannot
+    # drift apart on what counts as a spec (#1643).
+    local had_junit passed failed skipped total
+    IFS=' ' read -r had_junit passed failed skipped total <<<"$(
+        TARGET_RUN_LIB_ONLY=1 source "$(dirname "${BASH_SOURCE[0]}")/conformance-target-run.sh" \
+            && target_counts "$dir"
+    )"
 
     info "[$label] hydrophone exit=$hydro_exit  passed=$passed failed=$failed skipped=$skipped"
 
