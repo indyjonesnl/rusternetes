@@ -1,6 +1,13 @@
 use anyhow::Result;
+use rusternetes_common::quantity::Quantity;
 use rusternetes_common::resources::{Pod, ResourceQuota, ResourceQuotaStatus, Service};
 use rusternetes_common::types::Phase;
+
+/// Saturate a quantity value into the `i64` the parse helpers return, matching
+/// upstream `ScaledValue`'s int64 cap rather than wrapping.
+fn clamp_quantity(value: i128) -> i64 {
+    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -732,44 +739,25 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
     }
 
     /// Parse CPU string to millicores (e.g., "1" -> 1000, "500m" -> 500)
+    /// Parse a CPU quantity into millicores.
+    ///
+    /// This body was byte-identical (modulo `&self`) to the pair in
+    /// `api-server/src/admission.rs`, and both had the same defects: no
+    /// `Ti`/`Pi`/`Ei`/`T`/`P`/`E`, only an *uppercase* `K` — so the
+    /// non-upstream `"1K"` parsed while the valid `"1k"` did not — and
+    /// `trim_end_matches`, which strips repeated suffixes (`"1GiGi"` → 1Gi).
+    ///
+    /// Both now go through `rusternetes_common::quantity::Quantity`, reading
+    /// the unit upstream accounts each resource in (`Resource.Add`,
+    /// `../kubernetes/pkg/scheduler/framework/types.go:917-918`).
     fn parse_cpu_to_millicores(&self, cpu: &str) -> Result<i64> {
-        if cpu.ends_with('m') {
-            // Already in millicores
-            let millis = cpu.trim_end_matches('m').parse::<i64>()?;
-            Ok(millis)
-        } else {
-            // In cores, convert to millicores
-            let cores = cpu.parse::<f64>()?;
-            Ok((cores * 1000.0) as i64)
-        }
+        Ok(clamp_quantity(Quantity::parse(cpu.trim())?.milli_value()))
     }
 
-    /// Parse memory string to bytes (e.g., "1Gi" -> 1073741824, "512Mi" -> 536870912)
+    /// Parse a byte-denominated quantity (memory, ephemeral-storage) to bytes.
+    /// See [`Self::parse_cpu_to_millicores`].
     fn parse_memory_to_bytes(&self, memory: &str) -> Result<i64> {
-        let memory = memory.trim();
-
-        if memory.ends_with("Gi") {
-            let value = memory.trim_end_matches("Gi").parse::<f64>()?;
-            Ok((value * 1024.0 * 1024.0 * 1024.0) as i64)
-        } else if memory.ends_with("Mi") {
-            let value = memory.trim_end_matches("Mi").parse::<f64>()?;
-            Ok((value * 1024.0 * 1024.0) as i64)
-        } else if memory.ends_with("Ki") {
-            let value = memory.trim_end_matches("Ki").parse::<f64>()?;
-            Ok((value * 1024.0) as i64)
-        } else if memory.ends_with("G") {
-            let value = memory.trim_end_matches("G").parse::<f64>()?;
-            Ok((value * 1000.0 * 1000.0 * 1000.0) as i64)
-        } else if memory.ends_with("M") {
-            let value = memory.trim_end_matches("M").parse::<f64>()?;
-            Ok((value * 1000.0 * 1000.0) as i64)
-        } else if memory.ends_with("K") {
-            let value = memory.trim_end_matches("K").parse::<f64>()?;
-            Ok((value * 1000.0) as i64)
-        } else {
-            // Assume bytes
-            Ok(memory.parse::<i64>()?)
-        }
+        Ok(clamp_quantity(Quantity::parse(memory.trim())?.value()))
     }
 
     /// Convert bytes to human-readable memory string
@@ -825,6 +813,53 @@ mod tests {
         );
         assert_eq!(controller.parse_memory_to_bytes("1024Ki").unwrap(), 1048576);
         assert_eq!(controller.parse_memory_to_bytes("1000").unwrap(), 1000);
+    }
+
+    /// The pair in `api-server/src/admission.rs` was byte-identical to this
+    /// one, and shared every defect. Both now go through `Quantity`, so this
+    /// mirrors the admission-side test — the two must not drift again.
+    #[test]
+    fn test_parse_quantities_covers_full_grammar() {
+        let controller = ResourceQuotaController::new(Arc::new(MemoryStorage::new()));
+        for (value, expected) in [
+            ("1Ti", 1_099_511_627_776i64),
+            ("1Pi", 1_125_899_906_842_624),
+            ("1Ei", 1_152_921_504_606_846_976),
+            ("1T", 1_000_000_000_000),
+            ("1P", 1_000_000_000_000_000),
+            ("1E", 1_000_000_000_000_000_000),
+            ("129e6", 129_000_000),
+            ("0.5", 1),
+        ] {
+            assert_eq!(
+                controller
+                    .parse_memory_to_bytes(value)
+                    .unwrap_or_else(|e| panic!("{value}: {e}")),
+                expected,
+                "memory {value:?}"
+            );
+        }
+        assert_eq!(controller.parse_cpu_to_millicores("0.5m").unwrap(), 1);
+        assert_eq!(controller.parse_cpu_to_millicores("10.5m").unwrap(), 11);
+        assert_eq!(controller.parse_cpu_to_millicores("1500u").unwrap(), 2);
+    }
+
+    /// `k` is kilo; `K` is not in the grammar. The chain matched only
+    /// `ends_with("K")`, so it had these exactly backwards.
+    #[test]
+    fn test_parse_memory_k_case_sensitivity() {
+        let controller = ResourceQuotaController::new(Arc::new(MemoryStorage::new()));
+        assert_eq!(controller.parse_memory_to_bytes("1k").unwrap(), 1_000);
+        assert!(controller.parse_memory_to_bytes("1K").is_err());
+    }
+
+    /// `trim_end_matches` strips *every* trailing occurrence of the suffix, so
+    /// `"1GiGi"` used to read as 1Gi and `"100mm"` as 100 millicores.
+    #[test]
+    fn test_parse_rejects_repeated_suffix() {
+        let controller = ResourceQuotaController::new(Arc::new(MemoryStorage::new()));
+        assert!(controller.parse_memory_to_bytes("1GiGi").is_err());
+        assert!(controller.parse_cpu_to_millicores("100mm").is_err());
     }
 
     #[test]
