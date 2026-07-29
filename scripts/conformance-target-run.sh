@@ -37,7 +37,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 MANIFEST="${TARGETS_MANIFEST:-$REPO_ROOT/ci/conformance/targets.json}"
 
-# Count testcase statuses in <dir>/junit_01.xml.
+# Ginkgo's suite-level nodes, which it reports as <testcase> entries next to the
+# real specs: `[ReportBeforeSuite]`, `[SynchronizedBeforeSuite]`, … Counting them
+# as specs inflates every target (sig-instrumentation reported 11/11 for a
+# 4-spec SIG) and defeats the 0-match guard below, which keys off total==0 —
+# a focus matching nothing still produced a green 3/3 (#1643).
+#
+# The set is upstream's: ginkgo `types.NodeTypesForSuiteLevelNodes`
+# (types/types.go:885 — BeforeSuite | SynchronizedBeforeSuite | AfterSuite |
+# SynchronizedAfterSuite | ReportBeforeSuite | ReportAfterSuite |
+# CleanupAfterSuite), which its own junit reporter drops when asked to
+# (reporters/junit_report.go:195: `if config.OmitSuiteSetupNodes &&
+# spec.LeafNodeType != types.NodeTypeIt { continue }`). The name each carries is
+# "[<LeafNodeType>]" + optional text (junit_report.go:198), and
+# NodeTypeCleanupAfterSuite stringifies as "DeferCleanup (Suite)"
+# (types/types.go:910).
+GINKGO_SUITE_LEVEL_NODES='^\[(BeforeSuite|SynchronizedBeforeSuite|AfterSuite|SynchronizedAfterSuite|ReportBeforeSuite|ReportAfterSuite|DeferCleanup \(Suite\))\]'
+
+# Count real-spec testcase statuses in <dir>/junit_01.xml.
 # Echoes "had_junit passed failed skipped total". had_junit is 0/1; total is
 # passed+failed+skipped (0 => the focus matched no specs / "no tests matched").
 target_counts() {
@@ -46,12 +63,56 @@ target_counts() {
     if [ ! -f "$junit" ]; then
         echo "0 0 0 0 0"; return
     fi
+    # Per-testcase, so a name is matched against its OWN status. Attribute
+    # values are XML-escaped (&quot;, &gt;), so `[^>]*` / `[^"]*` are safe.
+    local counts
+    counts=$(grep -oE '<testcase [^>]*>' "$junit" | awk -v skip="$GINKGO_SUITE_LEVEL_NODES" '
+        {
+            name = ""; status = ""
+            if (match($0, /name="[^"]*"/))   name   = substr($0, RSTART + 6, RLENGTH - 7)
+            if (match($0, /status="[^"]*"/)) status = substr($0, RSTART + 8, RLENGTH - 9)
+            if (name ~ skip) next
+            c[status]++
+        }
+        END { printf "%d %d %d", c["passed"], c["failed"], c["skipped"] }')
     local passed failed skipped total
-    passed=$(grep -oE 'status="passed"' "$junit" | wc -l | tr -d ' ')
-    failed=$(grep -oE 'status="failed"' "$junit" | wc -l | tr -d ' ')
-    skipped=$(grep -oE 'status="skipped"' "$junit" | wc -l | tr -d ' ')
+    IFS=' ' read -r passed failed skipped <<<"$counts"
     total=$((passed + failed + skipped))
     echo "1 $passed $failed $skipped $total"
+}
+
+# Names of the ginkgo suite-level nodes that FAILED, one per line ("  - <name>").
+# These are excluded from the spec counts above, so without this a broken
+# BeforeSuite looks exactly like a focus that matched nothing.
+suite_level_failures() {
+    local junit="$1/junit_01.xml"
+    [ -f "$junit" ] || return 0
+    grep -oE '<testcase [^>]*>' "$junit" | awk -v keep="$GINKGO_SUITE_LEVEL_NODES" '
+        {
+            name = ""; status = ""
+            if (match($0, /name="[^"]*"/))   name   = substr($0, RSTART + 6, RLENGTH - 7)
+            if (match($0, /status="[^"]*"/)) status = substr($0, RSTART + 8, RLENGTH - 9)
+            if (name ~ keep && status == "failed") print "  - " name
+        }'
+}
+
+# Names of the real specs that FAILED, one per line ("  - <name>"), with junit's
+# XML entities decoded. Same suite-level-node exclusion as target_counts, so the
+# printed list always matches the reported `failed=` count.
+spec_failures() {
+    local junit="$1/junit_01.xml"
+    [ -f "$junit" ] || return 0
+    grep -oE '<testcase [^>]*>' "$junit" \
+        | awk -v skip="$GINKGO_SUITE_LEVEL_NODES" '
+            {
+                name = ""; status = ""
+                if (match($0, /name="[^"]*"/))   name   = substr($0, RSTART + 6, RLENGTH - 7)
+                if (match($0, /status="[^"]*"/)) status = substr($0, RSTART + 8, RLENGTH - 9)
+                if (name ~ skip) next
+                if (status == "failed") print "  - " name
+            }' \
+        | sed -e 's/&#39;/'"'"'/g' -e 's/&amp;/\&/g' -e 's/&lt;/</g' \
+              -e 's/&gt;/>/g' -e 's/&quot;/"/g' -e 's/&#34;/"/g'
 }
 
 # Emit key=value results to $GITHUB_OUTPUT when running under Actions, else stdout.
@@ -160,7 +221,17 @@ if [ "$HAD_JUNIT" -eq 0 ]; then
 fi
 
 if [ "$TOTAL" -eq 0 ]; then
-    echo "[conformance-target-run] target=$TARGET — no tests matched (empty junit)" >&2
+    # Zero specs, so either the focus matched nothing or ginkgo never got as far
+    # as running one. A failed suite-level node (BeforeSuite cannot reach the
+    # cluster, AfterSuite dump failed) says which, and blaming the focus for a
+    # broken cluster sends the next reader down the wrong path.
+    setup_failures="$(suite_level_failures "$OUTPUT_DIR")"
+    if [ -n "$setup_failures" ]; then
+        echo "[conformance-target-run] target=$TARGET — suite setup failed, no spec ran:" >&2
+        printf '%s\n' "$setup_failures" >&2
+    else
+        echo "[conformance-target-run] target=$TARGET — no tests matched (empty junit)" >&2
+    fi
     emit_output 0 0 0 "$FOCUS_OVERRIDDEN"
     exit 1
 fi
@@ -168,10 +239,7 @@ fi
 echo "[conformance-target-run] target=$TARGET hydrophone_exit=$hydro_exit passed=$PASSED failed=$FAILED skipped=$SKIPPED total=$((PASSED + FAILED))"
 if [ "$FAILED" -gt 0 ]; then
     echo "[conformance-target-run] FAILED tests:"
-    grep -oE '<testcase name="[^"]+"[^>]*status="failed"' "$OUTPUT_DIR/junit_01.xml" \
-        | sed -E 's|<testcase name="([^"]+)".*|  - \1|' \
-        | sed -e 's/&#39;/'"'"'/g' -e 's/&amp;/\&/g' -e 's/&lt;/</g' \
-              -e 's/&gt;/>/g' -e 's/&quot;/"/g' -e 's/&#34;/"/g' || true
+    spec_failures "$OUTPUT_DIR" || true
 fi
 
 # Badge total (attempted) EXCLUDES skipped, per the existing update-badge counting.

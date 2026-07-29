@@ -40,6 +40,51 @@ IFS=' ' read -r hj p f s t <<<"$(target_counts "$TMP/counts")"
     && ok "target_counts: parses passed/failed/skipped/total" \
     || bad "target_counts got hj=$hj p=$p f=$f s=$s t=$t (want 1 2 1 1 4)"
 
+# Ginkgo's junit carries suite-level nodes as testcases alongside the real
+# specs. Upstream's own reporter can drop them (OmitSuiteSetupNodes, ginkgo
+# reporters/junit_report.go:195 — `spec.LeafNodeType != types.NodeTypeIt`), and
+# the set is types.NodeTypesForSuiteLevelNodes (types.go:885). Counting them
+# inflates every target: sig-instrumentation reported 11/11 for a 4-spec SIG
+# (#1643), and it defeats the 0-match guard, which keys off total==0.
+mkdir -p "$TMP/synthetic"
+cat > "$TMP/synthetic/junit_01.xml" <<'EOF'
+<testsuite>
+  <testcase name="[ReportBeforeSuite]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[SynchronizedBeforeSuite]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[SynchronizedBeforeSuite]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[SynchronizedAfterSuite]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[SynchronizedAfterSuite]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[ReportAfterSuite] Invariant Metrics" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[ReportAfterSuite] Kubernetes e2e suite report" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[BeforeSuite]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[AfterSuite]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[DeferCleanup (Suite)]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[It] [sig-instrumentation] Events API should delete a collection of events [Conformance]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[It] [sig-instrumentation] Events should manage the lifecycle of an event [Conformance]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[It] [sig-instrumentation] Events broken spec [Conformance]" classname="Kubernetes e2e suite" status="failed"></testcase>
+  <testcase name="[It] [sig-node] not in this focus" classname="Kubernetes e2e suite" status="skipped"></testcase>
+</testsuite>
+EOF
+IFS=' ' read -r hj p f s t <<<"$(target_counts "$TMP/synthetic")"
+[ "$hj" = "1" ] && [ "$p" = "2" ] && [ "$f" = "1" ] && [ "$s" = "1" ] && [ "$t" = "4" ] \
+    && ok "target_counts: excludes ginkgo suite-level nodes" \
+    || bad "target_counts synthetic got hj=$hj p=$p f=$f s=$s t=$t (want 1 2 1 1 4)"
+
+# A run whose junit holds ONLY suite-level nodes matched no specs, whatever the
+# run log says — total must be 0 so the caller's guard fires.
+mkdir -p "$TMP/synthonly"
+cat > "$TMP/synthonly/junit_01.xml" <<'EOF'
+<testsuite>
+  <testcase name="[ReportBeforeSuite]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[SynchronizedBeforeSuite]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[ReportAfterSuite] Kubernetes e2e suite report" classname="Kubernetes e2e suite" status="passed"></testcase>
+</testsuite>
+EOF
+IFS=' ' read -r hj p f s t <<<"$(target_counts "$TMP/synthonly")"
+[ "$hj" = "1" ] && [ "$p" = "0" ] && [ "$t" = "0" ] \
+    && ok "target_counts: suite-level-only junit => total=0" \
+    || bad "target_counts synth-only got hj=$hj p=$p total=$t (want 1 0 0)"
+
 # ---- CLI fixtures ----
 KC="$TMP/kubeconfig"; echo "kc" > "$KC"
 
@@ -67,6 +112,27 @@ J
   <testcase name="BeforeSuite" status="passed"></testcase>
   <testcase name="AfterSuite" status="passed"></testcase>
   <testcase name="skipped-spec" status="skipped"></testcase>
+</testsuite>
+J
+  ;;
+  # Ginkgo wrote its suite-level nodes but no spec ran, and the run log carries
+  # no "Will run 0 of N specs" line (parallel runs word it differently). The
+  # only signal left is the junit count — which must be 0, not 3.
+  synthonly) cat > "$out/junit_01.xml" <<'J'
+<testsuite>
+  <testcase name="[ReportBeforeSuite]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[SynchronizedBeforeSuite]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[ReportAfterSuite] Kubernetes e2e suite report" classname="Kubernetes e2e suite" status="passed"></testcase>
+</testsuite>
+J
+  ;;
+  # Suite setup itself failed (BeforeSuite could not reach the cluster), so no
+  # spec ran. Not "no tests matched" — the focus was fine, the cluster was not.
+  setupfail) cat > "$out/junit_01.xml" <<'J'
+<testsuite>
+  <testcase name="[ReportBeforeSuite]" classname="Kubernetes e2e suite" status="passed"></testcase>
+  <testcase name="[SynchronizedBeforeSuite]" classname="Kubernetes e2e suite" status="failed"></testcase>
+  <testcase name="[ReportAfterSuite] Kubernetes e2e suite report" classname="Kubernetes e2e suite" status="passed"></testcase>
 </testsuite>
 J
   ;;
@@ -100,6 +166,14 @@ FAKE_MODE=pass run_cli --target sig-node --kubeconfig "$KC" --hydrophone "$FAKE"
   && ok "full run outputs passed=1 failed=1 total=2 focused=0" \
   || bad "full run outputs: passed=$(gho passed) failed=$(gho failed) total=$(gho total) focused=$(gho focused)"
 
+# the FAILED-tests list names the failing spec (same exclusion as the counts)
+set +e
+out=$(FAKE_MODE=pass run_cli --target sig-node --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/o1b" 2>&1)
+set -e
+echo "$out" | grep -q "FAILED tests:" && echo "$out" | grep -qE '^\s+- y$' \
+  && ok "failed-spec list names the spec" \
+  || bad "failed-spec list missing/wrong: $(echo "$out" | grep -A2 'FAILED tests' | tr '\n' ' ')"
+
 # a FEATURE target resolves from the manifest too (identical path)
 FAKE_MODE=pass run_cli --target sysctls --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/of" >/dev/null 2>&1 \
   && ok "feature target (sysctls) resolves + runs" || bad "feature target sysctls should exit 0"
@@ -115,6 +189,23 @@ set -e
 [ "$rc" -eq 1 ] && echo "$out" | grep -qi "no tests matched" && [ "$(gho passed)" = "0" ] && [ "$(gho total)" = "0" ] \
   && ok "empty focus => exit 1 + 'no tests matched' + passed/total 0" \
   || bad "empty focus rc=$rc msg/counts wrong (passed=$(gho passed) total=$(gho total))"
+
+# junit with suite-level nodes only => no false green, exit 1 with 0/0
+set +e
+out=$(FAKE_MODE=synthonly run_cli --target sig-node --focus 'zzz' --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/o5" 2>&1); rc=$?
+set -e
+[ "$rc" -eq 1 ] && echo "$out" | grep -qi "no tests matched" && [ "$(gho passed)" = "0" ] && [ "$(gho total)" = "0" ] \
+  && ok "suite-level-only junit => exit 1 + passed/total 0 (no false green)" \
+  || bad "synth-only rc=$rc msg/counts wrong (passed=$(gho passed) total=$(gho total))"
+
+# failed suite setup => exit 1, named as suite setup (not "no tests matched")
+set +e
+out=$(FAKE_MODE=setupfail run_cli --target sig-node --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/o6" 2>&1); rc=$?
+set -e
+[ "$rc" -eq 1 ] && echo "$out" | grep -qi "suite setup failed" && echo "$out" | grep -q "SynchronizedBeforeSuite" \
+  && [ "$(gho total)" = "0" ] \
+  && ok "failed suite setup => exit 1 named as suite setup, with the node listed" \
+  || bad "setupfail rc=$rc output/counts wrong: $(echo "$out" | tail -2 | tr '\n' ' ')"
 
 # no junit (infra fail) => exit 1
 if FAKE_MODE=nojunit run_cli --target sig-node --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/o4" >/dev/null 2>&1; then
