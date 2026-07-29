@@ -1,5 +1,6 @@
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection
 use rusternetes_common::{
+    quantity::Quantity,
     resources::{LimitRange, Pod, ResourceQuota, ServiceAccount},
     types::ResourceRequirements,
 };
@@ -270,7 +271,11 @@ pub async fn check_resource_quota_with_old<S: Storage>(
             let pod_cpu = pod_requests.get("cpu").copied().unwrap_or(0);
             let old_cpu = old_requests.get("cpu").copied().unwrap_or(0);
             let baseline_cpu = (current_cpu - old_cpu).max(0);
-            let limit = parse_cpu_to_millicores(cpu_limit_str).unwrap_or(i64::MAX);
+            let limit = quota_limit(
+                parse_cpu_to_millicores(cpu_limit_str),
+                "requests.cpu",
+                cpu_limit_str,
+            );
             if baseline_cpu + pod_cpu > limit {
                 exceeded.push(format!(
                     "requests.cpu, requested: {}m, used: {}m, limited: {}m",
@@ -293,7 +298,11 @@ pub async fn check_resource_quota_with_old<S: Storage>(
             let pod_mem = pod_requests.get("memory").copied().unwrap_or(0);
             let old_mem = old_requests.get("memory").copied().unwrap_or(0);
             let baseline_mem = (current_mem - old_mem).max(0);
-            let limit = parse_memory_to_bytes(mem_limit_str).unwrap_or(i64::MAX);
+            let limit = quota_limit(
+                parse_memory_to_bytes(mem_limit_str),
+                "requests.memory",
+                mem_limit_str,
+            );
             if baseline_mem + pod_mem > limit {
                 exceeded.push(format!(
                     "requests.memory, requested: {}, used: {}, limited: {}",
@@ -314,7 +323,11 @@ pub async fn check_resource_quota_with_old<S: Storage>(
                 .and_then(|s| parse_cpu_to_millicores(s).ok())
                 .unwrap_or(0);
             let baseline_cpu = (current_cpu - old_limits_cpu).max(0);
-            let limit = parse_cpu_to_millicores(cpu_limit_quota).unwrap_or(i64::MAX);
+            let limit = quota_limit(
+                parse_cpu_to_millicores(cpu_limit_quota),
+                "limits.cpu",
+                cpu_limit_quota,
+            );
             if baseline_cpu + pod_limits_cpu > limit {
                 exceeded.push(format!(
                     "limits.cpu, requested: {}m, used: {}m, limited: {}m",
@@ -335,7 +348,11 @@ pub async fn check_resource_quota_with_old<S: Storage>(
                 .and_then(|s| parse_memory_to_bytes(s).ok())
                 .unwrap_or(0);
             let baseline_mem = (current_mem - old_limits_memory).max(0);
-            let limit = parse_memory_to_bytes(mem_limit_quota).unwrap_or(i64::MAX);
+            let limit = quota_limit(
+                parse_memory_to_bytes(mem_limit_quota),
+                "limits.memory",
+                mem_limit_quota,
+            );
             if baseline_mem + pod_limits_memory > limit {
                 exceeded.push(format!(
                     "limits.memory, requested: {}, used: {}, limited: {}",
@@ -358,7 +375,11 @@ pub async fn check_resource_quota_with_old<S: Storage>(
             let pod_es = pod_requests.get("ephemeral-storage").copied().unwrap_or(0);
             let old_es = old_requests.get("ephemeral-storage").copied().unwrap_or(0);
             let baseline_es = (current_es - old_es).max(0);
-            let limit = parse_memory_to_bytes(es_limit_str).unwrap_or(i64::MAX);
+            let limit = quota_limit(
+                parse_memory_to_bytes(es_limit_str),
+                "requests.ephemeral-storage",
+                es_limit_str,
+            );
             if baseline_es + pod_es > limit {
                 exceeded.push(format!(
                     "requests.ephemeral-storage, requested: {}, used: {}, limited: {}",
@@ -1034,39 +1055,56 @@ fn validate_ratio(
     Ok(true)
 }
 
+/// Parse a CPU quantity into millicores.
+///
+/// Upstream never does this: `ResourceQuota.spec.hard`, `LimitRange` bounds and
+/// container resources are all typed `resource.Quantity` in Go, parsed once at
+/// decode time and compared with `Quantity.Cmp`. Rusternetes carries them as
+/// `String`, so every comparison re-parses — hence one shared implementation
+/// rather than a suffix chain per call site.
+///
+/// Millicores/bytes are the units upstream's scheduler accounts these in
+/// (`Resource.Add`, `../kubernetes/pkg/scheduler/framework/types.go:917-918`),
+/// and `Quantity` rounds both up away from zero as upstream `ScaledValue` does.
 fn parse_cpu_to_millicores(cpu: &str) -> anyhow::Result<i64> {
-    if cpu.ends_with('m') {
-        let millis = cpu.trim_end_matches('m').parse::<i64>()?;
-        Ok(millis)
-    } else {
-        let cores = cpu.parse::<f64>()?;
-        Ok((cores * 1000.0) as i64)
-    }
+    Ok(clamp_quantity(Quantity::parse(cpu.trim())?.milli_value()))
 }
 
+/// Parse a byte-denominated quantity (memory, ephemeral-storage, PVC storage)
+/// into bytes. See [`parse_cpu_to_millicores`] for why this is shared.
+///
+/// The `trim_end_matches` chain this replaced handled `Ti`/`Pi`/`Ei`/`T`/`P`/`E`
+/// nowhere, matched only an uppercase `K` — so the non-upstream `"1K"` parsed
+/// while the valid `"1k"` did not — and stripped *repeated* suffixes, so
+/// `"1GiGi"` read as 1Gi.
 fn parse_memory_to_bytes(memory: &str) -> anyhow::Result<i64> {
-    let memory = memory.trim();
+    Ok(clamp_quantity(Quantity::parse(memory.trim())?.value()))
+}
 
-    if memory.ends_with("Gi") {
-        let value = memory.trim_end_matches("Gi").parse::<f64>()?;
-        Ok((value * 1024.0 * 1024.0 * 1024.0) as i64)
-    } else if memory.ends_with("Mi") {
-        let value = memory.trim_end_matches("Mi").parse::<f64>()?;
-        Ok((value * 1024.0 * 1024.0) as i64)
-    } else if memory.ends_with("Ki") {
-        let value = memory.trim_end_matches("Ki").parse::<f64>()?;
-        Ok((value * 1024.0) as i64)
-    } else if memory.ends_with("G") {
-        let value = memory.trim_end_matches("G").parse::<f64>()?;
-        Ok((value * 1000.0 * 1000.0 * 1000.0) as i64)
-    } else if memory.ends_with("M") {
-        let value = memory.trim_end_matches("M").parse::<f64>()?;
-        Ok((value * 1000.0 * 1000.0) as i64)
-    } else if memory.ends_with("K") {
-        let value = memory.trim_end_matches("K").parse::<f64>()?;
-        Ok((value * 1000.0) as i64)
-    } else {
-        Ok(memory.parse::<i64>()?)
+/// Saturate a quantity value into the `i64` these helpers return, matching
+/// upstream `ScaledValue`'s int64 cap rather than wrapping.
+fn clamp_quantity(value: i128) -> i64 {
+    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+/// Resolve a `ResourceQuota.spec.hard` entry to the ceiling admission enforces.
+///
+/// An unparseable limit cannot be enforced, so it reads as unlimited — the
+/// pre-existing behaviour, kept because denying every pod in the namespace is
+/// the worse failure. Upstream has no equivalent branch (`hard` is a typed
+/// `resource.Quantity`), so reaching this means a value our own validation let
+/// through: say so instead of silently disabling the quota dimension.
+fn quota_limit(parsed: anyhow::Result<i64>, resource: &str, raw: &str) -> i64 {
+    match parsed {
+        Ok(limit) => limit,
+        Err(e) => {
+            warn!(
+                "ResourceQuota hard limit {} = {:?} is not a valid quantity ({}); \
+                 treating that dimension as unlimited",
+                resource, raw, e
+            );
+            i64::MAX
+        }
     }
 }
 
@@ -1612,6 +1650,65 @@ mod tests {
         assert_eq!(parse_memory_to_bytes("1Ki").unwrap(), 1024);
         assert_eq!(parse_memory_to_bytes("1Mi").unwrap(), 1024 * 1024);
         assert_eq!(parse_memory_to_bytes("1Gi").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    /// A `ResourceQuota` or `LimitRange` may carry any quantity the API
+    /// accepts. These all failed the old `trim_end_matches` chain, and in the
+    /// quota path a failed parse means `i64::MAX` — the dimension is simply not
+    /// enforced.
+    #[test]
+    fn parse_quantities_covers_full_grammar() {
+        for (value, expected) in [
+            ("1Ti", 1_099_511_627_776i64),
+            ("1Pi", 1_125_899_906_842_624),
+            ("1Ei", 1_152_921_504_606_846_976),
+            ("1T", 1_000_000_000_000),
+            ("1P", 1_000_000_000_000_000),
+            ("1E", 1_000_000_000_000_000_000),
+            ("129e6", 129_000_000),
+            ("0.5", 1),
+        ] {
+            assert_eq!(
+                parse_memory_to_bytes(value).unwrap_or_else(|e| panic!("{value}: {e}")),
+                expected,
+                "memory {value:?}"
+            );
+        }
+        // Sub-unit CPU suffixes, rounded up as `MilliValue()` does.
+        assert_eq!(parse_cpu_to_millicores("0.5m").unwrap(), 1);
+        assert_eq!(parse_cpu_to_millicores("10.5m").unwrap(), 11);
+        assert_eq!(parse_cpu_to_millicores("1500u").unwrap(), 2);
+    }
+
+    /// `k` is the kilo suffix; `K` is not in the grammar at all. The chain
+    /// matched only `ends_with("K")`, so it had these exactly backwards.
+    #[test]
+    fn parse_memory_accepts_lowercase_k_and_rejects_uppercase() {
+        assert_eq!(parse_memory_to_bytes("1k").unwrap(), 1_000);
+        assert!(parse_memory_to_bytes("1K").is_err());
+    }
+
+    /// `trim_end_matches` strips *every* trailing occurrence of the suffix.
+    #[test]
+    fn parse_memory_rejects_repeated_suffix() {
+        assert!(parse_memory_to_bytes("1GiGi").is_err());
+        assert!(parse_memory_to_bytes("1MiMi").is_err());
+        assert!(parse_cpu_to_millicores("100mm").is_err());
+    }
+
+    /// An unparseable quota limit still reads as unlimited — denying every pod
+    /// in the namespace is the worse failure — but it is no longer silent.
+    #[test]
+    fn quota_limit_falls_back_to_unlimited() {
+        assert_eq!(quota_limit(Ok(42), "requests.cpu", "42m"), 42);
+        assert_eq!(
+            quota_limit(
+                parse_memory_to_bytes("nonsense"),
+                "requests.memory",
+                "nonsense"
+            ),
+            i64::MAX
+        );
     }
 
     // ---- LimitRange admission tests ----
