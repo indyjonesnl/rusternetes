@@ -13,6 +13,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
+use rusternetes_common::quantity::parse_resource_value;
 use rusternetes_common::resources::CrossVersionObjectReference;
 use rusternetes_common::types::LabelSelector;
 use std::collections::HashMap;
@@ -584,62 +585,18 @@ impl MetricsClient for HttpMetricsClient {
 }
 
 /// Parse a k8s quantity to an integer in units consistent per resource so a
-/// usage/request ratio is meaningful: CPU in millicores, memory in bytes
-/// (binary `Ki/Mi/Gi/...` and SI `k/M/G/...` suffixes honoured), and any other
-/// metric as a best-effort whole number (leading digits).
+/// usage/request ratio is meaningful: CPU in millicores, every other metric in
+/// its base unit (bytes for memory, whole items for a custom metric).
+///
+/// Unparseable input reads as 0 — a metrics sample the client cannot decode
+/// must not scale the target on a garbage value.
+///
+/// The CPU branch this replaced parsed the pre-`m` digits with `i64`, so a
+/// fractional millicore sample collapsed to 0, and the fallback branch took
+/// only the leading digit run, so a canonicalised `"1k"` custom metric read
+/// as 1.
 fn parse_quantity_milli(q: &str, resource: &str) -> i64 {
-    let q = q.trim();
-    if resource == "cpu" {
-        if let Some(stripped) = q.strip_suffix('m') {
-            return stripped.parse::<i64>().unwrap_or(0);
-        }
-        if let Ok(cores) = q.parse::<f64>() {
-            return (cores * 1000.0) as i64;
-        }
-        return 0;
-    }
-    if resource == "memory" {
-        return parse_memory_bytes(q);
-    }
-    let digits: String = q.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse::<i64>().unwrap_or(0)
-}
-
-/// Parse a k8s memory quantity into bytes. Honours binary (Ki, Mi, Gi, Ti, Pi,
-/// Ei) and decimal SI (k, M, G, T, P, E) suffixes; a bare number is bytes.
-fn parse_memory_bytes(q: &str) -> i64 {
-    let q = q.trim();
-    let (num, mult): (&str, f64) = if let Some(n) = q.strip_suffix("Ki") {
-        (n, 1024.0)
-    } else if let Some(n) = q.strip_suffix("Mi") {
-        (n, 1024f64.powi(2))
-    } else if let Some(n) = q.strip_suffix("Gi") {
-        (n, 1024f64.powi(3))
-    } else if let Some(n) = q.strip_suffix("Ti") {
-        (n, 1024f64.powi(4))
-    } else if let Some(n) = q.strip_suffix("Pi") {
-        (n, 1024f64.powi(5))
-    } else if let Some(n) = q.strip_suffix("Ei") {
-        (n, 1024f64.powi(6))
-    } else if let Some(n) = q.strip_suffix('k') {
-        (n, 1e3)
-    } else if let Some(n) = q.strip_suffix('M') {
-        (n, 1e6)
-    } else if let Some(n) = q.strip_suffix('G') {
-        (n, 1e9)
-    } else if let Some(n) = q.strip_suffix('T') {
-        (n, 1e12)
-    } else if let Some(n) = q.strip_suffix('P') {
-        (n, 1e15)
-    } else if let Some(n) = q.strip_suffix('E') {
-        (n, 1e18)
-    } else {
-        (q, 1.0)
-    };
-    num.trim()
-        .parse::<f64>()
-        .map(|v| (v * mult) as i64)
-        .unwrap_or(0)
+    parse_resource_value(q, resource).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -672,8 +629,25 @@ mod tests {
         assert_eq!(parse_quantity_milli("1Gi", "memory"), 1024 * 1024 * 1024);
         assert_eq!(parse_quantity_milli("1M", "memory"), 1_000_000);
         assert_eq!(parse_quantity_milli("1048576", "memory"), 1_048_576);
-        // Other metrics -> leading digits, best-effort
+        // Other metrics -> base unit
         assert_eq!(parse_quantity_milli("42", "requests-per-second"), 42);
+    }
+
+    /// CPU parsed the pre-`m` digits with `parse::<i64>()`, so a fractional
+    /// millicore reading collapsed to 0 — an HPA target computed from that
+    /// scales on a utilisation of zero. Non-cpu/memory metrics took only the
+    /// leading digit run, so a canonicalised `"1k"` read as 1.
+    #[test]
+    fn parse_quantity_handles_fractional_cpu_and_suffixed_custom_metrics() {
+        assert_eq!(parse_quantity_milli("10.5m", "cpu"), 11);
+        assert_eq!(parse_quantity_milli("0.5m", "cpu"), 1);
+        assert_eq!(parse_quantity_milli("0.7", "cpu"), 700);
+        assert_eq!(parse_quantity_milli("1500u", "cpu"), 2);
+        assert_eq!(parse_quantity_milli("1k", "requests-per-second"), 1_000);
+        assert_eq!(parse_quantity_milli("2M", "requests-per-second"), 2_000_000);
+        // Unparseable stays 0 — the caller has no error channel.
+        assert_eq!(parse_quantity_milli("bogus", "cpu"), 0);
+        assert_eq!(parse_quantity_milli("", "memory"), 0);
     }
 
     #[tokio::test]

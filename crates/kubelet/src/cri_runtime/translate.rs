@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use rusternetes_common::quantity::parse_resource_value;
 use rusternetes_common::resources::pod::{Container, Pod};
 use rusternetes_common::resources::{ConfigMap, Secret, Service};
 use rusternetes_cri::v1;
@@ -804,39 +805,17 @@ fn mounts(container: &Container, host_paths: &HashMap<String, String>) -> Vec<v1
 }
 
 /// Parse a Kubernetes CPU quantity into millicores (`"500m"` → 500, `"2"` →
-/// 2000). Returns `None` for unparseable input.
+/// 2000). Returns `None` for input upstream `ParseQuantity` rejects.
 fn parse_cpu_millicores(q: &str) -> Option<i64> {
-    let q = q.trim();
-    if let Some(m) = q.strip_suffix('m') {
-        m.trim().parse::<i64>().ok()
-    } else {
-        q.parse::<f64>().ok().map(|c| (c * 1000.0).round() as i64)
-    }
+    parse_resource_value(q, "cpu").ok()
 }
 
-/// Parse a Kubernetes memory quantity into bytes (`"128Mi"`, `"1Gi"`, `"1000000"`).
+/// Parse a Kubernetes memory quantity into bytes (`"128Mi"`, `"1Gi"`,
+/// `"1000000"`). The local suffix table this replaced was missing `Pi`/`Ei` and
+/// the `P`/`E` decimal-SI pair, so those fell through to a bare `i64` parse and
+/// yielded `None` — dropping the downward-API env var entirely.
 fn parse_memory_bytes(q: &str) -> Option<i64> {
-    let q = q.trim();
-    let units: &[(&str, i64)] = &[
-        ("Ki", 1 << 10),
-        ("Mi", 1 << 20),
-        ("Gi", 1 << 30),
-        ("Ti", 1i64 << 40),
-        ("k", 1_000),
-        ("M", 1_000_000),
-        ("G", 1_000_000_000),
-        ("T", 1_000_000_000_000),
-    ];
-    for (suffix, mult) in units {
-        if let Some(n) = q.strip_suffix(suffix) {
-            return n
-                .trim()
-                .parse::<f64>()
-                .ok()
-                .map(|v| (v * *mult as f64) as i64);
-        }
-    }
-    q.parse::<i64>().ok()
+    parse_resource_value(q, "memory").ok()
 }
 
 /// Build CRI linux resources from a container's limits/requests. CPU limit →
@@ -1433,6 +1412,25 @@ mod tests {
         assert_eq!(parse_memory_bytes("1Gi"), Some(1024 * 1024 * 1024));
         assert_eq!(parse_memory_bytes("1000000"), Some(1_000_000));
         assert_eq!(parse_memory_bytes("1M"), Some(1_000_000));
+    }
+
+    /// `resourceFieldRef` divisors and limits carry the full quantity
+    /// grammar. `Pi`/`Ei`/`P`/`E` were missing from the suffix table and fell
+    /// through to a bare `i64` parse, yielding `None` — which drops the
+    /// downward-API env var entirely.
+    #[test]
+    fn quantity_parsing_covers_the_full_suffix_set() {
+        assert_eq!(parse_memory_bytes("1Pi"), Some(1_125_899_906_842_624));
+        assert_eq!(parse_memory_bytes("1Ei"), Some(1_152_921_504_606_846_976));
+        assert_eq!(parse_memory_bytes("1P"), Some(1_000_000_000_000_000));
+        assert_eq!(parse_memory_bytes("1E"), Some(1_000_000_000_000_000_000));
+        assert_eq!(parse_memory_bytes("129e6"), Some(129_000_000));
+        assert_eq!(parse_memory_bytes("0.5Gi"), Some(536_870_912));
+        // Sub-millicore CPU: `MilliValue()` rounds up, so a container asking
+        // for some CPU never reports none.
+        assert_eq!(parse_cpu_millicores("0.5m"), Some(1));
+        assert_eq!(parse_cpu_millicores("10.5m"), Some(11));
+        assert_eq!(parse_cpu_millicores("1500u"), Some(2));
     }
 
     #[test]

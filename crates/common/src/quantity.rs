@@ -334,6 +334,47 @@ impl fmt::Display for Quantity {
     }
 }
 
+/// Parse a `resource.Quantity` into the unit Kubernetes accounts the named
+/// resource in: **millicores** for `cpu`, the **base unit** (bytes for memory
+/// and ephemeral-storage, whole items for scalar/extended resources) for
+/// everything else.
+///
+/// Upstream makes this decision in exactly one place, `Resource.Add`
+/// (`pkg/scheduler/framework/types.go:915-925`):
+///
+/// ```text
+/// case v1.ResourceCPU:              r.MilliCPU += rQuant.MilliValue()
+/// case v1.ResourceMemory:           r.Memory += rQuant.Value()
+/// case v1.ResourceEphemeralStorage: r.EphemeralStorage += rQuant.Value()
+/// default:                          r.AddScalar(rName, rQuant.Value())
+/// ```
+///
+/// Prefer this over a local `strip_suffix` chain. Hand-rolled parsers keep
+/// getting the `<number>` production wrong — it permits a decimal point with
+/// *every* suffix, so `"0.5Gi"` is as valid as `"512Mi"` — and a quantity that
+/// silently parses to 0 is indistinguishable from "asks for nothing".
+///
+/// Both accessors round up away from zero like upstream `ScaledValue`, so a
+/// container asking for a sliver of a resource never accounts as asking for
+/// none. Values beyond `i64` saturate rather than wrapping.
+///
+/// Whitespace is trimmed before parsing. Upstream `ParseQuantity` rejects it,
+/// but these strings reach us from CLI flags (`--eviction-hard`) as well as
+/// from validated API objects, and every hand-rolled parser this replaces
+/// trimmed first.
+pub fn parse_resource_value(
+    quantity: &str,
+    resource_name: &str,
+) -> Result<i64, ParseQuantityError> {
+    let parsed = Quantity::parse(quantity.trim())?;
+    let value = if resource_name == "cpu" {
+        parsed.milli_value()
+    } else {
+        parsed.value()
+    };
+    Ok(value.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+}
+
 /// Strip trailing factors of 10 from `mantissa`, lifting the scale
 /// the same number of steps. Leaves the numeric value unchanged.
 fn strip_trailing_zeros(mut mantissa: i128, mut scale: i32) -> (i128, i32) {
