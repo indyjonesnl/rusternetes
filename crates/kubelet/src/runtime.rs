@@ -524,18 +524,12 @@ pub(crate) fn expand_env_vars(input: &str) -> String {
     result
 }
 
-/// Saturate an `i128` quantity value into the `i64` these helpers return,
-/// matching upstream `ScaledValue`'s int64 cap rather than wrapping.
-fn clamp_quantity_to_i64(value: i128) -> i64 {
-    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
-}
-
 /// Parse a Kubernetes memory quantity string (e.g. `"128Mi"`, `"0.5Gi"`,
 /// `"1000000"`) into bytes. Input that upstream `ParseQuantity` rejects reads
 /// as 0; the callers (`downward_api.rs`, `volumes.rs`, `kubelet.rs`) substitute
 /// their own default.
 ///
-/// Parsing is `rusternetes_common::quantity::Quantity`, the port of
+/// Parsing is [`parse_resource_value`], over the port of
 /// `k8s.io/apimachinery/pkg/api/resource/quantity.go`. The `trim_end_matches`
 /// chain this replaced parsed the digits with `parse::<i64>()`, so every
 /// quantity carrying a decimal point read as 0 — a container exposing
@@ -543,24 +537,21 @@ fn clamp_quantity_to_i64(value: i128) -> i64 {
 /// also had no `Ti`/`Pi`/`Ei`/`T`/`P`/`E` (all 0), accepted a non-upstream `K`,
 /// and stripped *repeated* suffixes, so `"1GiGi"` parsed as 1Gi.
 pub fn parse_memory_quantity(s: &str) -> i64 {
-    rusternetes_common::quantity::Quantity::parse(s.trim())
-        .map(|q| clamp_quantity_to_i64(q.value()))
-        .unwrap_or(0)
+    parse_resource_value(s, "memory").unwrap_or(0)
 }
 
 /// Parse a Kubernetes CPU quantity string (e.g. `"500m"`, `"1"`, `"0.5"`) into
-/// millicores, via `Quantity::milli_value()`.
+/// millicores.
 ///
-/// `value()`/`milli_value()` are the units upstream accounts each resource in
+/// Millicores for cpu and base units for everything else are what upstream
+/// accounts each resource in
 /// (`Resource.Add`, `../kubernetes/pkg/scheduler/framework/types.go:917-918`),
 /// and both round up away from zero, so a container asking for a sliver of a
 /// resource never reports none. The branch this replaced parsed the pre-`m`
 /// digits with `parse::<i64>()`, so `"0.5m"` read as 0, and cast an unbounded
 /// f64, so `"inf"` saturated to `i64::MAX`.
 pub fn parse_cpu_quantity(s: &str) -> i64 {
-    rusternetes_common::quantity::Quantity::parse(s.trim())
-        .map(|q| clamp_quantity_to_i64(q.milli_value()))
-        .unwrap_or(0)
+    parse_resource_value(s, "cpu").unwrap_or(0)
 }
 
 #[cfg(test)]

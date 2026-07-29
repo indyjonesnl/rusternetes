@@ -1,4 +1,4 @@
-use rusternetes_common::quantity::Quantity;
+use rusternetes_common::quantity::parse_resource_value;
 use rusternetes_common::resources::{
     IntOrString, Node, Pod, PodDisruptionBudget, PriorityClass, Taint, Toleration,
     TopologySpreadConstraint,
@@ -535,17 +535,7 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
 /// Callers have no error channel, so unparseable input yields 0. Values
 /// beyond `i64` saturate, matching upstream `ScaledValue`.
 pub(crate) fn parse_resource_quantity(quantity: &str, resource_type: &str) -> i64 {
-    let Ok(parsed) = Quantity::parse(quantity.trim()) else {
-        return 0;
-    };
-
-    let value = if resource_type == "cpu" {
-        parsed.milli_value()
-    } else {
-        parsed.value()
-    };
-
-    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    parse_resource_value(quantity, resource_type).unwrap_or(0)
 }
 
 /// System-critical priority threshold. Pods at or above this priority
