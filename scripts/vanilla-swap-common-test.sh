@@ -415,5 +415,100 @@ if [ -f "$NC_COMPOSE" ]; then
   fi
 fi
 
+
+# --- test pods must be pinned to the swapped node (join-worker) -------------
+# The join-worker leg adds the swapped node to a cluster that still has a
+# schedulable vanilla worker, and nothing pushed test pods onto the module under
+# test. Result: 8 of 8 focused specs passed locally while `kubectl exec` against a
+# pinned pod was completely broken — they ran on the vanilla worker and the
+# swapped kubelet logged zero exec_proxy lines for the whole suite (#1710).
+#
+# Fix: once hydrophone's conformance pod is SCHEDULED (cordon does not move
+# placed pods, and that pod must stay on a node with kube-proxy to reach
+# 10.96.0.1), make every other node unschedulable.
+PIN_BIN="$TMP/pin-bin"; mkdir -p "$PIN_BIN"
+PIN_CALLS="$TMP/pin-calls.txt"
+# The real kubectl EXITS NON-ZERO while the conformance pod does not exist yet,
+# and the driver runs under `set -euo pipefail` with IFS=$'\n\t' — the first
+# version of this test used a stub that always succeeded and emitted
+# space-separated node names, so it passed while the real function died on its
+# first iteration and cordoned nothing.
+cat >"$PIN_BIN/kubectl" <<'STUB'
+#!/bin/sh
+echo "kubectl $*" >>"$PIN_CALLS"
+case "$*" in
+  *"get pod e2e-conformance-test"*)
+    # not scheduled on the first look, as in a real run
+    if [ -f "$PIN_CALLS.seen" ]; then echo "vanilla-swap-kubelet-worker"; else : >"$PIN_CALLS.seen"; exit 1; fi ;;
+  *"get nodes"*)
+    printf '%s\n' vanilla-swap-kubelet-control-plane vanilla-swap-kubelet-worker rusternetes-node ;;
+esac
+exit 0
+STUB
+chmod +x "$PIN_BIN/kubectl"
+
+: >"$PIN_CALLS"; rm -f "$PIN_CALLS.seen"
+# Same shell settings as scripts/vanilla-swap-run.sh, or the test does not
+# exercise what actually runs.
+PIN_CALLS="$PIN_CALLS" PATH="$PIN_BIN:$PATH" VS_PIN_WAIT=5 bash -c "
+  set -euo pipefail
+  IFS=\$'\n\t'
+  source '$SCRIPT_DIR/vanilla-swap-common.sh'
+  vs_pin_tests_to_swapped_node /dev/null rusternetes-node
+" >/dev/null 2>&1
+
+if grep -q "cordon vanilla-swap-kubelet-worker" "$PIN_CALLS"; then
+  ok "pins tests by cordoning the vanilla worker"
+else
+  bad "must cordon the vanilla worker so test pods cannot land there"
+fi
+if grep -q "cordon rusternetes-node" "$PIN_CALLS"; then
+  bad "must NOT cordon the swapped node — it is where tests have to run"
+else
+  ok "leaves the swapped node schedulable"
+fi
+if grep -q "get pod e2e-conformance-test" "$PIN_CALLS"; then
+  ok "waits for the conformance pod to be placed before cordoning"
+else
+  bad "must wait for the conformance pod to be scheduled (cordon would leave it Pending)"
+fi
+
+# A conformance pod that never schedules must leave the cluster alone rather than
+# cordoning everything and guaranteeing a dead run.
+cat >"$PIN_BIN/kubectl" <<'STUB'
+#!/bin/sh
+echo "kubectl $*" >>"$PIN_CALLS"
+case "$*" in
+  *"get nodes"*) echo "a b rusternetes-node" ;;
+esac
+exit 0
+STUB
+chmod +x "$PIN_BIN/kubectl"
+: >"$PIN_CALLS"; rm -f "$PIN_CALLS.seen"
+PIN_CALLS="$PIN_CALLS" PATH="$PIN_BIN:$PATH" VS_PIN_WAIT=1 bash -c "
+  set -euo pipefail
+  IFS=\$'\n\t'
+  source '$SCRIPT_DIR/vanilla-swap-common.sh'
+  vs_pin_tests_to_swapped_node /dev/null rusternetes-node
+" >/dev/null 2>&1
+if grep -q "cordon" "$PIN_CALLS"; then
+  bad "must not cordon anything when the conformance pod never scheduled"
+else
+  ok "no cordon when the conformance pod never scheduled"
+fi
+
+# Only the join-worker leg needs this: a static-pod or daemonset module is
+# cluster-wide, so every spec already exercises it.
+DRIVER="$(cat "$SCRIPT_DIR/vanilla-swap-run.sh")"
+case "$DRIVER" in
+  *vs_pin_tests_to_swapped_node*) ok "driver pins tests for the swapped node" ;;
+  *) bad "driver must call vs_pin_tests_to_swapped_node" ;;
+esac
+case "$DRIVER" in
+  *'join-worker'*vs_pin_tests_to_swapped_node*|*vs_pin_tests_to_swapped_node*'join-worker'*)
+    ok "pinning is scoped to the join-worker swap" ;;
+  *) bad "pinning must be scoped to join-worker (static-pod/daemonset modules are cluster-wide)" ;;
+esac
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }
