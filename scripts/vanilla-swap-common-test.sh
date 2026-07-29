@@ -205,5 +205,32 @@ got="$(vs_verdict 11 0 124)"
   && ok "vs_verdict: specs green but runner killed late => still test-passed" \
   || bad "vs_verdict 11/0 rc=124 got '$got' (want 'test-passed 0')"
 
+
+# --- suite timeout must fit the job budget AND the biggest leg --------------
+# The controller-manager leg died on the old 1200s default: 6m44s of framework
+# startup, then killed part-way through 52 sig-apps specs, with junit still
+# inside the conformance pod — no counts, no badge. Both sides of the budget
+# live in different files, so guard the relationship.
+if vs_test_budget_ok 4500 90 15; then ok "vs_test_budget_ok: 75-min suite fits a 90-min job"; else bad "4500s/90min should fit"; fi
+if vs_test_budget_ok 5400 90 15; then bad "90-min suite must NOT fit a 90-min job"; else ok "vs_test_budget_ok: suite == job budget rejected"; fi
+if vs_test_budget_ok 0 90 15; then bad "zero suite timeout should be rejected"; else ok "vs_test_budget_ok: zero suite timeout rejected"; fi
+
+VS_RUN="$SCRIPT_DIR/vanilla-swap-run.sh"
+VS_WF="$SCRIPT_DIR/../.github/workflows/vanilla-swap-module.yml"
+suite_default="$(grep -oE 'VS_TEST_TIMEOUT:-[0-9]+' "$VS_RUN" | head -1 | grep -oE '[0-9]+')"
+job_minutes="$(grep -oE 'timeout-minutes: [0-9]+' "$VS_WF" | head -1 | grep -oE '[0-9]+')"
+if [ -n "$suite_default" ] && [ -n "$job_minutes" ] && vs_test_budget_ok "$suite_default" "$job_minutes" 15; then
+  ok "shipped suite timeout (${suite_default}s) fits the job budget (${job_minutes}min)"
+else
+  bad "suite timeout ${suite_default:-?}s does not fit job budget ${job_minutes:-?}min (leave >=15min for bring-up/swap/teardown)"
+fi
+# The largest leg is the kubelet's 191 NodeConformance specs, ~20 min in
+# node-conformance.yml, and ginkgo's startup alone costs ~7 min.
+if [ -n "$suite_default" ] && [ "$suite_default" -ge 2400 ]; then
+  ok "shipped suite timeout leaves room for the biggest leg"
+else
+  bad "suite timeout ${suite_default:-?}s is too small for a real subset (need >=2400s)"
+fi
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }

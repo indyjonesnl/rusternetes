@@ -325,10 +325,23 @@ fi
 # controller-manager that never finalizes namespace deletion) must not wedge the
 # run indefinitely. The junit on disk is authoritative for the verdict even if
 # the runner is killed mid-cleanup.
+#
+# The default was 1200s, which is less than a real subset needs and produced
+# nothing usable: the controller-manager leg (run 30433160080) spent 6m44s on
+# ginkgo's framework startup alone, then got killed part-way through its 52
+# sig-apps specs. And a kill here loses EVERYTHING — junit lives inside the
+# conformance pod until hydrophone retrieves it at the end, so "junit is
+# authoritative" has no junit to read, the outcome is no-result and no badge is
+# published (#1703 tracks salvaging junit from the pod on timeout).
+#
+# 4500s (75 min) fits under the workflow's 90-minute job timeout with room for
+# kind bring-up, the swap and teardown, and comfortably covers the largest leg
+# (the kubelet's 191 NodeConformance specs run in ~20 min in node-conformance.yml).
+# vs_test_budget_ok() guards the relationship against future edits to either side.
 vs_log "running scoped subset (target=$VS_TARGET focus=$VS_FOCUS) via conformance-target-run.sh"
 RESULT_OUT="$VS_WORKDIR/target-run.out"
 set +e
-timeout "${VS_TEST_TIMEOUT:-1200}" bash "$SCRIPT_DIR/conformance-target-run.sh" \
+timeout "${VS_TEST_TIMEOUT:-4500}" bash "$SCRIPT_DIR/conformance-target-run.sh" \
   --target "$VS_TARGET" \
   --focus "$VS_FOCUS" \
   --skip "$VS_SKIP" \

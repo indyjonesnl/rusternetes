@@ -602,6 +602,21 @@ vs_junit_counts() {
   printf '%s %s\n' "$(( ${passed:-0} + ${failed:-0} ))" "${failed:-0}"
 }
 
+# vs_test_budget_ok <suite-timeout-seconds> <job-timeout-minutes> [reserve-minutes]
+# True when the scoped-subset timeout leaves at least `reserve` minutes of the CI
+# job budget for everything around it: kind bring-up, image pull, the swap, the
+# readiness wait and teardown. The two numbers live in different files
+# (scripts/vanilla-swap-run.sh and .github/workflows/vanilla-swap-module.yml), so
+# raising one without the other silently reintroduces the failure this guards:
+# a suite killed with its junit still inside the conformance pod, which yields no
+# counts and therefore no badge.
+vs_test_budget_ok() {
+  local suite="${1:-0}" job_min="${2:-0}" reserve="${3:-15}"
+  case "$suite$job_min" in *[!0-9]*) return 1 ;; esac
+  [ "$suite" -gt 0 ] && [ "$job_min" -gt "$reserve" ] || return 1
+  [ "$suite" -le "$(( (job_min - reserve) * 60 ))" ]
+}
+
 # vs_verdict <ran> <failed> <runner_rc> — echo "<outcome> <exit-code>".
 #
 # `ran` is the REAL specs attempted (ginkgo suite-level nodes excluded, see
