@@ -523,7 +523,60 @@ vs_wait_ready() {
     fi
     sleep 5
   done
+  vs_dump_readiness_diagnostics "$cluster" "$kubeconfig"
   return "$VS_EX_NOTUP"
+}
+
+# vs_dump_readiness_diagnostics <cluster> <kubeconfig>
+# What the run looked like at the moment readiness gave up. Without this a
+# readiness timeout is three minutes of silence followed by a bare
+# `module-did-not-come-up` — the kubelet leg (run 30438506580) reported exactly
+# that and left nothing to act on. Every command is best-effort: this runs on a
+# cluster that is by definition unhealthy, and a failing dump must not replace
+# the real verdict.
+vs_dump_readiness_diagnostics() {
+  local cluster="$1" kubeconfig="$2"
+  vs_warn "readiness '$VS_READINESS' NOT satisfied within ${VS_READY_TIMEOUT:-180}s — diagnostics follow"
+
+  echo "--- nodes ---" >&2
+  KUBECONFIG="$kubeconfig" kubectl get nodes -o wide >&2 2>&1 || true
+  echo "--- kube-system pods ---" >&2
+  KUBECONFIG="$kubeconfig" kubectl get pods -n kube-system -o wide >&2 2>&1 || true
+
+  # The object the readiness probe was watching, in detail.
+  case "$VS_READINESS" in
+    node-ready)
+      echo "--- describe node rusternetes-node ---" >&2
+      KUBECONFIG="$kubeconfig" kubectl describe node rusternetes-node >&2 2>&1 || true ;;
+    readyz)
+      echo "--- /readyz ---" >&2
+      KUBECONFIG="$kubeconfig" kubectl get --raw=/readyz?verbose >&2 2>&1 || true ;;
+    service-programmed)
+      echo "--- rusternetes-kube-proxy daemonset ---" >&2
+      KUBECONFIG="$kubeconfig" kubectl -n kube-system describe daemonset rusternetes-kube-proxy >&2 2>&1 || true ;;
+    pod-scheduled)
+      echo "--- describe canary pod ---" >&2
+      KUBECONFIG="$kubeconfig" kubectl -n default describe pod vanilla-swap-canary >&2 2>&1 || true ;;
+    deployment-reconciled)
+      echo "--- deployments ---" >&2
+      KUBECONFIG="$kubeconfig" kubectl get deployments -A >&2 2>&1 || true ;;
+  esac
+
+  # The swapped module's own logs. A join-worker module runs as its own docker
+  # container beside the kind nodes; a static-pod / daemonset module runs inside
+  # the cluster, so its logs come from the node's container runtime.
+  echo "--- swapped module logs (last 60 lines) ---" >&2
+  local c
+  for c in rusternetes-node "rusternetes-${VS_MODULE}" "vs-${cluster}-runtime"; do
+    if docker inspect "$c" >/dev/null 2>&1; then
+      echo "[container $c]" >&2
+      docker logs --tail 60 "$c" >&2 2>&1 || true
+    fi
+  done
+  KUBECONFIG="$kubeconfig" kubectl -n kube-system logs --tail=60 \
+    "-l=component=kube-${VS_MODULE}" >&2 2>&1 || true
+  KUBECONFIG="$kubeconfig" kubectl -n kube-system logs --tail=60 \
+    "-l=app=rusternetes-${VS_MODULE}" >&2 2>&1 || true
 }
 
 vs_readiness_probe() {
