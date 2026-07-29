@@ -510,5 +510,68 @@ case "$DRIVER" in
   *) bad "pinning must be scoped to join-worker (static-pod/daemonset modules are cluster-wide)" ;;
 esac
 
+
+# --- a timed-out leg must still report what completed ----------------------
+# Ginkgo registers its junit reporter as a ReportAfterSuite node, so the file only
+# exists once the suite finishes: killing the runner mid-suite leaves NOTHING to
+# copy out of the conformance pod (#1703's original premise). What does survive is
+# ginkgo's progress stream, which the harness already tees to disk — one bullet per
+# completed spec, `• [FAILED]` for a failure, S for a skip.
+#
+# The controller-manager leg (run 30443157562) was killed at 4490s having finished
+# 23 of its 52 specs (16 passed, 7 failed) and published 0/0. Those numbers are
+# recoverable.
+PROG="$TMP/ginkgo-progress.out"
+cat >"$PROG" <<'EOF'
+Running in parallel across 2 processes
+SSSSSSSSSSSSSSSSSSSS•SSSSSS•SSS
+------------------------------
+• [FAILED] [315.751 seconds]
+[sig-apps] CronJob [It] should not schedule new jobs when ForbidConcurrent [Slow] [Conformance]
+  Timeline >>
+  STEP: Creating a ForbidConcurrent cronjob
+SS•SS•
+• [FAILED] [620.079 seconds]
+[sig-apps] DisruptionController [It] should create a PodDisruptionBudget [Conformance]
+SSS•
+EOF
+got="$(vs_progress_counts "$PROG")"
+[ "$got" = "5 2" ] && ok "vs_progress_counts: reads passed/failed from ginkgo's progress stream" \
+  || bad "vs_progress_counts got '$got' (want '5 2')"
+
+got="$(vs_progress_counts "$TMP/not-a-file")"
+[ "$got" = "0 0" ] && ok "vs_progress_counts: missing file => 0 0" \
+  || bad "vs_progress_counts missing-file got '$got' (want '0 0')"
+
+# "Ran N of M Specs" is printed only when the suite completes, which is how a
+# mid-suite kill is told apart from a kill during post-suite cleanup.
+printf 'SSS•\nRan 23 of 7348 Specs in 100.5 seconds\n' >"$TMP/completed.out"
+if vs_suite_completed "$TMP/completed.out"; then ok "vs_suite_completed: sees the ginkgo summary"; else bad "should detect the ginkgo summary"; fi
+if vs_suite_completed "$PROG"; then bad "must NOT report completion without the ginkgo summary"; else ok "vs_suite_completed: mid-suite kill is not completion"; fi
+
+# Verdict: killed mid-suite with specs on the board is a timeout WITH numbers, not
+# a module that never came up — and not a pass.
+got="$(vs_verdict 23 7 124 partial)"
+[ "$got" = "test-timeout $VS_EX_TESTFAIL" ] \
+  && ok "vs_verdict: mid-suite timeout with specs => test-timeout" \
+  || bad "vs_verdict partial-timeout got '$got' (want 'test-timeout $VS_EX_TESTFAIL')"
+
+# All specs green and the runner killed afterwards (hung cleanup) stays a pass.
+got="$(vs_verdict 52 0 124)"
+[ "$got" = "test-passed 0" ] \
+  && ok "vs_verdict: complete suite, late kill => still test-passed" \
+  || bad "vs_verdict late-kill got '$got' (want 'test-passed 0')"
+
+# Zero specs stays module-did-not-come-up regardless of how it died.
+got="$(vs_verdict 0 0 124 partial)"
+[ "$got" = "module-did-not-come-up $VS_EX_NOTUP" ] \
+  && ok "vs_verdict: timeout before any spec => module-did-not-come-up" \
+  || bad "vs_verdict empty-timeout got '$got'"
+
+# The badge step must mark a partial run so a percentage cannot be read as a
+# finished suite.
+WF="$SCRIPT_DIR/../.github/workflows/vanilla-swap-module.yml"
+if grep -q "test-timeout" "$WF"; then ok "workflow marks a partial run on the badge"; else bad "workflow must label a test-timeout badge as partial"; fi
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }

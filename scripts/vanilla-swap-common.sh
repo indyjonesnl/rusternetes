@@ -799,6 +799,38 @@ vs_test_budget_ok() {
   [ "$suite" -le "$(( (job_min - reserve) * 60 ))" ]
 }
 
+# vs_progress_counts <runner-stdout-file> — echo "PASSED FAILED" recovered from
+# ginkgo's progress stream. Always succeeds; 0 0 when there is nothing to read.
+#
+# Needed because ginkgo registers its junit reporter as a ReportAfterSuite node:
+# the file only exists once the suite finishes, so a runner killed mid-suite leaves
+# no junit anywhere — not on disk, not inside the conformance pod. What does survive
+# is the progress stream this harness already tees: exactly one bullet per completed
+# spec, `• [FAILED]` for a failure, S for a skip. The controller-manager leg (run
+# 30443157562) was killed having finished 23 of 52 specs and published 0/0; those
+# numbers were sitting in its own log.
+vs_progress_counts() {
+  local f="${1:-}" bullets=0 failed=0
+  if [ -n "$f" ] && [ -f "$f" ]; then
+    bullets="$(grep -o '•' "$f" 2>/dev/null | grep -c . || true)"
+    failed="$(grep -c '• \[FAILED\]' "$f" 2>/dev/null || true)"
+  fi
+  bullets="${bullets:-0}"; failed="${failed:-0}"
+  local passed=$(( bullets - failed ))
+  [ "$passed" -lt 0 ] && passed=0
+  printf '%s %s\n' "$passed" "$failed"
+}
+
+# vs_suite_completed <runner-stdout-file> — true when ginkgo printed its summary
+# ("Ran N of M Specs"), which it only does once the suite finishes. Distinguishes a
+# kill DURING the suite (partial results) from a kill during post-suite cleanup
+# (results are complete; that is what VS_TEST_TIMEOUT was originally for).
+vs_suite_completed() {
+  local f="${1:-}"
+  [ -n "$f" ] && [ -f "$f" ] || return 1
+  grep -qE 'Ran [0-9]+ of [0-9]+ Specs' "$f" 2>/dev/null
+}
+
 # vs_verdict <ran> <failed> <runner_rc> — echo "<outcome> <exit-code>".
 #
 # `ran` is the REAL specs attempted (ginkgo suite-level nodes excluded, see
@@ -812,13 +844,19 @@ vs_test_budget_ok() {
 # runner is killed on VS_TEST_TIMEOUT when post-test cleanup hangs, and junit
 # already holds the verdict.
 vs_verdict() {
-  local ran="${1:-0}" failed="${2:-0}" rc="${3:-0}"
+  local ran="${1:-0}" failed="${2:-0}" rc="${3:-0}" completeness="${4:-complete}"
   if [ "$ran" -le 0 ]; then
     if [ "$rc" -ne 0 ]; then
       printf 'module-did-not-come-up %s\n' "$VS_EX_NOTUP"
     else
       printf 'no-result %s\n' "$VS_EX_NOTUP"
     fi
+    return 0
+  fi
+  # Killed mid-suite with specs on the board: a real ratio of what ran, but not a
+  # finished suite and never a pass. The caller marks the badge partial.
+  if [ "$completeness" = "partial" ]; then
+    printf 'test-timeout %s\n' "$VS_EX_TESTFAIL"
     return 0
   fi
   if [ "$failed" -gt 0 ]; then
