@@ -255,23 +255,41 @@ impl Quantity {
     /// internal representation is `mantissa * 10^self.scale`, so this is
     /// `ceil(mantissa * 10^(self.scale - target_scale))`.
     fn scaled_value(&self, target_scale: i32) -> i128 {
-        let delta = self.scale - target_scale;
+        if self.mantissa == 0 {
+            return 0;
+        }
+        let saturated = if self.mantissa < 0 {
+            i128::MIN
+        } else {
+            i128::MAX
+        };
+        // `scale` is the parsed exponent, so `"1e2147483647"` can push this
+        // subtraction out of `i32` — saturate instead of overflowing.
+        let delta = self.scale.saturating_sub(target_scale);
         match delta.cmp(&0) {
             std::cmp::Ordering::Equal => self.mantissa,
             std::cmp::Ordering::Greater => {
-                // Multiply up — exact, no rounding needed.
-                self.mantissa
-                    .checked_mul(10i128.pow(delta as u32))
-                    .unwrap_or(if self.mantissa < 0 {
-                        i128::MIN
-                    } else {
-                        i128::MAX
-                    })
+                // Multiply up — exact, no rounding needed. `10^delta` alone
+                // leaves `i128` from `delta >= 39` (`"1e400"`), so the factor
+                // needs the same overflow check as the product; upstream caps
+                // at the int64 bound rather than erroring
+                // (`quantity.go`, `ScaledValue`).
+                let Some(factor) = 10i128.checked_pow(delta as u32) else {
+                    return saturated;
+                };
+                self.mantissa.checked_mul(factor).unwrap_or(saturated)
             }
             std::cmp::Ordering::Less => {
                 // Divide by 10^(-delta), rounding up away from zero to match
                 // upstream `ScaledValue` ceiling semantics.
-                let divisor = 10i128.pow((-delta) as u32);
+                let Some(divisor) = 10i128.checked_pow(delta.unsigned_abs()) else {
+                    // The divisor exceeds `i128`, so `|value| < 1` at this
+                    // scale. Upstream rounds a non-zero quantity up to the
+                    // smallest representable value rather than to zero ("if
+                    // you want some resources, you should get some
+                    // resources") — `ParseQuantity`'s `inf.RoundUp` call.
+                    return if self.mantissa < 0 { -1 } else { 1 };
+                };
                 let q = self.mantissa / divisor;
                 let r = self.mantissa % divisor;
                 if r > 0 {
@@ -500,6 +518,30 @@ mod tests {
         ] {
             assert_eq!(parse(s).canonical_string(), s);
         }
+    }
+
+    /// `value()`/`milli_value()` used to compute `10^delta` with an
+    /// unchecked `pow`, so an exponent past ~39 digits panicked with
+    /// "attempt to multiply with overflow" in debug and wrapped to a
+    /// nonsense value in release. Upstream `ScaledValue` caps at the
+    /// int64 bound instead.
+    #[test]
+    fn extreme_exponents_saturate_instead_of_overflowing() {
+        assert_eq!(parse("1e400").value(), i128::MAX);
+        assert_eq!(parse("-1e400").value(), i128::MIN);
+        assert_eq!(parse("1e400").milli_value(), i128::MAX);
+        // A non-zero quantity smaller than the target scale rounds up away
+        // from zero rather than dividing to 0.
+        assert_eq!(parse("1e-400").value(), 1);
+        assert_eq!(parse("-1e-400").value(), -1);
+        assert_eq!(parse("1e-400").milli_value(), 1);
+        // Zero stays zero at any scale.
+        assert_eq!(parse("0e400").value(), 0);
+        assert_eq!(parse("0e-400").value(), 0);
+        // Exponent at the i32 bound must not overflow the scale subtraction
+        // that `milli_value()` performs.
+        assert_eq!(parse("1e2147483647").milli_value(), i128::MAX);
+        assert_eq!(parse("1e-2147483648").milli_value(), 1);
     }
 
     #[test]
