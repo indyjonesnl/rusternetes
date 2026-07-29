@@ -358,6 +358,10 @@ vs_swap_join_worker() {
   local root; root="$(vs_repo_root)"
   local node_name cri clusterdns cri_repo
   node_name="$(vs_recipe_field "$root/$recipe" nodeName)"
+  # Exported so the driver can pin test pods to this node once the suite starts
+  # (vs_pin_tests_to_swapped_node, #1710).
+  VS_NODE_NAME="$node_name"
+  export VS_NODE_NAME
   cri="$(vs_recipe_field "$root/$recipe" criSocket)"
   clusterdns="$(vs_recipe_field "$root/$recipe" clusterDns)"
   # CRI runtime image = sibling of the kubelet imageRepo (.../rusternetes/containerd).
@@ -544,6 +548,59 @@ vs_guard_cluster() {
   count="${count:-0}"
   vs_log "post-swap guard: $count rusternetes image(s) present"
   [ "$count" -eq 1 ] || vs_die "single-module guard: expected exactly 1 rusternetes image in cluster, found $count" "$VS_EX_GUARD"
+}
+
+# ---------------------------------------------------------------------------
+# Test-pod pinning (join-worker only)
+# ---------------------------------------------------------------------------
+
+# vs_pin_tests_to_swapped_node <kubeconfig> <swapped-node>
+# Make every node EXCEPT the swapped one unschedulable, so the scoped subset
+# actually exercises the module under test.
+#
+# The join-worker leg adds the swapped node to a cluster that still has a
+# schedulable vanilla worker, and the only scheduling constraint in this harness
+# pushes kube-proxy OFF the swapped node (#1652) — nothing pulled test pods ONTO
+# it. So specs landed wherever the scheduler put them: 8 of 8 focused specs
+# passed locally while `kubectl exec` against a pinned pod was broken outright,
+# and the swapped kubelet logged zero exec_proxy lines for the entire suite. The
+# pass rate measured upstream code as much as ours (#1710).
+#
+# Ordering matters. Hydrophone's own conformance pod must stay on a node with
+# kube-proxy (it reaches the api-server via 10.96.0.1:443, which the swapped node
+# deliberately cannot route), so we wait until that pod has a nodeName and only
+# then cordon. `kubectl cordon` never moves already-placed pods, and DaemonSets
+# tolerate unschedulable, so kindnet/kube-proxy stay put. Ginkgo then spends
+# minutes on framework startup before creating its first test pod, leaving a wide
+# margin before pinning takes effect.
+#
+# Best-effort by design: if the conformance pod never schedules we leave the
+# cluster alone rather than cordoning everything and guaranteeing a dead run.
+vs_pin_tests_to_swapped_node() {
+  local kubeconfig="$1" keep="$2" placed="" i n
+  # `|| true` is load-bearing: kubectl exits non-zero until hydrophone creates the
+  # pod, and the driver runs this under `set -euo pipefail`, so without it the
+  # first iteration killed the whole watcher silently — it cordoned nothing and
+  # logged nothing (same shape as the counter-fallback death in #1704).
+  for (( i=0; i<${VS_PIN_WAIT:-150}; i++ )); do
+    placed="$(KUBECONFIG="$kubeconfig" kubectl -n conformance get pod e2e-conformance-test \
+      -o 'jsonpath={.spec.nodeName}' 2>/dev/null || true)"
+    [ -n "$placed" ] && break
+    sleep 2
+  done
+  if [ -z "$placed" ]; then
+    vs_warn "conformance pod never got a node; leaving every node schedulable (tests may not run on $keep)"
+    return 0
+  fi
+  # Newline-separated, NOT the space-separated `{.items[*].metadata.name}`: the
+  # driver sets IFS=$'\n\t', so a space-separated list would arrive as one word
+  # and `kubectl cordon "<all three names>"` would simply fail.
+  for n in $(KUBECONFIG="$kubeconfig" kubectl get nodes \
+    -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true); do
+    [ "$n" = "$keep" ] && continue
+    KUBECONFIG="$kubeconfig" kubectl cordon "$n" >/dev/null 2>&1 || true
+  done
+  vs_log "pinned test pods to '$keep' (conformance pod already placed on '$placed'; other nodes cordoned)"
 }
 
 # ---------------------------------------------------------------------------

@@ -338,6 +338,14 @@ fi
 # kind bring-up, the swap and teardown, and comfortably covers the largest leg
 # (the kubelet's 191 NodeConformance specs run in ~20 min in node-conformance.yml).
 # vs_test_budget_ok() guards the relationship against future edits to either side.
+# A join-worker module is one node among several, so the subset only means
+# something if its pods land there. Backgrounded: it waits for hydrophone's own
+# pod to be placed first (see vs_pin_tests_to_swapped_node, #1710). Static-pod and
+# daemonset modules are cluster-wide, so every spec already exercises them.
+if [ "$VS_SWAP" = "join-worker" ] && [ -n "${VS_NODE_NAME:-}" ]; then
+  vs_pin_tests_to_swapped_node "$KUBECONFIG_FILE" "$VS_NODE_NAME" &
+fi
+
 vs_log "running scoped subset (target=$VS_TARGET focus=$VS_FOCUS) via conformance-target-run.sh"
 RESULT_OUT="$VS_WORKDIR/target-run.out"
 set +e
