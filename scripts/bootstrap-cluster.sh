@@ -121,6 +121,60 @@ containerd_service_containers() {
         | sort
 }
 
+# The pod subnet this stack declares, read off the running kube-proxy
+# node-network agents (`--pod-cidr`). Empty when no agent runs — i.e. when the
+# stack's CNI does not derive per-node subnets from node.spec.podCIDR.
+stack_pod_subnet() {
+    local names name cmd cidr
+    names="$(${CONTAINER_RT:-docker} ps --format '{{.Names}}' 2>/dev/null \
+        | grep -E '^rusternetes-kube-proxy[0-9]*$' \
+        | sort)"
+    for name in $names; do
+        cmd="$(${CONTAINER_RT:-docker} inspect -f '{{join .Config.Cmd " "}}' "$name" 2>/dev/null || true)"
+        cidr="$(printf '%s\n' "$cmd" \
+            | grep -oE -- '--pod-cidr[= ]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' \
+            | head -1)"
+        if [ -n "$cidr" ]; then
+            printf '%s' "$cidr"
+            return 0
+        fi
+    done
+}
+
+# Cluster CIDR to run node IPAM with, or empty to leave the allocator off.
+#
+# Ported from kubeadm, which does NOT gate the allocator behind its own flag —
+# it turns it on whenever the cluster declares a pod subnet
+# (../kubernetes/cmd/kubeadm/app/phases/controlplane/manifests.go:351:
+#   if cfg.Networking.PodSubnet != "" {
+#       ... SetArgValues(..., "allocate-node-cidrs", "true", 1)
+#       ... SetArgValues(..., "cluster-cidr", cfg.Networking.PodSubnet, 1)
+#   }
+# ). Here the stack's pod subnet is what its kube-proxy node-network agents run
+# with, so node IPAM follows that declaration automatically: the multi-node
+# compose stack needs podCIDRs before its CNI conflists exist at all, and every
+# bring-up path (CI action, cluster-up.sh, the manual recipe) gets them without
+# having to remember an env var (#1697).
+#
+# ALLOCATE_NODE_CIDRS still overrides in both directions: 0/false/no/off forces
+# the allocator off, any other non-empty value forces it on (compose.calico.yml's
+# documented recipe) and defaults the CIDR when nothing is detectable.
+# CLUSTER_CIDR, when set, is the operator's word on the subnet.
+node_ipam_cluster_cidr() {
+    local mode="${ALLOCATE_NODE_CIDRS:-auto}"
+    case "$mode" in
+        0 | false | no | off) return 0 ;;
+    esac
+
+    local cidr="${CLUSTER_CIDR:-}"
+    [ -n "$cidr" ] || cidr="$(stack_pod_subnet)"
+    if [ -z "$cidr" ] && [ "$mode" != auto ]; then
+        cidr=10.244.0.0/16
+    fi
+    printf '%s' "$cidr"
+}
+
 import_image_into_containerd() {
     local image="$1"
     local runtimes
@@ -239,13 +293,15 @@ export CERTS_PATH
 if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
     print_step "Templating control-plane static pod manifests (CERTS_PATH=$CERTS_PATH)..."
     mkdir -p "$PROJECT_ROOT/.rusternetes/manifests"
-    # Node IPAM is opt-in (issue #1187). When ALLOCATE_NODE_CIDRS is set (the
-    # Calico stack sets it — see compose.calico.yml), expand the
-    # @NODE_IPAM_ARGS@ placeholder in the controller-manager manifest into the
-    # allocator flags; otherwise strip the placeholder line so the other stacks
-    # (conformance/sqlite/etcd/redis) keep node IPAM off and unchanged.
-    if [ -n "${ALLOCATE_NODE_CIDRS:-}" ]; then
-        CLUSTER_CIDR="${CLUSTER_CIDR:-10.244.0.0/16}"
+    # Node IPAM follows the stack's declared pod subnet (see
+    # node_ipam_cluster_cidr above, ported from kubeadm). When there is one,
+    # expand the @NODE_IPAM_ARGS@ placeholder in the controller-manager manifest
+    # into the allocator flags; otherwise strip the placeholder line so stacks
+    # with no pod subnet (etcd/redis/node-conformance) keep node IPAM off, as
+    # #1187 intended.
+    node_ipam_cidr="$(node_ipam_cluster_cidr)"
+    if [ -n "$node_ipam_cidr" ]; then
+        CLUSTER_CIDR="$node_ipam_cidr"
         NODE_CIDR_MASK_SIZE="${NODE_CIDR_MASK_SIZE:-24}"
         node_ipam_args='    - "--allocate-node-cidrs"\n    - "--cluster-cidr"\n    - "'"${CLUSTER_CIDR}"'"\n    - "--node-cidr-mask-size"\n    - "'"${NODE_CIDR_MASK_SIZE}"'"'
         print_step "Node IPAM enabled: cluster-cidr=${CLUSTER_CIDR}, node-mask=/${NODE_CIDR_MASK_SIZE}"
