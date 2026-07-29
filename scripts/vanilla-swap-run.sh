@@ -341,7 +341,13 @@ fi
 vs_log "running scoped subset (target=$VS_TARGET focus=$VS_FOCUS) via conformance-target-run.sh"
 RESULT_OUT="$VS_WORKDIR/target-run.out"
 set +e
-timeout "${VS_TEST_TIMEOUT:-4500}" bash "$SCRIPT_DIR/conformance-target-run.sh" \
+# GITHUB_OUTPUT is cleared for the child on purpose: with it set (every CI job
+# has it) the runner writes passed=/failed=/total= into the Actions output file,
+# where this driver cannot read them, and a leg without junit then has no counts
+# at all. Cleared, the same lines go to stdout and land in $RESULT_OUT. The
+# workflow reads run-result.json, not the runner's step outputs, so nothing
+# downstream loses information.
+env -u GITHUB_OUTPUT timeout "${VS_TEST_TIMEOUT:-4500}" bash "$SCRIPT_DIR/conformance-target-run.sh" \
   --target "$VS_TARGET" \
   --focus "$VS_FOCUS" \
   --skip "$VS_SKIP" \
@@ -355,9 +361,7 @@ set -e
 if counts="$(vs_junit_counts "$VS_WORKDIR")"; then
   RAN="${counts% *}"; FAILED="${counts#* }"; TOTAL="$RAN"; PASSED="$(( RAN - FAILED ))"
 else
-  PASSED="$(grep -E '^passed=' "$RESULT_OUT" | tail -1 | cut -d= -f2)"; PASSED="${PASSED:-0}"
-  FAILED="$(grep -E '^failed=' "$RESULT_OUT" | tail -1 | cut -d= -f2)"; FAILED="${FAILED:-0}"
-  TOTAL="$(grep -E '^total=' "$RESULT_OUT" | tail -1 | cut -d= -f2)"; TOTAL="${TOTAL:-0}"
+  IFS=' ' read -r PASSED FAILED TOTAL <<<"$(vs_stdout_counts "$RESULT_OUT")"
 fi
 
 # Verdict from the spec counts, NOT from the junit's presence: a junit that holds
