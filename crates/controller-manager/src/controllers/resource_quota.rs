@@ -1,11 +1,20 @@
 use anyhow::Result;
-use rusternetes_common::quantity::parse_resource_value;
+use rusternetes_common::quantity::{parse_resource_value, Format, Quantity};
 use rusternetes_common::resources::{Pod, ResourceQuota, ResourceQuotaStatus, Service};
 use rusternetes_common::types::Phase;
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
+
+/// Canonical `resource.Quantity` string for a millicore total.
+///
+/// `Quantity::from_milli_value` + `canonical_string()` is upstream's own round
+/// trip (`NewMilliQuantity`, `quantity.go:797`), so a whole number of cores
+/// serialises as `"2"`, not the `"2000m"` a `format!("{}m", ..)` emits.
+fn millicores_to_cpu_string(millicores: i64) -> String {
+    Quantity::from_milli_value(millicores, Format::DecimalSI).canonical_string()
+}
 
 /// ResourceQuotaController tracks resource usage per namespace and enforces quota limits.
 /// It:
@@ -611,7 +620,7 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
             }
 
             // Always insert resource usage values (even when zero, K8s expects "0" in status.used)
-            let cpu_req_str = format!("{}m", total_cpu_requests);
+            let cpu_req_str = millicores_to_cpu_string(total_cpu_requests);
             usage.insert("requests.cpu".to_string(), cpu_req_str.clone());
             usage.insert("cpu".to_string(), cpu_req_str);
 
@@ -619,7 +628,10 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
             usage.insert("requests.memory".to_string(), mem_req_str.clone());
             usage.insert("memory".to_string(), mem_req_str);
 
-            usage.insert("limits.cpu".to_string(), format!("{}m", total_cpu_limits));
+            usage.insert(
+                "limits.cpu".to_string(),
+                millicores_to_cpu_string(total_cpu_limits),
+            );
             usage.insert(
                 "limits.memory".to_string(),
                 self.bytes_to_memory_string(total_memory_limits),
@@ -756,22 +768,7 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
 
     /// Convert bytes to human-readable memory string
     fn bytes_to_memory_string(&self, bytes: i64) -> String {
-        if bytes == 0 {
-            return "0".to_string();
-        }
-        const GI: i64 = 1024 * 1024 * 1024;
-        const MI: i64 = 1024 * 1024;
-        const KI: i64 = 1024;
-
-        if bytes >= GI && bytes % GI == 0 {
-            format!("{}Gi", bytes / GI)
-        } else if bytes >= MI && bytes % MI == 0 {
-            format!("{}Mi", bytes / MI)
-        } else if bytes >= KI && bytes % KI == 0 {
-            format!("{}Ki", bytes / KI)
-        } else {
-            format!("{}", bytes)
-        }
+        Quantity::from_value(bytes, Format::BinarySI).canonical_string()
     }
 }
 
@@ -865,7 +862,13 @@ mod tests {
         assert_eq!(controller.bytes_to_memory_string(536870912), "512Mi");
         assert_eq!(controller.bytes_to_memory_string(1048576), "1Mi");
         assert_eq!(controller.bytes_to_memory_string(1024), "1Ki");
-        assert_eq!(controller.bytes_to_memory_string(1000), "1000");
+        // Upstream switches BinarySI to DecimalSI formatting below 1024
+        // (`CanonicalizeBytes`, `quantity.go:434-437`), so 1000 bytes is "1k",
+        // not "1000". The old hand-rolled encoder emitted "1000"; that was the
+        // divergence, this assertion is the fix.
+        assert_eq!(controller.bytes_to_memory_string(1000), "1k");
+        // Not a clean power of 1024 and >= 1024, so a bare number.
+        assert_eq!(controller.bytes_to_memory_string(1500), "1500");
         assert_eq!(controller.bytes_to_memory_string(0), "0");
     }
 
@@ -1200,7 +1203,10 @@ mod tests {
         assert!(status.used.is_some());
         let used = status.used.unwrap();
         assert_eq!(used.get("pods").unwrap(), "0");
-        assert_eq!(used.get("requests.cpu").unwrap(), "0m");
+        // `NewMilliQuantity(0, DecimalSI).String()` is "0" — upstream's
+        // `CanonicalizeBytes` short-circuits on `IsZero` (`quantity.go:426`),
+        // so a zero cpu usage never carries a suffix. Was "0m".
+        assert_eq!(used.get("requests.cpu").unwrap(), "0");
     }
 
     #[tokio::test]

@@ -179,7 +179,11 @@ async fn test_reconcile_one_decrements_used_on_pod_delete() {
             .get("requests.cpu")
             .map(|s| s.as_str())
             .unwrap_or(""),
-        "0m",
+        // Upstream's canonical form for a zero quantity is bare "0" — the
+        // `IsZero` short-circuit in `CanonicalizeBytes` (`quantity.go:426`)
+        // returns before any suffix is chosen. Was "0m", which upstream never
+        // emits.
+        "0",
         "after pod delete, used.requests.cpu must be 0 (got {:?})",
         used_after_delete.get("requests.cpu")
     );

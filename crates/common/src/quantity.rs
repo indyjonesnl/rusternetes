@@ -160,6 +160,45 @@ impl Quantity {
         })
     }
 
+    /// Quantity representing `value` in `format`. Port of upstream
+    /// `resource.NewQuantity(value int64, format Format)`
+    /// (`quantity.go:786-791`).
+    ///
+    /// Use this instead of hand-rolling a canonical string from an
+    /// accumulated integer: `from_value(bytes, BinarySI).canonical_string()`
+    /// is upstream's own round trip, suffix table and all.
+    pub fn from_value(value: i64, format: Format) -> Quantity {
+        Quantity {
+            mantissa: value as i128,
+            scale: 0,
+            format,
+        }
+    }
+
+    /// Quantity representing `value * 1/1000` in `format`. Port of upstream
+    /// `resource.NewMilliQuantity` (`quantity.go:797-802`).
+    ///
+    /// The natural inverse of [`Self::milli_value`], so a whole number of cores
+    /// canonicalises as `"2"` rather than the `"2000m"` a `format!("{}m", ..)`
+    /// would emit.
+    pub fn from_milli_value(value: i64, format: Format) -> Quantity {
+        Quantity {
+            mantissa: value as i128,
+            scale: -3,
+            format,
+        }
+    }
+
+    /// Quantity representing `value * 10^scale`, always `DecimalSI`. Port of
+    /// upstream `resource.NewScaledQuantity` (`quantity.go:806-811`).
+    pub fn from_scaled_value(value: i64, scale: i32) -> Quantity {
+        Quantity {
+            mantissa: value as i128,
+            scale,
+            format: Format::DecimalSI,
+        }
+    }
+
     /// Format. Preserved from parsed suffix.
     pub fn format(&self) -> Format {
         self.format
@@ -440,8 +479,36 @@ fn decimal_si_suffix(scale: i32) -> &'static str {
     }
 }
 
+/// DecimalExponent canonical form, per upstream `int64Amount.AsCanonicalBytes`
+/// (`../kubernetes/staging/src/k8s.io/apimachinery/pkg/api/resource/amount.go:257-281`):
+/// strip factors of 10 out of the mantissa, then **force the exponent to a
+/// multiple of 3**, shifting the mantissa back up to compensate.
+///
+/// The second step is easy to miss and not obviously desirable — it is why
+/// `80 * 10^-3` prints as `"80e-3"` rather than the simpler `"8e-2"`
+/// (`quantity_test.go:723`). Upstream then emits **no suffix at all** when the
+/// exponent lands on 0 (`suffix.go:165-167`), so `25 * 10^2` is `"2500"`, not
+/// `"25e2"`.
 fn canonical_decimal_exponent(mantissa: i128, scale: i32) -> String {
-    let (m, s) = strip_trailing_zeros(mantissa, scale);
+    let (mut m, mut s) = strip_trailing_zeros(mantissa, scale);
+
+    // `i32::rem_euclid` would map -2 to 1; upstream switches on Go's `%`,
+    // which keeps the sign, so match on the signed remainder directly.
+    match s % 3 {
+        1 | -2 => {
+            m *= 10;
+            s -= 1;
+        }
+        2 | -1 => {
+            m *= 100;
+            s -= 2;
+        }
+        _ => {}
+    }
+
+    if s == 0 {
+        return format!("{m}");
+    }
     format!("{m}e{s}")
 }
 
@@ -585,6 +652,203 @@ mod tests {
         assert_eq!(parse("1e-2147483648").milli_value(), 1);
     }
 
+    /// Upstream's own canonical-form table, ported row-for-row from
+    /// `TestQuantityString`
+    /// (`../kubernetes/staging/src/k8s.io/apimachinery/pkg/api/resource/quantity_test.go:696`).
+    ///
+    /// `expect` is the canonical string upstream's `Quantity.String()` produces
+    /// for that `(mantissa, scale, format)`. `alternate`, where non-empty, is a
+    /// *non-canonical* spelling of the same value that must canonicalise to
+    /// `expect` — upstream asserts all three properties per row, so this does
+    /// too. Testing the encoder against upstream's expectations rather than
+    /// against a reading of `CanonicalizeBytes` is the point: several of these
+    /// rows are counter-intuitive (BinarySI `5` prints `"5"`, not `"5m"`;
+    /// BinarySI `1025` stays `"1025"`; DecimalExponent `80e-3` does *not*
+    /// simplify to `8e-2`).
+    #[test]
+    fn upstream_quantity_string_table() {
+        use Format::{BinarySI, DecimalExponent, DecimalSI};
+
+        /// Mirrors upstream's `decQuantity(value, scale, format)` test helper.
+        fn dec(mantissa: i128, scale: i32, format: Format) -> Quantity {
+            Quantity {
+                mantissa,
+                scale,
+                format,
+            }
+        }
+
+        let table: &[(Quantity, &str, &str)] = &[
+            (dec(1024 * 1024 * 1024, 0, BinarySI), "1Gi", "1024Mi"),
+            (dec(300 * 1024 * 1024, 0, BinarySI), "300Mi", "307200Ki"),
+            (dec(6 * 1024, 0, BinarySI), "6Ki", ""),
+            (
+                dec(1001 * 1024 * 1024 * 1024, 0, BinarySI),
+                "1001Gi",
+                "1025024Mi",
+            ),
+            (dec(1024 * 1024 * 1024 * 1024, 0, BinarySI), "1Ti", "1024Gi"),
+            (dec(5, 0, BinarySI), "5", "5000m"),
+            (dec(500, -3, BinarySI), "500m", "0.5"),
+            (dec(1, 9, DecimalSI), "1G", "1000M"),
+            (dec(1000, 6, DecimalSI), "1G", "0.001T"),
+            (dec(1000000, 3, DecimalSI), "1G", ""),
+            (dec(1000000000, 0, DecimalSI), "1G", ""),
+            (dec(1, -3, DecimalSI), "1m", "1000u"),
+            (dec(80, -3, DecimalSI), "80m", ""),
+            (dec(1080, -3, DecimalSI), "1080m", "1.08"),
+            (dec(108, -2, DecimalSI), "1080m", "1080000000n"),
+            (dec(10800, -4, DecimalSI), "1080m", ""),
+            (dec(300, 6, DecimalSI), "300M", ""),
+            (dec(1, 12, DecimalSI), "1T", ""),
+            (dec(1234567, 6, DecimalSI), "1234567M", ""),
+            (dec(1234567, -3, BinarySI), "1234567m", ""),
+            (dec(3, 3, DecimalSI), "3k", ""),
+            (dec(1025, 0, BinarySI), "1025", ""),
+            (dec(0, 0, DecimalSI), "0", ""),
+            (dec(0, 0, BinarySI), "0", ""),
+            (dec(1, 9, DecimalExponent), "1e9", ".001e12"),
+            (dec(1, -3, DecimalExponent), "1e-3", "0.001e0"),
+            (dec(1, -9, DecimalExponent), "1e-9", "1000e-12"),
+            (dec(80, -3, DecimalExponent), "80e-3", ""),
+            (dec(300, 6, DecimalExponent), "300e6", ""),
+            (dec(1, 12, DecimalExponent), "1e12", ""),
+            (dec(1, 3, DecimalExponent), "1e3", ""),
+            (dec(3, 3, DecimalExponent), "3e3", ""),
+            (dec(3, 3, DecimalSI), "3k", ""),
+            (dec(0, 0, DecimalExponent), "0", "00"),
+            (dec(1, -9, DecimalSI), "1n", ""),
+            (dec(80, -9, DecimalSI), "80n", ""),
+            (dec(1080, -9, DecimalSI), "1080n", ""),
+            (dec(108, -8, DecimalSI), "1080n", ""),
+            (dec(10800, -10, DecimalSI), "1080n", ""),
+            (dec(1, -6, DecimalSI), "1u", ""),
+            (dec(80, -6, DecimalSI), "80u", ""),
+            (dec(1080, -6, DecimalSI), "1080u", ""),
+        ];
+
+        for (quantity, expect, alternate) in table {
+            assert_eq!(
+                &quantity.canonical_string(),
+                expect,
+                "String() for {quantity:?}"
+            );
+
+            // Upstream also asserts `expect` is itself canonical: parsing it
+            // and re-encoding must be a no-op.
+            let reparsed =
+                Quantity::parse(expect).unwrap_or_else(|e| panic!("parse({expect:?}) failed: {e}"));
+            assert_eq!(
+                &reparsed.canonical_string(),
+                expect,
+                "{expect:?} is not its own canonical form"
+            );
+
+            if alternate.is_empty() {
+                continue;
+            }
+            let alt = Quantity::parse(alternate)
+                .unwrap_or_else(|e| panic!("parse({alternate:?}) failed: {e}"));
+            assert_eq!(
+                &alt.canonical_string(),
+                expect,
+                "alternate {alternate:?} must canonicalise to {expect:?}"
+            );
+        }
+    }
+
+    /// Ports of upstream `NewQuantity` / `NewMilliQuantity` /
+    /// `NewScaledQuantity`, which is how upstream builds a quantity from an
+    /// accumulated integer before serialising it back
+    /// (`quantity.go:786-811`). Without these, callers hand-roll canonical
+    /// encoding from a raw byte count.
+    #[test]
+    fn constructors_round_trip_to_canonical_form() {
+        use Format::{BinarySI, DecimalSI};
+        // Byte counts, BinarySI — what a ResourceQuota status carries.
+        assert_eq!(
+            Quantity::from_value(1_073_741_824, BinarySI).canonical_string(),
+            "1Gi"
+        );
+        assert_eq!(
+            Quantity::from_value(536_870_912, BinarySI).canonical_string(),
+            "512Mi"
+        );
+        assert_eq!(
+            Quantity::from_value(1024, BinarySI).canonical_string(),
+            "1Ki"
+        );
+        // Below 1024, upstream switches BinarySI to DecimalSI formatting
+        // (`CanonicalizeBytes`, `quantity.go:434-437`), so 1000 bytes is "1k".
+        assert_eq!(
+            Quantity::from_value(1000, BinarySI).canonical_string(),
+            "1k"
+        );
+        // At/above 1024 but not a clean power, it stays a bare number.
+        assert_eq!(
+            Quantity::from_value(1500, BinarySI).canonical_string(),
+            "1500"
+        );
+        assert_eq!(Quantity::from_value(0, BinarySI).canonical_string(), "0");
+
+        // Millicores, DecimalSI — a whole number of cores must not print as
+        // "2000m", which is what hand-rolled `format!("{}m", ..)` produces.
+        assert_eq!(
+            Quantity::from_milli_value(2000, DecimalSI).canonical_string(),
+            "2"
+        );
+        assert_eq!(
+            Quantity::from_milli_value(1500, DecimalSI).canonical_string(),
+            "1500m"
+        );
+        assert_eq!(
+            Quantity::from_milli_value(100, DecimalSI).canonical_string(),
+            "100m"
+        );
+        assert_eq!(
+            Quantity::from_milli_value(0, DecimalSI).canonical_string(),
+            "0"
+        );
+
+        assert_eq!(Quantity::from_scaled_value(5, 3).canonical_string(), "5k");
+    }
+
+    /// The constructors must agree with `parse` on the same value, or the two
+    /// halves of a round trip disagree.
+    #[test]
+    fn constructors_agree_with_parse() {
+        for (bytes, text) in [
+            (1_073_741_824i64, "1Gi"),
+            (536_870_912, "512Mi"),
+            (1024, "1Ki"),
+        ] {
+            let built = Quantity::from_value(bytes, Format::BinarySI);
+            assert!(built.value_eq(&parse(text)), "{text}");
+            assert_eq!(built.canonical_string(), parse(text).canonical_string());
+        }
+        for (millis, text) in [(2000i64, "2"), (1500, "1500m"), (100, "100m")] {
+            let built = Quantity::from_milli_value(millis, Format::DecimalSI);
+            assert!(built.value_eq(&parse(text)), "{text}");
+            assert_eq!(built.canonical_string(), parse(text).canonical_string());
+        }
+    }
+
+    /// A quantity built from an integer reads back as that integer.
+    #[test]
+    fn constructors_preserve_value_accessors() {
+        assert_eq!(Quantity::from_value(4096, Format::BinarySI).value(), 4096);
+        assert_eq!(
+            Quantity::from_milli_value(1500, Format::DecimalSI).milli_value(),
+            1500
+        );
+        // 1500 millicores rounds up to 2 whole cores, per `Value()`'s ceiling.
+        assert_eq!(
+            Quantity::from_milli_value(1500, Format::DecimalSI).value(),
+            2
+        );
+        assert_eq!(Quantity::from_value(-5, Format::DecimalSI).value(), -5);
+    }
+
     #[test]
     fn binary_si_suffix_table_canonical_self() {
         for s in ["1Ki", "1Mi", "1Gi", "1Ti", "1Pi", "1Ei"] {
@@ -594,14 +858,28 @@ mod tests {
 
     #[test]
     fn decimal_exponent_canonical_form() {
-        assert_eq!(parse("1e0").canonical_string(), "1e0");
         assert_eq!(parse("1e3").canonical_string(), "1e3");
         assert_eq!(parse("1e-3").canonical_string(), "1e-3");
         // Upstream lowercases `E` -> `e` in DecimalExponent canonical.
         assert_eq!(parse("1E6").canonical_string(), "1e6");
-        // Mantissa is canonicalised by stripping trailing zeros, so
-        // `2.5e3` becomes `25e2`.
-        assert_eq!(parse("2.5e3").canonical_string(), "25e2");
+        // Exponent 0 emits NO suffix (`suffix.go:165-167` returns a nil suffix
+        // for `DecimalExponent` with `exponent == 0`). Previously asserted as
+        // "1e0", which upstream never produces.
+        assert_eq!(parse("1e0").canonical_string(), "1");
+        // The exponent is forced to a multiple of 3 after zero-stripping
+        // (`amount.go:264-279`), so `2.5e3` is mantissa 25 scale 2 -> shifted
+        // to 2500 scale 0 -> "2500". Previously asserted as "25e2", which
+        // skipped the multiple-of-3 step.
+        assert_eq!(parse("2.5e3").canonical_string(), "2500");
+        // Non-multiple-of-3 exponents in both directions. Not rows in
+        // upstream's table (every DecimalExponent row there already has a
+        // multiple-of-3 scale), so these come from `AsCanonicalBytes` directly.
+        assert_eq!(parse("8e-2").canonical_string(), "80e-3");
+        assert_eq!(parse("1e1").canonical_string(), "10");
+        assert_eq!(parse("1e2").canonical_string(), "100");
+        assert_eq!(parse("1e4").canonical_string(), "10e3");
+        assert_eq!(parse("1e-1").canonical_string(), "100e-3");
+        assert_eq!(parse("1e-2").canonical_string(), "10e-3");
     }
 
     #[test]
