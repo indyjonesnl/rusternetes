@@ -275,5 +275,51 @@ else
   bad "driver must clear GITHUB_OUTPUT when invoking conformance-target-run.sh"
 fi
 
+
+# --- a readiness timeout must leave evidence behind -------------------------
+# The kubelet leg (run 30438506580) waited 180s for node-ready and reported
+# `module-did-not-come-up` after three minutes of total silence — a red verdict
+# nobody can act on. vs_wait_ready now dumps state before giving up.
+STUB_BIN="$TMP/diag-bin"; mkdir -p "$STUB_BIN"
+for t in kubectl docker; do
+  cat >"$STUB_BIN/$t" <<STUB
+#!/bin/sh
+echo "STUB-$t \$*"
+exit 0
+STUB
+  chmod +x "$STUB_BIN/$t"
+done
+
+diag="$(VS_READINESS=node-ready VS_MODULE=kubelet PATH="$STUB_BIN:$PATH" \
+  vs_dump_readiness_diagnostics vanilla-swap-kubelet /dev/null 2>&1)"
+for want in "nodes" "describe node rusternetes-node" "swapped module logs"; do
+  case "$diag" in
+    *"$want"*) ok "readiness diagnostics include: $want" ;;
+    *) bad "readiness diagnostics missing '$want'" ;;
+  esac
+done
+
+# It runs against a cluster that is by definition unhealthy, so a failing probe
+# must not become the reported failure.
+cat >"$STUB_BIN/kubectl" <<'STUB'
+#!/bin/sh
+echo "boom" >&2
+exit 7
+STUB
+chmod +x "$STUB_BIN/kubectl"
+if VS_READINESS=readyz VS_MODULE=api-server PATH="$STUB_BIN:$PATH" \
+     vs_dump_readiness_diagnostics vanilla-swap-api-server /dev/null >/dev/null 2>&1; then
+  ok "readiness diagnostics survive failing probes"
+else
+  bad "readiness diagnostics must not fail when the cluster is broken"
+fi
+
+# And the wait itself must call them on timeout, not just return.
+if grep -q 'vs_dump_readiness_diagnostics' <(sed -n '/^vs_wait_ready()/,/^}/p' "$SCRIPT_DIR/vanilla-swap-common.sh"); then
+  ok "vs_wait_ready dumps diagnostics before returning VS_EX_NOTUP"
+else
+  bad "vs_wait_ready must dump diagnostics on timeout"
+fi
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }
