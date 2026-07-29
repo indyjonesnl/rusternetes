@@ -1,6 +1,6 @@
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection
 use rusternetes_common::{
-    quantity::Quantity,
+    quantity::parse_resource_value,
     resources::{LimitRange, Pod, ResourceQuota, ServiceAccount},
     types::ResourceRequirements,
 };
@@ -1067,7 +1067,7 @@ fn validate_ratio(
 /// (`Resource.Add`, `../kubernetes/pkg/scheduler/framework/types.go:917-918`),
 /// and `Quantity` rounds both up away from zero as upstream `ScaledValue` does.
 fn parse_cpu_to_millicores(cpu: &str) -> anyhow::Result<i64> {
-    Ok(clamp_quantity(Quantity::parse(cpu.trim())?.milli_value()))
+    Ok(parse_resource_value(cpu, "cpu")?)
 }
 
 /// Parse a byte-denominated quantity (memory, ephemeral-storage, PVC storage)
@@ -1078,13 +1078,7 @@ fn parse_cpu_to_millicores(cpu: &str) -> anyhow::Result<i64> {
 /// while the valid `"1k"` did not — and stripped *repeated* suffixes, so
 /// `"1GiGi"` read as 1Gi.
 fn parse_memory_to_bytes(memory: &str) -> anyhow::Result<i64> {
-    Ok(clamp_quantity(Quantity::parse(memory.trim())?.value()))
-}
-
-/// Saturate a quantity value into the `i64` these helpers return, matching
-/// upstream `ScaledValue`'s int64 cap rather than wrapping.
-fn clamp_quantity(value: i128) -> i64 {
-    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    Ok(parse_resource_value(memory, "memory")?)
 }
 
 /// Resolve a `ResourceQuota.spec.hard` entry to the ceiling admission enforces.

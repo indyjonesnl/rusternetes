@@ -1,13 +1,7 @@
 use anyhow::Result;
-use rusternetes_common::quantity::Quantity;
+use rusternetes_common::quantity::parse_resource_value;
 use rusternetes_common::resources::{Pod, ResourceQuota, ResourceQuotaStatus, Service};
 use rusternetes_common::types::Phase;
-
-/// Saturate a quantity value into the `i64` the parse helpers return, matching
-/// upstream `ScaledValue`'s int64 cap rather than wrapping.
-fn clamp_quantity(value: i128) -> i64 {
-    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
-}
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -751,13 +745,13 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
     /// the unit upstream accounts each resource in (`Resource.Add`,
     /// `../kubernetes/pkg/scheduler/framework/types.go:917-918`).
     fn parse_cpu_to_millicores(&self, cpu: &str) -> Result<i64> {
-        Ok(clamp_quantity(Quantity::parse(cpu.trim())?.milli_value()))
+        Ok(parse_resource_value(cpu, "cpu")?)
     }
 
     /// Parse a byte-denominated quantity (memory, ephemeral-storage) to bytes.
     /// See [`Self::parse_cpu_to_millicores`].
     fn parse_memory_to_bytes(&self, memory: &str) -> Result<i64> {
-        Ok(clamp_quantity(Quantity::parse(memory.trim())?.value()))
+        Ok(parse_resource_value(memory, "memory")?)
     }
 
     /// Convert bytes to human-readable memory string
