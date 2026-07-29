@@ -549,9 +549,15 @@ const NODE_RULES: &[(&str, &str, &[&str])] = &[
     ("", "nodes/status", &["update", "patch"]),
     ("", "events", &["create", "update", "patch"]),
     ("events.k8s.io", "events", &["create", "update", "patch"]),
-    ("", "pods", &["get", "list", "watch", "create", "delete"]),
+    // Upstream also grants nodes "create" and "delete" on pods, and "create" on
+    // pods/eviction (policy.go:217-219). Those are DELIBERATELY omitted here:
+    // upstream makes them safe with NodeRestriction admission, which limits a node
+    // to pods bound to it, and rusternetes has no equivalent yet — so granting them
+    // would let any node delete any pod. Read access is what a kubelet needs to run
+    // its own workloads, and it is what was missing. Tracked for alignment once
+    // NodeRestriction exists (#1721).
+    ("", "pods", &["get", "list", "watch"]),
     ("", "pods/status", &["update", "patch"]),
-    ("", "pods/eviction", &["create"]),
     ("", "secrets", &["get", "list", "watch"]),
     ("", "configmaps", &["get", "list", "watch"]),
     ("", "persistentvolumeclaims", &["get"]),
@@ -1100,15 +1106,18 @@ mod tests {
         ));
     }
 
-    /// NodeRules grants pods create/delete (mirror pods, eviction cleanup).
+    /// Upstream NodeRules grants pods create/delete, but we deliberately do not:
+    /// upstream constrains them with NodeRestriction admission (a node may only
+    /// touch pods bound to it) and we have no equivalent, so allowing them would let
+    /// any node delete any pod. See the note on NODE_RULES and #1721.
     #[tokio::test]
-    async fn node_may_delete_pods() {
+    async fn node_may_not_delete_pods_without_noderestriction() {
         let attrs = RequestAttributes::new(node_user(), "delete", "pods")
             .with_namespace("kube-system")
             .with_api_group("");
         assert!(matches!(
             NodeAuthorizer.authorize(&attrs).await.unwrap(),
-            Decision::Allow
+            Decision::Deny(_)
         ));
     }
 
