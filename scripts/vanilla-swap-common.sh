@@ -563,16 +563,24 @@ vs_dump_readiness_diagnostics() {
   esac
 
   # The swapped module's own logs. A join-worker module runs as its own docker
-  # container beside the kind nodes; a static-pod / daemonset module runs inside
-  # the cluster, so its logs come from the node's container runtime.
+  # container beside the kind nodes (named vanilla-swap-<cluster>-<node>, see
+  # vs_start_node); a static-pod / daemonset module runs inside the cluster, so
+  # its logs come from the node's container runtime.
+  #
+  # The container list is ENUMERATED, not guessed: the first version of this dump
+  # probed fixed names ("rusternetes-node", …), matched nothing, and printed an
+  # empty section for the one failure it existed to explain (run 30439140932).
+  echo "--- harness containers ---" >&2
+  docker ps -a --filter "name=vanilla-swap-${cluster}" \
+    --format '{{.Names}}\t{{.Status}}\t{{.Image}}' >&2 2>&1 || true
+
   echo "--- swapped module logs (last 60 lines) ---" >&2
   local c
-  for c in rusternetes-node "rusternetes-${VS_MODULE}" "vs-${cluster}-runtime"; do
-    if docker inspect "$c" >/dev/null 2>&1; then
-      echo "[container $c]" >&2
-      docker logs --tail 60 "$c" >&2 2>&1 || true
-    fi
-  done
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    echo "[container $c]" >&2
+    docker logs --tail 60 "$c" >&2 2>&1 || true
+  done < <(docker ps -a --filter "name=vanilla-swap-${cluster}" --format '{{.Names}}' 2>/dev/null)
   KUBECONFIG="$kubeconfig" kubectl -n kube-system logs --tail=60 \
     "-l=component=kube-${VS_MODULE}" >&2 2>&1 || true
   KUBECONFIG="$kubeconfig" kubectl -n kube-system logs --tail=60 \
