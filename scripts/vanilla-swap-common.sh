@@ -602,6 +602,35 @@ vs_junit_counts() {
   printf '%s %s\n' "$(( ${passed:-0} + ${failed:-0} ))" "${failed:-0}"
 }
 
+# vs_verdict <ran> <failed> <runner_rc> — echo "<outcome> <exit-code>".
+#
+# `ran` is the REAL specs attempted (ginkgo suite-level nodes excluded, see
+# vs_junit_counts). Zero of them means nothing about the module was proven, so it
+# is never test-passed: the kube-proxy leg swapped in cleanly, then the e2e
+# framework's [SynchronizedBeforeSuite] failed after 600s and ginkgo ran 0 of
+# 7348 specs — with honest counting that is 0/0, and reporting a pass over an
+# empty set would publish a green badge for a module that broke the cluster.
+#
+# A non-zero runner_rc with specs on the board is NOT a failure by itself: the
+# runner is killed on VS_TEST_TIMEOUT when post-test cleanup hangs, and junit
+# already holds the verdict.
+vs_verdict() {
+  local ran="${1:-0}" failed="${2:-0}" rc="${3:-0}"
+  if [ "$ran" -le 0 ]; then
+    if [ "$rc" -ne 0 ]; then
+      printf 'module-did-not-come-up %s\n' "$VS_EX_NOTUP"
+    else
+      printf 'no-result %s\n' "$VS_EX_NOTUP"
+    fi
+    return 0
+  fi
+  if [ "$failed" -gt 0 ]; then
+    printf 'test-failed %s\n' "$VS_EX_TESTFAIL"
+    return 0
+  fi
+  printf 'test-passed 0\n'
+}
+
 # vs_emit_result <outcome> <passed> <total> [k8s-version]
 # Writes run-result.json to $VS_WORKDIR and prints a stdout summary.
 vs_emit_result() {

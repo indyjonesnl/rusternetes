@@ -347,16 +347,10 @@ else
   TOTAL="$(grep -E '^total=' "$RESULT_OUT" | tail -1 | cut -d= -f2)"; TOTAL="${TOTAL:-0}"
 fi
 
-# No junit and the runner failed/timed out => the module never produced results.
-if ! [ -n "${counts:-}" ] && [ "$runner_rc" -ne 0 ]; then
-  vs_emit_result "module-did-not-come-up" "$PASSED" "$TOTAL" "$VS_K8S_VERSION"
-  exit "$VS_EX_NOTUP"
-fi
-
-if [ "${FAILED:-0}" -gt 0 ]; then
-  vs_emit_result "test-failed" "$PASSED" "$TOTAL" "$VS_K8S_VERSION"
-  exit "$VS_EX_TESTFAIL"
-fi
-
-vs_emit_result "test-passed" "$PASSED" "$TOTAL" "$VS_K8S_VERSION"
-exit 0
+# Verdict from the spec counts, NOT from the junit's presence: a junit that holds
+# only ginkgo's suite-level nodes means zero specs ran, which proves nothing about
+# the module and must not read as a pass (vs_verdict).
+IFS=' ' read -r VS_OUTCOME VS_EXIT <<<"$(vs_verdict "${TOTAL:-0}" "${FAILED:-0}" "$runner_rc")"
+[ "${TOTAL:-0}" -gt 0 ] || vs_warn "no spec executed (runner rc=$runner_rc) — reporting '$VS_OUTCOME'"
+vs_emit_result "$VS_OUTCOME" "$PASSED" "$TOTAL" "$VS_K8S_VERSION"
+exit "$VS_EXIT"

@@ -170,5 +170,40 @@ else
   ok "vs_junit_counts: no junit => non-zero"
 fi
 
+
+# --- verdict: a run where NO spec executed is never test-passed -------------
+# The kube-proxy leg swapped in fine, then the e2e framework's
+# [SynchronizedBeforeSuite] failed after 600s ("Error waiting for all pods to be
+# running and ready" — the vanilla control-plane static pods went unready behind
+# the swapped proxy) and ginkgo ran 0 of 7348 specs. With suite-level nodes no
+# longer counted the numbers are 0/0, and the verdict must say so instead of
+# reporting a pass over an empty set.
+got="$(vs_verdict 0 0 1)"
+[ "$got" = "module-did-not-come-up $VS_EX_NOTUP" ] \
+  && ok "vs_verdict: 0 specs + runner failure => module-did-not-come-up" \
+  || bad "vs_verdict 0/0 rc=1 got '$got' (want 'module-did-not-come-up $VS_EX_NOTUP')"
+
+got="$(vs_verdict 0 0 0)"
+[ "$got" = "no-result $VS_EX_NOTUP" ] \
+  && ok "vs_verdict: 0 specs, runner clean => no-result (focus selected nothing)" \
+  || bad "vs_verdict 0/0 rc=0 got '$got' (want 'no-result $VS_EX_NOTUP')"
+
+got="$(vs_verdict 11 2 1)"
+[ "$got" = "test-failed $VS_EX_TESTFAIL" ] \
+  && ok "vs_verdict: real failures => test-failed" \
+  || bad "vs_verdict 11/2 got '$got' (want 'test-failed $VS_EX_TESTFAIL')"
+
+got="$(vs_verdict 11 0 0)"
+[ "$got" = "test-passed 0" ] \
+  && ok "vs_verdict: all specs green => test-passed" \
+  || bad "vs_verdict 11/0 got '$got' (want 'test-passed 0')"
+
+# A module that came up and passed its specs is still a pass even if the runner
+# was killed afterwards (hung post-test cleanup) — junit already has the verdict.
+got="$(vs_verdict 11 0 124)"
+[ "$got" = "test-passed 0" ] \
+  && ok "vs_verdict: specs green but runner killed late => still test-passed" \
+  || bad "vs_verdict 11/0 rc=124 got '$got' (want 'test-passed 0')"
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }
