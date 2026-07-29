@@ -336,5 +336,41 @@ else
   bad "vs_wait_ready must dump diagnostics on timeout"
 fi
 
+
+# --- the node kubeconfig must not be bind-mounted from the host -------------
+# `-v <host-path>:...` is resolved by the docker DAEMON. Under DinD (every CI job
+# here) the daemon lives in another container, $VS_WORKDIR is not on its
+# filesystem, and Docker creates a DIRECTORY at the mount source — so the kubelet
+# died with `Failed to read kubeconfig from "/kc/admin.conf": Is a directory`
+# and the node never registered (run 30439714160). It worked locally on a single
+# daemon, so only CI ever saw it. docker cp goes through the daemon API instead.
+START_NODE="$(sed -n '/^vs_swap_join_worker()/,/^}/p' "$SCRIPT_DIR/vanilla-swap-common.sh")"
+[ -n "$START_NODE" ] || bad "could not extract vs_swap_join_worker (renamed? these assertions are scoped to it)"
+
+case "$START_NODE" in
+  *'-v "${kc}'*|*'-v "$kc'*)
+    bad "node kubeconfig must not be bind-mounted from a host path (breaks under DinD)" ;;
+  *) ok "node kubeconfig is not bind-mounted from the host" ;;
+esac
+
+case "$START_NODE" in
+  *'docker cp "$kc"'*) ok "node kubeconfig is copied in with docker cp" ;;
+  *) bad "node kubeconfig must be injected with docker cp (daemon-agnostic)" ;;
+esac
+
+# docker cp cannot create parent directories, so the destination has to live
+# under a path the image already has.
+case "$START_NODE" in
+  *':/app/admin.conf'*) ok "kubeconfig destination is under /app (exists in the image)" ;;
+  *) bad "kubeconfig destination must be a path that exists in the image" ;;
+esac
+
+# And a module that dies on startup must be reported immediately, not 180s later
+# through a readiness timeout.
+case "$START_NODE" in
+  *'{{.State.Running}}'*) ok "start checks the container stayed up" ;;
+  *) bad "vs_start_node must fail fast when the container exits immediately" ;;
+esac
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }
