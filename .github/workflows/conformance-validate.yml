@@ -37,6 +37,12 @@ on:
       - 'scripts/tests/test-vanilla-swap-workflows-sync.sh'
       - 'scripts/tests/test-update-badge.sh'
       - '.github/workflows/vanilla-swap-*.yml'
+      # The harness's own TDD suites (registry parser, guard, junit counting).
+      - 'scripts/vanilla-swap-common.sh'
+      - 'scripts/vanilla-swap-common-test.sh'
+      - 'scripts/vanilla-swap-guard-test.sh'
+      - 'scripts/vanilla-swap-run.sh'
+      - 'scripts/conformance-target-run.sh'
       # rehomed guards (compose overlays + image Dockerfiles)
       - 'scripts/tests/test-ghcr-overlays.sh'
       - 'scripts/tests/test-dockerfile-crate-enumeration.sh'
@@ -89,3 +95,10 @@ jobs:
         run: bash scripts/tests/test-per-node-netns-compose.sh
       - name: Node-IPAM auto-detection test
         run: bash scripts/tests/test-node-ipam-autodetect.sh
+      # The vanilla-swap harness's own TDD suites — pure logic, no kind, but they
+      # were wired into no workflow, so the badge-counting bug they now cover
+      # reached a published badge (100% (9/9) for a 2-spec run).
+      - name: Vanilla-swap registry + junit-counting tests
+        run: bash scripts/vanilla-swap-common-test.sh
+      - name: Vanilla-swap single-module guard tests
+        run: bash scripts/vanilla-swap-guard-test.sh

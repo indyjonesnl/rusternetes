@@ -78,12 +78,14 @@ GINKGO_AWK_PRELUDE='
     }
 '
 
-# Count real-spec testcase statuses in <dir>/junit_01.xml.
+# Count real-spec testcase statuses in <dir>/junit_01.xml, or in an explicit
+# junit path given as the second argument (the vanilla-swap harness keeps its
+# junit under a per-run workdir and picks the newest junit_*.xml).
 # Echoes "had_junit passed failed skipped total". had_junit is 0/1; total is
 # passed+failed+skipped (0 => the focus matched no specs / "no tests matched").
 target_counts() {
     local dir="$1"
-    local junit="$dir/junit_01.xml"
+    local junit="${2:-$dir/junit_01.xml}"
     if [ ! -f "$junit" ]; then
         echo "0 0 0 0 0"; return
     fi

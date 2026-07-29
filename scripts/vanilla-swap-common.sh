@@ -576,23 +576,30 @@ vs_readiness_probe() {
 # ---------------------------------------------------------------------------
 
 # vs_junit_counts <dir> — parse the newest junit_*.xml in <dir> and echo
-# "RAN FAILED" where RAN = tests - skipped/disabled and FAILED = failures +
-# errors. Returns 1 (no output) when no junit is present. Junit is authoritative
-# for the test verdict even when the runner is later killed (e.g. a module whose
-# post-test namespace cleanup hangs) — the results are already on disk.
+# "RAN FAILED" where RAN = the real specs attempted (passed + failed) and FAILED
+# = the real specs that failed. Returns 1 (no output) when no junit is present.
+# Junit is authoritative for the test verdict even when the runner is later
+# killed (e.g. a module whose post-test namespace cleanup hangs) — the results
+# are already on disk.
+#
+# Counted per <testcase> through the conformance runner's own parser, NOT from
+# the junit suite header: that header's `tests` includes ginkgo's suite-level
+# nodes ([ReportBeforeSuite], [SynchronizedBeforeSuite], …), which are not specs.
+# The scheduler leg ran 2 specs and published a `100% (9/9)` badge straight off
+# that header — 2 real + 7 suite-level entries (#1643, the same bug the
+# per-target runner had). Reusing target_counts also stops the badge and the
+# runner's own passed/total from disagreeing.
 vs_junit_counts() {
-  local dir="$1" f line tests fail err skip disabled
+  local dir="$1" f
   f="$(ls -t "$dir"/junit_*.xml 2>/dev/null | head -1)"
   [ -n "$f" ] || return 1
-  line="$(grep -oE '<testsuites?[^>]*>' "$f" | head -1)"
-  [ -n "$line" ] || return 1
-  tests="$(printf '%s' "$line" | grep -oE 'tests="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
-  fail="$(printf '%s' "$line" | grep -oE 'failures="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
-  err="$(printf '%s' "$line" | grep -oE 'errors="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
-  skip="$(printf '%s' "$line" | grep -oE 'skipped="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
-  disabled="$(printf '%s' "$line" | grep -oE 'disabled="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
-  tests="${tests:-0}"; fail="${fail:-0}"; err="${err:-0}"; skip="${skip:-0}"; disabled="${disabled:-0}"
-  printf '%s %s\n' "$(( tests - skip - disabled ))" "$(( fail + err ))"
+  local hj passed failed skipped total
+  IFS=' ' read -r hj passed failed skipped total <<<"$(
+    TARGET_RUN_LIB_ONLY=1 source "$(vs_repo_root)/scripts/conformance-target-run.sh" \
+      && target_counts "$(dirname "$f")" "$f"
+  )"
+  [ "${hj:-0}" = "1" ] || return 1
+  printf '%s %s\n' "$(( ${passed:-0} + ${failed:-0} ))" "${failed:-0}"
 }
 
 # vs_emit_result <outcome> <passed> <total> [k8s-version]
