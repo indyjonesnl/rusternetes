@@ -117,5 +117,120 @@ else
   ok "resolving unknown module fails"
 fi
 
+
+# --- junit counting excludes ginkgo suite-level nodes ----------------------
+# The badge is computed from these numbers, so counting ginkgo's suite-level
+# nodes as specs publishes a lie: the scheduler leg ran 2 specs and published
+# 100% (9/9) — 2 real + 7 [ReportBeforeSuite]/[SynchronizedBeforeSuite]/...
+# entries (#1643 again, via the junit suite header instead of per-testcase).
+mkjunit() {  # mkjunit <dir> <body> <tests> <failures> <skipped>
+  mkdir -p "$1"
+  # Header shaped like hydrophone's real file: <testsuites tests=… disabled=…>
+  # first, then the <testsuite> with skipped= (this header is what the old
+  # implementation trusted).
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites tests="%s" disabled="%s" errors="0" failures="%s">\n' "$3" "$5" "$4"
+    printf '<testsuite name="Kubernetes e2e suite" tests="%s" disabled="0" skipped="%s" errors="0" failures="%s">\n' "$3" "$5" "$4"
+    printf '%s\n' "$2"
+    printf '</testsuite></testsuites>\n'
+  } >"$1/junit_01.xml"
+}
+
+SYNTH='  <testcase name="[ReportBeforeSuite]" status="passed"></testcase>
+  <testcase name="[SynchronizedBeforeSuite]" status="passed"></testcase>
+  <testcase name="[SynchronizedBeforeSuite]" status="passed"></testcase>
+  <testcase name="[SynchronizedAfterSuite]" status="passed"></testcase>
+  <testcase name="[SynchronizedAfterSuite]" status="passed"></testcase>
+  <testcase name="[ReportAfterSuite] Invariant Metrics" status="passed"></testcase>
+  <testcase name="[ReportAfterSuite] Kubernetes e2e suite report" status="passed"></testcase>'
+
+mkjunit "$TMP/j-pass" "$SYNTH
+  <testcase name=\"[It] [sig-scheduling] a spec [Conformance]\" status=\"passed\"></testcase>
+  <testcase name=\"[It] [sig-scheduling] another spec [Conformance]\" status=\"passed\"></testcase>
+  <testcase name=\"[It] [sig-scheduling] skipped one\" status=\"skipped\"></testcase>" 10 0 1
+got="$(vs_junit_counts "$TMP/j-pass")"
+[ "$got" = "2 0" ] && ok "vs_junit_counts: 2 real specs, suite-level nodes excluded" \
+  || bad "vs_junit_counts pass-case got '$got' (want '2 0')"
+
+mkjunit "$TMP/j-fail" "$SYNTH
+  <testcase name=\"[It] [sig-scheduling] a spec [Conformance]\" status=\"passed\"></testcase>
+  <testcase name=\"[It] [sig-scheduling] broken spec [Conformance]\" status=\"failed\"></testcase>" 9 1 0
+got="$(vs_junit_counts "$TMP/j-fail")"
+[ "$got" = "2 1" ] && ok "vs_junit_counts: counts real failures, excludes suite-level nodes" \
+  || bad "vs_junit_counts fail-case got '$got' (want '2 1')"
+
+mkjunit "$TMP/j-synth" "$SYNTH" 7 0 0
+got="$(vs_junit_counts "$TMP/j-synth")"
+[ "$got" = "0 0" ] && ok "vs_junit_counts: suite-level-only junit => 0 0 (no false green)" \
+  || bad "vs_junit_counts synth-only got '$got' (want '0 0')"
+
+mkdir -p "$TMP/j-none"
+if vs_junit_counts "$TMP/j-none" >/dev/null 2>&1; then
+  bad "vs_junit_counts should fail when no junit is present"
+else
+  ok "vs_junit_counts: no junit => non-zero"
+fi
+
+
+# --- verdict: a run where NO spec executed is never test-passed -------------
+# The kube-proxy leg swapped in fine, then the e2e framework's
+# [SynchronizedBeforeSuite] failed after 600s ("Error waiting for all pods to be
+# running and ready" — the vanilla control-plane static pods went unready behind
+# the swapped proxy) and ginkgo ran 0 of 7348 specs. With suite-level nodes no
+# longer counted the numbers are 0/0, and the verdict must say so instead of
+# reporting a pass over an empty set.
+got="$(vs_verdict 0 0 1)"
+[ "$got" = "module-did-not-come-up $VS_EX_NOTUP" ] \
+  && ok "vs_verdict: 0 specs + runner failure => module-did-not-come-up" \
+  || bad "vs_verdict 0/0 rc=1 got '$got' (want 'module-did-not-come-up $VS_EX_NOTUP')"
+
+got="$(vs_verdict 0 0 0)"
+[ "$got" = "no-result $VS_EX_NOTUP" ] \
+  && ok "vs_verdict: 0 specs, runner clean => no-result (focus selected nothing)" \
+  || bad "vs_verdict 0/0 rc=0 got '$got' (want 'no-result $VS_EX_NOTUP')"
+
+got="$(vs_verdict 11 2 1)"
+[ "$got" = "test-failed $VS_EX_TESTFAIL" ] \
+  && ok "vs_verdict: real failures => test-failed" \
+  || bad "vs_verdict 11/2 got '$got' (want 'test-failed $VS_EX_TESTFAIL')"
+
+got="$(vs_verdict 11 0 0)"
+[ "$got" = "test-passed 0" ] \
+  && ok "vs_verdict: all specs green => test-passed" \
+  || bad "vs_verdict 11/0 got '$got' (want 'test-passed 0')"
+
+# A module that came up and passed its specs is still a pass even if the runner
+# was killed afterwards (hung post-test cleanup) — junit already has the verdict.
+got="$(vs_verdict 11 0 124)"
+[ "$got" = "test-passed 0" ] \
+  && ok "vs_verdict: specs green but runner killed late => still test-passed" \
+  || bad "vs_verdict 11/0 rc=124 got '$got' (want 'test-passed 0')"
+
+
+# --- suite timeout must fit the job budget AND the biggest leg --------------
+# The controller-manager leg died on the old 1200s default: 6m44s of framework
+# startup, then killed part-way through 52 sig-apps specs, with junit still
+# inside the conformance pod — no counts, no badge. Both sides of the budget
+# live in different files, so guard the relationship.
+if vs_test_budget_ok 4500 90 15; then ok "vs_test_budget_ok: 75-min suite fits a 90-min job"; else bad "4500s/90min should fit"; fi
+if vs_test_budget_ok 5400 90 15; then bad "90-min suite must NOT fit a 90-min job"; else ok "vs_test_budget_ok: suite == job budget rejected"; fi
+if vs_test_budget_ok 0 90 15; then bad "zero suite timeout should be rejected"; else ok "vs_test_budget_ok: zero suite timeout rejected"; fi
+
+VS_RUN="$SCRIPT_DIR/vanilla-swap-run.sh"
+VS_WF="$SCRIPT_DIR/../.github/workflows/vanilla-swap-module.yml"
+suite_default="$(grep -oE 'VS_TEST_TIMEOUT:-[0-9]+' "$VS_RUN" | head -1 | grep -oE '[0-9]+')"
+job_minutes="$(grep -oE 'timeout-minutes: [0-9]+' "$VS_WF" | head -1 | grep -oE '[0-9]+')"
+if [ -n "$suite_default" ] && [ -n "$job_minutes" ] && vs_test_budget_ok "$suite_default" "$job_minutes" 15; then
+  ok "shipped suite timeout (${suite_default}s) fits the job budget (${job_minutes}min)"
+else
+  bad "suite timeout ${suite_default:-?}s does not fit job budget ${job_minutes:-?}min (leave >=15min for bring-up/swap/teardown)"
+fi
+# The largest leg is the kubelet's 191 NodeConformance specs, ~20 min in
+# node-conformance.yml, and ginkgo's startup alone costs ~7 min.
+if [ -n "$suite_default" ] && [ "$suite_default" -ge 2400 ]; then
+  ok "shipped suite timeout leaves room for the biggest leg"
+else
+  bad "suite timeout ${suite_default:-?}s is too small for a real subset (need >=2400s)"
+fi
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }

@@ -576,23 +576,74 @@ vs_readiness_probe() {
 # ---------------------------------------------------------------------------
 
 # vs_junit_counts <dir> — parse the newest junit_*.xml in <dir> and echo
-# "RAN FAILED" where RAN = tests - skipped/disabled and FAILED = failures +
-# errors. Returns 1 (no output) when no junit is present. Junit is authoritative
-# for the test verdict even when the runner is later killed (e.g. a module whose
-# post-test namespace cleanup hangs) — the results are already on disk.
+# "RAN FAILED" where RAN = the real specs attempted (passed + failed) and FAILED
+# = the real specs that failed. Returns 1 (no output) when no junit is present.
+# Junit is authoritative for the test verdict even when the runner is later
+# killed (e.g. a module whose post-test namespace cleanup hangs) — the results
+# are already on disk.
+#
+# Counted per <testcase> through the conformance runner's own parser, NOT from
+# the junit suite header: that header's `tests` includes ginkgo's suite-level
+# nodes ([ReportBeforeSuite], [SynchronizedBeforeSuite], …), which are not specs.
+# The scheduler leg ran 2 specs and published a `100% (9/9)` badge straight off
+# that header — 2 real + 7 suite-level entries (#1643, the same bug the
+# per-target runner had). Reusing target_counts also stops the badge and the
+# runner's own passed/total from disagreeing.
 vs_junit_counts() {
-  local dir="$1" f line tests fail err skip disabled
+  local dir="$1" f
   f="$(ls -t "$dir"/junit_*.xml 2>/dev/null | head -1)"
   [ -n "$f" ] || return 1
-  line="$(grep -oE '<testsuites?[^>]*>' "$f" | head -1)"
-  [ -n "$line" ] || return 1
-  tests="$(printf '%s' "$line" | grep -oE 'tests="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
-  fail="$(printf '%s' "$line" | grep -oE 'failures="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
-  err="$(printf '%s' "$line" | grep -oE 'errors="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
-  skip="$(printf '%s' "$line" | grep -oE 'skipped="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
-  disabled="$(printf '%s' "$line" | grep -oE 'disabled="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
-  tests="${tests:-0}"; fail="${fail:-0}"; err="${err:-0}"; skip="${skip:-0}"; disabled="${disabled:-0}"
-  printf '%s %s\n' "$(( tests - skip - disabled ))" "$(( fail + err ))"
+  local hj passed failed skipped total
+  IFS=' ' read -r hj passed failed skipped total <<<"$(
+    TARGET_RUN_LIB_ONLY=1 source "$(vs_repo_root)/scripts/conformance-target-run.sh" \
+      && target_counts "$(dirname "$f")" "$f"
+  )"
+  [ "${hj:-0}" = "1" ] || return 1
+  printf '%s %s\n' "$(( ${passed:-0} + ${failed:-0} ))" "${failed:-0}"
+}
+
+# vs_test_budget_ok <suite-timeout-seconds> <job-timeout-minutes> [reserve-minutes]
+# True when the scoped-subset timeout leaves at least `reserve` minutes of the CI
+# job budget for everything around it: kind bring-up, image pull, the swap, the
+# readiness wait and teardown. The two numbers live in different files
+# (scripts/vanilla-swap-run.sh and .github/workflows/vanilla-swap-module.yml), so
+# raising one without the other silently reintroduces the failure this guards:
+# a suite killed with its junit still inside the conformance pod, which yields no
+# counts and therefore no badge.
+vs_test_budget_ok() {
+  local suite="${1:-0}" job_min="${2:-0}" reserve="${3:-15}"
+  case "$suite$job_min" in *[!0-9]*) return 1 ;; esac
+  [ "$suite" -gt 0 ] && [ "$job_min" -gt "$reserve" ] || return 1
+  [ "$suite" -le "$(( (job_min - reserve) * 60 ))" ]
+}
+
+# vs_verdict <ran> <failed> <runner_rc> — echo "<outcome> <exit-code>".
+#
+# `ran` is the REAL specs attempted (ginkgo suite-level nodes excluded, see
+# vs_junit_counts). Zero of them means nothing about the module was proven, so it
+# is never test-passed: the kube-proxy leg swapped in cleanly, then the e2e
+# framework's [SynchronizedBeforeSuite] failed after 600s and ginkgo ran 0 of
+# 7348 specs — with honest counting that is 0/0, and reporting a pass over an
+# empty set would publish a green badge for a module that broke the cluster.
+#
+# A non-zero runner_rc with specs on the board is NOT a failure by itself: the
+# runner is killed on VS_TEST_TIMEOUT when post-test cleanup hangs, and junit
+# already holds the verdict.
+vs_verdict() {
+  local ran="${1:-0}" failed="${2:-0}" rc="${3:-0}"
+  if [ "$ran" -le 0 ]; then
+    if [ "$rc" -ne 0 ]; then
+      printf 'module-did-not-come-up %s\n' "$VS_EX_NOTUP"
+    else
+      printf 'no-result %s\n' "$VS_EX_NOTUP"
+    fi
+    return 0
+  fi
+  if [ "$failed" -gt 0 ]; then
+    printf 'test-failed %s\n' "$VS_EX_TESTFAIL"
+    return 0
+  fi
+  printf 'test-passed 0\n'
 }
 
 # vs_emit_result <outcome> <passed> <total> [k8s-version]
