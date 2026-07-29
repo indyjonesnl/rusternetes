@@ -40,6 +40,14 @@ on:
       # rehomed guards (compose overlays + image Dockerfiles)
       - 'scripts/tests/test-ghcr-overlays.sh'
       - 'scripts/tests/test-dockerfile-crate-enumeration.sh'
+      # cluster-topology + bring-up guards: the per-node netns topology
+      # (#1691/#1695) and the node IPAM its CNI depends on (#1697). Both are
+      # config-only invariants no unit test sees, which surface hours later as
+      # a conformance run that produces no junit at all.
+      - 'scripts/tests/test-per-node-netns-compose.sh'
+      - 'scripts/tests/test-node-ipam-autodetect.sh'
+      - 'scripts/bootstrap-cluster.sh'
+      - 'ci/actions/bring-up-cluster/action.yml'
       - 'compose.ghcr.yml'
       - 'compose.ghcr.node-conformance.yml'
       - 'compose.sqlite.yml'
@@ -75,3 +83,9 @@ jobs:
         run: bash scripts/tests/test-ghcr-overlays.sh
       - name: Dockerfile crate-enumeration sync test
         run: bash scripts/tests/test-dockerfile-crate-enumeration.sh
+      # ubuntu-latest ships docker, so the compose-topology test's
+      # `docker compose config` render runs here (it self-skips without docker).
+      - name: Per-node netns topology test
+        run: bash scripts/tests/test-per-node-netns-compose.sh
+      - name: Node-IPAM auto-detection test
+        run: bash scripts/tests/test-node-ipam-autodetect.sh

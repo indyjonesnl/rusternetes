@@ -206,13 +206,25 @@ test_bootstrap_imports_into_every_runtime() {
     assert_contains "$(cat "$script")" "containerd_service_containers" \
         "bootstrap must enumerate the runtime containers, not assume one"
 
-    # The enumeration must cover both compose runtimes.
+    # The enumeration must cover both compose runtimes. Fed by a stub runtime
+    # whose `ps` reports what a live two-node stack reports, so the assertion
+    # holds with no cluster up (it used to need one, which made the whole test
+    # unrunnable — and therefore unrun — in CI).
+    local tmp; tmp="$(mktemp -d)"
+    cat > "$tmp/stub-rt" <<'STUB'
+#!/usr/bin/env bash
+[ "$1" = ps ] && printf '%s\n' rusternetes-containerd rusternetes-kubelet rusternetes-containerd2
+exit 0
+STUB
+    chmod +x "$tmp/stub-rt"
+
     local listed
-    listed="$(CONTAINER_RT=docker bash -c "
+    listed="$(CONTAINER_RT="$tmp/stub-rt" bash -c "
         set -euo pipefail
         source <(sed -n '/^containerd_service_containers()/,/^}/p' \"$script\")
         containerd_service_containers
     " 2>/dev/null | tr '\n' ' ')"
+    rm -rf "$tmp"
 
     # An explicit single-runtime override must still win — run-node-conformance.sh
     # passes CONTAINERD_SERVICE_CONTAINER=rusternetes-nc-containerd, and that

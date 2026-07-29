@@ -336,6 +336,45 @@ runs:
         docker compose -f compose.sqlite.yml ${GHCR_OVERLAY:-} logs --tail=80 kubelet || true
         exit 1
 
+    - name: Verify pod networking is ready (podCIDR + CNI conflist)
+      # The multi-node stack's CNI config is written by kube-proxy's
+      # node-network agent from node.spec.podCIDR (#1691/#1695). With no
+      # podCIDR there is no conflist, and containerd rejects EVERY sandbox with
+      # `cni plugin not initialized` — the conformance run then dies in
+      # BeforeSuite with no junit at all, which reads as an infra failure with
+      # no cause attached (the whole nightly set, 2026-07-29). Assert both
+      # halves here so the cause is named in the log instead.
+      shell: bash
+      run: |
+        set +e
+        for i in $(seq 1 60); do
+          missing=""
+          for n in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            cidr=$(kubectl get node "$n" -o jsonpath='{.spec.podCIDR}' 2>/dev/null)
+            [ -n "$cidr" ] || missing="$missing $n"
+          done
+          conf_ok=1
+          for rt in $(docker ps --format '{{.Names}}' | grep -E '^rusternetes-containerd[0-9]*$'); do
+            docker exec "$rt" sh -c 'ls /etc/cni/net.d/*.conflist >/dev/null 2>&1' || conf_ok=0
+          done
+          if [ -z "$missing" ] && [ "$conf_ok" -eq 1 ]; then
+            echo "pod networking ready after ${i} attempts"
+            kubectl get nodes -o custom-columns=NAME:.metadata.name,PODCIDR:.spec.podCIDR
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "pod networking not ready — dumping diagnostics:"
+        echo "nodes without a podCIDR:${missing:- none}"
+        kubectl get nodes -o custom-columns=NAME:.metadata.name,PODCIDR:.spec.podCIDR || true
+        for rt in $(docker ps --format '{{.Names}}' | grep -E '^rusternetes-containerd[0-9]*$'); do
+          echo "--- $rt /etc/cni/net.d ---"
+          docker exec "$rt" ls -l /etc/cni/net.d || true
+        done
+        docker compose -f compose.sqlite.yml ${GHCR_OVERLAY:-} logs --tail=40 kube-proxy kube-proxy2 || true
+        echo "::error::no podCIDR / no CNI conflist — node IPAM is off (see node_ipam_cluster_cidr in scripts/bootstrap-cluster.sh) or kube-proxy's node-network agent is not writing the conflist"
+        exit 1
+
     - name: Install Hydrophone
       # Pinned binary; callers expect it on PATH after this action runs.
       shell: bash
