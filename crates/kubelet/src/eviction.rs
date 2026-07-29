@@ -20,6 +20,7 @@
 //! - `google/cadvisor/fs/fs.go::GetFsInfoForPath` — filesystem stats via `statfs`.
 
 use anyhow::{anyhow, Result};
+use rusternetes_common::quantity::Quantity;
 use rusternetes_common::resources::{Node, NodeCondition, Pod};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -649,9 +650,11 @@ pub fn parse_eviction_flag(value: &str) -> Result<HashMap<EvictionSignal, Evicti
         }
         let signal = EvictionSignal::from_upstream_name(signal_str)
             .ok_or_else(|| anyhow!("eviction threshold '{}': unknown signal", signal_str))?;
-        let parsed = parse_threshold_value(value_str)
-            .ok_or_else(|| anyhow!("eviction threshold '{}': invalid value", value_str))?;
-        out.insert(signal, parsed);
+        // `Ok(None)` is upstream's "ignore this statement" (0% / 100%), which
+        // must not abort the rest of the flag.
+        if let Some(parsed) = parse_threshold_value(signal_str, value_str)? {
+            out.insert(signal, parsed);
+        }
     }
 
     Ok(out)
@@ -692,17 +695,64 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
     Some(total)
 }
 
-/// Parse a threshold value (`100Mi`, `1Gi`, `10%`, `1024`).
-fn parse_threshold_value(value: &str) -> Option<EvictionValue> {
+/// Parse a threshold value (`100Mi`, `0.5Gi`, `10%`, `1024`) for `signal`.
+///
+/// Ports upstream `parseThresholdStatement`
+/// (`../kubernetes/pkg/kubelet/eviction/helpers.go:381-424`). Three behaviours
+/// come from there and are easy to get wrong:
+///
+/// - `Ok(None)` means *drop this statement*. Upstream returns `(nil, nil)` for
+///   `0%` and `100%` rather than erroring (`helpers.go:387-390`). `100%` is the
+///   dangerous one: as a live threshold it is met on every sync, so the node
+///   would evict continuously.
+/// - The absolute form goes through the full `resource.Quantity` grammar
+///   (`helpers.go:410`), which permits a decimal point with every suffix.
+/// - The quantity must be strictly positive: upstream rejects
+///   `Sign() < 0 || IsZero()` (`helpers.go:414-416`).
+fn parse_threshold_value(signal: &str, value: &str) -> Result<Option<EvictionValue>> {
     let value = value.trim();
+
     if let Some(pct) = value.strip_suffix('%') {
-        let p: f64 = pct.trim().parse().ok()?;
-        if !(0.0..=100.0).contains(&p) {
-            return None;
+        // Ignored outright, before the bounds check.
+        if value == "0%" || value == "100%" {
+            return Ok(None);
         }
-        return Some(EvictionValue::Percentage(p));
+        let p: f64 = pct.trim().parse().map_err(|_| {
+            anyhow!("eviction percentage threshold {signal} is not a number: {value}")
+        })?;
+        // Upstream compares `percentage < 0` / `> 1` on a float, and every
+        // comparison against NaN is false — `NaN%` would survive both checks
+        // and leave a threshold that can never be met. Reject it here.
+        if !p.is_finite() {
+            return Err(anyhow!(
+                "eviction percentage threshold {signal} must be finite: {value}"
+            ));
+        }
+        if p < 0.0 {
+            return Err(anyhow!(
+                "eviction percentage threshold {signal} must be >= 0%: {value}"
+            ));
+        }
+        if p > 100.0 {
+            return Err(anyhow!(
+                "eviction percentage threshold {signal} must be <= 100%: {value}"
+            ));
+        }
+        return Ok(Some(EvictionValue::Percentage(p)));
     }
-    parse_memory_value(value).map(EvictionValue::Absolute)
+
+    let quantity =
+        Quantity::parse(value).map_err(|e| anyhow!("eviction threshold {signal}: {value}: {e}"))?;
+    if quantity.is_negative() || quantity.is_zero() {
+        return Err(anyhow!(
+            "eviction threshold {signal} must be positive: {}",
+            quantity.canonical_string()
+        ));
+    }
+    // Positive by the check above, so the `u64` conversion cannot fail; an
+    // absurd quantity saturates rather than wrapping.
+    let bytes = u64::try_from(quantity.value()).unwrap_or(u64::MAX);
+    Ok(Some(EvictionValue::Absolute(bytes)))
 }
 
 /// Build the threshold list from `--eviction-hard` and `--eviction-soft` maps.
@@ -815,26 +865,6 @@ pub fn get_qos_class(pod: &Pod) -> QoSClass {
         QoSClass::Burstable
     } else {
         QoSClass::BestEffort
-    }
-}
-
-/// Parse memory value string (e.g., "100Mi", "1Gi") to bytes
-fn parse_memory_value(value: &str) -> Option<u64> {
-    let value = value.trim();
-
-    if let Some(stripped) = value.strip_suffix("Ki") {
-        stripped.parse::<u64>().ok().map(|v| v * 1024)
-    } else if let Some(stripped) = value.strip_suffix("Mi") {
-        stripped.parse::<u64>().ok().map(|v| v * 1024 * 1024)
-    } else if let Some(stripped) = value.strip_suffix("Gi") {
-        stripped.parse::<u64>().ok().map(|v| v * 1024 * 1024 * 1024)
-    } else if let Some(stripped) = value.strip_suffix("Ti") {
-        stripped
-            .parse::<u64>()
-            .ok()
-            .map(|v| v * 1024 * 1024 * 1024 * 1024)
-    } else {
-        value.parse::<u64>().ok()
     }
 }
 
@@ -1075,28 +1105,38 @@ async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
 mod tests {
     use super::*;
 
+    /// Coverage inherited from the deleted `parse_memory_value`: every input
+    /// the local suffix chain handled correctly still parses identically.
     #[test]
-    fn test_parse_memory_value() {
-        assert_eq!(parse_memory_value("100"), Some(100));
-        assert_eq!(parse_memory_value("100Ki"), Some(102400));
-        assert_eq!(parse_memory_value("100Mi"), Some(104857600));
-        assert_eq!(parse_memory_value("1Gi"), Some(1073741824));
-        assert_eq!(parse_memory_value("1Ti"), Some(1099511627776));
+    fn test_parse_absolute_threshold_values() {
+        for (value, expected) in [
+            ("100", 100u64),
+            ("100Ki", 102_400),
+            ("100Mi", 104_857_600),
+            ("1Gi", 1_073_741_824),
+            ("1Ti", 1_099_511_627_776),
+        ] {
+            assert_eq!(
+                parse_threshold_value("memory.available", value).unwrap(),
+                Some(EvictionValue::Absolute(expected)),
+                "value {value:?}"
+            );
+        }
     }
 
     #[test]
     fn test_parse_threshold_value_percentage() {
         assert_eq!(
-            parse_threshold_value("10%"),
+            parse_threshold_value("memory.available", "10%").unwrap(),
             Some(EvictionValue::Percentage(10.0))
         );
         assert_eq!(
-            parse_threshold_value("0.5%"),
+            parse_threshold_value("memory.available", "0.5%").unwrap(),
             Some(EvictionValue::Percentage(0.5))
         );
         // Out-of-range percentages are rejected.
-        assert_eq!(parse_threshold_value("101%"), None);
-        assert_eq!(parse_threshold_value("-1%"), None);
+        assert!(parse_threshold_value("memory.available", "101%").is_err());
+        assert!(parse_threshold_value("memory.available", "-1%").is_err());
     }
 
     #[test]
@@ -1130,6 +1170,81 @@ mod tests {
     #[test]
     fn test_parse_eviction_flag_invalid_signal() {
         assert!(parse_eviction_flag("bogus.signal<10%").is_err());
+    }
+
+    /// Upstream parses the absolute form with `resource.ParseQuantity`
+    /// (`helpers.go:410`), which accepts the whole grammar. The local subset
+    /// covered only `Ki`/`Mi`/`Gi`/`Ti` and parsed the digits with `u64`, so
+    /// `--eviction-hard=memory.available<1G` failed the flag and kubelet
+    /// refused to start.
+    #[test]
+    fn eviction_flag_accepts_full_quantity_grammar() {
+        let cases = [
+            ("1G", 1_000_000_000u64),
+            ("1M", 1_000_000),
+            ("1k", 1_000),
+            ("1T", 1_000_000_000_000),
+            ("0.5Gi", 536_870_912),
+            ("1.5Gi", 1_610_612_736),
+            ("2.5Mi", 2_621_440),
+            ("1Ti", 1_099_511_627_776),
+            ("1Pi", 1_125_899_906_842_624),
+            ("129e6", 129_000_000),
+        ];
+        for (value, expected) in cases {
+            let map = parse_eviction_flag(&format!("memory.available<{value}"))
+                .unwrap_or_else(|e| panic!("{value} rejected: {e}"));
+            assert_eq!(
+                map.get(&EvictionSignal::MemoryAvailable),
+                Some(&EvictionValue::Absolute(expected)),
+                "value {value:?}"
+            );
+        }
+    }
+
+    /// `0%` and `100%` are dropped, not rejected — upstream returns
+    /// `(nil, nil)` for both (`helpers.go:387-390`). Treating `100%` as a real
+    /// threshold is the dangerous half: it is met on every sync, so the node
+    /// would evict continuously.
+    #[test]
+    fn eviction_flag_ignores_zero_and_hundred_percent() {
+        for value in ["0%", "100%"] {
+            let map = parse_eviction_flag(&format!("memory.available<{value}"))
+                .unwrap_or_else(|e| panic!("{value} must be ignored, not rejected: {e}"));
+            assert!(map.is_empty(), "{value} must not produce a threshold");
+        }
+        // A dropped statement must not take its neighbours with it.
+        let map = parse_eviction_flag("memory.available<100%,nodefs.available<5%").unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.get(&EvictionSignal::NodeFsAvailable),
+            Some(&EvictionValue::Percentage(5.0))
+        );
+    }
+
+    /// Upstream rejects a zero or negative quantity outright:
+    /// `quantity.Sign() < 0 || quantity.IsZero()` (`helpers.go:414-416`). A
+    /// zero threshold used to be accepted and simply never fired.
+    #[test]
+    fn eviction_flag_rejects_non_positive_absolute() {
+        for value in ["0", "0Gi", "0.0", "-1", "-1Gi"] {
+            let err = parse_eviction_flag(&format!("memory.available<{value}"))
+                .expect_err(&format!("{value} must be rejected"));
+            assert!(
+                err.chain()
+                    .any(|c| c.to_string().contains("must be positive")),
+                "{value}: unexpected error {err:#}"
+            );
+        }
+    }
+
+    /// A non-finite percentage passes upstream's `< 0` / `> 1` bounds check
+    /// because every comparison against NaN is false, leaving a threshold that
+    /// can never be met. Reject it instead.
+    #[test]
+    fn eviction_flag_rejects_non_finite_percentage() {
+        assert!(parse_eviction_flag("memory.available<NaN%").is_err());
+        assert!(parse_eviction_flag("memory.available<inf%").is_err());
     }
 
     #[test]
