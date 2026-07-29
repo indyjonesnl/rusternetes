@@ -169,6 +169,11 @@ jobs:
           set -uo pipefail
           slug="vanilla-swap-$MODULE"
           label="vanilla $MODULE"
+          # A leg killed mid-suite still has a real ratio of what ran, but the
+          # badge must not read as a finished suite (#1703).
+          if [ "${OUTCOME:-}" = "test-timeout" ]; then
+            label="$label (partial)"
+          fi
           if [ "${TOTAL:-0}" -gt 0 ]; then
             bash scripts/update-badge.sh "$slug" "$label" "$PASSED" "$TOTAL"
           else

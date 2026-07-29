@@ -365,17 +365,30 @@ runner_rc=${PIPESTATUS[0]}
 set -e
 [ "$runner_rc" -eq 124 ] && vs_warn "conformance step hit VS_TEST_TIMEOUT (likely a hung post-test cleanup); using junit on disk for the verdict"
 
-# Prefer junit (authoritative); fall back to the runner's stdout counters.
+# Prefer junit (authoritative), then the runner's stdout counters, then ginkgo's
+# progress stream. The last one is what makes a killed leg reportable at all:
+# ginkgo writes junit in a ReportAfterSuite node, so a mid-suite kill leaves no
+# junit and no counter lines — only the bullets it already printed (#1703).
+VS_COMPLETENESS=complete
 if counts="$(vs_junit_counts "$VS_WORKDIR")"; then
   RAN="${counts% *}"; FAILED="${counts#* }"; TOTAL="$RAN"; PASSED="$(( RAN - FAILED ))"
 else
   IFS=' ' read -r PASSED FAILED TOTAL <<<"$(vs_stdout_counts "$RESULT_OUT")"
+  if [ "${TOTAL:-0}" -eq 0 ]; then
+    IFS=' ' read -r PASSED FAILED <<<"$(vs_progress_counts "$RESULT_OUT")"
+    TOTAL=$(( PASSED + FAILED ))
+    [ "$TOTAL" -gt 0 ] && vs_warn "no junit; recovered $PASSED passed / $FAILED failed from ginkgo's progress output"
+  fi
+fi
+# A kill before ginkgo printed its summary means specs were still pending.
+if ! vs_suite_completed "$RESULT_OUT"; then
+  VS_COMPLETENESS=partial
 fi
 
 # Verdict from the spec counts, NOT from the junit's presence: a junit that holds
 # only ginkgo's suite-level nodes means zero specs ran, which proves nothing about
 # the module and must not read as a pass (vs_verdict).
-IFS=' ' read -r VS_OUTCOME VS_EXIT <<<"$(vs_verdict "${TOTAL:-0}" "${FAILED:-0}" "$runner_rc")"
+IFS=' ' read -r VS_OUTCOME VS_EXIT <<<"$(vs_verdict "${TOTAL:-0}" "${FAILED:-0}" "$runner_rc" "$VS_COMPLETENESS")"
 [ "${TOTAL:-0}" -gt 0 ] || vs_warn "no spec executed (runner rc=$runner_rc) — reporting '$VS_OUTCOME'"
 vs_emit_result "$VS_OUTCOME" "$PASSED" "$TOTAL" "$VS_K8S_VERSION"
 exit "$VS_EXIT"
