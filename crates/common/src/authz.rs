@@ -511,6 +511,97 @@ impl Authorizer for AlwaysDenyAuthorizer {
 ///
 /// Implements node authorization according to Kubernetes node authorizer specification.
 /// Nodes can only access resources that are bound to them or required for their operation.
+/// Static node rules, ported from upstream
+/// `plugin/pkg/auth/authorizer/rbac/bootstrappolicy/policy.go` `NodeRules()`.
+///
+/// Upstream's Node authorizer subdivides access for the resources it can tie to a
+/// node through its graph (secrets, configmaps, PVCs, leases, …) and then falls
+/// through to these statically defined rules for everything else
+/// (`plugin/pkg/auth/authorizer/node/node_authorizer.go`: "Access to other
+/// resources is not subdivided, so just evaluate against the statically defined
+/// node rules"). Pods are in that fall-through unless the
+/// `AuthorizeNodeWithSelectors` feature gate is on, which is why a kubelet's
+/// cluster-scoped `LIST pods?fieldSelector=spec.nodeName=…` is allowed.
+///
+/// Without these, a vanilla kubelet against this api-server never learns about its
+/// own pods and starts nothing:
+///
+/// ```text
+/// Failed to watch: failed to list *v1.Pod: Node <name> is not authorized to list
+/// pods in namespace None; User does not have permission to perform this action
+/// ```
+///
+/// Entries are `(apiGroup, resource[/subresource], verbs)`.
+const NODE_RULES: &[(&str, &str, &[&str])] = &[
+    ("authentication.k8s.io", "tokenreviews", &["create"]),
+    ("authorization.k8s.io", "subjectaccessreviews", &["create"]),
+    (
+        "authorization.k8s.io",
+        "localsubjectaccessreviews",
+        &["create"],
+    ),
+    ("", "services", &["get", "list", "watch"]),
+    (
+        "",
+        "nodes",
+        &["create", "get", "list", "watch", "update", "patch"],
+    ),
+    ("", "nodes/status", &["update", "patch"]),
+    ("", "events", &["create", "update", "patch"]),
+    ("events.k8s.io", "events", &["create", "update", "patch"]),
+    // Upstream also grants nodes "create" and "delete" on pods, and "create" on
+    // pods/eviction (policy.go:217-219). Those are DELIBERATELY omitted here:
+    // upstream makes them safe with NodeRestriction admission, which limits a node
+    // to pods bound to it, and rusternetes has no equivalent yet — so granting them
+    // would let any node delete any pod. Read access is what a kubelet needs to run
+    // its own workloads, and it is what was missing. Tracked for alignment once
+    // NodeRestriction exists (#1721).
+    ("", "pods", &["get", "list", "watch"]),
+    ("", "pods/status", &["update", "patch"]),
+    ("", "secrets", &["get", "list", "watch"]),
+    ("", "configmaps", &["get", "list", "watch"]),
+    ("", "persistentvolumeclaims", &["get"]),
+    (
+        "",
+        "persistentvolumeclaims/status",
+        &["get", "update", "patch"],
+    ),
+    ("", "persistentvolumes", &["get"]),
+    ("", "endpoints", &["get"]),
+    ("", "serviceaccounts/token", &["create"]),
+    (
+        "certificates.k8s.io",
+        "certificatesigningrequests",
+        &["create", "get", "list", "watch"],
+    ),
+    (
+        "coordination.k8s.io",
+        "leases",
+        &["get", "create", "update", "patch", "delete"],
+    ),
+    ("storage.k8s.io", "volumeattachments", &["get"]),
+    ("storage.k8s.io", "csidrivers", &["get", "list", "watch"]),
+    (
+        "storage.k8s.io",
+        "csinodes",
+        &["get", "create", "update", "patch", "delete"],
+    ),
+    ("node.k8s.io", "runtimeclasses", &["get", "list", "watch"]),
+];
+
+/// True when the request matches one of the static [`NODE_RULES`].
+fn node_rules_allow(attrs: &RequestAttributes) -> bool {
+    let target = match attrs.subresource.as_deref() {
+        Some(sub) if !sub.is_empty() => format!("{}/{}", attrs.resource, sub),
+        _ => attrs.resource.clone(),
+    };
+    NODE_RULES.iter().any(|(group, resource, verbs)| {
+        *group == attrs.api_group.as_str()
+            && *resource == target.as_str()
+            && verbs.contains(&attrs.verb.as_str())
+    })
+}
+
 pub struct NodeAuthorizer;
 
 impl NodeAuthorizer {
@@ -650,6 +741,13 @@ impl Authorizer for NodeAuthorizer {
 
         // Allow nodes to create events
         if attrs.resource == "events" && attrs.verb == "create" {
+            return Ok(Decision::Allow);
+        }
+
+        // Fall through to the statically defined node rules, exactly as upstream's
+        // Node authorizer does for resources it does not subdivide. This is what
+        // authorizes the kubelet's own cluster-scoped pod list/watch.
+        if node_rules_allow(attrs) {
             return Ok(Decision::Allow);
         }
 
@@ -949,6 +1047,110 @@ mod tests {
         {
             Ok(Vec::new())
         }
+    }
+
+    /// A kubelet's own pod watch, verbatim: cluster-scoped LIST of pods with a
+    /// `spec.nodeName` field selector, as `system:node:<name>`.
+    ///
+    /// A vanilla kind kubelet against a swapped rusternetes api-server was denied
+    /// this and therefore never started a single pod:
+    ///
+    ///   Failed to watch: failed to list *v1.Pod: Node vs-apisrv-dbg-worker is not
+    ///   authorized to list pods in namespace None
+    ///
+    /// Upstream allows it through the static node rules
+    /// (plugin/pkg/auth/authorizer/rbac/bootstrappolicy/policy.go NodeRules():
+    /// `NewRule(Read...).Groups(legacyGroup).Resources("pods")`), which the Node
+    /// authorizer falls through to when pods are not subdivided by selector
+    /// (node_authorizer.go: "Access to other resources is not subdivided, so just
+    /// evaluate against the statically defined node rules").
+    fn node_user() -> UserInfo {
+        UserInfo {
+            username: "system:node:worker-1".to_string(),
+            uid: "node-uid".to_string(),
+            groups: vec!["system:nodes".to_string()],
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn node_may_list_pods_cluster_wide() {
+        let attrs = RequestAttributes::new(node_user(), "list", "pods").with_api_group("");
+        assert!(
+            matches!(
+                NodeAuthorizer.authorize(&attrs).await.unwrap(),
+                Decision::Allow
+            ),
+            "the kubelet's own cluster-scoped pod list must be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_may_watch_pods_cluster_wide() {
+        let attrs = RequestAttributes::new(node_user(), "watch", "pods").with_api_group("");
+        assert!(matches!(
+            NodeAuthorizer.authorize(&attrs).await.unwrap(),
+            Decision::Allow
+        ));
+    }
+
+    /// The second denial the same kubelet logged, also a NodeRules entry:
+    /// `NewRule("get","list","watch").Groups("node.k8s.io").Resources("runtimeclasses")`.
+    #[tokio::test]
+    async fn node_may_list_runtimeclasses() {
+        let attrs = RequestAttributes::new(node_user(), "list", "runtimeclasses")
+            .with_api_group("node.k8s.io");
+        assert!(matches!(
+            NodeAuthorizer.authorize(&attrs).await.unwrap(),
+            Decision::Allow
+        ));
+    }
+
+    /// Upstream NodeRules grants pods create/delete, but we deliberately do not:
+    /// upstream constrains them with NodeRestriction admission (a node may only
+    /// touch pods bound to it) and we have no equivalent, so allowing them would let
+    /// any node delete any pod. See the note on NODE_RULES and #1721.
+    #[tokio::test]
+    async fn node_may_not_delete_pods_without_noderestriction() {
+        let attrs = RequestAttributes::new(node_user(), "delete", "pods")
+            .with_namespace("kube-system")
+            .with_api_group("");
+        assert!(matches!(
+            NodeAuthorizer.authorize(&attrs).await.unwrap(),
+            Decision::Deny(_)
+        ));
+    }
+
+    /// Services are read-only for nodes (`Read...`), so writes stay denied — the
+    /// rule table must not become a blanket allow.
+    #[tokio::test]
+    async fn node_may_not_delete_services() {
+        let attrs = RequestAttributes::new(node_user(), "delete", "services")
+            .with_namespace("default")
+            .with_api_group("");
+        assert!(
+            matches!(
+                NodeAuthorizer.authorize(&attrs).await.unwrap(),
+                Decision::Deny(_)
+            ),
+            "nodes have read-only access to services"
+        );
+    }
+
+    /// And a non-node user is still not a node.
+    #[tokio::test]
+    async fn non_node_user_is_denied() {
+        let user = UserInfo {
+            username: "alice".to_string(),
+            uid: "u".to_string(),
+            groups: vec![],
+            extra: std::collections::HashMap::new(),
+        };
+        let attrs = RequestAttributes::new(user, "list", "pods").with_api_group("");
+        assert!(matches!(
+            NodeAuthorizer.authorize(&attrs).await.unwrap(),
+            Decision::Deny(_)
+        ));
     }
 
     fn rule(verbs: &[&str], groups: &[&str], resources: &[&str]) -> PolicyRule {
