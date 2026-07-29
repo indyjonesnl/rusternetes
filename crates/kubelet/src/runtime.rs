@@ -542,32 +542,43 @@ pub(crate) fn expand_env_vars(input: &str) -> String {
     result
 }
 
-/// Parse a Kubernetes memory quantity string (e.g., "128Mi", "1Gi", "1000000") into bytes.
-pub fn parse_memory_quantity(s: &str) -> i64 {
-    if s.ends_with("Gi") {
-        s.trim_end_matches("Gi").parse::<i64>().unwrap_or(0) * 1024 * 1024 * 1024
-    } else if s.ends_with("Mi") {
-        s.trim_end_matches("Mi").parse::<i64>().unwrap_or(0) * 1024 * 1024
-    } else if s.ends_with("Ki") {
-        s.trim_end_matches("Ki").parse::<i64>().unwrap_or(0) * 1024
-    } else if s.ends_with('G') {
-        s.trim_end_matches('G').parse::<i64>().unwrap_or(0) * 1_000_000_000
-    } else if s.ends_with('M') {
-        s.trim_end_matches('M').parse::<i64>().unwrap_or(0) * 1_000_000
-    } else if s.ends_with('K') || s.ends_with('k') {
-        s.trim_end_matches(['K', 'k']).parse::<i64>().unwrap_or(0) * 1000
-    } else {
-        s.parse::<i64>().unwrap_or(0)
-    }
+/// Saturate an `i128` quantity value into the `i64` these helpers return,
+/// matching upstream `ScaledValue`'s int64 cap rather than wrapping.
+fn clamp_quantity_to_i64(value: i128) -> i64 {
+    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
-/// Parse a Kubernetes CPU quantity string (e.g., "500m", "1", "0.5") into millicores.
+/// Parse a Kubernetes memory quantity string (e.g. `"128Mi"`, `"0.5Gi"`,
+/// `"1000000"`) into bytes. Input that upstream `ParseQuantity` rejects reads
+/// as 0; the callers (`downward_api.rs`, `volumes.rs`, `kubelet.rs`) substitute
+/// their own default.
+///
+/// Parsing is `rusternetes_common::quantity::Quantity`, the port of
+/// `k8s.io/apimachinery/pkg/api/resource/quantity.go`. The `trim_end_matches`
+/// chain this replaced parsed the digits with `parse::<i64>()`, so every
+/// quantity carrying a decimal point read as 0 — a container exposing
+/// `limits.memory: 0.5Gi` through a `resourceFieldRef` was handed `"0"`. It
+/// also had no `Ti`/`Pi`/`Ei`/`T`/`P`/`E` (all 0), accepted a non-upstream `K`,
+/// and stripped *repeated* suffixes, so `"1GiGi"` parsed as 1Gi.
+pub fn parse_memory_quantity(s: &str) -> i64 {
+    rusternetes_common::quantity::Quantity::parse(s.trim())
+        .map(|q| clamp_quantity_to_i64(q.value()))
+        .unwrap_or(0)
+}
+
+/// Parse a Kubernetes CPU quantity string (e.g. `"500m"`, `"1"`, `"0.5"`) into
+/// millicores, via `Quantity::milli_value()`.
+///
+/// `value()`/`milli_value()` are the units upstream accounts each resource in
+/// (`Resource.Add`, `../kubernetes/pkg/scheduler/framework/types.go:917-918`),
+/// and both round up away from zero, so a container asking for a sliver of a
+/// resource never reports none. The branch this replaced parsed the pre-`m`
+/// digits with `parse::<i64>()`, so `"0.5m"` read as 0, and cast an unbounded
+/// f64, so `"inf"` saturated to `i64::MAX`.
 pub fn parse_cpu_quantity(s: &str) -> i64 {
-    if s.ends_with('m') {
-        s.trim_end_matches('m').parse::<i64>().unwrap_or(0)
-    } else {
-        (s.parse::<f64>().unwrap_or(0.0) * 1000.0) as i64
-    }
+    rusternetes_common::quantity::Quantity::parse(s.trim())
+        .map(|q| clamp_quantity_to_i64(q.milli_value()))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -4024,6 +4035,91 @@ mod tests {
                 compute_group_add(&pod),
                 Some(vec!["2000".to_string(), "3000".to_string()])
             );
+        }
+    }
+
+    mod downward_api_quantities {
+        use super::super::{parse_cpu_quantity, parse_memory_quantity};
+
+        /// Every input the old `trim_end_matches` + `parse::<i64>()` chain
+        /// handled correctly still parses the same way.
+        #[test]
+        fn unchanged_for_previously_working_input() {
+            assert_eq!(parse_memory_quantity("1Gi"), 1024 * 1024 * 1024);
+            assert_eq!(parse_memory_quantity("128Mi"), 128 * 1024 * 1024);
+            assert_eq!(parse_memory_quantity("64Ki"), 64 * 1024);
+            assert_eq!(parse_memory_quantity("1G"), 1_000_000_000);
+            assert_eq!(parse_memory_quantity("128M"), 128_000_000);
+            assert_eq!(parse_memory_quantity("1000000"), 1_000_000);
+            assert_eq!(parse_cpu_quantity("500m"), 500);
+            assert_eq!(parse_cpu_quantity("2"), 2000);
+            assert_eq!(parse_cpu_quantity("0.5"), 500);
+        }
+
+        /// The `<number>` production permits a decimal point with every
+        /// suffix. `limits.memory: 0.5Gi` exposed through a
+        /// `resourceFieldRef` used to hand the container `"0"`.
+        #[test]
+        fn fractional_quantities_are_not_zero() {
+            assert_eq!(parse_memory_quantity("0.5Gi"), 536_870_912);
+            assert_eq!(parse_memory_quantity("1.5Gi"), 1_610_612_736);
+            assert_eq!(parse_memory_quantity("2.5Mi"), 2_621_440);
+            assert_eq!(parse_memory_quantity("1.5G"), 1_500_000_000);
+            assert_eq!(parse_cpu_quantity("0.5m"), 1);
+            assert_eq!(parse_cpu_quantity("10.5m"), 11);
+            assert_eq!(parse_cpu_quantity("0.7"), 700);
+        }
+
+        /// `Ti`/`Pi`/`Ei` and the `T`/`P`/`E` decimal-SI trio were absent
+        /// from the chain, so every one of them fell through to the bare
+        /// `i64` parse and yielded 0.
+        #[test]
+        fn large_suffixes_are_not_zero() {
+            assert_eq!(parse_memory_quantity("1Ti"), 1_099_511_627_776);
+            assert_eq!(parse_memory_quantity("1Pi"), 1_125_899_906_842_624);
+            assert_eq!(parse_memory_quantity("1Ei"), 1_152_921_504_606_846_976);
+            assert_eq!(parse_memory_quantity("1T"), 1_000_000_000_000);
+            assert_eq!(parse_memory_quantity("1P"), 1_000_000_000_000_000);
+            assert_eq!(parse_memory_quantity("1E"), 1_000_000_000_000_000_000);
+            assert_eq!(parse_memory_quantity("129e6"), 129_000_000);
+        }
+
+        /// Sub-millicore/sub-byte suffixes exist in the grammar
+        /// (`[numkMGTPE]`) and round up away from zero, so a container
+        /// asking for a sliver never reports none.
+        #[test]
+        fn sub_unit_suffixes_round_up() {
+            assert_eq!(parse_cpu_quantity("1500u"), 2);
+            assert_eq!(parse_cpu_quantity("500n"), 1);
+            assert_eq!(parse_memory_quantity("2n"), 1);
+        }
+
+        /// `trim_end_matches` strips *every* trailing occurrence of the
+        /// suffix, so `"1GiGi"` parsed as 1Gi. `strip_suffix` semantics
+        /// reject it, as upstream `ParseQuantity` does.
+        #[test]
+        fn repeated_suffix_is_rejected() {
+            assert_eq!(parse_memory_quantity("1GiGi"), 0);
+            assert_eq!(parse_memory_quantity("1MiMi"), 0);
+            assert_eq!(parse_cpu_quantity("100mm"), 0);
+        }
+
+        /// `K` is not in the grammar (`k` is kilo; `K` is nothing).
+        /// Upstream `ParseQuantity("1K")` returns `ErrSuffix`.
+        #[test]
+        fn non_upstream_uppercase_k_is_rejected() {
+            assert_eq!(parse_memory_quantity("1k"), 1_000);
+            assert_eq!(parse_memory_quantity("1K"), 0);
+        }
+
+        /// Unparseable input keeps reading as 0 — these helpers have no
+        /// error channel and their callers substitute a default.
+        #[test]
+        fn malformed_input_stays_zero() {
+            for bad in ["", "   ", "bogus", "Gi", "1Xi", "--5", "inf", "NaN"] {
+                assert_eq!(parse_memory_quantity(bad), 0, "memory {bad:?}");
+                assert_eq!(parse_cpu_quantity(bad), 0, "cpu {bad:?}");
+            }
         }
     }
 }
