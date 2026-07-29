@@ -105,6 +105,14 @@ pub async fn bootstrap_default_rbac(storage: Arc<StorageBackend>) -> Result<()> 
 /// (`pkg/controlplane/instance.go`, 10s).
 pub const ENDPOINT_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
+const SERVICE_KEY: &str = "/registry/services/default/kubernetes";
+
+/// ClusterIP of the `default/kubernetes` Service: the first address of the
+/// service range this api-server bootstraps as the `kubernetes` ServiceCIDR
+/// (10.96.0.0/12, see main.rs / lib.rs). Upstream derives it the same way, from
+/// the first IP of `--service-cluster-ip-range`.
+const KUBERNETES_SERVICE_IP: &str = "10.96.0.1";
+
 const ENDPOINTS_KEY: &str = "/registry/endpoints/default/kubernetes";
 const ENDPOINTSLICE_KEY: &str = "/registry/endpointslices/default/kubernetes";
 
@@ -321,6 +329,80 @@ async fn reconcile_endpointslice<S: Storage + ?Sized>(
 
 /// Reconcile both the `kubernetes` Endpoints and EndpointSlice to `ip:port`.
 /// Idempotent and safe to call repeatedly (the interval reconciler does).
+/// Create the `default/kubernetes` Service if it is missing.
+///
+/// Ports upstream's kubernetesservice controller
+/// (`pkg/controlplane/instance.go:349` -> `kubernetesservice.New(...)`), which
+/// creates and repairs this Service on every reconcile tick. The api-server owns
+/// it because in-cluster clients depend on it existing: the kubelet derives
+/// `KUBERNETES_SERVICE_HOST` / `KUBERNETES_SERVICE_PORT` from it, so without it
+/// every client-go `InClusterConfig()` fails with
+/// "unable to load in-cluster configuration".
+///
+/// Previously only the Endpoints were reconciled here and the Service came from
+/// `bootstrap-cluster.yaml` — fine for the compose stack, but any cluster that
+/// does not run `scripts/bootstrap-cluster.sh` had no Service at all. That is what
+/// aborted the vanilla-swap api-server leg's conformance suite in 1ms (#1667).
+///
+/// Idempotent: an existing Service is left untouched (its ClusterIP is immutable
+/// and may have been allocated by whoever created it first).
+pub async fn reconcile_kubernetes_service<S: Storage + ?Sized>(
+    storage: &S,
+    api_server_port: u16,
+) -> Result<()> {
+    use rusternetes_common::resources::policy::IntOrString;
+    use rusternetes_common::resources::{Service, ServicePort, ServiceSpec, ServiceType};
+    use rusternetes_common::types::{ObjectMeta, TypeMeta};
+
+    if storage.get::<Service>(SERVICE_KEY).await.is_ok() {
+        return Ok(());
+    }
+
+    let mut metadata = ObjectMeta::new("kubernetes");
+    metadata.namespace = Some("default".to_string());
+    metadata.ensure_uid();
+    metadata.ensure_creation_timestamp();
+    // Upstream labels (`pkg/controlplane/controller/kubernetesservice`).
+    let mut labels = std::collections::HashMap::new();
+    labels.insert("component".to_string(), "apiserver".to_string());
+    labels.insert("provider".to_string(), "kubernetes".to_string());
+    metadata.labels = Some(labels);
+
+    let service = Service {
+        type_meta: TypeMeta {
+            kind: "Service".to_string(),
+            api_version: "v1".to_string(),
+        },
+        metadata,
+        spec: ServiceSpec {
+            cluster_ip: Some(KUBERNETES_SERVICE_IP.to_string()),
+            ports: vec![ServicePort {
+                name: Some("https".to_string()),
+                port: 443,
+                target_port: Some(IntOrString::Int(api_server_port as i32)),
+                protocol: "TCP".to_string(),
+                node_port: None,
+                app_protocol: None,
+            }],
+            service_type: Some(ServiceType::ClusterIP),
+            // No selector: the api-server maintains the Endpoints itself.
+            selector: None,
+            ..Default::default()
+        },
+        status: None,
+    };
+
+    storage
+        .create(SERVICE_KEY, &service)
+        .await
+        .context("Failed to create kubernetes Service")?;
+    info!(
+        "Created default/kubernetes Service ({} :443 -> :{})",
+        KUBERNETES_SERVICE_IP, api_server_port
+    );
+    Ok(())
+}
+
 pub async fn reconcile_kubernetes_endpoint<S: Storage + ?Sized>(
     storage: &S,
     ip: &str,
@@ -345,6 +427,7 @@ pub async fn bootstrap_kubernetes_service(
         "API server IP: {}, Port: {}",
         api_server_ip, api_server_port
     );
+    reconcile_kubernetes_service(storage.as_ref(), api_server_port).await?;
     reconcile_kubernetes_endpoint(storage.as_ref(), &api_server_ip, api_server_port).await
 }
 
@@ -374,6 +457,9 @@ pub fn spawn_endpoint_reconciler(
                     continue;
                 }
             };
+            if let Err(e) = reconcile_kubernetes_service(storage.as_ref(), api_server_port).await {
+                warn!("endpoint reconciler: service reconcile failed: {}", e);
+            }
             if let Err(e) =
                 reconcile_kubernetes_endpoint(storage.as_ref(), &ip, api_server_port).await
             {
@@ -466,6 +552,80 @@ mod tests {
                 .any(|s| s.kind == "Group" && s.name == "system:masters"),
             "binding must target the system:masters group"
         );
+    }
+
+    /// The api-server must own the `default/kubernetes` Service, as upstream's
+    /// kubernetesservice controller does (`pkg/controlplane/instance.go:349`,
+    /// which creates AND repairs it on every reconcile tick).
+    ///
+    /// Ours only ever reconciled the Endpoints. In the compose stack the Service
+    /// comes from bootstrap-cluster.yaml, so nothing was visibly broken — but on a
+    /// cluster that does not run that script (the vanilla-swap api-server leg, and
+    /// any real mixed deployment) there is no Service at all, so the kubelet
+    /// injects no KUBERNETES_SERVICE_HOST/PORT and every in-cluster client dies:
+    ///
+    /// ```text
+    /// Error loading client: error creating client: unable to load in-cluster
+    /// configuration, KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT must be defined
+    /// ```
+    ///
+    /// which aborted the whole conformance suite in 1ms (#1667).
+    #[tokio::test]
+    async fn creates_the_kubernetes_service_when_absent() {
+        let storage = MemoryStorage::new();
+        reconcile_kubernetes_service(&storage, 6443).await.unwrap();
+
+        let svc: rusternetes_common::resources::Service =
+            storage.get(SERVICE_KEY).await.expect("kubernetes Service");
+        assert_eq!(svc.spec.cluster_ip.as_deref(), Some(KUBERNETES_SERVICE_IP));
+        let ports = &svc.spec.ports;
+        assert_eq!(ports[0].port, 443);
+        assert_eq!(
+            ports[0].target_port.as_ref().map(|t| format!("{t:?}")),
+            Some(format!(
+                "{:?}",
+                rusternetes_common::resources::policy::IntOrString::Int(6443)
+            ))
+        );
+        let labels = svc.metadata.labels.as_ref().expect("labels");
+        assert_eq!(
+            labels.get("component").map(String::as_str),
+            Some("apiserver")
+        );
+        assert_eq!(
+            labels.get("provider").map(String::as_str),
+            Some("kubernetes")
+        );
+    }
+
+    /// Reconcile runs every tick, so it must be idempotent.
+    #[tokio::test]
+    async fn reconciling_the_service_twice_is_stable() {
+        let storage = MemoryStorage::new();
+        reconcile_kubernetes_service(&storage, 6443).await.unwrap();
+        let first: rusternetes_common::resources::Service = storage.get(SERVICE_KEY).await.unwrap();
+        reconcile_kubernetes_service(&storage, 6443).await.unwrap();
+        let second: rusternetes_common::resources::Service =
+            storage.get(SERVICE_KEY).await.unwrap();
+        assert_eq!(first.metadata.uid, second.metadata.uid, "must not recreate");
+        assert_eq!(
+            second.spec.cluster_ip.as_deref(),
+            Some(KUBERNETES_SERVICE_IP)
+        );
+    }
+
+    /// And it must self-heal: upstream recreates the Service if it is deleted.
+    #[tokio::test]
+    async fn recreates_the_service_after_deletion() {
+        let storage = MemoryStorage::new();
+        reconcile_kubernetes_service(&storage, 6443).await.unwrap();
+        storage.delete(SERVICE_KEY).await.unwrap();
+        reconcile_kubernetes_service(&storage, 6443).await.unwrap();
+        let svc: rusternetes_common::resources::Service = storage
+            .get(SERVICE_KEY)
+            .await
+            .expect("Service must be recreated after deletion");
+        assert_eq!(svc.spec.cluster_ip.as_deref(), Some(KUBERNETES_SERVICE_IP));
     }
 
     #[tokio::test]
