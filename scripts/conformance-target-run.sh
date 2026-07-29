@@ -52,7 +52,31 @@ MANIFEST="${TARGETS_MANIFEST:-$REPO_ROOT/ci/conformance/targets.json}"
 # "[<LeafNodeType>]" + optional text (junit_report.go:198), and
 # NodeTypeCleanupAfterSuite stringifies as "DeferCleanup (Suite)"
 # (types/types.go:910).
-GINKGO_SUITE_LEVEL_NODES='^\[(BeforeSuite|SynchronizedBeforeSuite|AfterSuite|SynchronizedAfterSuite|ReportBeforeSuite|ReportAfterSuite|DeferCleanup \(Suite\))\]'
+#
+# Tab-separated LITERAL prefixes, matched with awk's index() rather than a
+# dynamic regex: mawk (the awk on ubuntu-latest and on Debian/Ubuntu generally)
+# rewrites `\[` in a regex string to the metacharacter `[` and warns
+# "escape sequence `\[' treated as plain `['", which turned the anchored
+# alternation into a character class that matched nothing — the exclusion
+# silently did nothing under mawk while passing under gawk.
+GINKGO_SUITE_LEVEL_NODES='[BeforeSuite]	[SynchronizedBeforeSuite]	[AfterSuite]	[SynchronizedAfterSuite]	[ReportBeforeSuite]	[ReportAfterSuite]	[DeferCleanup (Suite)]'
+
+# awk snippet shared by the three parsers below: splits the prefix list and
+# defines is_suite_level(name).
+GINKGO_AWK_PRELUDE='
+    BEGIN { n_skip = split(skip, skip_list, "\t") }
+    function is_suite_level(name,   i) {
+        for (i = 1; i <= n_skip; i++)
+            if (index(name, skip_list[i]) == 1) return 1
+        return 0
+    }
+    function tc_name(line) {
+        return match(line, /name="[^"]*"/) ? substr(line, RSTART + 6, RLENGTH - 7) : ""
+    }
+    function tc_status(line) {
+        return match(line, /status="[^"]*"/) ? substr(line, RSTART + 8, RLENGTH - 9) : ""
+    }
+'
 
 # Count real-spec testcase statuses in <dir>/junit_01.xml.
 # Echoes "had_junit passed failed skipped total". had_junit is 0/1; total is
@@ -66,15 +90,10 @@ target_counts() {
     # Per-testcase, so a name is matched against its OWN status. Attribute
     # values are XML-escaped (&quot;, &gt;), so `[^>]*` / `[^"]*` are safe.
     local counts
-    counts=$(grep -oE '<testcase [^>]*>' "$junit" | awk -v skip="$GINKGO_SUITE_LEVEL_NODES" '
-        {
-            name = ""; status = ""
-            if (match($0, /name="[^"]*"/))   name   = substr($0, RSTART + 6, RLENGTH - 7)
-            if (match($0, /status="[^"]*"/)) status = substr($0, RSTART + 8, RLENGTH - 9)
-            if (name ~ skip) next
-            c[status]++
-        }
-        END { printf "%d %d %d", c["passed"], c["failed"], c["skipped"] }')
+    counts=$(grep -oE '<testcase [^>]*>' "$junit" \
+        | awk -v skip="$GINKGO_SUITE_LEVEL_NODES" "$GINKGO_AWK_PRELUDE"'
+            !is_suite_level(tc_name($0)) { c[tc_status($0)]++ }
+            END { printf "%d %d %d", c["passed"], c["failed"], c["skipped"] }')
     local passed failed skipped total
     IFS=' ' read -r passed failed skipped <<<"$counts"
     total=$((passed + failed + skipped))
@@ -87,13 +106,9 @@ target_counts() {
 suite_level_failures() {
     local junit="$1/junit_01.xml"
     [ -f "$junit" ] || return 0
-    grep -oE '<testcase [^>]*>' "$junit" | awk -v keep="$GINKGO_SUITE_LEVEL_NODES" '
-        {
-            name = ""; status = ""
-            if (match($0, /name="[^"]*"/))   name   = substr($0, RSTART + 6, RLENGTH - 7)
-            if (match($0, /status="[^"]*"/)) status = substr($0, RSTART + 8, RLENGTH - 9)
-            if (name ~ keep && status == "failed") print "  - " name
-        }'
+    grep -oE '<testcase [^>]*>' "$junit" \
+        | awk -v skip="$GINKGO_SUITE_LEVEL_NODES" "$GINKGO_AWK_PRELUDE"'
+            is_suite_level(tc_name($0)) && tc_status($0) == "failed" { print "  - " tc_name($0) }'
 }
 
 # Names of the real specs that FAILED, one per line ("  - <name>"), with junit's
@@ -103,14 +118,8 @@ spec_failures() {
     local junit="$1/junit_01.xml"
     [ -f "$junit" ] || return 0
     grep -oE '<testcase [^>]*>' "$junit" \
-        | awk -v skip="$GINKGO_SUITE_LEVEL_NODES" '
-            {
-                name = ""; status = ""
-                if (match($0, /name="[^"]*"/))   name   = substr($0, RSTART + 6, RLENGTH - 7)
-                if (match($0, /status="[^"]*"/)) status = substr($0, RSTART + 8, RLENGTH - 9)
-                if (name ~ skip) next
-                if (status == "failed") print "  - " name
-            }' \
+        | awk -v skip="$GINKGO_SUITE_LEVEL_NODES" "$GINKGO_AWK_PRELUDE"'
+            !is_suite_level(tc_name($0)) && tc_status($0) == "failed" { print "  - " tc_name($0) }' \
         | sed -e 's/&#39;/'"'"'/g' -e 's/&amp;/\&/g' -e 's/&lt;/</g' \
               -e 's/&gt;/>/g' -e 's/&quot;/"/g' -e 's/&#34;/"/g'
 }

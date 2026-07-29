@@ -65,10 +65,29 @@ cat > "$TMP/synthetic/junit_01.xml" <<'EOF'
   <testcase name="[It] [sig-node] not in this focus" classname="Kubernetes e2e suite" status="skipped"></testcase>
 </testsuite>
 EOF
-IFS=' ' read -r hj p f s t <<<"$(target_counts "$TMP/synthetic")"
-[ "$hj" = "1" ] && [ "$p" = "2" ] && [ "$f" = "1" ] && [ "$s" = "1" ] && [ "$t" = "4" ] \
-    && ok "target_counts: excludes ginkgo suite-level nodes" \
-    || bad "target_counts synthetic got hj=$hj p=$p f=$f s=$s t=$t (want 1 2 1 1 4)"
+# Run the count assertion under EVERY awk on this machine. The exclusion was
+# first written as a dynamic regex, which gawk honours and mawk (the awk on
+# ubuntu-latest, and on Debian/Ubuntu generally) silently reinterprets — so it
+# passed locally and excluded nothing in CI. Whichever awk a runner ships, the
+# counts must come out the same.
+for awk_impl in awk gawk mawk busybox-awk; do
+    case "$awk_impl" in
+        busybox-awk) command -v busybox >/dev/null 2>&1 || continue ;;
+        *) command -v "$awk_impl" >/dev/null 2>&1 || continue ;;
+    esac
+    shim="$TMP/awk-shim-$awk_impl"; mkdir -p "$shim"
+    if [ "$awk_impl" = "busybox-awk" ]; then
+        printf '#!/bin/sh\nexec busybox awk "$@"\n' > "$shim/awk"
+    else
+        printf '#!/bin/sh\nexec %s "$@"\n' "$(command -v "$awk_impl")" > "$shim/awk"
+    fi
+    chmod +x "$shim/awk"
+    IFS=' ' read -r hj p f s t <<<"$(PATH="$shim:$PATH" bash -c "
+        TARGET_RUN_LIB_ONLY=1 source '$RUNNER' && target_counts '$TMP/synthetic'")"
+    [ "$hj" = "1" ] && [ "$p" = "2" ] && [ "$f" = "1" ] && [ "$s" = "1" ] && [ "$t" = "4" ] \
+        && ok "target_counts under $awk_impl: excludes ginkgo suite-level nodes" \
+        || bad "target_counts synthetic under $awk_impl got hj=$hj p=$p f=$f s=$s t=$t (want 1 2 1 1 4)"
+done
 
 # A run whose junit holds ONLY suite-level nodes matched no specs, whatever the
 # run log says — total must be 0 so the caller's guard fires.
