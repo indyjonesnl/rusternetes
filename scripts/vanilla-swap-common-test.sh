@@ -372,5 +372,48 @@ case "$START_NODE" in
   *) bad "vs_start_node must fail fast when the container exits immediately" ;;
 esac
 
+
+# --- the co-located kubelet must be told where its CRI stream server is -----
+# The kubelet PROXIES exec/attach upgrades itself to
+# stream_target() = ($CONTAINERD_STREAM_HOST, $CONTAINERD_STREAM_PORT), whose host
+# defaults to the DNS name "containerd" (crates/cri/src/stream.rs). That name only
+# resolves where the runtime is a compose service literally called `containerd`
+# (compose.node-conformance.yml). In THIS harness the runtime container is
+# vanilla-swap-<cluster>-containerd and the kubelet shares its netns, so the
+# default does not resolve and every exec dies:
+#
+#   exec_proxy: ... target=http://containerd:10010/exec/wvXcjx6u
+#   proxy_upgrade: backend request failed: client error (Connect)
+#   $ kubectl exec exec-probe -- echo hello
+#   error: error stream protocol error: unknown error
+#
+# compose.sqlite.yml sets localhost per node for exactly this reason (#1695).
+# Reproduced locally against a pod pinned to the swapped node; #1708.
+JOIN_WORKER="$(sed -n '/^vs_swap_join_worker()/,/^}/p' "$SCRIPT_DIR/vanilla-swap-common.sh")"
+[ -n "$JOIN_WORKER" ] || bad "could not extract vs_swap_join_worker"
+
+case "$JOIN_WORKER" in
+  *CONTAINERD_STREAM_HOST*) ok "swapped kubelet is given a CRI stream host" ;;
+  *) bad "swapped kubelet must set CONTAINERD_STREAM_HOST (else exec/attach dial the unresolvable name 'containerd')" ;;
+esac
+
+# It shares the runtime's network namespace, so loopback is the correct answer —
+# and the only one that cannot depend on docker DNS.
+case "$JOIN_WORKER" in
+  *'CONTAINERD_STREAM_HOST=localhost'*) ok "CRI stream host is localhost (kubelet shares the runtime netns)" ;;
+  *) bad "CONTAINERD_STREAM_HOST must be localhost for a netns-sharing kubelet" ;;
+esac
+
+# The stacks whose kubelet is NOT co-located keep relying on the DNS-name default,
+# so it must not be changed globally.
+NC_COMPOSE="$SCRIPT_DIR/../compose.node-conformance.yml"
+if [ -f "$NC_COMPOSE" ]; then
+  if grep -q "network_mode" "$NC_COMPOSE"; then
+    bad "compose.node-conformance.yml now shares a netns — revisit the stream-host default"
+  else
+    ok "node-conformance kubelet still has its own netns (default 'containerd' must stay)"
+  fi
+fi
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }

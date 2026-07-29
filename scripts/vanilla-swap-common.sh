@@ -425,6 +425,21 @@ vs_swap_join_worker() {
   # CNI bridge all share the node's root netns; sharing containerd's netns
   # reproduces that. The node's InternalIP becomes containerd's kind IP (same
   # network), which the api-server still reaches for the :10250 log/exec proxy.
+  #
+  # CONTAINERD_STREAM_HOST=localhost follows from that netns sharing. The kubelet
+  # PROXIES exec/attach upgrades itself to stream_target()
+  # (crates/cri/src/stream.rs), whose host defaults to the DNS name "containerd" —
+  # correct only where the runtime is a compose service of that name
+  # (compose.node-conformance.yml), and unresolvable here, where the runtime
+  # container is vanilla-swap-<cluster>-containerd. Without it every exec failed:
+  #
+  #   exec_proxy: ... target=http://containerd:10010/exec/wvXcjx6u
+  #   proxy_upgrade: backend request failed: client error (Connect)
+  #
+  # surfacing to the client as `error stream protocol error: unknown error` and to
+  # ginkgo as 6 failed specs (#1708). compose.sqlite.yml sets the same value per
+  # node for the same reason (#1695); our containerd binds the stream server on
+  # 0.0.0.0:10010 (deploy/containerd/config.toml), so loopback reaches it.
   # The kubeconfig is COPIED IN, not bind-mounted. `-v <host-path>:...` is
   # resolved by the DOCKER DAEMON, and under DinD (every CI job here) the daemon
   # runs in a different container from this script — so $VS_WORKDIR/node-admin.conf
@@ -446,6 +461,7 @@ vs_swap_join_worker() {
     -v "${volsdir}:/app/volumes:rshared" \
     -e "CONTAINER_RUNTIME_ENDPOINT=$cri" \
     -e "KUBELET_VOLUMES_PATH=/app/volumes" \
+    -e "CONTAINERD_STREAM_HOST=localhost" \
     "$image" \
     --node-name "$node_name" \
     --kubeconfig /app/admin.conf \
