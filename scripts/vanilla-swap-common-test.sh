@@ -232,5 +232,48 @@ else
   bad "suite timeout ${suite_default:-?}s is too small for a real subset (need >=2400s)"
 fi
 
+
+# --- stdout counter fallback must survive a runner that printed no counters -
+# In CI, GITHUB_OUTPUT is set for the whole job, so conformance-target-run.sh
+# writes passed=/failed=/total= THERE and not to stdout. The driver's fallback
+# grepped stdout for those lines and, under `set -euo pipefail`, a grep that
+# matched nothing killed the driver before it could write run-result.json — so
+# every leg without junit (timeout, hydrophone infra failure) reported
+# `no-result` and published no badge at all. Runs 30433160080 and 30436964889.
+NO_COUNTERS="$TMP/no-counters.out"
+printf '[conformance-target-run] target=x hydrophone_exit=1 — NO junit produced (infra failure)\n' >"$NO_COUNTERS"
+if got="$(vs_stdout_counts "$NO_COUNTERS")"; then
+  [ "$got" = "0 0 0" ] && ok "vs_stdout_counts: no counter lines => 0 0 0 (and does not fail)" \
+    || bad "vs_stdout_counts no-counters got '$got' (want '0 0 0')"
+else
+  bad "vs_stdout_counts must not return non-zero when counters are absent"
+fi
+
+WITH_COUNTERS="$TMP/with-counters.out"
+printf 'noise\npassed=9\nfailed=2\ntotal=11\nmore noise\n' >"$WITH_COUNTERS"
+got="$(vs_stdout_counts "$WITH_COUNTERS")"
+[ "$got" = "9 2 11" ] && ok "vs_stdout_counts: parses passed/failed/total" \
+  || bad "vs_stdout_counts got '$got' (want '9 2 11')"
+
+# Last occurrence wins (the runner prints its summary once, but a refocused
+# re-run inside one file must not be averaged with the first).
+printf 'passed=1\nfailed=0\ntotal=1\npassed=4\nfailed=1\ntotal=5\n' >"$WITH_COUNTERS"
+got="$(vs_stdout_counts "$WITH_COUNTERS")"
+[ "$got" = "4 1 5" ] && ok "vs_stdout_counts: last counter block wins" \
+  || bad "vs_stdout_counts repeat got '$got' (want '4 1 5')"
+
+got="$(vs_stdout_counts "$TMP/definitely-not-here.out")"
+[ "$got" = "0 0 0" ] && ok "vs_stdout_counts: missing file => 0 0 0" \
+  || bad "vs_stdout_counts missing-file got '$got' (want '0 0 0')"
+
+# And the driver must ask the runner for stdout counters in the first place:
+# leaving GITHUB_OUTPUT set sends them to the Actions file where the driver
+# cannot see them.
+if grep -qE 'env -u GITHUB_OUTPUT|GITHUB_OUTPUT= ' "$SCRIPT_DIR/vanilla-swap-run.sh"; then
+  ok "driver clears GITHUB_OUTPUT for the runner so counters reach stdout"
+else
+  bad "driver must clear GITHUB_OUTPUT when invoking conformance-target-run.sh"
+fi
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }

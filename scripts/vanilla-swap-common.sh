@@ -602,6 +602,29 @@ vs_junit_counts() {
   printf '%s %s\n' "$(( ${passed:-0} + ${failed:-0} ))" "${failed:-0}"
 }
 
+# vs_stdout_counts <runner-stdout-file> — echo "PASSED FAILED TOTAL" parsed from
+# conformance-target-run.sh's `passed=`/`failed=`/`total=` lines, defaulting each
+# to 0. Always succeeds: a missing file or absent lines is a legitimate state
+# (the runner died before it could report), not an error.
+#
+# This used to be inline in the driver as `grep ... | tail -1 | cut -d= -f2`, and
+# under the driver's `set -euo pipefail` a grep that matched nothing took the
+# whole driver down BEFORE it wrote run-result.json — so the workflow saw no
+# result, reported `no-result`, and published no badge. Which is exactly what
+# happens in CI, where GITHUB_OUTPUT is set for the job and the runner therefore
+# writes its counters to that file instead of stdout (runs 30433160080,
+# 30436964889). The driver now clears GITHUB_OUTPUT for the child so the counters
+# land here, and this parse cannot kill it either way.
+vs_stdout_counts() {
+  local f="${1:-}" passed="" failed="" total=""
+  if [ -n "$f" ] && [ -f "$f" ]; then
+    passed="$(grep -E '^passed=[0-9]+$' "$f" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+    failed="$(grep -E '^failed=[0-9]+$' "$f" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+    total="$(grep -E '^total=[0-9]+$' "$f" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+  fi
+  printf '%s %s %s\n' "${passed:-0}" "${failed:-0}" "${total:-0}"
+}
+
 # vs_test_budget_ok <suite-timeout-seconds> <job-timeout-minutes> [reserve-minutes]
 # True when the scoped-subset timeout leaves at least `reserve` minutes of the CI
 # job budget for everything around it: kind bring-up, image pull, the swap, the
