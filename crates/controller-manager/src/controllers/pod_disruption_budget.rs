@@ -221,7 +221,13 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
                 Err(_) => pdb.clone(),
             };
             fresh_pdb.status = Some(new_status);
-            self.storage.update(&key, &fresh_pdb).await?;
+            // update_status, NOT update: a full-object PUT has its `.status`
+            // stripped by any api-server that exposes a status subresource (see
+            // crates/storage/src/api_storage.rs). Driving a vanilla api-server, the
+            // write silently vanished, observedGeneration never advanced, and
+            // upstream's waitForPdbToBeProcessed polled until every
+            // DisruptionController [Conformance] spec timed out (#1712).
+            self.storage.update_status(&key, &fresh_pdb).await?;
         }
 
         Ok(())
@@ -793,7 +799,9 @@ impl<S: Storage + 'static> StalePodDisruptionController<S> {
                 }
             }
         }
-        self.storage.update(&key, &fresh).await?;
+        // Pod conditions live in status, so this must go through the status
+        // subresource too — same reason as the PDB write above (#1712/#1723).
+        self.storage.update_status(&key, &fresh).await?;
         info!(
             "stale-pod-disruption: flipped DisruptionTarget True->False on Running pod {}/{}",
             pod.metadata.namespace.as_deref().unwrap_or("?"),
@@ -810,6 +818,173 @@ mod tests {
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
     use rusternetes_storage::MemoryStorage;
     use std::collections::HashMap;
+
+    /// A storage double that behaves like a real api-server: `update` (full-object
+    /// PUT) DISCARDS `.status`; only the status subresource persists it. Upstream
+    /// strips status on the main resource for any type with a status subresource,
+    /// and `crates/storage/src/api_storage.rs` says so explicitly — a controller
+    /// writing status through `update` "will not see it stick in API mode".
+    ///
+    /// Against a vanilla kube-apiserver that made `status.observedGeneration` never
+    /// advance, so upstream's `waitForPdbToBeProcessed` polled until it timed out
+    /// and every DisruptionController [Conformance] spec burned ~10 minutes — four
+    /// of them consumed the whole vanilla-swap controller-manager budget (#1712).
+    ///
+    /// MemoryStorage cannot show this: its default `update_status` funnels through
+    /// `update`, so both paths persist status there.
+    struct StatusStrippingStorage {
+        inner: MemoryStorage,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for StatusStrippingStorage {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.create(key, value).await
+        }
+
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+
+        /// Full-object PUT: keep whatever status is already stored, ignore the
+        /// caller's — exactly what an api-server with a status subresource does.
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            let mut doc = serde_json::to_value(value).unwrap();
+            let stored: serde_json::Value =
+                self.inner.get(key).await.unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = doc.as_object_mut() {
+                match stored.get("status") {
+                    Some(prev) if !prev.is_null() => {
+                        obj.insert("status".to_string(), prev.clone());
+                    }
+                    _ => {
+                        obj.remove("status");
+                    }
+                }
+            }
+            let kept: T = serde_json::from_value(doc).unwrap();
+            self.inner.update(key, &kept).await
+        }
+
+        /// The status subresource: this is the ONLY path that persists `.status`.
+        /// Must be overridden — the trait's default `update_status` does a
+        /// read-modify-write through `update`, which above strips status, so
+        /// inheriting it would make even a correct controller look broken.
+        async fn update_status<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            let incoming = serde_json::to_value(value).unwrap();
+            let mut stored: serde_json::Value = self.inner.get(key).await?;
+            if let Some(obj) = stored.as_object_mut() {
+                if let Some(status) = incoming.get("status") {
+                    obj.insert("status".to_string(), status.clone());
+                }
+            }
+            let merged: T = serde_json::from_value(stored).unwrap();
+            self.inner.update(key, &merged).await
+        }
+
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.inner.update_raw(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list(prefix).await
+        }
+
+        async fn watch(
+            &self,
+            prefix: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    fn pdb_fixture() -> PodDisruptionBudget {
+        PodDisruptionBudget {
+            type_meta: TypeMeta {
+                api_version: "policy/v1".to_string(),
+                kind: "PodDisruptionBudget".to_string(),
+            },
+            metadata: ObjectMeta {
+                name: "pdb-1".to_string(),
+                namespace: Some("default".to_string()),
+                generation: Some(1),
+                ..Default::default()
+            },
+            spec: PodDisruptionBudgetSpec {
+                min_available: Some(IntOrString::Int(1)),
+                max_unavailable: None,
+                selector: LabelSelector::default(),
+                unhealthy_pod_eviction_policy: None,
+            },
+            status: None,
+        }
+    }
+
+    /// THE regression: reconcile must persist status through the status
+    /// subresource, so observedGeneration advances even when a full-object PUT
+    /// drops status.
+    #[tokio::test]
+    async fn pdb_status_survives_an_apiserver_that_strips_status_on_put() {
+        let storage = Arc::new(StatusStrippingStorage {
+            inner: MemoryStorage::new(),
+        });
+        let pdb = pdb_fixture();
+        let key = build_key("poddisruptionbudgets", Some("default"), "pdb-1");
+        storage.create(&key, &pdb).await.unwrap();
+
+        let controller = PodDisruptionBudgetController::new(storage.clone());
+        controller.reconcile_pdb(&pdb).await.unwrap();
+
+        let stored: PodDisruptionBudget = storage.get(&key).await.unwrap();
+        let status = stored
+            .status
+            .expect("reconcile must persist PDB status via the status subresource");
+        assert_eq!(
+            status.observed_generation,
+            Some(1),
+            "observedGeneration must reach metadata.generation, else upstream's \
+             waitForPdbToBeProcessed polls until it times out"
+        );
+    }
 
     #[test]
     fn test_resolve_json_path_simple() {
