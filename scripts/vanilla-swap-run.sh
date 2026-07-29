@@ -70,7 +70,12 @@ vs_guard_recipe "$MODULE"
 vs_version_skew_check "$VS_K8S_VERSION"
 
 # --- workspace + teardown trap ---------------------------------------------
-CLUSTER="vanilla-swap-${MODULE}"
+# Cluster name is derived from the module so a leg is self-describing, but it can
+# be overridden: debugging a leg locally otherwise destroys any existing
+# vanilla-swap-<module> cluster (kind deletes and recreates by name), and two legs
+# for the same module cannot run on one host. Side containers and volumes are all
+# named from this, so an override isolates a run completely.
+CLUSTER="${VS_CLUSTER_NAME:-vanilla-swap-${MODULE}}"
 VS_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/vanilla-swap-${MODULE}.XXXXXX")"
 export VS_WORKDIR
 vs_install_teardown_trap "$CLUSTER"

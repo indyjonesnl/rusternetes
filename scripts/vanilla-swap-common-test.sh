@@ -573,5 +573,16 @@ got="$(vs_verdict 0 0 124 partial)"
 WF="$SCRIPT_DIR/../.github/workflows/vanilla-swap-module.yml"
 if grep -q "test-timeout" "$WF"; then ok "workflow marks a partial run on the badge"; else bad "workflow must label a test-timeout badge as partial"; fi
 
+
+# --- cluster name must be overridable --------------------------------------
+# kind creates/deletes by name, so debugging a leg locally would otherwise wipe an
+# existing vanilla-swap-<module> cluster someone is using.
+DRV="$(cat "$SCRIPT_DIR/vanilla-swap-run.sh")"
+case "$DRV" in
+  *'CLUSTER="${VS_CLUSTER_NAME:-vanilla-swap-${MODULE}}"'*)
+    ok "cluster name honours VS_CLUSTER_NAME, defaulting to the module" ;;
+  *) bad "CLUSTER must be overridable via VS_CLUSTER_NAME" ;;
+esac
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }
