@@ -1,6 +1,6 @@
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection
 use rusternetes_common::{
-    quantity::parse_resource_value,
+    quantity::{parse_resource_value, Format, Quantity},
     resources::{LimitRange, Pod, ResourceQuota, ServiceAccount},
     types::ResourceRequirements,
 };
@@ -284,7 +284,7 @@ pub async fn check_resource_quota_with_old<S: Storage>(
             } else {
                 new_usage.insert(
                     "requests.cpu".to_string(),
-                    format!("{}m", baseline_cpu + pod_cpu),
+                    millicores_to_cpu_string(baseline_cpu + pod_cpu),
                 );
             }
         }
@@ -336,7 +336,7 @@ pub async fn check_resource_quota_with_old<S: Storage>(
             } else {
                 new_usage.insert(
                     "limits.cpu".to_string(),
-                    format!("{}m", baseline_cpu + pod_limits_cpu),
+                    millicores_to_cpu_string(baseline_cpu + pod_limits_cpu),
                 );
             }
         }
@@ -804,7 +804,7 @@ async fn calculate_namespace_usage<S: Storage>(
     if total_cpu_requests > 0 {
         usage.insert(
             "requests.cpu".to_string(),
-            format!("{}m", total_cpu_requests),
+            millicores_to_cpu_string(total_cpu_requests),
         );
     }
     if total_memory_requests > 0 {
@@ -1066,6 +1066,14 @@ fn validate_ratio(
 /// Millicores/bytes are the units upstream's scheduler accounts these in
 /// (`Resource.Add`, `../kubernetes/pkg/scheduler/framework/types.go:917-918`),
 /// and `Quantity` rounds both up away from zero as upstream `ScaledValue` does.
+/// Canonical `resource.Quantity` string for a millicore total, so projected
+/// quota usage is spelled the way upstream spells it: a whole number of cores
+/// is `"2"`, not the `"2000m"` a `format!("{}m", ..)` emits
+/// (`NewMilliQuantity`, `quantity.go:797`).
+fn millicores_to_cpu_string(millicores: i64) -> String {
+    Quantity::from_milli_value(millicores, Format::DecimalSI).canonical_string()
+}
+
 fn parse_cpu_to_millicores(cpu: &str) -> anyhow::Result<i64> {
     Ok(parse_resource_value(cpu, "cpu")?)
 }

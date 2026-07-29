@@ -826,7 +826,13 @@ async fn resource_quota_usage_recomputes_on_pod_delete_via_http() {
         body
     );
     assert_eq!(
-        body["status"]["used"]["requests.cpu"], "0m",
+        // Real Kubernetes reports a zero quota usage as bare "0": upstream's
+        // `CanonicalizeBytes` short-circuits on `IsZero` (`quantity.go:426`)
+        // before any suffix is chosen. This asserted "0m", which upstream never
+        // emits — notable because this file is meant to mirror conformance
+        // expectations.
+        body["status"]["used"]["requests.cpu"],
+        "0",
         "after pod delete, used.requests.cpu must be 0: body={}",
         body
     );

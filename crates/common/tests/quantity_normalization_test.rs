@@ -131,10 +131,19 @@ fn decimal_si_keeps_format_when_value_has_no_factor_of_1000() {
 }
 
 #[test]
-fn decimal_exponent_strips_trailing_zeros_from_mantissa() {
-    // `"2.5e3"` canonical: mantissa stripped of trailing zeros gives
-    // 25, scale 2 — output is `"25e2"`.
-    assert_canonical("2.5e3", "25e2");
+fn decimal_exponent_normalises_exponent_to_a_multiple_of_three() {
+    // Upstream `int64Amount.AsCanonicalBytes` (`amount.go:264-279`) strips
+    // trailing zeros from the mantissa AND THEN forces the exponent to a
+    // multiple of 3, shifting the mantissa back up. `"2.5e3"` is mantissa 25
+    // scale 2, so the shift lands it on 2500 scale 0 — and `DecimalExponent`
+    // with exponent 0 emits no suffix at all (`suffix.go:165-167`).
+    //
+    // This previously asserted `"25e2"`, which skipped the multiple-of-3 step.
+    assert_canonical("2.5e3", "2500");
+    // The same normalisation in the other direction: 8 * 10^-2 is shifted to
+    // 80 * 10^-3, which is upstream's own expectation for that value
+    // (`quantity_test.go:723`).
+    assert_canonical("8e-2", "80e-3");
 }
 
 #[test]
