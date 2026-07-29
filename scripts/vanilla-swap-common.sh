@@ -425,22 +425,47 @@ vs_swap_join_worker() {
   # CNI bridge all share the node's root netns; sharing containerd's netns
   # reproduces that. The node's InternalIP becomes containerd's kind IP (same
   # network), which the api-server still reaches for the :10250 log/exec proxy.
-  docker run -d --privileged \
+  # The kubeconfig is COPIED IN, not bind-mounted. `-v <host-path>:...` is
+  # resolved by the DOCKER DAEMON, and under DinD (every CI job here) the daemon
+  # runs in a different container from this script — so $VS_WORKDIR/node-admin.conf
+  # does not exist on the daemon's filesystem and Docker helpfully creates a
+  # DIRECTORY at the mount source. The kubelet then died instantly with
+  #
+  #   Error: Failed to read kubeconfig from "/kc/admin.conf": Is a directory (os error 21)
+  #
+  # and the node never registered (run 30439714160). It works on a local single
+  # daemon, which is why this only ever failed in CI. `docker cp` goes through the
+  # daemon API, so it works either way; the destination is under /app, which
+  # exists in the image (docker cp does not create parent directories).
+  local node_container="vanilla-swap-${cluster}-${node_name}"
+  docker create --privileged \
     --network "container:vanilla-swap-${cluster}-containerd" \
-    --name "vanilla-swap-${cluster}-${node_name}" \
+    --name "$node_container" \
     --label "rusternetes-swap-cluster=$cluster" \
     -v "${vol}:/run/containerd" \
     -v "${volsdir}:/app/volumes:rshared" \
-    -v "${kc}:/kc/admin.conf:ro" \
     -e "CONTAINER_RUNTIME_ENDPOINT=$cri" \
     -e "KUBELET_VOLUMES_PATH=/app/volumes" \
     "$image" \
     --node-name "$node_name" \
-    --kubeconfig /kc/admin.conf \
+    --kubeconfig /app/admin.conf \
     --api-server-url "https://${node_ip}:6443" \
     --cluster-dns "$clusterdns" \
     --insecure-skip-tls-verify \
     --metrics-port 10250 --sync-interval 3 >/dev/null
+  docker cp "$kc" "${node_container}:/app/admin.conf" \
+    || vs_die "failed to copy the node kubeconfig into $node_container" "$VS_EX_NOTUP"
+  docker start "$node_container" >/dev/null
+
+  # A module that exits on startup should say so now, not 180 seconds from now
+  # via a readiness timeout: the container is already dead and its logs are the
+  # whole answer.
+  sleep 3
+  if [ "$(docker inspect -f '{{.State.Running}}' "$node_container" 2>/dev/null)" != "true" ]; then
+    vs_warn "kubelet container $node_container exited immediately — logs follow"
+    docker logs --tail 40 "$node_container" >&2 2>&1 || true
+    vs_die "swapped kubelet did not stay up" "$VS_EX_NOTUP"
+  fi
 
   # Scope kube-proxy OFF the swapped node. This harness isolates the *kubelet*;
   # kube-proxy is a separate component and currently crash-loops on the
