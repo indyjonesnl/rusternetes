@@ -281,23 +281,38 @@ fi
 # `module-did-not-come-up` after three minutes of total silence — a red verdict
 # nobody can act on. vs_wait_ready now dumps state before giving up.
 STUB_BIN="$TMP/diag-bin"; mkdir -p "$STUB_BIN"
-for t in kubectl docker; do
-  cat >"$STUB_BIN/$t" <<STUB
+cat >"$STUB_BIN/kubectl" <<'STUB'
 #!/bin/sh
-echo "STUB-$t \$*"
+echo "STUB-kubectl $*"
 exit 0
 STUB
-  chmod +x "$STUB_BIN/$t"
-done
+# `docker ps` must yield a container name so the log loop has something to read;
+# any other subcommand just echoes. Guessing fixed names is what failed before.
+cat >"$STUB_BIN/docker" <<'STUB'
+#!/bin/sh
+echo "STUB-docker $*"
+case "$1" in
+  ps) echo "vanilla-swap-vanilla-swap-kubelet-rusternetes-node" ;;
+  logs) echo "STUB-kubelet-log-line" ;;
+esac
+exit 0
+STUB
+chmod +x "$STUB_BIN/kubectl" "$STUB_BIN/docker"
 
 diag="$(VS_READINESS=node-ready VS_MODULE=kubelet PATH="$STUB_BIN:$PATH" \
   vs_dump_readiness_diagnostics vanilla-swap-kubelet /dev/null 2>&1)"
-for want in "nodes" "describe node rusternetes-node" "swapped module logs"; do
+for want in "nodes" "describe node rusternetes-node" "harness containers" "swapped module logs" "STUB-docker ps -a --filter name=vanilla-swap-vanilla-swap-kubelet"; do
   case "$diag" in
     *"$want"*) ok "readiness diagnostics include: $want" ;;
     *) bad "readiness diagnostics missing '$want'" ;;
   esac
 done
+
+case "$diag" in
+  *"[container vanilla-swap-vanilla-swap-kubelet-rusternetes-node]"*STUB-kubelet-log-line*)
+    ok "readiness diagnostics dump logs for each enumerated container" ;;
+  *) bad "readiness diagnostics must dump logs for containers found via docker ps" ;;
+esac
 
 # It runs against a cluster that is by definition unhealthy, so a failing probe
 # must not become the reported failure.
