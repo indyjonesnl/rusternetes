@@ -1,3 +1,4 @@
+use rusternetes_common::quantity::parse_resource_value;
 use rusternetes_common::resources::Pod;
 use tracing::{info, warn};
 
@@ -86,34 +87,15 @@ pub(crate) fn mount_tmpfs_for_emptydir(dir: &str, size_bytes: Option<u64>) {
     }
 }
 
-/// Parse a Kubernetes resource.Quantity (e.g. `1Gi`, `512Mi`, `100M`) into a
-/// byte count. Returns None on unrecognised input. Supports the binary (Ki, Mi,
-/// Gi, Ti) and decimal (k/K, M, G, T) suffixes used for memory quantities.
+/// Parse a Kubernetes `resource.Quantity` (e.g. `1Gi`, `512Mi`, `0.5Gi`) into a
+/// byte count. Returns `None` on input that upstream `ParseQuantity` rejects,
+/// and on a negative quantity — a `sizeLimit` below zero is not a size, and
+/// letting it through as a `u64` would either wrap or clamp to a zero-byte cap.
+///
+/// The suffix table lives in [`parse_resource_value`]; the local one here was
+/// missing `Pi`/`Ei`/`P`/`E` and accepted a non-upstream `K`.
 pub(crate) fn parse_quantity_bytes(q: &str) -> Option<u64> {
-    let q = q.trim();
-    let (num, mult): (&str, u64) = if let Some(n) = q.strip_suffix("Ki") {
-        (n, 1024)
-    } else if let Some(n) = q.strip_suffix("Mi") {
-        (n, 1024 * 1024)
-    } else if let Some(n) = q.strip_suffix("Gi") {
-        (n, 1024 * 1024 * 1024)
-    } else if let Some(n) = q.strip_suffix("Ti") {
-        (n, 1024u64.pow(4))
-    } else if let Some(n) = q.strip_suffix('k').or_else(|| q.strip_suffix('K')) {
-        (n, 1000)
-    } else if let Some(n) = q.strip_suffix('M') {
-        (n, 1_000_000)
-    } else if let Some(n) = q.strip_suffix('G') {
-        (n, 1_000_000_000)
-    } else if let Some(n) = q.strip_suffix('T') {
-        (n, 1_000_000_000_000)
-    } else {
-        (q, 1)
-    };
-    num.trim()
-        .parse::<f64>()
-        .ok()
-        .map(|v| (v * mult as f64) as u64)
+    u64::try_from(parse_resource_value(q, "memory").ok()?).ok()
 }
 
 /// Create the host-side termination-log file with world-writable permissions so
@@ -582,6 +564,30 @@ mod tests {
         assert_eq!(parse_quantity_bytes("64Ki"), Some(64 * 1024));
         assert_eq!(parse_quantity_bytes("2048"), Some(2048));
         assert_eq!(parse_quantity_bytes("bogus"), None);
+    }
+
+    /// The `<number>` production permits a decimal point with every suffix,
+    /// and `Pi`/`Ei` complete binarySI. `emptyDir.sizeLimit: 0.5Gi` is an
+    /// ordinary spec value; parsing it as `None` drops the tmpfs size cap.
+    #[test]
+    fn parse_quantity_bytes_handles_fractional_and_large_suffixes() {
+        assert_eq!(parse_quantity_bytes("0.5Gi"), Some(536_870_912));
+        assert_eq!(parse_quantity_bytes("1.5Gi"), Some(1_610_612_736));
+        assert_eq!(parse_quantity_bytes("2.5Mi"), Some(2_621_440));
+        assert_eq!(parse_quantity_bytes("1Pi"), Some(1_125_899_906_842_624));
+        assert_eq!(parse_quantity_bytes("1Ei"), Some(1_152_921_504_606_846_976));
+        assert_eq!(parse_quantity_bytes("1P"), Some(1_000_000_000_000_000));
+        assert_eq!(parse_quantity_bytes("1E"), Some(1_000_000_000_000_000_000));
+        assert_eq!(parse_quantity_bytes("129e6"), Some(129_000_000));
+    }
+
+    /// A negative size is not a size. The old f64 cast saturated it to
+    /// `Some(0)`, which mounts a zero-byte tmpfs instead of declining to
+    /// cap it.
+    #[test]
+    fn parse_quantity_bytes_rejects_negative() {
+        assert_eq!(parse_quantity_bytes("-1Gi"), None);
+        assert_eq!(parse_quantity_bytes("-1"), None);
     }
     use rusternetes_common::resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec};
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
