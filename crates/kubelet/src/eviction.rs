@@ -1112,7 +1112,7 @@ async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
         // label): working-set memory + writable-layer disk usage.
         let filter = rusternetes_cri::v1::ContainerStatsFilter {
             label_selector: HashMap::from([(
-                "io.kubernetes.pod.uid".to_string(),
+                crate::labels::POD_UID_LABEL.to_string(),
                 pod.metadata.uid.clone(),
             )]),
             ..Default::default()

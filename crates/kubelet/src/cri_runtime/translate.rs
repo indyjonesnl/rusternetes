@@ -26,11 +26,17 @@ use rusternetes_cri::v1;
 
 /// Well-known CRI metadata label keys the runtime indexes sandboxes/containers
 /// by. They mirror the keys the upstream kubelet sets so `crictl`/tools work.
+///
+/// Re-exported from [`crate::labels`] — the port of
+/// `staging/src/k8s.io/kubelet/pkg/types/labels.go` — under the shorter names
+/// this module's call sites use. These were a second, independent set of string
+/// literals with the same values; a typo or a rename in one would have silently
+/// orphaned every sandbox the other had labelled.
 pub(crate) mod labels {
-    pub const POD_NAME: &str = "io.kubernetes.pod.name";
-    pub const POD_NAMESPACE: &str = "io.kubernetes.pod.namespace";
-    pub const POD_UID: &str = "io.kubernetes.pod.uid";
-    pub const CONTAINER_NAME: &str = "io.kubernetes.container.name";
+    pub use crate::labels::{
+        CONTAINER_NAME_LABEL as CONTAINER_NAME, POD_NAMESPACE_LABEL as POD_NAMESPACE,
+        POD_NAME_LABEL as POD_NAME, POD_UID_LABEL as POD_UID,
+    };
 }
 
 fn namespace(pod: &Pod) -> &str {
