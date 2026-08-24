@@ -20,7 +20,7 @@ use std::sync::Arc;
 #[test]
 fn test_66_bootstrap_creates_kubernetes_service() {
     // Parse bootstrap-cluster.yaml and verify the kubernetes Service exists
-    let bootstrap_yaml = include_str!("../../../bootstrap-cluster.yaml");
+    let bootstrap_yaml = include_str!("../../../../bootstrap-cluster.yaml");
 
     // The YAML contains multiple documents; find the kubernetes service
     let mut found_kubernetes_svc = false;
