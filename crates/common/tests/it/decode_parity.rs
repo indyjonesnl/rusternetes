@@ -30,7 +30,7 @@ fn real_cluster_snapshot_decodes_by_kind() {
     };
 
     let list: Value =
-        serde_json::from_str(include_str!("fixtures/real_cluster_snapshot.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/real_cluster_snapshot.json")).unwrap();
     let items = list["items"].as_array().expect("snapshot has items[]");
 
     // (kind, name) -> deserialize error, for every object that fails to decode.
@@ -76,7 +76,7 @@ fn real_cluster_snapshot_decodes_by_kind() {
 /// with "missing field `name`" and reject the whole node registration.
 #[test]
 fn kubelet_node_registration_decodes() {
-    let body = include_str!("fixtures/kubelet_node_registration.json");
+    let body = include_str!("../fixtures/kubelet_node_registration.json");
     let node: Node = serde_json::from_str(body)
         .expect("a real kubelet Node registration body must deserialize into Node");
     // Sanity: the subject-less runtime handler round-tripped to an empty name.
