@@ -49,6 +49,32 @@ fn declares_its_inputs(source: &str) -> bool {
         .any(|instruction| source.contains(instruction))
 }
 
+/// A build script that watches git metadata is dirtied by every commit, fetch,
+/// and branch switch. On a crate that the whole workspace depends on — `common`
+/// — that turns `git commit` into a full-workspace rebuild. Watching refs is
+/// still the only way to keep a locally-stamped SHA honest, so it is allowed,
+/// but only behind the `RUSTERNETES_STAMP_GIT` opt-in rather than on by default.
+#[test]
+fn git_metadata_is_only_watched_behind_the_opt_in() {
+    let offenders: Vec<String> = build_scripts()
+        .iter()
+        .filter(|path| {
+            let source = std::fs::read_to_string(path).expect("build.rs should be readable");
+            let watches_git = source.contains("--git-path") || source.contains("watch_git_refs");
+            watches_git && !source.contains("RUSTERNETES_STAMP_GIT")
+        })
+        .map(|path| path.display().to_string())
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "build script(s) watch git metadata unconditionally, so every commit \
+         rebuilds their dependents:\n  {}\n\nGate the watch behind \
+         `RUSTERNETES_STAMP_GIT` (see crates/common/build.rs).",
+        offenders.join("\n  ")
+    );
+}
+
 #[test]
 fn every_build_script_declares_its_inputs() {
     let scripts = build_scripts();

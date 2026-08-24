@@ -5,12 +5,52 @@
 use std::process::Command;
 
 fn main() {
-    // Re-run when HEAD moves (local builds) or the injected SHA changes (Docker).
+    // Re-run when the injected SHA changes (Docker) or the opt-in below is
+    // toggled. Note what is deliberately absent: a `rerun-if-changed` on git
+    // HEAD/refs by default. Every crate in the workspace depends on `common`,
+    // so watching git metadata meant each commit, fetch, or branch switch
+    // dirtied this build script and rebuilt all 19 crates — a full-workspace
+    // rebuild as the routine price of `git commit`.
     println!("cargo:rerun-if-env-changed=RUSTERNETES_GIT_SHA");
-    // Ask git for the real HEAD/refs locations rather than hardcoding
-    // `../../.git/...`: in a linked worktree `.git` is a *file* pointing
-    // elsewhere, so the hardcoded path misses and the stamped SHA goes stale
-    // on every rebuild until something unrelated forces a recompile.
+    println!("cargo:rerun-if-env-changed=RUSTERNETES_STAMP_GIT");
+
+    // Container builds inject the SHA as a build-arg because `.git` is excluded
+    // from the Docker context (.dockerignore), and every shipped artifact is a
+    // container image, so the real SHA still reaches everything we publish.
+    let injected = std::env::var("RUSTERNETES_GIT_SHA")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string());
+
+    let sha = match injected {
+        Some(sha) => sha,
+        // Opt in with `RUSTERNETES_STAMP_GIT=1` when a local build genuinely
+        // needs to identify its commit; you get the git watch, and the
+        // per-commit rebuild, back along with it.
+        None if stamp_from_git() => {
+            watch_git_refs();
+            git_sha().unwrap_or_else(|| "unknown".to_string())
+        }
+        None => "dev".to_string(),
+    };
+    println!("cargo:rustc-env=RUSTERNETES_BUILD_SHA={sha}");
+
+    println!("cargo:rustc-env=RUSTERNETES_BUILD_TIME={}", build_time());
+}
+
+/// Whether a local build asked to be stamped with its real commit.
+fn stamp_from_git() -> bool {
+    std::env::var_os("RUSTERNETES_STAMP_GIT").is_some_and(|v| !v.is_empty())
+}
+
+/// Declare git's HEAD/refs as build inputs, so the stamped SHA follows the
+/// checkout. Only called on the opt-in path — see `main`.
+///
+/// Ask git for the real HEAD/refs locations rather than hardcoding
+/// `../../.git/...`: in a linked worktree `.git` is a *file* pointing
+/// elsewhere, so the hardcoded path misses and the stamped SHA goes stale on
+/// every rebuild until something unrelated forces a recompile.
+fn watch_git_refs() {
     for rel in ["HEAD", "refs"] {
         if let Some(p) = git_path(rel) {
             if std::path::Path::new(&p).exists() {
@@ -18,16 +58,6 @@ fn main() {
             }
         }
     }
-
-    let sha = std::env::var("RUSTERNETES_GIT_SHA")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().to_string())
-        .or_else(git_sha)
-        .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=RUSTERNETES_BUILD_SHA={sha}");
-
-    println!("cargo:rustc-env=RUSTERNETES_BUILD_TIME={}", build_time());
 }
 
 /// Resolve a path inside the git dir (e.g. `HEAD`, `refs`) in a way that works
