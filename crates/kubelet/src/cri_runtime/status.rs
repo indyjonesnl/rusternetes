@@ -12,27 +12,22 @@ use rusternetes_common::types::ResourceRequirements;
 use rusternetes_cri::v1;
 use std::collections::HashMap;
 
-/// Kernel CFS constants, ported verbatim from upstream
-/// `pkg/kubelet/cm/helpers_linux.go:43-59`.
-mod cfs {
-    pub const MIN_SHARES: i64 = 2;
-    pub const SHARES_PER_CPU: i64 = 1024;
-    pub const MILLI_CPU_TO_CPU: i64 = 1000;
-    /// `MinQuotaPeriod * MilliCPUToCPU / QuotaPeriod`.
-    pub const MIN_MILLI_CPU_LIMIT: i64 = 10;
-}
+/// The CFS constants live next to the forward conversion in [`super::translate`]
+/// (`milli_cpu_to_shares` / `milli_cpu_to_quota`); this module is the inverse
+/// and must not grow a second copy of them.
+use super::translate::{MILLI_CPU_TO_CPU, MIN_MILLI_CPU_LIMIT, MIN_SHARES, SHARES_PER_CPU};
 
 /// Convert `cpu.shares` to milli-CPU. Port of upstream `sharesToMilliCPU`
 /// (pkg/kubelet/cm/helpers_linux.go:383-389).
 fn shares_to_milli_cpu(shares: i64) -> i64 {
-    if shares < cfs::MIN_SHARES {
+    if shares < MIN_SHARES {
         return 0;
     }
     // ceil(shares * 1000 / 1024), integer-only to match Go's math.Ceil on the
     // float division without importing floating point. Both operands are
     // positive here, so the plain round-up form is exact.
-    let numerator = shares * cfs::MILLI_CPU_TO_CPU;
-    (numerator + cfs::SHARES_PER_CPU - 1) / cfs::SHARES_PER_CPU
+    let numerator = shares * MILLI_CPU_TO_CPU;
+    (numerator + SHARES_PER_CPU - 1) / SHARES_PER_CPU
 }
 
 /// Convert `cpu.cfs_quota_us`/`cpu.cfs_period_us` to milli-CPU. Port of
@@ -41,7 +36,7 @@ fn quota_to_milli_cpu(quota: i64, period: i64) -> i64 {
     if quota == -1 || period == 0 {
         return 0;
     }
-    (quota * cfs::MILLI_CPU_TO_CPU) / period
+    (quota * MILLI_CPU_TO_CPU) / period
 }
 
 /// The milli-CPU value of a quantity string, or `None` if it does not parse.
@@ -126,11 +121,11 @@ fn container_status_resources(
             // minimum effective limit, preserve the allocated value in the API
             // to avoid confusion and simplify comparisons." (:2369-2371)
             Some(milli)
-                if milli > cfs::MIN_MILLI_CPU_LIMIT
+                if milli > MIN_MILLI_CPU_LIMIT
                     || limits
                         .get("cpu")
                         .and_then(|c| milli_cpu_of(c))
-                        .is_some_and(|a| a > cfs::MIN_MILLI_CPU_LIMIT) =>
+                        .is_some_and(|a| a > MIN_MILLI_CPU_LIMIT) =>
             {
                 limits.insert(
                     "cpu".to_string(),
@@ -158,11 +153,11 @@ fn container_status_resources(
         match cpu_request {
             // Same MinShares reasoning as the limit above (:2387-2389).
             Some(milli)
-                if milli > cfs::MIN_SHARES
+                if milli > MIN_SHARES
                     || requests
                         .get("cpu")
                         .and_then(|c| milli_cpu_of(c))
-                        .is_some_and(|a| a > cfs::MIN_SHARES) =>
+                        .is_some_and(|a| a > MIN_SHARES) =>
             {
                 requests.insert(
                     "cpu".to_string(),
