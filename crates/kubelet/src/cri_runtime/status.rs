@@ -6,8 +6,189 @@
 //! derived purely from the runtime state; the kubelet overlays probe results on
 //! top.
 
-use rusternetes_common::resources::pod::{ContainerState, ContainerStatus};
+use rusternetes_common::quantity::{Format, Quantity};
+use rusternetes_common::resources::pod::{Container, ContainerState, ContainerStatus};
+use rusternetes_common::types::ResourceRequirements;
 use rusternetes_cri::v1;
+use std::collections::HashMap;
+
+/// The CFS constants live next to the forward conversion in [`super::translate`]
+/// (`milli_cpu_to_shares` / `milli_cpu_to_quota`); this module is the inverse
+/// and must not grow a second copy of them.
+use super::translate::{MILLI_CPU_TO_CPU, MIN_MILLI_CPU_LIMIT, MIN_SHARES, SHARES_PER_CPU};
+
+/// Convert `cpu.shares` to milli-CPU. Port of upstream `sharesToMilliCPU`
+/// (pkg/kubelet/cm/helpers_linux.go:383-389).
+fn shares_to_milli_cpu(shares: i64) -> i64 {
+    if shares < MIN_SHARES {
+        return 0;
+    }
+    // ceil(shares * 1000 / 1024), integer-only to match Go's math.Ceil on the
+    // float division without importing floating point. Both operands are
+    // positive here, so the plain round-up form is exact.
+    let numerator = shares * MILLI_CPU_TO_CPU;
+    (numerator + SHARES_PER_CPU - 1) / SHARES_PER_CPU
+}
+
+/// Convert `cpu.cfs_quota_us`/`cpu.cfs_period_us` to milli-CPU. Port of
+/// upstream `quotaToMilliCPU` (pkg/kubelet/cm/helpers_linux.go:394-399).
+fn quota_to_milli_cpu(quota: i64, period: i64) -> i64 {
+    if quota == -1 || period == 0 {
+        return 0;
+    }
+    (quota * MILLI_CPU_TO_CPU) / period
+}
+
+/// The milli-CPU value of a quantity string, or `None` if it does not parse.
+fn milli_cpu_of(raw: &str) -> Option<i64> {
+    Quantity::parse(raw).ok().map(|q| q.milli_value() as i64)
+}
+
+/// Resources the runtime actually applied, as reported over CRI. Port of the
+/// linux half of upstream `toKubeContainerResources`
+/// (pkg/kubelet/kuberuntime/kuberuntime_container_linux.go:384-412).
+///
+/// Returns `(cpu_request, cpu_limit, memory_limit)` in milli-CPU / milli-CPU /
+/// bytes, each `None` when the runtime did not report it.
+fn cri_applied_resources(cri: &v1::ContainerStatus) -> (Option<i64>, Option<i64>, Option<i64>) {
+    let Some(linux) = cri.resources.as_ref().and_then(|r| r.linux.as_ref()) else {
+        return (None, None, None);
+    };
+
+    let cpu_limit = if linux.cpu_period > 0 {
+        let milli = quota_to_milli_cpu(linux.cpu_quota, linux.cpu_period);
+        (milli > 0).then_some(milli)
+    } else {
+        None
+    };
+    let cpu_request = if linux.cpu_shares > 0 {
+        let milli = shares_to_milli_cpu(linux.cpu_shares);
+        (milli > 0).then_some(milli)
+    } else {
+        None
+    };
+    let memory_limit = (linux.memory_limit_in_bytes > 0).then_some(linux.memory_limit_in_bytes);
+
+    (cpu_request, cpu_limit, memory_limit)
+}
+
+/// `status.resources` for one container. Port of upstream's
+/// `convertContainerStatusResources` closure
+/// (pkg/kubelet/kubelet_pods.go:2338-2404).
+///
+/// The reported value starts from the *allocated* spec resources and is
+/// overridden, per resource, by what the runtime actually applied — so during
+/// an in-place resize the status reflects the cgroup reality, not the desired
+/// state. Non-resizable resources keep their allocated value because the CRI
+/// status has nothing to say about them.
+///
+/// Divergence from upstream, deliberate: upstream's `preserveOldResourcesValue`
+/// carries the *previously reported* value forward when the runtime omits a
+/// resource for a still-running container with an unchanged container ID. We
+/// fall back to the allocated value instead — `old` is accepted and used for
+/// the same running/same-ID guard, but only for resources the previous status
+/// actually carried. See the callers in `runtime.rs`.
+fn container_status_resources(
+    allocated: &Container,
+    cri: &v1::ContainerStatus,
+    old: Option<&ContainerStatus>,
+) -> Option<ResourceRequirements> {
+    let allocated_resources = allocated.resources.as_ref()?;
+
+    // "If the container isn't running, just use the allocated resources."
+    // (kubelet_pods.go:2357-2359)
+    let running = cri.state == v1::ContainerState::ContainerRunning as i32;
+    if !running {
+        return Some(allocated_resources.clone());
+    }
+
+    let (cpu_request, cpu_limit, memory_limit) = cri_applied_resources(cri);
+
+    // Upstream only preserves an old value for a running container whose
+    // container ID has not changed (kubelet_pods.go:2345-2355).
+    let old_resources = old
+        .filter(|o| {
+            matches!(o.state, Some(ContainerState::Running { .. }))
+                && o.container_id.as_deref() == Some(cri.id.as_str())
+        })
+        .and_then(|o| o.resources.as_ref());
+
+    let mut resources = allocated_resources.clone();
+
+    if let Some(limits) = resources.limits.as_mut() {
+        match cpu_limit {
+            // "If both the allocated & actual resources are at or below the
+            // minimum effective limit, preserve the allocated value in the API
+            // to avoid confusion and simplify comparisons." (:2369-2371)
+            Some(milli)
+                if milli > MIN_MILLI_CPU_LIMIT
+                    || limits
+                        .get("cpu")
+                        .and_then(|c| milli_cpu_of(c))
+                        .is_some_and(|a| a > MIN_MILLI_CPU_LIMIT) =>
+            {
+                limits.insert(
+                    "cpu".to_string(),
+                    Quantity::from_milli_value(milli, Format::DecimalSI).canonical_string(),
+                );
+            }
+            _ => preserve_old(limits, "cpu", old_resources.and_then(|r| r.limits.as_ref())),
+        }
+        match memory_limit {
+            Some(bytes) => {
+                limits.insert(
+                    "memory".to_string(),
+                    Quantity::from_value(bytes, Format::BinarySI).canonical_string(),
+                );
+            }
+            None => preserve_old(
+                limits,
+                "memory",
+                old_resources.and_then(|r| r.limits.as_ref()),
+            ),
+        }
+    }
+
+    if let Some(requests) = resources.requests.as_mut() {
+        match cpu_request {
+            // Same MinShares reasoning as the limit above (:2387-2389).
+            Some(milli)
+                if milli > MIN_SHARES
+                    || requests
+                        .get("cpu")
+                        .and_then(|c| milli_cpu_of(c))
+                        .is_some_and(|a| a > MIN_SHARES) =>
+            {
+                requests.insert(
+                    "cpu".to_string(),
+                    Quantity::from_milli_value(milli, Format::DecimalSI).canonical_string(),
+                );
+            }
+            _ => preserve_old(
+                requests,
+                "cpu",
+                old_resources.and_then(|r| r.requests.as_ref()),
+            ),
+        }
+        // Memory requests are not resizable in place and the runtime does not
+        // report them, so the allocated value stands.
+    }
+
+    Some(resources)
+}
+
+/// Carry a previously-reported value forward when the runtime omitted it. Port
+/// of upstream's `preserveOldResourcesValue` (kubelet_pods.go:2345-2355); the
+/// running/same-ID guard is applied by the caller.
+fn preserve_old(
+    target: &mut HashMap<String, String>,
+    name: &str,
+    old: Option<&HashMap<String, String>>,
+) {
+    if let Some(value) = old.and_then(|o| o.get(name)) {
+        target.insert(name.to_string(), value.clone());
+    }
+}
 
 /// Convert a unix-nanoseconds timestamp into an RFC3339 string, or `None` for a
 /// zero/absent timestamp.
@@ -153,7 +334,16 @@ fn map_state(cri: &v1::ContainerStatus) -> ContainerState {
 /// Translate a CRI [`ContainerStatus`](v1::ContainerStatus) into a rusternetes
 /// one. `ready`/`started` reflect the runtime RUNNING state only; the kubelet
 /// applies probe results afterwards.
-pub fn map_container_status(cri: &v1::ContainerStatus) -> ContainerStatus {
+///
+/// `allocated` is the container's spec entry in the pod that owns it, and
+/// `old` its previously-reported status, if any. Both feed
+/// `status.resources`/`status.allocatedResources` the way upstream's
+/// `convertToAPIContainerStatuses` does (pkg/kubelet/kubelet_pods.go:2600-2605).
+pub fn map_container_status(
+    cri: &v1::ContainerStatus,
+    allocated: Option<&Container>,
+    old: Option<&ContainerStatus>,
+) -> ContainerStatus {
     let running = cri.state == v1::ContainerState::ContainerRunning as i32;
     let name = cri
         .metadata
@@ -172,9 +362,13 @@ pub fn map_container_status(cri: &v1::ContainerStatus) -> ContainerStatus {
         image_id: empty_to_none(&cri.image_ref),
         container_id: empty_to_none(&cri.id),
         started: Some(running),
-        allocated_resources: None,
+        // `status.AllocatedResources = allocatedContainer.Resources.Requests`
+        // (kubelet_pods.go:2604).
+        allocated_resources: allocated
+            .and_then(|c| c.resources.as_ref())
+            .and_then(|r| r.requests.clone()),
         allocated_resources_status: None,
-        resources: None,
+        resources: allocated.and_then(|c| container_status_resources(c, cri, old)),
         user: None,
         volume_mounts: None,
         stop_signal: None,
@@ -196,6 +390,132 @@ mod tests {
             exit_code: 0,
             ..Default::default()
         }
+    }
+
+    /// A spec container requesting 100m/100Mi with 200m/200Mi limits.
+    fn allocated_container() -> Container {
+        Container {
+            name: "app".to_string(),
+            resources: Some(ResourceRequirements {
+                requests: Some(HashMap::from([
+                    ("cpu".to_string(), "100m".to_string()),
+                    ("memory".to_string(), "100Mi".to_string()),
+                ])),
+                limits: Some(HashMap::from([
+                    ("cpu".to_string(), "200m".to_string()),
+                    ("memory".to_string(), "200Mi".to_string()),
+                ])),
+                claims: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn get(map: &Option<HashMap<String, String>>, key: &str) -> Option<String> {
+        map.as_ref().and_then(|m| m.get(key)).cloned()
+    }
+
+    /// Regression for the six `[sig-node] Pod InPlace Resize Container
+    /// [Conformance]` specs, which all `[PANICKED]` with a nil-pointer
+    /// dereference at `creating and verifying pod` — before any resize.
+    ///
+    /// The e2e framework dereferences the pointer unconditionally:
+    ///
+    /// ```text
+    /// // test/e2e/common/node/framework/podresize/resize.go:230
+    /// if err := framework.Gomega().Expect(*gotCtrStatus.Resources)...
+    /// ```
+    ///
+    /// so a missing `status.containerStatuses[].resources` is not a mismatch,
+    /// it is a panic. Upstream always populates it for a container that has an
+    /// allocated spec — `convertToAPIContainerStatuses`
+    /// (pkg/kubelet/kubelet_pods.go:2600-2605).
+    #[test]
+    fn running_status_reports_allocated_and_actual_resources() {
+        let allocated = allocated_container();
+        let mut cri = cri_status(v1::ContainerState::ContainerRunning);
+        cri.resources = Some(v1::ContainerResources {
+            linux: Some(v1::LinuxContainerResources {
+                // quotaToMilliCPU(20000, 100000) == 200m
+                cpu_period: 100_000,
+                cpu_quota: 20_000,
+                // sharesToMilliCPU(102) == ceil(102 * 1000 / 1024) == 100m
+                cpu_shares: 102,
+                memory_limit_in_bytes: 209_715_200,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let s = map_container_status(&cri, Some(&allocated), None);
+
+        let res = s
+            .resources
+            .expect("a running container MUST report status.resources");
+        assert_eq!(get(&res.requests, "cpu").as_deref(), Some("100m"));
+        assert_eq!(get(&res.limits, "cpu").as_deref(), Some("200m"));
+        assert_eq!(get(&res.limits, "memory").as_deref(), Some("200Mi"));
+
+        // AllocatedResources mirrors the allocated *requests* verbatim.
+        assert_eq!(
+            get(&s.allocated_resources, "cpu").as_deref(),
+            Some("100m"),
+            "status.allocatedResources must equal the allocated requests"
+        );
+        assert_eq!(
+            get(&s.allocated_resources, "memory").as_deref(),
+            Some("100Mi")
+        );
+    }
+
+    /// "If the container isn't running, just use the allocated resources."
+    /// — pkg/kubelet/kubelet_pods.go:2357-2359.
+    #[test]
+    fn non_running_status_reports_allocated_resources_verbatim() {
+        let allocated = allocated_container();
+        let cri = cri_status(v1::ContainerState::ContainerExited);
+
+        let s = map_container_status(&cri, Some(&allocated), None);
+
+        let res = s
+            .resources
+            .expect("an exited container MUST still report status.resources");
+        assert_eq!(get(&res.requests, "cpu").as_deref(), Some("100m"));
+        assert_eq!(get(&res.limits, "memory").as_deref(), Some("200Mi"));
+    }
+
+    /// The runtime may report no `resources` at all (a CRI implementation is
+    /// not required to fill it in). The allocated values must still surface —
+    /// nil is what panics the framework.
+    #[test]
+    fn running_status_without_cri_resources_falls_back_to_allocated() {
+        let allocated = allocated_container();
+        let cri = cri_status(v1::ContainerState::ContainerRunning);
+
+        let s = map_container_status(&cri, Some(&allocated), None);
+
+        let res = s
+            .resources
+            .expect("missing CRI resources must not yield a nil status.resources");
+        assert_eq!(get(&res.requests, "cpu").as_deref(), Some("100m"));
+        assert_eq!(get(&res.limits, "cpu").as_deref(), Some("200m"));
+    }
+
+    /// A container with no `resources` in its spec has nothing to report:
+    /// upstream leaves `status.Resources` nil, and the resize framework only
+    /// dereferences it for pods it created with resources set.
+    #[test]
+    fn container_without_spec_resources_reports_none() {
+        let allocated = Container {
+            name: "app".to_string(),
+            ..Default::default()
+        };
+        let cri = cri_status(v1::ContainerState::ContainerRunning);
+
+        let s = map_container_status(&cri, Some(&allocated), None);
+
+        assert!(s.resources.is_none());
+        assert!(s.allocated_resources.is_none());
     }
 
     #[test]
@@ -327,7 +647,11 @@ mod tests {
 
     #[test]
     fn running_maps_to_ready_running() {
-        let s = map_container_status(&cri_status(v1::ContainerState::ContainerRunning));
+        let s = map_container_status(
+            &cri_status(v1::ContainerState::ContainerRunning),
+            None,
+            None,
+        );
         assert_eq!(s.name, "app");
         assert!(s.ready);
         assert_eq!(s.restart_count, 2);
@@ -337,7 +661,11 @@ mod tests {
 
     #[test]
     fn created_maps_to_waiting_creating() {
-        let s = map_container_status(&cri_status(v1::ContainerState::ContainerCreated));
+        let s = map_container_status(
+            &cri_status(v1::ContainerState::ContainerCreated),
+            None,
+            None,
+        );
         assert!(!s.ready);
         match s.state {
             Some(ContainerState::Waiting { reason, .. }) => {
@@ -352,7 +680,7 @@ mod tests {
         let mut cri = cri_status(v1::ContainerState::ContainerExited);
         cri.exit_code = 137;
         cri.finished_at = 1_700_000_000_000_000_000;
-        let s = map_container_status(&cri);
+        let s = map_container_status(&cri, None, None);
         assert!(!s.ready);
         match s.state {
             Some(ContainerState::Terminated {
@@ -395,7 +723,7 @@ mod tests {
             name: "app".to_string(),
             attempt: 0,
         });
-        let s0 = map_container_status(&cri);
+        let s0 = map_container_status(&cri, None, None);
         assert_eq!(s0.restart_count, 0, "first run: restartCount must be 0");
 
         // After one restart: attempt=1 → restartCount 1 (never regresses to 0).
@@ -403,7 +731,7 @@ mod tests {
             name: "app".to_string(),
             attempt: 1,
         });
-        let s1 = map_container_status(&cri);
+        let s1 = map_container_status(&cri, None, None);
         assert_eq!(
             s1.restart_count, 1,
             "after first restart: restartCount must be 1"
@@ -420,7 +748,7 @@ mod tests {
             name: "app".to_string(),
             attempt: 2,
         });
-        let s2 = map_container_status(&cri);
+        let s2 = map_container_status(&cri, None, None);
         assert_eq!(
             s2.restart_count, 2,
             "after second restart: restartCount must be 2"

@@ -820,13 +820,18 @@ fn parse_memory_bytes(q: &str) -> Option<i64> {
 
 /// Build CRI linux resources from a container's limits/requests. CPU limit →
 /// cfs quota (100ms period); CPU request → shares; memory limit → byte cap.
-// CFS scheduling constants (upstream `pkg/kubelet/cm/helpers_linux.go`).
-const MIN_SHARES: i64 = 2;
+// CFS scheduling constants (upstream `pkg/kubelet/cm/helpers_linux.go:41-59`).
+// `super::status` reads these back the other way — milliCPU out of the shares /
+// quota the runtime reports — so both directions must agree on one definition.
+pub(super) const MIN_SHARES: i64 = 2;
 const MAX_SHARES: i64 = 262_144;
-const SHARES_PER_CPU: i64 = 1024;
-const MILLI_CPU_TO_CPU: i64 = 1000;
+pub(super) const SHARES_PER_CPU: i64 = 1024;
+pub(super) const MILLI_CPU_TO_CPU: i64 = 1000;
 const QUOTA_PERIOD: i64 = 100_000;
 const MIN_QUOTA_PERIOD: i64 = 1000;
+/// From the inverse of the conversion in `MilliCPUToQuota`:
+/// `MinQuotaPeriod * MilliCPUToCPU / QuotaPeriod`.
+pub(super) const MIN_MILLI_CPU_LIMIT: i64 = MIN_QUOTA_PERIOD * MILLI_CPU_TO_CPU / QUOTA_PERIOD;
 
 /// Port of upstream `cm.MilliCPUToShares`: convert milliCPU to CFS shares,
 /// clamped to `[MinShares, MaxShares]`. 0 milliCPU → `MinShares` (the kernel
