@@ -327,9 +327,12 @@ fn terminal_phase_requires_termination(pod: &Pod) -> bool {
 }
 
 /// The node's advertised capacity/allocatable. Single source of truth so the
-/// NodeStatus the kubelet posts and the values the runtime uses to default
-/// resourceFieldRef LIMITS (downward-API `limits.cpu`/`memory` env) never drift.
-fn node_allocatable_map() -> HashMap<String, String> {
+/// NodeStatus the kubelet posts and the values used to default resourceFieldRef
+/// LIMITS never drift — both the env-var path (via
+/// `CriContainerRuntime::with_node_allocatable`) and the downwardAPI/projected
+/// *volume* path (via [`crate::volumes::VolumeManager::node_allocatable`]) read
+/// this one map.
+pub(crate) fn node_allocatable_map() -> HashMap<String, String> {
     HashMap::from([
         ("cpu".to_string(), "4".to_string()),
         ("memory".to_string(), "8Gi".to_string()),
