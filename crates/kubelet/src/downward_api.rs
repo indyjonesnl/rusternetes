@@ -212,6 +212,10 @@ fn find_container_in_pod<'a>(
 
 /// Default a missing request from the matching limit.
 ///
+/// Shared with [`crate::eviction::get_qos_class`], which needs the same
+/// defaulting for the same reason: upstream's `ComputePodQOS` also assumes it
+/// already happened.
+///
 /// Upstream does this in the **api-server**, not the kubelet:
 /// `SetDefaults_Pod` (`pkg/apis/core/v1/defaults.go:164-180`) copies every
 /// `limits` entry into `requests` when the request is absent, so by the time a
@@ -220,7 +224,9 @@ fn find_container_in_pod<'a>(
 /// has no resource pass), so a limits-only pod would otherwise report
 /// `requests.memory` as `0` here while upstream reports the limit. Applied to
 /// the local copy only; tracked for a proper api-server-side port.
-fn default_requests_from_limits(container: &mut rusternetes_common::resources::Container) {
+pub(crate) fn default_requests_from_limits(
+    container: &mut rusternetes_common::resources::Container,
+) {
     let Some(resources) = container.resources.as_mut() else {
         return;
     };

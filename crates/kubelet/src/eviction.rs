@@ -92,6 +92,18 @@ pub enum QoSClass {
     BestEffort = 1,
 }
 
+impl QoSClass {
+    /// The `status.qosClass` string. Matches the upstream `v1.PodQOSClass`
+    /// constants (`pkg/apis/core/types.go:4331-4335`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Guaranteed => "Guaranteed",
+            Self::Burstable => "Burstable",
+            Self::BestEffort => "BestEffort",
+        }
+    }
+}
+
 /// Resource statistics for a node
 #[derive(Debug, Clone)]
 pub struct NodeStats {
@@ -782,90 +794,128 @@ pub fn build_thresholds(
 
 /// Determine QoS class for a pod.
 ///
-/// Mirrors upstream Kubernetes' `ComputePodQOS`
-/// (`pkg/apis/core/v1/helper/qos/qos.go`):
+/// The pod's QoS class. Port of upstream `ComputePodQOS`
+/// (`pkg/apis/core/v1/helper/qos/qos.go:92-172`), the single definition the
+/// whole kubelet uses — the pod status the kubelet posts
+/// (`crate::kubelet::Kubelet::compute_qos_class`, mirroring
+/// `pkg/kubelet/kubelet_pods.go:2097`) and eviction ordering both call it, so
+/// the class a pod is evicted by is the class its status reports.
 ///
-/// - **BestEffort** – no container (init or regular) requests or limits any
-///   CPU/memory.
-/// - **Guaranteed** – every container has explicit CPU **and** memory limits
-///   and the effective requests equal those limits for every resource. A
-///   container that sets limits but no requests is treated as if its requests
-///   equal its limits (upstream defaults a missing request to the limit).
-/// - **Burstable** – has some requests/limits but does not qualify as
-///   Guaranteed.
+/// Upstream, verbatim in structure:
 ///
-/// Both `spec.containers` and `spec.init_containers` participate in the
-/// classification. Ephemeral containers are excluded (they cannot declare
-/// resources).
+/// - only **cpu and memory** count (`supportedQoSComputeResources`, qos.go:29),
+///   and only quantities **strictly greater than zero** (`quantity.Cmp(
+///   zeroQuantity) == 1`, qos.go:57 / 122). An `nvidia.com/gpu` request or a
+///   `cpu: "0"` contributes nothing;
+/// - `spec.containers` **and** `spec.initContainers` participate (qos.go:113-116).
+///   Ephemeral containers do not — they cannot declare resources;
+/// - requests and limits are **summed across containers** and compared by
+///   numeric value (`lim.Cmp(req) != 0`, qos.go:161), not as strings — `"1"` and
+///   `"1000m"` are the same CPU;
+/// - a container whose limits do not cover *both* cpu and memory forfeits
+///   Guaranteed for the whole pod (qos.go:149-152);
+/// - empty requests **and** empty limits is BestEffort (qos.go:156-158);
+/// - Guaranteed additionally requires `len(requests) == len(limits)` (qos.go:168).
+///
+/// The two copies this replaces both string-compared quantities, and the
+/// status-side one skipped init containers entirely — reporting `Guaranteed`
+/// for a pod whose init container declared no limits, where upstream says
+/// `Burstable`.
+///
+/// Note the deliberate absence of a requests-default-to-limits step: upstream
+/// relies on `SetDefaults_Pod` having already done it at admission
+/// (`pkg/apis/core/v1/defaults.go:164-180`), and `ComputePodQOS` itself does
+/// not. A limits-only container therefore lands on Burstable here — the
+/// `len(requests) == len(limits)` check fails — exactly as it would upstream
+/// against an undefaulted pod.
 pub fn get_qos_class(pod: &Pod) -> QoSClass {
-    let spec = match &pod.spec {
-        Some(s) => s,
-        None => return QoSClass::BestEffort,
+    let Some(spec) = pod.spec.as_ref() else {
+        return QoSClass::BestEffort;
     };
 
-    let mut has_limits = false;
-    let mut has_requests = false;
-    let mut all_guaranteed = true;
+    // Summed per resource: cpu in milli-units, memory in bytes.
+    let mut requests: HashMap<&'static str, i128> = HashMap::new();
+    let mut limits: HashMap<&'static str, i128> = HashMap::new();
+    let mut is_guaranteed = true;
 
-    // Upstream folds init containers into the same set as regular containers.
-    let all_containers = spec
+    for container in spec
         .containers
         .iter()
-        .chain(spec.init_containers.iter().flatten());
+        .chain(spec.init_containers.iter().flatten())
+    {
+        // Upstream classifies an already-defaulted pod: `SetDefaults_Pod`
+        // (`pkg/apis/core/v1/defaults.go:164-180`) has copied limits into unset
+        // requests long before the kubelet sees it, which is why a limits-only
+        // container is Guaranteed upstream even though `ComputePodQOS` itself
+        // never looks at limits when filling `requests`. The rusternetes
+        // api-server has no such pass yet, so apply it to a local copy — the
+        // same compensation, and the same helper, the downward-API resolver uses.
+        let mut container = container.clone();
+        crate::downward_api::default_requests_from_limits(&mut container);
+        let resources = container.resources.as_ref();
 
-    for container in all_containers {
-        let resources = match &container.resources {
-            Some(r) => r,
-            None => {
-                // No resources at all: cannot be Guaranteed.
-                all_guaranteed = false;
-                continue;
-            }
-        };
-
-        // A container is Guaranteed only when it declares both CPU and memory
-        // limits.
-        match &resources.limits {
-            Some(limits) => {
-                has_limits = true;
-                if !limits.contains_key("cpu") || !limits.contains_key("memory") {
-                    all_guaranteed = false;
-                }
-            }
-            None => all_guaranteed = false,
+        if let Some(map) = resources.and_then(|r| r.requests.as_ref()) {
+            process_resource_list(map, &mut requests);
         }
 
-        // Effective requests default to the limits when requests are absent
-        // (upstream defaults a missing request to the matching limit before
-        // classifying, so a limits-only container is Guaranteed).
-        match (&resources.requests, &resources.limits) {
-            (Some(requests), Some(limits)) => {
-                has_requests = true;
-                if requests != limits {
-                    all_guaranteed = false;
-                }
+        let mut qos_limits_found = 0u8;
+        if let Some(map) = resources.and_then(|r| r.limits.as_ref()) {
+            for name in process_resource_list(map, &mut limits) {
+                qos_limits_found |= if name == "cpu" { 1 } else { 2 };
             }
-            (Some(_requests), None) => {
-                has_requests = true;
-                // Requests without limits can never be Guaranteed.
-                all_guaranteed = false;
-            }
-            (None, Some(_limits)) => {
-                // Limits-only: treat requests as equal to limits. This still
-                // counts as having requests for the Guaranteed check.
-                has_requests = true;
-            }
-            (None, None) => all_guaranteed = false,
+        }
+        // `!qosLimitsFound.HasAll(memory, cpu)` — both bits, or not Guaranteed.
+        if qos_limits_found != 3 {
+            is_guaranteed = false;
         }
     }
 
-    if all_guaranteed && has_limits && has_requests {
+    if requests.is_empty() && limits.is_empty() {
+        return QoSClass::BestEffort;
+    }
+
+    if is_guaranteed {
+        for (name, req) in &requests {
+            if limits.get(name) != Some(req) {
+                is_guaranteed = false;
+                break;
+            }
+        }
+    }
+
+    if is_guaranteed && requests.len() == limits.len() {
         QoSClass::Guaranteed
-    } else if has_limits || has_requests {
-        QoSClass::Burstable
     } else {
-        QoSClass::BestEffort
+        QoSClass::Burstable
     }
+}
+
+/// Add a container's cpu/memory quantities into the running per-resource totals,
+/// returning which of them it contributed. Port of upstream `processResourceList`
+/// (`pkg/apis/core/v1/helper/qos/qos.go:50-66`) fused with `getQOSResources`
+/// (qos.go:70-82): unsupported resources and non-positive quantities are skipped
+/// by both.
+fn process_resource_list(
+    list: &HashMap<String, String>,
+    totals: &mut HashMap<&'static str, i128>,
+) -> Vec<&'static str> {
+    let mut found = Vec::new();
+    for name in ["cpu", "memory"] {
+        let Some(raw) = list.get(name) else { continue };
+        let Ok(quantity) = Quantity::parse(raw.trim()) else {
+            continue;
+        };
+        let value = if name == "cpu" {
+            quantity.milli_value()
+        } else {
+            quantity.value()
+        };
+        if value > 0 {
+            *totals.entry(name).or_insert(0) += value;
+            found.push(name);
+        }
+    }
+    found
 }
 
 /// Get filesystem stats for the path that hosts the kubelet's root dir.
