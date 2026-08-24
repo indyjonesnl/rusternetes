@@ -3849,60 +3849,21 @@ impl Kubelet {
                     let mut all_resized = true;
                     if let Some(spec) = &fresh_pod.spec {
                         for container in &spec.containers {
-                            if let Some(resources) = &container.resources {
+                            if container.resources.is_some() {
                                 let container_name = format!("{}_{}", pod_name, container.name);
-                                let mut cpu_period = None;
-                                let mut cpu_quota = None;
-                                let mut memory = None;
-                                let mut needs_update = false;
-
-                                // Set CPU shares from requests (maps to cgroup cpu.weight)
-                                let mut cpu_shares: Option<i64> = None;
-                                if let Some(requests) = &resources.requests {
-                                    if let Some(cpu) = requests.get("cpu") {
-                                        let millicores = crate::runtime::parse_cpu_quantity(cpu);
-                                        if millicores > 0 {
-                                            // K8s formula: shares = max(2, (millicores * 1024) / 1000)
-                                            cpu_shares = Some(((millicores * 1024) / 1000).max(2));
-                                            needs_update = true;
-                                        }
-                                    }
-                                }
-
-                                if let Some(limits) = &resources.limits {
-                                    if let Some(cpu) = limits.get("cpu") {
-                                        let millicores = crate::runtime::parse_cpu_quantity(cpu);
-                                        if millicores > 0 {
-                                            let period = 100000i64; // 100ms
-                                            let quota = (millicores * period) / 1000;
-                                            cpu_period = Some(period);
-                                            cpu_quota = Some(quota);
-                                            needs_update = true;
-                                            // Also set shares from limits if no requests
-                                            if cpu_shares.is_none() {
-                                                cpu_shares =
-                                                    Some(((millicores * 1024) / 1000).max(2));
-                                            }
-                                        }
-                                    }
-                                    if let Some(mem) = limits.get("memory") {
-                                        let bytes = crate::runtime::parse_memory_quantity(mem);
-                                        if bytes > 0 {
-                                            memory = Some(bytes);
-                                            needs_update = true;
-                                        }
-                                    }
-                                }
-
-                                if needs_update {
+                                {
+                                    // The cgroup values are derived by
+                                    // `translate::linux_resources`, the same
+                                    // helper the create path uses. A hand-rolled
+                                    // copy here skipped upstream's
+                                    // `MinQuotaPeriod` floor and crun rejected
+                                    // sub-10m CPU limits with
+                                    // "write to `cpu.max`: Invalid argument".
                                     match self
                                         .runtime
                                         .update_container_resources(
-                                            &container_name,
-                                            cpu_period,
-                                            cpu_quota,
-                                            cpu_shares,
-                                            memory,
+                                            &fresh_pod.metadata.uid,
+                                            container,
                                         )
                                         .await
                                     {
@@ -3913,7 +3874,12 @@ impl Kubelet {
                                             );
                                         }
                                         Err(e) => {
-                                            debug!(
+                                            // A resize that never reached the
+                                            // runtime must be loud: the pod
+                                            // stays wedged in InProgress and
+                                            // status keeps reporting the old
+                                            // cgroup values.
+                                            warn!(
                                                 "Failed to update container {} resources: {}",
                                                 container_name, e
                                             );

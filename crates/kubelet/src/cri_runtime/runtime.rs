@@ -107,6 +107,9 @@ pub enum CriRuntimeError {
         #[source]
         source: anyhow::Error,
     },
+
+    #[error("no running container {container} for pod uid {pod_uid} to resize")]
+    ResizeTargetNotFound { pod_uid: String, container: String },
 }
 
 type Result<T> = std::result::Result<T, CriRuntimeError>;
@@ -161,6 +164,27 @@ fn old_container_status<'a>(pod: &'a Pod, name: &str) -> Option<&'a ContainerSta
 
 fn is_restartable_init_container(container: &Container) -> bool {
     container.restart_policy.as_deref() == Some("Always")
+}
+
+/// CRI filter selecting the one container to resize.
+///
+/// Two labels, both required. `CONTAINER_NAME` carries the BARE container name
+/// — that is what `translate.rs:1208` stamps on the container at create time,
+/// so a `<pod>_<container>` composite matches nothing. `POD_UID` scopes it to
+/// the owning pod: the bare name alone matches every container called `c1` on
+/// the node, and the conformance suite runs identically-named containers in
+/// concurrent namespaces (`statuses_for` filters the same way).
+fn resize_container_filter(pod_uid: &str, container_name: &str) -> v1::ContainerFilter {
+    v1::ContainerFilter {
+        label_selector: std::collections::HashMap::from([
+            (
+                translate::labels::CONTAINER_NAME.to_string(),
+                container_name.to_string(),
+            ),
+            (translate::labels::POD_UID.to_string(), pod_uid.to_string()),
+        ]),
+        ..Default::default()
+    }
 }
 
 /// True if the prior status shows a container that actually ran at least once
@@ -2199,33 +2223,32 @@ impl CriContainerRuntime {
 
     /// Update a container's cgroup limits in place (in-place pod resize). Matches
     /// the container by name; no-op if it is not found.
+    /// Apply `container`'s spec resources to the running container's cgroups.
+    ///
+    /// The cgroup values come from [`translate::linux_resources`] — the same
+    /// helper the create path uses — so a resize can never disagree with a
+    /// create about how a milliCPU value maps to shares/quota.
     pub async fn update_container_resources(
         &self,
-        container_name: &str,
-        cpu_period: Option<i64>,
-        cpu_quota: Option<i64>,
-        cpu_shares: Option<i64>,
-        memory: Option<i64>,
+        pod_uid: &str,
+        container: &Container,
     ) -> Result<()> {
-        let filter = v1::ContainerFilter {
-            label_selector: std::collections::HashMap::from([(
-                translate::labels::CONTAINER_NAME.to_string(),
-                container_name.to_string(),
-            )]),
-            ..Default::default()
-        };
-        let mut cri = self.cri.clone();
-        let Some(container) = cri.list_containers(Some(filter)).await?.into_iter().next() else {
+        let Some(resources) = translate::linux_resources(container) else {
             return Ok(());
         };
-        let resources = v1::LinuxContainerResources {
-            cpu_period: cpu_period.unwrap_or(0),
-            cpu_quota: cpu_quota.unwrap_or(0),
-            cpu_shares: cpu_shares.unwrap_or(0),
-            memory_limit_in_bytes: memory.unwrap_or(0),
-            ..Default::default()
+        let container_name = container.name.as_str();
+        let mut cri = self.cri.clone();
+        let filter = resize_container_filter(pod_uid, container_name);
+        // A miss used to `return Ok(())`, so a resize that resolved to no
+        // container reported success and the caller logged "Updated container
+        // ... (resize)" over a no-op. Surface it instead.
+        let Some(running) = cri.list_containers(Some(filter)).await?.into_iter().next() else {
+            return Err(CriRuntimeError::ResizeTargetNotFound {
+                pod_uid: pod_uid.to_string(),
+                container: container_name.to_string(),
+            });
         };
-        cri.update_container_resources(&container.id, resources)
+        cri.update_container_resources(&running.id, resources)
             .await?;
         Ok(())
     }
@@ -2644,6 +2667,73 @@ mod tests {
     use rusternetes_common::resources::Event;
     use rusternetes_storage::{Storage, StorageBackend};
     use std::collections::HashMap;
+
+    /// Regression for the in-place-resize specs: the resize was silently
+    /// dropped because the caller passed a `<pod>_<container>` composite name
+    /// while the CRI label holds the BARE container name
+    /// (`translate.rs:1208` inserts `container.name`), so the filter matched
+    /// nothing and `update_container_resources` returned `Ok(())` while the
+    /// kubelet logged "Updated container ... (resize)".
+    ///
+    /// The filter must also be pod-scoped: the bare name alone matches every
+    /// pod on the node with a container called `c1`, and the resize specs run
+    /// identically-named containers in concurrent namespaces.
+    /// Regression: the resize path used to re-derive the cgroup values by hand
+    /// (`kubelet.rs`, `let quota = (millicores * period) / 1000`) instead of
+    /// reusing the create path's `translate::linux_resources`. It therefore
+    /// skipped upstream's `MinQuotaPeriod` floor, and a sub-10m CPU limit
+    /// produced `cpu.cfs_quota_us = 500` — below the kernel's 1000µs minimum.
+    /// crun rejected the write:
+    ///
+    /// ```text
+    /// crun did not terminate successfully: write to `cpu.max`: Invalid argument
+    /// ```
+    ///
+    /// leaving the pod wedged in `resize: InProgress` forever. Both paths must
+    /// produce identical values for the same container.
+    #[test]
+    fn resize_values_floor_tiny_cpu_like_the_create_path() {
+        let container = Container {
+            name: "c1".to_string(),
+            resources: Some(rusternetes_common::types::ResourceRequirements {
+                requests: Some(HashMap::from([("cpu".to_string(), "1m".to_string())])),
+                limits: Some(HashMap::from([("cpu".to_string(), "5m".to_string())])),
+                claims: None,
+            }),
+            ..Default::default()
+        };
+
+        let r = translate::linux_resources(&container).expect("resources");
+
+        assert_eq!(
+            r.cpu_quota, 1000,
+            "5m -> 500µs must be floored to the kernel minimum 1000µs, not written raw"
+        );
+        assert_eq!(r.cpu_period, 100_000);
+        assert_eq!(
+            r.cpu_shares, 2,
+            "1m -> 1 share must be raised to MinShares (2)"
+        );
+    }
+
+    #[test]
+    fn resize_filter_is_pod_scoped_and_uses_the_bare_container_name() {
+        let filter = resize_container_filter("uid-123", "c1");
+        let sel = filter.label_selector;
+
+        assert_eq!(
+            sel.get(translate::labels::CONTAINER_NAME)
+                .map(String::as_str),
+            Some("c1"),
+            "must match the label CRI actually carries, not a <pod>_<container> composite"
+        );
+        assert_eq!(
+            sel.get(translate::labels::POD_UID).map(String::as_str),
+            Some("uid-123"),
+            "an unscoped name matches other pods' containers of the same name"
+        );
+        assert_eq!(sel.len(), 2, "both labels, nothing else");
+    }
 
     #[test]
     fn reserved_sandbox_id_parses_containerd_reserved_error() {

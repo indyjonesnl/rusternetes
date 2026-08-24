@@ -859,7 +859,11 @@ fn milli_cpu_to_quota(milli_cpu: i64, period: i64) -> i64 {
 /// (the api-server defaults request→limit, but controller-created pods written
 /// straight to storage may lack it), else `MinShares`. A CPU limit additionally
 /// sets the CFS quota/period; a memory limit sets `memory_limit_in_bytes`.
-fn linux_resources(container: &Container) -> Option<v1::LinuxContainerResources> {
+/// Also used by the in-place-resize path (`super::runtime`), so a resize sends
+/// byte-identical cgroup values to what the container was created with. A
+/// hand-rolled second copy of this math skipped the `MinQuotaPeriod` floor and
+/// had the kernel reject sub-10m CPU limits.
+pub(super) fn linux_resources(container: &Container) -> Option<v1::LinuxContainerResources> {
     let req = container.resources.as_ref();
     let cpu_of = |which: fn(
         &rusternetes_common::types::ResourceRequirements,

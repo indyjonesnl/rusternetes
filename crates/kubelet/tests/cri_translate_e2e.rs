@@ -41,6 +41,29 @@ fn exec_probe(cmd: &str) -> rusternetes_common::resources::pod::Probe {
 
 /// Build a single-container test pod. `name` is distinct per test so the two
 /// (parallel) e2e tests don't collide on the runtime's sandbox-name reservation.
+/// The `sleeper` container with resources set, for the resize call. Values are
+/// deliberately above the cgroup minimums so this exercises the CRI round-trip
+/// rather than the `MinQuotaPeriod` / `MinShares` clamps (those are unit-tested
+/// in `cri_runtime::runtime`).
+fn resized_container() -> Container {
+    Container {
+        name: "sleeper".to_string(),
+        image: IMAGE.to_string(),
+        resources: Some(rusternetes_common::types::ResourceRequirements {
+            requests: Some(std::collections::HashMap::from([(
+                "cpu".to_string(),
+                "50m".to_string(),
+            )])),
+            limits: Some(std::collections::HashMap::from([
+                ("cpu".to_string(), "500m".to_string()),
+                ("memory".to_string(), "128Mi".to_string()),
+            ])),
+            claims: None,
+        }),
+        ..Default::default()
+    }
+}
+
 fn test_pod(name: &str) -> Pod {
     let container = Container {
         name: "sleeper".to_string(),
@@ -265,13 +288,7 @@ async fn cri_container_runtime_lifecycle() {
 
     // In-place resource update is accepted by the runtime.
     runtime
-        .update_container_resources(
-            "sleeper",
-            Some(100_000),
-            Some(50_000),
-            None,
-            Some(128 * 1024 * 1024),
-        )
+        .update_container_resources(&pod.metadata.uid, &resized_container())
         .await
         .expect("update_container_resources");
     eprintln!("CriContainerRuntime metrics + resource update OK");
