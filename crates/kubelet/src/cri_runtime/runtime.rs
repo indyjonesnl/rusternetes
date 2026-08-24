@@ -146,6 +146,19 @@ fn find_container<'a>(pod: &'a Pod, name: &str) -> Option<&'a Container> {
         .find(|c| c.name == name)
 }
 
+/// The status this container reported on the previous sync, across both the
+/// regular and init status lists. Upstream's `oldStatuses` map, built from the
+/// pod's current API status (`kubelet_pods.go:2461-2470`).
+fn old_container_status<'a>(pod: &'a Pod, name: &str) -> Option<&'a ContainerStatus> {
+    let status = pod.status.as_ref()?;
+    status
+        .container_statuses
+        .iter()
+        .flatten()
+        .chain(status.init_container_statuses.iter().flatten())
+        .find(|cs| cs.name == name)
+}
+
 fn is_restartable_init_container(container: &Container) -> bool {
     container.restart_policy.as_deref() == Some("Always")
 }
@@ -1279,10 +1292,17 @@ impl CriContainerRuntime {
             match by_name.get(name) {
                 Some((id, _)) => {
                     let full = cri.container_status(id, false).await?;
+                    // The allocated spec container and the previously-reported
+                    // status feed `status.resources`/`status.allocatedResources`,
+                    // exactly as upstream's `convertToAPIContainerStatuses`
+                    // pairs `GetContainerSpec(pod, cName)` and `oldStatuses`
+                    // with the runtime status (kubelet_pods.go:2600-2605).
+                    let allocated = find_container(pod, name);
+                    let old = old_container_status(pod, name);
                     let mut mapped = full
                         .status
                         .as_ref()
-                        .map(status::map_container_status)
+                        .map(|s| status::map_container_status(s, allocated, old))
                         .unwrap_or_else(|| waiting_status(name));
                     self.apply_termination_message(pod, name, &mut mapped);
                     out.push(mapped);
