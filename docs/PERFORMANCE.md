@@ -111,7 +111,9 @@ Reference hardware: _TBD (record CPU/RAM/OS when filling this in)_.
 | Metric | rusternetes | k3s | Notes |
 |---|---|---|---|
 | Binary size (release, glibc) | **75.1 MiB** | — | dynamically linked; the release profile already strips symbols, so raw == stripped |
-| Binary size (musl, static) | **82.4 MiB** | ~70 MB | static-pie, stripped, self-contained (no glibc) |
+| Binary size (musl, static, x86_64) | **82.4 MiB** | ~70 MB | static-pie, stripped, self-contained (no glibc) |
+| Scratch image size (musl, x86_64) | **82 MiB** | — | uncompressed; binary + CA bundle, nothing else (`all-in-one-musl.Dockerfile`) |
+| Scratch image size (musl, aarch64) | **65 MiB** | — | same image, native arm64 build — comfortably under #1041's sub-100MB target |
 | Time-to-cluster | TBD | TBD | `up` → first node Ready |
 | Idle RSS (avg) | TBD | ~535–750 MB | all-in-one container |
 | Idle RSS (max) | TBD | — | |
