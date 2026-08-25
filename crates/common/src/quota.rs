@@ -211,6 +211,28 @@ pub fn is_zero(list: &ResourceList) -> bool {
     list.values().all(|q| q.is_zero())
 }
 
+/// Drop the zero-valued names. Port of upstream `RemoveZeros`
+/// (`resources.go:230-238`).
+///
+/// Admission uses this to short-circuit: a delta with nothing left in it cannot
+/// exceed anything, so an UPDATE that changes no charged dimension is admitted
+/// without touching the quota (`plugin/resourcequota/controller.go:555-565`).
+pub fn remove_zeros(list: &ResourceList) -> ResourceList {
+    list.iter()
+        .filter(|(_, q)| !q.is_zero())
+        .map(|(name, q)| (name.clone(), *q))
+        .collect()
+}
+
+/// The names whose value is negative. Port of upstream `IsNegative`
+/// (`resources.go:241-250`).
+pub fn is_negative(list: &ResourceList) -> Vec<String> {
+    list.iter()
+        .filter(|(_, q)| q.is_negative())
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// `name=value,name=value` in name order, values in canonical form. Port of
 /// upstream `prettyPrint` (`plugin/resourcequota/controller.go:741-754`) — the
 /// exact rendering the `exceeded quota` admission message is built from.

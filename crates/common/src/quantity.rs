@@ -1077,4 +1077,53 @@ mod tests {
         assert!(neg.is_negative());
         assert!(!q("500m").sub(&q("100m")).unwrap().is_negative());
     }
+
+    /// The three grammar defects every hand-rolled parser this module replaced
+    /// shared, pinned here now that the per-crate wrappers that used to guard
+    /// them are gone.
+    #[test]
+    fn rejects_the_hand_rolled_parser_defects() {
+        // `trim_end_matches` strips *repeated* suffixes; `strip_suffix` does not.
+        assert!(Quantity::parse("1GiGi").is_err());
+        assert!(Quantity::parse("100mm").is_err());
+        // Upstream defines `k` (lowercase) and no `K`. The copies had it
+        // backwards: `1K` parsed as 1000 and the legal `1k` errored.
+        assert_eq!(Quantity::parse("1k").unwrap().value(), 1_000);
+        assert!(Quantity::parse("1K").is_err());
+        // A decimal point is legal with every suffix — `0.5Gi` is as valid as
+        // `512Mi`, and an integer-only mantissa parse read it as nothing.
+        assert_eq!(Quantity::parse("0.5Gi").unwrap().value(), 536_870_912);
+        assert_eq!(Quantity::parse("0.5").unwrap().milli_value(), 500);
+    }
+
+    /// Port of upstream `Quantity.Add` (`quantity.go:601-614`), including its
+    /// format rule: the receiver's format wins unless the receiver is zero.
+    #[test]
+    fn add_value_and_format() {
+        let q = |s: &str| Quantity::parse(s).unwrap();
+        assert!(q("1Gi").add(&q("1Gi")).unwrap().value_eq(&q("2Gi")));
+        assert!(q("500m").add(&q("500m")).unwrap().value_eq(&q("1")));
+        // Cross-scale.
+        assert!(q("1").add(&q("500m")).unwrap().value_eq(&q("1500m")));
+        // Cross-format: the receiver's suffix survives.
+        assert_eq!(
+            q("1Gi").add(&q("1G")).unwrap().canonical_string(),
+            "2073741824"
+        );
+        // A zero receiver adopts the addend's format, so an accumulator
+        // seeded at zero still prints in binary units.
+        assert_eq!(q("0").add(&q("512Mi")).unwrap().canonical_string(), "512Mi");
+        // Sub follows the same rule (`quantity.go:620-622`).
+        assert_eq!(q("0").sub(&q("1Gi")).unwrap().canonical_string(), "-1Gi");
+    }
+
+    #[test]
+    fn neg_flips_sign_and_keeps_format() {
+        let q = |s: &str| Quantity::parse(s).unwrap();
+        let n = q("1Gi").neg();
+        assert!(n.is_negative());
+        assert_eq!(n.canonical_string(), "-1Gi");
+        assert_eq!(n.neg().canonical_string(), "1Gi");
+        assert!(q("0").neg().is_zero());
+    }
 }

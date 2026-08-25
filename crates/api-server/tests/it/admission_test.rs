@@ -672,3 +672,251 @@ async fn limitrange_pod_level_aggregates_across_containers() {
         "two containers at 1500m (sum 3) must exceed type:Pod max.cpu=2",
     );
 }
+
+// ===== ResourceQuota accounting on Quantity (#1714) =====
+
+/// `create_minimal_pod` with `requests` set on its single container.
+fn pod_with_requests(name: &str, namespace: &str, requests: &[(&str, &str)]) -> Pod {
+    let mut pod = create_minimal_pod(name, namespace);
+    let map: HashMap<String, String> = requests
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    pod.spec.as_mut().unwrap().containers[0].resources =
+        Some(rusternetes_common::types::ResourceRequirements {
+            requests: Some(map),
+            limits: None,
+            claims: None,
+        });
+    pod
+}
+
+async fn put_quota(storage: &Arc<MemoryStorage>, name: &str, hard: &[(&str, &str)]) {
+    let hard: HashMap<String, String> = hard
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let quota = ResourceQuota::new(
+        name,
+        "test-namespace",
+        ResourceQuotaSpec {
+            hard: Some(hard),
+            scopes: None,
+            scope_selector: None,
+        },
+    );
+    let key = build_key("resourcequotas", Some("test-namespace"), name);
+    storage.create(&key, &quota).await.unwrap();
+}
+
+/// An extended-resource limit carrying a suffix used to go through
+/// `limit_str.parse().unwrap_or(i64::MAX)`, so `hard: requests.example.com/dongle: 1k`
+/// was not enforced at all — the same fail-open shape as the `1Ti` memory quota
+/// fixed in #1722, one layer further in.
+#[tokio::test]
+async fn quota_enforces_extended_resource_limit_with_suffix() {
+    let storage = Arc::new(MemoryStorage::new());
+    put_quota(
+        &storage,
+        "dongles",
+        &[("requests.example.com/dongle", "1k")],
+    )
+    .await;
+
+    // Under the limit.
+    let ok = pod_with_requests("small", "test-namespace", &[("example.com/dongle", "999")]);
+    assert!(
+        check_resource_quota(&storage, "test-namespace", &ok)
+            .await
+            .unwrap(),
+        "999 dongles is under a 1k limit"
+    );
+
+    // Over the limit: 1001 > 1000.
+    let too_big = pod_with_requests("big", "test-namespace", &[("example.com/dongle", "1001")]);
+    assert!(
+        !check_resource_quota(&storage, "test-namespace", &too_big)
+            .await
+            .unwrap(),
+        "1001 dongles must be rejected against a 1k limit"
+    );
+}
+
+/// A fractional quota limit. `0.5Gi` read as 0 through every hand-rolled parser,
+/// and `Value()`-to-bytes made `1.5Gi` and `1610612736` indistinguishable only
+/// by luck; both now compare as quantities.
+#[tokio::test]
+async fn quota_enforces_fractional_memory_limit() {
+    let storage = Arc::new(MemoryStorage::new());
+    put_quota(&storage, "mem", &[("requests.memory", "1.5Gi")]).await;
+
+    let fits = pod_with_requests("fits", "test-namespace", &[("memory", "1Gi")]);
+    assert!(
+        check_resource_quota(&storage, "test-namespace", &fits)
+            .await
+            .unwrap(),
+        "1Gi fits in a 1.5Gi quota"
+    );
+
+    let existing = pod_with_requests("existing", "test-namespace", &[("memory", "1Gi")]);
+    storage
+        .create(
+            &build_key("pods", Some("test-namespace"), "existing"),
+            &existing,
+        )
+        .await
+        .unwrap();
+
+    let second = pod_with_requests("second", "test-namespace", &[("memory", "1Gi")]);
+    assert!(
+        !check_resource_quota(&storage, "test-namespace", &second)
+            .await
+            .unwrap(),
+        "2Gi total must be rejected against a 1.5Gi quota"
+    );
+}
+
+/// A pod's peak footprint includes its init containers (upstream `PodRequests`
+/// takes the max). Summing only `spec.containers` let a 4Gi init container in
+/// under a 2Gi quota.
+#[tokio::test]
+async fn quota_charges_init_container_peak() {
+    let storage = Arc::new(MemoryStorage::new());
+    put_quota(&storage, "mem", &[("requests.memory", "2Gi")]).await;
+
+    let mut pod = pod_with_requests("init-heavy", "test-namespace", &[("memory", "1Gi")]);
+    let mut init = pod.spec.as_ref().unwrap().containers[0].clone();
+    init.name = "init".to_string();
+    let mut init_reqs = HashMap::new();
+    init_reqs.insert("memory".to_string(), "4Gi".to_string());
+    init.resources = Some(rusternetes_common::types::ResourceRequirements {
+        requests: Some(init_reqs),
+        limits: None,
+        claims: None,
+    });
+    pod.spec.as_mut().unwrap().init_containers = Some(vec![init]);
+
+    assert!(
+        !check_resource_quota(&storage, "test-namespace", &pod)
+            .await
+            .unwrap(),
+        "a 4Gi init container must be charged against a 2Gi quota"
+    );
+}
+
+/// `status.used` written by admission must be canonical quantities restricted to
+/// the quota's hard keys — the same shape the quota controller writes. Admission
+/// used to emit raw byte counts (`format!("{}", bytes)`) plus keys the quota did
+/// not constrain, so the two components overwrote each other's spelling.
+#[tokio::test]
+async fn quota_status_used_is_canonical_and_masked() {
+    let storage = Arc::new(MemoryStorage::new());
+    put_quota(
+        &storage,
+        "mem",
+        &[("requests.memory", "4Gi"), ("pods", "10")],
+    )
+    .await;
+
+    let pod = pod_with_requests(
+        "p",
+        "test-namespace",
+        &[("memory", "512Mi"), ("cpu", "250m")],
+    );
+    assert!(check_resource_quota(&storage, "test-namespace", &pod)
+        .await
+        .unwrap());
+
+    let stored: ResourceQuota = storage
+        .get(&build_key("resourcequotas", Some("test-namespace"), "mem"))
+        .await
+        .unwrap();
+    let used = stored.status.unwrap().used.unwrap();
+    let mut keys: Vec<&String> = used.keys().collect();
+    keys.sort();
+    assert_eq!(keys, vec!["pods", "requests.memory"]);
+    assert_eq!(
+        used.get("requests.memory").map(String::as_str),
+        Some("512Mi")
+    );
+    assert_eq!(used.get("pods").map(String::as_str), Some("1"));
+}
+
+/// A quota dimension the pod does not ask for cannot reject it. Upstream masks
+/// the comparison to the names the request actually charges
+/// (`Mask(newUsage, ResourceNames(requestedUsage))`), so a namespace already at
+/// its memory ceiling still admits a pod that requests no memory.
+#[tokio::test]
+async fn quota_ignores_dimensions_the_pod_does_not_request() {
+    let storage = Arc::new(MemoryStorage::new());
+    put_quota(
+        &storage,
+        "mem",
+        &[("requests.memory", "1Gi"), ("pods", "10")],
+    )
+    .await;
+
+    let existing = pod_with_requests("existing", "test-namespace", &[("memory", "1Gi")]);
+    storage
+        .create(
+            &build_key("pods", Some("test-namespace"), "existing"),
+            &existing,
+        )
+        .await
+        .unwrap();
+
+    let no_memory = pod_with_requests("cpu-only", "test-namespace", &[("cpu", "100m")]);
+    assert!(
+        check_resource_quota(&storage, "test-namespace", &no_memory)
+            .await
+            .unwrap(),
+        "a pod requesting no memory must not fail a full memory quota"
+    );
+}
+
+/// An UPDATE that changes no charged dimension has a zero delta and is admitted
+/// even when the namespace is exactly at its limit — the pod's own usage is
+/// already counted. Upstream reaches this via
+/// `RemoveZeros(SubtractWithNonNegativeResult(new, old))`.
+#[tokio::test]
+async fn quota_admits_update_with_zero_delta_at_the_limit() {
+    use rusternetes_api_server::admission::check_resource_quota_with_old;
+
+    let storage = Arc::new(MemoryStorage::new());
+    put_quota(
+        &storage,
+        "mem",
+        &[("requests.memory", "1Gi"), ("pods", "1")],
+    )
+    .await;
+
+    let pod = pod_with_requests("p", "test-namespace", &[("memory", "1Gi")]);
+    storage
+        .create(&build_key("pods", Some("test-namespace"), "p"), &pod)
+        .await
+        .unwrap();
+
+    // Same resources, so nothing new is charged.
+    let mut updated = pod.clone();
+    updated
+        .metadata
+        .labels
+        .get_or_insert_with(HashMap::new)
+        .insert("touched".to_string(), "yes".to_string());
+
+    assert!(
+        check_resource_quota_with_old(&storage, "test-namespace", &updated, Some(&pod))
+            .await
+            .unwrap(),
+        "an update charging nothing must be admitted at the limit"
+    );
+
+    // Raising the request past the ceiling still fails.
+    let bigger = pod_with_requests("p", "test-namespace", &[("memory", "2Gi")]);
+    assert!(
+        !check_resource_quota_with_old(&storage, "test-namespace", &bigger, Some(&pod))
+            .await
+            .unwrap(),
+        "an update that raises usage past the limit must be rejected"
+    );
+}

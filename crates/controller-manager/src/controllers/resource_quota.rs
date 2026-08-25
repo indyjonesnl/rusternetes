@@ -1,20 +1,33 @@
 use anyhow::Result;
-use rusternetes_common::quantity::{parse_resource_value, Format, Quantity};
+use chrono::Utc;
+use rusternetes_common::quantity::{Format, Quantity};
+use rusternetes_common::quota;
 use rusternetes_common::resources::{Pod, ResourceQuota, ResourceQuotaStatus, Service};
-use rusternetes_common::types::Phase;
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
-/// Canonical `resource.Quantity` string for a millicore total.
+/// Compute keys the pod evaluator tracks, each defaulted to zero before the
+/// per-pod sum so `status.used` reports `"0"` rather than omitting the key.
 ///
-/// `Quantity::from_milli_value` + `canonical_string()` is upstream's own round
-/// trip (`NewMilliQuantity`, `quantity.go:797`), so a whole number of cores
-/// serialises as `"2"`, not the `"2000m"` a `format!("{}m", ..)` emits.
-fn millicores_to_cpu_string(millicores: i64) -> String {
-    Quantity::from_milli_value(millicores, Format::DecimalSI).canonical_string()
-}
+/// Upstream seeds the same set from the quota's own hard keys — `Resources` in
+/// `UsageStatsOptions`, defaulted in `generic.CalculateUsageStats` — and then
+/// masks the result back down to them. The mask in `reconcile_quota` does the
+/// trimming here, so this list only has to cover what the evaluator can charge.
+const QUOTA_COMPUTE_KEYS: &[&str] = &[
+    "pods",
+    "count/pods",
+    "cpu",
+    "requests.cpu",
+    "limits.cpu",
+    "memory",
+    "requests.memory",
+    "limits.memory",
+    "ephemeral-storage",
+    "requests.ephemeral-storage",
+    "limits.ephemeral-storage",
+];
 
 /// ResourceQuotaController tracks resource usage per namespace and enforces quota limits.
 /// It:
@@ -289,11 +302,17 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
             .calculate_usage(namespace, scopes, scope_selector, &hard_keys)
             .await?;
 
-        // Ensure every key in hard also appears in used (default to "0")
+        // `status.used` reports exactly the quota's own hard keys: every one of
+        // them (defaulted to "0" when nothing charges it) and nothing else.
+        // Upstream does both — the zero default in `generic.CalculateUsageStats`
+        // and `used = quota.Mask(used, hardResources)` in `syncResourceQuota` —
+        // so a key the evaluator happens to compute but the quota does not
+        // constrain must not leak into the status.
         if let Some(hard) = &quota.spec.hard {
             for key in hard.keys() {
                 used.entry(key.clone()).or_insert_with(|| "0".to_string());
             }
+            used.retain(|key, _| hard.contains_key(key));
         }
 
         // Build the desired status
@@ -522,129 +541,41 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
             .iter()
             .any(|k| k == "resourcequotas" || k == "count/resourcequotas");
 
-        // Count active pods (not Failed/Succeeded), filtered by scopes
+        // Sum the pod evaluator's usage over the scope-matched pods.
         if needs_pods {
+            // Sum each scope-matched pod's quota footprint as a `ResourceList`
+            // of `Quantity`. Upstream `generic.CalculateUsageStats` does exactly
+            // this — filter by scope, then `quota.Add` each pod's `Usage` —
+            // and never reduces to an integer in between
+            // (`staging/src/k8s.io/apiserver/pkg/quota/v1/generic/evaluator.go`).
+            //
+            // `pod_usage` decides both which keys a pod is charged under
+            // (`podComputeUsageHelper`) and whether the compute keys are
+            // charged at all (`QuotaV1Pod`): a terminal pod contributes only
+            // `count/pods`, and a *terminating* pod keeps its charge until its
+            // deletion grace period elapses.
             let pod_prefix = format!("/registry/pods/{}/", namespace);
             let all_pods: Vec<Pod> = self.storage.list(&pod_prefix).await?;
-            let pods: Vec<&Pod> = all_pods
+            let now = Utc::now();
+            let mut totals = quota::ResourceList::new();
+            for pod in all_pods
                 .iter()
-                .filter(|p| {
-                    let phase = p.status.as_ref().and_then(|s| s.phase.as_ref());
-                    if matches!(phase, Some(Phase::Failed) | Some(Phase::Succeeded)) {
-                        return false;
-                    }
-                    Self::pod_matches_scopes(p, scopes, scope_selector)
-                })
-                .collect();
-            let pod_count = pods.len().to_string();
-            usage.insert("pods".to_string(), pod_count.clone());
-            usage.insert("count/pods".to_string(), pod_count);
-
-            // Calculate CPU, memory, and ephemeral-storage requests/limits.
-            // K8s tracks all three standard resource types in quota.
-            // See: pkg/quota/v1/evaluator/core/pods.go — PodUsageFunc
-            let mut total_cpu_requests = 0i64;
-            let mut total_memory_requests = 0i64;
-            let mut total_cpu_limits = 0i64;
-            let mut total_memory_limits = 0i64;
-            let mut total_ephemeral_storage_requests = 0i64;
-            let mut total_ephemeral_storage_limits = 0i64;
-
-            for pod in pods.iter() {
-                if let Some(spec) = &pod.spec {
-                    for container in &spec.containers {
-                        if let Some(resources) = &container.resources {
-                            if let Some(requests) = &resources.requests {
-                                if let Some(cpu) = requests.get("cpu") {
-                                    if let Ok(millis) = self.parse_cpu_to_millicores(cpu) {
-                                        total_cpu_requests += millis;
-                                    }
-                                }
-                                if let Some(memory) = requests.get("memory") {
-                                    if let Ok(bytes) = self.parse_memory_to_bytes(memory) {
-                                        total_memory_requests += bytes;
-                                    }
-                                }
-                                if let Some(es) = requests.get("ephemeral-storage") {
-                                    if let Ok(bytes) = self.parse_memory_to_bytes(es) {
-                                        total_ephemeral_storage_requests += bytes;
-                                    }
-                                }
-                            }
-                            if let Some(limits) = &resources.limits {
-                                if let Some(cpu) = limits.get("cpu") {
-                                    if let Ok(millis) = self.parse_cpu_to_millicores(cpu) {
-                                        total_cpu_limits += millis;
-                                    }
-                                }
-                                if let Some(memory) = limits.get("memory") {
-                                    if let Ok(bytes) = self.parse_memory_to_bytes(memory) {
-                                        total_memory_limits += bytes;
-                                    }
-                                }
-                                if let Some(es) = limits.get("ephemeral-storage") {
-                                    if let Ok(bytes) = self.parse_memory_to_bytes(es) {
-                                        total_ephemeral_storage_limits += bytes;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                .filter(|p| Self::pod_matches_scopes(p, scopes, scope_selector))
+            {
+                totals = quota::add(&totals, &quota::pod_usage(pod, now));
             }
 
-            // Track extended resource requests (non-cpu/memory).
-            // K8s quota controller counts ALL resources specified in the quota spec.
-            let mut extended_requests: std::collections::HashMap<String, i64> =
-                std::collections::HashMap::new();
-            for pod in pods.iter() {
-                if let Some(spec) = &pod.spec {
-                    for container in &spec.containers {
-                        if let Some(resources) = &container.resources {
-                            if let Some(requests) = &resources.requests {
-                                for (res_name, qty) in requests {
-                                    if res_name == "cpu" || res_name == "memory" {
-                                        continue;
-                                    }
-                                    // Parse quantity (extended resources are integers)
-                                    let val = qty.parse::<i64>().unwrap_or(0);
-                                    *extended_requests.entry(res_name.clone()).or_insert(0) += val;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            for (res_name, total) in &extended_requests {
-                usage.insert(format!("requests.{}", res_name), total.to_string());
+            // Default every compute key this evaluator tracks to zero, matching
+            // upstream `CalculateUsageStats`, which seeds `result.Used` with a
+            // zero `Quantity` for each requested resource before summing
+            // (`generic/evaluator.go`). `status.used` must report `"0"` for a
+            // hard key with no usage, not omit it.
+            let zero = Quantity::from_value(0, Format::DecimalSI);
+            for key in QUOTA_COMPUTE_KEYS {
+                totals.entry((*key).to_string()).or_insert(zero);
             }
 
-            // Always insert resource usage values (even when zero, K8s expects "0" in status.used)
-            let cpu_req_str = millicores_to_cpu_string(total_cpu_requests);
-            usage.insert("requests.cpu".to_string(), cpu_req_str.clone());
-            usage.insert("cpu".to_string(), cpu_req_str);
-
-            let mem_req_str = self.bytes_to_memory_string(total_memory_requests);
-            usage.insert("requests.memory".to_string(), mem_req_str.clone());
-            usage.insert("memory".to_string(), mem_req_str);
-
-            usage.insert(
-                "limits.cpu".to_string(),
-                millicores_to_cpu_string(total_cpu_limits),
-            );
-            usage.insert(
-                "limits.memory".to_string(),
-                self.bytes_to_memory_string(total_memory_limits),
-            );
-
-            // Track ephemeral-storage — K8s tracks this alongside cpu/memory
-            let es_req_str = self.bytes_to_memory_string(total_ephemeral_storage_requests);
-            usage.insert("requests.ephemeral-storage".to_string(), es_req_str.clone());
-            usage.insert("ephemeral-storage".to_string(), es_req_str);
-            usage.insert(
-                "limits.ephemeral-storage".to_string(),
-                self.bytes_to_memory_string(total_ephemeral_storage_limits),
-            );
+            usage.extend(quota::to_string_map(&totals));
         }
 
         // Count services and service subtypes
@@ -743,33 +674,6 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
 
         Ok(usage)
     }
-
-    /// Parse CPU string to millicores (e.g., "1" -> 1000, "500m" -> 500)
-    /// Parse a CPU quantity into millicores.
-    ///
-    /// This body was byte-identical (modulo `&self`) to the pair in
-    /// `api-server/src/admission.rs`, and both had the same defects: no
-    /// `Ti`/`Pi`/`Ei`/`T`/`P`/`E`, only an *uppercase* `K` — so the
-    /// non-upstream `"1K"` parsed while the valid `"1k"` did not — and
-    /// `trim_end_matches`, which strips repeated suffixes (`"1GiGi"` → 1Gi).
-    ///
-    /// Both now go through `rusternetes_common::quantity::Quantity`, reading
-    /// the unit upstream accounts each resource in (`Resource.Add`,
-    /// `../kubernetes/pkg/scheduler/framework/types.go:917-918`).
-    fn parse_cpu_to_millicores(&self, cpu: &str) -> Result<i64> {
-        Ok(parse_resource_value(cpu, "cpu")?)
-    }
-
-    /// Parse a byte-denominated quantity (memory, ephemeral-storage) to bytes.
-    /// See [`Self::parse_cpu_to_millicores`].
-    fn parse_memory_to_bytes(&self, memory: &str) -> Result<i64> {
-        Ok(parse_resource_value(memory, "memory")?)
-    }
-
-    /// Convert bytes to human-readable memory string
-    fn bytes_to_memory_string(&self, bytes: i64) -> String {
-        Quantity::from_value(bytes, Format::BinarySI).canonical_string()
-    }
 }
 
 #[cfg(test)]
@@ -780,97 +684,6 @@ mod tests {
     };
     use rusternetes_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
     use rusternetes_storage::memory::MemoryStorage;
-
-    #[test]
-    fn test_parse_cpu_to_millicores() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = ResourceQuotaController::new(storage);
-
-        assert_eq!(controller.parse_cpu_to_millicores("1").unwrap(), 1000);
-        assert_eq!(controller.parse_cpu_to_millicores("500m").unwrap(), 500);
-        assert_eq!(controller.parse_cpu_to_millicores("0.5").unwrap(), 500);
-        assert_eq!(controller.parse_cpu_to_millicores("2").unwrap(), 2000);
-    }
-
-    #[test]
-    fn test_parse_memory_to_bytes() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = ResourceQuotaController::new(storage);
-
-        assert_eq!(controller.parse_memory_to_bytes("1Gi").unwrap(), 1073741824);
-        assert_eq!(
-            controller.parse_memory_to_bytes("512Mi").unwrap(),
-            536870912
-        );
-        assert_eq!(controller.parse_memory_to_bytes("1024Ki").unwrap(), 1048576);
-        assert_eq!(controller.parse_memory_to_bytes("1000").unwrap(), 1000);
-    }
-
-    /// The pair in `api-server/src/admission.rs` was byte-identical to this
-    /// one, and shared every defect. Both now go through `Quantity`, so this
-    /// mirrors the admission-side test — the two must not drift again.
-    #[test]
-    fn test_parse_quantities_covers_full_grammar() {
-        let controller = ResourceQuotaController::new(Arc::new(MemoryStorage::new()));
-        for (value, expected) in [
-            ("1Ti", 1_099_511_627_776i64),
-            ("1Pi", 1_125_899_906_842_624),
-            ("1Ei", 1_152_921_504_606_846_976),
-            ("1T", 1_000_000_000_000),
-            ("1P", 1_000_000_000_000_000),
-            ("1E", 1_000_000_000_000_000_000),
-            ("129e6", 129_000_000),
-            ("0.5", 1),
-        ] {
-            assert_eq!(
-                controller
-                    .parse_memory_to_bytes(value)
-                    .unwrap_or_else(|e| panic!("{value}: {e}")),
-                expected,
-                "memory {value:?}"
-            );
-        }
-        assert_eq!(controller.parse_cpu_to_millicores("0.5m").unwrap(), 1);
-        assert_eq!(controller.parse_cpu_to_millicores("10.5m").unwrap(), 11);
-        assert_eq!(controller.parse_cpu_to_millicores("1500u").unwrap(), 2);
-    }
-
-    /// `k` is kilo; `K` is not in the grammar. The chain matched only
-    /// `ends_with("K")`, so it had these exactly backwards.
-    #[test]
-    fn test_parse_memory_k_case_sensitivity() {
-        let controller = ResourceQuotaController::new(Arc::new(MemoryStorage::new()));
-        assert_eq!(controller.parse_memory_to_bytes("1k").unwrap(), 1_000);
-        assert!(controller.parse_memory_to_bytes("1K").is_err());
-    }
-
-    /// `trim_end_matches` strips *every* trailing occurrence of the suffix, so
-    /// `"1GiGi"` used to read as 1Gi and `"100mm"` as 100 millicores.
-    #[test]
-    fn test_parse_rejects_repeated_suffix() {
-        let controller = ResourceQuotaController::new(Arc::new(MemoryStorage::new()));
-        assert!(controller.parse_memory_to_bytes("1GiGi").is_err());
-        assert!(controller.parse_cpu_to_millicores("100mm").is_err());
-    }
-
-    #[test]
-    fn test_bytes_to_memory_string() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = ResourceQuotaController::new(storage);
-
-        assert_eq!(controller.bytes_to_memory_string(1073741824), "1Gi");
-        assert_eq!(controller.bytes_to_memory_string(536870912), "512Mi");
-        assert_eq!(controller.bytes_to_memory_string(1048576), "1Mi");
-        assert_eq!(controller.bytes_to_memory_string(1024), "1Ki");
-        // Upstream switches BinarySI to DecimalSI formatting below 1024
-        // (`CanonicalizeBytes`, `quantity.go:434-437`), so 1000 bytes is "1k",
-        // not "1000". The old hand-rolled encoder emitted "1000"; that was the
-        // divergence, this assertion is the fix.
-        assert_eq!(controller.bytes_to_memory_string(1000), "1k");
-        // Not a clean power of 1024 and >= 1024, so a bare number.
-        assert_eq!(controller.bytes_to_memory_string(1500), "1500");
-        assert_eq!(controller.bytes_to_memory_string(0), "0");
-    }
 
     fn make_container(name: &str, resources: Option<ResourceRequirements>) -> Container {
         Container {
@@ -1276,5 +1089,233 @@ mod tests {
                 "resourcequotas/ns-1/quota-b".to_string(),
             ]
         );
+    }
+
+    /// `status.used` for an extended resource used to go through
+    /// `qty.parse::<i64>().unwrap_or(0)`, so any quantity carrying a suffix —
+    /// `"2k"`, `"1Ki"` — reported as `0` and the dimension went unaccounted.
+    #[tokio::test]
+    async fn test_calculate_usage_extended_resource_with_suffix() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ResourceQuotaController::new(storage.clone());
+
+        let mut reqs = HashMap::new();
+        reqs.insert("example.com/dongle".to_string(), "2k".to_string());
+        let pod = make_pod(
+            "dongle-pod",
+            "test-ns",
+            Some(ResourceRequirements {
+                requests: Some(reqs),
+                limits: None,
+                claims: None,
+            }),
+        );
+        storage
+            .create("/registry/pods/test-ns/dongle-pod", &pod)
+            .await
+            .unwrap();
+
+        let usage = controller
+            .calculate_usage(
+                "test-ns",
+                &[],
+                None,
+                &["requests.example.com/dongle".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            usage.get("requests.example.com/dongle").map(String::as_str),
+            Some("2k")
+        );
+        // Upstream charges an extended resource only under `requests.<name>`
+        // (`podComputeUsageHelper`, `pods.go:324-328`).
+        assert!(!usage.contains_key("example.com/dongle"));
+    }
+
+    /// A pod's peak footprint includes its init containers: upstream
+    /// `PodRequests` takes `max(sum(containers), max over init containers)`.
+    /// Summing only `spec.containers` charged the 1Gi app container and ignored
+    /// the 4Gi init container entirely.
+    #[tokio::test]
+    async fn test_calculate_usage_charges_init_container_peak() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ResourceQuotaController::new(storage.clone());
+
+        let mut app_reqs = HashMap::new();
+        app_reqs.insert("memory".to_string(), "1Gi".to_string());
+        let mut init_reqs = HashMap::new();
+        init_reqs.insert("memory".to_string(), "4Gi".to_string());
+
+        let mut pod = make_pod(
+            "init-heavy",
+            "test-ns",
+            Some(ResourceRequirements {
+                requests: Some(app_reqs),
+                limits: None,
+                claims: None,
+            }),
+        );
+        pod.spec.as_mut().unwrap().init_containers = Some(vec![make_container(
+            "init",
+            Some(ResourceRequirements {
+                requests: Some(init_reqs),
+                limits: None,
+                claims: None,
+            }),
+        )]);
+        storage
+            .create("/registry/pods/test-ns/init-heavy", &pod)
+            .await
+            .unwrap();
+
+        let usage = controller
+            .calculate_usage("test-ns", &[], None, &["requests.memory".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            usage.get("requests.memory").map(String::as_str),
+            Some("4Gi")
+        );
+    }
+
+    /// A fractional memory request must not round to zero, and the total must
+    /// come back in canonical form rather than raw bytes.
+    #[tokio::test]
+    async fn test_calculate_usage_fractional_memory() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ResourceQuotaController::new(storage.clone());
+
+        for name in ["a", "b"] {
+            let mut reqs = HashMap::new();
+            reqs.insert("memory".to_string(), "0.5Gi".to_string());
+            let pod = make_pod(
+                name,
+                "test-ns",
+                Some(ResourceRequirements {
+                    requests: Some(reqs),
+                    limits: None,
+                    claims: None,
+                }),
+            );
+            storage
+                .create(&format!("/registry/pods/test-ns/{name}"), &pod)
+                .await
+                .unwrap();
+        }
+
+        let usage = controller
+            .calculate_usage("test-ns", &[], None, &["requests.memory".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            usage.get("requests.memory").map(String::as_str),
+            Some("1Gi")
+        );
+    }
+
+    /// Upstream charges a *terminating* pod until its deletion grace period has
+    /// elapsed (`QuotaV1Pod`, `pods.go:499-506`); only a terminal phase drops
+    /// the compute charge outright. `count/pods` is charged either way.
+    #[tokio::test]
+    async fn test_calculate_usage_terminal_and_terminating_pods() {
+        use rusternetes_common::resources::PodStatus;
+        use rusternetes_common::types::Phase;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ResourceQuotaController::new(storage.clone());
+
+        let with_cpu = || {
+            let mut reqs = HashMap::new();
+            reqs.insert("cpu".to_string(), "100m".to_string());
+            Some(ResourceRequirements {
+                requests: Some(reqs),
+                limits: None,
+                claims: None,
+            })
+        };
+
+        let running = make_pod("running", "test-ns", with_cpu());
+        storage
+            .create("/registry/pods/test-ns/running", &running)
+            .await
+            .unwrap();
+
+        let mut succeeded = make_pod("succeeded", "test-ns", with_cpu());
+        succeeded.status = Some(PodStatus {
+            phase: Some(Phase::Succeeded),
+            ..Default::default()
+        });
+        storage
+            .create("/registry/pods/test-ns/succeeded", &succeeded)
+            .await
+            .unwrap();
+
+        let mut terminating = make_pod("terminating", "test-ns", with_cpu());
+        terminating.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        terminating.metadata.deletion_grace_period_seconds = Some(3600);
+        storage
+            .create("/registry/pods/test-ns/terminating", &terminating)
+            .await
+            .unwrap();
+
+        let usage = controller
+            .calculate_usage(
+                "test-ns",
+                &[],
+                None,
+                &[
+                    "pods".to_string(),
+                    "count/pods".to_string(),
+                    "requests.cpu".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // running + terminating (still inside its grace period)
+        assert_eq!(usage.get("pods").map(String::as_str), Some("2"));
+        assert_eq!(usage.get("requests.cpu").map(String::as_str), Some("200m"));
+        // object-count quota tracks everything in storage, terminal included
+        assert_eq!(usage.get("count/pods").map(String::as_str), Some("3"));
+    }
+
+    /// `status.used` carries exactly the quota's hard keys — upstream masks the
+    /// evaluator's output down to them (`syncResourceQuota`). A key the
+    /// evaluator computes but the quota does not constrain must not leak.
+    #[tokio::test]
+    async fn test_reconcile_quota_masks_status_used_to_hard_keys() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ResourceQuotaController::new(storage.clone());
+
+        let mut hard = HashMap::new();
+        hard.insert("requests.cpu".to_string(), "4".to_string());
+        let quota = ResourceQuota {
+            type_meta: TypeMeta {
+                kind: "ResourceQuota".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("masked").with_namespace("test-ns"),
+            spec: ResourceQuotaSpec {
+                hard: Some(hard),
+                scopes: None,
+                scope_selector: None,
+            },
+            status: None,
+        };
+        storage
+            .create("/registry/resourcequotas/test-ns/masked", &quota)
+            .await
+            .unwrap();
+
+        controller.reconcile_quota(&quota).await.unwrap();
+
+        let stored: ResourceQuota = storage
+            .get("/registry/resourcequotas/test-ns/masked")
+            .await
+            .unwrap();
+        let used = stored.status.unwrap().used.unwrap();
+        assert_eq!(used.keys().collect::<Vec<_>>(), vec!["requests.cpu"]);
+        assert_eq!(used.get("requests.cpu").map(String::as_str), Some("0"));
     }
 }
