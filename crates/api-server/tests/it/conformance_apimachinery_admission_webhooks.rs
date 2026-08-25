@@ -180,6 +180,72 @@ async fn start_mutator_label(key: String, value: String) -> (String, oneshot::Se
     (format!("http://{}", addr), tx)
 }
 
+/// Mutating mock that adds `data[<add_key>] = "yes"` **only if**
+/// `data[<require_key>]` is already present on the incoming object.
+///
+/// This is upstream's `newMutateConfigMapWebhookFixture(f, certCtx, stage, …)`
+/// (k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:1258-1260): two of these
+/// are registered, stage 1 keyed off `mutation-start` and stage 2 keyed off
+/// `mutation-stage-1`, so stage 2 can only fire if it observes stage 1's
+/// output. That chaining is the whole point of the "ordered mutation" case —
+/// a webhook that mutated unconditionally would satisfy a subset assertion
+/// while proving nothing about order.
+async fn start_mutator_configmap_stage(
+    require_key: String,
+    add_key: String,
+) -> (String, oneshot::Sender<()>) {
+    let (tx, rx) = oneshot::channel();
+    let route = warp::post()
+        .and(warp::body::json())
+        .map(move |r: AdmissionReview| {
+            let request = match r.request {
+                Some(r) => r,
+                None => {
+                    return warp::reply::json(&wrap(AdmissionReviewResponse::allow("u".into())))
+                }
+            };
+            let has_required = request
+                .object
+                .as_ref()
+                .and_then(|o| o.pointer(&format!("/data/{require_key}")))
+                .is_some();
+            if !has_required {
+                return warp::reply::json(&wrap(AdmissionReviewResponse {
+                    uid: request.uid,
+                    allowed: true,
+                    status: None,
+                    patch: None,
+                    patch_type: None,
+                    audit_annotations: None,
+                    warnings: None,
+                }));
+            }
+            let patch = vec![PatchOperation {
+                op: PatchOp::Add,
+                path: format!("/data/{add_key}"),
+                value: Some(json!("yes")),
+                from: None,
+            }];
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&patch).unwrap());
+            warp::reply::json(&wrap(AdmissionReviewResponse {
+                uid: request.uid,
+                allowed: true,
+                status: None,
+                patch: Some(b64),
+                patch_type: Some("JSONPatch".to_string()),
+                audit_annotations: None,
+                warnings: None,
+            }))
+        });
+    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+        rx.await.ok();
+    });
+    tokio::spawn(srv);
+    (format!("http://{}", addr), tx)
+}
+
 /// Mutating mock that adds an arbitrary JSON pointer path → value. Used by the
 /// structural-schema pruning test: the path lands inside the CR's `spec` so
 /// the api-server's post-mutation pruning pass can strip it when the CRD
@@ -422,7 +488,8 @@ fn admin_user_info() -> UserInfo {
 /// [sig-api-machinery] AdmissionWebhook should include webhook resources in
 /// discovery documents [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:96
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:118
+///   ("should include webhook resources in discovery documents")
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 ///
 /// Verifies the api-server's `/apis/admissionregistration.k8s.io/v1`
@@ -478,27 +545,151 @@ async fn should_include_webhook_resources_in_discovery_documents() {
     }
 }
 
-/// [sig-api-machinery] AdmissionWebhook should be able to deny pod and
-/// configmap creation [Conformance]
+/// [sig-api-machinery] AdmissionWebhook should be able to deny pod and configmap
+/// creation [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:167
-/// Integration-tests the deny path via `AdmissionWebhookManager`: a
-/// ValidatingWebhookConfiguration with rules for `pods` and `configmaps`
-/// (CREATE) must produce `AdmissionResponse::Deny` for matching requests.
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:198
+///   ("should be able to deny pod and configmap creation")
+///   Assertions live in testWebhook (webhook.go:1372-1465); the configuration
+///   under test is built by registerWebhook (webhook.go:1163-1197).
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// `registerWebhook` installs **four** webhooks, and the case is as much about
+/// what is *admitted* as what is denied:
+///
+///   - `newDenyPodWebhookFixture` / `newDenyConfigMapWebhookFixture` deny
+///     non-compliant pods and configmaps. Note the configmap rule is
+///     CREATE + UPDATE + DELETE (webhook.go:2612), not CREATE alone;
+///   - both deny fixtures carry a namespaceSelector of
+///     `matchLabels {uniqueName: "true"}` plus
+///     `matchExpressions [{skip-webhook-admission NotIn [yes]}]`
+///     (webhook.go:2620-2629), so a namespace labelled `skip-webhook-admission=yes`
+///     is exempt;
+///   - `failOpenHook` is deliberately unreachable with `failurePolicy: Ignore`
+///     — upstream's own comment says "Because this webhook is configured
+///     fail-open, request should be admitted after the call fails"
+///     (webhook.go:1169-1185).
+///
+/// `testWebhook` then walks seven scenarios. This mirror covers the six that
+/// are decidable at the admission layer: deny pod, deny configmap on CREATE,
+/// deny configmap on UPDATE, admit a compliant configmap, admit through the
+/// unreachable fail-open webhook, and admit in the exempt namespace.
+///
+/// Before this audit the mirror asserted only that a Deny came back for pods
+/// and configmaps on CREATE. Nothing asserted an Allow, so a webhook that
+/// denied unconditionally would have passed it — which is precisely what the
+/// fail-open and namespace-exemption halves exist to rule out.
+///
+/// Not mirrored, and why: upstream's exact rejection strings ("the pod
+/// contains unwanted container name", "the pod contains unwanted label", "the
+/// configmap contains unwanted key and value") are produced by the e2e
+/// webhook *server*, not by the api-server, so they pin that fixture rather
+/// than any Rusternetes behaviour. The hanging-pod scenario
+/// (webhook.go:1388-1405) asserts a dial timeout and that the pod was not
+/// persisted; the timeout half is covered by `should_honor_timeout`, and the
+/// not-persisted half needs the full HTTP create path rather than the
+/// admission manager.
 #[tokio::test]
 async fn should_be_able_to_deny_pod_and_configmap_creation() {
     let mem = Arc::new(MemoryStorage::new());
     let manager = AdmissionWebhookManager::new(mem.clone());
     let (url, _shutdown) = start_deny_validator("denied by webhook".to_string()).await;
 
+    // Upstream's skip-namespace labels (webhook.go:65-66).
+    const SKIP_LABEL_KEY: &str = "skip-webhook-admission";
+    const SKIP_LABEL_VALUE: &str = "yes";
+    const UNIQUE: &str = "e2e-webhook-unique";
+
+    // The two namespaces the case distinguishes: the test namespace, and the
+    // exempted one (upstream `skipNamespaceBaseName`, webhook.go:67).
+    for (ns_name, skip) in [("default", false), ("exempted-namespace", true)] {
+        let mut labels = serde_json::Map::new();
+        labels.insert(UNIQUE.to_string(), json!("true"));
+        if skip {
+            labels.insert(SKIP_LABEL_KEY.to_string(), json!(SKIP_LABEL_VALUE));
+        }
+        mem.create(
+            &build_key("namespaces", None, ns_name),
+            &json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": ns_name, "labels": Value::Object(labels)}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    // The namespaceSelector both deny fixtures carry.
+    let deny_selector = rusternetes_common::resources::LabelSelector {
+        match_labels: Some(std::collections::HashMap::from([(
+            UNIQUE.to_string(),
+            "true".to_string(),
+        )])),
+        match_expressions: Some(vec![
+            rusternetes_common::resources::LabelSelectorRequirement {
+                key: SKIP_LABEL_KEY.to_string(),
+                operator: rusternetes_common::resources::LabelSelectorOperator::NotIn,
+                values: Some(vec![SKIP_LABEL_VALUE.to_string()]),
+            },
+        ]),
+    };
+
+    // configmaps are matched on CREATE, UPDATE and DELETE upstream.
+    let configmap_rule = RuleWithOperations {
+        operations: vec![
+            OperationType::Create,
+            OperationType::Update,
+            OperationType::Delete,
+        ],
+        rule: Rule {
+            api_groups: vec!["".to_string()],
+            api_versions: vec!["v1".to_string()],
+            resources: vec!["configmaps".to_string()],
+            scope: None,
+        },
+    };
+
     let cfg = ValidatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".to_string(),
         kind: "ValidatingWebhookConfiguration".to_string(),
         metadata: rusternetes_common::types::ObjectMeta::new("deny-pod-cm"),
-        webhooks: Some(vec![ValidatingWebhook {
-            rules: vec![rule_for("", "v1", "pods"), rule_for("", "v1", "configmaps")],
-            ..validating("deny.k8s.io", url, vec![], Some(FailurePolicy::Fail), None)
-        }]),
+        webhooks: Some(vec![
+            ValidatingWebhook {
+                rules: vec![rule_for("", "v1", "pods")],
+                namespace_selector: Some(deny_selector.clone()),
+                ..validating(
+                    "deny-unwanted-pod-container-name-and-label.k8s.io",
+                    url.clone(),
+                    vec![],
+                    Some(FailurePolicy::Fail),
+                    None,
+                )
+            },
+            ValidatingWebhook {
+                rules: vec![configmap_rule],
+                namespace_selector: Some(deny_selector),
+                ..validating(
+                    "deny-unwanted-configmap-data.k8s.io",
+                    url,
+                    vec![],
+                    Some(FailurePolicy::Fail),
+                    None,
+                )
+            },
+            // The unreachable fail-open webhook: port 1 never answers, and
+            // `Ignore` means the request must still be admitted.
+            ValidatingWebhook {
+                rules: vec![rule_for("", "v1", "configmaps")],
+                ..validating(
+                    "fail-open.k8s.io",
+                    "http://127.0.0.1:1/fail-open".to_string(),
+                    vec![],
+                    Some(FailurePolicy::Ignore),
+                    Some(1),
+                )
+            },
+        ]),
     };
     mem.create(
         &build_key("validatingwebhookconfigurations", None, "deny-pod-cm"),
@@ -507,44 +698,85 @@ async fn should_be_able_to_deny_pod_and_configmap_creation() {
     .await
     .unwrap();
 
+    let run = |op: Operation, kind: &'static str, resource: &'static str, ns: &'static str| {
+        let manager = &manager;
+        async move {
+            manager
+                .run_validating_webhooks(
+                    &op,
+                    &GroupVersionKind {
+                        group: "".into(),
+                        version: "v1".into(),
+                        kind: kind.into(),
+                    },
+                    &GroupVersionResource {
+                        group: "".into(),
+                        version: "v1".into(),
+                        resource: resource.into(),
+                    },
+                    Some(ns),
+                    "obj",
+                    Some(json!({"metadata": {"name": "obj"}})),
+                    None,
+                    &admin_user_info(),
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1 + 2: non-compliant pod and configmap denied on CREATE.
     for (resource, kind) in [("pods", "Pod"), ("configmaps", "ConfigMap")] {
-        let resp = manager
-            .run_validating_webhooks(
-                &Operation::Create,
-                &GroupVersionKind {
-                    group: "".into(),
-                    version: "v1".into(),
-                    kind: kind.into(),
-                },
-                &GroupVersionResource {
-                    group: "".into(),
-                    version: "v1".into(),
-                    resource: resource.into(),
-                },
-                Some("default"),
-                "obj",
-                Some(json!({"metadata": {"name": "obj"}})),
-                None,
-                &admin_user_info(),
-            )
-            .await
-            .unwrap();
+        let resp = run(Operation::Create, kind, resource, "default").await;
         match resp {
-            AdmissionResponse::Deny(reason) => {
-                assert!(
-                    reason.contains("denied by webhook"),
-                    "deny reason: {reason}"
-                );
-            }
-            other => panic!("{resource}: expected Deny, got {other:?}"),
+            AdmissionResponse::Deny(reason) => assert!(
+                reason.contains("denied by webhook"),
+                "{resource}: deny reason: {reason}"
+            ),
+            other => panic!("{resource}: expected Deny on create, got {other:?}"),
         }
     }
+
+    // 3: the configmap rule covers UPDATE too — upstream rejects both the PUT
+    // and the strategic-merge PATCH of an admitted configmap.
+    let resp = run(Operation::Update, "ConfigMap", "configmaps", "default").await;
+    assert!(
+        matches!(resp, AdmissionResponse::Deny(_)),
+        "configmap UPDATE must be denied, got {resp:?}"
+    );
+
+    // 4: an object the deny webhooks do not match is admitted — here a
+    // Secret, which neither rule selects. Without an Allow assertion the deny
+    // cases above would pass against a deny-everything implementation.
+    let resp = run(Operation::Create, "Secret", "secrets", "default").await;
+    assert!(
+        matches!(resp, AdmissionResponse::Allow),
+        "an unmatched resource must be admitted, got {resp:?}"
+    );
+
+    // 5 + 6: in the exempted namespace the deny webhooks are out of scope, so
+    // the only webhook left matching configmaps is the unreachable fail-open
+    // one — the request must still be admitted.
+    let resp = run(
+        Operation::Create,
+        "ConfigMap",
+        "configmaps",
+        "exempted-namespace",
+    )
+    .await;
+    assert!(
+        matches!(resp, AdmissionResponse::Allow),
+        "a namespace labelled {SKIP_LABEL_KEY}={SKIP_LABEL_VALUE} is exempt, and the \
+         unreachable fail-open webhook must not block it; got {resp:?}"
+    );
 }
 
 /// [sig-api-machinery] AdmissionWebhook should be able to deny attaching pod
 /// [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:180
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:209
+///   ("should be able to deny attaching pod")
+///   Assertions live in testAttachingPodWebhook (webhook.go:1466-1514).
 /// Asserts a webhook scoped to the `pods/attach` subresource denies the
 /// operation. `resource_matches` splits the request's `pods/attach` GVR on
 /// `/` and matches the rule's `pods/attach` entry; the operation is CONNECT
@@ -620,7 +852,9 @@ async fn should_be_able_to_deny_attaching_pod() {
 /// [sig-api-machinery] AdmissionWebhook should be able to deny custom
 /// resource creation, update and deletion [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:193
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:220
+///   ("should be able to deny custom resource creation, update and deletion")
+///   Assertions live in testCustomResourceWebhook (webhook.go:2112-2135) + testBlockingCustomResourceUpdateDeletion (webhook.go:2136-2195).
 /// Verifies a webhook bound to a CRD's resource (`example.com/v1/foos`)
 /// denies all of CREATE/UPDATE/DELETE — the dispatcher routes by
 /// `(apiGroup, version, resource)` exactly like any built-in resource.
@@ -690,7 +924,9 @@ async fn should_be_able_to_deny_custom_resource_creation_update_and_deletion() {
 /// [sig-api-machinery] AdmissionWebhook should unconditionally reject
 /// operations on fail closed webhook [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:212
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:237
+///   ("should unconditionally reject operations on fail closed webhook")
+///   Assertions live in testFailClosedWebhook (webhook.go:1553-1576).
 /// Sonobuoy (Round 160): PASS
 ///
 /// A webhook with `failurePolicy: Fail` and no reachable backend must
@@ -755,22 +991,68 @@ async fn should_unconditionally_reject_operations_on_fail_closed_webhook() {
 
 /// [sig-api-machinery] AdmissionWebhook should mutate configmap [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:226
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:249
+///   ("should mutate configmap")
+///   Assertions live in testMutatingConfigMapWebhook (webhook.go:1273-1288);
+///   the configuration is built by registerMutatingWebhookForConfigMap
+///   (webhook.go:1249-1272).
 /// Sonobuoy (Round 160): PASS
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Upstream's Testname is "Admission webhook, **ordered** mutation" and its
+/// Description spells the contract out: two webhooks admit configmaps, "one
+/// that adds a data key if the configmap already has a specific key, and
+/// another that adds a key if the key added by the first webhook is present"
+/// (webhook.go:243-247). Stage 2 can only fire if it observes stage 1's
+/// output, so the case proves ordering. It then compares the resulting map
+/// with `reflect.DeepEqual` against exactly
+/// `{mutation-start, mutation-stage-1, mutation-stage-2}`.
+///
+/// The mirror registered **one** unconditional webhook, mutated
+/// `metadata.labels` rather than `data`, and asserted that a single key was
+/// present. Ordering was untested, and a subset check cannot catch a mutation
+/// that drops `mutation-start` or adds something extra. Both stages are now
+/// conditional (`start_mutator_configmap_stage`) and the assertion is exact
+/// map equality, as upstream's is.
 #[tokio::test]
 async fn should_mutate_configmap() {
     let mem = Arc::new(MemoryStorage::new());
     let manager = AdmissionWebhookManager::new(mem.clone());
-    let (url, _shutdown) = start_mutator_label("mutation-stage-1".into(), "yes".into()).await;
+
+    // Two chained stages, exactly as `registerMutatingWebhookForConfigMap`
+    // registers them (webhook.go:1259-1260): stage 1 keys off the configmap's
+    // own `mutation-start`, stage 2 keys off stage 1's output.
+    let (url1, _s1) =
+        start_mutator_configmap_stage("mutation-start".into(), "mutation-stage-1".into()).await;
+    let (url2, _s2) =
+        start_mutator_configmap_stage("mutation-stage-1".into(), "mutation-stage-2".into()).await;
 
     let cfg = MutatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".to_string(),
         kind: "MutatingWebhookConfiguration".to_string(),
         metadata: rusternetes_common::types::ObjectMeta::new("mutate-cm"),
-        webhooks: Some(vec![MutatingWebhook {
-            rules: vec![rule_for("", "v1", "configmaps")],
-            ..mutating("mutate.cm.io", url, vec![], None, None)
-        }]),
+        webhooks: Some(vec![
+            MutatingWebhook {
+                rules: vec![rule_for("", "v1", "configmaps")],
+                ..mutating(
+                    "adding-configmap-data-stage-1.k8s.io",
+                    url1,
+                    vec![],
+                    None,
+                    None,
+                )
+            },
+            MutatingWebhook {
+                rules: vec![rule_for("", "v1", "configmaps")],
+                ..mutating(
+                    "adding-configmap-data-stage-2.k8s.io",
+                    url2,
+                    vec![],
+                    None,
+                    None,
+                )
+            },
+        ]),
     };
     mem.create(
         &build_key("mutatingwebhookconfigurations", None, "mutate-cm"),
@@ -779,7 +1061,11 @@ async fn should_mutate_configmap() {
     .await
     .unwrap();
 
-    let object = Some(json!({"metadata":{"name":"cm-1","labels":{}}}));
+    // Upstream's `toBeMutatedConfigMap` carries a single `mutation-start` key.
+    let object = Some(json!({
+        "metadata": {"name": "to-be-mutated"},
+        "data": {"mutation-start": "yes"}
+    }));
     let (_resp, mutated) = manager
         .run_mutating_webhooks(
             &Operation::Create,
@@ -794,7 +1080,7 @@ async fn should_mutate_configmap() {
                 resource: "configmaps".into(),
             },
             Some("default"),
-            "cm-1",
+            "to-be-mutated",
             object,
             None,
             &admin_user_info(),
@@ -802,13 +1088,28 @@ async fn should_mutate_configmap() {
         .await
         .unwrap();
     let obj = mutated.expect("mutated object");
-    assert_eq!(obj["metadata"]["labels"]["mutation-stage-1"], json!("yes"));
+
+    // Upstream compares the whole map with reflect.DeepEqual
+    // (webhook.go:1284-1287), so this is exact equality, not a subset check:
+    // `mutation-start` must survive, both stages must have fired, and nothing
+    // else may have been added.
+    assert_eq!(
+        obj["data"],
+        json!({
+            "mutation-start": "yes",
+            "mutation-stage-1": "yes",
+            "mutation-stage-2": "yes"
+        }),
+        "expected the ordered mutation to produce exactly the three keys: {obj}"
+    );
 }
 
 /// [sig-api-machinery] AdmissionWebhook should mutate pod and apply defaults
 /// after mutation [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:240
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:260
+///   ("should mutate pod and apply defaults after mutation")
+///   Assertions live in testMutatingPodWebhook (webhook.go:1339-1371).
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn should_mutate_pod_and_apply_defaults_after_mutation() {
@@ -868,7 +1169,9 @@ async fn should_mutate_pod_and_apply_defaults_after_mutation() {
 /// [sig-api-machinery] AdmissionWebhook should not be able to mutate or
 /// prevent deletion of webhook configuration objects [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:254
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:272
+///   ("should not be able to mutate or prevent deletion of webhook configuration objects")
+///   Assertions live in testWebhooksForWebhookConfigurations (webhook.go:1696-1986).
 /// Sonobuoy (Round 160): PASS
 ///
 /// A deny-everything webhook that registers itself against admissionregistration
@@ -945,7 +1248,9 @@ async fn should_not_be_able_to_mutate_or_prevent_deletion_of_webhook_configurati
 /// [sig-api-machinery] AdmissionWebhook should mutate custom resource
 /// [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:270
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:284
+///   ("should mutate custom resource")
+///   Assertions live in testMutatingCustomResourceWebhook (webhook.go:2196-2225).
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn should_mutate_custom_resource() {
@@ -1001,7 +1306,9 @@ async fn should_mutate_custom_resource() {
 
 /// [sig-api-machinery] AdmissionWebhook should deny crd creation [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:288
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:300
+///   ("should deny crd creation")
+///   Assertions live in testCRDDenyWebhook (webhook.go:2342-2417).
 /// Sonobuoy (Round 160): PASS
 ///
 /// A validating webhook scoped to
@@ -1062,7 +1369,9 @@ async fn should_deny_crd_creation() {
 /// [sig-api-machinery] AdmissionWebhook should mutate custom resource with
 /// different stored version [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:304
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:314
+///   ("should mutate custom resource with different stored version")
+///   Assertions live in testMultiVersionCustomResourceWebhook (webhook.go:2226-2288).
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn should_mutate_custom_resource_with_different_stored_version() {
@@ -1136,7 +1445,9 @@ async fn should_mutate_custom_resource_with_different_stored_version() {
 /// [sig-api-machinery] AdmissionWebhook should mutate custom resource with
 /// pruning [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:323
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:331
+///   ("should mutate custom resource with pruning")
+///   Assertions live in testMutatingCustomResourceWebhook with prune=true (webhook.go:2196-2225).
 ///
 /// Verifies the K8s contract: after a mutating webhook injects a field into
 /// a CR via JSON patch, the api-server runs structural-schema pruning. Any
@@ -1254,8 +1565,10 @@ async fn should_mutate_custom_resource_with_pruning() {
 
 /// [sig-api-machinery] AdmissionWebhook should honor timeout [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:358, asserted
-/// by `testSlowWebhookTimeoutFailEarly` (`webhook.go:2480-2494`).
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:370
+///   ("should honor timeout")
+///   Assertions live in testSlowWebhookTimeoutFailEarly (webhook.go:2480-2494)
+///   and testSlowWebhookTimeoutNoError (webhook.go:2495-2509).
 /// Sonobuoy (Round 160+): PASS — the slow webhook is aborted at the
 /// `timeoutSeconds` boundary and the surfaced error reads as a timeout and
 /// names the queried endpoint, which is what upstream matches on. The deadline
@@ -1355,7 +1668,8 @@ async fn should_honor_timeout() {
 /// [sig-api-machinery] AdmissionWebhook patching/updating a validating
 /// webhook should work [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:391
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:402
+///   ("patching/updating a validating webhook should work")
 /// Sonobuoy (Round 160): PASS
 ///
 /// Verifies that POST → GET → PUT → GET round-trips a ValidatingWebhookConfiguration
@@ -1425,7 +1739,8 @@ async fn patching_updating_a_validating_webhook_should_work() {
 /// [sig-api-machinery] AdmissionWebhook patching/updating a mutating webhook
 /// should work [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:492
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:497
+///   ("patching/updating a mutating webhook should work")
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn patching_updating_a_mutating_webhook_should_work() {
@@ -1486,7 +1801,8 @@ async fn patching_updating_a_mutating_webhook_should_work() {
 /// [sig-api-machinery] AdmissionWebhook listing validating webhooks should
 /// work [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:594
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:574
+///   ("listing validating webhooks should work")
 /// Sonobuoy (Round 160): PASS
 ///
 /// Creates several VWCs, lists them, then deletes the collection and
@@ -1558,7 +1874,8 @@ async fn listing_validating_webhooks_should_work() {
 /// [sig-api-machinery] AdmissionWebhook listing mutating webhooks should
 /// work [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:669
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:648
+///   ("listing mutating webhooks should work")
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn listing_mutating_webhooks_should_work() {
@@ -1625,7 +1942,8 @@ async fn listing_mutating_webhooks_should_work() {
 /// [sig-api-machinery] AdmissionWebhook should be able to create and update
 /// validating webhook configurations with match conditions [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:744
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:717
+///   ("should be able to create and update validating webhook configurations with match conditions")
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn should_be_able_to_create_and_update_validating_webhook_configurations_with_match_conditions(
@@ -1697,7 +2015,8 @@ async fn should_be_able_to_create_and_update_validating_webhook_configurations_w
 /// [sig-api-machinery] AdmissionWebhook should be able to create and update
 /// mutating webhook configurations with match conditions [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:799
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:771
+///   ("should be able to create and update mutating webhook configurations with match conditions")
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn should_be_able_to_create_and_update_mutating_webhook_configurations_with_match_conditions()
@@ -1765,7 +2084,8 @@ async fn should_be_able_to_create_and_update_mutating_webhook_configurations_wit
 /// [sig-api-machinery] AdmissionWebhook should reject validating webhook
 /// configurations with invalid match conditions [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:854
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:825
+///   ("should reject validating webhook configurations with invalid match conditions")
 /// Sonobuoy (Round 160): PASS
 ///
 /// The api-server compiles every CEL `matchConditions[].expression` at
@@ -1811,7 +2131,8 @@ async fn should_reject_validating_webhook_configurations_with_invalid_match_cond
 /// [sig-api-machinery] AdmissionWebhook should reject mutating webhook
 /// configurations with invalid match conditions [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:884
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:849
+///   ("should reject mutating webhook configurations with invalid match conditions")
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn should_reject_mutating_webhook_configurations_with_invalid_match_conditions() {
@@ -1851,7 +2172,8 @@ async fn should_reject_mutating_webhook_configurations_with_invalid_match_condit
 /// [sig-api-machinery] AdmissionWebhook should mutate everything except
 /// 'skip-me' configmaps [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:914
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:874
+///   ("should mutate everything except 'skip-me' configmaps")
 /// Sonobuoy (Round 160): PASS
 ///
 /// Verifies an `objectSelector` based on labels excludes specific objects
