@@ -19,7 +19,7 @@ pub const CONFIG_HASH_ANNOTATION: &str = "kubernetes.io/config.hash";
 /// Parse one manifest file (YAML or JSON) into a Pod. Rejects non-Pod kinds
 /// and pods without a name.
 pub fn parse_manifest(bytes: &[u8], file_name: &str) -> Result<Pod> {
-    let pod: Pod = if file_name.ends_with(".json") {
+    let mut pod: Pod = if file_name.ends_with(".json") {
         serde_json::from_slice(bytes).with_context(|| format!("parsing {file_name} as JSON"))?
     } else {
         serde_yaml::from_slice(bytes).with_context(|| format!("parsing {file_name} as YAML"))?
@@ -30,6 +30,24 @@ pub fn parse_manifest(bytes: &[u8], file_name: &str) -> Result<Pod> {
     if pod.metadata.name.is_empty() {
         bail!("{file_name}: metadata.name is required");
     }
+
+    // Decoding a versioned object runs its defaulters. Upstream gets this for
+    // free — `tryDecodeSinglePod` reads the manifest through
+    // `runtime.Decode(legacyscheme.Codecs.UniversalDecoder(), json)`
+    // (`pkg/kubelet/config/common.go:122`), which applies `SetObjectDefaults_Pod`
+    // and therefore `SetDefaults_Pod`. Serde has no such hook, so the Pod-only
+    // resource defaulting is applied explicitly here.
+    //
+    // Without it a static pod is the one pod in the cluster that never passes
+    // through the api-server, so a limits-only container would reach the runtime
+    // declaring no requests at all while an identical manifest posted to the API
+    // would not. `pod_config_hash` deliberately runs *after* this, on the
+    // defaulted spec, exactly as upstream hashes the decoded-and-defaulted pod:
+    // the manifest's own bytes are not the identity, the effective spec is.
+    if let Some(spec) = pod.spec.as_mut() {
+        rusternetes_common::defaults::default_pod_requests_from_limits(spec);
+    }
+
     Ok(pod)
 }
 

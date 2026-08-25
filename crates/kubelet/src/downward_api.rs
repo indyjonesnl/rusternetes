@@ -210,33 +210,26 @@ fn find_container_in_pod<'a>(
         .find(|c| c.name == name)
 }
 
-/// Default a missing request from the matching limit.
+/// Default a missing request from the matching limit, on a container the caller
+/// already owns a copy of.
 ///
-/// Shared with [`crate::eviction::get_qos_class`], which needs the same
-/// defaulting for the same reason: upstream's `ComputePodQOS` also assumes it
-/// already happened.
+/// Delegates to [`rusternetes_common::defaults::default_container_requests_from_limits`],
+/// the port of `SetDefaults_Pod` (`pkg/apis/core/v1/defaults.go:169-179`), which
+/// the api-server's pod-create path and the static-pod decoder now both apply —
+/// so in a healthy cluster this is a no-op and every caller here sees a pod that
+/// was already defaulted.
 ///
-/// Upstream does this in the **api-server**, not the kubelet:
-/// `SetDefaults_Pod` (`pkg/apis/core/v1/defaults.go:164-180`) copies every
-/// `limits` entry into `requests` when the request is absent, so by the time a
-/// pod reaches the kubelet `requests.cpu` is already populated. The rusternetes
-/// api-server does not implement that defaulting yet (`handlers/defaults.rs`
-/// has no resource pass), so a limits-only pod would otherwise report
-/// `requests.memory` as `0` here while upstream reports the limit. Applied to
-/// the local copy only; tracked for a proper api-server-side port.
+/// It is kept, rather than deleted, because upstream's guarantee is "every pod
+/// was decoded through the scheme", and the kubelet cannot verify that for a pod
+/// it reads back out of storage — one written before this defaulting existed, or
+/// by any writer that bypasses the api-server, still arrives undefaulted. Being
+/// idempotent, re-applying it costs nothing and keeps
+/// [`crate::eviction::get_qos_class`] (whose upstream, `ComputePodQOS`, likewise
+/// assumes admission already ran) from silently reclassifying such a pod.
 pub(crate) fn default_requests_from_limits(
     container: &mut rusternetes_common::resources::Container,
 ) {
-    let Some(resources) = container.resources.as_mut() else {
-        return;
-    };
-    let Some(limits) = resources.limits.clone() else {
-        return;
-    };
-    let requests = resources.requests.get_or_insert_with(Default::default);
-    for (key, value) in limits {
-        requests.entry(key).or_insert(value);
-    }
+    rusternetes_common::defaults::default_container_requests_from_limits(container);
 }
 
 /// Fill an unset (or zero) cpu / memory / ephemeral-storage **limit** from the
