@@ -474,11 +474,12 @@ pub fn spawn_endpoint_reconciler(
 /// Upstream runs the aggregator's availability controller as part of
 /// kube-apiserver (`kube-aggregator/pkg/controllers/status`), NOT in
 /// kube-controller-manager. In the vanilla-module-swap the controller-manager
-/// is the stock KCM, which does not run this controller, so an aggregated
-/// `APIService`'s `Available` condition would stay `Unknown` forever and every
+/// is the stock KCM, which does not run this controller, so a remote
+/// `APIService` would never get an `Available` condition at all — the create
+/// path deliberately writes none (upstream `PrepareForCreate`) — and every
 /// aggregation client (`e2e Aggregator`, `kubectl get apiservices`) would hang
-/// "waiting for APIService controller probe". Running it here matches upstream
-/// placement and works regardless of which controller-manager is deployed.
+/// waiting for one. Running it here matches upstream placement and works
+/// regardless of which controller-manager is deployed.
 pub fn spawn_apiservice_availability_controller(
     storage: Arc<StorageBackend>,
 ) -> tokio::task::JoinHandle<()> {

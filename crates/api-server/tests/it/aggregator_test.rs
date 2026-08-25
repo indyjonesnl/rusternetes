@@ -260,7 +260,12 @@ async fn resolve_aggregator_target_uses_clusterip_and_apiservice_port() {
 async fn resolve_aggregator_target_503_while_not_available() {
     let storage = MemoryStorage::new();
     seed_service(&storage, "wardle", "sample-apiserver", "10.96.0.42", 7443).await;
-    // Fresh/unprobed APIService: Available=Unknown.
+    // Fresh/unprobed APIService: no conditions at all. That is what
+    // `create_apiservice` now writes for a remote APIService, matching upstream
+    // `apiServerStrategy.PrepareForCreate` — the first `Available` condition
+    // comes from the availability controller, off a real probe. The gate must
+    // read "no Available=True" as unavailable whether the condition is missing
+    // or present-but-not-True.
     let mut spec = json!({
         "group": "wardle.example.com",
         "version": "v1alpha1",
@@ -275,10 +280,7 @@ async fn resolve_aggregator_target_503_while_not_available() {
         "kind": "APIService",
         "metadata": { "name": "v1alpha1.wardle.example.com" },
         "spec": spec,
-        "status": { "conditions": [{
-            "type": "Available", "status": "Unknown",
-            "reason": "Pending", "message": "waiting for APIService controller probe",
-        }]},
+        "status": {},
     });
     let key = build_key("apiservices", None, "v1alpha1.wardle.example.com");
     storage.create::<Value>(&key, &apiservice).await.unwrap();

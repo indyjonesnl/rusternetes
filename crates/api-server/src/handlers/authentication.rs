@@ -259,7 +259,13 @@ pub async fn create_token_request(
 
     token_request.status = Some(TokenRequestStatus {
         token,
-        expiration_timestamp: expiration_timestamp.to_rfc3339(),
+        // `TokenRequestStatus.expirationTimestamp` is a `metav1.Time` upstream,
+        // so it goes on the wire as RFC3339 at second precision with a `Z`
+        // suffix. Rusternetes carries it as a `String` with no normalising
+        // serializer, so the format has to be chosen here — chrono's plain
+        // `to_rfc3339()` would emit `…:00.123456789+00:00`.
+        expiration_timestamp: expiration_timestamp
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     });
 
     Ok(Json(token_request))

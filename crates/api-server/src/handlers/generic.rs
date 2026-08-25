@@ -24,6 +24,23 @@ use tracing::{debug, info, warn};
 
 // --- APIService handlers ---
 
+/// Message upstream attaches to the `Available` condition of a local
+/// APIService. Verbatim from `NewLocalAvailableAPIServiceCondition`
+/// (`kube-aggregator/pkg/apis/apiregistration/v1/helper/helpers.go:96-104`) —
+/// plural "APIServices", which is what a client comparing the message sees.
+pub const LOCAL_AVAILABLE_MESSAGE: &str = "Local APIServices are always available";
+
+/// `metav1.Time`'s wire form: RFC3339, second precision, `Z` suffix.
+///
+/// `metav1.Time.MarshalJSON` emits `t.UTC().Format(time.RFC3339)`, so upstream
+/// never puts sub-second digits or a numeric offset in a timestamp field.
+/// Chrono's plain `to_rfc3339()` does both (`…:00.123456789+00:00`). Typed
+/// resources already go through `common::types::k8s_time`; these handlers build
+/// their objects as untyped `serde_json::Value` and so have to format here.
+pub(crate) fn k8s_now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 pub async fn create_apiservice(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -66,34 +83,42 @@ pub async fn create_apiservice(
         .and_then(|m| m.get("creationTimestamp"))
         .is_none()
     {
-        value["metadata"]["creationTimestamp"] = Value::String(chrono::Utc::now().to_rfc3339());
+        value["metadata"]["creationTimestamp"] = Value::String(k8s_now());
     }
 
-    // Initial status conditions:
-    //   - local APIService (no spec.service): Available=True immediately.
-    //   - remote APIService (spec.service set): Available=Unknown until the
-    //     APIServiceAvailabilityController probes the backing service. This
-    //     matches kube-aggregator behaviour and keeps tests deterministic.
-    let now = chrono::Utc::now().to_rfc3339();
+    // Status on create, port of upstream `apiServerStrategy.PrepareForCreate`
+    // (`kube-aggregator/pkg/registry/apiservice/strategy.go:68-76`):
+    //
+    //     apiservice.Status = apiregistration.APIServiceStatus{}
+    //     if apiservice.Spec.Service == nil {
+    //         SetAPIServiceCondition(apiservice, NewLocalAvailableAPIServiceCondition())
+    //     }
+    //
+    // A **local** APIService (no `spec.service`) is available immediately. A
+    // **remote** one gets an empty status: the first `Available` condition is
+    // written by the availability controller, from a real probe.
+    //
+    // We used to seed remote APIServices with `Available=Unknown` /
+    // `reason: Pending` "to keep tests deterministic". That is a condition
+    // upstream never writes, and it made `status.conditions` non-empty before
+    // anything had been checked. The aggregator proxy gate reads the absence of
+    // an `Available=True` condition as unavailable either way
+    // (`.unwrap_or(false)` in `resolve_aggregator_target`), so dropping the seed
+    // changes no routing decision — only what a client observes.
     let has_service_backend = value.pointer("/spec/service").is_some_and(|v| !v.is_null());
-    let (status, reason, message) = if has_service_backend {
-        (
-            "Unknown",
-            "Pending",
-            "waiting for APIService controller probe",
-        )
+    value["status"] = if has_service_backend {
+        serde_json::json!({})
     } else {
-        ("True", "Local", "Local APIService is always available")
+        serde_json::json!({
+            "conditions": [{
+                "type": "Available",
+                "status": "True",
+                "lastTransitionTime": k8s_now(),
+                "reason": "Local",
+                "message": LOCAL_AVAILABLE_MESSAGE,
+            }]
+        })
     };
-    value["status"] = serde_json::json!({
-        "conditions": [{
-            "type": "Available",
-            "status": status,
-            "lastTransitionTime": now,
-            "reason": reason,
-            "message": message,
-        }]
-    });
 
     let key = build_key("apiservices", None, &name);
     let created: Value = state.storage.create(&key, &value).await?;
