@@ -3,6 +3,15 @@
 //! Each test sets `RUSTERNETES_DUMP_PAYLOADS=1` via a process-wide guard
 //! before the first call to `dumps_enabled()`. Tests run with
 //! `--test-threads=1` because the env gate is read once per process.
+//!
+//! SEPARATE-TEST-BINARY: needs a process of its own. `dump::dumps_enabled()`
+//! caches the env var in a `OnceLock` on first call, and
+//! `middleware::capture_payload` calls it on every request — so inside the
+//! shared `tests/it` binary any of the other tests that drives a router would
+//! latch the gate to `false` before these tests set the variable, and these
+//! assertions would fail on a race rather than on a real regression. `cargo
+//! nextest` gives every test its own process and would hide the problem; plain
+//! `cargo test` does not.
 
 use axum::{body::Body, http::Request, routing::post, Router};
 use rusternetes_api_server::middleware::capture_payload;
