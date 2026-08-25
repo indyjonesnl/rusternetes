@@ -539,7 +539,7 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
     // Sub-assertion 2: create leaves a REMOTE APIService's status empty.
     //
     // Upstream `apiServerStrategy.PrepareForCreate`
-    // (`kube-aggregator/pkg/registry/apiservice/strategy.go:68-76`) wipes
+    // (`staging/src/k8s.io/kube-aggregator/pkg/registry/apiservice/strategy.go:68-76`) wipes
     // `status` and only seeds a condition when `spec.service == nil`. So the
     // first `Available` condition on a remote APIService comes from the
     // availability controller, off a real probe — never from the create path.
@@ -791,7 +791,7 @@ async fn aggregator_create_local_apiservice_returns_available_true() {
 /// [sig-api-machinery] Aggregator — create leaves a remote APIService's status empty
 ///
 /// Upstream: `apiServerStrategy.PrepareForCreate`
-/// (`kube-aggregator/pkg/registry/apiservice/strategy.go:68-76`):
+/// (`staging/src/k8s.io/kube-aggregator/pkg/registry/apiservice/strategy.go:68-76`):
 ///
 /// ```text
 /// apiservice.Status = apiregistration.APIServiceStatus{}
@@ -834,7 +834,7 @@ async fn aggregator_create_remote_apiservice_leaves_status_empty() {
 /// with upstream's exact reason and message.
 ///
 /// Upstream `NewLocalAvailableAPIServiceCondition`
-/// (`kube-aggregator/pkg/apis/apiregistration/v1/helper/helpers.go:96-104`):
+/// (`staging/src/k8s.io/kube-aggregator/pkg/apis/apiregistration/v1/helper/helpers.go:96-104`):
 /// `Reason: "Local"`, `Message: "Local APIServices are always available"`.
 /// The message was singular here ("Local APIService is always available"),
 /// in both the create handler and the availability controller.

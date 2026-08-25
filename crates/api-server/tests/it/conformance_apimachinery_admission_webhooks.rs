@@ -1254,12 +1254,13 @@ async fn should_mutate_custom_resource_with_pruning() {
 
 /// [sig-api-machinery] AdmissionWebhook should honor timeout [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:358
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:358, asserted
+/// by `testSlowWebhookTimeoutFailEarly` (`webhook.go:2480-2494`).
 /// Sonobuoy (Round 160+): PASS — the slow webhook is aborted at the
-/// `timeoutSeconds` boundary and the surfaced error includes the upstream
-/// "HTTP/dial timeout" phrase the conformance suite asserts the literal text
-/// of. The deadline is enforced by [`AdmissionWebhookManager::call_webhook_with_ca`]
-/// wrapping the inner reqwest call in `tokio::time::timeout`.
+/// `timeoutSeconds` boundary and the surfaced error reads as a timeout and
+/// names the queried endpoint, which is what upstream matches on. The deadline
+/// is enforced by [`AdmissionWebhookManager::call_webhook_with_ca`] wrapping
+/// the inner reqwest call in `tokio::time::timeout`.
 #[tokio::test]
 async fn should_honor_timeout() {
     let mem = Arc::new(MemoryStorage::new());
@@ -1326,11 +1327,28 @@ async fn should_honor_timeout() {
         elapsed < slow_webhook_sleep,
         "1s deadline must abort before the {slow_webhook_sleep:?} webhook response; took {elapsed:?}"
     );
-    // Upstream expects the literal substring "HTTP/dial timeout" — the gap.
-    let msg = format!("{}", res.unwrap_err()).to_lowercase();
+    // Upstream `testSlowWebhookTimeoutFailEarly`
+    // (`test/e2e/apimachinery/webhook.go:2480-2494`) makes exactly two checks
+    // on the returned error:
+    //
+    //     isTimeoutError := strings.Contains(err.Error(), `context deadline exceeded`) ||
+    //                       strings.Contains(err.Error(), `timeout`)
+    //     isErrorQueryingWebhook := strings.Contains(err.Error(), `/always-allow-delay-5s?timeout=1s`)
+    //
+    // This used to assert the literal substring "HTTP/dial timeout" instead,
+    // and the webhook client spliced that phrase into its error to satisfy it.
+    // The phrase occurs in upstream only inside `framework.Failf` — the message
+    // printed when the assertion *fails*. It is not something any Kubernetes
+    // component emits, and nothing upstream matches on it.
+    let msg = format!("{}", res.unwrap_err());
     assert!(
-        msg.contains("http/dial timeout"),
-        "upstream test asserts literal 'HTTP/dial timeout' substring; got {msg:?}"
+        msg.contains("context deadline exceeded") || msg.contains("timeout"),
+        "error must read as a timeout (upstream webhook.go:2488); got {msg:?}"
+    );
+    assert!(
+        msg.contains("?timeout=1s"),
+        "error must name the queried endpoint with its timeout query \
+         (upstream webhook.go:2489); got {msg:?}"
     );
 }
 

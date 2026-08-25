@@ -183,17 +183,22 @@ impl AdmissionWebhookClient {
         .await
         {
             Ok(result) => result,
-            // Match the upstream wording asserted by the K8s conformance suite
-            // (test/e2e/apimachinery/webhook.go:358 — "Webhook fail open" should
-            // observe an HTTP/dial timeout error). The Go context-deadline phrase
-            // is retained for backwards compatibility with existing assertions.
-            // Include the webhook URL with its `?timeout={n}s` query: the
-            // conformance "should honor timeout" test asserts the error names
-            // the queried endpoint (e.g. `/always-allow-delay-5s?timeout=1s`),
-            // not just that a timeout occurred.
-            // K8s ref: test/e2e/apimachinery/webhook.go (testSlowWebhookTimeoutFailEarly)
+            // What upstream's "should honor timeout" test actually checks
+            // (`test/e2e/apimachinery/webhook.go:2480-2494`,
+            // `testSlowWebhookTimeoutFailEarly`):
+            //
+            //     isTimeoutError := strings.Contains(err.Error(), `context deadline exceeded`) ||
+            //                       strings.Contains(err.Error(), `timeout`)
+            //     isErrorQueryingWebhook := strings.Contains(err.Error(), `/always-allow-delay-5s?timeout=1s`)
+            //
+            // — a timeout phrase, plus the queried endpoint including its
+            // `?timeout={n}s` query. The string "HTTP/dial timeout" appears in
+            // that function only inside `framework.Failf`, the message printed
+            // when the assertion *fails*; upstream never emits it and never
+            // matches on it. It used to be spliced into this error on the
+            // strength of that misreading.
             Err(_elapsed) => Err(rusternetes_common::Error::Internal(format!(
-                "failed to call webhook: HTTP/dial timeout: context deadline exceeded querying {}?timeout={}s",
+                "failed to call webhook: context deadline exceeded querying {}?timeout={}s",
                 url,
                 timeout.as_secs()
             ))),
@@ -262,11 +267,11 @@ impl AdmissionWebhookClient {
                 url, e, detail, cause_chain
             );
             // Include cause chain so errors like "deadline has elapsed" are visible to clients.
-            // K8s Go context timeout produces "context deadline exceeded" — tests check for
-            // the word "deadline". Reqwest produces "operation timed out" for timeouts and
-            // "deadline has elapsed" for connect timeouts. Normalize to include "deadline"
-            // AND the upstream "HTTP/dial timeout" phrase that the K8s conformance suite
-            // asserts (test/e2e/apimachinery/webhook.go:358).
+            // Go's context timeout produces "context deadline exceeded", which is one of the
+            // two phrases upstream's timeout test accepts
+            // (`webhook.go:2488`). Reqwest produces "operation timed out" for
+            // read timeouts and "deadline has elapsed" for connect timeouts, so
+            // normalize to carry "context deadline exceeded".
             let cause_str = causes.join(": ");
             let normalized_causes = if e.is_timeout() || cause_str.contains("timed out") {
                 if cause_str.contains("deadline") {
@@ -277,28 +282,21 @@ impl AdmissionWebhookClient {
             } else {
                 cause_str
             };
-            let timeout_phrase = if e.is_timeout() || e.is_connect() {
-                "HTTP/dial timeout: "
-            } else {
-                ""
-            };
             // `url` here is url_with_timeout (carries `?timeout={n}s`). Naming it
-            // in the error lets the conformance timeout test match the queried
-            // endpoint (e.g. `/always-allow-delay-5s?timeout=1s`).
+            // in the error is what upstream's timeout test matches on — the
+            // queried endpoint, e.g. `/always-allow-delay-5s?timeout=1s`
+            // (`webhook.go:2489`).
             let full_error = if causes.is_empty() && !e.is_timeout() {
-                format!(
-                    "failed to call webhook: {}{} querying {}",
-                    timeout_phrase, e, url
-                )
+                format!("failed to call webhook: {} querying {}", e, url)
             } else if causes.is_empty() {
                 format!(
-                    "failed to call webhook: {}{}: context deadline exceeded querying {}",
-                    timeout_phrase, e, url
+                    "failed to call webhook: {}: context deadline exceeded querying {}",
+                    e, url
                 )
             } else {
                 format!(
-                    "failed to call webhook: {}{} ({}) querying {}",
-                    timeout_phrase, e, normalized_causes, url
+                    "failed to call webhook: {} ({}) querying {}",
+                    e, normalized_causes, url
                 )
             };
             rusternetes_common::Error::Internal(full_error)

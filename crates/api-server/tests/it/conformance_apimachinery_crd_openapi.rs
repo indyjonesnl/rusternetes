@@ -76,11 +76,11 @@ async fn get_openapi_v3_root(state: &TestApiServer) -> Value {
 
 // ---------------------------------------------------------------------------
 // CRD builders. Mirror the canonical fixtures in
-// k8s.io/kubernetes/test/utils/crd/crdtestutils.go used by crd_publish_openapi.
+// k8s.io/kubernetes/test/utils/crd/crd_util.go used by crd_publish_openapi.
 // ---------------------------------------------------------------------------
 
 /// Canonical "Foo CRD with validation schema" body — same shape used by
-/// upstream `schemaFoo` at `test/utils/crd/crdtestutils.go`. The schema
+/// upstream `schemaFoo` at `test/utils/crd/crd_util.go`. The schema
 /// declares `spec.bars[].feeling` constrained by an enum.
 fn schema_foo_crd(crd_name: &str, group: &str, plural: &str, kind: &str) -> Value {
     json!({

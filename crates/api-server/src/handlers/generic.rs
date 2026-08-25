@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 
 /// Message upstream attaches to the `Available` condition of a local
 /// APIService. Verbatim from `NewLocalAvailableAPIServiceCondition`
-/// (`kube-aggregator/pkg/apis/apiregistration/v1/helper/helpers.go:96-104`) —
+/// (`staging/src/k8s.io/kube-aggregator/pkg/apis/apiregistration/v1/helper/helpers.go:96-104`) —
 /// plural "APIServices", which is what a client comparing the message sees.
 pub const LOCAL_AVAILABLE_MESSAGE: &str = "Local APIServices are always available";
 
@@ -87,7 +87,7 @@ pub async fn create_apiservice(
     }
 
     // Status on create, port of upstream `apiServerStrategy.PrepareForCreate`
-    // (`kube-aggregator/pkg/registry/apiservice/strategy.go:68-76`):
+    // (`staging/src/k8s.io/kube-aggregator/pkg/registry/apiservice/strategy.go:68-76`):
     //
     //     apiservice.Status = apiregistration.APIServiceStatus{}
     //     if apiservice.Spec.Service == nil {

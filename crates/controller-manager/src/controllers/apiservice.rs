@@ -239,7 +239,7 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
             None => {
                 // Local APIService (no service backing) — always available.
                 // Message is verbatim upstream `NewLocalAvailableAPIServiceCondition`
-                // (`kube-aggregator/pkg/apis/apiregistration/v1/helper/helpers.go:96-104`):
+                // (`staging/src/k8s.io/kube-aggregator/pkg/apis/apiregistration/v1/helper/helpers.go:96-104`):
                 // plural "APIServices". This file already treats the message as
                 // contract (see `update_condition`), and it was the one reason
                 // whose wording did not match.

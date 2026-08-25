@@ -6,7 +6,7 @@
 //! Specifically:
 //!   - test/e2e/apimachinery/namespace.go
 //!   - test/e2e/apimachinery/resource_quota.go
-//!   - test/e2e/apimachinery/limit_range.go
+//!   - test/e2e/scheduling/limit_range.go
 //!
 //! See `docs/conformance/apimachinery-namespaces-quota-limits.md` for the
 //! test-by-test status table and the cross-reference into `docs/CONFORMANCE.md`
@@ -1182,13 +1182,13 @@ async fn resource_quota_deletecollection_by_label_selector() {
 
 // ===========================================================================
 // LimitRange lifecycle + admission enforcement
-// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/limit_range.go
+// Upstream: k8s.io/kubernetes/test/e2e/scheduling/limit_range.go
 // ===========================================================================
 
 /// [sig-api-machinery] LimitRange should create a LimitRange with defaults
 /// and ensure pod has correct min/max defaults injected [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/limit_range.go:60
+/// Upstream: k8s.io/kubernetes/test/e2e/scheduling/limit_range.go:57
 /// Sonobuoy (Round 160): PASS
 ///
 /// This test verifies the **handler contract** (LimitRange survives a
