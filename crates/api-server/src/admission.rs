@@ -1,6 +1,8 @@
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection
+use chrono::Utc;
 use rusternetes_common::{
-    quantity::{parse_resource_value, Format, Quantity},
+    quantity::parse_resource_value,
+    quota,
     resources::{LimitRange, Pod, ResourceQuota, ServiceAccount},
     types::ResourceRequirements,
 };
@@ -170,15 +172,35 @@ pub async fn check_resource_quota<S: Storage>(
 
 /// Check if a pod CREATE or UPDATE would exceed ResourceQuota limits.
 ///
-/// `old_pod` is `Some` for UPDATE/PATCH and `None` for CREATE. When set,
-/// the previous pod's resource contribution is subtracted from the live
-/// namespace usage before the new pod's footprint is added — this
-/// implements K8s delta-usage semantics so an UPDATE that does not raise
-/// total usage past `.spec.hard` is admitted even if the live namespace
-/// recount still sees the stale pod row.
+/// Port of upstream `quotaEvaluator.checkRequest`
+/// (`staging/src/k8s.io/apiserver/pkg/admission/plugin/resourcequota/controller.go:480-635`):
 ///
-/// K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/resourcequota/controller.go
-/// (`charge` builds usage from `New` ‑ `Old`).
+/// ```text
+/// delta      = Usage(new)                                    on CREATE
+///            = SubtractWithNonNegativeResult(Usage(new), Usage(old))  on UPDATE
+/// delta      = RemoveZeros(delta)   -> nothing left? admit
+/// requested  = Mask(delta, ResourceNames(hard))
+/// newUsage   = Add(used, requested)
+/// allowed    = LessThanOrEqual(Mask(newUsage, ResourceNames(requested)), hard)
+/// ```
+///
+/// Every step is `Quantity` arithmetic. The previous implementation open-coded
+/// one branch per quota key (`requests.cpu`, `requests.memory`, `limits.cpu`,
+/// `limits.memory`, `requests.ephemeral-storage`, then a loop for the rest),
+/// each reducing to `i64` millicores or bytes and each with its own fallback —
+/// which is how `hard: requests.example.com/foo: 1k` came to be silently
+/// unenforced (`limit_str.parse().unwrap_or(i64::MAX)`).
+///
+/// Two deliberate deviations from upstream, both pre-existing:
+///
+/// * **Live recount instead of `status.used`.** Upstream charges against the
+///   figure the quota controller maintains; this recomputes from the pods in
+///   storage so a stale `status.used` cannot reject a request after the pods it
+///   counted are gone. Consequence, shared with upstream: an UPDATE that
+///   *lowers* usage charges a zero delta, so the recorded figure stays high
+///   until the controller re-syncs.
+/// * **Scope filtering applied to the recount.** The recount only sums pods the
+///   quota's scopes match, which is what `status.used` would have held.
 pub async fn check_resource_quota_with_old<S: Storage>(
     storage: &Arc<S>,
     namespace: &str,
@@ -192,326 +214,165 @@ pub async fn check_resource_quota_with_old<S: Storage>(
         return Ok(true);
     }
 
-    let pod_requests = calculate_pod_requests(pod);
-    let pod_limits_cpu = calculate_pod_limits_cpu(pod);
-    let pod_limits_memory = calculate_pod_limits_memory(pod);
+    let now = Utc::now();
+    let input_usage = quota::pod_usage(pod, now);
+    let delta = match old_pod {
+        // UPDATE: charge the increase only. Upstream uses
+        // `SubtractWithNonNegativeResult` here (`controller.go:530`), so a
+        // shrinking dimension charges nothing rather than a credit.
+        Some(old) => quota::remove_zeros(&quota::subtract_with_non_negative_result(
+            &input_usage,
+            &quota::pod_usage(old, now),
+        )),
+        // CREATE: the pod's whole footprint.
+        None => quota::remove_zeros(&input_usage),
+    };
 
-    // For UPDATE: compute the old pod's contribution so we can subtract
-    // it from the live namespace recount (which still includes the old
-    // pod row in storage). On CREATE the deltas are all zero.
-    let old_requests = old_pod.map(calculate_pod_requests).unwrap_or_default();
-    let old_limits_cpu = old_pod.map(calculate_pod_limits_cpu).unwrap_or(0);
-    let old_limits_memory = old_pod.map(calculate_pod_limits_memory).unwrap_or(0);
-    // Whether the OLD pod was already counted by the namespace recount
-    // (i.e. it still occupies a "pods" slot from the listing's POV).
-    let old_pod_counted = old_pod
-        .map(|p| {
-            let phase = p.status.as_ref().and_then(|s| s.phase.as_ref());
-            !matches!(
-                phase,
-                Some(rusternetes_common::types::Phase::Succeeded)
-                    | Some(rusternetes_common::types::Phase::Failed)
-            ) && p.metadata.deletion_timestamp.is_none()
-        })
-        .unwrap_or(false);
+    // Nothing charged means nothing can be exceeded (`controller.go:555-565`).
+    if delta.is_empty() {
+        return Ok(true);
+    }
 
-    for mut quota in quotas {
-        if !pod_matches_quota_scopes(pod, &quota) {
+    for mut quota_obj in quotas {
+        if !pod_matches_quota_scopes(pod, &quota_obj) {
             continue;
         }
 
-        let hard = match &quota.spec.hard {
+        let hard_raw = match &quota_obj.spec.hard {
             Some(h) => h.clone(),
             None => continue,
         };
+        let hard = quota::parse_resource_list(&hard_raw);
+        let hard_names = quota::resource_names(&hard);
 
-        // Always compute live usage from actual pods, not from quota status.used.
-        // K8s quota evaluator recomputes usage to avoid stale data causing
-        // false rejections (e.g., after pods are deleted, status.used is stale
-        // until the quota controller reconciles).
-        // K8s ref: staging/src/k8s.io/apiserver/pkg/quota/v1/generic/evaluator.go
-        let current_usage = calculate_namespace_usage(storage, namespace).await?;
-
-        let mut new_usage = current_usage.clone();
-        let mut exceeded = Vec::new();
-
-        // Check and increment pod count. On CREATE we add +1; on UPDATE
-        // the slot is already counted, so the delta is 0 — an UPDATE can
-        // never fail the pod-count check by itself.
-        if let Some(pod_limit_str) = hard.get("pods") {
-            let current_pods = current_usage
-                .get("pods")
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            let baseline_pods = if old_pod_counted {
-                (current_pods - 1).max(0)
-            } else {
-                current_pods
-            };
-            let limit = pod_limit_str.parse::<i64>().unwrap_or(i64::MAX);
-            let projected_pods = baseline_pods + 1;
-            // Only enforce the limit when this admission adds to the
-            // count (CREATE). UPDATE keeps the slot count unchanged.
-            if old_pod.is_none() && projected_pods > limit {
-                exceeded.push(format!(
-                    "pods, requested: 1, used: {}, limited: {}",
-                    baseline_pods, limit
-                ));
-            } else {
-                new_usage.insert("pods".to_string(), projected_pods.to_string());
-            }
+        let requested = quota::mask(&delta, &hard_names);
+        if requested.is_empty() {
+            continue;
         }
 
-        // Check requests.cpu (K8s aliases "cpu" → "requests.cpu").
-        if let Some(cpu_limit_str) = hard.get("requests.cpu").or_else(|| hard.get("cpu")) {
-            let current_cpu = current_usage
-                .get("requests.cpu")
-                .and_then(|s| parse_cpu_to_millicores(s).ok())
-                .unwrap_or(0);
-            let pod_cpu = pod_requests.get("cpu").copied().unwrap_or(0);
-            let old_cpu = old_requests.get("cpu").copied().unwrap_or(0);
-            let baseline_cpu = (current_cpu - old_cpu).max(0);
-            let limit = quota_limit(
-                parse_cpu_to_millicores(cpu_limit_str),
-                "requests.cpu",
-                cpu_limit_str,
-            );
-            if baseline_cpu + pod_cpu > limit {
-                exceeded.push(format!(
-                    "requests.cpu, requested: {}m, used: {}m, limited: {}m",
-                    pod_cpu, baseline_cpu, limit
-                ));
-            } else {
-                new_usage.insert(
-                    "requests.cpu".to_string(),
-                    millicores_to_cpu_string(baseline_cpu + pod_cpu),
-                );
-            }
-        }
+        // Live usage stands in for `status.used` — see the deviation note above.
+        let used = namespace_usage(storage, namespace, &quota_obj, now).await?;
+        let new_usage = quota::add(&used, &requested);
 
-        // Check requests.memory (K8s aliases "memory" → "requests.memory").
-        if let Some(mem_limit_str) = hard.get("requests.memory").or_else(|| hard.get("memory")) {
-            let current_mem = current_usage
-                .get("requests.memory")
-                .and_then(|s| parse_memory_to_bytes(s).ok())
-                .unwrap_or(0);
-            let pod_mem = pod_requests.get("memory").copied().unwrap_or(0);
-            let old_mem = old_requests.get("memory").copied().unwrap_or(0);
-            let baseline_mem = (current_mem - old_mem).max(0);
-            let limit = quota_limit(
-                parse_memory_to_bytes(mem_limit_str),
-                "requests.memory",
-                mem_limit_str,
-            );
-            if baseline_mem + pod_mem > limit {
-                exceeded.push(format!(
-                    "requests.memory, requested: {}, used: {}, limited: {}",
-                    pod_mem, baseline_mem, limit
-                ));
-            } else {
-                new_usage.insert(
-                    "requests.memory".to_string(),
-                    format!("{}", baseline_mem + pod_mem),
-                );
-            }
-        }
-
-        // Check limits.cpu.
-        if let Some(cpu_limit_quota) = hard.get("limits.cpu") {
-            let current_cpu = current_usage
-                .get("limits.cpu")
-                .and_then(|s| parse_cpu_to_millicores(s).ok())
-                .unwrap_or(0);
-            let baseline_cpu = (current_cpu - old_limits_cpu).max(0);
-            let limit = quota_limit(
-                parse_cpu_to_millicores(cpu_limit_quota),
-                "limits.cpu",
-                cpu_limit_quota,
-            );
-            if baseline_cpu + pod_limits_cpu > limit {
-                exceeded.push(format!(
-                    "limits.cpu, requested: {}m, used: {}m, limited: {}m",
-                    pod_limits_cpu, baseline_cpu, limit
-                ));
-            } else {
-                new_usage.insert(
-                    "limits.cpu".to_string(),
-                    millicores_to_cpu_string(baseline_cpu + pod_limits_cpu),
-                );
-            }
-        }
-
-        // Check limits.memory.
-        if let Some(mem_limit_quota) = hard.get("limits.memory") {
-            let current_mem = current_usage
-                .get("limits.memory")
-                .and_then(|s| parse_memory_to_bytes(s).ok())
-                .unwrap_or(0);
-            let baseline_mem = (current_mem - old_limits_memory).max(0);
-            let limit = quota_limit(
-                parse_memory_to_bytes(mem_limit_quota),
-                "limits.memory",
-                mem_limit_quota,
-            );
-            if baseline_mem + pod_limits_memory > limit {
-                exceeded.push(format!(
-                    "limits.memory, requested: {}, used: {}, limited: {}",
-                    pod_limits_memory, baseline_mem, limit
-                ));
-            } else {
-                new_usage.insert(
-                    "limits.memory".to_string(),
-                    format!("{}", baseline_mem + pod_limits_memory),
-                );
-            }
-        }
-
-        // Check requests.ephemeral-storage.
-        if let Some(es_limit_str) = hard.get("requests.ephemeral-storage") {
-            let current_es = current_usage
-                .get("requests.ephemeral-storage")
-                .and_then(|s| parse_memory_to_bytes(s).ok())
-                .unwrap_or(0);
-            let pod_es = pod_requests.get("ephemeral-storage").copied().unwrap_or(0);
-            let old_es = old_requests.get("ephemeral-storage").copied().unwrap_or(0);
-            let baseline_es = (current_es - old_es).max(0);
-            let limit = quota_limit(
-                parse_memory_to_bytes(es_limit_str),
-                "requests.ephemeral-storage",
-                es_limit_str,
-            );
-            if baseline_es + pod_es > limit {
-                exceeded.push(format!(
-                    "requests.ephemeral-storage, requested: {}, used: {}, limited: {}",
-                    pod_es, baseline_es, limit
-                ));
-            } else {
-                new_usage.insert(
-                    "requests.ephemeral-storage".to_string(),
-                    format!("{}", baseline_es + pod_es),
-                );
-            }
-        }
-
-        // Check extended resources (requests.example.com/foo, etc.) — K8s
-        // treats any quota key starting with "requests." that is not
-        // cpu/memory/ephemeral-storage as an extended resource.
-        for (key, limit_str) in &hard {
-            if key.starts_with("requests.")
-                && !matches!(
-                    key.as_str(),
-                    "requests.cpu" | "requests.memory" | "requests.ephemeral-storage"
-                )
-            {
-                let ext_name = &key["requests.".len()..];
-                let limit: i64 = limit_str.parse().unwrap_or(i64::MAX);
-                let current: i64 = current_usage
-                    .get(key)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                let pod_request = sum_extended_request(pod, ext_name);
-                let old_request = old_pod
-                    .map(|p| sum_extended_request(p, ext_name))
-                    .unwrap_or(0);
-                let baseline = (current - old_request).max(0);
-                if pod_request > 0 && baseline + pod_request > limit {
-                    exceeded.push(format!(
-                        "{}, requested: {}, used: {}, limited: {}",
-                        key, pod_request, baseline, limit
-                    ));
-                }
-            }
-        }
-
-        if !exceeded.is_empty() {
+        // Only the dimensions this request actually charges can fail: a
+        // namespace already over quota on some other dimension must not block
+        // a pod that does not ask for it (`controller.go:617`).
+        let compared = quota::mask(&new_usage, &quota::resource_names(&requested));
+        let (allowed, exceeded) = quota::less_than_or_equal(&compared, &hard);
+        if !allowed {
+            // Upstream's message, verbatim modulo the "Forbidden: " prefix the
+            // caller supplies: `exceeded quota: <name>, requested: <list>,
+            // used: <list>, limited: <list>` where each list is
+            // `prettyPrint(Mask(.., exceeded))` (`controller.go:619-625`).
             warn!(
-                "Forbidden: exceeded quota: {}, {}",
-                quota.metadata.name,
-                exceeded.join(", ")
+                "Forbidden: exceeded quota: {}, requested: {}, used: {}, limited: {}",
+                quota_obj.metadata.name,
+                quota::pretty_print(&quota::mask(&requested, &exceeded)),
+                quota::pretty_print(&quota::mask(&used, &exceeded)),
+                quota::pretty_print(&quota::mask(&hard, &exceeded)),
             );
             return Ok(false);
         }
 
-        // Atomically update quota status.used via CAS.
-        // K8s ref: controller.go:288 — UpdateQuotaStatus with resourceVersion.
-        // On UPDATE we don't bump pod count (slot already taken); on CREATE we do.
+        // Record the new usage. Upstream sets `Status.Used = newUsage`
+        // (`controller.go:630`) — the full add, not just the compared subset.
         let quota_key = format!(
             "/registry/resourcequotas/{}/{}",
-            namespace, quota.metadata.name
+            namespace, quota_obj.metadata.name
         );
-        let status = quota.status.get_or_insert_with(|| {
-            rusternetes_common::resources::ResourceQuotaStatus {
-                hard: quota.spec.hard.clone(),
-                used: None,
-            }
-        });
-        status.used = Some(new_usage);
-
-        if let Err(e) = storage.update(&quota_key, &quota).await {
-            warn!(
-                "Failed to atomically update quota usage for {}: {} — retrying with fresh data",
-                quota.metadata.name, e
-            );
-            // CAS conflict: re-read quota and retry once
-            if let Ok(fresh_quota) = storage.get::<ResourceQuota>(&quota_key).await {
-                let mut retry_quota = fresh_quota;
-                // Re-check with fresh data — simplified: just recount.
-                let fresh_usage = calculate_namespace_usage(storage, namespace).await?;
-                if let Some(pod_limit_str) =
-                    retry_quota.spec.hard.as_ref().and_then(|h| h.get("pods"))
-                {
-                    let fresh_pods = fresh_usage
-                        .get("pods")
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .unwrap_or(0);
-                    let limit = pod_limit_str.parse::<i64>().unwrap_or(i64::MAX);
-                    // CREATE adds +1; UPDATE doesn't (slot already counted).
-                    let projected = fresh_pods + if old_pod.is_none() { 1 } else { 0 };
-                    if projected > limit {
-                        return Ok(false);
-                    }
-                }
-                let mut retry_usage = fresh_usage;
-                if old_pod.is_none() {
-                    let pods_count = retry_usage
-                        .get("pods")
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .unwrap_or(0);
-                    retry_usage.insert("pods".to_string(), (pods_count + 1).to_string());
-                }
-                let status = retry_quota.status.get_or_insert_with(|| {
-                    rusternetes_common::resources::ResourceQuotaStatus {
-                        hard: retry_quota.spec.hard.clone(),
-                        used: None,
-                    }
-                });
-                status.used = Some(retry_usage);
-                let _ = storage.update(&quota_key, &retry_quota).await;
-            }
-        }
+        write_quota_usage(storage, &quota_key, &mut quota_obj, &new_usage).await;
     }
 
     Ok(true)
 }
 
-/// Sum the request value for a named extended resource across all
-/// containers in `pod`. Returns 0 if the resource is unset or unparseable.
-fn sum_extended_request(pod: &Pod, ext_name: &str) -> i64 {
-    pod.spec
-        .as_ref()
-        .map(|s| {
-            s.containers
-                .iter()
-                .filter_map(|c| {
-                    c.resources
-                        .as_ref()
-                        .and_then(|r| r.requests.as_ref())
-                        .and_then(|reqs| reqs.get(ext_name))
-                        .and_then(|v| v.parse::<i64>().ok())
-                })
-                .sum::<i64>()
-        })
-        .unwrap_or(0)
+/// Sum the quota footprint of every pod in `namespace` that `quota_obj`'s scopes
+/// match — the figure `status.used` would hold.
+///
+/// Upstream equivalent is `generic.CalculateUsageStats`
+/// (`staging/src/k8s.io/apiserver/pkg/quota/v1/generic/evaluator.go`): filter by
+/// scope, then `quota.Add` each object's `Usage`. `pod_usage` carries the
+/// `QuotaV1Pod` rule with it, so a terminal pod contributes only `count/pods`
+/// and a terminating one keeps its charge until its grace period elapses.
+async fn namespace_usage<S: Storage>(
+    storage: &Arc<S>,
+    namespace: &str,
+    quota_obj: &ResourceQuota,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<quota::ResourceList> {
+    let pod_prefix = format!("/registry/pods/{}/", namespace);
+    let pods: Vec<Pod> = storage.list(&pod_prefix).await?;
+    let mut usage = quota::ResourceList::new();
+    for pod in pods
+        .iter()
+        .filter(|p| pod_matches_quota_scopes(p, quota_obj))
+    {
+        usage = quota::add(&usage, &quota::pod_usage(pod, now));
+    }
+    Ok(usage)
+}
+
+/// Write `new_usage` into the quota's `status.used`, masked to its hard keys.
+///
+/// A CAS conflict means a concurrent admission or a controller re-sync got
+/// there first; both write a figure derived from the same pod list, so the
+/// retry just recomputes and writes again rather than re-running the check.
+/// Upstream retries the whole evaluation up to three times
+/// (`checkQuotas(..., remainingRetries)`); here the controller's own reconcile
+/// converges the value regardless, so one retry is enough.
+async fn write_quota_usage<S: Storage>(
+    storage: &Arc<S>,
+    quota_key: &str,
+    quota_obj: &mut ResourceQuota,
+    new_usage: &quota::ResourceList,
+) {
+    let hard = quota_obj.spec.hard.clone();
+    let used = masked_used(new_usage, hard.as_ref());
+
+    let status = quota_obj.status.get_or_insert_with(|| {
+        rusternetes_common::resources::ResourceQuotaStatus {
+            hard: hard.clone(),
+            used: None,
+        }
+    });
+    status.used = Some(used);
+
+    if let Err(e) = storage.update(quota_key, quota_obj).await {
+        warn!(
+            "Failed to atomically update quota usage for {}: {} — retrying with fresh data",
+            quota_obj.metadata.name, e
+        );
+        if let Ok(mut fresh) = storage.get::<ResourceQuota>(quota_key).await {
+            let fresh_hard = fresh.spec.hard.clone();
+            let used = masked_used(new_usage, fresh_hard.as_ref());
+            let status = fresh.status.get_or_insert_with(|| {
+                rusternetes_common::resources::ResourceQuotaStatus {
+                    hard: fresh_hard.clone(),
+                    used: None,
+                }
+            });
+            status.used = Some(used);
+            let _ = storage.update(quota_key, &fresh).await;
+        }
+    }
+}
+
+/// `status.used` as canonical strings, restricted to the quota's hard keys and
+/// defaulting each of them to `"0"`. Mirrors what the quota controller writes,
+/// so the two do not fight over the same field
+/// (`quota.Mask(used, hardResources)` in `syncResourceQuota`).
+fn masked_used(
+    new_usage: &quota::ResourceList,
+    hard: Option<&HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let mut used = quota::to_string_map(new_usage);
+    if let Some(hard) = hard {
+        for key in hard.keys() {
+            used.entry(key.clone()).or_insert_with(|| "0".to_string());
+        }
+        used.retain(|key, _| hard.contains_key(key));
+    }
+    used
 }
 
 /// Apply LimitRange defaults and validate constraints
@@ -750,168 +611,6 @@ pub async fn apply_limit_range_to_pvc<S: Storage>(
     Ok(true)
 }
 
-// Helper functions
-
-async fn calculate_namespace_usage<S: Storage>(
-    storage: &Arc<S>,
-    namespace: &str,
-) -> anyhow::Result<HashMap<String, String>> {
-    let mut usage = HashMap::new();
-
-    // Count ACTIVE pods (exclude terminal and terminating).
-    // K8s only counts non-terminal pods against quota.
-    // K8s ref: pkg/quota/v1/evaluator/core/pods.go — PodEvaluator
-    let pod_prefix = format!("/registry/pods/{}/", namespace);
-    let pods: Vec<Pod> = storage.list(&pod_prefix).await?;
-    let active_pods: Vec<&Pod> = pods
-        .iter()
-        .filter(|p| {
-            let phase = p.status.as_ref().and_then(|s| s.phase.as_ref());
-            !matches!(
-                phase,
-                Some(rusternetes_common::types::Phase::Succeeded)
-                    | Some(rusternetes_common::types::Phase::Failed)
-            ) && p.metadata.deletion_timestamp.is_none()
-        })
-        .collect();
-    usage.insert("pods".to_string(), active_pods.len().to_string());
-
-    // Calculate CPU and memory requests from ACTIVE pods only
-    let mut total_cpu_requests = 0i64;
-    let mut total_memory_requests = 0i64;
-
-    for pod in &active_pods {
-        if let Some(spec) = &pod.spec {
-            for container in &spec.containers {
-                if let Some(resources) = &container.resources {
-                    if let Some(requests) = &resources.requests {
-                        if let Some(cpu) = requests.get("cpu") {
-                            if let Ok(millis) = parse_cpu_to_millicores(cpu) {
-                                total_cpu_requests += millis;
-                            }
-                        }
-                        if let Some(memory) = requests.get("memory") {
-                            if let Ok(bytes) = parse_memory_to_bytes(memory) {
-                                total_memory_requests += bytes;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if total_cpu_requests > 0 {
-        usage.insert(
-            "requests.cpu".to_string(),
-            millicores_to_cpu_string(total_cpu_requests),
-        );
-    }
-    if total_memory_requests > 0 {
-        usage.insert(
-            "requests.memory".to_string(),
-            bytes_to_memory_string(total_memory_requests),
-        );
-    }
-
-    // Count extended resources (anything that's not cpu/memory/ephemeral-storage)
-    let mut extended_totals: HashMap<String, i64> = HashMap::new();
-    for pod in &active_pods {
-        if let Some(spec) = &pod.spec {
-            for container in &spec.containers {
-                if let Some(resources) = &container.resources {
-                    if let Some(requests) = &resources.requests {
-                        for (key, val) in requests {
-                            if key != "cpu" && key != "memory" && key != "ephemeral-storage" {
-                                if let Ok(n) = val.parse::<i64>() {
-                                    *extended_totals
-                                        .entry(format!("requests.{}", key))
-                                        .or_insert(0) += n;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    for (key, total) in extended_totals {
-        usage.insert(key, total.to_string());
-    }
-
-    Ok(usage)
-}
-
-fn calculate_pod_requests(pod: &Pod) -> HashMap<String, i64> {
-    let mut requests = HashMap::new();
-    let mut total_cpu = 0i64;
-    let mut total_memory = 0i64;
-
-    if let Some(spec) = &pod.spec {
-        for container in &spec.containers {
-            if let Some(resources) = &container.resources {
-                if let Some(reqs) = &resources.requests {
-                    if let Some(cpu) = reqs.get("cpu") {
-                        if let Ok(millis) = parse_cpu_to_millicores(cpu) {
-                            total_cpu += millis;
-                        }
-                    }
-                    if let Some(memory) = reqs.get("memory") {
-                        if let Ok(bytes) = parse_memory_to_bytes(memory) {
-                            total_memory += bytes;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if total_cpu > 0 {
-        requests.insert("cpu".to_string(), total_cpu);
-    }
-    if total_memory > 0 {
-        requests.insert("memory".to_string(), total_memory);
-    }
-
-    requests
-}
-
-fn calculate_pod_limits_cpu(pod: &Pod) -> i64 {
-    let mut total = 0i64;
-    if let Some(spec) = &pod.spec {
-        for container in &spec.containers {
-            if let Some(resources) = &container.resources {
-                if let Some(limits) = &resources.limits {
-                    if let Some(cpu) = limits.get("cpu") {
-                        if let Ok(millis) = parse_cpu_to_millicores(cpu) {
-                            total += millis;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    total
-}
-
-fn calculate_pod_limits_memory(pod: &Pod) -> i64 {
-    let mut total = 0i64;
-    if let Some(spec) = &pod.spec {
-        for container in &spec.containers {
-            if let Some(resources) = &container.resources {
-                if let Some(limits) = &resources.limits {
-                    if let Some(memory) = limits.get("memory") {
-                        if let Ok(bytes) = parse_memory_to_bytes(memory) {
-                            total += bytes;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    total
-}
-
 fn validate_min_resources(
     resources: &ResourceRequirements,
     min: &HashMap<String, String>,
@@ -1066,14 +765,6 @@ fn validate_ratio(
 /// Millicores/bytes are the units upstream's scheduler accounts these in
 /// (`Resource.Add`, `../kubernetes/pkg/scheduler/framework/types.go:917-918`),
 /// and `Quantity` rounds both up away from zero as upstream `ScaledValue` does.
-/// Canonical `resource.Quantity` string for a millicore total, so projected
-/// quota usage is spelled the way upstream spells it: a whole number of cores
-/// is `"2"`, not the `"2000m"` a `format!("{}m", ..)` emits
-/// (`NewMilliQuantity`, `quantity.go:797`).
-fn millicores_to_cpu_string(millicores: i64) -> String {
-    Quantity::from_milli_value(millicores, Format::DecimalSI).canonical_string()
-}
-
 fn parse_cpu_to_millicores(cpu: &str) -> anyhow::Result<i64> {
     Ok(parse_resource_value(cpu, "cpu")?)
 }
@@ -1087,43 +778,6 @@ fn parse_cpu_to_millicores(cpu: &str) -> anyhow::Result<i64> {
 /// `"1GiGi"` read as 1Gi.
 fn parse_memory_to_bytes(memory: &str) -> anyhow::Result<i64> {
     Ok(parse_resource_value(memory, "memory")?)
-}
-
-/// Resolve a `ResourceQuota.spec.hard` entry to the ceiling admission enforces.
-///
-/// An unparseable limit cannot be enforced, so it reads as unlimited — the
-/// pre-existing behaviour, kept because denying every pod in the namespace is
-/// the worse failure. Upstream has no equivalent branch (`hard` is a typed
-/// `resource.Quantity`), so reaching this means a value our own validation let
-/// through: say so instead of silently disabling the quota dimension.
-fn quota_limit(parsed: anyhow::Result<i64>, resource: &str, raw: &str) -> i64 {
-    match parsed {
-        Ok(limit) => limit,
-        Err(e) => {
-            warn!(
-                "ResourceQuota hard limit {} = {:?} is not a valid quantity ({}); \
-                 treating that dimension as unlimited",
-                resource, raw, e
-            );
-            i64::MAX
-        }
-    }
-}
-
-fn bytes_to_memory_string(bytes: i64) -> String {
-    const GI: i64 = 1024 * 1024 * 1024;
-    const MI: i64 = 1024 * 1024;
-    const KI: i64 = 1024;
-
-    if bytes >= GI && bytes % GI == 0 {
-        format!("{}Gi", bytes / GI)
-    } else if bytes >= MI && bytes % MI == 0 {
-        format!("{}Mi", bytes / MI)
-    } else if bytes >= KI && bytes % KI == 0 {
-        format!("{}Ki", bytes / KI)
-    } else {
-        format!("{}", bytes)
-    }
 }
 
 /// DefaultStorageClass admission controller - sets default storage class for PVCs
@@ -1698,19 +1352,17 @@ mod tests {
         assert!(parse_cpu_to_millicores("100mm").is_err());
     }
 
-    /// An unparseable quota limit still reads as unlimited — denying every pod
-    /// in the namespace is the worse failure — but it is no longer silent.
+    /// An unparseable `spec.hard` value leaves that one dimension unenforced
+    /// without taking the rest of the quota with it. The old code reached the
+    /// same outcome via a per-key `unwrap_or(i64::MAX)`; now there is one place
+    /// where a bad quantity is dropped, and the surviving keys still bind.
     #[test]
-    fn quota_limit_falls_back_to_unlimited() {
-        assert_eq!(quota_limit(Ok(42), "requests.cpu", "42m"), 42);
-        assert_eq!(
-            quota_limit(
-                parse_memory_to_bytes("nonsense"),
-                "requests.memory",
-                "nonsense"
-            ),
-            i64::MAX
-        );
+    fn unparseable_hard_value_drops_only_its_own_dimension() {
+        let mut hard = HashMap::new();
+        hard.insert("requests.cpu".to_string(), "1".to_string());
+        hard.insert("requests.memory".to_string(), "nonsense".to_string());
+        let parsed = quota::parse_resource_list(&hard);
+        assert_eq!(quota::resource_names(&parsed), vec!["requests.cpu"]);
     }
 
     // ---- LimitRange admission tests ----

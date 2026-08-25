@@ -20,6 +20,7 @@ pub mod observability;
 pub mod pagination;
 pub mod protobuf;
 pub mod quantity;
+pub mod quota;
 pub mod resources;
 pub mod schema_validation;
 pub mod server_side_apply;
