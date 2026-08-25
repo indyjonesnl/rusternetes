@@ -110,12 +110,19 @@ fn every_it_module_file_is_declared() {
     );
 }
 
+/// Marker a top-level test file uses to declare that it needs its own process,
+/// followed by the reason. Some tests genuinely cannot share a binary — a
+/// `OnceLock` that latches an env var on first read is the usual cause — so the
+/// rule is "justify it in the file", not "never".
+const SEPARATE_BINARY_MARKER: &str = "SEPARATE-TEST-BINARY:";
+
 /// A stray `tests/*.rs` next to `tests/it/` silently reintroduces the very
 /// per-file test binary the consolidation removed. Cheap to detect, so detect
-/// it rather than letting the win erode a file at a time.
+/// it rather than letting the win erode a file at a time. Files carrying
+/// [`SEPARATE_BINARY_MARKER`] are deliberate and exempt.
 #[test]
-fn consolidated_crates_have_no_stray_top_level_test_files() {
-    let strays: Vec<String> = consolidated_test_dirs()
+fn stray_top_level_test_files_justify_themselves() {
+    let unjustified: Vec<String> = consolidated_test_dirs()
         .iter()
         .filter_map(|it_dir| it_dir.parent().map(Path::to_path_buf))
         .flat_map(|tests_dir| {
@@ -124,15 +131,21 @@ fn consolidated_crates_have_no_stray_top_level_test_files() {
                 .filter_map(|entry| entry.ok())
                 .map(|entry| entry.path())
                 .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+                .filter(|path| {
+                    let source = std::fs::read_to_string(path).expect("test file is readable");
+                    !source.contains(SEPARATE_BINARY_MARKER)
+                })
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
         })
         .collect();
 
     assert!(
-        strays.is_empty(),
-        "these files are separate test binaries again; move them into \
-         `tests/it/` and add a `mod` line:\n  {}",
-        strays.join("\n  ")
+        unjustified.is_empty(),
+        "these files are separate test binaries again, which is what the \
+         `tests/it/` layout exists to avoid. Move each into `tests/it/` and add \
+         a `mod` line -- or, if it truly needs its own process, say why in a \
+         `{SEPARATE_BINARY_MARKER}` comment in the file:\n  {}",
+        unjustified.join("\n  ")
     );
 }
