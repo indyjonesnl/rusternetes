@@ -19,6 +19,7 @@ pub mod leader_election;
 pub mod observability;
 pub mod pagination;
 pub mod protobuf;
+pub mod qos;
 pub mod quantity;
 pub mod quota;
 pub mod resources;

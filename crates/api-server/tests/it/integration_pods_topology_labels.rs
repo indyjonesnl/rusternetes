@@ -1108,6 +1108,94 @@ async fn test_node_declared_feature_admission() {
     reset_to_defaults();
 }
 
+/// Regression: the CPU-resize gate reads the *shared* QoS port, so a pod that
+/// is only Guaranteed if `spec.initContainers` are ignored is **not** gated.
+///
+/// The api-server's resize admission used to carry its own partial
+/// Guaranteed-only check that looked at `spec.containers` alone. Upstream's
+/// admission asks the same classifier everything else does
+/// (`qos.GetPodQOS` → `ComputePodQOS`), which folds init containers into the
+/// container set (`pkg/apis/core/v1/helper/qos/qos.go:113-116`). An init
+/// container declaring no limits therefore makes the pod `Burstable`, and a CPU
+/// resize on it must be admitted even on a node that does not declare
+/// `GuaranteedQoSPodCPUResize`.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_cpu_resize_gate_skips_pod_burstable_via_init_container() {
+    use rusternetes_common::feature_gates::{reset_to_defaults, with_feature, Feature};
+    use rusternetes_common::resources::{Node, NodeStatus};
+    use rusternetes_storage::Storage;
+
+    let (mem, router) = spawn_router();
+    let ns = "init-container-qos-resize";
+    create_namespace(&router, ns).await;
+
+    let _g1 = with_feature(Feature::NodeDeclaredFeatures, true);
+    let _g2 = with_feature(Feature::InPlacePodVerticalScaling, true);
+
+    // Node without `GuaranteedQoSPodCPUResize` — the gate would fire here if
+    // the pod were classified Guaranteed.
+    let mut node = Node::new("node-without-features");
+    node.status = Some(NodeStatus {
+        declared_features: None,
+        ..Default::default()
+    });
+    mem.create(
+        &rusternetes_storage::build_key("nodes", None, "node-without-features"),
+        &node,
+    )
+    .await
+    .expect("seed node");
+
+    let pod_name = "guaranteed-app-burstable-init";
+    let mut pod = prototype_pod(pod_name);
+    pod["spec"]["nodeName"] = json!("node-without-features");
+    pod["spec"]["containers"][0]["resources"] = json!({
+        "requests": { "cpu": "100m", "memory": "64Mi" },
+        "limits":   { "cpu": "100m", "memory": "64Mi" },
+    });
+    // Requests only, no limits: this container is what drops the pod to
+    // Burstable, and the old check never looked at it.
+    pod["spec"]["initContainers"] = json!([{
+        "name": "init",
+        "image": "busybox",
+        "resources": { "requests": { "cpu": "10m", "memory": "16Mi" } },
+    }]);
+    let (st, body) = post_json(&router, &format!("/api/v1/namespaces/{}/pods", ns), &pod).await;
+    assert!(
+        st == 201 || st == 200,
+        "create must succeed: status={} body={}",
+        st,
+        body
+    );
+    assert_eq!(
+        body["status"]["qosClass"].as_str(),
+        Some("Burstable"),
+        "the limits-less init container must drop the published qosClass to          Burstable: {}",
+        body
+    );
+
+    let mut resize_body = pod.clone();
+    resize_body["spec"]["containers"][0]["resources"] = json!({
+        "requests": { "cpu": "200m", "memory": "64Mi" },
+        "limits":   { "cpu": "200m", "memory": "64Mi" },
+    });
+    let (st, body) = put_json(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods/{}/resize", ns, pod_name),
+        &resize_body,
+    )
+    .await;
+    assert!(
+        st == 200 || st == 201,
+        "CPU resize on a Burstable pod must not consult the node's declared          features: status={} body={}",
+        st,
+        body
+    );
+
+    reset_to_defaults();
+}
+
 // ---------------------------------------------------------------------------
 // Upstream conformance mirrors — [Conformance] tests that exercise
 // ValidatePodUpdate. All three are gated by f.WithNodeConformance() in

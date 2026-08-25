@@ -1260,40 +1260,21 @@ async fn compute_pdb_disruptions_allowed<S: Storage>(
 /// admit a `/pods/{name}/resize` request that mutates a Guaranteed pod's CPU.
 pub(crate) const GUARANTEED_QOS_POD_CPU_RESIZE: &str = "GuaranteedQoSPodCPUResize";
 
-/// Returns `true` if `pod` is Guaranteed-QoS (all containers have `cpu` AND
-/// `memory` in both `requests` and `limits`, with `requests == limits`).
+/// Returns `true` if `pod` is Guaranteed-QoS.
 ///
-/// Mirrors `pkg/apis/core/v1/helper/qos/qos.go::GetPodQOS` for the Guaranteed
-/// branch. Keeping the helper local avoids dragging the full QoS classifier
-/// into the resize path — the admission check only needs the Guaranteed/not
-/// distinction.
+/// Delegates to [`rusternetes_common::qos::get_pod_qos`], the port of
+/// `pkg/apis/core/v1/helper/qos/qos.go::GetPodQOS`. Upstream's gate reads the
+/// **published** class off the pod being resized
+/// (`guaranteed_cpu_resize.go:64`, `oldPodInfo.Status.QOSClass !=
+/// v1.PodQOSGuaranteed`), which is what `get_pod_qos` prefers before falling
+/// back to computing.
+///
+/// The partial Guaranteed-only check this used to carry — `spec.containers`
+/// only, quantities compared as strings — is gone: a pod whose init container
+/// declares no limits is `Burstable`, so the CPU-resize gate must not fire for
+/// it.
 fn is_guaranteed_qos(pod: &rusternetes_common::resources::Pod) -> bool {
-    let Some(spec) = pod.spec.as_ref() else {
-        return false;
-    };
-    if spec.containers.is_empty() {
-        return false;
-    }
-    for c in &spec.containers {
-        let Some(res) = c.resources.as_ref() else {
-            return false;
-        };
-        let has_limits = res
-            .limits
-            .as_ref()
-            .is_some_and(|l| l.contains_key("cpu") && l.contains_key("memory"));
-        if !has_limits {
-            return false;
-        }
-        // For Guaranteed, requests must either be absent (defaulted from
-        // limits) or equal to limits. Upstream `qos.go` collapses these.
-        if let Some(req) = res.requests.as_ref() {
-            if res.limits.as_ref() != Some(req) {
-                return false;
-            }
-        }
-    }
-    true
+    rusternetes_common::qos::get_pod_qos(pod) == rusternetes_common::qos::QoSClass::Guaranteed
 }
 
 /// Returns `true` if the CPU resource request OR limit differs between any

@@ -542,43 +542,16 @@ pub async fn create(
         pod.status = Some(status);
     }
 
-    // Compute and set QoS class
+    // Compute and set QoS class. The api-server is the authoritative writer —
+    // upstream does it in the registry strategy
+    // (`pkg/registry/core/pod/strategy.go:92`, `QOSClass: qos.GetPodQOS(pod)`)
+    // — and the kubelet recomputes the same value for the status it posts
+    // (`pkg/kubelet/kubelet_pods.go:2097`), so both sides call the one port of
+    // `ComputePodQOS` rather than deriving it here.
     {
-        let qos = if let Some(spec) = &pod.spec {
-            let mut all_guaranteed = true;
-            let mut any_resources = false;
-            for c in &spec.containers {
-                if let Some(res) = &c.resources {
-                    let has_limits = res
-                        .limits
-                        .as_ref()
-                        .is_some_and(|l| l.contains_key("cpu") && l.contains_key("memory"));
-                    let has_requests = res
-                        .requests
-                        .as_ref()
-                        .is_some_and(|r| r.contains_key("cpu") && r.contains_key("memory"));
-                    if has_limits || has_requests {
-                        any_resources = true;
-                    }
-                    if !has_limits || (has_requests && res.limits != res.requests) {
-                        all_guaranteed = false;
-                    }
-                } else {
-                    all_guaranteed = false;
-                }
-            }
-            if !any_resources {
-                "BestEffort"
-            } else if all_guaranteed {
-                "Guaranteed"
-            } else {
-                "Burstable"
-            }
-        } else {
-            "BestEffort"
-        };
+        let qos = rusternetes_common::qos::compute_pod_qos(&pod);
         let status = pod.status.get_or_insert_with(Default::default);
-        status.qos_class = Some(qos.to_string());
+        status.qos_class = Some(qos.as_str().to_string());
     }
 
     let key = build_key("pods", Some(&namespace), &pod.metadata.name);

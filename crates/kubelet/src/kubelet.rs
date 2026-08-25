@@ -5522,14 +5522,14 @@ impl Kubelet {
     /// (`apiPodStatus.QOSClass = v1qos.GetPodQOS(pod)`,
     /// `pkg/kubelet/kubelet_pods.go:2097`).
     ///
-    /// Delegates to [`crate::eviction::get_qos_class`], the port of
-    /// `ComputePodQOS`, so the class the kubelet publishes and the class the
-    /// eviction manager ranks pods by are the same computation. This used to be
-    /// a second implementation that ignored `spec.initContainers` and compared
-    /// quantities as strings, so it disagreed with the eviction copy on any pod
-    /// with an init container and on `cpu: "1"` vs `cpu: "1000m"`.
+    /// Delegates to [`rusternetes_common::qos::compute_pod_qos`], the one port
+    /// of `ComputePodQOS`, so the class the kubelet publishes, the class the
+    /// eviction manager ranks pods by, and the class the api-server wrote at
+    /// create time are the same computation.
     fn compute_qos_class(pod: &Pod) -> String {
-        crate::eviction::get_qos_class(pod).as_str().to_string()
+        rusternetes_common::qos::compute_pod_qos(pod)
+            .as_str()
+            .to_string()
     }
 
     async fn update_pod_status(
