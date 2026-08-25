@@ -222,6 +222,36 @@ fn apply_probe_defaults(probe: &mut rusternetes_common::resources::pod::Probe) {
     }
 }
 
+/// Apply the **Pod-only** K8s defaults — the ones upstream deliberately keeps
+/// out of `SetDefaults_PodSpec` so they never touch an embedded
+/// `PodTemplateSpec`.
+///
+/// Port of `SetDefaults_Pod` (`pkg/apis/core/v1/defaults.go:164-209`). Upstream
+/// reaches it only from `SetObjectDefaults_Pod`
+/// (`zz_generated.defaults.go:208`), whereas `SetDefaults_PodSpec` is reached
+/// from every workload's `SetObjectDefaults_*` as well. Two things depend on
+/// that separation:
+///
+/// - `enableServiceLinks` defaulting to true (`v1.DefaultEnableServiceLinks`)
+///   on a template would change the bytes a ControllerRevision hashes;
+/// - the requests-from-limits pass carries upstream's own explanation: "we only
+///   want this defaulting semantic to take place on a v1.Pod and not a
+///   v1.PodTemplate" (defaults.go:166-167).
+///
+/// The resource pass itself lives in `rusternetes_common::defaults` because the
+/// api-server is not the only decoder of a `v1.Pod` — the kubelet's static-pod
+/// reader needs the identical defaulting, and upstream gets it there for free by
+/// decoding through the scheme (`pkg/kubelet/config/common.go:122`).
+///
+/// Idempotent: the create path runs it before validation and again after
+/// mutating webhooks, matching upstream's re-defaulting of the mutated object.
+pub fn apply_pod_defaults(spec: &mut PodSpec) {
+    if spec.enable_service_links.is_none() {
+        spec.enable_service_links = Some(true);
+    }
+    rusternetes_common::defaults::default_pod_requests_from_limits(spec);
+}
+
 /// Apply K8s defaults to a PodTemplateSpec (used by workload resources).
 /// This is called for DaemonSet, Deployment, StatefulSet, ReplicaSet, Job, CronJob.
 pub fn apply_pod_template_defaults(template: &mut rusternetes_common::resources::PodTemplateSpec) {

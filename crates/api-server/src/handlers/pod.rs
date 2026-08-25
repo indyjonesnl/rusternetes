@@ -180,38 +180,9 @@ pub async fn create(
     // The Pod-only defaults below (enableServiceLinks, limits→requests) and the
     // LimitRange defaults do not affect that validation pass.
     if let Some(ref mut spec) = pod.spec {
-        // SetDefaults_Pod (Pod-only, NOT templates): enableServiceLinks defaults
-        // to true (v1.DefaultEnableServiceLinks). Defaulting this on embedded
-        // PodTemplateSpecs would diverge from upstream and break ControllerRevision
-        // byte-comparisons, so it lives here on the standalone Pod path.
-        // K8s ref: pkg/apis/core/v1/defaults.go SetDefaults_Pod.
-        if spec.enable_service_links.is_none() {
-            spec.enable_service_links = Some(true);
-        }
-
-        // K8s pod-only defaulting: if a container has explicit limits but no requests,
-        // default requests to the limit value. This happens BEFORE LimitRange so that
-        // explicit limits take precedence over LimitRange defaultRequest.
-        // K8s ref: SetDefaults_Pod (NOT SetDefaults_PodSpec — only on Pods, not templates)
-        for container in &mut spec.containers {
-            if let Some(ref limits) = container.resources.as_ref().and_then(|r| r.limits.clone()) {
-                if !limits.is_empty() {
-                    let resources = container.resources.get_or_insert({
-                        rusternetes_common::types::ResourceRequirements {
-                            limits: None,
-                            requests: None,
-                            claims: None,
-                        }
-                    });
-                    let requests = resources
-                        .requests
-                        .get_or_insert_with(std::collections::HashMap::new);
-                    for (key, value) in limits {
-                        requests.entry(key.clone()).or_insert_with(|| value.clone());
-                    }
-                }
-            }
-        }
+        // The Pod-only half of upstream defaulting. Runs BEFORE LimitRange so an
+        // explicit limit takes precedence over a LimitRange defaultRequest.
+        crate::handlers::defaults::apply_pod_defaults(spec);
 
         // LimitRange defaults are applied by apply_limit_range_with() below.
     }
@@ -377,10 +348,7 @@ pub async fn create(
     // K8s ref: staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go
     if let Some(ref mut spec) = pod.spec {
         crate::handlers::defaults::apply_pod_spec_defaults(spec);
-        // SetDefaults_Pod (Pod-only): enableServiceLinks defaults to true.
-        if spec.enable_service_links.is_none() {
-            spec.enable_service_links = Some(true);
-        }
+        crate::handlers::defaults::apply_pod_defaults(spec);
     }
 
     // Inject service account token (built-in admission controller)

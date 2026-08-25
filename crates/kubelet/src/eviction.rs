@@ -844,12 +844,14 @@ pub fn get_qos_class(pod: &Pod) -> QoSClass {
         .chain(spec.init_containers.iter().flatten())
     {
         // Upstream classifies an already-defaulted pod: `SetDefaults_Pod`
-        // (`pkg/apis/core/v1/defaults.go:164-180`) has copied limits into unset
+        // (`pkg/apis/core/v1/defaults.go:164-192`) has copied limits into unset
         // requests long before the kubelet sees it, which is why a limits-only
         // container is Guaranteed upstream even though `ComputePodQOS` itself
-        // never looks at limits when filling `requests`. The rusternetes
-        // api-server has no such pass yet, so apply it to a local copy — the
-        // same compensation, and the same helper, the downward-API resolver uses.
+        // never looks at limits when filling `requests`. Rusternetes applies it
+        // in the same two places upstream does — pod create and static-pod
+        // decode — so this is normally a no-op; it is re-applied to a local copy
+        // because a pod read back out of storage carries no proof of that, and
+        // reclassifying such a pod would change which victim gets evicted.
         let mut container = container.clone();
         crate::downward_api::default_requests_from_limits(&mut container);
         let resources = container.resources.as_ref();
