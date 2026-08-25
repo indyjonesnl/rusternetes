@@ -99,6 +99,23 @@ fn extract_resource_type_from_uri(uri: &Uri) -> String {
     }
 }
 
+/// Extract the API group from the request URI, for authorization.
+///
+/// `/apis/{group}/{version}/...` carries a group; `/api/v1/...` is the core
+/// group, which upstream represents as the empty string. RBAC matches on this
+/// (`apiGroups:` in a PolicyRule), so a grouped resource authorized with an
+/// empty group matches no rule at all — see
+/// `api_group_is_extracted_from_the_request_uri`.
+fn extract_api_group_from_uri(uri: &Uri) -> String {
+    let path = uri.path();
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    match segments.next() {
+        Some("apis") => segments.next().unwrap_or("").to_string(),
+        // "api" (core) or anything unexpected: the core group is "".
+        _ => String::new(),
+    }
+}
+
 /// Map resource type to Kind and apiVersion for TypeMeta injection.
 fn resource_type_to_kind_api_version(resource_type: &str) -> (String, String) {
     match resource_type {
@@ -284,6 +301,7 @@ pub async fn update_status(
 
     // Check authorization - use 'update' verb with '/status' subresource
     let attrs = RequestAttributes::new(auth_ctx.user, "update", &resource_type)
+        .with_api_group(extract_api_group_from_uri(&uri))
         .with_namespace(&namespace)
         .with_name(&name)
         .with_subresource("status");
@@ -458,6 +476,7 @@ pub async fn update_cluster_status(
 
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "update", &resource_type)
+        .with_api_group(extract_api_group_from_uri(&uri))
         .with_name(&name)
         .with_subresource("status");
 
@@ -702,6 +721,7 @@ pub async fn get_status(
 
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "get", &resource_type)
+        .with_api_group(extract_api_group_from_uri(&uri))
         .with_namespace(&namespace)
         .with_name(&name)
         .with_subresource("status");
@@ -740,6 +760,7 @@ pub async fn get_cluster_status(
 
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "get", &resource_type)
+        .with_api_group(extract_api_group_from_uri(&uri))
         .with_name(&name)
         .with_subresource("status");
 
@@ -769,6 +790,56 @@ pub async fn get_cluster_status(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The authorizer must see the request's real API group. RBAC rules name a
+    /// group ("apps" for deployments/status), so authorizing a
+    /// `/apis/apps/v1/...` status write as if it were core ("") matches no rule
+    /// and the request is denied — which is what silently unauthorizes the
+    /// vanilla kube-controller-manager's per-controller ServiceAccounts in a
+    /// vanilla-swap cluster (its RBAC grants
+    /// `apiGroups:["apps","extensions"], resources:["deployments/status"]`).
+    #[test]
+    fn api_group_is_extracted_from_the_request_uri() {
+        let cases = [
+            // namespaced, grouped
+            (
+                "/apis/apps/v1/namespaces/default/deployments/probe/status",
+                "apps",
+                "deployments",
+            ),
+            (
+                "/apis/batch/v1/namespaces/default/jobs/j/status",
+                "batch",
+                "jobs",
+            ),
+            // cluster-scoped, grouped
+            (
+                "/apis/storage.k8s.io/v1/volumeattachments/va/status",
+                "storage.k8s.io",
+                "volumeattachments",
+            ),
+            // core group stays empty
+            ("/api/v1/namespaces/default/pods/p/status", "", "pods"),
+            ("/api/v1/nodes/n1/status", "", "nodes"),
+            ("/api/v1/namespaces/ns1/status", "", "namespaces"),
+        ];
+
+        for (path, want_group, want_resource) in cases {
+            let uri: Uri = path.parse().expect("parse uri");
+            assert_eq!(
+                extract_api_group_from_uri(&uri),
+                want_group,
+                "api group for {}",
+                path
+            );
+            assert_eq!(
+                extract_resource_type_from_uri(&uri),
+                want_resource,
+                "resource for {}",
+                path
+            );
+        }
+    }
 
     #[test]
     fn test_status_update_preserves_generation() {

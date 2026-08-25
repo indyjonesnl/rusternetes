@@ -190,6 +190,7 @@ mod ssa_secret_apply_test;
 mod statefulset_handler_test;
 mod statefulset_pvc_retention_default_test;
 mod status_field_error_shape_test;
+mod status_subresource_api_group_authz;
 mod status_subresource_test;
 mod storageclass_handler_test;
 mod strategy_batch_test;
