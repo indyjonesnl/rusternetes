@@ -238,27 +238,72 @@ impl Quantity {
         self.cmp_value(other) == std::cmp::Ordering::Equal
     }
 
-    /// Subtract `other` from `self`, returning a new `Quantity`.
-    ///
-    /// The result inherits the format of `self` (the "capacity" side)
-    /// so that `8Gi - 1Gi` canonicalises as `7Gi`.  Returns `None` on
-    /// overflow (i128 mantissa).
-    ///
-    /// Used by `NodeController` to compute `allocatable = capacity - reserved`.
-    pub fn sub(&self, other: &Quantity) -> Option<Quantity> {
-        // Bring both operands to a common scale = min(self.scale, other.scale)
-        // so the mantissas can be subtracted directly.
+    /// Bring `self` and `other` onto a common scale so their mantissas can be
+    /// combined directly. Returns `(a, b, scale)`, or `None` if either
+    /// mantissa overflows `i128` at that scale.
+    fn align(&self, other: &Quantity) -> Option<(i128, i128, i32)> {
         let common = self.scale.min(other.scale);
         let shift_a = (self.scale - common) as u32;
         let shift_b = (other.scale - common) as u32;
         let a = self.mantissa.checked_mul(10i128.checked_pow(shift_a)?)?;
         let b = other.mantissa.checked_mul(10i128.checked_pow(shift_b)?)?;
-        let result = a.checked_sub(b)?;
+        Some((a, b, common))
+    }
+
+    /// Subtract `other` from `self`, returning a new `Quantity`. Port of
+    /// upstream `Quantity.Sub` (`quantity.go:618-627`).
+    ///
+    /// The result inherits the format of `self` (the "capacity" side) so that
+    /// `8Gi - 1Gi` canonicalises as `7Gi` — except when `self` is zero, where
+    /// upstream adopts `other`'s format (`quantity.go:620-622`) so that
+    /// `0 - 1Gi` prints as `-1Gi` and not `-1073741824`.  Returns `None` on
+    /// overflow (i128 mantissa).
+    ///
+    /// Used by `NodeController` to compute `allocatable = capacity - reserved`.
+    pub fn sub(&self, other: &Quantity) -> Option<Quantity> {
+        let (a, b, common) = self.align(other)?;
         Some(Quantity {
-            mantissa: result,
+            mantissa: a.checked_sub(b)?,
             scale: common,
-            format: self.format,
+            format: self.effective_format(other),
         })
+    }
+
+    /// Add `other` to `self`, returning a new `Quantity`. Port of upstream
+    /// `Quantity.Add` (`quantity.go:601-614`).
+    ///
+    /// The result inherits the format of `self`, unless `self` is zero — then
+    /// it adopts `other`'s (`quantity.go:604-606`). That rule is what makes an
+    /// accumulator work: folding `0 + 512Mi + 512Mi` yields `1Gi`, whereas an
+    /// unconditional `self.format` would print the `DecimalSI` of the seed.
+    /// Returns `None` on overflow (i128 mantissa).
+    pub fn add(&self, other: &Quantity) -> Option<Quantity> {
+        let (a, b, common) = self.align(other)?;
+        Some(Quantity {
+            mantissa: a.checked_add(b)?,
+            scale: common,
+            format: self.effective_format(other),
+        })
+    }
+
+    /// Negate this quantity. Port of upstream `Quantity.Neg`
+    /// (`quantity.go:658-665`); the format is untouched.
+    pub fn neg(&self) -> Quantity {
+        Quantity {
+            mantissa: -self.mantissa,
+            scale: self.scale,
+            format: self.format,
+        }
+    }
+
+    /// The format an in-place `Add`/`Sub` would leave behind: `self`'s, unless
+    /// `self` is zero, in which case upstream adopts the operand's.
+    fn effective_format(&self, other: &Quantity) -> Format {
+        if self.mantissa == 0 {
+            other.format
+        } else {
+            self.format
+        }
     }
 
     /// True when this quantity represents a whole-number value (no fractional
