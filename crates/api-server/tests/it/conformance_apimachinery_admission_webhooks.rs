@@ -305,7 +305,7 @@ async fn start_mutator_init_container() -> (String, oneshot::Sender<()>) {
                 op: PatchOp::Add,
                 path: "/spec/initContainers".to_string(),
                 value: Some(json!([{
-                    "name": "webhook-added-init",
+                    "name": "webhook-added-init-container",
                     "image": "registry.k8s.io/pause:3.10",
                 }])),
                 from: None,
@@ -926,7 +926,14 @@ async fn should_be_able_to_deny_custom_resource_creation_update_and_deletion() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:237
 ///   ("should unconditionally reject operations on fail closed webhook")
-///   Assertions live in testFailClosedWebhook (webhook.go:1553-1576).
+///   Assertions live in testFailClosedWebhook (webhook.go:1553-1575).
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Upstream does not merely require an error — it requires
+/// `apierrors.IsInternalError(err)` (webhook.go:1571-1573), a 500 Status with
+/// reason "InternalError". The mirror asserted only `is_err()` and its own
+/// comment admitted it did not know the outcome ("maps to a 500/Deny depending
+/// on call site"), so the contract went untested. The HTTP half now pins it.
 /// Sonobuoy (Round 160): PASS
 ///
 /// A webhook with `failurePolicy: Fail` and no reachable backend must
@@ -986,6 +993,40 @@ async fn should_unconditionally_reject_operations_on_fail_closed_webhook() {
     assert!(
         result.is_err(),
         "fail-closed webhook with unreachable backend must surface an error, got {result:?}"
+    );
+
+    // Upstream is specific about *which* error: `apierrors.IsInternalError`
+    // (webhook.go:1571-1573), i.e. a 500 Status with reason "InternalError".
+    // Asserting that needs the HTTP path, since the manager returns a Rust
+    // error rather than a Status. The old comment here hedged — "maps to a
+    // 500/Deny depending on call site" — which left the actual contract
+    // untested.
+    let (router_mem, router) = spawn_router();
+    router_mem
+        .create(
+            &build_key("validatingwebhookconfigurations", None, "fail-closed"),
+            &cfg,
+        )
+        .await
+        .unwrap();
+    let (status, body) = post_json(
+        router,
+        "/api/v1/namespaces/default/configmaps",
+        &json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "foo"}
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an unreachable fail-closed webhook must reject with an internal error: {body}"
+    );
+    assert_eq!(
+        body["reason"], "InternalError",
+        "upstream requires apierrors.IsInternalError: {body}"
     );
 }
 
@@ -1109,61 +1150,98 @@ async fn should_mutate_configmap() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:260
 ///   ("should mutate pod and apply defaults after mutation")
-///   Assertions live in testMutatingPodWebhook (webhook.go:1339-1371).
+///   Assertions live in testMutatingPodWebhook (webhook.go:1339-1354).
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Upstream asserts three things, and the third is the half the case is named
+/// for: exactly one init container, its name, and that its
+/// `TerminationMessagePolicy` **defaulted** to `File`
+/// (v1.TerminationMessageReadFile) — which only holds if the api-server's
+/// defaulting pass runs *after* the webhook mutation. The webhook's JSON patch
+/// deliberately omits the field.
+///
+/// The mirror asserted the first two and dropped the defaulting one entirely,
+/// so "apply defaults after mutation" was untested. It also ran against
+/// `AdmissionWebhookManager` directly, where no defaulting happens; it now
+/// drives the real `POST /api/v1/namespaces/default/pods` path and checks both
+/// the response and the stored object.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn should_mutate_pod_and_apply_defaults_after_mutation() {
-    let mem = Arc::new(MemoryStorage::new());
-    let manager = AdmissionWebhookManager::new(mem.clone());
+    let (mem, router) = spawn_router();
     let (url, _shutdown) = start_mutator_init_container().await;
 
     let cfg = MutatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".to_string(),
         kind: "MutatingWebhookConfiguration".to_string(),
-        metadata: rusternetes_common::types::ObjectMeta::new("mutate-pod"),
+        metadata: rusternetes_common::types::ObjectMeta::new("adding-init-container"),
         webhooks: Some(vec![MutatingWebhook {
             rules: vec![rule_for("", "v1", "pods")],
-            ..mutating("mutate.pod.io", url, vec![], None, None)
+            ..mutating("adding-init-container.k8s.io", url, vec![], None, None)
         }]),
     };
     mem.create(
-        &build_key("mutatingwebhookconfigurations", None, "mutate-pod"),
+        &build_key(
+            "mutatingwebhookconfigurations",
+            None,
+            "adding-init-container",
+        ),
         &cfg,
     )
     .await
     .unwrap();
 
-    let pod = Some(json!({
-        "metadata": {"name": "p1", "labels": {}},
-        "spec": {"containers": [{"name": "main", "image": "nginx"}]}
-    }));
-    let (_resp, mutated) = manager
-        .run_mutating_webhooks(
-            &Operation::Create,
-            &GroupVersionKind {
-                group: "".into(),
-                version: "v1".into(),
-                kind: "Pod".into(),
-            },
-            &GroupVersionResource {
-                group: "".into(),
-                version: "v1".into(),
-                resource: "pods".into(),
-            },
-            Some("default"),
-            "p1",
-            pod,
-            None,
-            &admin_user_info(),
-        )
-        .await
-        .unwrap();
-    let obj = mutated.expect("mutated object");
-    let init = obj["spec"]["initContainers"]
+    // Upstream's `toBeMutatedPod` (webhook.go:1356-1370): one container, no
+    // initContainers, and crucially no terminationMessagePolicy anywhere.
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "webhook-to-be-mutated"},
+        "spec": {"containers": [{"name": "example", "image": "registry.k8s.io/pause:3.10"}]}
+    });
+    let (status, body) = post_json(router, "/api/v1/namespaces/default/pods", &pod).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pod create must succeed: {body}"
+    );
+
+    // 1: exactly one init container — upstream tests the count, not presence.
+    let init = body["spec"]["initContainers"]
         .as_array()
-        .expect("initContainers must be present after mutation");
-    assert_eq!(init.len(), 1);
-    assert_eq!(init[0]["name"], json!("webhook-added-init"));
+        .unwrap_or_else(|| panic!("initContainers must be present after mutation: {body}"));
+    assert_eq!(
+        init.len(),
+        1,
+        "expect pod to have 1 init container, got {init:?}"
+    );
+
+    // 2: the webhook-added name.
+    assert_eq!(
+        init[0]["name"], "webhook-added-init-container",
+        "unexpected init container name: {body}"
+    );
+
+    // 3: the defaulting half the case is named for. The webhook's JSON patch
+    // sets no terminationMessagePolicy, so the api-server's defaulting pass
+    // must run *after* the mutation and fill in "File"
+    // (handlers/defaults.rs:129-131; upstream
+    // v1.TerminationMessageReadFile).
+    assert_eq!(
+        init[0]["terminationMessagePolicy"], "File",
+        "expect the init terminationMessagePolicy to default to File — \
+         defaulting must run after webhook mutation: {body}"
+    );
+
+    // The same must hold for what was persisted, not just the response.
+    let stored: Value = mem
+        .get(&build_key("pods", Some("default"), "webhook-to-be-mutated"))
+        .await
+        .expect("pod must be stored");
+    assert_eq!(
+        stored["spec"]["initContainers"][0]["terminationMessagePolicy"], "File",
+        "stored pod must carry the defaulted terminationMessagePolicy: {stored}"
+    );
 }
 
 /// [sig-api-machinery] AdmissionWebhook should not be able to mutate or
