@@ -7,9 +7,12 @@
 # default allocator is ~10x slower under multi-threaded lock contention and
 # would regress the all-in-one's throughput (see crates/rusternetes/Cargo.toml).
 #
-# Scope: x86_64 only. aarch64 musl cross-compile is the remaining #1041 item —
-# the workspace's C deps (bundled SQLite via rusqlite, ring) cross-compile
-# cleanly via cargo-zigbuild / an aarch64-musl toolchain, tracked separately.
+# Arches: linux/amd64 + linux/arm64. Nothing here is arch-specific — the
+# builder is Alpine, so the host target IS the build target and no cross-compile
+# plumbing (no `--target`, no aarch64-musl cross C toolchain, no cargo-zigbuild)
+# is involved. .github/workflows/publish-musl-image.yml builds each arch on a
+# NATIVE runner and stitches the two into one multi-arch manifest; keep this
+# file arch-neutral (guarded by scripts/tests/test-dockerfile-multiarch.sh).
 #
 # Build context = repo root, so the rhino in-tree submodule at ./rhino resolves
 # the `../../rhino` path-dep from crates/storage. Check it out first:
@@ -23,9 +26,10 @@
 # takes. Run a standalone kube-proxy (host network) for full Service DNAT.
 # The web console is served from `--console-dir` at runtime; mount it if wanted.
 
-# ── Builder: Alpine is musl-native, so the host target is
-#    x86_64-unknown-linux-musl and links crt-static by default → a fully
-#    static binary with no extra target/flag plumbing. ──────────────────────
+# ── Builder: Alpine is musl-native, so the host target is already
+#    <arch>-unknown-linux-musl (x86_64 or aarch64, whichever the runner is) and
+#    links crt-static by default → a fully static binary with no extra
+#    target/flag plumbing. ──────────────────────────────────────────────────
 FROM rust:1.95-alpine AS builder
 
 # C toolchain + deps that build native code:

@@ -1,0 +1,200 @@
+name: Publish musl image
+
+# Build the fully static (musl/scratch) all-in-one image for BOTH linux/amd64
+# and linux/arm64 and publish it to GHCR as one multi-arch manifest — the
+# remaining aarch64 item of #1041.
+#
+# Why this is a separate workflow from publish-images.yml:
+#   * Different Dockerfile (all-in-one-musl.Dockerfile, not the compose bake
+#     set) and a different profile — the shipped `release` profile (lto=thin,
+#     codegen-units=1), not the compile-speed `release-fast` the stack images
+#     use. That build is slow enough that it must not sit on the critical path
+#     of the per-push stack publish, whose tags every conformance nightly pulls.
+#   * It has no consumer in CI; it is a distribution artefact (RPi / USB image /
+#     Apple-Silicon-native dev), so a weekly refresh plus on-demand is enough.
+#
+# aarch64 without cross-compile plumbing: the builder stage is Alpine, so the
+# host target IS aarch64-unknown-linux-musl on an arm64 runner and crt-static
+# links a fully static binary — no `--target`, no cross C toolchain, no
+# cargo-zigbuild. That only holds while the Dockerfile stays arch-neutral,
+# which scripts/tests/test-dockerfile-multiarch.sh guards.
+#
+# Both arches build on NATIVE runners (arm64 on ubuntu-24.04-arm). QEMU
+# emulation of a full release build of a 200k-line workspace is a multi-hour
+# job and would time out.
+#
+# Tags (push to main / schedule / dispatch from main):
+#   * sha-<full-sha> — immutable, one per build.
+#   * musl          — moving alias for the latest successful publish.
+# A pull_request run BUILDS both arches but pushes nothing: it is the proof
+# that the arm64 build still compiles, which is the only thing that can rot.
+
+on:
+  pull_request:
+    paths:
+      - 'all-in-one-musl.Dockerfile'
+      - '.github/workflows/publish-musl-image.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'all-in-one-musl.Dockerfile'
+      - '.github/workflows/publish-musl-image.yml'
+  # Weekly refresh so :musl tracks main's Rust even though a Rust-only change
+  # does not match the paths filter above.
+  schedule:
+    - cron: '0 4 * * 0'
+  workflow_dispatch: {}
+
+env:
+  IMAGE: ghcr.io/indyjonesnl/rusternetes/all-in-one-musl
+  # Push-by-digest cannot emit a manifest list, and the per-arch merge attaches
+  # nothing extra — same reasoning as publish-images.yml.
+  BUILDX_NO_DEFAULT_ATTESTATIONS: "1"
+
+concurrency:
+  group: publish-musl-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    # A full `release` build (codegen-units=1) of the whole workspace on a
+    # 4-vCPU hosted runner. GitHub reports a job that hits its timeout as
+    # `cancelled`, not `failed`, so give it real headroom instead of debugging
+    # a phantom cancellation.
+    timeout-minutes: 300
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The rhino in-tree submodule backs the `../../rhino` path-dep from
+          # crates/storage; without it cargo cannot resolve the workspace.
+          submodules: recursive
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # PR: build only — verifies the arch still compiles, pushes nothing (a
+      # PR from a fork has no packages:write anyway). Loaded locally so the
+      # image size can be reported.
+      - name: Build (pull_request — no push)
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            -f all-in-one-musl.Dockerfile \
+            --build-arg "RUSTERNETES_GIT_SHA=${{ github.event.pull_request.head.sha }}" \
+            --load -t "rusternetes-all-in-one:musl-${{ matrix.arch }}" \
+            .
+          size=$(docker image inspect "rusternetes-all-in-one:musl-${{ matrix.arch }}" \
+                   --format '{{.Size}}')
+          echo "uncompressed image size (${{ matrix.arch }}): $((size / 1024 / 1024)) MiB"
+
+      - name: Build + push by digest
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            -f all-in-one-musl.Dockerfile \
+            --build-arg "RUSTERNETES_GIT_SHA=${{ github.sha }}" \
+            --platform "linux/${{ matrix.arch }}" \
+            --output "type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file /tmp/build-meta.json \
+            .
+          mkdir -p /tmp/digests
+          jq -er '.["containerimage.digest"]' /tmp/build-meta.json \
+            > "/tmp/digests/${{ matrix.arch }}"
+          cat "/tmp/digests/${{ matrix.arch }}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: musl-digest-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge multi-arch manifest + tag
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+
+      - name: Create + push multi-arch manifest
+        run: |
+          set -euo pipefail
+          sha_tag="sha-${{ github.sha }}"
+          amd=$(cat /tmp/digests/musl-digest-amd64/amd64)
+          arm=$(cat /tmp/digests/musl-digest-arm64/arm64)
+
+          tags=(-t "${IMAGE}:${sha_tag}")
+          # Only main may move the :musl alias — a dispatch from a feature
+          # branch still gets its sha- tag but must not clobber :musl.
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            tags+=(-t "${IMAGE}:musl")
+          fi
+
+          echo "== ${IMAGE}: amd64=${amd} arm64=${arm} =="
+          docker buildx imagetools create "${tags[@]}" \
+            "${IMAGE}@${amd}" "${IMAGE}@${arm}"
+          docker buildx imagetools inspect "${IMAGE}:${sha_tag}"
+
+      # #1041's acceptance target is a sub-100MB image. Sum the per-arch
+      # layer sizes (registry/compressed — what a pull actually transfers) and
+      # fail if either arch regressed past it, so a fat base or an unstripped
+      # binary cannot creep in unnoticed.
+      - name: Image size guard (sub-100MB target)
+        run: |
+          set -euo pipefail
+          limit=$((100 * 1024 * 1024))
+          fail=0
+          for arch in amd64 arm64; do
+            digest=$(cat "/tmp/digests/musl-digest-${arch}/${arch}")
+            bytes=$(docker buildx imagetools inspect --raw "${IMAGE}@${digest}" \
+                      | jq '[.layers[].size] | add')
+            echo "${arch}: $((bytes / 1024 / 1024)) MiB compressed"
+            if [ "$bytes" -gt "$limit" ]; then
+              echo "FAIL: ${arch} image is over the 100MB target (#1041)" >&2
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ]
