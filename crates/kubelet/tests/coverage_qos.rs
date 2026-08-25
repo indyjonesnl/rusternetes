@@ -679,3 +679,116 @@ fn get_qos_class_ignores_status_field() {
     // Classification must derive from spec, not status.
     assert_eq!(get_qos_class(&pod), QoSClass::Guaranteed);
 }
+
+// ---------------------------------------------------------------------------
+// Regressions from the 2026-08-24 duplicate-derivation audit
+//
+// `status.qosClass` used to be computed by a *second* implementation
+// (`Kubelet::compute_qos_class`) that had drifted from this one. It now
+// delegates here, so these cases pin the behaviour both paths share.
+// ---------------------------------------------------------------------------
+
+/// Quantities are compared by **value**, not as strings: `lim.Cmp(req) != 0`
+/// (`pkg/apis/core/v1/helper/qos/qos.go:161`). `1` and `1000m` are the same CPU,
+/// and `1Gi` and `1024Mi` the same memory.
+///
+/// The status-side copy compared the raw strings, so this pod was published as
+/// `Burstable` while the eviction manager ranked it `Guaranteed`.
+#[test]
+fn equal_quantities_written_differently_are_guaranteed() {
+    let c = with_resources(
+        make_container("c1"),
+        ResourceRequirements {
+            requests: Some(HashMap::from([
+                ("cpu".to_string(), "1000m".to_string()),
+                ("memory".to_string(), "1024Mi".to_string()),
+            ])),
+            limits: Some(HashMap::from([
+                ("cpu".to_string(), "1".to_string()),
+                ("memory".to_string(), "1Gi".to_string()),
+            ])),
+            claims: None,
+        },
+    );
+    let pod = make_pod("pod", vec![c], None, None);
+    assert_eq!(get_qos_class(&pod), QoSClass::Guaranteed);
+}
+
+/// Only cpu and memory are QoS compute resources
+/// (`supportedQoSComputeResources`, qos.go:29); `isSupportedQoSComputeResource`
+/// skips everything else, so a pod requesting only an extended resource has
+/// empty `requests` *and* `limits` and is **BestEffort** (qos.go:156-158).
+///
+/// The status-side copy asked only "is either map non-empty?" and published
+/// `Burstable`.
+#[test]
+fn extended_resources_alone_are_best_effort() {
+    let c = with_resources(
+        make_container("c1"),
+        ResourceRequirements {
+            requests: Some(HashMap::from([(
+                "nvidia.com/gpu".to_string(),
+                "1".to_string(),
+            )])),
+            limits: None,
+            claims: None,
+        },
+    );
+    let pod = make_pod("pod", vec![c], None, None);
+    assert_eq!(get_qos_class(&pod), QoSClass::BestEffort);
+}
+
+/// A quantity only counts when it is strictly greater than zero
+/// (`quantity.Cmp(zeroQuantity) == 1`, qos.go:57 and qos.go:122), so an
+/// explicit `cpu: "0"` contributes nothing and leaves the pod BestEffort.
+#[test]
+fn zero_quantities_do_not_make_a_pod_burstable() {
+    let c = with_resources(
+        make_container("c1"),
+        ResourceRequirements {
+            requests: Some(HashMap::from([
+                ("cpu".to_string(), "0".to_string()),
+                ("memory".to_string(), "0".to_string()),
+            ])),
+            limits: None,
+            claims: None,
+        },
+    );
+    let pod = make_pod("pod", vec![c], None, None);
+    assert_eq!(get_qos_class(&pod), QoSClass::BestEffort);
+}
+
+/// Init containers are folded into the same set as regular containers
+/// (`allContainers = append(Containers, InitContainers...)`, qos.go:113-116), so
+/// an init container without limits forfeits Guaranteed for the whole pod.
+///
+/// The status-side copy iterated `spec.containers` only and published
+/// `Guaranteed` for exactly this pod — while the eviction manager, which did
+/// look at init containers, ranked it `Burstable`.
+#[test]
+fn an_init_container_without_limits_downgrades_the_published_class() {
+    let app = with_resources(make_container("app"), guaranteed_resources("100m", "128Mi"));
+    let init = with_resources(
+        make_container("init"),
+        requests_only_resources("50m", "64Mi"),
+    );
+    let pod = make_pod("pod", vec![app], Some(vec![init]), None);
+    assert_eq!(get_qos_class(&pod), QoSClass::Burstable);
+}
+
+/// Requests are **summed across containers** (qos.go:100-105 / 126-133) and the
+/// sums compared, so two Guaranteed containers stay Guaranteed rather than the
+/// totals being compared against a single container's limits.
+#[test]
+fn requests_and_limits_are_summed_across_containers() {
+    let pod = make_pod(
+        "pod",
+        vec![
+            with_resources(make_container("c1"), guaranteed_resources("100m", "128Mi")),
+            with_resources(make_container("c2"), guaranteed_resources("250m", "256Mi")),
+        ],
+        None,
+        None,
+    );
+    assert_eq!(get_qos_class(&pod), QoSClass::Guaranteed);
+}

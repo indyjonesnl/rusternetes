@@ -16,6 +16,11 @@ mod cri_runtime;
 // into the bin (shared modules) but read as dead here; the lib is their real
 // consumer.
 mod atomic_writer;
+// The single home for downward-API `fieldRef`/`resourceFieldRef` resolution.
+// `volumes` and `cri_runtime::translate` both delegate here; until now this
+// module was declared only in `lib.rs`, so the *binary* compiled two divergent
+// hand-rolled copies instead and its unit tests guarded neither of them.
+mod downward_api;
 #[allow(dead_code)]
 mod events;
 #[allow(dead_code)]

@@ -305,6 +305,18 @@ fn downward_api_provides_pod_uid_env_var() {
     );
 }
 
+/// The node's advertised `status.allocatable`, mirroring what the kubelet posts
+/// in NodeStatus. Upstream `defaultPodLimitsForDownwardAPI` reads it from the
+/// node object (`pkg/kubelet/kubelet_resources.go:43-47`) before extracting.
+fn node_allocatable() -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        ("cpu".to_string(), "4".to_string()),
+        ("memory".to_string(), "8Gi".to_string()),
+        ("pods".to_string(), "110".to_string()),
+        ("ephemeral-storage".to_string(), "100Gi".to_string()),
+    ])
+}
+
 /// [sig-node] Downward API should provide container's limits.cpu/memory and requests.cpu/memory as env vars
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/downwardapi.go:157
@@ -322,7 +334,10 @@ fn downward_api_provides_container_cpu_and_memory_limits_and_requests() {
         resource: "limits.cpu".to_string(),
         divisor: None,
     };
-    assert_eq!(resolve_container_resource(&pod, &sel).unwrap(), "1");
+    assert_eq!(
+        resolve_container_resource(&pod, &sel, Some(&node_allocatable())).unwrap(),
+        "1"
+    );
     // limits.memory (no divisor) → 128 MiB in bytes
     let sel = ResourceFieldSelector {
         container_name: Some("app".to_string()),
@@ -330,7 +345,7 @@ fn downward_api_provides_container_cpu_and_memory_limits_and_requests() {
         divisor: None,
     };
     assert_eq!(
-        resolve_container_resource(&pod, &sel).unwrap(),
+        resolve_container_resource(&pod, &sel, Some(&node_allocatable())).unwrap(),
         (128 * 1024 * 1024).to_string()
     );
     // requests.cpu in millicores via 1m divisor → 100
@@ -339,14 +354,20 @@ fn downward_api_provides_container_cpu_and_memory_limits_and_requests() {
         resource: "requests.cpu".to_string(),
         divisor: Some("1m".to_string()),
     };
-    assert_eq!(resolve_container_resource(&pod, &sel).unwrap(), "100");
+    assert_eq!(
+        resolve_container_resource(&pod, &sel, Some(&node_allocatable())).unwrap(),
+        "100"
+    );
     // requests.memory in MiB via Mi divisor → 64
     let sel = ResourceFieldSelector {
         container_name: Some("app".to_string()),
         resource: "requests.memory".to_string(),
         divisor: Some("1Mi".to_string()),
     };
-    assert_eq!(resolve_container_resource(&pod, &sel).unwrap(), "64");
+    assert_eq!(
+        resolve_container_resource(&pod, &sel, Some(&node_allocatable())).unwrap(),
+        "64"
+    );
 }
 
 /// [sig-node] Downward API should provide default limits.cpu/memory from node allocatable
@@ -362,7 +383,10 @@ fn downward_api_defaults_limits_to_node_allocatable() {
         divisor: None,
     };
     // Default 4 cores → 4
-    assert_eq!(resolve_container_resource(&pod, &sel).unwrap(), "4");
+    assert_eq!(
+        resolve_container_resource(&pod, &sel, Some(&node_allocatable())).unwrap(),
+        "4"
+    );
     let sel = ResourceFieldSelector {
         container_name: Some("app".to_string()),
         resource: "limits.memory".to_string(),
@@ -370,7 +394,7 @@ fn downward_api_defaults_limits_to_node_allocatable() {
     };
     // Default 8 GiB in bytes
     assert_eq!(
-        resolve_container_resource(&pod, &sel).unwrap(),
+        resolve_container_resource(&pod, &sel, Some(&node_allocatable())).unwrap(),
         (8i64 * 1024 * 1024 * 1024).to_string()
     );
 }
@@ -474,7 +498,10 @@ fn downward_api_volume_provides_container_cpu_limit() {
         resource: "limits.cpu".to_string(),
         divisor: Some("1m".to_string()),
     };
-    assert_eq!(resolve_container_resource(&pod, &sel).unwrap(), "250");
+    assert_eq!(
+        resolve_container_resource(&pod, &sel, Some(&node_allocatable())).unwrap(),
+        "250"
+    );
 }
 
 /// [sig-storage] Downward API volume should provide container's memory limit
@@ -489,7 +516,10 @@ fn downward_api_volume_provides_container_memory_limit() {
         resource: "limits.memory".to_string(),
         divisor: Some("1Mi".to_string()),
     };
-    assert_eq!(resolve_container_resource(&pod, &sel).unwrap(), "32");
+    assert_eq!(
+        resolve_container_resource(&pod, &sel, Some(&node_allocatable())).unwrap(),
+        "32"
+    );
 }
 
 /// [sig-storage] Downward API volume should provide container's cpu/memory request
@@ -513,8 +543,14 @@ fn downward_api_volume_provides_container_cpu_and_memory_requests() {
         resource: "requests.memory".to_string(),
         divisor: Some("1Mi".to_string()),
     };
-    assert_eq!(resolve_container_resource(&pod, &cpu).unwrap(), "125");
-    assert_eq!(resolve_container_resource(&pod, &mem).unwrap(), "16");
+    assert_eq!(
+        resolve_container_resource(&pod, &cpu, Some(&node_allocatable())).unwrap(),
+        "125"
+    );
+    assert_eq!(
+        resolve_container_resource(&pod, &mem, Some(&node_allocatable())).unwrap(),
+        "16"
+    );
 }
 
 /// [sig-storage] Downward API volume should provide node allocatable as default cpu limit
@@ -530,7 +566,10 @@ fn downward_api_volume_defaults_cpu_to_node_allocatable_when_no_limit() {
         divisor: Some("1m".to_string()),
     };
     // 4000m default node-allocatable cores.
-    assert_eq!(resolve_container_resource(&pod, &sel).unwrap(), "4000");
+    assert_eq!(
+        resolve_container_resource(&pod, &sel, Some(&node_allocatable())).unwrap(),
+        "4000"
+    );
 }
 
 // ===========================================================================

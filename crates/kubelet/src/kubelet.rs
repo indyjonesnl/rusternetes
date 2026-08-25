@@ -327,9 +327,12 @@ fn terminal_phase_requires_termination(pod: &Pod) -> bool {
 }
 
 /// The node's advertised capacity/allocatable. Single source of truth so the
-/// NodeStatus the kubelet posts and the values the runtime uses to default
-/// resourceFieldRef LIMITS (downward-API `limits.cpu`/`memory` env) never drift.
-fn node_allocatable_map() -> HashMap<String, String> {
+/// NodeStatus the kubelet posts and the values used to default resourceFieldRef
+/// LIMITS never drift — both the env-var path (via
+/// `CriContainerRuntime::with_node_allocatable`) and the downwardAPI/projected
+/// *volume* path (via [`crate::volumes::VolumeManager::node_allocatable`]) read
+/// this one map.
+pub(crate) fn node_allocatable_map() -> HashMap<String, String> {
     HashMap::from([
         ("cpu".to_string(), "4".to_string()),
         ("memory".to_string(), "8Gi".to_string()),
@@ -5515,75 +5518,18 @@ impl Kubelet {
         )
     }
 
-    /// Compute the QoS class for a pod based on resource requests/limits.
+    /// The pod's `status.qosClass`, as upstream `generateAPIPodStatus` sets it
+    /// (`apiPodStatus.QOSClass = v1qos.GetPodQOS(pod)`,
+    /// `pkg/kubelet/kubelet_pods.go:2097`).
     ///
-    /// - Guaranteed: every container has both cpu and memory limits AND requests, and they're equal
-    /// - BestEffort: no container has any requests or limits
-    /// - Burstable: everything else
+    /// Delegates to [`crate::eviction::get_qos_class`], the port of
+    /// `ComputePodQOS`, so the class the kubelet publishes and the class the
+    /// eviction manager ranks pods by are the same computation. This used to be
+    /// a second implementation that ignored `spec.initContainers` and compared
+    /// quantities as strings, so it disagreed with the eviction copy on any pod
+    /// with an init container and on `cpu: "1"` vs `cpu: "1000m"`.
     fn compute_qos_class(pod: &Pod) -> String {
-        let spec = match &pod.spec {
-            Some(s) => s,
-            None => return "BestEffort".to_string(),
-        };
-
-        let containers = &spec.containers;
-        if containers.is_empty() {
-            return "BestEffort".to_string();
-        }
-
-        let mut all_have_limits_eq_requests = true;
-        let mut none_have_any = true;
-
-        for container in containers {
-            let resources = match &container.resources {
-                Some(r) => r,
-                None => {
-                    all_have_limits_eq_requests = false;
-                    // no resources at all — still counts as "none" for BestEffort
-                    continue;
-                }
-            };
-
-            let limits = resources.limits.as_ref();
-            let requests = resources.requests.as_ref();
-
-            let has_any =
-                limits.is_some_and(|l| !l.is_empty()) || requests.is_some_and(|r| !r.is_empty());
-
-            if has_any {
-                none_have_any = false;
-            }
-
-            // For Guaranteed, both cpu and memory limits must exist, and requests must equal limits
-            for res in &["cpu", "memory"] {
-                let limit_val = limits.and_then(|l| l.get(*res));
-                let request_val = requests.and_then(|r| r.get(*res));
-
-                match (limit_val, request_val) {
-                    (Some(l), Some(r)) => {
-                        if l != r {
-                            all_have_limits_eq_requests = false;
-                        }
-                    }
-                    (Some(_), None) => {
-                        // Kubernetes defaults requests to limits if not set,
-                        // but we check explicitly here
-                        // Still counts as Guaranteed if request is missing (defaults to limit)
-                    }
-                    (None, _) => {
-                        all_have_limits_eq_requests = false;
-                    }
-                }
-            }
-        }
-
-        if none_have_any {
-            "BestEffort".to_string()
-        } else if all_have_limits_eq_requests {
-            "Guaranteed".to_string()
-        } else {
-            "Burstable".to_string()
-        }
+        crate::eviction::get_qos_class(pod).as_str().to_string()
     }
 
     async fn update_pod_status(

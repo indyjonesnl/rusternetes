@@ -20,8 +20,8 @@ use tracing::{info, warn};
 // shared with non-volume code paths there). Imported so the moved bodies keep
 // calling them by their bare names, verbatim.
 use crate::runtime::{
-    check_host_path_type, mount_tmpfs_for_emptydir, parse_cpu_quantity, parse_memory_quantity,
-    parse_quantity_bytes, pod_dir_key, setup_emptydir_dir, HostPathCheck,
+    check_host_path_type, mount_tmpfs_for_emptydir, parse_quantity_bytes, pod_dir_key,
+    setup_emptydir_dir, HostPathCheck,
 };
 
 /// Build the projection payload (relative user-visible path -> bytes) for a
@@ -140,6 +140,12 @@ pub struct VolumeManager {
     pub volumes_base_path: String,
     pub storage: Option<Arc<rusternetes_storage::StorageBackend>>,
     pub token_manager: rusternetes_common::auth::TokenManager,
+    /// The node's `status.allocatable`, used to default an unset downwardAPI
+    /// `limits.*` the way upstream `defaultPodLimitsForDownwardAPI`
+    /// (`pkg/kubelet/kubelet_resources.go:43-47`) does. Seeded from the same
+    /// [`crate::kubelet::node_allocatable_map`] the kubelet posts in NodeStatus,
+    /// so a volume file and the NodeStatus can never disagree.
+    pub node_allocatable: std::collections::HashMap<String, String>,
 }
 
 impl VolumeManager {
@@ -154,6 +160,7 @@ impl VolumeManager {
             volumes_base_path,
             storage,
             token_manager,
+            node_allocatable: crate::kubelet::node_allocatable_map(),
         }
     }
 
@@ -1801,211 +1808,45 @@ impl VolumeManager {
     }
 
     /// Get a pod field value for DownwardAPI
+    /// Resolve a downwardAPI/projected volume item's `fieldRef` to the string
+    /// written into the volume file.
+    ///
+    /// Delegates to [`crate::downward_api::resolve_pod_field`] so the volume and
+    /// env-var paths render `metadata.labels['x']`, `status.podIP` and friends
+    /// identically. The hand-rolled copy this replaced was a near-duplicate that
+    /// had drifted: it hardcoded the bracket-key offsets (`&path[17..]`, so only
+    /// single quotes parsed) where the shared helper accepts the double-quoted
+    /// and unquoted forms the API allows too.
     pub(crate) fn get_pod_field_value(&self, pod: &Pod, field_path: &str) -> Result<String> {
-        let value = match field_path {
-            "metadata.name" => pod.metadata.name.clone(),
-            "metadata.namespace" => pod
-                .metadata
-                .namespace
-                .clone()
-                .unwrap_or("default".to_string()),
-            "metadata.uid" => pod.metadata.uid.clone(),
-            "spec.nodeName" => pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.node_name.clone())
-                .unwrap_or("".to_string()),
-            "spec.serviceAccountName" => pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.service_account_name.clone())
-                .unwrap_or("default".to_string()),
-            "status.podIP" => pod
-                .status
-                .as_ref()
-                .and_then(|s| s.pod_ip.clone())
-                .unwrap_or("".to_string()),
-            "status.hostIP" => pod
-                .status
-                .as_ref()
-                .and_then(|s| s.host_ip.clone())
-                .unwrap_or_else(|| "127.0.0.1".to_string()),
-            // All labels formatted as key="value"\n (with trailing newline, matching K8s)
-            "metadata.labels" => pod
-                .metadata
-                .labels
-                .as_ref()
-                .map(|labels| {
-                    let mut pairs: Vec<_> = labels.iter().collect();
-                    pairs.sort_by_key(|(k, _)| (*k).clone());
-                    let mut result = pairs
-                        .iter()
-                        .map(|(k, v)| format!("{}=\"{}\"", k, v))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !result.is_empty() {
-                        result.push('\n');
-                    }
-                    result
-                })
-                .unwrap_or_default(),
-            // All annotations formatted as key="value"\n (with trailing newline, matching K8s)
-            "metadata.annotations" => pod
-                .metadata
-                .annotations
-                .as_ref()
-                .map(|anns| {
-                    let mut pairs: Vec<_> = anns.iter().collect();
-                    pairs.sort_by_key(|(k, _)| (*k).clone());
-                    let mut result = pairs
-                        .iter()
-                        .map(|(k, v)| format!("{}=\"{}\"", k, v))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !result.is_empty() {
-                        result.push('\n');
-                    }
-                    result
-                })
-                .unwrap_or_default(),
-            _ => {
-                // Support metadata.labels['key'] and metadata.annotations['key']
-                if field_path.starts_with("metadata.labels['") && field_path.ends_with("']") {
-                    let key = &field_path[17..field_path.len() - 2];
-                    pod.metadata
-                        .labels
-                        .as_ref()
-                        .and_then(|labels| labels.get(key))
-                        .cloned()
-                        .unwrap_or("".to_string())
-                } else if field_path.starts_with("metadata.annotations['")
-                    && field_path.ends_with("']")
-                {
-                    let key = &field_path[22..field_path.len() - 2];
-                    pod.metadata
-                        .annotations
-                        .as_ref()
-                        .and_then(|annotations| annotations.get(key))
-                        .cloned()
-                        .unwrap_or("".to_string())
-                } else {
-                    return Err(anyhow::anyhow!("Unsupported field path: {}", field_path));
-                }
-            }
-        };
-        Ok(value)
+        crate::downward_api::resolve_pod_field(pod, field_path).map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    /// Get a container resource value for DownwardAPI
+    /// Resolve a downwardAPI/projected volume item's `resourceFieldRef` to the
+    /// string written into the volume file.
     ///
-    /// Returns the resource value formatted according to the divisor.
-    /// For memory: returns bytes (or bytes/divisor) as a string.
-    /// For CPU: returns millicores (or cores with divisor "1") as a string.
-    /// When divisor is "0" or absent, default units are used (bytes for memory, whole-number
-    /// representation for CPU).
+    /// Delegates to [`crate::downward_api::resolve_container_resource`], the port
+    /// of upstream `ExtractResourceValueByContainerNameAndNodeAllocatable`, which
+    /// is exactly what `pkg/volume/downwardapi/downwardapi.go:266` calls. The env
+    /// var path ([`crate::cri_runtime::translate`]) resolves the same selectors
+    /// through the same function, so a `resourceFieldRef` cannot render one value
+    /// as a file and a different one as an environment variable.
+    ///
+    /// This used to be a second, hand-rolled copy that (a) fell back to a
+    /// hardcoded 4 cores / 8 GiB instead of consulting the node's allocatable —
+    /// which reported `limits.ephemeral-storage` as 8 GiB on a node advertising
+    /// 100 GiB — (b) never searched init containers, and (c) had no
+    /// requests-default-to-limits fallback.
     pub(crate) fn get_container_resource_value(
         &self,
         pod: &Pod,
         resource_ref: &rusternetes_common::resources::ResourceFieldSelector,
     ) -> Result<String> {
-        let spec = pod.spec.as_ref().context("Pod has no spec")?;
-
-        // Find the container — if containerName is not set, default to the first container
-        let container = if let Some(ref container_name) = resource_ref.container_name {
-            spec.containers
-                .iter()
-                .find(|c| &c.name == container_name)
-                .with_context(|| format!("Container {} not found", container_name))?
-        } else {
-            spec.containers.first().context("Pod has no containers")?
-        };
-
-        let is_cpu =
-            resource_ref.resource.contains("cpu") || resource_ref.resource.contains("hugepages");
-        let is_memory = resource_ref.resource.contains("memory")
-            || resource_ref.resource.contains("ephemeral-storage");
-
-        let raw_value = match resource_ref.resource.as_str() {
-            "limits.cpu" => container
-                .resources
-                .as_ref()
-                .and_then(|r| r.limits.as_ref())
-                .and_then(|l| l.get("cpu"))
-                .cloned(),
-            "limits.memory" => container
-                .resources
-                .as_ref()
-                .and_then(|r| r.limits.as_ref())
-                .and_then(|l| l.get("memory"))
-                .cloned(),
-            "limits.ephemeral-storage" => container
-                .resources
-                .as_ref()
-                .and_then(|r| r.limits.as_ref())
-                .and_then(|l| l.get("ephemeral-storage"))
-                .cloned(),
-            "requests.cpu" => container
-                .resources
-                .as_ref()
-                .and_then(|r| r.requests.as_ref())
-                .and_then(|l| l.get("cpu"))
-                .cloned(),
-            "requests.memory" => container
-                .resources
-                .as_ref()
-                .and_then(|r| r.requests.as_ref())
-                .and_then(|l| l.get("memory"))
-                .cloned(),
-            "requests.ephemeral-storage" => container
-                .resources
-                .as_ref()
-                .and_then(|r| r.requests.as_ref())
-                .and_then(|l| l.get("ephemeral-storage"))
-                .cloned(),
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "Unsupported resource field: {}",
-                    resource_ref.resource
-                ));
-            }
-        };
-
-        // Parse the divisor (default: "1" meaning base units — bytes for memory, cores for cpu)
-        let divisor_str = resource_ref.divisor.as_deref().unwrap_or("0");
-        // A divisor of "0" means use default units (same as "1")
-
-        if is_cpu {
-            // Convert CPU value to millicores, then apply divisor
-            // When no limit is set, use node capacity (default 4 cores = 4000m)
-            let millicores = raw_value.as_deref().map(parse_cpu_quantity).unwrap_or(4000); // 4 cores default
-            let divisor_millicores = if divisor_str == "0" || divisor_str == "1" {
-                // Default divisor "1" means return in cores (1 core = 1000 millicores)
-                1000
-            } else {
-                parse_cpu_quantity(divisor_str).max(1)
-            };
-            // Kubernetes uses ceiling division for resource quantities
-            let result = (millicores + divisor_millicores - 1) / divisor_millicores;
-            Ok(result.to_string())
-        } else if is_memory {
-            // Convert memory value to bytes, then apply divisor
-            // When no limit is set, use node allocatable memory (default 8Gi)
-            let bytes = raw_value
-                .as_deref()
-                .map(parse_memory_quantity)
-                .unwrap_or(8 * 1024 * 1024 * 1024); // 8Gi default
-            let divisor_bytes = if divisor_str == "0" || divisor_str == "1" {
-                1 // return bytes
-            } else {
-                parse_memory_quantity(divisor_str).max(1)
-            };
-            // Kubernetes uses ceiling division for resource quantities
-            let result = (bytes + divisor_bytes - 1) / divisor_bytes;
-            Ok(result.to_string())
-        } else {
-            // Unknown resource type, return raw value
-            Ok(raw_value.unwrap_or_else(|| "0".to_string()))
-        }
+        crate::downward_api::resolve_container_resource(
+            pod,
+            resource_ref,
+            Some(&self.node_allocatable),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 

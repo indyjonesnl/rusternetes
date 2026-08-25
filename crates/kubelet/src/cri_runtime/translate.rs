@@ -26,11 +26,17 @@ use rusternetes_cri::v1;
 
 /// Well-known CRI metadata label keys the runtime indexes sandboxes/containers
 /// by. They mirror the keys the upstream kubelet sets so `crictl`/tools work.
+///
+/// Re-exported from [`crate::labels`] — the port of
+/// `staging/src/k8s.io/kubelet/pkg/types/labels.go` — under the shorter names
+/// this module's call sites use. These were a second, independent set of string
+/// literals with the same values; a typo or a rename in one would have silently
+/// orphaned every sandbox the other had labelled.
 pub(crate) mod labels {
-    pub const POD_NAME: &str = "io.kubernetes.pod.name";
-    pub const POD_NAMESPACE: &str = "io.kubernetes.pod.namespace";
-    pub const POD_UID: &str = "io.kubernetes.pod.uid";
-    pub const CONTAINER_NAME: &str = "io.kubernetes.container.name";
+    pub use crate::labels::{
+        CONTAINER_NAME_LABEL as CONTAINER_NAME, POD_NAMESPACE_LABEL as POD_NAMESPACE,
+        POD_NAME_LABEL as POD_NAME, POD_UID_LABEL as POD_UID,
+    };
 }
 
 fn namespace(pod: &Pod) -> &str {
@@ -504,12 +510,7 @@ fn env_vars(
                 if let Some(fr) = src.field_ref.as_ref() {
                     pod_field_value(pod, &fr.field_path)
                 } else if let Some(rfr) = src.resource_field_ref.as_ref() {
-                    container_resource_value(
-                        container,
-                        &rfr.resource,
-                        rfr.divisor.as_deref(),
-                        node_allocatable,
-                    )
+                    container_resource_value(container, rfr, node_allocatable)
                 } else if let Some(cmr) = src.config_map_key_ref.as_ref() {
                     config_maps
                         .get(&cmr.name)
@@ -612,86 +613,26 @@ fn phase_str(phase: &rusternetes_common::types::Phase) -> String {
     .to_string()
 }
 
-/// Resolve a `resourceFieldRef` (`limits.cpu` / `requests.memory`, etc.) to its
-/// numeric value as a decimal string. `None` if the resource is not set.
+/// Resolve an env var's `resourceFieldRef` (`limits.cpu` / `requests.memory`,
+/// etc.) to its numeric value as a decimal string.
+///
+/// The arithmetic lives in [`crate::downward_api`] — the port of upstream's
+/// `ExtractContainerResourceValue` chain — because the downwardAPI *volume*
+/// path resolves the very same selectors and the two must not drift. This copy
+/// used to floor byte quantities where upstream ceils, so the volume file and
+/// the env var could disagree on the same `resourceFieldRef`.
+///
+/// `None` means "omit the variable": upstream instead fails container creation
+/// with `CreateContainerConfigError` on an unsupported resource
+/// (`pkg/api/v1/resource/helpers.go:141`). Dropping the var is the pre-existing
+/// (more forgiving) behaviour and is kept here; the api-server's
+/// `validateContainerResourceFieldSelector` is what actually rejects these.
 fn container_resource_value(
     container: &Container,
-    resource: &str,
-    divisor: Option<&str>,
+    sel: &rusternetes_common::resources::ResourceFieldSelector,
     node_allocatable: Option<&HashMap<String, String>>,
 ) -> Option<String> {
-    let (kind, name) = resource.split_once('.')?;
-    let req = container.resources.as_ref();
-    let explicit = |which: &str| -> Option<String> {
-        match which {
-            "limits" => req.and_then(|r| r.limits.as_ref()),
-            "requests" => req.and_then(|r| r.requests.as_ref()),
-            _ => None,
-        }
-        .and_then(|m| m.get(name).cloned())
-    };
-    // Upstream MergeContainerResourceLimits: an unset cpu/memory/
-    // ephemeral-storage/hugepages LIMIT defaults to the node's allocatable;
-    // an unset REQUEST defaults to the (possibly defaulted) limit. Other
-    // resources have no default — the var is omitted when absent.
-    let defaultable =
-        matches!(name, "cpu" | "memory" | "ephemeral-storage") || name.starts_with("hugepages-");
-    let from_allocatable = || -> Option<String> {
-        if defaultable {
-            node_allocatable.and_then(|a| a.get(name).cloned())
-        } else {
-            None
-        }
-    };
-    let raw = match kind {
-        "limits" => explicit("limits").or_else(from_allocatable),
-        "requests" => explicit("requests")
-            .or_else(|| explicit("limits"))
-            .or_else(from_allocatable),
-        _ => None,
-    }?;
-    let raw = &raw;
-    // `divisor` defaults to "1" (cores for cpu, bytes for memory) — matches
-    // upstream `pkg/api/v1/resource/helpers.go` `ExtractContainerResourceValue`
-    // (lines 106-111):
-    //
-    //   divisor := resource.Quantity{}
-    //   if divisor.Cmp(fs.Divisor) == 0 {
-    //       divisor = resource.MustParse("1")
-    //   }
-    //
-    // The Go client marshals an UNSET resource.Quantity as "0" on the wire
-    // (`zeroBytes = []byte("0")`, k8s.io/apimachinery pkg/api/resource/amount.go:52),
-    // so rusternetes receives divisor = Some("0") for every field that was left
-    // at its default. Treat "0" identically to None/missing — both mean "use
-    // the natural unit (1 core for cpu, 1 byte for memory)".
-    let div = match divisor {
-        None | Some("0") => "1",
-        Some(d) => d,
-    };
-    match name {
-        "cpu" => {
-            let milli = parse_cpu_millicores(raw)?;
-            let div_milli = parse_cpu_millicores(div).filter(|d| *d > 0)?;
-            // Ceil division (toolchain predates stable `div_ceil`).
-            Some(((milli + div_milli - 1) / div_milli).to_string())
-        }
-        // memory, ephemeral-storage and hugepages-<size> are all byte quantities;
-        // upstream normalises to an integer count of `divisor` bytes (floor
-        // matches upstream math.Ceil for the common case, identical for whole
-        // multiples which is the vast majority of real workloads).
-        "memory" | "ephemeral-storage" => {
-            let bytes = parse_memory_bytes(raw)?;
-            let div_bytes = parse_memory_bytes(div).filter(|d| *d > 0)?;
-            Some((bytes / div_bytes).to_string())
-        }
-        n if n.starts_with("hugepages-") => {
-            let bytes = parse_memory_bytes(raw)?;
-            let div_bytes = parse_memory_bytes(div).filter(|d| *d > 0)?;
-            Some((bytes / div_bytes).to_string())
-        }
-        _ => Some(raw.clone()),
-    }
+    crate::downward_api::resolve_container_resource_in(container, sel, node_allocatable).ok()
 }
 
 /// Verify every *non-optional* `configMapKeyRef`/`secretKeyRef` env var in the
@@ -2581,6 +2522,19 @@ mod tests {
         assert_eq!(pod_field_value(&pod, "metadata.labels['nope']"), None);
     }
 
+    /// A `resourceFieldRef` selector; env vars never carry a `containerName`
+    /// (validation rejects it outside a volume).
+    fn rfr(
+        resource: &str,
+        divisor: Option<&str>,
+    ) -> rusternetes_common::resources::ResourceFieldSelector {
+        rusternetes_common::resources::ResourceFieldSelector {
+            container_name: None,
+            resource: resource.to_string(),
+            divisor: divisor.map(str::to_string),
+        }
+    }
+
     #[test]
     fn resource_field_ref_resolves_ephemeral_storage_and_hugepages() {
         use rusternetes_common::types::ResourceRequirements;
@@ -2599,11 +2553,11 @@ mod tests {
         };
         // Both normalize to bytes, like memory (not raw passthrough).
         assert_eq!(
-            container_resource_value(&c, "limits.ephemeral-storage", None, None).as_deref(),
+            container_resource_value(&c, &rfr("limits.ephemeral-storage", None), None).as_deref(),
             Some("1073741824")
         );
         assert_eq!(
-            container_resource_value(&c, "limits.hugepages-2Mi", None, None).as_deref(),
+            container_resource_value(&c, &rfr("limits.hugepages-2Mi", None), None).as_deref(),
             Some("4194304")
         );
     }
@@ -2630,15 +2584,23 @@ mod tests {
             ("memory".to_string(), "8Gi".to_string()),
         ]);
         assert_eq!(
-            container_resource_value(&c, "limits.cpu", None, Some(&alloc)).as_deref(),
+            container_resource_value(&c, &rfr("limits.cpu", None), Some(&alloc)).as_deref(),
             Some("4")
         );
         assert_eq!(
-            container_resource_value(&c, "limits.memory", None, Some(&alloc)).as_deref(),
+            container_resource_value(&c, &rfr("limits.memory", None), Some(&alloc)).as_deref(),
             Some("8589934592")
         );
-        // No node allocatable available → var omitted, as before.
-        assert_eq!(container_resource_value(&c, "limits.cpu", None, None), None);
+        // With no node allocatable to merge in, the limit stays unset, and an
+        // unset quantity is the zero Quantity upstream — `Limits.Cpu()` returns
+        // it and `convertResourceCPUToString` renders "0"
+        // (`pkg/api/v1/resource/helpers.go:115,146-149`). Upstream never takes
+        // this branch (`getNodeAnyWay` always yields allocatable); the previous
+        // copy dropped the variable entirely instead.
+        assert_eq!(
+            container_resource_value(&c, &rfr("limits.cpu", None), None).as_deref(),
+            Some("0")
+        );
     }
 
     #[test]
