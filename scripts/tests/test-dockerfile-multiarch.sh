@@ -37,8 +37,43 @@ grep -q 'ARG TARGETARCH' containerd.Dockerfile \
 grep -q 'ARG TARGETARCH' services.Dockerfile \
   || { echo "FAIL: services.Dockerfile must declare ARG TARGETARCH" >&2; fail=1; }
 
+# ── The static-musl all-in-one image (#1041) must stay arch-neutral. ────────
+# It builds on Alpine, whose host target IS the build target, so a native
+# runner per arch needs no cross-compile plumbing — but only as long as nothing
+# pins x86_64. A `--platform=linux/amd64` on FROM, or an explicit
+# `--target x86_64-unknown-linux-musl` on cargo, silently makes the arm64 job
+# produce an amd64 binary (or fail to link), which is exactly the aarch64 gap
+# this image was supposed to close.
+MUSL_DF="all-in-one-musl.Dockerfile"
+if [ -f "$MUSL_DF" ]; then
+  if grep -nE '^\s*(FROM|COPY)[^#]*--platform=' "$MUSL_DF"; then
+    echo "FAIL: $MUSL_DF pins --platform; it must build natively per arch" >&2
+    fail=1
+  fi
+  if grep -nE 'cargo[^#]*--target[= ]' "$MUSL_DF"; then
+    echo "FAIL: $MUSL_DF passes an explicit cargo --target; the Alpine host target must be used" >&2
+    fail=1
+  fi
+fi
+
+# The publish workflow for that image must cover BOTH arches on native runners.
+MUSL_WF=".github/workflows/publish-musl-image.yml"
+if [ -f "$MUSL_WF" ]; then
+  for arch in amd64 arm64; do
+    grep -qE "arch: ${arch}\b" "$MUSL_WF" \
+      || { echo "FAIL: $MUSL_WF has no '${arch}' matrix entry" >&2; fail=1; }
+  done
+  # arm64 must run on arm64 hardware — QEMU emulation turns a full release
+  # build of the workspace into a multi-hour job.
+  grep -q 'ubuntu-24.04-arm' "$MUSL_WF" \
+    || { echo "FAIL: $MUSL_WF must build arm64 on a native arm64 runner" >&2; fail=1; }
+else
+  echo "FAIL: $MUSL_WF missing — the musl image is built for no arch at all" >&2
+  fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "test-dockerfile-multiarch: FAILED" >&2
   exit 1
 fi
-echo "test-dockerfile-multiarch: OK — all Dockerfile release downloads are arch-parameterised"
+echo "test-dockerfile-multiarch: OK — Dockerfile downloads arch-parameterised, musl image arch-neutral + built for both arches"

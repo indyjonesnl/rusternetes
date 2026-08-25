@@ -85,6 +85,24 @@ CC_x86_64_unknown_linux_musl=musl-gcc \
 > **arm64 (`aarch64-unknown-linux-musl`)** additionally needs an aarch64 musl
 > cross C toolchain (`aarch64-linux-musl-gcc`) for those same cc-based deps; the
 > Rust target alone is not enough.
+>
+> To skip the cross toolchain entirely, build the static image instead of a
+> cross-compiled binary — its Alpine builder is musl-native, so on arm64
+> hardware the host target already *is* `aarch64-unknown-linux-musl`:
+>
+> ```bash
+> docker build -f all-in-one-musl.Dockerfile -t rusternetes-all-in-one:musl .
+> ```
+>
+> `.github/workflows/publish-musl-image.yml` does exactly this on a native
+> runner per arch and publishes the two as one multi-arch manifest
+> (`ghcr.io/indyjonesnl/rusternetes/all-in-one-musl:musl`), so an arm64 static
+> binary is a `docker pull` away:
+>
+> ```bash
+> docker create --platform linux/arm64 \
+>   ghcr.io/indyjonesnl/rusternetes/all-in-one-musl:musl   # then `docker cp <id>:/rusternetes .`
+> ```
 
 ## Results
 

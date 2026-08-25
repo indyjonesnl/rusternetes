@@ -46,6 +46,7 @@ on:
       # rehomed guards (compose overlays + image Dockerfiles)
       - 'scripts/tests/test-ghcr-overlays.sh'
       - 'scripts/tests/test-dockerfile-crate-enumeration.sh'
+      - 'scripts/tests/test-dockerfile-multiarch.sh'
       # cluster-topology + bring-up guards: the per-node netns topology
       # (#1691/#1695) and the node IPAM its CNI depends on (#1697). Both are
       # config-only invariants no unit test sees, which surface hours later as
@@ -58,10 +59,11 @@ on:
       - 'compose.ghcr.node-conformance.yml'
       - 'compose.sqlite.yml'
       - 'compose.node-conformance.yml'
-      - 'Dockerfile.services'
-      - 'Dockerfile.dns'
-      - 'Dockerfile.kubectl'
-      - 'Dockerfile.all-in-one'
+      # Root-level '<name>.Dockerfile' — this used to list 'Dockerfile.<name>',
+      # which matched nothing after the rename, so the Dockerfile guards below
+      # silently stopped firing on Dockerfile-only PRs. The glob keeps every
+      # current and future root Dockerfile covered.
+      - '*.Dockerfile'
       - 'Cargo.toml'
   workflow_dispatch: {}
 
@@ -89,6 +91,11 @@ jobs:
         run: bash scripts/tests/test-ghcr-overlays.sh
       - name: Dockerfile crate-enumeration sync test
         run: bash scripts/tests/test-dockerfile-crate-enumeration.sh
+      # Multi-arch guard: no hardcoded-arch release downloads, and the static
+      # musl image (#1041) stays arch-neutral + built for both arches. This
+      # test existed but was wired into no workflow at all.
+      - name: Dockerfile multi-arch test
+        run: bash scripts/tests/test-dockerfile-multiarch.sh
       # ubuntu-latest ships docker, so the compose-topology test's
       # `docker compose config` render runs here (it self-skips without docker).
       - name: Per-node netns topology test
