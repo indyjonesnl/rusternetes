@@ -245,3 +245,51 @@ fn hostport_rules_skip_pods_without_pod_ip() {
         rules
     );
 }
+
+#[test]
+fn hostport_rules_skip_host_network_pods() {
+    // A hostNetwork pod's containers already listen in the host netns, so its
+    // `hostPort` declarations are pure metadata — upstream never programs a
+    // DNAT for them: containerd invokes CNI (and therefore the portmap plugin
+    // that owns hostPort DNAT) only for pods that get their own netns —
+    // containerd internal/cri/server/sandbox_run.go:196
+    // `if !hostNetwork(config) { ... setup pod network ... }`, with the
+    // portMappings capability attached inside that branch (line 517).
+    //
+    // Programming one anyway breaks the pod: a hostNetwork pod's podIP is the
+    // node IP, so the DNAT sends every packet for that port — including the
+    // kubelet's `127.0.0.1:<port>` health probe — to `nodeIP:<port>`, where a
+    // process bound to loopback only (kubeadm's etcd `--listen-metrics-urls`,
+    // kube-scheduler / kube-controller-manager `--bind-address=127.0.0.1`) is
+    // not listening. The probe gets ECONNREFUSED and the pod never goes Ready.
+    let mgr = IptablesManager::new(
+        rusternetes_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string(),
+        rusternetes_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE.to_string(),
+    );
+    // Mirrors kubeadm's kube-scheduler static pod on a v1.35 cluster: a
+    // hostNetwork pod carrying a `probe-port` hostPort of 10259 whose podIP is
+    // the node IP.
+    let mut pod = pod_with_hostport(
+        "kube-scheduler-node-1",
+        "kube-system",
+        "node-1",
+        "172.18.0.11",
+        10259,
+        10259,
+        "TCP",
+    );
+    pod.spec.as_mut().unwrap().host_network = Some(true);
+
+    let rules = mgr.build_hostport_rules(&[pod], "node-1");
+
+    assert!(
+        !rules.contains("--dport 10259"),
+        "hostNetwork pod must not produce any KUBE-HOSTPORTS rule:\n{}",
+        rules
+    );
+    assert!(
+        !rules.contains("-j DNAT --to-destination 172.18.0.11:10259"),
+        "hostNetwork pod must not produce a DNAT to the node IP:\n{}",
+        rules
+    );
+}

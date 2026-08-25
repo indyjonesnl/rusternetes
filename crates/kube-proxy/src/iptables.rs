@@ -2138,6 +2138,27 @@ impl IptablesManager {
             if spec.node_name.as_deref() != Some(node_name) {
                 continue;
             }
+            // hostNetwork pods share the host netns, so their containers are
+            // already reachable on the node's addresses — a hostPort DNAT is
+            // both unnecessary and actively harmful. Upstream never programs
+            // one: hostPort DNAT is the CNI portmap plugin's job, and CNI is
+            // only invoked for pods that get their own netns — containerd
+            // internal/cri/server/sandbox_run.go:196
+            // (`if !hostNetwork(config) { ... setup pod network ... }`), with
+            // the portMappings capability attached inside that branch
+            // (line 517).
+            //
+            // Programming one anyway breaks the pod: a hostNetwork pod's podIP
+            // IS the node IP, so `-p tcp --dport <hostPort> -j DNAT --to
+            // nodeIP:<port>` also captures the kubelet's `127.0.0.1:<port>`
+            // health probe and redirects it at the node IP, where a
+            // loopback-only listener (kubeadm's etcd `--listen-metrics-urls`,
+            // kube-scheduler / kube-controller-manager
+            // `--bind-address=127.0.0.1`) is not bound. The probe gets
+            // ECONNREFUSED and the static pod never reports Ready.
+            if spec.host_network.unwrap_or(false) {
+                continue;
+            }
             let pod_ip = match pod.status.as_ref().and_then(|s| s.pod_ip.as_deref()) {
                 Some(ip) if !ip.is_empty() => ip,
                 _ => continue,
