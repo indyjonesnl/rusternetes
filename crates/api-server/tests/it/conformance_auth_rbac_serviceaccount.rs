@@ -12,6 +12,28 @@
 //! production routes through an inline `spawn_router()` HTTP harness over
 //! `MemoryStorage`, so the assertion surface is the same JSON/HTTP that
 //! Sonobuoy drives.
+//!
+//! ## Mirror audit — #1749, 2026-08-25
+//!
+//! Every `framework.ConformanceIt` cited by this file has been opened and
+//! re-derived assertion by assertion. Do not treat this file as audited again
+//! after a change: re-run the same check and move the date, or drop this
+//! block.
+//!
+//! | upstream case | state |
+//! |---|---|
+//! | service_accounts.go:679 lifecycle | full, minus resourceVersion (#1751) |
+//! | service_accounts.go:843 update | full |
+//! | service_accounts.go:882 token + review | full |
+//! | service_accounts.go:81 mount API token (TokenReview half) | full; mounted-file half needs a live kubelet |
+//! | subjectreviews.go:50 SubjectReview | full |
+//!
+//! Tests here with no upstream Conformance counterpart, each carrying its own
+//! citation: `token_review_user_info_matches_upstream_serviceaccount_userinfo`
+//! (authentication/serviceaccount/util.go), `token_review_rejects_invalid_token`,
+//! the SelfSubjectReview / SelfSubjectRulesReview cases
+//! (selfsubjectreviews.go:115 is a plain `ginkgo.It`), and the RBAC
+//! round-trips.
 
 use rusternetes_common::{
     auth::{ServiceAccountClaims, TokenManager},
@@ -52,6 +74,19 @@ async fn get_json(state: TestApiServer, uri: &str) -> (u16, Value) {
 /// DELETE `uri`.
 async fn delete(state: TestApiServer, uri: &str) -> u16 {
     state.delete(uri).await.0.as_u16()
+}
+
+/// GET `uri` as `username`, via an `Impersonate-User` header.
+///
+/// Upstream builds a second clientset with `rest.ImpersonationConfig` and
+/// performs the reviewed request through it
+/// (k8s.io/kubernetes/test/e2e/auth/subjectreviews.go:73-105); the header is
+/// the wire form of that.
+async fn get_json_as(state: TestApiServer, uri: &str, username: &str) -> (u16, Value) {
+    let (status, _h, _b, value) = state
+        .send_with_headers("GET", uri, &[("Impersonate-User", username)], None)
+        .await;
+    (status.as_u16(), value)
 }
 
 /// Await the next storage watch event and return its Kubernetes event type.
@@ -704,95 +739,197 @@ async fn self_subject_review_returns_calling_user_info() {
 
 /// [sig-auth] SubjectReview should support SubjectReview API operations [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/subjectreviews.go:50
+/// Upstream: k8s.io/kubernetes/test/e2e/auth/subjectreviews.go:50-151
 /// Sonobuoy (Round 160, 2026-04-26): PASS
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
 ///
-/// Drives `POST /apis/authorization.k8s.io/v1/subjectaccessreviews` with a
-/// ServiceAccount principal asking to `list configmaps` and asserts the
-/// review's allowed status is exposed (the upstream test then cross-checks
-/// the actual API call's allowed-ness — we cannot impersonate here, so we
-/// settle for asserting the response shape, allowed boolean, and a populated
-/// reason, which is the same contract Sonobuoy relies on internally).
+/// Upstream does **not** assert that the review comes back `allowed: true`.
+/// It asserts *agreement*: it records `expectedAllowed :=
+/// sarResponse.Status.Allowed`, then has an impersonated client actually
+/// perform the reviewed request (`list configmaps` in the namespace), maps the
+/// outcome to `actuallyAllowed` — false on `IsForbidden`, true on success,
+/// failing outright on any other error — and requires the two to match
+/// (subjectreviews.go:104-120). It then repeats the comparison for a
+/// LocalSubjectAccessReview against the same `actuallyAllowed`
+/// (subjectreviews.go:141-149).
+///
+/// The old mirror pinned `allowed == true` and justified it with "exactly what
+/// the upstream test verifies via the impersonated client call". It is not:
+/// under the allow-all authorizer that assertion holds no matter what the
+/// authorizer decides, so the agreement contract was never exercised. It also
+/// required `status.reason` to be populated, which upstream never checks.
+///
+/// This mirror runs the real `RBACAuthorizer` and covers both verdicts: a
+/// ServiceAccount with no binding (review and request must agree on denied)
+/// and the same SA once a Role/RoleBinding grants `list configmaps` (both must
+/// agree on allowed). Each verdict is checked through SubjectAccessReview and
+/// LocalSubjectAccessReview, as upstream does.
 #[tokio::test]
-async fn subject_access_review_returns_allowed_status() {
-    let (state, _) = spawn_state();
-    let ns = "sar-ns";
-    let sar = json!({
-        "apiVersion": "authorization.k8s.io/v1",
-        "kind": "SubjectAccessReview",
-        "metadata": {},
-        "spec": {
-            "user": format!("system:serviceaccount:{ns}:e2e"),
-            "groups": [
-                "system:authenticated",
-                "system:serviceaccounts",
-                format!("system:serviceaccounts:{ns}")
-            ],
-            "resourceAttributes": {
-                "verb": "list",
-                "resource": "configmaps",
-                "namespace": ns,
-                "version": "v1"
-            }
-        }
-    });
-    let (status, body) = post_json(
-        state.clone(),
-        "/apis/authorization.k8s.io/v1/subjectaccessreviews",
-        &sar,
-    )
-    .await;
-    assert_eq!(status, 200, "SAR must succeed: {body}");
-    assert!(
-        body["status"]["allowed"].is_boolean(),
-        "status.allowed must be a boolean: {body}"
-    );
-    // With AlwaysAllowAuthorizer the answer is `allowed: true`, exactly what
-    // the upstream test verifies via the impersonated client call.
-    assert_eq!(
-        body["status"]["allowed"], true,
-        "AlwaysAllow must permit list/configmaps: {body}"
-    );
-    assert!(
-        body["status"]["reason"].as_str().is_some(),
-        "status.reason must be populated: {body}"
-    );
-}
+async fn subject_access_review_agrees_with_the_impersonated_request() {
+    let api = TestApiServer::builder().rbac().build();
+    // Upstream's framework client is cluster-admin; under the real
+    // RBACAuthorizer the harness's `admin` / `system:masters` caller needs the
+    // same bootstrap binding the api-server seeds at startup
+    // (crates/api-server/src/bootstrap.rs `bootstrap_default_rbac`).
+    // A second StorageBackend handle over the same MemoryStorage — the data,
+    // not the wrapper, is what the authorizer reads.
+    rusternetes_api_server::bootstrap::bootstrap_default_rbac(Arc::new(
+        rusternetes_storage::StorageBackend::Memory(api.storage.clone()),
+    ))
+    .await
+    .expect("bootstrap cluster-admin");
 
-/// LocalSubjectAccessReview second half of the upstream SubjectReview test:
-/// `POST /apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews`.
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/subjectreviews.go:50 (second half)
-/// Sonobuoy (Round 160, 2026-04-26): PASS
-#[tokio::test]
-async fn local_subject_access_review_returns_allowed_status() {
-    let (state, _) = spawn_state();
-    let ns = "lsar-ns";
-    let lsar = json!({
-        "apiVersion": "authorization.k8s.io/v1",
-        "kind": "LocalSubjectAccessReview",
-        "metadata": { "namespace": ns },
-        "spec": {
-            "user": "e2e",
-            "resourceAttributes": {
-                "verb": "list",
-                "resource": "configmaps",
-                "namespace": ns,
-                "version": "v1"
-            }
-        }
-    });
-    let (status, body) = post_json(
-        state.clone(),
-        &format!("/apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews"),
-        &lsar,
+    let ns = "sar-ns";
+    let sa_name = "e2e";
+
+    let (status, created_sa) = post_json(
+        api.clone(),
+        &format!("/api/v1/namespaces/{ns}/serviceaccounts"),
+        &json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {"name": sa_name}
+        }),
     )
     .await;
-    assert_eq!(status, 200, "LSAR must succeed: {body}");
-    assert_eq!(
-        body["status"]["allowed"], true,
-        "AlwaysAllow must permit: {body}"
-    );
+    assert_eq!(status, 201, "create SA: {created_sa}");
+    let sa_uid = created_sa["metadata"]["uid"].as_str().expect("SA uid");
+
+    // saUsername / saGroups / saUID, built exactly as upstream does from
+    // MakeUsername + "system:authenticated" + MakeGroupNames.
+    let sa_username = format!("system:serviceaccount:{ns}:{sa_name}");
+    let sa_groups = json!([
+        "system:authenticated",
+        "system:serviceaccounts",
+        format!("system:serviceaccounts:{ns}")
+    ]);
+
+    let resource_attributes = json!({
+        "verb": "list",
+        "resource": "configmaps",
+        "namespace": ns,
+        "version": "v1"
+    });
+
+    // Both verdicts: before the RoleBinding exists, and after.
+    for expect_allowed in [false, true] {
+        if expect_allowed {
+            let (s, role) = post_json(
+                api.clone(),
+                &format!("/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/roles"),
+                &json!({
+                    "apiVersion": "rbac.authorization.k8s.io/v1",
+                    "kind": "Role",
+                    "metadata": {"name": "configmap-lister"},
+                    "rules": [{
+                        "apiGroups": [""],
+                        "resources": ["configmaps"],
+                        "verbs": ["list"]
+                    }]
+                }),
+            )
+            .await;
+            assert_eq!(s, 201, "create Role: {role}");
+
+            let (s, binding) = post_json(
+                api.clone(),
+                &format!("/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings"),
+                &json!({
+                    "apiVersion": "rbac.authorization.k8s.io/v1",
+                    "kind": "RoleBinding",
+                    "metadata": {"name": "configmap-lister"},
+                    "subjects": [{
+                        "kind": "ServiceAccount",
+                        "name": sa_name,
+                        "namespace": ns
+                    }],
+                    "roleRef": {
+                        "apiGroup": "rbac.authorization.k8s.io",
+                        "kind": "Role",
+                        "name": "configmap-lister"
+                    }
+                }),
+            )
+            .await;
+            assert_eq!(s, 201, "create RoleBinding: {binding}");
+        }
+
+        // SubjectAccessReview — upstream records, it does not assert, the verdict.
+        let (s, sar) = post_json(
+            api.clone(),
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            &json!({
+                "apiVersion": "authorization.k8s.io/v1",
+                "kind": "SubjectAccessReview",
+                "metadata": {},
+                "spec": {
+                    "user": sa_username,
+                    "groups": sa_groups,
+                    "uid": sa_uid,
+                    "resourceAttributes": resource_attributes
+                }
+            }),
+        )
+        .await;
+        assert_eq!(s, 200, "SAR must succeed: {sar}");
+        let sar_allowed = sar["status"]["allowed"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("status.allowed must be a boolean: {sar}"));
+
+        // The reviewed request, performed as that subject.
+        let (list_status, list_body) = get_json_as(
+            api.clone(),
+            &format!("/api/v1/namespaces/{ns}/configmaps"),
+            &sa_username,
+        )
+        .await;
+        let actually_allowed = match list_status {
+            403 => false,
+            200 => true,
+            other => panic!("unexpected error listing configmaps: {other} {list_body}"),
+        };
+
+        assert_eq!(
+            sar_allowed, actually_allowed,
+            "SubjectAccessReview allowed: {sar_allowed}, request allowed: \
+             {actually_allowed} (list returned {list_status}): {sar}"
+        );
+        assert_eq!(
+            actually_allowed,
+            expect_allowed,
+            "the RBAC fixture should make this request \
+             {}: {list_body}",
+            if expect_allowed { "allowed" } else { "denied" }
+        );
+
+        // LocalSubjectAccessReview — compared against the same
+        // `actuallyAllowed`, per subjectreviews.go:141-149.
+        let (s, lsar) = post_json(
+            api.clone(),
+            &format!("/apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews"),
+            &json!({
+                "apiVersion": "authorization.k8s.io/v1",
+                "kind": "LocalSubjectAccessReview",
+                "metadata": {"namespace": ns},
+                "spec": {
+                    "user": sa_username,
+                    "groups": sa_groups,
+                    "uid": sa_uid,
+                    "resourceAttributes": resource_attributes
+                }
+            }),
+        )
+        .await;
+        assert_eq!(s, 200, "LSAR must succeed: {lsar}");
+        let lsar_allowed = lsar["status"]["allowed"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("status.allowed must be a boolean: {lsar}"));
+        assert_eq!(
+            lsar_allowed, actually_allowed,
+            "LocalSubjectAccessReview allowed: {lsar_allowed}, request allowed: \
+             {actually_allowed}: {lsar}"
+        );
+    }
 }
 
 /// SelfSubjectAccessReview echoes back the authorizer decision for the

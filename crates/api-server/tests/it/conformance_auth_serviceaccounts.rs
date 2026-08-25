@@ -25,13 +25,31 @@
 //!     /var/run/secrets/kubernetes.io/serviceaccount; kubelet materialisation
 //!     of the files is covered live.
 //!
-//! IGNORED (failing, gap annotated):
-//!   - SubjectReview full conformance (end-to-end impersonation not wired)
-//!
 //! The CSR full lifecycle (create → approve → issued certificate) now passes:
 //! the signer lives in the controller-manager (`controllers::cert_authority`),
 //! and the api-server half (storing/serving `status.certificate`) is covered by
 //! `csr_full_lifecycle_with_signer_issues_certificate` below.
+//!
+//! ## Mirror audit — #1749, 2026-08-25
+//!
+//! Every `framework.ConformanceIt` cited by this file has been opened and
+//! re-derived assertion by assertion. Do not treat this file as audited again
+//! after a change: re-run the same check and move the date, or drop this
+//! block.
+//!
+//! | upstream case | state |
+//! |---|---|
+//! | service_accounts.go:193 automount opt-out | full — all nine table cases |
+//! | service_accounts.go:307 projected token | admission half; kubelet materialisation is live-only |
+//! | service_accounts.go:561 OIDC discovery | document contract full; in-cluster validator is live-only; the bootstrap ClusterRole precondition is #1753 |
+//! | service_accounts.go:775 kube-root-ca | requirement 1 here; 2 and 3 in controller-manager's `namespace_controller_test.rs` |
+//! | certificates.go:202 CSR API operations | full, minus resourceVersion (#1751) |
+//!
+//! A previous header block listed "IGNORED (failing, gap annotated):
+//! SubjectReview full conformance (end-to-end impersonation not wired)". Both
+//! halves were stale — no test in this file is `#[ignore]`d, and inbound
+//! impersonation is wired and exercised by
+//! `self_subject_review_reflects_the_impersonated_identity`.
 
 use rusternetes_common::{
     resources::ServiceAccount,
@@ -1422,9 +1440,20 @@ async fn subject_access_review_non_resource_url_returns_allowed() {
 ///
 /// Upstream impersonation filter:
 ///   staging/src/k8s.io/apiserver/pkg/endpoints/filters/impersonation
-/// Upstream e2e: k8s.io/kubernetes/test/e2e/auth/subjectreviews.go:50
+/// Upstream e2e: k8s.io/kubernetes/test/e2e/auth/selfsubjectreviews.go:115
+///   ("should support SelfSubjectReview API operations")
+///
+/// Mirror audit (#1749, 2026-08-25): re-cited and renamed. This drives
+/// `POST /apis/authentication.k8s.io/v1/selfsubjectreviews`, which
+/// subjectreviews.go:50 never issues — that case only creates a
+/// SubjectAccessReview and a LocalSubjectAccessReview, and its agreement
+/// contract is mirrored by
+/// `subject_access_review_agrees_with_the_impersonated_request` in
+/// `conformance_auth_rbac_serviceaccount.rs`. Note also that
+/// selfsubjectreviews.go:115 is a plain `ginkgo.It`, not a
+/// `framework.ConformanceIt`, so this is not a Conformance case.
 #[tokio::test]
-async fn subject_review_full_conformance_with_impersonated_client() {
+async fn self_subject_review_reflects_the_impersonated_identity() {
     let (state, mem) = spawn_state();
     let ns = "subjectreview-impersonation-ns";
     let sa = "e2e-impersonated";
