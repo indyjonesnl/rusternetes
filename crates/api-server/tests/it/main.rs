@@ -141,6 +141,7 @@ mod pod_enable_service_links_default_test;
 mod pod_handler_test;
 mod pod_lifecycle_extended_test;
 mod pod_probe_default_test;
+mod pod_requests_from_limits_default_test;
 mod pod_resize_cas_test;
 mod pod_security_admission_test;
 mod pod_update_immutability_test;

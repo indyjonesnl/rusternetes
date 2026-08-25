@@ -50,5 +50,6 @@ mod runtime_prestop_exit_test;
 mod sandbox_lookup_isolation;
 mod server_extended_test;
 mod sidecar_containers_test;
+mod static_pod_defaults_test;
 mod static_pods_test;
 mod status_idempotency_test;
