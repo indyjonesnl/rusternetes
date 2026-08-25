@@ -261,12 +261,14 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
                 "metadata": {
                     "name": "kubernetes",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339()
+                    "creationTimestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                 },
                 "spec": { "cidrs": ["10.96.0.0/12"] },
+                // Condition verbatim from upstream's default-ServiceCIDR
+                // controller — see the note on the same seed in `main.rs`.
                 "status": { "conditions": [{ "type": "Ready", "status": "True",
-                    "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
-                    "reason": "NetworkReady", "message": "ServiceCIDR is ready" }] }
+                    "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "reason": "", "message": "Kubernetes default Service CIDR is ready" }] }
             });
             if let Err(e) = storage.create(&cidr_key, &service_cidr).await {
                 warn!("Failed to create default ServiceCIDR: {}", e);
@@ -286,7 +288,7 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
                 "metadata": {
                     "name": "standard",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339(),
+                    "creationTimestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                     "annotations": {
                         "storageclass.kubernetes.io/is-default-class": "true"
                     }

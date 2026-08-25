@@ -56,7 +56,7 @@ async fn create_namespace(router: &TestApiServer) {
         "metadata": { "name": TEST_NS },
     });
     let (status, _) = post_json(router, "/api/v1/namespaces", &body).await;
-    assert!(status == 201 || status == 200);
+    assert_eq!(status, 201, "namespace create must return 201");
 }
 
 /// Mirror of upstream `e2epod.NewAgnhostPod` with an init container — the
@@ -122,12 +122,7 @@ async fn test_pod_generation_empty_update_does_not_bump() {
     let body = agnhost_pod_with_init("gen-empty-update");
     let create_uri = format!("/api/v1/namespaces/{}/pods", TEST_NS);
     let (status, resp) = post_json(&router, &create_uri, &body).await;
-    assert!(
-        status == 201 || status == 200,
-        "create failed: {} {}",
-        status,
-        resp
-    );
+    assert!(status == 201, "create failed: {} {}", status, resp);
     assert_eq!(
         resp["metadata"]["generation"].as_i64(),
         Some(1),
@@ -141,7 +136,7 @@ async fn test_pod_generation_empty_update_does_not_bump() {
     let put_body = add_go_defaults(fetched);
     let (status, updated) = put_json(&router, &get_uri, &put_body).await;
     assert!(
-        status == 200 || status == 201,
+        status == 200,
         "empty update must succeed: status={} body={}",
         status,
         updated
@@ -174,7 +169,7 @@ async fn test_pod_generation_image_swap_bumps_to_2() {
 
     let (status, updated) = put_json(&router, &get_uri, &put_body).await;
     assert!(
-        status == 200 || status == 201,
+        status == 200,
         "image swap must succeed: status={} body={}",
         status,
         updated
@@ -206,7 +201,7 @@ async fn test_pod_generation_active_deadline_bumps() {
 
     let (status, updated) = put_json(&router, &get_uri, &put_body).await;
     assert!(
-        status == 200 || status == 201,
+        status == 200,
         "activeDeadlineSeconds set must succeed: status={} body={}",
         status,
         updated
@@ -238,7 +233,7 @@ async fn test_pod_generation_metadata_update_does_not_bump() {
 
     let (status, updated) = put_json(&router, &get_uri, &put_body).await;
     assert!(
-        status == 200 || status == 201,
+        status == 200,
         "annotation set must succeed: status={} body={}",
         status,
         updated
@@ -274,7 +269,7 @@ async fn test_pod_generation_client_set_value_is_ignored() {
 
     let (status, updated) = put_json(&router, &get_uri, &put_body).await;
     assert!(
-        status == 200 || status == 201,
+        status == 200,
         "client-set generation must not error: status={} body={}",
         status,
         updated

@@ -80,7 +80,7 @@ async fn create_namespace(state: &TestApiServer, ns: &str) {
     });
     let (status, _v) = post_json(state, "/api/v1/namespaces", &body).await;
     assert!(
-        status == StatusCode::CREATED || status == StatusCode::OK,
+        status == StatusCode::CREATED,
         "namespace create returned {status}",
     );
 }
@@ -229,10 +229,7 @@ async fn core_v1_should_manage_lifecycle_of_an_event() {
         &format!("/api/v1/namespaces/{ns}/events/{event_name}"),
     )
     .await;
-    assert!(
-        status == StatusCode::OK || status == StatusCode::ACCEPTED,
-        "delete returned {status}",
-    );
+    assert!(status == StatusCode::OK, "delete returned {status}",);
 
     // --- listing all events: deleted event MUST NOT show ---
     let (status, list) = get_json(
@@ -300,7 +297,7 @@ async fn core_v1_should_delete_a_collection_of_events() {
     )
     .await;
     assert!(
-        status == StatusCode::OK || status == StatusCode::ACCEPTED,
+        status == StatusCode::OK,
         "deletecollection returned {status}",
     );
 
@@ -520,10 +517,7 @@ async fn events_v1_should_fetch_patch_delete_list() {
 
     // --- deleting the test event ---
     let (status, _v) = delete(&state, &format!("{ns_path}/{event_name}")).await;
-    assert!(
-        status == StatusCode::OK || status == StatusCode::ACCEPTED,
-        "delete returned {status}",
-    );
+    assert!(status == StatusCode::OK, "delete returned {status}",);
 
     // --- listing all namespaces: deleted event MUST NOT show ---
     let (status, list) = get_json(
@@ -595,7 +589,7 @@ async fn events_v1_should_delete_a_collection_of_events() {
     )
     .await;
     assert!(
-        status == StatusCode::OK || status == StatusCode::ACCEPTED,
+        status == StatusCode::OK,
         "deletecollection returned {status}",
     );
 

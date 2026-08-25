@@ -241,18 +241,25 @@ async fn main() -> Result<()> {
                 "metadata": {
                     "name": "kubernetes",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339()
+                    "creationTimestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                 },
                 "spec": {
                     "cidrs": ["10.96.0.0/12"]
                 },
+                // Ready condition verbatim from the upstream default-ServiceCIDR
+                // controller (`pkg/controlplane/controller/defaultservicecidr/
+                // default_servicecidr_controller.go:232-237`): type `Ready`,
+                // status `True`, message "Kubernetes default Service CIDR is
+                // ready", and **no reason** — it applies the condition without
+                // one, and ServiceCIDR status is not condition-validated
+                // (`ValidateServiceCIDRStatusUpdate`, validation.go:883-886).
                 "status": {
                     "conditions": [{
                         "type": "Ready",
                         "status": "True",
-                        "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
-                        "reason": "NetworkReady",
-                        "message": "ServiceCIDR is ready"
+                        "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        "reason": "",
+                        "message": "Kubernetes default Service CIDR is ready"
                     }]
                 }
             });
@@ -274,7 +281,7 @@ async fn main() -> Result<()> {
                 "metadata": {
                     "name": "standard",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339(),
+                    "creationTimestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                     "annotations": {
                         "storageclass.kubernetes.io/is-default-class": "true"
                     }

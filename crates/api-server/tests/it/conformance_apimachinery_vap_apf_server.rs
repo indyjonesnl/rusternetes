@@ -125,14 +125,14 @@ async fn server_version_should_find_the_server_version() {
 // [sig-api-machinery] ValidatingAdmissionPolicy [Privileged:ClusterAdmin]
 // should support ValidatingAdmissionPolicy API operations [Conformance]
 //
-// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/validating_admission_policy.go
+// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/validatingadmissionpolicy.go
 // Sonobuoy: newly-passing.txt
 // ===========================================================================
 
 /// [sig-api-machinery] ValidatingAdmissionPolicy should support
 /// ValidatingAdmissionPolicy API operations [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/validating_admission_policy.go:75
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/validatingadmissionpolicy.go:413
 /// Sonobuoy (2026-05-29): PASS
 ///
 /// Full CRUD lifecycle: create → get → list → update → patch → delete.
@@ -232,10 +232,7 @@ async fn vap_should_support_validating_admission_policy_api_operations() {
         None,
     )
     .await;
-    assert!(
-        status == 200 || status == 202 || status == 204,
-        "delete VAP must return 2xx; got {status}"
-    );
+    assert!(status == 200, "delete VAP must return 2xx; got {status}");
 
     // Confirm it's gone
     let (status, _) = send(&router, "GET", &format!("{base}/vap-lifecycle-test"), None).await;
@@ -245,7 +242,7 @@ async fn vap_should_support_validating_admission_policy_api_operations() {
 /// [sig-api-machinery] ValidatingAdmissionPolicy should support
 /// ValidatingAdmissionPolicyBinding API operations [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/validating_admission_policy.go:175
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/validatingadmissionpolicy.go:682
 /// Sonobuoy (2026-05-29): PASS
 ///
 /// Full CRUD lifecycle on `ValidatingAdmissionPolicyBinding`.
@@ -324,7 +321,7 @@ async fn vap_should_support_validating_admission_policy_binding_api_operations()
     )
     .await;
     assert!(
-        status == 200 || status == 202 || status == 204,
+        status == 200,
         "delete VAPBinding must return 2xx; got {status}"
     );
 }
@@ -332,7 +329,7 @@ async fn vap_should_support_validating_admission_policy_binding_api_operations()
 /// [sig-api-machinery] ValidatingAdmissionPolicy should allow expressions to
 /// refer variables [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/validating_admission_policy.go:256
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/validatingadmissionpolicy.go:223
 /// Sonobuoy (2026-05-29): PASS
 ///
 /// Creates a VAP whose `variables[]` section defines a named CEL variable
@@ -409,7 +406,7 @@ async fn vap_should_allow_expressions_to_refer_variables() {
 /// [sig-api-machinery] ValidatingAdmissionPolicy should validate against a
 /// Deployment [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/validating_admission_policy.go:319
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/validatingadmissionpolicy.go:79
 /// Sonobuoy (2026-05-29): PASS
 ///
 /// Asserts the VAP resource itself is persisted correctly; the actual
@@ -590,10 +587,7 @@ async fn apf_should_support_priority_level_configuration_api_operations() {
 
     // DELETE
     let (status, _) = send(&router, "DELETE", &format!("{base}/conformance-plc"), None).await;
-    assert!(
-        status == 200 || status == 202 || status == 204,
-        "delete PLC must return 2xx; got {status}"
-    );
+    assert!(status == 200, "delete PLC must return 2xx; got {status}");
 
     // Confirm deleted
     let (status, _) = send(&router, "GET", &format!("{base}/conformance-plc"), None).await;
@@ -694,7 +688,7 @@ async fn apf_should_support_flow_schema_api_operations() {
     // DELETE
     let (status, _) = send(&router, "DELETE", &format!("{base}/conformance-fs"), None).await;
     assert!(
-        status == 200 || status == 202 || status == 204,
+        status == 200,
         "delete FlowSchema must return 2xx; got {status}"
     );
 
@@ -814,7 +808,7 @@ async fn watchers_should_restart_from_last_resource_version_observed() {
 // [sig-api-machinery] Servers with support for Table transformation
 // [Conformance]
 //
-// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/table.go
+// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/table_conversion.go
 // Sonobuoy: failing.txt
 // ===========================================================================
 

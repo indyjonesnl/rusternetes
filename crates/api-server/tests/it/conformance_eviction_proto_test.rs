@@ -360,7 +360,7 @@ async fn test_eviction_subresource_accepts_protobuf_body() {
     let body_str = String::from_utf8_lossy(&bytes).to_string();
 
     assert!(
-        status == StatusCode::OK || status == StatusCode::CREATED,
+        status == StatusCode::CREATED,
         "POST protobuf Eviction must return 200/201 — got {status}, body={body_str}",
     );
 
@@ -401,7 +401,7 @@ async fn test_eviction_subresource_protobuf_honors_matching_uid_precondition() {
     let (status, _bytes) = post_proto(&router, &uri, envelope).await;
 
     assert!(
-        status == StatusCode::OK || status == StatusCode::CREATED,
+        status == StatusCode::CREATED,
         "protobuf Eviction with matching UID precondition must succeed; got {status}",
     );
     let key = build_key("pods", Some(ns), name);

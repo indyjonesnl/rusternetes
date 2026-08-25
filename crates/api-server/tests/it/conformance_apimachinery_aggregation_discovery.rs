@@ -391,57 +391,41 @@ async fn discovery_aggregated_v2_on_core_api() {
 // ---------------------------------------------------------------------------
 // APIService aggregation — TestSampleAPIServer slice
 //
-// The CRUD handlers on `/apis/apiregistration.k8s.io/v1/apiservices` live in
-// `public_routes` and therefore have no auth middleware that injects
-// `Extension<AuthContext>` (see `crates/api-server/src/router.rs`). Driving
-// them via the HTTP harness yields 500 because the extractor is missing —
-// this is a separate defect tracked in
-// `docs/conformance/apimachinery-aggregation-discovery.md`. The conformance
-// scenarios that matter for the aggregator slice are:
+// The conformance scenarios that matter for the aggregator slice are:
 //   * persisted APIService gets picked up by `/apis` discovery merge
 //   * `resolve_aggregator_target` finds the registered backend
-//   * status seed semantics on creation
-// We exercise those by seeding the APIService directly through the storage
-// layer (mirroring what `create_apiservice` would persist) and then verifying
-// the downstream surface via HTTP.
+//   * status semantics on creation
+//
+// All three are driven through the real HTTP route. A note here used to say
+// that POSTing to `/apis/apiregistration.k8s.io/v1/apiservices` returned 500
+// because the handler's `Extension<AuthContext>` extractor had no middleware to
+// populate it, and that the tests therefore seeded storage directly. That is no
+// longer true — the route works — and seeding directly had quietly turned the
+// creation assertions into a test of a copy of the handler kept in this file.
 // ---------------------------------------------------------------------------
 
-/// Helper: persist an APIService into the api-server's storage as if
-/// `create_apiservice` had been invoked. Mirrors the same seeded status
-/// conditions the handler would write so downstream merge logic sees the same
-/// shape it would in production.
+/// Helper: register an APIService by POSTing it, so what lands in storage is
+/// whatever `create_apiservice` actually writes.
+///
+/// This used to write straight to storage, re-implementing the handler's
+/// status-seeding logic inline. That made every "status seed semantics on
+/// creation" assertion below tautological — they compared the handler's output
+/// to a *copy of the handler's own code* living in this file, so a divergence
+/// from upstream in the real create path could never fail them. Going through
+/// the route is what lets those assertions mean anything.
 async fn seed_apiservice(state: &TestApiServer, body: Value) {
-    let name = body["metadata"]["name"]
-        .as_str()
-        .expect("apiservice has metadata.name")
-        .to_string();
-    let mut value = body;
-    let has_service_backend = value.pointer("/spec/service").is_some_and(|v| !v.is_null());
-    let (status, reason, message) = if has_service_backend {
-        (
-            "Unknown",
-            "Pending",
-            "waiting for APIService controller probe",
+    let (status, _bytes, response) = state
+        .send_raw(
+            "POST",
+            "/apis/apiregistration.k8s.io/v1/apiservices",
+            Some("application/json"),
+            Some(&body),
         )
-    } else {
-        ("True", "Local", "Local APIService is always available")
-    };
-    let now = chrono::Utc::now().to_rfc3339();
-    value["status"] = json!({
-        "conditions": [{
-            "type": "Available",
-            "status": status,
-            "lastTransitionTime": now,
-            "reason": reason,
-            "message": message,
-        }]
-    });
-    let key = build_key("apiservices", None, &name);
-    state
-        .storage
-        .create::<Value>(&key, &value)
-        .await
-        .expect("seed apiservice");
+        .await;
+    assert!(
+        status.is_success(),
+        "POST apiservice must succeed: {status} {response}"
+    );
 }
 
 /// [sig-api-machinery] Aggregator should be able to support the 1.17 Sample
@@ -552,19 +536,24 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
     );
 
     // -------------------------------------------------------------------
-    // Sub-assertion 2: status seed Available=Unknown for remote APIService.
-    // Upstream aggregator.go:382 reads conditions immediately post-create.
+    // Sub-assertion 2: create leaves a REMOTE APIService's status empty.
+    //
+    // Upstream `apiServerStrategy.PrepareForCreate`
+    // (`staging/src/k8s.io/kube-aggregator/pkg/registry/apiservice/strategy.go:68-76`) wipes
+    // `status` and only seeds a condition when `spec.service == nil`. So the
+    // first `Available` condition on a remote APIService comes from the
+    // availability controller, off a real probe — never from the create path.
     // -------------------------------------------------------------------
     let key = build_key("apiservices", None, "v1alpha1.wardle.example.com");
     let stored: Value = state.storage.get(&key).await.unwrap();
-    let avail = stored["status"]["conditions"]
-        .as_array()
-        .expect("conditions present after create")
-        .iter()
-        .find(|c| c["type"].as_str() == Some("Available"))
-        .expect("Available condition present");
-    assert_eq!(avail["status"].as_str(), Some("Unknown"));
-    assert_eq!(avail["reason"].as_str(), Some("Pending"));
+    let conditions = stored
+        .pointer("/status/conditions")
+        .and_then(|v| v.as_array());
+    assert!(
+        conditions.is_none_or(|c| c.is_empty()),
+        "create must not fabricate a condition for a remote APIService; got {}",
+        stored["status"]
+    );
 
     // -------------------------------------------------------------------
     // Sub-assertion 3: status-subresource update flips Available to True.
@@ -799,15 +788,25 @@ async fn aggregator_create_local_apiservice_returns_available_true() {
     );
 }
 
-/// [sig-api-machinery] Aggregator — remote APIService seeds Available=Unknown
+/// [sig-api-machinery] Aggregator — create leaves a remote APIService's status empty
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/aggregator.go:382
-/// (controller-driven status; we assert the seed value because the e2e suite
-/// asserts `Available` is reported before flipping True after a successful
-/// probe).
-/// Sonobuoy (Round 160): PASS (seed behaviour)
+/// Upstream: `apiServerStrategy.PrepareForCreate`
+/// (`staging/src/k8s.io/kube-aggregator/pkg/registry/apiservice/strategy.go:68-76`):
+///
+/// ```text
+/// apiservice.Status = apiregistration.APIServiceStatus{}
+/// if apiservice.Spec.Service == nil {
+///     SetAPIServiceCondition(apiservice, NewLocalAvailableAPIServiceCondition())
+/// }
+/// ```
+///
+/// The condition on a remote APIService is written by the availability
+/// controller off a real probe. This test used to assert a create-time seed of
+/// `Available=Unknown` / `reason: Pending` — a condition upstream never writes,
+/// held in place by a test in the directory that is supposed to mirror upstream
+/// responses.
 #[tokio::test]
-async fn aggregator_create_remote_apiservice_seeds_available_unknown() {
+async fn aggregator_create_remote_apiservice_leaves_status_empty() {
     let state = spawn_state();
     let body = apiservice_remote(
         "v1alpha1.wardle.example.com",
@@ -821,14 +820,68 @@ async fn aggregator_create_remote_apiservice_seeds_available_unknown() {
 
     let key = build_key("apiservices", None, "v1alpha1.wardle.example.com");
     let stored: Value = state.storage.get(&key).await.unwrap();
+    let conditions = stored
+        .pointer("/status/conditions")
+        .and_then(|v| v.as_array());
+    assert!(
+        conditions.is_none_or(|c| c.is_empty()),
+        "remote APIService must carry no conditions until a probe runs; got {}",
+        stored["status"]
+    );
+}
+
+/// [sig-api-machinery] Aggregator — a LOCAL APIService is available on create,
+/// with upstream's exact reason and message.
+///
+/// Upstream `NewLocalAvailableAPIServiceCondition`
+/// (`staging/src/k8s.io/kube-aggregator/pkg/apis/apiregistration/v1/helper/helpers.go:96-104`):
+/// `Reason: "Local"`, `Message: "Local APIServices are always available"`.
+/// The message was singular here ("Local APIService is always available"),
+/// in both the create handler and the availability controller.
+#[tokio::test]
+async fn aggregator_create_local_apiservice_uses_upstream_local_condition() {
+    let state = spawn_state();
+    let body = json!({
+        "apiVersion": "apiregistration.k8s.io/v1",
+        "kind": "APIService",
+        "metadata": { "name": "v1.local.example.com" },
+        "spec": {
+            "group": "local.example.com",
+            "version": "v1",
+            "groupPriorityMinimum": 1000,
+            "versionPriority": 100,
+        },
+    });
+    seed_apiservice(&state, body).await;
+
+    let key = build_key("apiservices", None, "v1.local.example.com");
+    let stored: Value = state.storage.get(&key).await.unwrap();
     let avail = stored["status"]["conditions"]
         .as_array()
-        .unwrap()
+        .expect("local APIService is available on create")
         .iter()
         .find(|c| c["type"].as_str() == Some("Available"))
         .expect("Available condition");
-    assert_eq!(avail["status"].as_str(), Some("Unknown"));
-    assert_eq!(avail["reason"].as_str(), Some("Pending"));
+    assert_eq!(avail["status"].as_str(), Some("True"));
+    assert_eq!(avail["reason"].as_str(), Some("Local"));
+    assert_eq!(
+        avail["message"].as_str(),
+        Some("Local APIServices are always available"),
+    );
+    // `metav1.Time` on the wire: RFC3339, second precision, `Z` — never
+    // sub-second digits or a `+00:00` offset.
+    let transition = avail["lastTransitionTime"].as_str().unwrap_or_default();
+    assert!(
+        transition.ends_with('Z') && !transition.contains('.'),
+        "lastTransitionTime must be second-precision UTC like metav1.Time; got {transition:?}"
+    );
+    let created = stored["metadata"]["creationTimestamp"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        created.ends_with('Z') && !created.contains('.'),
+        "creationTimestamp must be second-precision UTC like metav1.Time; got {created:?}"
+    );
 }
 
 /// [sig-api-machinery] Aggregator — APIService discovery merge: a registered

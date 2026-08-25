@@ -85,10 +85,7 @@ async fn create_namespace(router: &TestApiServer) {
         "metadata": { "name": TEST_NS },
     });
     let (status, _) = post_json(router, "/api/v1/namespaces", &body).await;
-    assert!(
-        status == 201 || status == 200,
-        "namespace create failed: {status}"
-    );
+    assert!(status == 201, "namespace create failed: {status}");
 }
 
 /// Minimal ReplicationController body.
@@ -147,10 +144,7 @@ async fn test_kubectl_label_add_and_remove_on_pod() {
         &pod_body,
     )
     .await;
-    assert!(
-        status == 201 || status == 200,
-        "pod create failed: {status}"
-    );
+    assert!(status == 201, "pod create failed: {status}");
 
     // kubectl label pod label-test-pod app=testlabel
     let patch_add = json!({ "metadata": { "labels": { "app": "testlabel" } } });
@@ -215,10 +209,7 @@ async fn test_kubectl_label_add_on_cluster_scoped_node() {
         "spec": {}
     });
     let (status, _) = post_json(&router, "/api/v1/nodes", &node_body).await;
-    assert!(
-        status == 201 || status == 200,
-        "node create failed: {status}"
-    );
+    assert!(status == 201, "node create failed: {status}");
 
     // kubectl label node label-test-node env=staging
     let patch = json!({ "metadata": { "labels": { "env": "staging" } } });
@@ -263,10 +254,7 @@ async fn test_kubectl_label_overwrite_existing_value() {
         &pod_body,
     )
     .await;
-    assert!(
-        status == 201 || status == 200,
-        "pod create failed: {status}"
-    );
+    assert!(status == 201, "pod create failed: {status}");
 
     // kubectl label pod overwrite-pod version=v2 --overwrite
     let patch = json!({ "metadata": { "labels": { "version": "v2" } } });
@@ -315,7 +303,7 @@ async fn test_update_demo_create_and_stop_rc() {
     let body = rc_body(rc_name, 1);
     let (status, created) = post_json(&router, &create_uri, &body).await;
     assert!(
-        status == 201 || status == 200,
+        status == 201,
         "RC create must succeed; got {status} body={created}"
     );
     assert_eq!(
@@ -338,10 +326,7 @@ async fn test_update_demo_create_and_stop_rc() {
 
     // DELETE the RC.
     let status = delete_resource(&router, &rc_uri).await;
-    assert!(
-        status == 200 || status == 202 || status == 204,
-        "DELETE must succeed; got {status}"
-    );
+    assert!(status == 200, "DELETE must succeed; got {status}");
 
     // GET the RC — must now be 404.
     let (status, _) = get_json(&router, &rc_uri).await;
@@ -377,7 +362,7 @@ async fn test_update_demo_scale_rc() {
     // Create the RC with replicas=1.
     let body = rc_body(rc_name, 1);
     let (status, _) = post_json(&router, &create_uri, &body).await;
-    assert!(status == 201 || status == 200, "RC create failed: {status}");
+    assert!(status == 201, "RC create failed: {status}");
 
     // Verify initial scale via GET /scale.
     let (status, scale) = get_json(&router, &scale_uri).await;
@@ -441,7 +426,7 @@ async fn test_update_demo_scale_rc_idempotent() {
 
     let body = rc_body(rc_name, 3);
     let (status, _) = post_json(&router, &create_uri, &body).await;
-    assert!(status == 201 || status == 200, "RC create failed: {status}");
+    assert!(status == 201, "RC create failed: {status}");
 
     // Patch to the same replicas=3.
     let patch = json!({ "spec": { "replicas": 3 } });

@@ -173,7 +173,7 @@ async fn watch_should_receive_event_per_object_lifecycle_op() {
 /// [sig-api-machinery] Watch event types serialize in UPPERCASE per K8s wire
 /// format ("ADDED" | "MODIFIED" | "DELETED" | "BOOKMARK" | "ERROR")
 ///
-/// Upstream: vendor/k8s.io/apimachinery/pkg/watch/watch.go EventType
+/// Upstream: staging/src/k8s.io/apimachinery/pkg/watch/watch.go EventType
 /// Sonobuoy (Round 160, 2026-04-26): PASS — precondition for any watch test
 #[tokio::test]
 async fn watch_event_types_serialize_in_uppercase() {
@@ -260,7 +260,7 @@ async fn watch_delete_event_preserves_prev_object_when_present() {
 /// [sig-api-machinery] Watch event resourceVersion is extractable from raw JSON
 /// bodies (used by the watch cache to compute the highest observed RV).
 ///
-/// Upstream: vendor/k8s.io/apimachinery/pkg/watch
+/// Upstream: staging/src/k8s.io/apimachinery/pkg/watch
 /// Sonobuoy (Round 160, 2026-04-26): PASS — precondition
 #[tokio::test]
 async fn watch_extract_resource_version_from_raw_json() {
@@ -273,7 +273,7 @@ async fn watch_extract_resource_version_from_raw_json() {
 /// [sig-api-machinery] Watch query-param parsing: ?watch=true switches list
 /// requests into watch mode.
 ///
-/// Upstream: vendor/k8s.io/apimachinery/pkg/runtime watch routing
+/// Upstream: staging/src/k8s.io/apimachinery/pkg/runtime watch routing
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn watch_query_param_recognised_for_list_endpoints() {
@@ -331,7 +331,7 @@ async fn watch_filters_events_outside_subscribed_namespace_prefix() {
 /// [sig-api-machinery] Watch resourceVersion must monotonically advance on
 /// successive modifications.
 ///
-/// Upstream: vendor/k8s.io/apimachinery/pkg/watch
+/// Upstream: staging/src/k8s.io/apimachinery/pkg/watch
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn watch_resource_version_is_monotonic_across_updates() {
@@ -537,7 +537,7 @@ async fn chunking_continue_after_compaction_returns_410_expired() {
 /// [sig-api-machinery] ListMeta wire format includes the optional `continue`
 /// field (camelCased lowercase `continue` to match upstream).
 ///
-/// Upstream: vendor/k8s.io/apimachinery/pkg/apis/meta/v1/types.go ListMeta
+/// Upstream: staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go ListMeta
 /// Sonobuoy (Round 160, 2026-04-26): PASS — serialization contract
 #[tokio::test]
 async fn chunking_listmeta_continue_field_serializes_as_continue_key() {
@@ -564,7 +564,7 @@ async fn chunking_listmeta_continue_field_serializes_as_continue_key() {
 /// [sig-api-machinery] Default ListMeta omits chunking fields entirely (so
 /// clients see a plain `{resourceVersion: "0"}` until chunking is invoked).
 ///
-/// Upstream: vendor/k8s.io/apimachinery/pkg/apis/meta/v1/types.go ListMeta
+/// Upstream: staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go ListMeta
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn chunking_default_listmeta_omits_continue_and_remaining() {
@@ -576,13 +576,14 @@ async fn chunking_default_listmeta_omits_continue_and_remaining() {
 }
 
 // =========================================================================
-// Field & label selectors — mirrors test/e2e/apimachinery/field_selector.go
+// Field & label selectors — semantics owned by
+// staging/src/k8s.io/apimachinery/pkg/fields/selector.go and .../labels/selector.go
 // =========================================================================
 
 /// [sig-api-machinery] FieldSelectors should filter `metadata.name`
 /// equality [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/field_selector.go
+/// Upstream: k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/fields/selector.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn field_selector_filters_by_metadata_name_equality() {
@@ -600,7 +601,7 @@ async fn field_selector_filters_by_metadata_name_equality() {
 /// [sig-api-machinery] FieldSelectors support inequality (`metadata.name!=x`)
 /// [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/field_selector.go
+/// Upstream: k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/fields/selector.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn field_selector_filters_by_metadata_name_inequality() {
@@ -614,7 +615,7 @@ async fn field_selector_filters_by_metadata_name_inequality() {
 /// [sig-api-machinery] FieldSelectors support comma-separated AND of
 /// predicates [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/field_selector.go
+/// Upstream: k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/fields/selector.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn field_selector_supports_comma_and_of_predicates() {
@@ -635,8 +636,8 @@ async fn field_selector_supports_comma_and_of_predicates() {
 
 /// [sig-api-machinery] LabelSelectors should filter by equality [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/label_selector.go (via
-/// the watch.go and chunking.go reuse paths)
+/// Upstream: k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/labels/selector.go
+/// (exercised end-to-end by test/e2e/apimachinery/watch.go:257)
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn label_selector_filters_by_equality() {
@@ -673,7 +674,7 @@ async fn label_selector_supports_set_in_notation() {
 /// [sig-api-machinery] Field and label selectors can be combined; both must
 /// match for the item to be returned.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/field_selector.go +
+/// Upstream: k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/fields/selector.go +
 /// label_selector.go combined scenarios
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
@@ -695,7 +696,7 @@ async fn field_and_label_selectors_combine_with_logical_and() {
 
 /// [sig-api-machinery] Empty fieldSelector must be a no-op (return all items).
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/field_selector.go
+/// Upstream: k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/fields/selector.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn field_selector_empty_string_is_noop() {
@@ -708,7 +709,7 @@ async fn field_selector_empty_string_is_noop() {
 /// [sig-api-machinery] Invalid field selectors must surface as 400-class
 /// errors (InvalidResource at the handler layer).
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/field_selector.go
+/// Upstream: k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/fields/selector.go
 /// (the test asserts Bad Request for `metadata.name=` with no value variants
 /// like nested dots beyond the supported allowlist)
 /// Sonobuoy (Round 160, 2026-04-26): PASS
@@ -735,7 +736,7 @@ async fn field_selector_invalid_returns_invalid_resource_error() {
 /// [sig-api-machinery] OwnerReference contains apiVersion, kind, name, uid as
 /// required fields [Conformance precondition]
 ///
-/// Upstream: vendor/k8s.io/apimachinery/pkg/apis/meta/v1/types.go
+/// Upstream: staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS — serialization contract
 #[tokio::test]
 async fn gc_owner_reference_required_fields_present() {
@@ -750,7 +751,7 @@ async fn gc_owner_reference_required_fields_present() {
 /// [sig-api-machinery] OwnerReference `controller: true` marks the managing
 /// controller.
 ///
-/// Upstream: vendor/k8s.io/apimachinery/pkg/apis/meta/v1/types.go +
+/// Upstream: staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go +
 /// test/e2e/apimachinery/garbage_collector.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
@@ -763,7 +764,7 @@ async fn gc_owner_reference_controller_flag_serializes() {
 /// [sig-api-machinery] OwnerReference `blockOwnerDeletion: true` opts the
 /// dependent into the foreground-deletion finalizer chain.
 ///
-/// Upstream: vendor/k8s.io/apimachinery/pkg/apis/meta/v1/types.go
+/// Upstream: staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn gc_owner_reference_block_owner_deletion_serializes() {
@@ -776,7 +777,7 @@ async fn gc_owner_reference_block_owner_deletion_serializes() {
 /// [sig-api-machinery] OwnerReference omits optional fields when None so the
 /// wire body matches Go's `omitempty` semantics.
 ///
-/// Upstream: vendor/k8s.io/apimachinery/pkg/apis/meta/v1/types.go
+/// Upstream: staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn gc_owner_reference_omits_optional_fields_when_unset() {
@@ -808,7 +809,7 @@ async fn gc_object_supports_multiple_owner_references() {
 /// [sig-api-machinery] DeletePropagation policies serialize as `Orphan`,
 /// `Foreground`, `Background` per the K8s wire contract.
 ///
-/// Upstream: vendor/k8s.io/apimachinery/pkg/apis/meta/v1/types.go
+/// Upstream: staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go
 /// (DeletionPropagation), exercised by garbage_collector.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS — wire contract
 #[tokio::test]
@@ -1013,7 +1014,7 @@ async fn gc_owner_references_round_trip_through_storage() {
 /// [sig-api-machinery] An object with no `ownerReferences` field round-trips
 /// without growing a `[]` array (omitempty contract).
 ///
-/// Upstream: vendor/k8s.io/apimachinery/pkg/apis/meta/v1/types.go
+/// Upstream: staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn gc_object_without_owner_refs_omits_field() {

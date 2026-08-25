@@ -237,12 +237,17 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
         {
             Some(n) => n.to_string(),
             None => {
-                // Local APIService (no service backing) — always available
+                // Local APIService (no service backing) — always available.
+                // Message is verbatim upstream `NewLocalAvailableAPIServiceCondition`
+                // (`staging/src/k8s.io/kube-aggregator/pkg/apis/apiregistration/v1/helper/helpers.go:96-104`):
+                // plural "APIServices". This file already treats the message as
+                // contract (see `update_condition`), and it was the one reason
+                // whose wording did not match.
                 self.update_condition(
                     name,
                     "True",
                     "Local",
-                    "Local APIService is always available",
+                    "Local APIServices are always available",
                 )
                 .await?;
                 return Ok(());
@@ -439,7 +444,10 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
         // Reason/message-only updates retain the prior transition time so
         // observers can tell how long the condition has held its current
         // status. Default to "now" if there's no prior Available condition.
-        let now = chrono::Utc::now().to_rfc3339();
+        // `metav1.Time` wire form: RFC3339, second precision, `Z`. Chrono's
+        // plain `to_rfc3339()` emits sub-second digits and a `+00:00` offset,
+        // neither of which upstream ever writes.
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let prior_transition = apiservice
             .pointer("/status/conditions")
             .and_then(|v| v.as_array())
