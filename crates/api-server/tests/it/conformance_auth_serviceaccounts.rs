@@ -37,10 +37,13 @@ use rusternetes_common::{
     resources::ServiceAccount,
     types::{ObjectMeta, TypeMeta},
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, WatchEvent};
 use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
+use tokio_stream::StreamExt;
 
 // ---------------------------------------------------------------------------
 // HTTP harness — thin shims over the shared `TestApiServer`. The token-signing
@@ -143,48 +146,86 @@ async fn seed_service_account(mem: &Arc<MemoryStorage>, namespace: &str, name: &
 // conformance case.
 // ---------------------------------------------------------------------------
 
-/// `/.well-known/openid-configuration` must return a 200 with a JSON body
-/// containing at least `issuer`, `jwks_uri` and
-/// `id_token_signing_alg_values_supported`.
+/// [sig-auth] ServiceAccounts ServiceAccountIssuerDiscovery should support OIDC
+/// discovery of service account issuer [Conformance] — the discovery-document
+/// half.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go ServiceAccountIssuerDiscovery
+/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:561-668
 /// Sonobuoy (batch-64, 2026-05-28): PASS
+/// Mirror audit (#1749, 2026-08-25): re-derived.
+///
+/// The upstream body itself asserts nothing about the document: it grants the
+/// namespace's `default` SA the `system:service-account-issuer-discovery`
+/// ClusterRole, runs an agnhost pod with
+/// `--args test-service-account-issuer-discovery`, and asserts only that the
+/// pod succeeds. The document contract it is exercising is the struct the
+/// api-server serves, `openIDMetadata` in
+/// k8s.io/kubernetes/pkg/serviceaccount/openidmetadata.go:199-211, whose five
+/// fields are each annotated "REQUIRED in OIDC", with the fixed values set at
+/// openidmetadata.go:222-228 (`response_types_supported: ["id_token"]` —
+/// "Kubernetes only produces ID tokens" — and `subject_types_supported:
+/// ["public"]`). This mirror asserts all five; before the audit it asserted
+/// three, omitting `response_types_supported` and `subject_types_supported`.
+///
+/// Not mirrored, and why: running the validator in-cluster needs a live
+/// kubelet and a pod that reaches the endpoints over the network.
+///
+/// Also not mirrored: upstream's precondition that
+/// `system:service-account-issuer-discovery` "should have already been
+/// automatically created as part of the RBAC bootstrap policy"
+/// (service_accounts.go:563-565). `crates/api-server/src/bootstrap.rs` seeds
+/// only `cluster-admin` and its binding, so that ClusterRole and its binding
+/// to `system:serviceaccounts` (upstream policy.go:555-566 and :709) do not
+/// exist here. Porting them is #1753, not this test-only change.
 #[tokio::test]
 async fn oidc_discovery_document_is_valid() {
     let (state, _) = spawn_state();
     let (status, body) = get_json(state, "/.well-known/openid-configuration").await;
     assert_eq!(status, 200, "OIDC discovery must return 200: {body}");
-    assert!(
-        body["issuer"].as_str().is_some(),
-        "OIDC discovery must have 'issuer': {body}"
-    );
-    assert!(
-        body["jwks_uri"].as_str().is_some(),
-        "OIDC discovery must have 'jwks_uri': {body}"
-    );
-    assert!(
-        body["id_token_signing_alg_values_supported"]
-            .as_array()
-            .is_some(),
-        "OIDC discovery must have 'id_token_signing_alg_values_supported': {body}"
-    );
-    // The issuer and jwks_uri must be non-empty strings.
-    let issuer = body["issuer"].as_str().unwrap();
+
+    // openIDMetadata.Issuer / .JWKSURI — REQUIRED, and meaningful to relying
+    // parties, so they must be non-empty.
+    let issuer = body["issuer"]
+        .as_str()
+        .unwrap_or_else(|| panic!("OIDC discovery must have 'issuer': {body}"));
     assert!(
         !issuer.is_empty(),
         "OIDC discovery issuer must be non-empty: {body}"
     );
-    let jwks_uri = body["jwks_uri"].as_str().unwrap();
+    let jwks_uri = body["jwks_uri"]
+        .as_str()
+        .unwrap_or_else(|| panic!("OIDC discovery must have 'jwks_uri': {body}"));
     assert!(
         !jwks_uri.is_empty(),
         "OIDC discovery jwks_uri must be non-empty: {body}"
     );
+
+    // openIDMetadata.ResponseTypes / .SubjectTypes — REQUIRED, and fixed
+    // upstream (openidmetadata.go:225-226).
+    assert_eq!(
+        body["response_types_supported"],
+        json!(["id_token"]),
+        "Kubernetes only produces ID tokens: {body}"
+    );
+    assert_eq!(
+        body["subject_types_supported"],
+        json!(["public"]),
+        "OIDC subject identifier type: {body}"
+    );
+
+    // openIDMetadata.SigningAlgs — REQUIRED; upstream derives it from the
+    // key set, so only its shape is fixed.
+    let algs = body["id_token_signing_alg_values_supported"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("OIDC discovery must have 'id_token_signing_alg_values_supported': {body}")
+        });
+    assert!(
+        !algs.is_empty(),
+        "id_token_signing_alg_values_supported must not be empty: {body}"
+    );
 }
 
-/// `/openid/v1/jwks` must return a 200 with a `keys` array (may be empty if
-/// no RSA signing key is present in the test environment, but the shape must
-/// be correct — upstream conformance checks the document parses as JWKS).
-///
 /// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go ServiceAccountIssuerDiscovery
 /// Sonobuoy (batch-64, 2026-05-28): PASS
 #[tokio::test]
@@ -988,7 +1029,21 @@ async fn csr_full_lifecycle_with_signer_issues_certificate() {
 /// remove a condition of type \"Approved\"". They now apply a genuine
 /// merge/JSON patch onto the stored object and run the subresource validator.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/certificates.go
+/// Upstream: k8s.io/kubernetes/test/e2e/auth/certificates.go:202-437
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Upstream opens with three discovery checks before touching a CSR — `/apis`
+/// must advertise the `certificates.k8s.io` group at `v1`,
+/// `/apis/certificates.k8s.io` must list that version, and
+/// `/apis/certificates.k8s.io/v1` must list `certificatesigningrequests` plus
+/// both subresources (certificates.go:231-291). Those had no counterpart here
+/// and are now the first thing this mirror does.
+///
+/// Two upstream assertions remain unmirrorable for the reason recorded on
+/// `service_account_should_run_through_lifecycle`: `HaveValidResourceVersion()`
+/// on the get (certificates.go:310) and the RV-increase after the main patch
+/// (certificates.go:326). `MemoryStorage` writes no `metadata.resourceVersion`
+/// — #1751.
 #[tokio::test]
 async fn csr_api_operations_full_surface() {
     // A valid base64-encoded PKCS#10 CSR PEM (same fixture the sibling CSR
@@ -1000,7 +1055,55 @@ async fn csr_api_operations_full_surface() {
     const SIGNER: &str = "example.com/e2e-csr-1607";
     const COLLECTION: &str = "/apis/certificates.k8s.io/v1/certificatesigningrequests";
 
-    let (state, _) = spawn_state();
+    let (state, mem) = spawn_state();
+
+    // Discovery — upstream's three `ginkgo.By("getting /apis…")` blocks.
+    let (s, groups) = get_json(state.clone(), "/apis").await;
+    assert_eq!(s, 200, "GET /apis: {groups}");
+    assert!(
+        groups["groups"]
+            .as_array()
+            .expect("groups array")
+            .iter()
+            .any(|g| {
+                g["name"] == "certificates.k8s.io"
+                    && g["versions"]
+                        .as_array()
+                        .map(|vs| vs.iter().any(|v| v["version"] == "v1"))
+                        .unwrap_or(false)
+            }),
+        "expected certificates API group/version in /apis: {groups}"
+    );
+
+    let (s, group) = get_json(state.clone(), "/apis/certificates.k8s.io").await;
+    assert_eq!(s, 200, "GET /apis/certificates.k8s.io: {group}");
+    assert!(
+        group["versions"]
+            .as_array()
+            .expect("versions array")
+            .iter()
+            .any(|v| v["version"] == "v1"),
+        "expected certificates API version: {group}"
+    );
+
+    let (s, resources) = get_json(state.clone(), "/apis/certificates.k8s.io/v1").await;
+    assert_eq!(s, 200, "GET /apis/certificates.k8s.io/v1: {resources}");
+    let names: Vec<&str> = resources["resources"]
+        .as_array()
+        .expect("resources array")
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    for expected in [
+        "certificatesigningrequests",
+        "certificatesigningrequests/approval",
+        "certificatesigningrequests/status",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "expected {expected} in the v1 resource list, got {names:?}"
+        );
+    }
 
     let template = json!({
         "apiVersion": "certificates.k8s.io/v1",
@@ -1053,6 +1156,18 @@ async fn csr_api_operations_full_surface() {
         "field-selector list must have 3 items: {list}"
     );
 
+    // watching — upstream opens the watch here, after the list and before the
+    // patch, with `FieldSelector: "metadata.name=" + createdCSR.Name`
+    // (certificates.go:319-321), then requires a `watch.Modified` carrying the
+    // `patched` annotation. Same harness constraint as
+    // `service_account_should_run_through_lifecycle`: the oneshot HTTP client
+    // cannot hold a streaming response open across the patch, so the mirror
+    // observes the storage stream and filters on the object's own name.
+    let mut csr_watch = mem
+        .watch("/registry/certificatesigningrequests/")
+        .await
+        .expect("watch CSRs");
+
     // patch (main resource) — merge-patch an annotation.
     let (s, patched) = patch_merge(
         state.clone(),
@@ -1069,6 +1184,32 @@ async fn csr_api_operations_full_surface() {
     let (s, updated) = state.put(&format!("{COLLECTION}/{name}"), &to_update).await;
     assert_eq!(s.as_u16(), 200, "main update: {updated}");
     assert_eq!(updated["metadata"]["annotations"]["updated"], "true");
+
+    // The watch must have delivered a MODIFIED event for this CSR carrying the
+    // patched annotation.
+    let mut saw_patched = false;
+    for _ in 0..8 {
+        let ev = timeout(Duration::from_millis(500), csr_watch.next())
+            .await
+            .expect("timed out waiting for watch event")
+            .expect("watch channel should not close")
+            .expect("watch event error");
+        let WatchEvent::Modified(key, value) = ev else {
+            continue;
+        };
+        if !key.ends_with(&format!("/{name}")) {
+            continue;
+        }
+        let obj: Value = serde_json::from_str(&value).expect("watch payload is JSON");
+        if obj["metadata"]["annotations"]["patched"] == "true" {
+            saw_patched = true;
+            break;
+        }
+    }
+    assert!(
+        saw_patched,
+        "watch must deliver a MODIFIED event carrying the patched annotation"
+    );
 
     // GET /approval — must return a CertificateSigningRequest with the UID.
     let (s, appr_get) = get_json(state.clone(), &format!("{COLLECTION}/{name}/approval")).await;
@@ -1129,6 +1270,7 @@ async fn csr_api_operations_full_surface() {
     let (s, stat_get) = get_json(state.clone(), &format!("{COLLECTION}/{name}/status")).await;
     assert_eq!(s, 200, "get /status: {stat_get}");
     assert_eq!(stat_get["kind"], "CertificateSigningRequest");
+    assert_eq!(stat_get["apiVersion"], "certificates.k8s.io/v1");
     assert_eq!(stat_get["metadata"]["uid"], created["metadata"]["uid"]);
 
     // PATCH /status — set the certificate; the Approved condition set by the
