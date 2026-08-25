@@ -523,16 +523,56 @@ pub async fn handle_container_logs(
     // Non-follow: read current log contents and return in one shot.
     let opts = log_read_options(&params);
     match rusternetes_cri::stream::read_log_file(&log_path, &opts) {
-        Ok(bytes) => Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/plain; charset=utf-8")
-            .body(Body::from(bytes))
-            .unwrap(),
+        Ok(bytes) => container_logs_response(bytes),
         Err(e) => {
             warn!("handle_container_logs: read_log_file failed: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }
+}
+
+/// Build the `/containerLogs` response for a completed (`follow=false`) read.
+///
+/// The body is deliberately a one-item *stream*, not `Body::from(bytes)`, so
+/// hyper frames it chunked with no `Content-Length` — the framing upstream
+/// produces by writing logs through `flushwriter.Wrap(response.ResponseWriter)`
+/// (`pkg/kubelet/server/server.go` `getContainerLogs`).
+///
+/// The framing is load-bearing, not cosmetic. For a `Content-Length` body Go's
+/// net/http hands the last bytes to the caller *together with* `io.EOF`
+/// (`net/http/transfer.go` `body.readLocked`: "If we can return an EOF here
+/// along with the read data, do so"), and the api-server's websocket log relay
+/// inspects the error before the byte count:
+///
+/// ```text
+/// n, err := r.Read(buf)
+/// if err != nil { if err == io.EOF { return nil } ... }  // n bytes dropped
+/// if n > 0 { websocket.Message.Send(ws, buf[:n]) }
+/// ```
+///
+/// (`apimachinery/pkg/util/httpstream/wsstream.messageCopy`). So a
+/// fixed-length body is discarded whole and `GET pods/<p>/log` over a websocket
+/// returns nothing, failing the conformance spec "should support retrieving
+/// logs from the container over websockets" (#1713). The plain-HTTP path uses
+/// `io.Copy`, which honours `(n > 0, io.EOF)`, which is why `kubectl logs` kept
+/// working. The `follow=true` branch above was already streamed and unaffected.
+fn container_logs_response(bytes: Vec<u8>) -> Response {
+    let stream = async_stream::stream! {
+        yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(bytes));
+        // Yield once more so hyper sees a pending body and flushes the data
+        // chunk on its own, ahead of the terminating `0\r\n\r\n`. Upstream gets
+        // this for free from `flushwriter.Wrap` — each log write is flushed and
+        // the terminator only follows when the handler returns. Without the
+        // gap both land in one TCP segment, Go's chunked reader consumes the
+        // terminator in the same `Read` as the data and hands back
+        // `(n, io.EOF)` — which `wsstream.messageCopy` throws away.
+        tokio::task::yield_now().await;
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(Body::from_stream(stream))
+        .unwrap()
 }
 
 /// Render a run of raw CRI log bytes (one or more `\n`-delimited lines) into the
@@ -854,6 +894,78 @@ mod tests {
         assert!(
             calls.load(Ordering::SeqCst) >= 2,
             "exit must be polled while idle"
+        );
+    }
+
+    // Regression (#1713): a completed (`follow=false`) container-log response
+    // must be framed exactly like a vanilla kubelet's — chunked, with the log
+    // bytes flushed ahead of the terminating `0\r\n\r\n` — because the
+    // api-server's websocket log relay drops any read that returns data and
+    // EOF together:
+    //
+    //   n, err := r.Read(buf)
+    //   if err != nil { if err == io.EOF { return nil } ... }  // n bytes lost
+    //   if n > 0 { websocket.Message.Send(ws, buf[:n]) }
+    //
+    // (`apimachinery/pkg/util/httpstream/wsstream.messageCopy`). Go's net/http
+    // hands back `(n, io.EOF)` in one call both for a `Content-Length` body
+    // (`net/http/transfer.go` `body.readLocked` — "If we can return an EOF here
+    // along with the read data, do so") and for a chunked body whose terminator
+    // is already buffered. A vanilla kubelet avoids both by writing through
+    // `flushwriter.Wrap(response.ResponseWriter)`
+    // (`pkg/kubelet/server/server.go` `getContainerLogs`): measured against the
+    // vanilla kubelet in the swap harness, `cl=-1`, `read n=117 err=<nil>` then
+    // `read n=0 err=EOF`. Before the fix this endpoint sent
+    // `content-length: 19`, so the conformance spec "should support retrieving
+    // logs from the container over websockets" read an empty log through a
+    // vanilla api-server (`kubectl logs` uses `io.Copy` and was unaffected).
+    #[tokio::test]
+    async fn container_logs_response_is_chunked_and_flushes_before_terminator() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let app = axum::Router::new().route(
+            "/containerLogs/ns/pod/main",
+            axum::routing::get(|| async {
+                container_logs_response(b"container is alive\n".to_vec())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // The data-before-terminator split is what the client observes. A
+        // single-write body makes it unobservable on every attempt, so a
+        // handful of attempts separates the two framings without flaking.
+        let mut splits = 0;
+        for _ in 0..10 {
+            let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            sock.write_all(b"GET /containerLogs/ns/pod/main HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).await.unwrap();
+            let first = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+
+            assert!(
+                first.contains("transfer-encoding: chunked"),
+                "log response must be chunked, got:\n{first}"
+            );
+            assert!(
+                !first.contains("content-length:"),
+                "log response must not set Content-Length, got:\n{first}"
+            );
+            assert!(
+                first.contains("container is alive"),
+                "log body must survive the framing, got:\n{first}"
+            );
+            if !first.contains("0\r\n\r\n") {
+                splits += 1;
+            }
+        }
+        assert!(
+            splits > 0,
+            "log bytes must be flushed ahead of the chunked terminator; every \
+             attempt delivered both in one read"
         );
     }
 }
