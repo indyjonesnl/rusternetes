@@ -232,10 +232,7 @@ async fn vap_should_support_validating_admission_policy_api_operations() {
         None,
     )
     .await;
-    assert!(
-        status == 200 || status == 202 || status == 204,
-        "delete VAP must return 2xx; got {status}"
-    );
+    assert!(status == 200, "delete VAP must return 2xx; got {status}");
 
     // Confirm it's gone
     let (status, _) = send(&router, "GET", &format!("{base}/vap-lifecycle-test"), None).await;
@@ -324,7 +321,7 @@ async fn vap_should_support_validating_admission_policy_binding_api_operations()
     )
     .await;
     assert!(
-        status == 200 || status == 202 || status == 204,
+        status == 200,
         "delete VAPBinding must return 2xx; got {status}"
     );
 }
@@ -590,10 +587,7 @@ async fn apf_should_support_priority_level_configuration_api_operations() {
 
     // DELETE
     let (status, _) = send(&router, "DELETE", &format!("{base}/conformance-plc"), None).await;
-    assert!(
-        status == 200 || status == 202 || status == 204,
-        "delete PLC must return 2xx; got {status}"
-    );
+    assert!(status == 200, "delete PLC must return 2xx; got {status}");
 
     // Confirm deleted
     let (status, _) = send(&router, "GET", &format!("{base}/conformance-plc"), None).await;
@@ -694,7 +688,7 @@ async fn apf_should_support_flow_schema_api_operations() {
     // DELETE
     let (status, _) = send(&router, "DELETE", &format!("{base}/conformance-fs"), None).await;
     assert!(
-        status == 200 || status == 202 || status == 204,
+        status == 200,
         "delete FlowSchema must return 2xx; got {status}"
     );
 

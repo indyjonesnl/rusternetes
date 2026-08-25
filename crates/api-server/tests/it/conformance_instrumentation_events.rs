@@ -246,7 +246,7 @@ async fn events_lifecycle_update_count_core_v1() {
     )
     .await;
     assert!(
-        status == 200 || status == 201,
+        status == 200,
         "expected 200/201 after update; got {status}: {body}",
     );
     assert_eq!(
@@ -285,7 +285,7 @@ async fn events_lifecycle_delete_core_v1() {
     )
     .await;
     assert!(
-        del_status == 200 || del_status == 202,
+        del_status == 200,
         "expected 200/202 on delete; got {del_status}",
     );
 
@@ -399,7 +399,7 @@ async fn events_api_patch_events_k8s_io_v1() {
     )
     .await;
     assert!(
-        status == 200 || status == 201,
+        status == 200,
         "expected 200/201 after patch; got {status}: {body}",
     );
     assert_eq!(
@@ -437,7 +437,7 @@ async fn events_api_delete_events_k8s_io_v1() {
     )
     .await;
     assert!(
-        del_status == 200 || del_status == 202,
+        del_status == 200,
         "expected 200/202 on delete; got {del_status}",
     );
 
@@ -546,7 +546,7 @@ async fn events_deletecollection_core_v1_clears_namespace() {
     )
     .await;
     assert!(
-        del_status == 200 || del_status == 204,
+        del_status == 200,
         "expected 200/204 on deletecollection; got {del_status}",
     );
 
@@ -609,7 +609,7 @@ async fn events_deletecollection_events_k8s_io_v1_clears_namespace() {
     )
     .await;
     assert!(
-        del_status == 200 || del_status == 204,
+        del_status == 200,
         "expected 200/204 on deletecollection; got {del_status}",
     );
 
@@ -672,10 +672,7 @@ async fn events_deletecollection_label_selector_only_removes_matching() {
         None,
     )
     .await;
-    assert!(
-        del_status == 200 || del_status == 204,
-        "expected 200/204; got {del_status}",
-    );
+    assert!(del_status == 200, "expected 200/204; got {del_status}",);
 
     // Only the unlabeled event should remain.
     let (ls, lb) = send(
