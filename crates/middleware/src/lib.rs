@@ -463,21 +463,15 @@ pub async fn auth_middleware(
             // Upstream parity: a JWT that decodes is not sufficient; the
             // ServiceAccount it references must also still exist. This is
             // how upstream invalidates tokens after SA deletion.
-            let sa_name = claims
-                .kubernetes
-                .as_ref()
-                .map(|k| k.svcacct.name.clone())
-                .unwrap_or_else(|| {
-                    // Fallback: parse from `sub` ("system:serviceaccount:<ns>:<name>")
-                    claims
-                        .sub
-                        .strip_prefix("system:serviceaccount:")
-                        .and_then(|s| s.split(':').nth(1))
-                        .unwrap_or("")
-                        .to_string()
-                });
-            if !sa_name.is_empty() && !claims.namespace.is_empty() {
-                let sa_key = build_key("serviceaccounts", Some(&claims.namespace), &sa_name);
+            // An upstream-minted token has no flat `namespace`/`uid` claim, so
+            // resolve all three through the accessors (nested `kubernetes.io`
+            // claim, else `sub`). Reading the flat claims directly would leave
+            // the namespace empty and skip this existence check entirely.
+            let sa_name = claims.effective_service_account_name().to_string();
+            let sa_namespace = claims.effective_namespace().to_string();
+            let sa_uid = claims.effective_uid().to_string();
+            if !sa_name.is_empty() && !sa_namespace.is_empty() {
+                let sa_key = build_key("serviceaccounts", Some(&sa_namespace), &sa_name);
                 match storage
                     .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
                     .await
@@ -485,13 +479,13 @@ pub async fn auth_middleware(
                     Ok(sa) => {
                         // Also verify UID matches — upstream checks this to
                         // detect "same-name, different-instance" cases.
-                        if !claims.uid.is_empty()
+                        if !sa_uid.is_empty()
                             && !sa.metadata.uid.is_empty()
-                            && sa.metadata.uid != claims.uid
+                            && sa.metadata.uid != sa_uid
                         {
                             warn!(
                                 "ServiceAccount {}/{} UID mismatch: token uid={} current uid={}",
-                                claims.namespace, sa_name, claims.uid, sa.metadata.uid
+                                sa_namespace, sa_name, sa_uid, sa.metadata.uid
                             );
                             return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
                         }
@@ -499,7 +493,7 @@ pub async fn auth_middleware(
                     Err(_) => {
                         warn!(
                             "ServiceAccount {}/{} no longer exists; rejecting token",
-                            claims.namespace, sa_name
+                            sa_namespace, sa_name
                         );
                         return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
                     }

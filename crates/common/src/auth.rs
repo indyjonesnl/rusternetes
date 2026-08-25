@@ -34,10 +34,18 @@ pub struct ServiceAccountClaims {
     /// Subject (service account name)
     pub sub: String,
 
-    /// Namespace (kept for backward compat with our auth middleware)
+    /// Namespace (rusternetes-only flat claim, kept for backward compat with
+    /// our auth middleware). Absent from tokens minted by an upstream
+    /// kube-apiserver, which carries it only inside `kubernetes.io`
+    /// (upstream `pkg/serviceaccount/claims.go` `privateClaims`) — so this must
+    /// default rather than be required, or every upstream token fails to
+    /// decode. Read it through [`ServiceAccountClaims::effective_namespace`].
+    #[serde(default)]
     pub namespace: String,
 
-    /// Service account UID (kept for backward compat)
+    /// Service account UID (rusternetes-only flat claim; see `namespace`).
+    /// Read it through [`ServiceAccountClaims::effective_uid`].
+    #[serde(default)]
     pub uid: String,
 
     /// Issued at timestamp
@@ -103,6 +111,55 @@ impl ServiceAccountClaims {
             node_name: None,
             node_uid: None,
         }
+    }
+
+    /// Namespace this token's ServiceAccount lives in.
+    ///
+    /// Prefers the flat rusternetes claim, then the nested `kubernetes.io`
+    /// claim, then `sub` (`system:serviceaccount:<namespace>:<name>`) — the
+    /// order matters only for our own tokens, since an upstream-minted token
+    /// has the nested claim and `sub` alone. Upstream reads the same two
+    /// sources: `pkg/serviceaccount/claims.go` validator uses
+    /// `private.Kubernetes.Namespace` plus `public.Subject`.
+    pub fn effective_namespace(&self) -> &str {
+        if !self.namespace.is_empty() {
+            return &self.namespace;
+        }
+        if let Some(k) = self.kubernetes.as_ref() {
+            if !k.namespace.is_empty() {
+                return &k.namespace;
+            }
+        }
+        Self::subject_part(&self.sub, 0)
+    }
+
+    /// UID of this token's ServiceAccount (flat claim, else nested claim).
+    pub fn effective_uid(&self) -> &str {
+        if !self.uid.is_empty() {
+            return &self.uid;
+        }
+        self.kubernetes
+            .as_ref()
+            .map(|k| k.svcacct.uid.as_str())
+            .unwrap_or("")
+    }
+
+    /// Name of this token's ServiceAccount (nested claim, else `sub`).
+    pub fn effective_service_account_name(&self) -> &str {
+        if let Some(k) = self.kubernetes.as_ref() {
+            if !k.svcacct.name.is_empty() {
+                return &k.svcacct.name;
+            }
+        }
+        Self::subject_part(&self.sub, 1)
+    }
+
+    /// Split `system:serviceaccount:<namespace>:<name>` and return field
+    /// `index` (0 = namespace, 1 = name), or "" if `sub` is not that shape.
+    fn subject_part(sub: &str, index: usize) -> &str {
+        sub.strip_prefix("system:serviceaccount:")
+            .and_then(|rest| rest.split(':').nth(index))
+            .unwrap_or("")
     }
 }
 
@@ -385,12 +442,16 @@ impl UserInfo {
             vec![jti],
         );
 
+        // Resolve namespace/uid through the accessors: an upstream-minted token
+        // carries them only in the nested `kubernetes.io` claim, and getting the
+        // namespace wrong here would emit a bare `system:serviceaccounts:`
+        // group, so every namespace-scoped RBAC binding would miss.
         Self {
             username: claims.sub.clone(),
-            uid: claims.uid.clone(),
+            uid: claims.effective_uid().to_string(),
             groups: vec![
                 "system:serviceaccounts".to_string(),
-                format!("system:serviceaccounts:{}", claims.namespace),
+                format!("system:serviceaccounts:{}", claims.effective_namespace()),
                 "system:authenticated".to_string(),
             ],
             extra,
@@ -879,6 +940,88 @@ impl WebhookTokenAuthenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sign an arbitrary claim body, so a test can present a token shaped
+    /// exactly like one an upstream kube-apiserver mints.
+    fn sign_raw(secret: &[u8], body: &serde_json::Value) -> String {
+        encode(
+            &Header::new(Algorithm::HS256),
+            body,
+            &EncodingKey::from_secret(secret),
+        )
+        .expect("sign raw claims")
+    }
+
+    /// An upstream Kubernetes service-account token carries the namespace and
+    /// the ServiceAccount name/uid ONLY inside the nested `kubernetes.io`
+    /// claim — there is no top-level `namespace` or `uid` claim
+    /// (upstream `pkg/serviceaccount/claims.go:52-88`: `privateClaims` holds
+    /// `Kubernetes kubernetes json:"kubernetes.io,omitempty"`, whose fields are
+    /// `Namespace` and `Svcacct{Name,UID}`; the public claims carry only
+    /// `sub`/`aud`/`iat`/`nbf`/`exp`/`jti`).
+    ///
+    /// Such a token must authenticate. Requiring the rusternetes-only flat
+    /// claims makes every genuine upstream token fail to decode, which in a
+    /// vanilla-swap cluster silently unauthenticates the kube-controller-manager's
+    /// per-controller ServiceAccount clients (`--use-service-account-credentials`)
+    /// — every status write then dies as "Not a node user; User does not have
+    /// permission to perform this action".
+    #[test]
+    fn upstream_shaped_token_authenticates() {
+        let secret = b"test-secret-key";
+        let manager = TokenManager::new(secret);
+
+        let now = Utc::now().timestamp();
+        let token = sign_raw(
+            secret,
+            &serde_json::json!({
+                "aud": ["https://kubernetes.default.svc.cluster.local"],
+                "exp": now + 3600,
+                "iat": now,
+                "nbf": now,
+                "iss": "https://kubernetes.default.svc.cluster.local",
+                "jti": "8f1a2b3c-0000-4444-8888-abcdefabcdef",
+                "kubernetes.io": {
+                    "namespace": "kube-system",
+                    "serviceaccount": {
+                        "name": "deployment-controller",
+                        "uid": "9c99fb60-9878-4e34-939e-f3c60c3d6a4b"
+                    }
+                },
+                "sub": "system:serviceaccount:kube-system:deployment-controller",
+            }),
+        );
+
+        let claims = manager
+            .validate_token(&token)
+            .expect("upstream-shaped service account token must validate");
+
+        // The namespace and uid must be recoverable from the nested claim, so
+        // the SA-existence check and the `system:serviceaccounts:<ns>` group
+        // still work.
+        assert_eq!(claims.effective_namespace(), "kube-system");
+        assert_eq!(
+            claims.effective_uid(),
+            "9c99fb60-9878-4e34-939e-f3c60c3d6a4b"
+        );
+        assert_eq!(
+            claims.effective_service_account_name(),
+            "deployment-controller"
+        );
+
+        let user = UserInfo::from_service_account_claims(&claims);
+        assert_eq!(
+            user.username,
+            "system:serviceaccount:kube-system:deployment-controller"
+        );
+        assert_eq!(user.uid, "9c99fb60-9878-4e34-939e-f3c60c3d6a4b");
+        assert!(
+            user.groups
+                .contains(&"system:serviceaccounts:kube-system".to_string()),
+            "groups must include the namespace-scoped SA group, got {:?}",
+            user.groups
+        );
+    }
 
     #[test]
     fn test_token_generation_and_validation() {

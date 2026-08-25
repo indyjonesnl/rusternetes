@@ -42,10 +42,15 @@ pub async fn create_token_review(
             authenticated: Some(true),
             user: Some(UserInfo {
                 username: Some(claims.sub.clone()),
-                uid: Some(claims.uid),
+                // Via the accessors: an upstream-minted token carries the
+                // namespace/uid only in the nested `kubernetes.io` claim, and
+                // a TokenReview that answered with a bare
+                // `system:serviceaccounts:` group would misreport the identity
+                // to every webhook that asks.
+                uid: Some(claims.effective_uid().to_string()),
                 groups: Some(vec![
                     "system:serviceaccounts".to_string(),
-                    format!("system:serviceaccounts:{}", claims.namespace),
+                    format!("system:serviceaccounts:{}", claims.effective_namespace()),
                     "system:authenticated".to_string(),
                 ]),
                 extra: Some({
