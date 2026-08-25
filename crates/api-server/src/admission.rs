@@ -9,44 +9,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Check if a pod is BestEffort QoS class.
-/// A pod is BestEffort if NONE of its containers specify any resource requests or limits.
+/// Check if a pod is BestEffort QoS class — the `BestEffort` ResourceQuota
+/// scope.
+///
+/// Port of upstream `isBestEffort` (`pkg/quota/v1/evaluator/core/pods.go:412-414`),
+/// which is one line: `qos.GetPodQOS(pod) == corev1.PodQOSBestEffort`. It reads
+/// the same classifier as everything else, so the scope a pod is charged
+/// against is the class the api-server published.
+///
+/// This used to be a hand-rolled "any non-empty requests or limits map"
+/// scan, which counted resources `ComputePodQOS` ignores: a pod requesting only
+/// `nvidia.com/gpu`, or an explicit `cpu: "0"`, is BestEffort upstream
+/// (`isSupportedQoSComputeResource` + `Cmp(zeroQuantity) == 1`,
+/// `qos.go:29-35/57`) but was excluded from the BestEffort scope here.
 fn is_pod_best_effort(pod: &Pod) -> bool {
-    let spec = match &pod.spec {
-        Some(s) => s,
-        None => return true,
-    };
-    for container in &spec.containers {
-        if let Some(resources) = &container.resources {
-            if let Some(requests) = &resources.requests {
-                if !requests.is_empty() {
-                    return false;
-                }
-            }
-            if let Some(limits) = &resources.limits {
-                if !limits.is_empty() {
-                    return false;
-                }
-            }
-        }
-    }
-    if let Some(init_containers) = &spec.init_containers {
-        for container in init_containers {
-            if let Some(resources) = &container.resources {
-                if let Some(requests) = &resources.requests {
-                    if !requests.is_empty() {
-                        return false;
-                    }
-                }
-                if let Some(limits) = &resources.limits {
-                    if !limits.is_empty() {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-    true
+    rusternetes_common::qos::get_pod_qos(pod) == rusternetes_common::qos::QoSClass::BestEffort
 }
 
 /// Check if a pod matches the scopes of a ResourceQuota.

@@ -327,46 +327,18 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
         Ok(())
     }
 
-    /// Check if a pod is BestEffort QoS class.
-    /// A pod is BestEffort if NONE of its containers specify any resource requests or limits.
+    /// Check if a pod is BestEffort QoS class — the `BestEffort` ResourceQuota
+    /// scope.
+    ///
+    /// Port of upstream `isBestEffort`
+    /// (`pkg/quota/v1/evaluator/core/pods.go:412-414`):
+    /// `qos.GetPodQOS(pod) == corev1.PodQOSBestEffort`. The quota controller and
+    /// the api-server's quota admission
+    /// (`crates/api-server/src/admission.rs`) must agree on which pods a
+    /// `BestEffort`-scoped quota covers, or admission charges a pod the
+    /// controller then does not count.
     fn is_pod_best_effort(pod: &Pod) -> bool {
-        let spec = match &pod.spec {
-            Some(s) => s,
-            None => return true, // no spec = no resources = best effort
-        };
-        for container in &spec.containers {
-            if let Some(resources) = &container.resources {
-                // Check if there are actual non-empty requests or limits
-                if let Some(requests) = &resources.requests {
-                    if !requests.is_empty() {
-                        return false;
-                    }
-                }
-                if let Some(limits) = &resources.limits {
-                    if !limits.is_empty() {
-                        return false;
-                    }
-                }
-            }
-        }
-        // Also check init containers
-        if let Some(init_containers) = &spec.init_containers {
-            for container in init_containers {
-                if let Some(resources) = &container.resources {
-                    if let Some(requests) = &resources.requests {
-                        if !requests.is_empty() {
-                            return false;
-                        }
-                    }
-                    if let Some(limits) = &resources.limits {
-                        if !limits.is_empty() {
-                            return false;
-                        }
-                    }
-                }
-            }
-        }
-        true
+        rusternetes_common::qos::get_pod_qos(pod) == rusternetes_common::qos::QoSClass::BestEffort
     }
 
     /// Check if a pod matches the given scopes

@@ -223,9 +223,12 @@ fn find_container_in_pod<'a>(
 /// was decoded through the scheme", and the kubelet cannot verify that for a pod
 /// it reads back out of storage — one written before this defaulting existed, or
 /// by any writer that bypasses the api-server, still arrives undefaulted. Being
-/// idempotent, re-applying it costs nothing and keeps
-/// [`crate::eviction::get_qos_class`] (whose upstream, `ComputePodQOS`, likewise
-/// assumes admission already ran) from silently reclassifying such a pod.
+/// idempotent, re-applying it costs nothing and keeps a `resourceFieldRef` from
+/// reporting `0` for a limits-only container.
+///
+/// [`rusternetes_common::qos::compute_pod_qos`] compensates the same way, for
+/// the same reason — its upstream, `ComputePodQOS`, likewise assumes admission
+/// already ran.
 pub(crate) fn default_requests_from_limits(
     container: &mut rusternetes_common::resources::Container,
 ) {
