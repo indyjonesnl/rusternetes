@@ -100,7 +100,7 @@ async fn next_watch_type(stream: &mut rusternetes_storage::WatchStream) -> &'sta
 ///     `metadata.resourceVersion`, while `etcd.rs:43-52` and `rhino.rs:100-105`
 ///     both inject it from the backend revision. Until the memory backend
 ///     stamps a monotonic revision the RV contract is unobservable from a
-///     mirror; tracked in the queue.
+///     mirror; tracked in #1751.
 ///   - upstream's watch is the label-selected REST watch. The oneshot HTTP
 ///     harness cannot hold a streaming response open across the intervening
 ///     requests, so this mirror observes the same three event types on the

@@ -209,87 +209,171 @@ async fn oidc_jwks_endpoint_returns_key_set() {
 // [sig-auth] ServiceAccounts should allow opting out of API token automount
 // [Conformance]
 //
-// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:
-//   "should allow opting out of API token automount"
+// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:193-297
 // Sonobuoy (batch-64, 2026-05-28): PASS
-//
-// If a ServiceAccount has `automountServiceAccountToken: false`, a Pod that
-// omits the field must NOT get a projected SA token volume injected.
 // ---------------------------------------------------------------------------
 
-/// Creating an SA with `automountServiceAccountToken: false` and a pod that
-/// explicitly opts out must result in no projected SA-token volume.
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go opt-out block
+/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:193-297
 /// Sonobuoy (batch-64, 2026-05-28): PASS
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Upstream is a **nine-case table** — three ServiceAccounts (`default` with
+/// the field unset, `mount` with it `true`, `nomount` with it `false`) crossed
+/// with three pod-spec values (unset, `true`, `false`) — and the point of the
+/// test is the precedence, stated in its own comments as "Make sure pod spec
+/// trumps when opting in" and "…when opting out". Every case asserts on the
+/// **created pod object**, not on a running container: upstream walks
+/// `createdPod.Spec.Containers[*].VolumeMounts[*]` looking for a mount at
+/// `serviceaccount.DefaultAPITokenMountPath`
+/// (plugin/pkg/admission/serviceaccount/admission.go:57 —
+/// "/var/run/secrets/kubernetes.io/serviceaccount"). That makes the whole
+/// table mirrorable through the create handler.
+///
+/// Before the #1749 audit this mirror ran exactly one of the nine cases — SA
+/// `false` + pod-spec `false`, the case where the two agree — so the
+/// precedence the test exists to pin was never exercised. It also asserted on
+/// `spec.volumes[*].projected.sources[*].serviceAccountToken` rather than on
+/// the container mount path upstream checks.
 #[tokio::test]
-async fn service_account_automount_opt_out_suppresses_projected_token_volume() {
+async fn service_account_automount_opt_out_table() {
     let (state, _) = spawn_state();
     let ns = "sa-automount-optout";
 
-    // Create a ServiceAccount with automount disabled.
-    let sa_body = json!({
-        "apiVersion": "v1",
-        "kind": "ServiceAccount",
-        "metadata": {"name": "no-automount"},
-        "automountServiceAccountToken": false
-    });
-    let (status, created_sa) = post_json(
+    // Upstream's framework creates the namespace, and the ServiceAccount
+    // controller seeds `default` into it with the field unset.
+    let (status, created_ns) = post_json(
         state.clone(),
-        &format!("/api/v1/namespaces/{ns}/serviceaccounts"),
-        &sa_body,
+        "/api/v1/namespaces",
+        &json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": ns}
+        }),
     )
     .await;
-    assert_eq!(status, 201, "create SA with automount=false: {created_sa}");
-    assert_eq!(created_sa["automountServiceAccountToken"], false);
+    assert_eq!(status, 201, "create namespace: {created_ns}");
 
-    // Create a Pod that explicitly opts out at the pod level as well.
-    // Upstream uses a pod-level override that mirrors the SA setting to
-    // guarantee no injection.
-    let pod_body = json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {"name": "no-mount-pod"},
-        "spec": {
-            "serviceAccountName": "no-automount",
-            "automountServiceAccountToken": false,
-            "containers": [{"name": "c", "image": "nginx:latest"}]
+    for (sa_name, automount) in [("mount", true), ("nomount", false)] {
+        let (status, created) = post_json(
+            state.clone(),
+            &format!("/api/v1/namespaces/{ns}/serviceaccounts"),
+            &json!({
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": {"name": sa_name},
+                "automountServiceAccountToken": automount
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "create SA {sa_name}: {created}");
+        assert_eq!(created["automountServiceAccountToken"], automount);
+    }
+
+    // The table, verbatim from service_accounts.go:205-267.
+    let cases: [(&str, &str, Option<bool>, bool); 9] = [
+        ("pod-service-account-defaultsa", "default", None, true),
+        ("pod-service-account-mountsa", "mount", None, true),
+        ("pod-service-account-nomountsa", "nomount", None, false),
+        // Make sure pod spec trumps when opting in.
+        (
+            "pod-service-account-defaultsa-mountspec",
+            "default",
+            Some(true),
+            true,
+        ),
+        (
+            "pod-service-account-mountsa-mountspec",
+            "mount",
+            Some(true),
+            true,
+        ),
+        (
+            "pod-service-account-nomountsa-mountspec",
+            "nomount",
+            Some(true),
+            true,
+        ),
+        // Make sure pod spec trumps when opting out.
+        (
+            "pod-service-account-defaultsa-nomountspec",
+            "default",
+            Some(false),
+            false,
+        ),
+        (
+            "pod-service-account-mountsa-nomountspec",
+            "mount",
+            Some(false),
+            false,
+        ),
+        (
+            "pod-service-account-nomountsa-nomountspec",
+            "nomount",
+            Some(false),
+            false,
+        ),
+    ];
+
+    for (pod_name, sa_name, automount_pod_spec, expect_token_volume) in cases {
+        let mut spec = json!({
+            "serviceAccountName": sa_name,
+            "restartPolicy": "Never",
+            "containers": [{"name": "token-test", "image": "agnhost"}]
+        });
+        if let Some(v) = automount_pod_spec {
+            spec["automountServiceAccountToken"] = json!(v);
         }
-    });
-    let (status, created_pod) = post_json(
-        state.clone(),
-        &format!("/api/v1/namespaces/{ns}/pods"),
-        &pod_body,
-    )
-    .await;
-    assert_eq!(
-        status, 201,
-        "create pod with automount=false: {created_pod}"
-    );
 
-    // The pod must NOT have a projected ServiceAccountToken volume.
-    let volumes = created_pod["spec"]["volumes"].as_array();
-    let has_projected_sa_token = volumes
-        .map(|vols| {
-            vols.iter().any(|v| {
-                v["projected"]["sources"]
+        let (status, created_pod) = post_json(
+            state.clone(),
+            &format!("/api/v1/namespaces/{ns}/pods"),
+            &json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": pod_name},
+                "spec": spec
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "create pod {pod_name}: {created_pod}");
+
+        // Upstream: any container volumeMount whose mountPath is
+        // DefaultAPITokenMountPath.
+        let has_token_volume = created_pod["spec"]["containers"]
+            .as_array()
+            .expect("containers array")
+            .iter()
+            .any(|c| {
+                c["volumeMounts"]
                     .as_array()
-                    .map(|srcs| srcs.iter().any(|s| !s["serviceAccountToken"].is_null()))
+                    .map(|mounts| {
+                        mounts.iter().any(|m| {
+                            m["mountPath"] == "/var/run/secrets/kubernetes.io/serviceaccount"
+                        })
+                    })
                     .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
-    assert!(
-        !has_projected_sa_token,
-        "Pod with automount=false must NOT have projected SA token volume: {created_pod}"
-    );
+            });
+
+        assert_eq!(
+            has_token_volume, expect_token_volume,
+            "{pod_name}: expected volume={expect_token_volume}, got {has_token_volume} \
+             (SA {sa_name}, pod spec {automount_pod_spec:?}): {created_pod}"
+        );
+    }
 }
 
 /// A ServiceAccount with `automountServiceAccountToken: false` can be toggled
 /// back to `true` via a PATCH; the field must be persisted correctly.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go opt-out block
+/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:843-871
+/// (`should update a ServiceAccount` — same false -> true transition, driven
+/// through Update rather than Patch; the PUT form is mirrored by
+/// `service_account_should_update` in
+/// `conformance_auth_rbac_serviceaccount.rs`).
 /// Sonobuoy (batch-64, 2026-05-28): PASS
+/// Mirror audit (#1749, 2026-08-25): re-cited. The old citation pointed at the
+/// "opt out of API token automount" block, which creates ServiceAccounts but
+/// never mutates one — this test has no counterpart there.
 #[tokio::test]
 async fn service_account_automount_field_is_mutable_via_patch() {
     let (state, _) = spawn_state();
@@ -340,8 +424,26 @@ async fn service_account_automount_field_is_mutable_via_patch() {
 /// with a `ca.crt` data key (may be empty in the test environment where no
 /// real CA is configured, but the ConfigMap itself must be present).
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go kube-root-ca block
+/// [sig-auth] ServiceAccounts should guarantee kube-root-ca.crt exist in any
+/// namespace [Conformance]
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:775-833
 /// Sonobuoy (batch-64, 2026-05-28): PASS
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// The upstream Description block lists three requirements, and the body
+/// asserts all three in sequence:
+///   1. created automatically — mirrored here
+///   2. recreated if deleted — `kube_root_ca_crt_is_recreated_after_deletion`
+///   3. reconciled if modified —
+///      `kube_root_ca_crt_is_reconciled_after_modification`
+///
+/// (2) and (3) belong to `NamespaceController::reconcile_namespace`, the port
+/// of `pkg/controller/certificates/rootcacertpublisher/publisher.go`
+/// `syncNamespace()`, so they live in
+/// `crates/controller-manager/tests/it/namespace_controller_test.rs`. Before
+/// the #1749 audit neither had a counterpart anywhere, and this file carried
+/// two mirrors of requirement (1) — the second a strict subset of the first.
 #[tokio::test]
 async fn kube_root_ca_crt_configmap_exists_in_new_namespace() {
     // Use the CA-cert-aware state so the namespace handler creates the
@@ -373,39 +475,15 @@ async fn kube_root_ca_crt_configmap_exists_in_new_namespace() {
         cm["metadata"]["name"], "kube-root-ca.crt",
         "ConfigMap name mismatch: {cm}"
     );
-    // The ConfigMap must have a 'data' field (even if ca.crt is empty string
-    // in a test environment with no real TLS cert configured).
+    // Upstream's poll only accepts the ConfigMap once `data["ca.crt"]` exists
+    // and is non-empty (service_accounts.go:826-830).
+    let ca = cm["data"]["ca.crt"]
+        .as_str()
+        .unwrap_or_else(|| panic!("kube-root-ca.crt must contain a 'ca.crt' key: {cm}"));
     assert!(
-        cm["data"].is_object(),
-        "kube-root-ca.crt ConfigMap must have a 'data' object: {cm}"
+        !ca.is_empty(),
+        "kube-root-ca.crt 'ca.crt' must be non-empty: {cm}"
     );
-    // `ca.crt` key must exist.
-    assert!(
-        cm["data"]["ca.crt"].is_string(),
-        "kube-root-ca.crt ConfigMap must contain a 'ca.crt' key: {cm}"
-    );
-}
-
-/// `kube-root-ca.crt` ConfigMap must be present immediately after namespace
-/// creation (synchronous; the namespace handler creates it inline).
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go kube-root-ca block
-/// Sonobuoy (batch-64, 2026-05-28): PASS
-#[tokio::test]
-async fn kube_root_ca_crt_configmap_is_present_on_create() {
-    let (state, _) = spawn_state_with_ca_cert();
-    let ns = "kube-root-ca-presence";
-
-    let ns_body = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns}});
-    let (status, _) = post_json(state.clone(), "/api/v1/namespaces", &ns_body).await;
-    assert_eq!(status, 201, "namespace create");
-
-    let (cm_status, _) = get_json(
-        state.clone(),
-        &format!("/api/v1/namespaces/{ns}/configmaps/kube-root-ca.crt"),
-    )
-    .await;
-    assert_eq!(cm_status, 200, "kube-root-ca.crt must be auto-created");
 }
 
 // ---------------------------------------------------------------------------

@@ -631,3 +631,128 @@ async fn test_namespace_rbac_isolation() {
         alice.namespace
     );
 }
+
+// ---------------------------------------------------------------------------
+// [sig-auth] ServiceAccounts should guarantee kube-root-ca.crt exist in any
+// namespace [Conformance] — the controller half.
+//
+// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:775-833
+// Ported mechanism: pkg/controller/certificates/rootcacertpublisher/publisher.go
+// `syncNamespace()`.
+//
+// The upstream Description block lists three requirements:
+//   1. Created automatically
+//   2. Recreated if deleted
+//   3. Reconciled if modified
+//
+// (1) is the api-server's namespace-create path and is mirrored by
+// `kube_root_ca_crt_configmap_exists_in_new_namespace` in
+// `crates/api-server/tests/it/conformance_auth_serviceaccounts.rs`. (2) and (3)
+// belong to `NamespaceController::reconcile_namespace`, and had no counterpart
+// anywhere until the #1749 mirror audit — the recreate-on-delete and
+// reconcile-on-modify branches were implemented but never asserted.
+// ---------------------------------------------------------------------------
+
+/// A cluster CA PEM stub. Only its non-emptiness matters: the controller skips
+/// the whole root-ca branch when it resolves an empty CA.
+const TEST_CA_PEM: &str =
+    "-----BEGIN CERTIFICATE-----\nrootcacertpublisher-test\n-----END CERTIFICATE-----\n";
+
+/// Build an Active namespace, the shape `reconcile_all` expects.
+fn active_ns(name: &str) -> Namespace {
+    Namespace {
+        type_meta: TypeMeta {
+            kind: "Namespace".to_string(),
+            api_version: "v1".to_string(),
+        },
+        metadata: ObjectMeta {
+            name: name.to_string(),
+            uid: uuid::Uuid::new_v4().to_string(),
+            creation_timestamp: Some(Utc::now()),
+            ..Default::default()
+        },
+        spec: Some(NamespaceSpec { finalizers: None }),
+        status: Some(NamespaceStatus {
+            phase: Some(rusternetes_common::types::Phase::Active),
+            conditions: None,
+        }),
+    }
+}
+
+/// Upstream step 2: "Recreated if deleted".
+///
+/// Upstream deletes `kube-root-ca.crt` with `GracePeriodSeconds: 0` and then
+/// polls until a new one appears (service_accounts.go:815-828).
+#[tokio::test]
+async fn kube_root_ca_crt_is_recreated_after_deletion() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller =
+        NamespaceController::new(storage.clone()).with_ca_cert(Some(TEST_CA_PEM.to_string()));
+
+    let ns = "root-ca-recreate";
+    storage
+        .create(&build_key("namespaces", None, ns), &active_ns(ns))
+        .await
+        .unwrap();
+
+    let cm_key = build_key("configmaps", Some(ns), "kube-root-ca.crt");
+
+    controller.reconcile_all().await.unwrap();
+    let cm: serde_json::Value = storage.get(&cm_key).await.expect("created on first sync");
+    assert_eq!(cm["data"]["ca.crt"], TEST_CA_PEM);
+
+    storage.delete(&cm_key).await.unwrap();
+    assert!(
+        storage.get::<serde_json::Value>(&cm_key).await.is_err(),
+        "precondition: the ConfigMap is gone"
+    );
+
+    controller.reconcile_all().await.unwrap();
+    let recreated: serde_json::Value = storage
+        .get(&cm_key)
+        .await
+        .expect("kube-root-ca.crt must be recreated after deletion");
+    assert_eq!(
+        recreated["data"]["ca.crt"], TEST_CA_PEM,
+        "recreated ConfigMap must carry the cluster CA: {recreated}"
+    );
+}
+
+/// Upstream step 3: "Reconciled if modified".
+///
+/// Upstream overwrites the ConfigMap with `Data: {"ca.crt": ""}` and polls
+/// until `ca.crt` is non-empty again (service_accounts.go:806-832). The
+/// controller's own comment cites the same publisher behaviour:
+/// "K8s rootcacertpublisher checks if the data matches and updates if not".
+#[tokio::test]
+async fn kube_root_ca_crt_is_reconciled_after_modification() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller =
+        NamespaceController::new(storage.clone()).with_ca_cert(Some(TEST_CA_PEM.to_string()));
+
+    let ns = "root-ca-reconcile";
+    storage
+        .create(&build_key("namespaces", None, ns), &active_ns(ns))
+        .await
+        .unwrap();
+
+    let cm_key = build_key("configmaps", Some(ns), "kube-root-ca.crt");
+    controller.reconcile_all().await.unwrap();
+
+    // Blank out ca.crt, exactly as upstream's Update does.
+    let mut tampered: serde_json::Value = storage.get(&cm_key).await.unwrap();
+    tampered["data"]["ca.crt"] = serde_json::json!("");
+    storage.update(&cm_key, &tampered).await.unwrap();
+
+    controller.reconcile_all().await.unwrap();
+    let reconciled: serde_json::Value = storage.get(&cm_key).await.unwrap();
+    let ca = reconciled["data"]["ca.crt"].as_str().unwrap_or("");
+    assert!(
+        !ca.is_empty(),
+        "kube-root-ca.crt must be reconciled back to a non-empty ca.crt: {reconciled}"
+    );
+    assert_eq!(
+        ca, TEST_CA_PEM,
+        "reconciled ca.crt must match the cluster CA"
+    );
+}
