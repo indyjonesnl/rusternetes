@@ -63,6 +63,7 @@ mod service_controller_test;
 mod service_lb_endpoints_test;
 mod service_lb_extended_test;
 mod serviceaccount_controller_test;
+mod servicecidr_controller_test;
 mod statefulset_controller_test;
 mod statefulset_extended_test;
 mod statefulset_status_correctness_test;

@@ -492,6 +492,337 @@ pub fn spawn_apiservice_availability_controller(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Default ServiceCIDR controller
+// ---------------------------------------------------------------------------
+
+/// Upstream `defaultservicecidr.DefaultServiceCIDRName`
+/// (`pkg/controlplane/controller/defaultservicecidr/default_servicecidr_controller.go:47`).
+pub const DEFAULT_SERVICE_CIDR_NAME: &str = "kubernetes";
+
+/// Upstream `controllerName` (`default_servicecidr_controller.go:46`), used as
+/// the event source component.
+const DEFAULT_SERVICE_CIDR_CONTROLLER: &str = "kubernetes-service-cidr-controller";
+
+/// The service range this api-server allocates ClusterIPs from — upstream's
+/// `--service-cluster-ip-range`, which this api-server does not expose as a
+/// flag. Must stay in step with [`crate::ip_allocator::ClusterIPAllocator::new`]
+/// and [`KUBERNETES_SERVICE_IP`] (the range's first address).
+pub const DEFAULT_SERVICE_CIDRS: &[&str] = &["10.96.0.0/12"];
+
+/// Upstream's controller interval (`default_servicecidr_controller.go:61`,
+/// "same as DefaultEndpointReconcilerInterval", 10s).
+pub const DEFAULT_SERVICE_CIDR_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Upstream `default_servicecidr_controller.go:236`. Applied with **no reason**
+/// — the controller builds the condition without one, and ServiceCIDR status is
+/// not condition-validated (`ValidateServiceCIDRStatusUpdate`,
+/// `pkg/apis/networking/validation/validation.go:883-886`).
+pub const DEFAULT_SERVICE_CIDR_READY_MESSAGE: &str = "Kubernetes default Service CIDR is ready";
+
+/// Port of upstream's `kubernetes-service-cidr-controller`
+/// (`pkg/controlplane/controller/defaultservicecidr`), which owns the
+/// `kubernetes` ServiceCIDR and lives in the **apiserver**, not the KCM — it is
+/// the only component that knows this process's service range.
+///
+/// Replaces the create-if-absent seed that used to be duplicated inline in
+/// `main.rs` and `lib.rs`. Unlike that seed this reconciles: it upgrades
+/// single-stack to dual-stack when the configured ranges grow, warns (once) via
+/// an Event when the persisted CIDRs disagree with this api-server's
+/// configuration, and applies `Ready=True` only when they agree.
+///
+/// The *deletion* half of ServiceCIDR lifecycle — the protection finalizer, the
+/// `Ready=False`/`Terminating` condition, `canDeleteCIDR` — belongs to the
+/// separate `service-cidr-controller` in the controller-manager
+/// (`crates/controller-manager/src/controllers/servicecidr.rs`), exactly as
+/// upstream splits it. This controller deliberately never touches the status of
+/// a ServiceCIDR that is being deleted (`syncStatus`, `:188-193`).
+pub struct DefaultServiceCIDRController<S: Storage + ?Sized> {
+    storage: Arc<S>,
+    /// Order matters: the first CIDR defines the default IP family.
+    cidrs: Vec<String>,
+    recorder: rusternetes_storage::EventRecorder<S>,
+    reported_mismatched_cidrs: bool,
+    reported_not_ready_condition: bool,
+}
+
+impl<S: Storage + ?Sized> DefaultServiceCIDRController<S> {
+    pub fn new(storage: Arc<S>, cidrs: Vec<String>) -> Self {
+        Self {
+            recorder: rusternetes_storage::EventRecorder::new(Arc::clone(&storage)),
+            storage,
+            cidrs,
+            reported_mismatched_cidrs: false,
+            reported_not_ready_condition: false,
+        }
+    }
+
+    fn key() -> String {
+        rusternetes_storage::build_key("servicecidrs", None, DEFAULT_SERVICE_CIDR_NAME)
+    }
+
+    fn object_ref(
+        sc: &rusternetes_common::resources::ServiceCIDR,
+    ) -> rusternetes_common::resources::ObjectReference {
+        rusternetes_common::resources::ObjectReference {
+            kind: Some("ServiceCIDR".to_string()),
+            namespace: None,
+            name: Some(sc.metadata.name.clone()),
+            uid: Some(sc.metadata.uid.clone()),
+            api_version: Some("networking.k8s.io/v1".to_string()),
+            resource_version: sc.metadata.resource_version.clone(),
+            field_path: None,
+        }
+    }
+
+    async fn warn_event(
+        &self,
+        sc: &rusternetes_common::resources::ServiceCIDR,
+        reason: &str,
+        message: &str,
+    ) {
+        let source = rusternetes_common::resources::EventSource {
+            component: DEFAULT_SERVICE_CIDR_CONTROLLER.to_string(),
+            host: None,
+        };
+        if let Err(e) = self
+            .recorder
+            .event(
+                &Self::object_ref(sc),
+                &source,
+                rusternetes_common::resources::EventType::Warning,
+                reason,
+                message,
+            )
+            .await
+        {
+            warn!(
+                "default ServiceCIDR: could not record {} event: {}",
+                reason, e
+            );
+        }
+    }
+
+    /// Upstream `sync` (`default_servicecidr_controller.go:142-185`).
+    pub async fn sync(&mut self) -> Result<()> {
+        use rusternetes_common::resources::{ServiceCIDR, ServiceCIDRSpec};
+        use rusternetes_common::types::{ObjectMeta, TypeMeta};
+
+        let key = Self::key();
+        match self.storage.get::<ServiceCIDR>(&key).await {
+            Ok(existing) => {
+                let existing_cidrs = existing
+                    .spec
+                    .as_ref()
+                    .map(|s| s.cidrs.clone())
+                    .unwrap_or_default();
+                // Single-stack -> dual-stack upgrade (`:148-156`).
+                if self.cidrs.len() == 2
+                    && existing_cidrs.len() == 1
+                    && self.cidrs[0] == existing_cidrs[0]
+                {
+                    info!(
+                        "Updating default ServiceCIDR from single-stack ({:?}) to dual-stack ({:?})",
+                        existing_cidrs, self.cidrs
+                    );
+                    let mut updated = existing.clone();
+                    updated.spec = Some(ServiceCIDRSpec {
+                        cidrs: self.cidrs.clone(),
+                    });
+                    if let Err(e) = self.storage.update(&key, &updated).await {
+                        warn!(
+                            "The default ServiceCIDR can not be updated from {} to dual stack {:?}: {}",
+                            self.cidrs[0], self.cidrs, e
+                        );
+                        self.warn_event(
+                            &existing,
+                            "KubernetesDefaultServiceCIDRError",
+                            &format!(
+                                "The default ServiceCIDR can not be upgraded from {} to dual stack {:?} : {}",
+                                self.cidrs[0], self.cidrs, e
+                            ),
+                        )
+                        .await;
+                    }
+                } else {
+                    self.sync_status(&existing).await;
+                }
+                return Ok(());
+            }
+            Err(rusternetes_common::Error::NotFound(_)) => {}
+            // Unknown error: retry on the next tick rather than racing a create
+            // against a backend that is merely unreachable.
+            Err(e) => return Err(e.into()),
+        }
+
+        // The default ServiceCIDR does not exist yet.
+        info!("Creating default ServiceCIDR with CIDRs: {:?}", self.cidrs);
+        let mut metadata = ObjectMeta::new(DEFAULT_SERVICE_CIDR_NAME);
+        metadata.ensure_uid();
+        metadata.ensure_creation_timestamp();
+        let service_cidr = ServiceCIDR {
+            type_meta: TypeMeta {
+                kind: "ServiceCIDR".to_string(),
+                api_version: "networking.k8s.io/v1".to_string(),
+            },
+            metadata,
+            spec: Some(ServiceCIDRSpec {
+                cidrs: self.cidrs.clone(),
+            }),
+            // No status on create — upstream's registry strategy clears it
+            // (`pkg/registry/networking/servicecidr/strategy.go:67-71`) and
+            // `syncStatus` below is what applies `Ready`.
+            status: None,
+        };
+        let created = match self.storage.create(&key, &service_cidr).await {
+            Ok(created) => created,
+            // Another api-server replica won the race; fall through to status.
+            Err(rusternetes_common::Error::AlreadyExists(_)) => {
+                self.storage.get::<ServiceCIDR>(&key).await?
+            }
+            Err(e) => {
+                self.warn_event(
+                    &service_cidr,
+                    "KubernetesDefaultServiceCIDRError",
+                    "The default ServiceCIDR can not be created",
+                )
+                .await;
+                return Err(e.into());
+            }
+        };
+        self.sync_status(&created).await;
+        Ok(())
+    }
+
+    /// Upstream `syncStatus` (`default_servicecidr_controller.go:187-245`).
+    async fn sync_status(&mut self, sc: &rusternetes_common::resources::ServiceCIDR) {
+        use rusternetes_common::resources::{ServiceCIDRCondition, ServiceCIDRStatus};
+
+        // A ServiceCIDR being deleted belongs to the controller-manager's
+        // service-cidr-controller; never fight it over the condition.
+        if sc.metadata.deletion_timestamp.is_some() {
+            return;
+        }
+
+        let spec_cidrs = sc
+            .spec
+            .as_ref()
+            .map(|s| s.cidrs.clone())
+            .unwrap_or_default();
+        let same_config = spec_cidrs == self.cidrs;
+        let ready = sc
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|c| c.iter().find(|c| c.condition_type == "Ready"))
+            .cloned();
+
+        if !same_config {
+            if !self.reported_mismatched_cidrs {
+                warn!(
+                    "Inconsistent ServiceCIDR status for {}, controller configuration: {:?}, ServiceCIDR configuration: {:?}. Configure the flags to match current ServiceCIDR or manually delete it.",
+                    sc.metadata.name, self.cidrs, spec_cidrs
+                );
+                self.warn_event(
+                    sc,
+                    "KubernetesDefaultServiceCIDRInconsistent",
+                    &format!(
+                        "The default ServiceCIDR {:?} does not match the controller flag configurations {:?}",
+                        spec_cidrs, self.cidrs
+                    ),
+                )
+                .await;
+                self.reported_mismatched_cidrs = true;
+            }
+            // Inconsistent config is a problem regardless of the current Ready
+            // condition; don't try to change it.
+            return;
+        }
+
+        match ready {
+            // Ready=False with matching config should not happen, and is not
+            // ours to overwrite — the service-cidr-controller owns the
+            // Terminating case. Report once and leave it for an operator.
+            Some(c) if c.status == "False" => {
+                if !self.reported_not_ready_condition {
+                    warn!(
+                        "Default ServiceCIDR {} condition Ready is False, but controller configuration matches. Please validate your cluster's network configuration. reason={} message={}",
+                        sc.metadata.name, c.reason, c.message
+                    );
+                    let reason = if c.reason.is_empty() {
+                        "KubernetesDefaultServiceCIDRError"
+                    } else {
+                        c.reason.as_str()
+                    };
+                    self.warn_event(
+                        sc,
+                        reason,
+                        &format!("Configuration matches, but {}", c.message),
+                    )
+                    .await;
+                    self.reported_not_ready_condition = true;
+                }
+            }
+            // Already Ready=True and the config matches: nothing to do.
+            Some(c) if c.status == "True" => {}
+            // Missing or Unknown: this is ours to set.
+            _ => {
+                info!("Setting default ServiceCIDR condition Ready to True");
+                let mut updated = sc.clone();
+                updated.status = Some(ServiceCIDRStatus {
+                    conditions: Some(vec![ServiceCIDRCondition {
+                        condition_type: "Ready".to_string(),
+                        status: "True".to_string(),
+                        observed_generation: sc.metadata.generation,
+                        last_transition_time: Some(
+                            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        ),
+                        reason: String::new(),
+                        message: DEFAULT_SERVICE_CIDR_READY_MESSAGE.to_string(),
+                    }]),
+                });
+                if let Err(e) = self.storage.update_status(&Self::key(), &updated).await {
+                    warn!("error updating default ServiceCIDR status: {}", e);
+                    self.warn_event(
+                        sc,
+                        "KubernetesDefaultServiceCIDRError",
+                        "The default ServiceCIDR Status can not be set to Ready=True",
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+/// Run the default-ServiceCIDR controller: one synchronous sync so the
+/// `kubernetes` ServiceCIDR exists before this api-server starts serving, then
+/// a background reconcile every [`DEFAULT_SERVICE_CIDR_RECONCILE_INTERVAL`].
+/// Mirrors upstream `Controller.Start` (`default_servicecidr_controller.go:101-140`),
+/// which likewise blocks on a first successful sync before returning.
+pub async fn start_default_servicecidr_controller(
+    storage: Arc<StorageBackend>,
+) -> tokio::task::JoinHandle<()> {
+    let cidrs: Vec<String> = DEFAULT_SERVICE_CIDRS
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+    let mut controller = DefaultServiceCIDRController::new(storage, cidrs);
+    if let Err(e) = controller.sync().await {
+        warn!("error initializing the default ServiceCIDR: {}", e);
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(DEFAULT_SERVICE_CIDR_RECONCILE_INTERVAL);
+        ticker.tick().await; // startup sync already ran
+        loop {
+            ticker.tick().await;
+            if let Err(e) = controller.sync().await {
+                warn!("error trying to sync the default ServiceCIDR: {}", e);
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,5 +1014,163 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+    }
+
+    // --- default ServiceCIDR controller -----------------------------------
+
+    use rusternetes_common::resources::{ServiceCIDR, ServiceCIDRCondition, ServiceCIDRStatus};
+
+    fn default_cidrs() -> Vec<String> {
+        DEFAULT_SERVICE_CIDRS
+            .iter()
+            .map(|c| c.to_string())
+            .collect()
+    }
+
+    fn sc_key() -> String {
+        rusternetes_storage::build_key("servicecidrs", None, DEFAULT_SERVICE_CIDR_NAME)
+    }
+
+    fn controller(
+        storage: &Arc<MemoryStorage>,
+        cidrs: Vec<String>,
+    ) -> DefaultServiceCIDRController<MemoryStorage> {
+        DefaultServiceCIDRController::new(Arc::clone(storage), cidrs)
+    }
+
+    async fn stored(storage: &MemoryStorage) -> ServiceCIDR {
+        storage
+            .get::<ServiceCIDR>(&sc_key())
+            .await
+            .expect("default ServiceCIDR exists")
+    }
+
+    fn ready(sc: &ServiceCIDR) -> Option<ServiceCIDRCondition> {
+        sc.status
+            .as_ref()?
+            .conditions
+            .as_ref()?
+            .iter()
+            .find(|c| c.condition_type == "Ready")
+            .cloned()
+    }
+
+    #[tokio::test]
+    async fn creates_the_default_servicecidr_and_marks_it_ready() {
+        let storage = Arc::new(MemoryStorage::new());
+        controller(&storage, default_cidrs()).sync().await.unwrap();
+
+        let sc = stored(&storage).await;
+        assert_eq!(sc.spec.as_ref().unwrap().cidrs, default_cidrs());
+        let cond = ready(&sc).expect("Ready condition applied by syncStatus");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.message, DEFAULT_SERVICE_CIDR_READY_MESSAGE);
+        assert_eq!(
+            cond.reason, "",
+            "upstream applies Ready=True with no reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_is_idempotent() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut c = controller(&storage, default_cidrs());
+        c.sync().await.unwrap();
+        let first = ready(&stored(&storage).await).unwrap();
+        c.sync().await.unwrap();
+        let second = ready(&stored(&storage).await).unwrap();
+        assert_eq!(first.last_transition_time, second.last_transition_time);
+    }
+
+    #[tokio::test]
+    async fn upgrades_single_stack_to_dual_stack() {
+        let storage = Arc::new(MemoryStorage::new());
+        controller(&storage, vec!["10.96.0.0/12".into()])
+            .sync()
+            .await
+            .unwrap();
+
+        let dual = vec!["10.96.0.0/12".to_string(), "2001:db8::/112".to_string()];
+        controller(&storage, dual.clone()).sync().await.unwrap();
+
+        assert_eq!(stored(&storage).await.spec.unwrap().cidrs, dual);
+    }
+
+    #[tokio::test]
+    async fn mismatched_cidrs_leave_the_condition_alone() {
+        let storage = Arc::new(MemoryStorage::new());
+        // Persisted range disagrees with this api-server's configuration.
+        controller(&storage, vec!["10.0.0.0/16".into()])
+            .sync()
+            .await
+            .unwrap();
+        let mut sc = stored(&storage).await;
+        sc.status = None;
+        storage.update(&sc_key(), &sc).await.unwrap();
+
+        controller(&storage, vec!["10.96.0.0/12".into()])
+            .sync()
+            .await
+            .unwrap();
+
+        let sc = stored(&storage).await;
+        assert_eq!(
+            sc.spec.as_ref().unwrap().cidrs,
+            vec!["10.0.0.0/16".to_string()],
+            "a mismatch is reported, never silently rewritten"
+        );
+        assert!(
+            ready(&sc).is_none(),
+            "inconsistent config must not be marked Ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn never_touches_the_status_of_a_terminating_servicecidr() {
+        let storage = Arc::new(MemoryStorage::new());
+        controller(&storage, default_cidrs()).sync().await.unwrap();
+
+        // The controller-manager owns the terminating path; clear Ready and
+        // mark the object deleting the way a DELETE + finalizer would.
+        let mut sc = stored(&storage).await;
+        sc.status = Some(ServiceCIDRStatus { conditions: None });
+        sc.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        sc.metadata.finalizers = Some(vec!["networking.k8s.io/service-cidr-finalizer".into()]);
+        storage.update(&sc_key(), &sc).await.unwrap();
+
+        controller(&storage, default_cidrs()).sync().await.unwrap();
+
+        assert!(
+            ready(&stored(&storage).await).is_none(),
+            "a deleting ServiceCIDR must not be marked Ready again"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_overwrite_a_ready_false_condition() {
+        let storage = Arc::new(MemoryStorage::new());
+        controller(&storage, default_cidrs()).sync().await.unwrap();
+
+        let mut sc = stored(&storage).await;
+        sc.status = Some(ServiceCIDRStatus {
+            conditions: Some(vec![ServiceCIDRCondition {
+                condition_type: "Ready".to_string(),
+                status: "False".to_string(),
+                observed_generation: None,
+                last_transition_time: None,
+                reason: "Terminating".to_string(),
+                message: "blocked".to_string(),
+            }]),
+        });
+        storage.update(&sc_key(), &sc).await.unwrap();
+
+        controller(&storage, default_cidrs()).sync().await.unwrap();
+
+        let cond = ready(&stored(&storage).await).unwrap();
+        assert_eq!(
+            cond.status, "False",
+            "Ready=False is another component's to clear, not ours"
+        );
+        assert_eq!(cond.reason, "Terminating");
     }
 }
