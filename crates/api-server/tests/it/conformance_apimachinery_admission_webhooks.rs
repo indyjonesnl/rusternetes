@@ -13,6 +13,32 @@
 //! used by `admission_webhook_e2e_test.rs`) — every webhook configuration
 //! either targets one of these mocks or `https://0.0.0.0:1/...` for the
 //! "fail closed without CA bundle" scenario.
+//!
+//! ## Mirror audit — #1749, 2026-08-25
+//!
+//! All 22 `framework.ConformanceIt` bodies in `webhook.go` have been opened and
+//! re-derived assertion by assertion, including the helper each one delegates
+//! to. Do not treat this file as audited again after a change: re-run the same
+//! check and move the date, or drop this block.
+//!
+//! Every citation names the `ConformanceIt` line, its descriptor string, and
+//! the helper holding the assertions. The descriptor is the durable anchor —
+//! the line numbers this file carried before the audit were all stale against
+//! the pinned `release-1.35` checkout, drifting from -22 to +40.
+//!
+//! Cases whose upstream half needs a live cluster, recorded rather than faked:
+//! `should be able to deny attaching pod` (a Running pod plus `kubectl
+//! attach`), the mounted-file half of the pod token cases, and the
+//! storage-version conversion in `should mutate custom resource with different
+//! stored version`. Two upstream assertions are blocked on #1751
+//! (`MemoryStorage` writes no `resourceVersion`): `HaveValidResourceVersion()`
+//! and the post-patch RV comparison in both patching/updating cases.
+//!
+//! Two deliberate deviations, each explained at its test: the listing cases
+//! register unreachable fail-closed webhooks so "in effect" reads as 500
+//! rather than 403, and the patching cases rewrite their rule set through
+//! storage because `validateWebhookURL` rejects the plain-HTTP mock URL on the
+//! API's create/update path.
 
 use axum::http::StatusCode;
 use rusternetes_api_server::admission_webhook::AdmissionWebhookManager;
@@ -893,7 +919,19 @@ async fn should_be_able_to_deny_pod_and_configmap_creation() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:209
 ///   ("should be able to deny attaching pod")
-///   Assertions live in testAttachingPodWebhook (webhook.go:1466-1514).
+///   Assertions live in testAttachingPodWebhook (webhook.go:1466-1482).
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Upstream creates a pod, waits for it to reach Running, then shells out to
+/// `kubectl attach ... -i -c=container1` and requires the error to contain
+/// "attaching to pod 'to-be-attached-pod' is not allowed". Both halves are
+/// live-only: a running pod needs a kubelet, and the message is produced by
+/// the e2e webhook server rather than by the api-server.
+///
+/// What is decidable here — and what this mirror asserts — is the routing
+/// half: a webhook whose rule names the `pods/attach` subresource is selected
+/// for a CONNECT on that subresource and denies it. That is the part the
+/// api-server owns.
 /// Asserts a webhook scoped to the `pods/attach` subresource denies the
 /// operation. `resource_matches` splits the request's `pods/attach` GVR on
 /// `/` and matches the rule's `pods/attach` entry; the operation is CONNECT
@@ -2187,6 +2225,7 @@ async fn should_honor_timeout() {
     // matters as an upper bound if the timeout regresses.
     let slow_webhook_sleep = std::time::Duration::from_secs(10);
     let (url, _shutdown) = start_slow_validator(slow_webhook_sleep).await;
+    let url_for_slow = url.clone();
 
     let cfg = ValidatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".to_string(),
@@ -2263,6 +2302,85 @@ async fn should_honor_timeout() {
         "error must name the queried endpoint with its timeout query \
          (upstream webhook.go:2489); got {msg:?}"
     );
+
+    // Upstream runs three more scenarios after the fail-early one, all of
+    // which must produce **no** error (webhook.go:379-392):
+    //
+    //   2. timeout shorter than latency, failurePolicy Ignore
+    //   3. timeout longer than latency, failurePolicy Fail
+    //   4. timeout unset — defaulted to 10s in v1 — failurePolicy Fail
+    //
+    // The mirror stopped after scenario 1, so neither the fail-open path nor
+    // the timeout default was covered. Scenarios 3 and 4 use a short-latency
+    // validator: what upstream is pinning is the *relationship* between the
+    // timeout and the latency, and reproducing its literal 5s response would
+    // add seconds of wall clock for nothing.
+    let (fast_url, _fast_shutdown) =
+        start_slow_validator(std::time::Duration::from_millis(50)).await;
+
+    let scenarios: [(&str, Option<i32>, FailurePolicy, String); 3] = [
+        (
+            "slow-ignore",
+            Some(1),
+            FailurePolicy::Ignore,
+            url_for_slow.clone(),
+        ),
+        (
+            "slow-long-timeout",
+            Some(10),
+            FailurePolicy::Fail,
+            fast_url.clone(),
+        ),
+        ("slow-default-timeout", None, FailurePolicy::Fail, fast_url),
+    ];
+
+    for (name, timeout, policy, hook_url) in scenarios {
+        let cfg = ValidatingWebhookConfiguration {
+            api_version: "admissionregistration.k8s.io/v1".to_string(),
+            kind: "ValidatingWebhookConfiguration".to_string(),
+            metadata: rusternetes_common::types::ObjectMeta::new(name),
+            webhooks: Some(vec![ValidatingWebhook {
+                rules: vec![rule_for("", "v1", "configmaps")],
+                timeout_seconds: timeout,
+                ..validating("slow.io", hook_url, vec![], Some(policy), timeout)
+            }]),
+        };
+        let scenario_mem = Arc::new(MemoryStorage::new());
+        scenario_mem
+            .create(
+                &build_key("validatingwebhookconfigurations", None, name),
+                &cfg,
+            )
+            .await
+            .unwrap();
+        let scenario_manager = AdmissionWebhookManager::new(scenario_mem);
+
+        let res = scenario_manager
+            .run_validating_webhooks(
+                &Operation::Create,
+                &GroupVersionKind {
+                    group: "".into(),
+                    version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                },
+                &GroupVersionResource {
+                    group: "".into(),
+                    version: "v1".into(),
+                    resource: "configmaps".into(),
+                },
+                Some("default"),
+                "cm-slow",
+                Some(json!({"metadata": {"name": "cm-slow"}})),
+                None,
+                &admin_user_info(),
+            )
+            .await;
+
+        match res {
+            Ok(AdmissionResponse::Allow) => {}
+            other => panic!("{name}: expected no error and an Allow, got {other:?}"),
+        }
+    }
 }
 
 /// [sig-api-machinery] AdmissionWebhook patching/updating a validating
@@ -2892,6 +3010,13 @@ async fn should_be_able_to_create_and_update_validating_webhook_configurations_w
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    // Upstream compares the whole slice with gomega.Equal — names and
+    // expressions both (webhook.go:734 / :788), not just its length.
+    assert_eq!(
+        serde_json::to_value(&mc).unwrap(),
+        body["webhooks"][0]["matchConditions"],
+        "the created object must echo the match conditions exactly: {body}"
+    );
 
     // Update: add a second match condition.
     let mut updated: ValidatingWebhookConfiguration = serde_json::from_value(body).unwrap();
@@ -2920,7 +3045,19 @@ async fn should_be_able_to_create_and_update_validating_webhook_configurations_w
         .match_conditions
         .clone()
         .unwrap();
-    assert_eq!(conds.len(), 2);
+    // Upstream re-reads and compares the whole updated slice, again with
+    // gomega.Equal (webhook.go:761 / :815).
+    assert_eq!(
+        conds,
+        vec![
+            mc[0].clone(),
+            MatchCondition {
+                name: "exclude-events".into(),
+                expression: "object.kind != 'Event'".into(),
+            },
+        ],
+        "the updated match conditions must round-trip exactly"
+    );
 }
 
 /// [sig-api-machinery] AdmissionWebhook should be able to create and update
@@ -2945,7 +3082,7 @@ async fn should_be_able_to_create_and_update_mutating_webhook_configurations_wit
         metadata: rusternetes_common::types::ObjectMeta::new("mwc-match-cond"),
         webhooks: Some(vec![MutatingWebhook {
             rules: vec![rule_for("", "v1", "configmaps")],
-            match_conditions: Some(mc),
+            match_conditions: Some(mc.clone()),
             ..mutating(
                 "mwc.match.io",
                 "https://example.invalid/hook".to_string(),
@@ -2962,6 +3099,13 @@ async fn should_be_able_to_create_and_update_mutating_webhook_configurations_wit
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    // Upstream compares the whole slice with gomega.Equal — names and
+    // expressions both (webhook.go:734 / :788), not just its length.
+    assert_eq!(
+        serde_json::to_value(&mc).unwrap(),
+        body["webhooks"][0]["matchConditions"],
+        "the created object must echo the match conditions exactly: {body}"
+    );
 
     let mut updated: MutatingWebhookConfiguration = serde_json::from_value(body).unwrap();
     if let Some(ref mut hooks) = updated.webhooks {
@@ -2989,7 +3133,19 @@ async fn should_be_able_to_create_and_update_mutating_webhook_configurations_wit
         .match_conditions
         .clone()
         .unwrap();
-    assert_eq!(conds.len(), 2);
+    // Upstream re-reads and compares the whole updated slice, again with
+    // gomega.Equal (webhook.go:761 / :815).
+    assert_eq!(
+        conds,
+        vec![
+            mc[0].clone(),
+            MatchCondition {
+                name: "exclude-priv".into(),
+                expression: "object.metadata.name != 'priv'".into(),
+            },
+        ],
+        "the updated match conditions must round-trip exactly"
+    );
 }
 
 /// [sig-api-machinery] AdmissionWebhook should reject validating webhook
@@ -3013,10 +3169,12 @@ async fn should_reject_validating_webhook_configurations_with_invalid_match_cond
         webhooks: Some(vec![ValidatingWebhook {
             rules: vec![rule_for("", "v1", "configmaps")],
             match_conditions: Some(vec![MatchCondition {
-                name: "bad".into(),
-                // Empty expression is the cheapest path to "invalid" that
-                // the handler explicitly rejects (admission_webhook.rs:47).
-                expression: "".into(),
+                name: "invalid-expression-1".into(),
+                // Upstream's exact malformed CEL (webhook.go:827-830 and
+                // :854-857). An *empty* expression — what this fixture used
+                // to send — fails the required-field check instead, which is
+                // a different code path and never reaches the CEL compiler.
+                expression: "... [] bad expression".into(),
             }]),
             ..validating(
                 "invalid.mc.io",
@@ -3037,6 +3195,13 @@ async fn should_reject_validating_webhook_configurations_with_invalid_match_cond
         status.is_client_error(),
         "create with invalid CEL must be 4xx; got {status} {body}"
     );
+    // Upstream requires the message to name the CEL failure, not merely to be
+    // a rejection (webhook.go:838-840 / :860-862).
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("compilation failed"),
+        "the rejection must report a CEL compilation failure; got {message:?}"
+    );
 }
 
 /// [sig-api-machinery] AdmissionWebhook should reject mutating webhook
@@ -3056,8 +3221,12 @@ async fn should_reject_mutating_webhook_configurations_with_invalid_match_condit
         webhooks: Some(vec![MutatingWebhook {
             rules: vec![rule_for("", "v1", "configmaps")],
             match_conditions: Some(vec![MatchCondition {
-                name: "".into(), // empty name → InvalidResource (handler:53)
-                expression: "true".into(),
+                name: "invalid-expression-1".into(),
+                // Upstream's exact malformed CEL (webhook.go:854-857). This
+                // fixture used to send an empty *name* with a valid
+                // expression, which fails required-field validation and never
+                // reaches the CEL compiler at all.
+                expression: "... [] bad expression".into(),
             }]),
             ..mutating(
                 "invalid.mwc.io",
@@ -3076,7 +3245,12 @@ async fn should_reject_mutating_webhook_configurations_with_invalid_match_condit
     .await;
     assert!(
         status.is_client_error(),
-        "create with invalid match condition must be 4xx; got {status} {body}"
+        "create with invalid CEL must be 4xx; got {status} {body}"
+    );
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("compilation failed"),
+        "the rejection must report a CEL compilation failure; got {message:?}"
     );
 }
 
@@ -3085,6 +3259,15 @@ async fn should_reject_mutating_webhook_configurations_with_invalid_match_condit
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:874
 ///   ("should mutate everything except 'skip-me' configmaps")
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Upstream excludes the object by a **matchConditions CEL expression over its
+/// name** — `object.metadata.name != 'skip-me'` (webhook.go:875-880) — which
+/// is what the case is named for ("mutating webhook excluding object with
+/// specific name"). The mirror used an `objectSelector` on labels instead: the
+/// same outcome reached by a different mechanism, so the CEL match-condition
+/// path this case exists to cover was never exercised. It also checked for the
+/// presence of a marker label rather than upstream's exact `data` maps.
 /// Sonobuoy (Round 160): PASS
 ///
 /// Verifies an `objectSelector` based on labels excludes specific objects
@@ -3094,23 +3277,23 @@ async fn should_reject_mutating_webhook_configurations_with_invalid_match_condit
 async fn should_mutate_everything_except_skip_me_configmaps() {
     let mem = Arc::new(MemoryStorage::new());
     let manager = AdmissionWebhookManager::new(mem.clone());
-    let (url, _shutdown) = start_mutator_label("mutated".into(), "1".into()).await;
+    let (url, _shutdown) =
+        start_mutator_data_stage("mutation-start".into(), "mutation-stage-1".into()).await;
 
-    use std::collections::HashMap;
-    let mut match_labels = HashMap::new();
-    match_labels.insert("skip-me".into(), "false".into());
-
+    // Upstream's match condition is a CEL expression over the object's *name*
+    // (webhook.go:875-880), not a label selector:
+    //     name: "skip-me", expression: "object.metadata.name != 'skip-me'"
     let cfg = MutatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".to_string(),
         kind: "MutatingWebhookConfiguration".to_string(),
         metadata: rusternetes_common::types::ObjectMeta::new("skip-me"),
         webhooks: Some(vec![MutatingWebhook {
             rules: vec![rule_for("", "v1", "configmaps")],
-            object_selector: Some(rusternetes_common::resources::LabelSelector {
-                match_labels: Some(match_labels),
-                match_expressions: None,
-            }),
-            ..mutating("skip.me.io", url, vec![], None, None)
+            match_conditions: Some(vec![MatchCondition {
+                name: "skip-me".into(),
+                expression: "object.metadata.name != 'skip-me'".into(),
+            }]),
+            ..mutating("adding-configmap-data.k8s.io", url, vec![], None, None)
         }]),
     };
     mem.create(
@@ -3120,65 +3303,56 @@ async fn should_mutate_everything_except_skip_me_configmaps() {
     .await
     .unwrap();
 
-    // Object with `skip-me=true` must NOT be mutated.
-    let skip_obj_value = json!({
-        "metadata": {"name": "cm-skip", "labels": {"skip-me": "true"}}
-    });
-    let (_, mutated) = manager
-        .run_mutating_webhooks(
-            &Operation::Create,
-            &GroupVersionKind {
-                group: "".into(),
-                version: "v1".into(),
-                kind: "ConfigMap".into(),
-            },
-            &GroupVersionResource {
-                group: "".into(),
-                version: "v1".into(),
-                resource: "configmaps".into(),
-            },
-            Some("default"),
-            "cm-skip",
-            Some(skip_obj_value.clone()),
-            None,
-            &admin_user_info(),
-        )
-        .await
-        .unwrap();
-    // Object unchanged: labels still {skip-me: true}, no `mutated` key.
-    let obj = mutated.unwrap_or(skip_obj_value);
-    assert!(
-        obj["metadata"]["labels"].get("mutated").is_none(),
-        "objectSelector must skip objects with skip-me=true; got {obj}"
+    let create = |name: &'static str| {
+        let manager = &manager;
+        async move {
+            let (_resp, mutated) = manager
+                .run_mutating_webhooks(
+                    &Operation::Create,
+                    &GroupVersionKind {
+                        group: "".into(),
+                        version: "v1".into(),
+                        kind: "ConfigMap".into(),
+                    },
+                    &GroupVersionResource {
+                        group: "".into(),
+                        version: "v1".into(),
+                        resource: "configmaps".into(),
+                    },
+                    Some("default"),
+                    name,
+                    Some(json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {"name": name, "namespace": "default"},
+                        "data": {"mutation-start": "yes"}
+                    })),
+                    None,
+                    &admin_user_info(),
+                )
+                .await
+                .unwrap();
+            mutated.expect("object must come back")
+        }
+    };
+
+    // A configmap with any other name is mutated: upstream expects exactly
+    // {mutation-start, mutation-stage-1} (webhook.go:917-921).
+    let mutated = create("some-random-name").await;
+    assert_eq!(
+        mutated["data"],
+        json!({"mutation-start": "yes", "mutation-stage-1": "yes"}),
+        "a non-'skip-me' configmap must be mutated: {mutated}"
     );
 
-    // Object with `skip-me=false` (matches selector) MUST be mutated.
-    let go_obj = Some(json!({
-        "metadata": {"name": "cm-go", "labels": {"skip-me": "false"}}
-    }));
-    let (_, mutated2) = manager
-        .run_mutating_webhooks(
-            &Operation::Create,
-            &GroupVersionKind {
-                group: "".into(),
-                version: "v1".into(),
-                kind: "ConfigMap".into(),
-            },
-            &GroupVersionResource {
-                group: "".into(),
-                version: "v1".into(),
-                resource: "configmaps".into(),
-            },
-            Some("default"),
-            "cm-go",
-            go_obj,
-            None,
-            &admin_user_info(),
-        )
-        .await
-        .unwrap();
-    let obj2 = mutated2.expect("matching object must be mutated");
-    assert_eq!(obj2["metadata"]["labels"]["mutated"], json!("1"));
+    // The one named `skip-me` is excluded by the match condition and keeps
+    // exactly its original data (webhook.go:925-930).
+    let skipped = create("skip-me").await;
+    assert_eq!(
+        skipped["data"],
+        json!({"mutation-start": "yes"}),
+        "the 'skip-me' configmap must be left untouched: {skipped}"
+    );
 }
 
 /// [sig-api-machinery] AdmissionWebhook — a validating webhook scoped to the
