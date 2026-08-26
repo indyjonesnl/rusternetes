@@ -553,6 +553,13 @@ fn admin_user_info() -> UserInfo {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:118
 ///   ("should include webhook resources in discovery documents")
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Upstream fetches **three** documents in sequence — `/apis`,
+/// `/apis/admissionregistration.k8s.io`, and
+/// `/apis/admissionregistration.k8s.io/v1` — and checks the group is present
+/// at v1 in each, plus `GroupVersion` on the resource list. The mirror fetched
+/// only the third and never checked `groupVersion`. All three blocks now run.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 ///
 /// Verifies the api-server's `/apis/admissionregistration.k8s.io/v1`
@@ -562,8 +569,52 @@ fn admin_user_info() -> UserInfo {
 #[tokio::test]
 async fn should_include_webhook_resources_in_discovery_documents() {
     let (_mem, router) = spawn_router();
+
+    // Block 1 (webhook.go:119-144): /apis must carry the group, at v1.
+    let (status, groups) = get_json(router.clone(), "/apis").await;
+    assert_eq!(status, StatusCode::OK, "GET /apis: {groups}");
+    let group = groups["groups"]
+        .as_array()
+        .expect("APIGroupList.groups must be an array")
+        .iter()
+        .find(|g| g["name"] == "admissionregistration.k8s.io")
+        .unwrap_or_else(|| {
+            panic!("admissionregistration.k8s.io API group not found in /apis: {groups}")
+        });
+    assert!(
+        group["versions"]
+            .as_array()
+            .map(|vs| vs.iter().any(|v| v["version"] == "v1"))
+            .unwrap_or(false),
+        "admissionregistration.k8s.io/v1 not found in /apis: {group}"
+    );
+
+    // Block 2 (webhook.go:146-161): the group document itself.
+    let (status, group_doc) = get_json(router.clone(), "/apis/admissionregistration.k8s.io").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GET /apis/admissionregistration.k8s.io: {group_doc}"
+    );
+    assert_eq!(
+        group_doc["name"], "admissionregistration.k8s.io",
+        "verifying API group name: {group_doc}"
+    );
+    assert!(
+        group_doc["versions"]
+            .as_array()
+            .map(|vs| vs.iter().any(|v| v["version"] == "v1"))
+            .unwrap_or(false),
+        "admissionregistration.k8s.io/v1 not found in the group document: {group_doc}"
+    );
+
+    // Block 3 (webhook.go:163-194): the versioned resource list.
     let (status, body) = get_json(router, "/apis/admissionregistration.k8s.io/v1").await;
     assert_eq!(status, StatusCode::OK, "discovery must return 200: {body}");
+    assert_eq!(
+        body["groupVersion"], "admissionregistration.k8s.io/v1",
+        "verifying API group/version in the resource list: {body}"
+    );
 
     let resources = body["resources"]
         .as_array()
@@ -573,6 +624,9 @@ async fn should_include_webhook_resources_in_discovery_documents() {
         .filter_map(|r| r["name"].as_str())
         .collect();
 
+    // Upstream requires the two webhook-configuration resources; the policy
+    // resources below are this group's other members and are asserted beyond
+    // what the upstream case checks.
     for required in [
         "validatingwebhookconfigurations",
         "mutatingwebhookconfigurations",
@@ -2216,70 +2270,184 @@ async fn should_honor_timeout() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:402
 ///   ("patching/updating a validating webhook should work")
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// The case is about the reconfiguration *taking effect*, not about the object
+/// round-tripping. Upstream: create the config and confirm a non-compliant
+/// configmap is denied; Update the rules to drop CREATE and confirm the same
+/// configmap is now admitted; Patch CREATE back in and confirm it is denied
+/// again (webhook.go:427-478).
+///
+/// The mirror was a pure CRUD round-trip — create, PUT to add a resource to the
+/// rule, GET to confirm the rule changed — and never issued a single admission
+/// request, so the behaviour the case exists to pin was untested. All three
+/// admission checks now run against the real router, and the CRUD round-trip
+/// is kept as the closing section.
+///
+/// Deviation: the rule set is rewritten through storage rather than through the
+/// API. `validateWebhookURL` requires an https `clientConfig.url` on the
+/// create/update path and the mock validator serves plain HTTP, so routing the
+/// rewrites through the API would leave the webhook unreachable and every
+/// attempt would return 500 (fail-closed) regardless of whether the rule
+/// matched. Upstream sidesteps this by using a `service` reference rather than
+/// a URL.
+///
+/// Upstream also asserts `HaveValidResourceVersion()` on create and an RV
+/// increase after the patch (webhook.go:417, :471); both are unobservable on
+/// `MemoryStorage` for the reason recorded in #1751.
 /// Sonobuoy (Round 160): PASS
 ///
 /// Verifies that POST → GET → PUT → GET round-trips a ValidatingWebhookConfiguration
 /// through the REST API and preserves an update to the `rules` field.
 #[tokio::test]
 async fn patching_updating_a_validating_webhook_should_work() {
-    let (_mem, router) = spawn_router();
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_deny_validator("denied by webhook".to_string()).await;
 
-    // Build a minimal config with a single rule on pods.
-    let cfg = ValidatingWebhookConfiguration {
-        api_version: "admissionregistration.k8s.io/v1".to_string(),
-        kind: "ValidatingWebhookConfiguration".to_string(),
-        metadata: rusternetes_common::types::ObjectMeta::new("vwc-patchable"),
-        webhooks: Some(vec![ValidatingWebhook {
-            rules: vec![rule_for("", "v1", "pods")],
-            ..validating(
-                "vwc.patch.io",
-                "https://example.invalid/hook".to_string(),
-                vec![],
-                Some(FailurePolicy::Ignore),
-                None,
-            )
-        }]),
+    // The rule set is rewritten straight through storage rather than through
+    // the API. `validateWebhookURL` requires an https `clientConfig.url` on the
+    // create/update path, and the mock validator serves plain HTTP — routing
+    // the rewrites through the API would leave the webhook unreachable, so
+    // every attempt below would come back 500 (fail-closed) instead of
+    // exercising whether the *rule* matches. The configuration object's own
+    // create/update round-trip through the API is asserted at the end.
+    let store_rules = |operations: Vec<&'static str>| {
+        let url = url.clone();
+        let mem = mem.clone();
+        async move {
+            let cfg = ValidatingWebhookConfiguration {
+                api_version: "admissionregistration.k8s.io/v1".to_string(),
+                kind: "ValidatingWebhookConfiguration".to_string(),
+                metadata: rusternetes_common::types::ObjectMeta::new("vwc-patchable"),
+                webhooks: Some(vec![ValidatingWebhook {
+                    rules: vec![RuleWithOperations {
+                        operations: operations
+                            .into_iter()
+                            .map(|o| match o {
+                                "CREATE" => OperationType::Create,
+                                "UPDATE" => OperationType::Update,
+                                other => panic!("unhandled operation {other}"),
+                            })
+                            .collect(),
+                        rule: Rule {
+                            api_groups: vec!["".to_string()],
+                            api_versions: vec!["v1".to_string()],
+                            resources: vec!["configmaps".to_string()],
+                            scope: None,
+                        },
+                    }],
+                    ..validating(
+                        "deny-unwanted-configmap-data.k8s.io",
+                        url,
+                        vec![],
+                        Some(FailurePolicy::Fail),
+                        None,
+                    )
+                }]),
+            };
+            let key = build_key("validatingwebhookconfigurations", None, "vwc-patchable");
+            if mem.get::<Value>(&key).await.is_ok() {
+                mem.update(&key, &cfg).await.unwrap();
+            } else {
+                mem.create(&key, &cfg).await.unwrap();
+            }
+        }
     };
-    let (status, _body) = post_json(
+
+    let attempt = |router: TestApiServer, name: &'static str| async move {
+        let (status, _body) = post_json(
+            router,
+            "/api/v1/namespaces/default/configmaps",
+            &json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": name},
+                "data": {"webhook-e2e-test": "webhook-disallow"}
+            }),
+        )
+        .await;
+        status
+    };
+
+    // 1. While the rule covers CREATE, the configmap is rejected.
+    store_rules(vec!["CREATE"]).await;
+    assert_eq!(
+        attempt(router.clone(), "cm-1").await,
+        StatusCode::FORBIDDEN,
+        "the webhook rule covers CREATE, so the configmap must be denied"
+    );
+
+    // 2. Drop CREATE from the rule (upstream swaps to UPDATE only,
+    //    webhook.go:442-448) — the same create must now be admitted.
+    store_rules(vec!["UPDATE"]).await;
+    assert_eq!(
+        attempt(router.clone(), "cm-2").await,
+        StatusCode::CREATED,
+        "with CREATE removed from the rule the configmap must be admitted"
+    );
+
+    // 3. Put CREATE back (webhook.go:465-471) — denied again.
+    store_rules(vec!["CREATE", "UPDATE"]).await;
+    assert_eq!(
+        attempt(router.clone(), "cm-3").await,
+        StatusCode::FORBIDDEN,
+        "restoring CREATE to the rule must make the webhook fire again"
+    );
+
+    // The configuration object itself must also create and update through the
+    // API, which is the half the old mirror covered.
+    let api_cfg = |resources: Value| {
+        json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "vwc-api-roundtrip"},
+            "webhooks": [{
+                "name": "vwc.patch.io",
+                "clientConfig": {"url": "https://127.0.0.1:1/hook"},
+                "rules": [{
+                    "operations": ["CREATE"],
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": resources
+                }],
+                "failurePolicy": "Ignore",
+                "sideEffects": "None",
+                "admissionReviewVersions": ["v1"]
+            }]
+        })
+    };
+    let (status, created) = post_json(
         router.clone(),
         "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations",
-        &serde_json::to_value(&cfg).unwrap(),
+        &api_cfg(json!(["pods"])),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(status, StatusCode::CREATED, "create config: {created}");
 
-    // Read back; mutate rules to also cover configmaps; PUT.
-    let (_, body) = get_json(
+    let (status, updated) = put_json(
         router.clone(),
-        "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations/vwc-patchable",
+        "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations/vwc-api-roundtrip",
+        &api_cfg(json!(["pods", "configmaps"])),
     )
     .await;
-    let mut updated: ValidatingWebhookConfiguration = serde_json::from_value(body).unwrap();
-    if let Some(ref mut hooks) = updated.webhooks {
-        hooks[0].rules.push(rule_for("", "v1", "configmaps"));
-    }
-    let (status, _) = put_json(
-        router.clone(),
-        "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations/vwc-patchable",
-        &serde_json::to_value(&updated).unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "update config: {updated}");
 
-    // Verify the PUT stuck.
-    let (_, body2) = get_json(
+    let (status, fetched) = get_json(
         router,
-        "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations/vwc-patchable",
+        "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations/vwc-api-roundtrip",
     )
     .await;
-    let final_cfg: ValidatingWebhookConfiguration = serde_json::from_value(body2).unwrap();
-    let rules = &final_cfg.webhooks.unwrap()[0].rules;
-    let resources: Vec<&str> = rules
+    assert_eq!(status, StatusCode::OK, "get config: {fetched}");
+    let resources: Vec<&str> = fetched["webhooks"][0]["rules"][0]["resources"]
+        .as_array()
+        .expect("resources array")
         .iter()
-        .flat_map(|r| r.rule.resources.iter().map(|s| s.as_str()))
+        .filter_map(Value::as_str)
         .collect();
-    assert!(resources.contains(&"pods"));
-    assert!(resources.contains(&"configmaps"));
+    assert!(
+        resources.contains(&"pods") && resources.contains(&"configmaps"),
+        "the update must stick, got {resources:?}"
+    );
 }
 
 /// [sig-api-machinery] AdmissionWebhook patching/updating a mutating webhook
