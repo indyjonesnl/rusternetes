@@ -408,6 +408,25 @@ fn upsert_env(out: &mut Vec<v1::KeyValue>, key: String, value: String) {
 /// `pkg/kubelet/kubelet_pods.go::makeEnvironmentVariables` and
 /// `kuberuntime_container.go::expandContainerCommandAndArgs`.
 pub(crate) fn expand(input: &str, mapping: &HashMap<String, String>) -> String {
+    // `MappingFuncFor` semantics: an unknown var expands to the verbatim
+    // `$(VAR)`. `None` from the lookup means "leave it alone".
+    expand_with(input, |name| mapping.get(name).cloned())
+}
+
+/// The shared `$(VAR)` parser behind [`expand`] and [`expand_subpath_expr`].
+///
+/// Upstream uses one `expansion.Expand` with two different mapping funcs: the
+/// command/args path leaves an unknown reference verbatim
+/// (`MappingFuncFor`), while the subPath path substitutes the empty string and
+/// records the key as missing (`ExpandContainerVolumeMounts`,
+/// `pkg/kubelet/container/helpers.go:242-256`). Keeping one parser here means
+/// the two cannot drift on `$$` escaping or incomplete-reference handling.
+///
+/// `lookup` returning `None` reproduces the verbatim behaviour.
+fn expand_with<F>(input: &str, mut lookup: F) -> String
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let b = input.as_bytes();
     let mut out = String::with_capacity(input.len());
     let mut cursor = 0;
@@ -422,8 +441,8 @@ pub(crate) fn expand(input: &str, mapping: &HashMap<String, String>) -> String {
                 b'(' => {
                     if let Some(rel) = b[cursor + 2..].iter().position(|&c| c == b')') {
                         let name = &input[cursor + 2..cursor + 2 + rel];
-                        match mapping.get(name) {
-                            Some(v) => out.push_str(v),
+                        match lookup(name) {
+                            Some(v) => out.push_str(&v),
                             // Unknown var: leave the whole `$(name)` verbatim.
                             None => out.push_str(&input[cursor..cursor + 2 + rel + 1]),
                         }
@@ -455,6 +474,89 @@ pub(crate) fn expand(input: &str, mapping: &HashMap<String, String>) -> String {
 /// Expand `$(VAR)` in every element of a command/args vector against `env`.
 fn expand_all(items: Vec<String>, env: &HashMap<String, String>) -> Vec<String> {
     items.iter().map(|s| expand(s, env)).collect()
+}
+
+/// Expand a `volumeMounts[].subPathExpr` against the container env.
+///
+/// Port of upstream `kubecontainer.ExpandContainerVolumeMounts`
+/// (`pkg/kubelet/container/helpers.go:242-256`). Unlike command/args
+/// expansion, a reference whose key is **missing or empty** is an error, not a
+/// verbatim passthrough: the expanded value would otherwise silently become a
+/// different directory. Missing keys are reported sorted, matching upstream's
+/// `sets.List` ordering, so the message is deterministic.
+pub(crate) fn expand_subpath_expr(
+    expr: &str,
+    env: &HashMap<String, String>,
+) -> Result<String, String> {
+    let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let expanded = expand_with(expr, |name| {
+        match env.get(name) {
+            Some(v) if !v.is_empty() => Some(v.clone()),
+            // Missing *or* empty: upstream records the key and substitutes "".
+            _ => {
+                missing.insert(name.to_string());
+                Some(String::new())
+            }
+        }
+    });
+    if !missing.is_empty() {
+        let keys: Vec<&str> = missing.iter().map(String::as_str).collect();
+        return Err(format!("missing value for {}", keys.join(", ")));
+    }
+    Ok(expanded)
+}
+
+/// Guard an already-resolved subPath, porting the checks upstream runs in
+/// `makeMounts` (`pkg/kubelet/kubelet_pods.go:316-325`) in this order:
+///
+/// 1. absolute → `error SubPath `<p>` must not be an absolute path`
+/// 2. contains `..` → `unable to provision SubPath `<p>`: must not contain '..'`
+///    (the inner wording is `volumevalidation.ValidatePathNoBacksteps`,
+///    `pkg/volume/validation/pv_validation.go:62-71`)
+///
+/// The strings are part of the contract: the conformance specs assert the
+/// container fails, and the message is what an operator sees.
+fn validate_resolved_sub_path(sub_path: &str) -> Result<(), String> {
+    if Path::new(sub_path).is_absolute() {
+        return Err(format!(
+            "error SubPath `{sub_path}` must not be an absolute path"
+        ));
+    }
+    if sub_path.split('/').any(|part| part == "..") {
+        return Err(format!(
+            "unable to provision SubPath `{sub_path}`: must not contain '..'"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the effective subPath for one volume mount: `subPath` verbatim, or
+/// `subPathExpr` expanded against the container env, then guarded.
+///
+/// Mirrors the head of upstream's `makeMounts` loop
+/// (`pkg/kubelet/kubelet_pods.go:308-325`). Returns `None` when the mount has
+/// no subPath at all.
+pub(crate) fn resolve_sub_path(
+    vm: &rusternetes_common::resources::VolumeMount,
+    env: &HashMap<String, String>,
+) -> Result<Option<String>, String> {
+    let mut sub_path = vm
+        .sub_path
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    if let Some(expr) = vm.sub_path_expr.as_deref().filter(|s| !s.is_empty()) {
+        sub_path = Some(expand_subpath_expr(expr, env)?);
+    }
+
+    match sub_path.as_deref().filter(|s| !s.is_empty()) {
+        Some(p) => {
+            validate_resolved_sub_path(p)?;
+            Ok(Some(p.to_string()))
+        }
+        None => Ok(None),
+    }
 }
 
 fn env_vars(
@@ -722,27 +824,44 @@ fn translate_mount_propagation(mode: Option<&str>) -> i32 {
     }
 }
 
-fn mounts(container: &Container, host_paths: &HashMap<String, String>) -> Vec<v1::Mount> {
+/// Build the CRI mounts for a container.
+///
+/// `env` is the container's fully-resolved environment: upstream expands
+/// `subPathExpr` against exactly this map inside `makeMounts`
+/// (`pkg/kubelet/kubelet_pods.go:308-325`), so the two must agree. Fallible for
+/// the same reason upstream's `makeMounts` is: an unresolvable or unsafe
+/// subPath must stop container creation, not silently mount the volume root.
+fn mounts(
+    container: &Container,
+    host_paths: &HashMap<String, String>,
+    env: &HashMap<String, String>,
+) -> Result<Vec<v1::Mount>, String> {
     let Some(vms) = container.volume_mounts.as_ref() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    vms.iter()
-        .filter_map(|vm| {
-            host_paths.get(&vm.name).map(|host| v1::Mount {
-                container_path: vm.mount_path.clone(),
-                host_path: match vm.sub_path.as_deref().filter(|s| !s.is_empty()) {
-                    Some(sub_path) => Path::new(host)
-                        .join(sub_path)
-                        .to_string_lossy()
-                        .into_owned(),
-                    None => host.clone(),
-                },
-                readonly: vm.read_only.unwrap_or(false),
-                propagation: translate_mount_propagation(vm.mount_propagation.as_deref()),
-                ..Default::default()
-            })
-        })
-        .collect()
+    let mut out = Vec::new();
+    for vm in vms.iter() {
+        // A mount whose volume did not resolve to a host path is skipped, as
+        // before — the volume manager reports that separately.
+        let Some(host) = host_paths.get(&vm.name) else {
+            continue;
+        };
+        let sub_path = resolve_sub_path(vm, env)?;
+        out.push(v1::Mount {
+            container_path: vm.mount_path.clone(),
+            host_path: match sub_path.as_deref() {
+                Some(sub_path) => Path::new(host)
+                    .join(sub_path)
+                    .to_string_lossy()
+                    .into_owned(),
+                None => host.clone(),
+            },
+            readonly: vm.read_only.unwrap_or(false),
+            propagation: translate_mount_propagation(vm.mount_propagation.as_deref()),
+            ..Default::default()
+        });
+    }
+    Ok(out)
 }
 
 /// Parse a Kubernetes CPU quantity into millicores (`"500m"` → 500, `"2"` →
@@ -1123,7 +1242,7 @@ pub fn container_config(
     host_paths: &HashMap<String, String>,
     config_maps: &HashMap<String, ConfigMap>,
     secrets: &HashMap<String, Secret>,
-) -> v1::ContainerConfig {
+) -> Result<v1::ContainerConfig, String> {
     container_config_with_allocatable(
         pod,
         container,
@@ -1148,7 +1267,7 @@ pub fn container_config_with_allocatable(
     config_maps: &HashMap<String, ConfigMap>,
     secrets: &HashMap<String, Secret>,
     node_allocatable: Option<&HashMap<String, String>>,
-) -> v1::ContainerConfig {
+) -> Result<v1::ContainerConfig, String> {
     let mut labels = pod_labels(pod);
     labels.insert(labels::CONTAINER_NAME.to_string(), container.name.clone());
 
@@ -1173,7 +1292,7 @@ pub fn container_config_with_allocatable(
         .map(|kv| (kv.key.clone(), kv.value.clone()))
         .collect();
 
-    v1::ContainerConfig {
+    Ok(v1::ContainerConfig {
         metadata: Some(v1::ContainerMetadata {
             name: container.name.clone(),
             attempt: 0,
@@ -1186,12 +1305,12 @@ pub fn container_config_with_allocatable(
         args: expand_all(container.args.clone().unwrap_or_default(), &env_map),
         working_dir: container.working_dir.clone().unwrap_or_default(),
         envs,
-        mounts: mounts(container, host_paths),
+        mounts: mounts(container, host_paths, &env_map)?,
         labels,
         log_path: format!("{}.log", container.name),
         linux,
         ..Default::default()
-    }
+    })
 }
 
 /// Build the Docker-link-style service env a container sees, per upstream
@@ -1467,7 +1586,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.command, vec!["/bin/sh"]);
         assert_eq!(cfg.args, vec!["-c", "sleep 1"]);
         assert_eq!(cfg.envs[0].key, "FOO");
@@ -1563,7 +1683,8 @@ mod tests {
             &host_paths,
             &HashMap::new(),
             &HashMap::new(),
-        );
+        )
+        .unwrap();
         // Only the resolvable mount is emitted; the unmapped one is skipped.
         assert_eq!(cfg.mounts.len(), 1);
         assert_eq!(cfg.mounts[0].container_path, "/data");
@@ -1605,7 +1726,8 @@ mod tests {
             &host_paths,
             &HashMap::new(),
             &HashMap::new(),
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.mounts.len(), 1);
         assert_eq!(cfg.mounts[0].host_path, "/host/data/nested/sub");
     }
@@ -1631,7 +1753,7 @@ mod tests {
         let host_paths = HashMap::from([("v".to_string(), "/host/v".to_string())]);
         let mut prop = |mode: Option<&str>| -> i32 {
             c.volume_mounts = Some(vec![mk(mode)]);
-            mounts(&c, &host_paths)[0].propagation
+            mounts(&c, &host_paths, &HashMap::new()).unwrap()[0].propagation
         };
         assert_eq!(
             prop(Some("HostToContainer")),
@@ -2062,6 +2184,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
         )
+        .unwrap()
         .linux
         .unwrap()
         .security_context
@@ -2092,6 +2215,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
             )
+            .unwrap()
             .linux
             .unwrap()
             .security_context
@@ -2164,6 +2288,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
             )
+            .unwrap()
             .linux
             .unwrap()
             .security_context
@@ -2204,6 +2329,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
             )
+            .unwrap()
             .linux
             .and_then(|l| l.security_context)
             .and_then(|s| s.seccomp)
@@ -2382,6 +2508,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
             )
+            .unwrap()
             .linux
             .and_then(|l| l.security_context)
             .and_then(|s| s.apparmor)
@@ -2425,6 +2552,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
             )
+            .unwrap()
             .linux
             .and_then(|l| l.security_context)
             .and_then(|s| s.selinux_options)
@@ -2650,7 +2778,8 @@ mod tests {
         let config_maps = HashMap::from([("cfg".to_string(), cm)]);
         let secrets = HashMap::from([("creds".to_string(), secret)]);
 
-        let cfg = container_config(&pod, &c, "img", &HashMap::new(), &config_maps, &secrets);
+        let cfg =
+            container_config(&pod, &c, "img", &HashMap::new(), &config_maps, &secrets).unwrap();
         let get = |k: &str| {
             cfg.envs
                 .iter()
@@ -2704,7 +2833,8 @@ mod tests {
         let config_maps = HashMap::from([("cfg".to_string(), cm)]);
         let secrets = HashMap::from([("creds".to_string(), secret)]);
 
-        let cfg = container_config(&pod, &c, "img", &HashMap::new(), &config_maps, &secrets);
+        let cfg =
+            container_config(&pod, &c, "img", &HashMap::new(), &config_maps, &secrets).unwrap();
         let get = |k: &str| {
             cfg.envs
                 .iter()
@@ -2754,7 +2884,8 @@ mod tests {
             &HashMap::new(),
             &config_maps,
             &HashMap::new(),
-        );
+        )
+        .unwrap();
         let colors: Vec<&str> = cfg
             .envs
             .iter()
@@ -2795,7 +2926,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-        );
+        )
+        .unwrap();
         assert!(cfg.envs.iter().all(|e| e.key != "MISSING"));
     }
 
@@ -2984,6 +3116,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
         )
+        .unwrap()
         .linux
         .unwrap()
         .security_context
@@ -3092,7 +3225,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-        );
+        )
+        .unwrap();
         let get = |k: &str| {
             cfg.envs
                 .iter()
@@ -3181,7 +3315,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             Some(&alloc),
-        );
+        )
+        .unwrap();
         let get = |k: &str| {
             cfg.envs
                 .iter()
@@ -3224,6 +3359,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
         )
+        .unwrap()
         .linux
         .unwrap()
         .security_context

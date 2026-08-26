@@ -115,7 +115,8 @@ async fn translated_pod_runs_on_containerd() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
-    );
+    )
+    .expect("container config translates");
 
     assert_eq!(sandbox_cfg.metadata.as_ref().unwrap().name, "translate-e2e");
 

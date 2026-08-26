@@ -698,6 +698,14 @@ impl CriContainerRuntime {
         } else {
             Some(&self.node_allocatable)
         };
+        // Container config is fallible for the same reason upstream's
+        // `generateContainerConfig`/`makeMounts` are: a `subPathExpr` that
+        // cannot be expanded, or that resolves to an absolute path or one
+        // containing `..`, must stop container creation
+        // (`pkg/kubelet/kubelet_pods.go:308-325`). The `CreateContainerConfigError:`
+        // prefix is what `lifecycle::container_reason_from_error_message` turns
+        // into the container's `waiting.reason` — the field the upstream
+        // conformance specs assert on.
         let mut cfg = translate::container_config_with_allocatable(
             pod,
             container,
@@ -706,7 +714,13 @@ impl CriContainerRuntime {
             &config_maps,
             &secrets,
             node_allocatable,
-        );
+        )
+        .map_err(|msg| {
+            anyhow::anyhow!(
+                "CreateContainerConfigError: container {}: {msg}",
+                container.name
+            )
+        })?;
         self.inject_service_env(&mut cfg);
         self.inject_service_links(pod, &mut cfg).await;
 
@@ -832,6 +846,20 @@ impl CriContainerRuntime {
                 ),
             }
         }
+
+        // Create each subPath directory before the runtime bind-mounts it.
+        //
+        // Upstream does this in `makeMounts` (`pkg/kubelet/kubelet_pods.go:338-358`):
+        // "Create the sub path now because if it's auto-created later when
+        // referenced, it may have an incorrect ownership and mode." Without it a
+        // subPath into an emptyDir — whose subdirectory does not exist yet — is a
+        // hard mount failure rather than a working mount.
+        //
+        // Upstream creates it with the *volume root's* mode and via
+        // `SafeMakeDir`, which refuses to escape the volume. We reproduce the
+        // mode and a containment check; the full `PrepareSafeSubpath` bind-mount
+        // dance (which also defends against symlink races) is not ported here.
+        create_sub_path_dirs(&container.name, host_paths, &cfg);
 
         let container_id = cri
             .create_container(sandbox_id, cfg, sandbox_cfg.clone())
@@ -2655,6 +2683,68 @@ fn grpc_status_healthy(status: i32) -> bool {
 /// timeout, which the kubelet exec prober treats as a probe failure.
 fn exec_probe_passed(exit_code: Option<i32>) -> bool {
     exit_code == Some(0)
+}
+
+/// Create the host-side directory for every subPath mount in `cfg` before the
+/// runtime bind-mounts it.
+///
+/// Port of the subPath branch of upstream `makeMounts`
+/// (`pkg/kubelet/kubelet_pods.go:338-358`). A subPath mount's `host_path` is
+/// `join(volume_root, sub_path)`; when that directory does not exist yet — the
+/// normal case for an emptyDir — the bind-mount fails outright, so upstream
+/// creates it first, deliberately with the **volume root's** mode so an fsGroup
+/// pod does not end up with a `0750` directory it cannot write.
+///
+/// Any mount whose `host_path` is exactly a volume root has no subPath and is
+/// skipped. The `starts_with` check is the containment guard corresponding to
+/// upstream's "make extra care not to escape the volume" (`SafeMakeDir`);
+/// `..` has already been rejected during resolution.
+fn create_sub_path_dirs(
+    container_name: &str,
+    host_paths: &std::collections::HashMap<String, String>,
+    cfg: &v1::ContainerConfig,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mount in &cfg.mounts {
+        let Some(root) = host_paths
+            .values()
+            .filter(|root| {
+                mount.host_path.len() > root.len()
+                    && mount.host_path.starts_with(*root)
+                    && mount.host_path.as_bytes()[root.len()] == b'/'
+            })
+            // Longest matching root wins, so nested volume roots resolve to the
+            // most specific one.
+            .max_by_key(|root| root.len())
+        else {
+            continue;
+        };
+
+        if Path::new(&mount.host_path).exists() {
+            continue;
+        }
+
+        // Inherit the volume root's mode, as upstream's `GetMode(volumePath)` does.
+        let perm = std::fs::metadata(root).map(|m| m.permissions().mode() & 0o7777);
+        if let Err(e) = std::fs::create_dir_all(&mount.host_path) {
+            warn!(
+                "container {container_name}: failed to create subPath directory {}: {e}",
+                mount.host_path
+            );
+            continue;
+        }
+        if let Ok(mode) = perm {
+            if let Err(e) =
+                std::fs::set_permissions(&mount.host_path, std::fs::Permissions::from_mode(mode))
+            {
+                warn!(
+                    "container {container_name}: failed to set mode {mode:o} on subPath directory {}: {e}",
+                    mount.host_path
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
