@@ -895,18 +895,19 @@ impl<S: Storage + 'static> NamespaceController<S> {
             };
             let key = build_key(resource_type, Some(namespace), name);
 
-            // For pods: terminal pods (Succeeded/Failed) should be hard-deleted
-            // from storage regardless of finalizers — mirrors upstream's
-            // graceful-termination short-circuit for pods that have already
-            // finished executing.
-            if resource_type == "pods" {
-                let phase = resource.pointer("/status/phase").and_then(|p| p.as_str());
-                if matches!(phase, Some("Succeeded") | Some("Failed")) {
-                    let _ = self.storage.delete(&key).await;
-                    continue;
-                }
-            }
-
+            // A pod's phase does NOT license removing it while a finalizer is
+            // still attached. Upstream's only terminal-pod special case is in
+            // `estimateGracefulTerminationForPods`
+            // (namespaced_resources_deleter.go:643-648), where a Succeeded or
+            // Failed pod contributes nothing to the grace-period *estimate*;
+            // the deletion itself goes through the API, which honours
+            // finalizers for every object regardless of phase. Hard-deleting a
+            // terminal pod here retired the namespace out from under a pod
+            // whose finalizer had not been cleared, failing the conformance
+            // spec "[sig-api-machinery] OrderedNamespaceDeletion namespace
+            // deletion should delete pod first" with "namespace was deleted
+            // unexpectedly". Terminal pods without finalizers still fall
+            // through to the plain hard delete below.
             let finalizers = metadata
                 .get("finalizers")
                 .and_then(|f| f.as_array())
@@ -1390,6 +1391,104 @@ mod tests {
                 assert!(types.contains(&"NamespaceDeletionDiscoveryFailure"));
                 assert!(types.contains(&"NamespaceContentRemaining"));
             }
+        }
+    }
+
+    /// A pod that has reached a terminal phase still holds the namespace open
+    /// for as long as it carries a finalizer.
+    ///
+    /// Upstream's only terminal-pod special case is in the grace-period
+    /// *estimate*, where terminal pods simply contribute nothing:
+    ///
+    /// ```text
+    /// // pkg/controller/namespace/deletion/namespaced_resources_deleter.go:643-648
+    /// for i := range items.Items {
+    ///     pod := items.Items[i]
+    ///     // filter out terminal pods
+    ///     phase := pod.Status.Phase
+    ///     if v1.PodSucceeded == phase || v1.PodFailed == phase {
+    ///         continue
+    ///     }
+    /// ```
+    ///
+    /// The deletion path itself goes through the API and therefore honours
+    /// finalizers for every object, terminal or not — there is no
+    /// remove-anyway short-circuit.
+    ///
+    /// This is the state the conformance spec "[sig-api-machinery]
+    /// OrderedNamespaceDeletion namespace deletion should delete pod first"
+    /// ends up in: the kubelet stops the container and, because the pod carries
+    /// `e2e.example.com/finalizer`, marks it Failed instead of removing it
+    /// (`crates/kubelet/src/kubelet.rs` — "Pod has finalizers — update status
+    /// to Failed but don't delete"). Dropping it from storage at that point
+    /// retires the namespace while the spec is still waiting to observe it
+    /// Terminating, and the spec fails with "namespace was deleted
+    /// unexpectedly".
+    #[tokio::test]
+    async fn a_terminal_pod_with_a_finalizer_still_blocks_namespace_deletion() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = NamespaceController::new(storage.clone());
+
+        let ns_name = "test-ns-terminal-pod";
+
+        let mut ns = Namespace::new(ns_name);
+        ns.metadata.deletion_timestamp = Some(Utc::now());
+        set_namespace_finalizers(&mut ns, vec!["kubernetes".to_string()]);
+        ns.status = Some(NamespaceStatus {
+            phase: Some(Phase::Terminating),
+            conditions: None,
+        });
+        let ns_key = build_key("namespaces", None, ns_name);
+        storage.create(&ns_key, &ns).await.unwrap();
+
+        // The container has already been stopped, so the pod is Failed — but
+        // its finalizer is never removed.
+        let pod_value = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "terminal-pod",
+                "namespace": ns_name,
+                "finalizers": ["e2e.example.com/finalizer"]
+            },
+            "spec": {
+                "containers": [{"name": "test", "image": "nginx"}]
+            },
+            "status": {"phase": "Failed"}
+        });
+        let pod_key = build_key("pods", Some(ns_name), "terminal-pod");
+        storage.create(&pod_key, &pod_value).await.unwrap();
+
+        let cm_value = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "test-configmap", "namespace": ns_name},
+            "data": {"key": "value"}
+        });
+        let cm_key = build_key("configmaps", Some(ns_name), "test-configmap");
+        storage.create(&cm_key, &cm_value).await.unwrap();
+
+        for round in 1..=3 {
+            let ns_again = storage
+                .get::<Namespace>(&ns_key)
+                .await
+                .unwrap_or(ns.clone());
+            controller.finalize_namespace(&ns_again).await.unwrap();
+
+            assert!(
+                storage.get::<serde_json::Value>(&pod_key).await.is_ok(),
+                "round {round}: a terminal pod that still carries a finalizer \
+                 must not be removed from storage"
+            );
+            assert!(
+                storage.get::<serde_json::Value>(&cm_key).await.is_ok(),
+                "round {round}: other content must outlive the pod"
+            );
+            assert!(
+                storage.get::<Namespace>(&ns_key).await.is_ok(),
+                "round {round}: the namespace must stay Terminating while the \
+                 finalized pod remains"
+            );
         }
     }
 
