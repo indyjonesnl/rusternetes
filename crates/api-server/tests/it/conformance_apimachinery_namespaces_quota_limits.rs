@@ -40,7 +40,8 @@
 //! `namespace.go` :247, :256, :309, :376, :404, and `limit_range.go` :256.
 //! Nine upstream conformance cases in these sources have **no mirror at all** —
 //! the quota cases covering the life of a service, secret, configMap,
-//! replication controller and replica set among them.
+//! replication controller and replica set among them. Enumerated and tracked in
+//! #1770.
 //!
 //! Do not treat this file as audited: the record above is explicitly partial.
 //!
