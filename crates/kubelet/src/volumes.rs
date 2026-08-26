@@ -19,6 +19,7 @@ use tracing::{info, warn};
 // Free helpers that stay in `runtime.rs` (they are not runtime-specific but are
 // shared with non-volume code paths there). Imported so the moved bodies keep
 // calling them by their bare names, verbatim.
+use crate::atomic_writer::FileProjection;
 use crate::runtime::{
     check_host_path_type, mount_tmpfs_for_emptydir, parse_quantity_bytes, pod_dir_key,
     setup_emptydir_dir, HostPathCheck,
@@ -35,19 +36,37 @@ fn build_configmap_payload(
     items: Option<&Vec<KeyToPath>>,
     configmap_name: &str,
     is_optional: bool,
-) -> std::collections::BTreeMap<String, Vec<u8>> {
-    let mut payload: std::collections::BTreeMap<String, Vec<u8>> =
+    default_mode: u32,
+) -> std::collections::BTreeMap<String, FileProjection> {
+    let mut payload: std::collections::BTreeMap<String, FileProjection> =
         std::collections::BTreeMap::new();
     if let Some(items) = items {
         for item in items {
+            // `items[].mode` wins over the volume `defaultMode` for this key
+            // alone — upstream carries it per file in `FileProjection.Mode`
+            // (`pkg/volume/util/atomic_writer.go:64-68`), which is what the
+            // "with mappings and Item mode set" Conformance spec asserts.
+            let mode = item.mode.map(|m| m as u32).unwrap_or(default_mode);
             if let Some(v) = configmap.data.as_ref().and_then(|d| d.get(&item.key)) {
-                payload.insert(item.path.clone(), v.clone().into_bytes());
+                payload.insert(
+                    item.path.clone(),
+                    FileProjection {
+                        data: v.clone().into_bytes(),
+                        mode,
+                    },
+                );
             } else if let Some(v) = configmap
                 .binary_data
                 .as_ref()
                 .and_then(|d| d.get(&item.key))
             {
-                payload.insert(item.path.clone(), v.clone());
+                payload.insert(
+                    item.path.clone(),
+                    FileProjection {
+                        data: v.clone(),
+                        mode,
+                    },
+                );
             } else if !is_optional {
                 warn!("ConfigMap {} missing key {}", configmap_name, item.key);
             }
@@ -55,12 +74,24 @@ fn build_configmap_payload(
     } else {
         if let Some(data) = &configmap.data {
             for (k, v) in data {
-                payload.insert(k.clone(), v.clone().into_bytes());
+                payload.insert(
+                    k.clone(),
+                    FileProjection {
+                        data: v.clone().into_bytes(),
+                        mode: default_mode,
+                    },
+                );
             }
         }
         if let Some(bin) = &configmap.binary_data {
             for (k, v) in bin {
-                payload.insert(k.clone(), v.clone());
+                payload.insert(
+                    k.clone(),
+                    FileProjection {
+                        data: v.clone(),
+                        mode: default_mode,
+                    },
+                );
             }
         }
     }
@@ -372,17 +403,17 @@ impl VolumeManager {
                             let volume_dir =
                                 format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
                             let is_optional = cm_source.optional.unwrap_or(false);
+                            let mode = cm_source.default_mode.unwrap_or(0o644) as u32;
                             let payload = build_configmap_payload(
                                 &cm,
                                 cm_source.items.as_ref(),
                                 cm_name,
                                 is_optional,
+                                mode,
                             );
-                            let mode = cm_source.default_mode.unwrap_or(0o644) as u32;
-                            let _ = crate::atomic_writer::write_payload(
+                            let _ = crate::atomic_writer::write_projected_payload(
                                 std::path::Path::new(&volume_dir),
                                 &payload,
-                                mode,
                             );
                         }
                     }
@@ -740,19 +771,18 @@ impl VolumeManager {
                     // AtomicWriter. Re-projecting an unchanged payload is a no-op
                     // (no write, no chmod, no symlink swap), so a running pod's
                     // config watcher (kube-proxy) is never disturbed by the
-                    // kubelet's periodic re-SetUp. Per-item modes are not honored
-                    // individually here; the volume defaultMode applies (matches
-                    // the common case, incl. kube-proxy).
+                    // kubelet's periodic re-SetUp. Each entry carries its own
+                    // mode: `items[].mode` when set, else the volume defaultMode.
                     let payload = build_configmap_payload(
                         &configmap,
                         configmap_source.items.as_ref(),
                         configmap_name,
                         is_optional,
+                        cm_default_mode as u32,
                     );
-                    crate::atomic_writer::write_payload(
+                    crate::atomic_writer::write_projected_payload(
                         std::path::Path::new(&volume_dir),
                         &payload,
-                        cm_default_mode as u32,
                     )
                     .with_context(|| format!("failed to project ConfigMap {configmap_name}"))?;
                 }
@@ -1777,17 +1807,17 @@ impl VolumeManager {
                         // symlinks and fires an fsnotify Write, crash-looping a
                         // config watcher like kube-proxy (#1652).
                         let is_optional = cm_source.optional.unwrap_or(false);
+                        let mode = cm_source.default_mode.unwrap_or(0o644) as u32;
                         let payload = build_configmap_payload(
                             &cm,
                             cm_source.items.as_ref(),
                             cm_name,
                             is_optional,
+                            mode,
                         );
-                        let mode = cm_source.default_mode.unwrap_or(0o644) as u32;
-                        let _ = crate::atomic_writer::write_payload(
+                        let _ = crate::atomic_writer::write_projected_payload(
                             std::path::Path::new(&volume_dir),
                             &payload,
-                            mode,
                         );
                     }
                     Err(_) => {
@@ -1847,6 +1877,76 @@ impl VolumeManager {
             Some(&self.node_allocatable),
         )
         .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+#[cfg(test)]
+mod configmap_payload_tests {
+    use super::*;
+
+    fn cm(pairs: &[(&str, &str)]) -> ConfigMap {
+        let mut c = ConfigMap::new("cm", "default");
+        c.data = Some(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        c
+    }
+
+    fn item(key: &str, path: &str, mode: Option<i32>) -> KeyToPath {
+        KeyToPath {
+            key: key.to_string(),
+            path: path.to_string(),
+            mode,
+        }
+    }
+
+    /// `items[].mode` must reach the projected file; siblings without one keep
+    /// the volume `defaultMode`.
+    ///
+    /// Pins the upstream Conformance spec "ConfigMap should be consumable from
+    /// pods in volume with mappings and Item mode set [LinuxOnly]"
+    /// (`test/e2e/common/storage/configmap_volume.go:99-102`), which maps a key
+    /// to the nested path `path/to/data-2` with `Mode: 0400` and asserts the
+    /// file mode. Upstream carries the mode per file in `FileProjection.Mode`
+    /// (`pkg/volume/util/atomic_writer.go:64-68`); this projection used to
+    /// collapse it to one mode for the whole volume, so the spec could not pass.
+    #[test]
+    fn item_mode_overrides_default_mode_per_file() {
+        let configmap = cm(&[("data-1", "value-1"), ("data-2", "value-2")]);
+        let items = vec![
+            item("data-2", "path/to/data-2", Some(0o400)),
+            item("data-1", "plain", None),
+        ];
+
+        let payload = build_configmap_payload(&configmap, Some(&items), "cm", false, 0o644);
+
+        assert_eq!(
+            payload.get("path/to/data-2").map(|p| p.mode),
+            Some(0o400),
+            "items[].mode must be carried per file"
+        );
+        assert_eq!(
+            payload.get("path/to/data-2").map(|p| p.data.as_slice()),
+            Some(b"value-2".as_slice())
+        );
+        assert_eq!(
+            payload.get("plain").map(|p| p.mode),
+            Some(0o644),
+            "an item without a mode falls back to the volume defaultMode"
+        );
+    }
+
+    /// With no `items`, every key takes the volume `defaultMode`.
+    #[test]
+    fn without_items_every_key_takes_default_mode() {
+        let configmap = cm(&[("a", "1"), ("b", "2")]);
+        let payload = build_configmap_payload(&configmap, None, "cm", false, 0o400);
+
+        assert_eq!(payload.len(), 2);
+        assert!(payload.values().all(|p| p.mode == 0o400));
     }
 }
 
