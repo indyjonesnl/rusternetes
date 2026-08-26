@@ -562,7 +562,44 @@ impl<S: Storage + 'static> DeploymentController<S> {
             false
         };
 
+        // K8s scale() (sync.go:308-316) — FindActiveOrLatest short-circuit.
+        // "If there is only one active replica set then we should scale that up
+        // to the full count of the deployment." With a single active RS the
+        // proportional distribution below has nothing to distribute *between*,
+        // and its allowed_size (desired + maxSurge) overshoots: a 1 -> 2 scale
+        // with maxSurge 1 handed the whole delta to that one RS and produced 3.
+        // FindActiveOrLatest (deployment_util.go:357-377) counts RSes with
+        // spec.replicas > 0, i.e. controller.FilterActiveReplicaSets.
+        let single_active_rs: Option<ReplicaSet> = {
+            let active: Vec<&ReplicaSet> = owned_replicasets
+                .iter()
+                .filter(|rs| rs.spec.replicas > 0)
+                .collect();
+            match active.as_slice() {
+                [only] => Some((*only).clone()),
+                _ => None,
+            }
+        };
         if is_scaling_event {
+            if let Some(only) = &single_active_rs {
+                // Upstream returns early without touching the annotations when
+                // the RS is already at the deployment's count (sync.go:311-313).
+                if only.spec.replicas != desired_replicas {
+                    self.update_replicaset_replicas(only, desired_replicas)
+                        .await?;
+                    self.set_desired_replicas_annotation(
+                        only,
+                        desired_replicas,
+                        max_surge,
+                        namespace,
+                    )
+                    .await;
+                    return self.update_deployment_status(deployment).await;
+                }
+            }
+        }
+
+        if is_scaling_event && single_active_rs.is_none() {
             let all_rs_replicas: i32 = owned_replicasets.iter().map(|rs| rs.spec.replicas).sum();
             let allowed_size = desired_replicas + max_surge;
             let replicas_to_add = allowed_size - all_rs_replicas;
@@ -2061,6 +2098,141 @@ mod tests {
             tty: None,
             ..Default::default()
         }
+    }
+
+    /// Upstream `scale()` short-circuits before proportional scaling whenever
+    /// exactly one ReplicaSet is active, and scales it to the deployment's
+    /// replica count verbatim:
+    ///
+    /// ```text
+    /// // pkg/controller/deployment/sync.go:308-316
+    /// // If there is only one active replica set then we should scale that up to the full count of the
+    /// // deployment. If there is no active replica set, then we should scale up the newest replica set.
+    /// if activeOrLatest := deploymentutil.FindActiveOrLatest(newRS, oldRSs); activeOrLatest != nil {
+    ///     if *(activeOrLatest.Spec.Replicas) == *(deployment.Spec.Replicas) {
+    ///         return nil
+    ///     }
+    ///     _, _, err := dc.scaleReplicaSetAndRecordEvent(ctx, activeOrLatest, *(deployment.Spec.Replicas), deployment)
+    ///     return err
+    /// }
+    /// ```
+    ///
+    /// Falling through to proportional scaling instead computes
+    /// `allowedSize = desired + maxSurge = 3` and hands the whole delta to the
+    /// single RS, overshooting the desired count. Exercised by conformance
+    /// "[sig-apps] Deployment should run the lifecycle of a Deployment", whose
+    /// final step changes the image and `spec.replicas` 1 -> 2 in one PUT.
+    #[tokio::test]
+    async fn a_scaling_event_with_one_active_replicaset_scales_it_to_desired_not_allowed_size() {
+        use rusternetes_common::resources::{PodTemplateSpec, ReplicaSetStatus};
+        use rusternetes_common::types::LabelSelector;
+        use rusternetes_storage::memory::MemoryStorage;
+        use std::collections::HashMap;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DeploymentController::new(storage.clone(), 5);
+
+        let mut labels = HashMap::new();
+        labels.insert("app".to_string(), "test".to_string());
+
+        // Deployment now wants 2 replicas of the NEW image.
+        let deployment = Deployment {
+            type_meta: TypeMeta {
+                kind: "Deployment".to_string(),
+                api_version: "apps/v1".to_string(),
+            },
+            metadata: ObjectMeta::new("test-deploy").with_namespace("default"),
+            spec: rusternetes_common::resources::DeploymentSpec {
+                replicas: Some(2),
+                selector: LabelSelector {
+                    match_labels: Some(labels.clone()),
+                    match_expressions: None,
+                },
+                template: PodTemplateSpec {
+                    metadata: Some(ObjectMeta::new("").with_labels(labels.clone())),
+                    spec: rusternetes_common::resources::PodSpec {
+                        containers: vec![test_container("test", "agnhost:2.59")],
+                        ..Default::default()
+                    },
+                },
+                strategy: None,
+                min_ready_seconds: None,
+                revision_history_limit: None,
+                paused: None,
+                progress_deadline_seconds: None,
+            },
+            status: None,
+        };
+        let dep_key = build_key("deployments", Some("default"), "test-deploy");
+        storage.create(&dep_key, &deployment).await.unwrap();
+
+        // The only active ReplicaSet still runs the OLD image at 1 replica,
+        // and its annotations record the previous desired count of 1.
+        let mut rs_labels = labels.clone();
+        rs_labels.insert("pod-template-hash".to_string(), "old".to_string());
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "deployment.kubernetes.io/desired-replicas".to_string(),
+            "1".to_string(),
+        );
+        annotations.insert(
+            "deployment.kubernetes.io/max-replicas".to_string(),
+            "2".to_string(),
+        );
+
+        let mut old_template = deployment.spec.template.clone();
+        old_template.spec.containers = vec![test_container("test", "pause:3.10")];
+
+        let rs = ReplicaSet {
+            type_meta: TypeMeta {
+                kind: "ReplicaSet".to_string(),
+                api_version: "apps/v1".to_string(),
+            },
+            metadata: ObjectMeta {
+                name: "test-deploy-old".to_string(),
+                namespace: Some("default".to_string()),
+                labels: Some(rs_labels.clone()),
+                annotations: Some(annotations),
+                owner_references: Some(vec![rusternetes_common::types::OwnerReference {
+                    api_version: "apps/v1".to_string(),
+                    kind: "Deployment".to_string(),
+                    name: "test-deploy".to_string(),
+                    uid: deployment.metadata.uid.clone(),
+                    controller: Some(true),
+                    block_owner_deletion: Some(true),
+                }]),
+                ..Default::default()
+            },
+            spec: ReplicaSetSpec {
+                replicas: 1,
+                selector: LabelSelector {
+                    match_labels: Some(rs_labels.clone()),
+                    match_expressions: None,
+                },
+                template: old_template,
+                min_ready_seconds: None,
+            },
+            status: Some(ReplicaSetStatus {
+                replicas: 1,
+                ready_replicas: 1,
+                available_replicas: 1,
+                fully_labeled_replicas: Some(1),
+                observed_generation: None,
+                conditions: None,
+                terminating_replicas: None,
+            }),
+        };
+        let rs_key = build_key("replicasets", Some("default"), "test-deploy-old");
+        storage.create(&rs_key, &rs).await.unwrap();
+
+        controller.reconcile_deployment(&deployment).await.unwrap();
+
+        let scaled: ReplicaSet = storage.get(&rs_key).await.unwrap();
+        assert_eq!(
+            scaled.spec.replicas, 2,
+            "the single active ReplicaSet must be scaled to spec.replicas (2), \
+             not to desired + maxSurge (3)"
+        );
     }
 
     #[tokio::test]
