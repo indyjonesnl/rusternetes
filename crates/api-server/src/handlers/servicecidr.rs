@@ -53,42 +53,14 @@ pub async fn create_servicecidr(
     servicecidr.metadata.ensure_uid();
     servicecidr.metadata.ensure_creation_timestamp();
 
-    // Seed the `Ready` condition, standing in for a controller rusternetes does
-    // not have yet.
-    //
-    // Upstream splits this differently: the registry strategy writes no status
-    // (`pkg/registry/networking/servicecidr/strategy.go:67-71`) and the
-    // servicecidrs controller sets the condition
-    // (`pkg/controller/servicecidrs/servicecidrs_controller.go:340-345`), which
-    // is also the only place that can ever set it to `False` with
-    // `ServiceCIDRReasonTerminating` while IPAddresses still reference the
-    // range. There is no such controller in this workspace, so a ServiceCIDR
-    // created here would stay condition-less forever — hence the seed.
-    //
-    // What is ported is the condition's shape: upstream's is `Ready=True` with
-    // message "Kubernetes Service CIDR is ready" and **no reason** (the
-    // controller applies it without one; ServiceCIDR status is not
-    // condition-validated — `ValidateServiceCIDRStatusUpdate`,
-    // `pkg/apis/networking/validation/validation.go:883-886`). The invented
-    // `ServiceCIDRReady` reason and "ready for allocation" message appear in no
-    // upstream controller.
-    //
-    // Porting the controller — and with it the terminating path — is tracked
-    // separately.
-    if servicecidr.status.is_none() {
-        servicecidr.status = Some(rusternetes_common::resources::ServiceCIDRStatus {
-            conditions: Some(vec![rusternetes_common::resources::ServiceCIDRCondition {
-                condition_type: "Ready".to_string(),
-                status: "True".to_string(),
-                observed_generation: servicecidr.metadata.generation,
-                last_transition_time: Some(
-                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                ),
-                reason: String::new(),
-                message: "Kubernetes Service CIDR is ready".to_string(),
-            }]),
-        });
-    }
+    // Create writes no status. Upstream's registry strategy clears whatever the
+    // client sent (`pkg/registry/networking/servicecidr/strategy.go:67-71`);
+    // the `Ready` condition is the servicecidrs controller's to set
+    // (`pkg/controller/servicecidrs/servicecidrs_controller.go:341-346`), which
+    // is also the only component that can flip it to `False` with reason
+    // `Terminating` while IPAddresses still reference the range. That
+    // controller lives in `crates/controller-manager/src/controllers/servicecidr.rs`.
+    servicecidr.status = None;
 
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);

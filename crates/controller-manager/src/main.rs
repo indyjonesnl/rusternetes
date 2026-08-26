@@ -38,6 +38,7 @@ use controllers::{
     resource_quota::ResourceQuotaController,
     service::ServiceController,
     serviceaccount::ServiceAccountController,
+    servicecidr::ServiceCIDRController,
     statefulset::StatefulSetController,
     storage_class::StorageClassController,
     ttl_controller::TTLController,
@@ -821,6 +822,19 @@ async fn main() -> Result<()> {
         async move {
             if let Err(e) = controller.run().await {
                 tracing::error!("APIService availability controller error: {}", e);
+            }
+        }
+    });
+
+    // Start ServiceCIDR controller (upstream `service-cidr-controller`):
+    // protection finalizer, Ready condition, and the Terminating path that
+    // stops a range being deleted out from under live IPAddresses.
+    let servicecidr_controller = Arc::new(ServiceCIDRController::new(storage.clone()));
+    spawn_controller!("ServiceCIDR controller", leader_elector, {
+        let controller = servicecidr_controller.clone();
+        async move {
+            if let Err(e) = controller.run().await {
+                tracing::error!("ServiceCIDR controller error: {}", e);
             }
         }
     });

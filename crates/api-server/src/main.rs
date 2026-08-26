@@ -231,45 +231,12 @@ async fn main() -> Result<()> {
     // which lives in the apiserver — not KCM).
     bootstrap::spawn_apiservice_availability_controller(storage.clone());
 
-    // Create default ServiceCIDR "kubernetes" (required by conformance tests)
-    {
-        let cidr_key = rusternetes_storage::build_key("servicecidrs", None, "kubernetes");
-        if storage.get::<serde_json::Value>(&cidr_key).await.is_err() {
-            let service_cidr = serde_json::json!({
-                "apiVersion": "networking.k8s.io/v1",
-                "kind": "ServiceCIDR",
-                "metadata": {
-                    "name": "kubernetes",
-                    "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-                },
-                "spec": {
-                    "cidrs": ["10.96.0.0/12"]
-                },
-                // Ready condition verbatim from the upstream default-ServiceCIDR
-                // controller (`pkg/controlplane/controller/defaultservicecidr/
-                // default_servicecidr_controller.go:232-237`): type `Ready`,
-                // status `True`, message "Kubernetes default Service CIDR is
-                // ready", and **no reason** — it applies the condition without
-                // one, and ServiceCIDR status is not condition-validated
-                // (`ValidateServiceCIDRStatusUpdate`, validation.go:883-886).
-                "status": {
-                    "conditions": [{
-                        "type": "Ready",
-                        "status": "True",
-                        "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                        "reason": "",
-                        "message": "Kubernetes default Service CIDR is ready"
-                    }]
-                }
-            });
-            if let Err(e) = storage.create(&cidr_key, &service_cidr).await {
-                warn!("Failed to create default ServiceCIDR: {}", e);
-            } else {
-                info!("Created default ServiceCIDR 'kubernetes' with CIDR 10.96.0.0/12");
-            }
-        }
-    }
+    // The `kubernetes` ServiceCIDR, owned by the apiserver-side
+    // default-ServiceCIDR controller (upstream
+    // `pkg/controlplane/controller/defaultservicecidr`). Reconciles rather than
+    // create-once: dual-stack upgrade, flag-mismatch warning, and `Ready=True`
+    // only when the persisted CIDRs match this api-server's configuration.
+    bootstrap::start_default_servicecidr_controller(storage.clone()).await;
 
     // Create default StorageClass (like k3s/kind ship with a default)
     {

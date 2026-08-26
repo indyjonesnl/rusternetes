@@ -30,6 +30,7 @@ use controllers::{
     resource_quota::ResourceQuotaController,
     service::ServiceController,
     serviceaccount::ServiceAccountController,
+    servicecidr::ServiceCIDRController,
     statefulset::StatefulSetController,
     storage_class::StorageClassController,
     ttl_controller::TTLController,
@@ -378,6 +379,14 @@ async fn run_controllers<S: Storage + Send + Sync + 'static>(
         let c = Arc::new(APIServiceAvailabilityController::new(s));
         if let Err(e) = c.run().await {
             error!("APIService availability controller error: {}", e);
+        }
+    });
+
+    let s = storage.clone();
+    tokio::spawn(async move {
+        let c = Arc::new(ServiceCIDRController::new(s));
+        if let Err(e) = c.run().await {
+            error!("ServiceCIDR controller error: {}", e);
         }
     });
 

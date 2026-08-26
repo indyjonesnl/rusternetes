@@ -80,3 +80,53 @@ async fn servicecidr_cidrs_immutable() {
         "single->dual-stack expansion must be allowed"
     );
 }
+
+/// Create writes no status: upstream's registry strategy drops whatever the
+/// client sent (`pkg/registry/networking/servicecidr/strategy.go:67-71`), and
+/// the `Ready` condition belongs to the servicecidrs controller
+/// (`pkg/controller/servicecidrs/servicecidrs_controller.go:341-346`) — which
+/// is also the only component that can flip it to `Terminating`. Seeding it
+/// here would make a range that is going away look permanently Ready (#1747).
+#[tokio::test]
+async fn servicecidr_create_writes_no_status() {
+    let state = TestApiServer::new();
+    let name = "nostatus";
+    let (code, body) = state
+        .post(sc_uri(), &sc(name, json!(["10.2.0.0/24"])))
+        .await;
+    assert_eq!(code, StatusCode::CREATED);
+    assert!(
+        body.get("status").is_none_or(Value::is_null),
+        "create must not seed a status, got {:?}",
+        body.get("status")
+    );
+
+    let (code, body) = state.get(&format!("{}/{name}", sc_uri())).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(
+        body.get("status").is_none_or(Value::is_null),
+        "the stored object must have no status either, got {:?}",
+        body.get("status")
+    );
+}
+
+/// A client-supplied status is dropped, not persisted.
+#[tokio::test]
+async fn servicecidr_create_drops_client_supplied_status() {
+    let state = TestApiServer::new();
+    let name = "clientstatus";
+    let mut payload = sc(name, json!(["10.3.0.0/24"]));
+    payload["status"] = json!({
+        "conditions": [{
+            "type": "Ready", "status": "True",
+            "reason": "", "message": "i said so"
+        }]
+    });
+    let (code, body) = state.post(sc_uri(), &payload).await;
+    assert_eq!(code, StatusCode::CREATED);
+    assert!(
+        body.get("status").is_none_or(Value::is_null),
+        "client-supplied status must be cleared, got {:?}",
+        body.get("status")
+    );
+}

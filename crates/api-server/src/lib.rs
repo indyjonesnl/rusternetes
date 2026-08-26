@@ -251,32 +251,12 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     // which lives in the apiserver — not KCM).
     bootstrap::spawn_apiservice_availability_controller(storage.clone());
 
-    // Create default ServiceCIDR
-    {
-        let cidr_key = rusternetes_storage::build_key("servicecidrs", None, "kubernetes");
-        if storage.get::<serde_json::Value>(&cidr_key).await.is_err() {
-            let service_cidr = serde_json::json!({
-                "apiVersion": "networking.k8s.io/v1",
-                "kind": "ServiceCIDR",
-                "metadata": {
-                    "name": "kubernetes",
-                    "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-                },
-                "spec": { "cidrs": ["10.96.0.0/12"] },
-                // Condition verbatim from upstream's default-ServiceCIDR
-                // controller — see the note on the same seed in `main.rs`.
-                "status": { "conditions": [{ "type": "Ready", "status": "True",
-                    "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    "reason": "", "message": "Kubernetes default Service CIDR is ready" }] }
-            });
-            if let Err(e) = storage.create(&cidr_key, &service_cidr).await {
-                warn!("Failed to create default ServiceCIDR: {}", e);
-            } else {
-                info!("Created default ServiceCIDR 'kubernetes' with CIDR 10.96.0.0/12");
-            }
-        }
-    }
+    // The `kubernetes` ServiceCIDR, owned by the apiserver-side
+    // default-ServiceCIDR controller (upstream
+    // `pkg/controlplane/controller/defaultservicecidr`). Reconciles rather than
+    // create-once: dual-stack upgrade, flag-mismatch warning, and `Ready=True`
+    // only when the persisted CIDRs match this api-server's configuration.
+    bootstrap::start_default_servicecidr_controller(storage.clone()).await;
 
     // Create default StorageClass (like k3s/kind ship with a default)
     {

@@ -35,6 +35,7 @@ pub mod resource_quota;
 pub mod resourceclaim;
 pub mod service;
 pub mod serviceaccount;
+pub mod servicecidr;
 pub mod statefulset;
 pub mod storage_class;
 pub mod taint_eviction;
