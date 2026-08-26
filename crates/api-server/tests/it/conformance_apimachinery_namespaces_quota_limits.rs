@@ -36,9 +36,11 @@
 //! | resource_quota.go:1009 manage the lifecycle | patch now changes metadata + spec in one request, as upstream does |
 //! | limit_range.go:65 defaults applied to pod | now driven through the real create route and re-fetched |
 //! | resource_quota.go:1078 apply changes to a status | /status write path added; watch confirmation not mirrored |
+//! | resource_quota.go:87 status promptly calculated | self-counting `resourcequotas` usage now asserted |
+//! | namespace.go:404 apply a finalizer | both halves (add + remove) now asserted |
 //!
-//! Not yet re-derived: `resource_quota.go` :87, :950, and
-//! `namespace.go` :247, :256, :309, :376, :404, and `limit_range.go` :256.
+//! Not yet re-derived: `resource_quota.go` :950, `namespace.go` :247, :256,
+//! :309, :376, and `limit_range.go` :256.
 //! Nine upstream conformance cases in these sources have **no mirror at all** —
 //! the quota cases covering the life of a service, secret, configMap,
 //! replication controller and replica set among them. Enumerated and tracked in
@@ -476,6 +478,35 @@ async fn namespace_finalize_subresource_removes_finalizer() {
     let uid = created["metadata"]["uid"].as_str().unwrap();
     assert!(!uid.is_empty());
 
+    // Upstream's case has two halves and the mirror only had the second.
+    // It first *adds* `e2e.example.com/fakeFinalizer` through `/finalize` and
+    // asserts it appears in `spec.finalizers`
+    // (namespace.go:417-437), and only then removes it. Adding a finalizer
+    // through the subresource was never exercised here.
+    let mut with_finalizer = created.clone();
+    with_finalizer["spec"]["finalizers"] = json!(["e2e.example.com/fakeFinalizer"]);
+    let (status, added) = send_json(
+        router.clone(),
+        "PUT",
+        "/api/v1/namespaces/ns-final-test/finalize",
+        Some(&with_finalizer),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "/finalize PUT (add) must return 200: body={}",
+        added
+    );
+    let present = added["spec"]["finalizers"]
+        .as_array()
+        .map(|f| f.iter().any(|v| v == "e2e.example.com/fakeFinalizer"))
+        .unwrap_or(false);
+    assert!(
+        present,
+        "the added finalizer must appear in spec.finalizers, got {:?}",
+        added["spec"]["finalizers"]
+    );
+
     // PUT the namespace back with empty finalizers (simulating the namespace
     // controller calling `/finalize` after cleanup). The lifecycle finalizer
     // lives in spec.finalizers (upstream namespaceStrategy.PrepareForCreate).
@@ -535,7 +566,7 @@ async fn namespace_get_unknown_returns_not_found() {
 /// `status.used` to "0" for every tracked resource key.
 #[tokio::test]
 async fn resource_quota_create_seeds_status_used_to_zero() {
-    let (router, _mem) = spawn_router();
+    let (router, mem) = spawn_router();
     // The handler needs the namespace path param, but the underlying
     // storage doesn't enforce that the namespace exists for resourcequotas
     // (so we don't need a prior create).
@@ -550,7 +581,7 @@ async fn resource_quota_create_seeds_status_used_to_zero() {
     );
 
     let (status, body) = send_json(
-        router,
+        router.clone(),
         "POST",
         "/api/v1/namespaces/default/resourcequotas",
         Some(&body),
@@ -573,6 +604,43 @@ async fn resource_quota_create_seeds_status_used_to_zero() {
         .as_object()
         .expect("status.hard mirrors spec.hard");
     assert_eq!(hard.get("pods").and_then(|v| v.as_str()), Some("5"));
+
+    // The assertions above cover the create-time seed. Upstream's case goes
+    // further: `newTestResourceQuota` puts `resourcequotas: 1` in hard
+    // (resource_quota.go:2159) and `waitForResourceQuota` then requires
+    // `used[resourcequotas]` to reach `c + 1` (resource_quota.go:100-102) —
+    // the quota counts *itself* as an object in the namespace. The mirror
+    // stopped at the zero seed and never reconciled, so that never ran.
+    let ns = "rq-seed";
+    let (s, body) = send_json(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/namespaces/{}/resourcequotas", ns),
+        Some(&quota_body(
+            "self-counting",
+            &[("pods", "5"), ("resourcequotas", "1")],
+        )),
+    )
+    .await;
+    assert_eq!(s, 201, "create self-counting quota: body={}", body);
+
+    ResourceQuotaController::new(mem.clone())
+        .reconcile_one(ns, "self-counting")
+        .await
+        .unwrap();
+
+    let (_, reconciled) = send_json(
+        router,
+        "GET",
+        &format!("/api/v1/namespaces/{}/resourcequotas/self-counting", ns),
+        None,
+    )
+    .await;
+    assert_eq!(
+        reconciled["status"]["used"]["resourcequotas"], "1",
+        "a ResourceQuota must count itself against a `resourcequotas` hard \
+         limit: {reconciled}"
+    );
 }
 
 /// [sig-api-machinery] ResourceQuota should track the lifecycle of a
