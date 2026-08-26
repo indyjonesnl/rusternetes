@@ -8,6 +8,41 @@
 //!   - test/e2e/apimachinery/resource_quota.go
 //!   - test/e2e/scheduling/limit_range.go
 //!
+//! ## Mirror audit — #1749, 2026-08-26 (IN PROGRESS)
+//!
+//! Citations: **complete**. All 23 upstream references in this file have been
+//! re-derived against the pinned `release-1.35` (v1.35.5) checkout and now name
+//! the conformance case line plus its descriptor string. Only one line number
+//! in the file was previously correct (`resource_quota.go:243`); the rest named
+//! no case and leaned on qualifiers — "(family)", "(list family)", "tested
+//! indirectly by the framework helper" — to cover the gap.
+//!
+//! Seven tests turned out to have **no upstream conformance counterpart** and
+//! no longer imply one: namespace create-then-list, 404-on-unknown-namespace,
+//! the `default` ServiceAccount seed, the all-namespaces ResourceQuota list,
+//! LimitRange min- and max-constraint rejection (defined by
+//! `plugin/pkg/admission/limitranger`, not by a conformance case), and
+//! pod-create-with-no-LimitRange. One test cited "manage the lifecycle of a
+//! ResourceQuota" while label-selecting **namespaces**, where that case
+//! label-selects **ResourceQuotas**.
+//!
+//! Assertion re-derivation: **partial**. Done so far:
+//!
+//! | upstream case | state |
+//! |---|---|
+//! | namespace.go:276 should patch a Namespace | full, minus resourceVersion (#1751) |
+//! | resource_quota.go:243 capture the life of a pod | usage assertions + CREATE-path denial added; extended-resources denial still missing |
+//! | resource_quota.go:869 best effort scope | both scopes now asserted |
+//!
+//! Not yet re-derived: the remaining `resource_quota.go` cases (:87, :754,
+//! :950, :1009, :1078), `namespace.go` (:247, :256, :309, :376, :404) and
+//! `limit_range.go` (:65, :256). Nine upstream conformance cases in these
+//! sources have **no mirror at all** — the quota cases covering the life of a
+//! service, secret, configMap, replication controller and replica set among
+//! them.
+//!
+//! Do not treat this file as audited: the record above is explicitly partial.
+//!
 //! See `docs/conformance/apimachinery-namespaces-quota-limits.md` for the
 //! test-by-test status table and the cross-reference into `docs/CONFORMANCE.md`
 //! (Round 160 "Other" bucket — ResourceQuota pod lifecycle).
@@ -276,13 +311,8 @@ async fn namespace_patch_updates_labels() {
     // namespace with a fresh Get and asserts the label on the *fetched* object
     // (namespace.go:295-298). A mirror that only checks the response cannot
     // catch a patch that is echoed back but not persisted.
-    let (status, fetched) = send_json(
-        router,
-        "GET",
-        "/api/v1/namespaces/ns-patch-test",
-        None,
-    )
-    .await;
+    let (status, fetched) =
+        send_json(router, "GET", "/api/v1/namespaces/ns-patch-test", None).await;
     assert_eq!(status, 200, "get must return 200: body={}", fetched);
     assert_eq!(
         fetched["metadata"]["labels"]["testLabel"], "testValue",
@@ -723,11 +753,84 @@ async fn resource_quota_captures_full_pod_lifecycle() {
     .await;
     assert_eq!(s, 201, "initial pod create must succeed: body={}", body);
 
-    // 3. Reconcile so quota.status.used reflects the pod we just created.
+    // 3. Reconcile so quota.status.used reflects the pod we just created, and
+    //    assert the computed usage. Upstream's `waitForResourceQuota` compares
+    //    the whole used list against expected values
+    //    (resource_quota.go:274-282); the mirror used to reconcile and move on
+    //    without ever checking the numbers, so a quota that computed usage
+    //    wrongly would still have passed.
     ResourceQuotaController::new(mem.clone())
         .reconcile_one(ns, "test-quota")
         .await
         .unwrap();
+    let (s, quota) = send_json(
+        router.clone(),
+        "GET",
+        &format!("/api/v1/namespaces/{}/resourcequotas/test-quota", ns),
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "quota get: body={}", quota);
+    assert_eq!(quota["status"]["used"]["pods"], "1", "used.pods: {quota}");
+    assert_eq!(
+        quota["status"]["used"]["requests.cpu"], "300m",
+        "used.requests.cpu: {quota}"
+    );
+    assert_eq!(
+        quota["status"]["used"]["requests.memory"], "200Mi",
+        "used.requests.memory: {quota}"
+    );
+
+    // 3b. Upstream then creates a *second* pod whose requests exceed the
+    //     remaining quota and requires the create to fail
+    //     (resource_quota.go:284-290). This is a CREATE-path denial, distinct
+    //     from the RESIZE denials below, and had no counterpart here.
+    let over_budget_pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "p2", "namespace": ns },
+        "spec": {
+            "containers": [{
+                "name": "c",
+                "image": "pause:latest",
+                "resources": {
+                    // 800m + the 300m already used exceeds the 1 CPU hard limit.
+                    "requests": { "cpu": "800m", "memory": "100Mi" }
+                }
+            }]
+        }
+    });
+    let (s, body) = send_json(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/namespaces/{}/pods", ns),
+        Some(&over_budget_pod),
+    )
+    .await;
+    assert_eq!(
+        s, 403,
+        "a pod exceeding the remaining quota must not be created: body={}",
+        body
+    );
+
+    // 3c. And the rejected create must not have moved the usage. Upstream makes
+    //     the same check after its rejected update (resource_quota.go:314-315).
+    ResourceQuotaController::new(mem.clone())
+        .reconcile_one(ns, "test-quota")
+        .await
+        .unwrap();
+    let (_, quota) = send_json(
+        router.clone(),
+        "GET",
+        &format!("/api/v1/namespaces/{}/resourcequotas/test-quota", ns),
+        None,
+    )
+    .await;
+    assert_eq!(
+        quota["status"]["used"]["requests.cpu"], "300m",
+        "a rejected create must leave quota usage unchanged: {quota}"
+    );
+    assert_eq!(quota["status"]["used"]["pods"], "1", "used.pods: {quota}");
 
     // 4. RESIZE the pod with resource requests that would exceed the
     //    quota (cpu=2 > 1). Expect 403 Forbidden / "exceeded quota".
@@ -1061,6 +1164,47 @@ async fn resource_quota_scopes_best_effort_filter() {
         Some("1"),
         "BestEffort scope must include only the BE pod, got {:?}",
         updated.status
+    );
+
+    // Upstream's case is symmetric: it creates a NotBestEffort quota alongside
+    // the BestEffort one and, for each pod, asserts that the matching scope
+    // captures the usage *and* the non-matching scope ignores it
+    // (resource_quota.go:880-935). The mirror only ever built the BestEffort
+    // quota, so the NotBestEffort scope was untested in both directions.
+    let not_be_quota = json!({
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": { "name": "not-be-quota", "namespace": ns },
+        "spec": {
+            "hard": { "pods": "5" },
+            "scopes": ["NotBestEffort"]
+        }
+    });
+    let nbq: ResourceQuota = serde_json::from_value(not_be_quota).unwrap();
+    mem.create(&build_key("resourcequotas", Some(ns), "not-be-quota"), &nbq)
+        .await
+        .unwrap();
+
+    ResourceQuotaController::new(mem.clone())
+        .reconcile_one(ns, "not-be-quota")
+        .await
+        .unwrap();
+
+    let not_be: ResourceQuota = mem
+        .get(&build_key("resourcequotas", Some(ns), "not-be-quota"))
+        .await
+        .unwrap();
+    assert_eq!(
+        not_be
+            .status
+            .as_ref()
+            .and_then(|s| s.used.as_ref())
+            .and_then(|u| u.get("pods"))
+            .map(|s| s.as_str()),
+        Some("1"),
+        "NotBestEffort scope must count only the Burstable pod and ignore the \
+         BestEffort one, got {:?}",
+        not_be.status
     );
 }
 
