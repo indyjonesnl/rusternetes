@@ -554,8 +554,13 @@ impl<S: Storage + 'static> NamespaceController<S> {
         let content_delete_errors: Vec<String> = Vec::new();
 
         let mut any_finalizers_remaining = false;
+        // Pods still present after the delete pass. Upstream keys the ordering
+        // gate on exactly this (`gvrToNumRemaining[podsGVR] > 0`), not on
+        // whether the pod had a finalizer or on any prior bookkeeping.
+        let mut pods_remaining = 0usize;
         match self.delete_all_resources_with_metadata(name, "pods").await {
             Ok(meta) => {
+                pods_remaining = meta.num_remaining;
                 if meta.num_remaining > 0 {
                     gvr_to_num_remaining
                         .insert(resource_type_to_gvr_label("pods"), meta.num_remaining);
@@ -568,20 +573,28 @@ impl<S: Storage + 'static> NamespaceController<S> {
             Err(e) => warn!("Failed to delete pods in namespace {}: {}", name, e),
         }
 
-        // If pods have finalizers AND conditions haven't been set yet, stop here.
-        // This gives the test time to observe pods with deletionTimestamp while
-        // configmaps/secrets still exist (K8s ordering requirement).
-        // On subsequent reconciles (conditions already set), proceed to phase 2.
-        let conditions_already_set = namespace
-            .status
-            .as_ref()
-            .and_then(|s| s.conditions.as_ref())
-            .map(|c| {
-                c.iter()
-                    .any(|cond| cond.condition_type == "NamespaceDeletionContentFailure")
-            })
-            .unwrap_or(false);
-        if any_finalizers_remaining && !conditions_already_set {
+        // Ordered deletion: while ANY pod remains, refresh the conditions and
+        // stop. Other content must outlive every pod in the namespace, because
+        // a terminating pod may still read its ConfigMaps and Secrets during
+        // shutdown.
+        //
+        // Upstream returns early here on EVERY pass for as long as pods remain
+        // (`pkg/controller/namespace/deletion/namespaced_resources_deleter.go:553-562`):
+        //
+        //     // Check if any pods remain before proceeding to delete other resources
+        //     if numRemainingTotals.gvrToNumRemaining[podsGVR] > 0 {
+        //         ... conditionUpdater.Update(ns) ... UpdateStatus ...
+        //         return estimate, utilerrors.NewAggregate(errs)
+        //     }
+        //
+        // This gate used to be "pods have finalizers AND we have not written
+        // the conditions yet", which let the SECOND reconcile delete
+        // ConfigMaps and Secrets out from under a pod that was still
+        // terminating — and failed the `OrderedNamespaceDeletion` Conformance
+        // spec, which holds a pod open with a finalizer and then asserts its
+        // ConfigMap still exists.
+        let _ = any_finalizers_remaining;
+        if pods_remaining > 0 {
             let conditions = Self::build_deletion_conditions_with_totals(
                 &gvr_to_num_remaining,
                 &finalizers_to_num_remaining,
@@ -597,8 +610,8 @@ impl<S: Storage + 'static> NamespaceController<S> {
                 // api-server strips `.status` (#1723).
                 let _ = self.storage.update_status(&key, &ns).await;
                 info!(
-                    "Namespace {} has pods with finalizers, conditions set (will delete other resources next cycle)",
-                    name
+                    "Namespace {} still has {} pod(s); delaying deletion of other content",
+                    name, pods_remaining
                 );
             }
             return Ok(());
@@ -1457,14 +1470,28 @@ mod tests {
             "ConfigMap should still exist after first reconcile (pods processed first)"
         );
 
-        // Second reconcile should delete the configmap
-        let ns_for_second = storage.get::<Namespace>(&ns_key).await.unwrap();
-        controller.finalize_namespace(&ns_for_second).await.unwrap();
-        let cm_result = storage.get::<serde_json::Value>(&cm_key).await;
-        assert!(
-            cm_result.is_err(),
-            "ConfigMap without finalizer should be deleted after second reconcile"
-        );
+        // ...and it must STILL exist after a second reconcile, and a third.
+        // The pod's finalizer is never removed here, so the pod never goes
+        // away, so other content must never be touched.
+        //
+        // Upstream re-checks this on every pass rather than once
+        // (`pkg/controller/namespace/deletion/namespaced_resources_deleter.go:553-562`
+        // returns early for as long as `gvrToNumRemaining[podsGVR] > 0`).
+        //
+        // This assertion previously required the ConfigMap to be GONE after the
+        // second reconcile, which pinned the divergence that fails the
+        // `[sig-api-machinery] OrderedNamespaceDeletion namespace deletion
+        // should delete pod first` Conformance spec: that spec holds a pod open
+        // with a finalizer and then asserts its ConfigMap still exists.
+        for round in 2..=3 {
+            let ns_again = storage.get::<Namespace>(&ns_key).await.unwrap();
+            controller.finalize_namespace(&ns_again).await.unwrap();
+            let cm_result = storage.get::<serde_json::Value>(&cm_key).await;
+            assert!(
+                cm_result.is_ok(),
+                "round {round}: ConfigMap must outlive a pod that is still terminating"
+            );
+        }
 
         // Upstream contract: only `NamespaceFinalizersRemaining` (and the
         // associated `NamespaceContentRemaining`) should flip when items
