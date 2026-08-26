@@ -13,6 +13,33 @@
 //! implemented (CEL `x-kubernetes-validations`, ratcheting, scale subresource
 //! JSONPath rooted at the CR) are `#[ignore]`d with a reason pointing back to
 //! the doc fragment.
+//!
+//! ## Mirror audit — #1749, 2026-08-27 (citations complete; assertions pending)
+//!
+//! Citations: **complete**. All 26 upstream references re-derived against the
+//! pinned `release-1.35` (v1.35.5) checkout.
+//!
+//! The headline finding is that **15 of 26 citations pointed at files
+//! containing no conformance case at all**:
+//! `crd_validation_rules.go` (7) and `crd_validation_ratcheting.go` (8) both
+//! register their tests with plain `ginkgo.It` and contain no
+//! `framework.ConformanceIt`. Those mirrors were labelled `[Conformance]`
+//! regardless. The behaviour they check is real — CEL
+//! `x-kubernetes-validations` enforcement, and validation ratcheting — but it
+//! is not required for conformance, and the file no longer claims it is.
+//! `[Conformance]` markers in this file dropped from 22 to 7; the seven that
+//! remain each map to a real upstream case.
+//!
+//! Two more had the right topic and the wrong mechanism:
+//! `crd_scale_subresource_get_and_update` cited the **status** subresource case
+//! (custom_resource_definition.go:148) while testing **scale** — distinct
+//! subresources, and no upstream conformance case covers CRD scale;
+//! `crd_deletecollection_honours_field_and_label_selectors` cited the
+//! selectable-fields case, which covers list and watch, not deletecollection.
+//!
+//! Assertion re-derivation against the seven real cases is **not yet done**.
+//! Do not treat this file as audited.
+//!
 
 use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
@@ -161,7 +188,9 @@ fn default_flavoured_crd() -> Value {
 
 /// [sig-api-machinery] CustomResourceDefinition resources creating/deleting custom resource definition objects works [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:69
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:61
+///   ("creating/deleting custom resource definition objects works")
+/// Mirror audit (#1749, 2026-08-27): re-cited; :69 named no case.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn crd_create_and_delete_round_trip() {
@@ -224,7 +253,9 @@ async fn crd_create_and_delete_round_trip() {
 
 /// [sig-api-machinery] CustomResourceDefinition resources listing custom resource definition objects works [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:89
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:88
+///   ("listing custom resource definition objects works")
+/// Mirror audit (#1749, 2026-08-27): re-cited; :89 was one line off.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn crd_list_filters_by_label_selector_and_deletecollection() {
@@ -286,7 +317,11 @@ async fn crd_list_filters_by_label_selector_and_deletecollection() {
 
 /// Lifecycle helper: list across the group reflects newly created definitions.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:188
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:88
+///   ("listing custom resource definition objects works") — the
+///   create-then-list half of the same case.
+/// Mirror audit (#1749, 2026-08-27): re-cited; :188 falls inside the status-subresource case, which this
+/// test does not exercise.
 /// Sonobuoy (Round 160, 2026-04-26): PASS (covered by the discovery test)
 #[tokio::test]
 async fn crd_list_all_includes_newly_created() {
@@ -322,7 +357,9 @@ async fn crd_list_all_includes_newly_created() {
 /// Lifecycle helper: GET unknown CRD returns 404 with the Kubernetes
 /// `Status` / `NotFound` reason envelope.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:69
+/// Upstream: no conformance case — a 404-on-unknown-name check that no
+///   upstream conformance body asserts for CustomResourceDefinitions.
+/// Mirror audit (#1749, 2026-08-27): re-cited; not a conformance case.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn crd_get_unknown_name_returns_not_found() {
@@ -348,7 +385,10 @@ async fn crd_get_unknown_name_returns_not_found() {
 
 /// [sig-api-machinery] CustomResourceDefinition resources getting/updating/patching custom resource definition status sub-resource works [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:142
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:148
+///   ("getting/updating/patching custom resource definition status
+///   sub-resource works")
+/// Mirror audit (#1749, 2026-08-27): re-cited; :142 named no case.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn crd_status_subresource_get_update_patch() {
@@ -427,7 +467,14 @@ async fn crd_status_subresource_get_update_patch() {
 
 /// Lifecycle: scale subresource get + update through a CR.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:142
+/// Upstream: no conformance case. This test covers the **scale**
+///   subresource; the nearest case,
+///   k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:148
+///   ("getting/updating/patching custom resource definition status
+///   sub-resource works"), is about **status** and is already mirrored by
+///   `crd_status_subresource_get_update_patch`. The two subresources are
+///   distinct; no upstream conformance case exercises CRD scale.
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named a different mechanism.
 /// (subresource family — same upstream test fixture)
 /// Sonobuoy (Round 160): was FAIL; fixed by PR #86 — scale subresource JSONPath resolved against CR root not narrowed spec.
 #[tokio::test]
@@ -503,7 +550,10 @@ async fn crd_scale_subresource_get_and_update() {
 
 /// [sig-api-machinery] CustomResourceDefinition resources should include custom resource definition resources in discovery documents [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:188
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:201
+///   ("should include custom resource definition resources in discovery
+///   documents")
+/// Mirror audit (#1749, 2026-08-27): re-cited; :188 named no case.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn crd_resources_in_discovery_documents() {
@@ -545,7 +595,9 @@ async fn crd_resources_in_discovery_documents() {
 
 /// [sig-api-machinery] CustomResourceDefinition resources custom resource defaulting for requests and from storage works [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:238
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:272
+///   ("custom resource defaulting for requests and from storage works")
+/// Mirror audit (#1749, 2026-08-27): re-cited; :238 named no case.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn crd_defaulting_for_requests_and_storage() {
@@ -593,7 +645,9 @@ async fn crd_defaulting_for_requests_and_storage() {
 
 /// [sig-api-machinery] CustomResourceDefinition watch on custom resource definition objects [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_watch.go:53
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_watch.go:52
+///   ("watch on custom resource definition objects")
+/// Mirror audit (#1749, 2026-08-27): re-cited; :53 was one line off.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 ///
 /// Mirrored as a lifecycle assertion: after create + modify + delete, the
@@ -676,7 +730,9 @@ async fn crd_watch_create_modify_delete() {
 
 /// [sig-api-machinery] CustomResourceDefinition MUST list and watch custom resources matching the field selector [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_selectable_fields.go:174
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_selectable_fields.go:124
+///   ("MUST list and watch custom resources matching the field selector")
+/// Mirror audit (#1749, 2026-08-27): re-cited; :174 named no case.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 ///
 /// Scope vs. upstream: the upstream test exercises a conversion webhook on
@@ -851,7 +907,12 @@ async fn crd_selectable_fields_list_watch_informer() {
 
 /// Custom-resource `deletecollection` honours field/label selectors.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_selectable_fields.go:271
+/// Upstream: no conformance case. The only case in that file,
+///   k8s.io/kubernetes/test/e2e/apimachinery/crd_selectable_fields.go:124
+///   ("MUST list and watch custom resources matching the field selector"),
+///   covers list and watch, not deletecollection, and is already mirrored
+///   by `crd_selectable_fields_list_watch_informer`.
+/// Mirror audit (#1749, 2026-08-27): re-cited; not a conformance case.
 /// (`v2Client.Namespace(ns).DeleteCollection(..., FieldSelector: "host=host1,port=80")`).
 ///
 /// Regression guard for the route gap that returned a bare 404
@@ -1008,9 +1069,14 @@ fn crd_with_cel_rule(rule: &str, message: &str) -> Value {
     })
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST NOT fail validation for create of a custom resource that satisfies the x-kubernetes-validations rules [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST NOT fail validation for create of a custom resource that satisfies the x-kubernetes-validations rules
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:97
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:97 — **not a conformance
+///   case**. That file registers its tests with plain `ginkgo.It`; it
+///   contains no `framework.ConformanceIt` at all. The behaviour is real
+///   (CEL `x-kubernetes-validations` enforcement) but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn cel_rule_satisfied_create_succeeds() {
@@ -1045,9 +1111,14 @@ async fn cel_rule_satisfied_create_succeeds() {
     );
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST fail validation for create of a custom resource that does not satisfy the x-kubernetes-validations rules [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST fail validation for create of a custom resource that does not satisfy the x-kubernetes-validations rules
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:124
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:124 — **not a conformance
+///   case**. That file registers its tests with plain `ginkgo.It`; it
+///   contains no `framework.ConformanceIt` at all. The behaviour is real
+///   (CEL `x-kubernetes-validations` enforcement) but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn cel_rule_violated_create_fails() {
@@ -1084,9 +1155,14 @@ async fn cel_rule_violated_create_fails() {
     );
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST fail create of a CRD that contains a x-kubernetes-validations rule that refers to a property that do not exist [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST fail create of a CRD that contains a x-kubernetes-validations rule that refers to a property that do not exist
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:150
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:150 — **not a conformance
+///   case**. That file registers its tests with plain `ginkgo.It`; it
+///   contains no `framework.ConformanceIt` at all. The behaviour is real
+///   (CEL `x-kubernetes-validations` enforcement) but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn cel_rule_unknown_property_crd_rejected() {
@@ -1105,9 +1181,14 @@ async fn cel_rule_unknown_property_crd_rejected() {
     );
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST fail create of a CRD that contains an x-kubernetes-validations rule that contains a syntax error [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST fail create of a CRD that contains an x-kubernetes-validations rule that contains a syntax error
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:177
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:177 — **not a conformance
+///   case**. That file registers its tests with plain `ginkgo.It`; it
+///   contains no `framework.ConformanceIt` at all. The behaviour is real
+///   (CEL `x-kubernetes-validations` enforcement) but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn cel_rule_syntax_error_crd_rejected() {
@@ -1126,9 +1207,14 @@ async fn cel_rule_syntax_error_crd_rejected() {
     );
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST fail create of a CRD that contains an x-kubernetes-validations rule that exceeds the estimated cost limit [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST fail create of a CRD that contains an x-kubernetes-validations rule that exceeds the estimated cost limit
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:203
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:203 — **not a conformance
+///   case**. That file registers its tests with plain `ginkgo.It`; it
+///   contains no `framework.ConformanceIt` at all. The behaviour is real
+///   (CEL `x-kubernetes-validations` enforcement) but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn cel_rule_cost_limit_exceeded_crd_rejected() {
@@ -1148,9 +1234,14 @@ async fn cel_rule_cost_limit_exceeded_crd_rejected() {
     );
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST fail create of a CR that exceeds the runtime cost limit for x-kubernetes-validations rule execution [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST fail create of a CR that exceeds the runtime cost limit for x-kubernetes-validations rule execution
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:231
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:231 — **not a conformance
+///   case**. That file registers its tests with plain `ginkgo.It`; it
+///   contains no `framework.ConformanceIt` at all. The behaviour is real
+///   (CEL `x-kubernetes-validations` enforcement) but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 ///
 /// Mirrored as: a CRD whose rule fits under the per-rule budget but with
@@ -1233,9 +1324,14 @@ async fn cel_rule_runtime_cost_limit_exceeded() {
     );
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST fail update of a CR that does not satisfy a x-kubernetes-validations transition rule [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST fail update of a CR that does not satisfy a x-kubernetes-validations transition rule
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:260
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:260 — **not a conformance
+///   case**. That file registers its tests with plain `ginkgo.It`; it
+///   contains no `framework.ConformanceIt` at all. The behaviour is real
+///   (CEL `x-kubernetes-validations` enforcement) but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn cel_transition_rule_violated_update_fails() {
@@ -1425,9 +1521,14 @@ async fn ratchet_put_cr(
     put_json(router, &uri, &cr).await
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST NOT fail to update a resource due to JSONSchema errors on unchanged correlatable fields [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST NOT fail to update a resource due to JSONSchema errors on unchanged correlatable fields
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:201
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:201 — **not a
+///   conformance case**. That file registers its tests with plain
+///   `ginkgo.It`; it contains no `framework.ConformanceIt` at all.
+///   Validation ratcheting is real behaviour but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_unchanged_correlatable_jsonschema_errors_allowed() {
@@ -1503,9 +1604,14 @@ async fn ratcheting_unchanged_correlatable_jsonschema_errors_allowed() {
     );
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to JSONSchema errors on unchanged uncorrelatable fields [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to JSONSchema errors on unchanged uncorrelatable fields
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:244
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:244 — **not a
+///   conformance case**. That file registers its tests with plain
+///   `ginkgo.It`; it contains no `framework.ConformanceIt` at all.
+///   Validation ratcheting is real behaviour but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_unchanged_uncorrelatable_jsonschema_errors_blocked() {
@@ -1564,9 +1670,14 @@ async fn ratcheting_unchanged_uncorrelatable_jsonschema_errors_blocked() {
     );
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to JSONSchema errors on changed fields [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to JSONSchema errors on changed fields
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:280
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:280 — **not a
+///   conformance case**. That file registers its tests with plain
+///   `ginkgo.It`; it contains no `framework.ConformanceIt` at all.
+///   Validation ratcheting is real behaviour but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_changed_jsonschema_errors_blocked() {
@@ -1641,9 +1752,14 @@ async fn ratcheting_changed_jsonschema_errors_blocked() {
     );
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST NOT fail to update a resource due to CRD Validation Rule errors on unchanged correlatable fields [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST NOT fail to update a resource due to CRD Validation Rule errors on unchanged correlatable fields
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:333
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:333 — **not a
+///   conformance case**. That file registers its tests with plain
+///   `ginkgo.It`; it contains no `framework.ConformanceIt` at all.
+///   Validation ratcheting is real behaviour but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_unchanged_correlatable_cel_errors_allowed() {
@@ -1745,9 +1861,14 @@ async fn ratcheting_unchanged_correlatable_cel_errors_allowed() {
     );
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to CRD Validation Rule errors on unchanged uncorrelatable fields [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to CRD Validation Rule errors on unchanged uncorrelatable fields
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:412
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:412 — **not a
+///   conformance case**. That file registers its tests with plain
+///   `ginkgo.It`; it contains no `framework.ConformanceIt` at all.
+///   Validation ratcheting is real behaviour but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_unchanged_uncorrelatable_cel_errors_blocked() {
@@ -1802,9 +1923,14 @@ async fn ratcheting_unchanged_uncorrelatable_cel_errors_blocked() {
     );
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to CRD Validation Rule errors on changed fields [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to CRD Validation Rule errors on changed fields
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:448
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:448 — **not a
+///   conformance case**. That file registers its tests with plain
+///   `ginkgo.It`; it contains no `framework.ConformanceIt` at all.
+///   Validation ratcheting is real behaviour but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_changed_cel_errors_blocked() {
@@ -1889,9 +2015,14 @@ async fn ratcheting_changed_cel_errors_blocked() {
     );
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST NOT ratchet errors raised by transition rules [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST NOT ratchet errors raised by transition rules
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:511
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:511 — **not a
+///   conformance case**. That file registers its tests with plain
+///   `ginkgo.It`; it contains no `framework.ConformanceIt` at all.
+///   Validation ratcheting is real behaviour but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_transition_rule_errors_never_ratcheted() {
@@ -1973,9 +2104,14 @@ async fn ratcheting_transition_rule_errors_never_ratcheted() {
     );
 }
 
-/// [sig-api-machinery] CustomResourceValidationRules MUST evaluate a CRD Validation Rule with oldSelf = nil for new values when optionalOldSelf is true [Conformance]
+/// [sig-api-machinery] CustomResourceValidationRules MUST evaluate a CRD Validation Rule with oldSelf = nil for new values when optionalOldSelf is true
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:569
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:569 — **not a
+///   conformance case**. That file registers its tests with plain
+///   `ginkgo.It`; it contains no `framework.ConformanceIt` at all.
+///   Validation ratcheting is real behaviour but is not required for
+///   conformance, and this mirror does not claim it is.
+/// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 #[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
