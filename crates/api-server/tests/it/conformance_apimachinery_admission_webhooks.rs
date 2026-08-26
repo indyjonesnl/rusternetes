@@ -2455,60 +2455,147 @@ async fn patching_updating_a_validating_webhook_should_work() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:497
 ///   ("patching/updating a mutating webhook should work")
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// The mutating counterpart of `patching_updating_a_validating_webhook_should_work`
+/// and it had the same gap: upstream creates the configuration and confirms a
+/// configmap comes back **mutated**, Updates the rules to drop CREATE and
+/// confirms the next configmap is **not** mutated, then Patches CREATE back in
+/// and confirms mutation resumes (webhook.go:501-572). The mirror only
+/// round-tripped the configuration object and never created a configmap, so
+/// none of that was tested. Same storage-rewrite deviation as the validating
+/// case, for the same `validateWebhookURL` reason.
+///
+/// Upstream's `HaveValidResourceVersion()` and post-patch RV comparison
+/// (webhook.go:512, :549) are unobservable on `MemoryStorage` — #1751.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn patching_updating_a_mutating_webhook_should_work() {
-    let (_mem, router) = spawn_router();
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_mutator_label("mutated-by-webhook".into(), "yes".into()).await;
 
-    let cfg = MutatingWebhookConfiguration {
-        api_version: "admissionregistration.k8s.io/v1".to_string(),
-        kind: "MutatingWebhookConfiguration".to_string(),
-        metadata: rusternetes_common::types::ObjectMeta::new("mwc-patchable"),
-        webhooks: Some(vec![MutatingWebhook {
-            rules: vec![rule_for("", "v1", "pods")],
-            ..mutating(
-                "mwc.patch.io",
-                "https://example.invalid/hook".to_string(),
-                vec![],
-                Some(FailurePolicy::Ignore),
-                None,
-            )
-        }]),
+    // Same storage-rewrite deviation as the validating counterpart: the mock
+    // serves plain HTTP, which `validateWebhookURL` rejects on the API's
+    // create/update path.
+    let store_rules = |operations: Vec<&'static str>| {
+        let url = url.clone();
+        let mem = mem.clone();
+        async move {
+            let cfg = MutatingWebhookConfiguration {
+                api_version: "admissionregistration.k8s.io/v1".to_string(),
+                kind: "MutatingWebhookConfiguration".to_string(),
+                metadata: rusternetes_common::types::ObjectMeta::new("mwc-patchable"),
+                webhooks: Some(vec![MutatingWebhook {
+                    rules: vec![RuleWithOperations {
+                        operations: operations
+                            .into_iter()
+                            .map(|o| match o {
+                                "CREATE" => OperationType::Create,
+                                "UPDATE" => OperationType::Update,
+                                other => panic!("unhandled operation {other}"),
+                            })
+                            .collect(),
+                        rule: Rule {
+                            api_groups: vec!["".to_string()],
+                            api_versions: vec!["v1".to_string()],
+                            resources: vec!["configmaps".to_string()],
+                            scope: None,
+                        },
+                    }],
+                    ..mutating("adding-configmap-data.k8s.io", url, vec![], None, None)
+                }]),
+            };
+            let key = build_key("mutatingwebhookconfigurations", None, "mwc-patchable");
+            if mem.get::<Value>(&key).await.is_ok() {
+                mem.update(&key, &cfg).await.unwrap();
+            } else {
+                mem.create(&key, &cfg).await.unwrap();
+            }
+        }
     };
-    let (status, _body) = post_json(
+
+    // Returns whether the created configmap came back carrying the webhook's
+    // label.
+    let was_mutated = |router: TestApiServer, name: &'static str| async move {
+        let (status, body) = post_json(
+            router,
+            "/api/v1/namespaces/default/configmaps",
+            &json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": name, "labels": {}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create {name}: {body}");
+        body["metadata"]["labels"]["mutated-by-webhook"] == "yes"
+    };
+
+    // 1. The rule covers CREATE — the configmap is mutated.
+    store_rules(vec!["CREATE"]).await;
+    assert!(
+        was_mutated(router.clone(), "cm-1").await,
+        "the webhook rule covers CREATE, so the configmap must be mutated"
+    );
+
+    // 2. Drop CREATE (upstream webhook.go:524-529) — no longer mutated.
+    store_rules(vec!["UPDATE"]).await;
+    assert!(
+        !was_mutated(router.clone(), "cm-2").await,
+        "with CREATE removed from the rule the configmap must not be mutated"
+    );
+
+    // 3. Put CREATE back (webhook.go:543-551) — mutated again.
+    store_rules(vec!["CREATE", "UPDATE"]).await;
+    assert!(
+        was_mutated(router.clone(), "cm-3").await,
+        "restoring CREATE to the rule must make the webhook fire again"
+    );
+
+    // The configuration object itself must create and update through the API.
+    let api_cfg = |resources: Value| {
+        json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "mwc-api-roundtrip"},
+            "webhooks": [{
+                "name": "mwc.patch.io",
+                "clientConfig": {"url": "https://127.0.0.1:1/hook"},
+                "rules": [{
+                    "operations": ["CREATE"],
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": resources
+                }],
+                "failurePolicy": "Ignore",
+                "sideEffects": "None",
+                "admissionReviewVersions": ["v1"]
+            }]
+        })
+    };
+    let (status, created) = post_json(
         router.clone(),
         "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations",
-        &serde_json::to_value(&cfg).unwrap(),
+        &api_cfg(json!(["pods"])),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED);
-
-    let (_, body) = get_json(
+    assert_eq!(status, StatusCode::CREATED, "create config: {created}");
+    let (status, updated) = put_json(
         router.clone(),
-        "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations/mwc-patchable",
+        "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations/mwc-api-roundtrip",
+        &api_cfg(json!(["pods", "configmaps"])),
     )
     .await;
-    let mut updated: MutatingWebhookConfiguration = serde_json::from_value(body).unwrap();
-    if let Some(ref mut hooks) = updated.webhooks {
-        hooks[0].reinvocation_policy = Some(ReinvocationPolicy::IfNeeded);
-    }
-    let (status, _) = put_json(
-        router.clone(),
-        "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations/mwc-patchable",
-        &serde_json::to_value(&updated).unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let (_, body2) = get_json(
-        router,
-        "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations/mwc-patchable",
-    )
-    .await;
-    let final_cfg: MutatingWebhookConfiguration = serde_json::from_value(body2).unwrap();
-    assert_eq!(
-        final_cfg.webhooks.unwrap()[0].reinvocation_policy,
-        Some(ReinvocationPolicy::IfNeeded)
+    assert_eq!(status, StatusCode::OK, "update config: {updated}");
+    let resources: Vec<&str> = updated["webhooks"][0]["rules"][0]["resources"]
+        .as_array()
+        .expect("resources array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        resources.contains(&"pods") && resources.contains(&"configmaps"),
+        "the update must stick, got {resources:?}"
     );
 }
 
@@ -2517,6 +2604,21 @@ async fn patching_updating_a_mutating_webhook_should_work() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:574
 ///   ("listing validating webhooks should work")
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Upstream creates **ten** configurations sharing a run-scoped label, lists
+/// them *by that label selector* and requires exactly ten, then brackets the
+/// DeleteCollection with admission attempts: a non-compliant configmap is
+/// refused while the webhooks exist and accepted once the collection is gone
+/// (webhook.go:575-646). The mirror created three, listed and deleted without
+/// any selector, and never issued an admission request — so neither the
+/// selector nor the effect of the collection delete was tested.
+///
+/// Deviation: the registered webhooks are unreachable with
+/// `failurePolicy: Fail`, so "in effect" reads as 500 rather than upstream's
+/// 403. The bracket is what the case is about, and this keeps the
+/// configurations creatable through the API, which `validateWebhookURL` would
+/// otherwise block for a plain-HTTP mock.
 /// Sonobuoy (Round 160): PASS
 ///
 /// Creates several VWCs, lists them, then deletes the collection and
@@ -2524,64 +2626,107 @@ async fn patching_updating_a_mutating_webhook_should_work() {
 #[tokio::test]
 async fn listing_validating_webhooks_should_work() {
     let (_mem, router) = spawn_router();
+    // Upstream creates ten, all carrying the same run-scoped label, and both
+    // the list and the DeleteCollection are label-selected
+    // (webhook.go:575-593).
+    const TEST_LIST_SIZE: usize = 10;
+    const SELECTOR: &str = "e2e-list-test-uuid=listing-validating";
 
-    for name in ["v-list-a", "v-list-b", "v-list-c"] {
-        let cfg = ValidatingWebhookConfiguration {
-            api_version: "admissionregistration.k8s.io/v1".to_string(),
-            kind: "ValidatingWebhookConfiguration".to_string(),
-            metadata: rusternetes_common::types::ObjectMeta::new(name),
-            webhooks: Some(vec![ValidatingWebhook {
-                rules: vec![rule_for("", "v1", "configmaps")],
-                ..validating(
-                    &format!("{name}.k8s.io"),
-                    "https://example.invalid/hook".to_string(),
-                    vec![],
-                    Some(FailurePolicy::Ignore),
-                    None,
-                )
-            }]),
-        };
-        let (status, _) = post_json(
+    for i in 0..TEST_LIST_SIZE {
+        let (status, body) = post_json(
             router.clone(),
             "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations",
-            &serde_json::to_value(&cfg).unwrap(),
+            &json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": "ValidatingWebhookConfiguration",
+                "metadata": {
+                    "name": format!("e2e-list-{i}"),
+                    "labels": {"e2e-list-test-uuid": "listing-validating"}
+                },
+                "webhooks": [{
+                    "name": "deny-unwanted-configmap-data.k8s.io",
+                    // Unreachable on purpose: with failurePolicy Fail, "the
+                    // webhook is in effect" is observable as a 500 on any
+                    // matching request, and its absence as a successful create.
+                    "clientConfig": {"url": "https://127.0.0.1:1/configmaps"},
+                    "rules": [{
+                        "operations": ["CREATE"],
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "resources": ["configmaps"]
+                    }],
+                    "failurePolicy": "Fail",
+                    "sideEffects": "None",
+                    "admissionReviewVersions": ["v1"]
+                }]
+            }),
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED, "create {name}");
+        assert_eq!(status, StatusCode::CREATED, "create e2e-list-{i}: {body}");
     }
 
+    // Listing by the selector must return exactly the ten.
     let (status, body) = get_json(
         router.clone(),
-        "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations",
+        &format!(
+            "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations?labelSelector={SELECTOR}"
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    let items = body["items"].as_array().expect("list must have items");
-    let names: std::collections::HashSet<&str> = items
-        .iter()
-        .filter_map(|i| i["metadata"]["name"].as_str())
-        .collect();
-    for n in ["v-list-a", "v-list-b", "v-list-c"] {
-        assert!(names.contains(n), "list missing {n}");
-    }
+    assert_eq!(status, StatusCode::OK, "list: {body}");
+    assert_eq!(
+        body["items"].as_array().map(Vec::len),
+        Some(TEST_LIST_SIZE),
+        "label-selected list must return exactly {TEST_LIST_SIZE} items: {body}"
+    );
 
-    // DeleteCollection.
+    // While they exist, a matching request cannot get through.
+    let (status, _) = post_json(
+        router.clone(),
+        "/api/v1/namespaces/default/configmaps",
+        &json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm-before"}}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "with fail-closed webhooks registered the configmap must not be created"
+    );
+
+    // DeleteCollection, by the same selector.
     let status = delete_status(
         router.clone(),
-        "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations",
+        &format!(
+            "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations?labelSelector={SELECTOR}"
+        ),
     )
     .await;
-    assert!(status.is_success());
+    assert!(status.is_success(), "deletecollection: {status}");
 
     let (_, body) = get_json(
-        router,
-        "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations",
+        router.clone(),
+        &format!(
+            "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations?labelSelector={SELECTOR}"
+        ),
     )
     .await;
-    let items = body["items"].as_array().expect("list must have items");
-    assert!(
-        items.is_empty(),
-        "list must be empty after deletecollection; got {items:?}"
+    assert_eq!(
+        body["items"].as_array().map(Vec::len),
+        Some(0),
+        "list must be empty after deletecollection: {body}"
+    );
+
+    // And now the same request succeeds — the collection delete took effect.
+    let (status, body) = post_json(
+        router,
+        "/api/v1/namespaces/default/configmaps",
+        &json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm-after"}}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "once the webhooks are deleted the configmap must be created: {body}"
     );
 }
 
@@ -2590,66 +2735,118 @@ async fn listing_validating_webhooks_should_work() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:648
 ///   ("listing mutating webhooks should work")
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// The mutating counterpart of `listing_validating_webhooks_should_work`, and
+/// it had the same three gaps: three configurations instead of ten, no label
+/// selector on either the list or the DeleteCollection, and no admission
+/// request bracketing the delete (webhook.go:649-716). Same fail-closed
+/// deviation as the validating case.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn listing_mutating_webhooks_should_work() {
     let (_mem, router) = spawn_router();
+    // Upstream creates ten, all carrying the same run-scoped label, and both
+    // the list and the DeleteCollection are label-selected
+    // (webhook.go:649-667).
+    const TEST_LIST_SIZE: usize = 10;
+    const SELECTOR: &str = "e2e-list-test-uuid=listing-mutating";
 
-    for name in ["m-list-a", "m-list-b", "m-list-c"] {
-        let cfg = MutatingWebhookConfiguration {
-            api_version: "admissionregistration.k8s.io/v1".to_string(),
-            kind: "MutatingWebhookConfiguration".to_string(),
-            metadata: rusternetes_common::types::ObjectMeta::new(name),
-            webhooks: Some(vec![MutatingWebhook {
-                rules: vec![rule_for("", "v1", "configmaps")],
-                ..mutating(
-                    &format!("{name}.k8s.io"),
-                    "https://example.invalid/hook".to_string(),
-                    vec![],
-                    Some(FailurePolicy::Ignore),
-                    None,
-                )
-            }]),
-        };
-        let (status, _) = post_json(
+    for i in 0..TEST_LIST_SIZE {
+        let (status, body) = post_json(
             router.clone(),
             "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations",
-            &serde_json::to_value(&cfg).unwrap(),
+            &json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": "MutatingWebhookConfiguration",
+                "metadata": {
+                    "name": format!("e2e-list-{i}"),
+                    "labels": {"e2e-list-test-uuid": "listing-mutating"}
+                },
+                "webhooks": [{
+                    "name": "adding-configmap-data.k8s.io",
+                    // Unreachable on purpose: with failurePolicy Fail, "the
+                    // webhook is in effect" is observable as a 500 on any
+                    // matching request, and its absence as a successful create.
+                    "clientConfig": {"url": "https://127.0.0.1:1/configmaps"},
+                    "rules": [{
+                        "operations": ["CREATE"],
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "resources": ["configmaps"]
+                    }],
+                    "failurePolicy": "Fail",
+                    "sideEffects": "None",
+                    "admissionReviewVersions": ["v1"]
+                }]
+            }),
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED, "create {name}");
+        assert_eq!(status, StatusCode::CREATED, "create e2e-list-{i}: {body}");
     }
 
-    let (_, body) = get_json(
+    // Listing by the selector must return exactly the ten.
+    let (status, body) = get_json(
         router.clone(),
-        "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations",
+        &format!(
+            "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations?labelSelector={SELECTOR}"
+        ),
     )
     .await;
-    let items = body["items"].as_array().expect("list must have items");
-    let names: std::collections::HashSet<&str> = items
-        .iter()
-        .filter_map(|i| i["metadata"]["name"].as_str())
-        .collect();
-    for n in ["m-list-a", "m-list-b", "m-list-c"] {
-        assert!(names.contains(n), "list missing {n}");
-    }
+    assert_eq!(status, StatusCode::OK, "list: {body}");
+    assert_eq!(
+        body["items"].as_array().map(Vec::len),
+        Some(TEST_LIST_SIZE),
+        "label-selected list must return exactly {TEST_LIST_SIZE} items: {body}"
+    );
 
+    // While they exist, a matching request cannot get through.
+    let (status, _) = post_json(
+        router.clone(),
+        "/api/v1/namespaces/default/configmaps",
+        &json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm-before"}}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "with fail-closed webhooks registered the configmap must not be created"
+    );
+
+    // DeleteCollection, by the same selector.
     let status = delete_status(
         router.clone(),
-        "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations",
+        &format!(
+            "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations?labelSelector={SELECTOR}"
+        ),
     )
     .await;
-    assert!(status.is_success());
+    assert!(status.is_success(), "deletecollection: {status}");
 
     let (_, body) = get_json(
-        router,
-        "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations",
+        router.clone(),
+        &format!(
+            "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations?labelSelector={SELECTOR}"
+        ),
     )
     .await;
-    let items = body["items"].as_array().expect("list must have items");
-    assert!(
-        items.is_empty(),
-        "list must be empty after deletecollection"
+    assert_eq!(
+        body["items"].as_array().map(Vec::len),
+        Some(0),
+        "list must be empty after deletecollection: {body}"
+    );
+
+    // And now the same request succeeds — the collection delete took effect.
+    let (status, body) = post_json(
+        router,
+        "/api/v1/namespaces/default/configmaps",
+        &json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm-after"}}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "once the webhooks are deleted the configmap must be created: {body}"
     );
 }
 
