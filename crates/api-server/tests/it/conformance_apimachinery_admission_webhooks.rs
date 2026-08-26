@@ -142,6 +142,68 @@ async fn start_delete_deny_validator(reason: String) -> (String, oneshot::Sender
     (format!("http://{}", addr), tx)
 }
 
+/// Validating mock keyed off the object's `data["webhook-e2e-test"]` value,
+/// the way upstream's e2e webhook server is
+/// (k8s.io/kubernetes/test/e2e/apimachinery/webhook.go drives it through
+/// `testCustomResourceWebhook` / `testBlockingCustomResourceUpdateDeletion`,
+/// webhook.go:2112-2194):
+///
+///   - `webhook-disallow` rejects CREATE and UPDATE
+///     ("the custom resource contains unwanted data");
+///   - `webhook-nondeletable` rejects DELETE
+///     ("the custom resource cannot be deleted because it contains unwanted
+///     key and value");
+///   - anything else is admitted.
+///
+/// DELETE is decided from `oldObject`, since an AdmissionReview for a delete
+/// carries no new object — which is exactly the contract the upstream case
+/// exercises when it blocks a delete, rewrites the data, and then deletes
+/// successfully.
+async fn start_cr_data_validator() -> (String, oneshot::Sender<()>) {
+    let (tx, rx) = oneshot::channel();
+    let route = warp::post()
+        .and(warp::body::json())
+        .map(|r: AdmissionReview| {
+            let request = match r.request {
+                Some(req) => req,
+                None => {
+                    return warp::reply::json(&wrap(AdmissionReviewResponse::allow("u".into())))
+                }
+            };
+            let subject = match request.operation {
+                Operation::Delete => request.old_object.as_ref(),
+                _ => request.object.as_ref(),
+            };
+            let marker = subject
+                .and_then(|o| o.pointer("/data/webhook-e2e-test"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+
+            let denial = match (&request.operation, marker) {
+                (Operation::Create | Operation::Update, "webhook-disallow") => {
+                    Some("the custom resource contains unwanted data")
+                }
+                (Operation::Delete, "webhook-nondeletable") => Some(
+                    "the custom resource cannot be deleted because it contains unwanted key and value",
+                ),
+                _ => None,
+            };
+
+            match denial {
+                Some(reason) => warp::reply::json(&wrap(AdmissionReviewResponse::deny(
+                    request.uid,
+                    reason.to_string(),
+                ))),
+                None => warp::reply::json(&wrap(AdmissionReviewResponse::allow(request.uid))),
+            }
+        });
+    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+        rx.await.ok();
+    });
+    tokio::spawn(srv);
+    (format!("http://{}", addr), tx)
+}
+
 /// Mutating mock that adds `/metadata/labels/{key}={value}`.
 async fn start_mutator_label(key: String, value: String) -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
@@ -184,13 +246,18 @@ async fn start_mutator_label(key: String, value: String) -> (String, oneshot::Se
 /// `data[<require_key>]` is already present on the incoming object.
 ///
 /// This is upstream's `newMutateConfigMapWebhookFixture(f, certCtx, stage, …)`
-/// (k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:1258-1260): two of these
+/// (webhook.go:1258-1260) and the custom-resource fixtures
+/// `registerMutatingWebhookForCustomResource` installs (webhook.go:2036-2111),
+/// which use the same two-stage shape over a top-level `data` map: two of these
 /// are registered, stage 1 keyed off `mutation-start` and stage 2 keyed off
 /// `mutation-stage-1`, so stage 2 can only fire if it observes stage 1's
 /// output. That chaining is the whole point of the "ordered mutation" case —
 /// a webhook that mutated unconditionally would satisfy a subset assertion
 /// while proving nothing about order.
-async fn start_mutator_configmap_stage(
+///
+/// Referenced by `start_mutator_data_stage` callers in both the configmap and
+/// custom-resource mutation mirrors.
+async fn start_mutator_data_stage(
     require_key: String,
     add_key: String,
 ) -> (String, oneshot::Sender<()>) {
@@ -224,47 +291,6 @@ async fn start_mutator_configmap_stage(
                 op: PatchOp::Add,
                 path: format!("/data/{add_key}"),
                 value: Some(json!("yes")),
-                from: None,
-            }];
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD
-                .encode(serde_json::to_vec(&patch).unwrap());
-            warp::reply::json(&wrap(AdmissionReviewResponse {
-                uid: request.uid,
-                allowed: true,
-                status: None,
-                patch: Some(b64),
-                patch_type: Some("JSONPatch".to_string()),
-                audit_annotations: None,
-                warnings: None,
-            }))
-        });
-    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
-        rx.await.ok();
-    });
-    tokio::spawn(srv);
-    (format!("http://{}", addr), tx)
-}
-
-/// Mutating mock that adds an arbitrary JSON pointer path → value. Used by the
-/// structural-schema pruning test: the path lands inside the CR's `spec` so
-/// the api-server's post-mutation pruning pass can strip it when the CRD
-/// schema doesn't declare the field.
-async fn start_mutator_path(path: String, value: Value) -> (String, oneshot::Sender<()>) {
-    let (tx, rx) = oneshot::channel();
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(move |r: AdmissionReview| {
-            let request = match r.request {
-                Some(r) => r,
-                None => {
-                    return warp::reply::json(&wrap(AdmissionReviewResponse::allow("u".into())))
-                }
-            };
-            let patch = vec![PatchOperation {
-                op: PatchOp::Add,
-                path: path.clone(),
-                value: Some(value.clone()),
                 from: None,
             }];
             use base64::Engine;
@@ -330,8 +356,6 @@ async fn start_mutator_init_container() -> (String, oneshot::Sender<()>) {
     (format!("http://{}", addr), tx)
 }
 
-/// Slow validator — sleeps `delay` before responding `allow`. Used by the
-/// `should honor timeout` mirror.
 async fn start_slow_validator(delay: std::time::Duration) -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
     let route =
@@ -854,7 +878,26 @@ async fn should_be_able_to_deny_attaching_pod() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:220
 ///   ("should be able to deny custom resource creation, update and deletion")
-///   Assertions live in testCustomResourceWebhook (webhook.go:2112-2135) + testBlockingCustomResourceUpdateDeletion (webhook.go:2136-2195).
+///   Assertions live in testCustomResourceWebhook (webhook.go:2112-2134) and
+///   testBlockingCustomResourceUpdateDeletion (webhook.go:2136-2194).
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream bodies.
+///
+/// Upstream's webhook decides from the CR's own
+/// `data["webhook-e2e-test"]`, and the case walks six steps: a
+/// `webhook-disallow` CR is refused on create; a `webhook-nondeletable` one is
+/// **created successfully**; updating it to disallowed data is refused;
+/// deleting it is refused; rewriting the value to `webhook-allow` is accepted;
+/// and the delete then succeeds.
+///
+/// The mirror used a deny-everything validator and asserted only that CREATE,
+/// UPDATE and DELETE all came back denied. Nothing asserted an Allow, so the
+/// test could not distinguish a correct implementation from one that rejects
+/// everything — and the interesting half was missing entirely: the delete
+/// refusal is decided from the **stored** object, since a delete
+/// AdmissionReview carries no new object
+/// (handlers/admission_helper.rs:68-75 sends `object: None`,
+/// `old_object: Some(stored)`), and the same delete must succeed once that
+/// stored content changes.
 /// Verifies a webhook bound to a CRD's resource (`example.com/v1/foos`)
 /// denies all of CREATE/UPDATE/DELETE — the dispatcher routes by
 /// `(apiGroup, version, resource)` exactly like any built-in resource.
@@ -862,7 +905,7 @@ async fn should_be_able_to_deny_attaching_pod() {
 async fn should_be_able_to_deny_custom_resource_creation_update_and_deletion() {
     let mem = Arc::new(MemoryStorage::new());
     let manager = AdmissionWebhookManager::new(mem.clone());
-    let (url, _shutdown) = start_deny_validator("cr denied".into()).await;
+    let (url, _shutdown) = start_cr_data_validator().await;
 
     let cfg = ValidatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".to_string(),
@@ -876,13 +919,19 @@ async fn should_be_able_to_deny_custom_resource_creation_update_and_deletion() {
                     OperationType::Delete,
                 ],
                 rule: Rule {
-                    api_groups: vec!["example.com".into()],
-                    api_versions: vec!["v1".into()],
-                    resources: vec!["foos".into()],
+                    api_groups: vec!["example.com".to_string()],
+                    api_versions: vec!["v1".to_string()],
+                    resources: vec!["foos".to_string()],
                     scope: None,
                 },
             }],
-            ..validating("deny.cr.io", url, vec![], Some(FailurePolicy::Fail), None)
+            ..validating(
+                "deny-unwanted-custom-resource-data.k8s.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
         }]),
     };
     mem.create(
@@ -892,33 +941,137 @@ async fn should_be_able_to_deny_custom_resource_creation_update_and_deletion() {
     .await
     .unwrap();
 
-    for op in [Operation::Create, Operation::Update, Operation::Delete] {
-        let resp = manager
-            .run_validating_webhooks(
-                &op,
-                &GroupVersionKind {
-                    group: "example.com".into(),
-                    version: "v1".into(),
-                    kind: "Foo".into(),
-                },
-                &GroupVersionResource {
-                    group: "example.com".into(),
-                    version: "v1".into(),
-                    resource: "foos".into(),
-                },
-                Some("default"),
-                "my-foo",
-                Some(json!({"apiVersion":"example.com/v1","kind":"Foo","metadata":{"name":"my-foo"}})),
-                None,
-                &admin_user_info(),
-            )
-            .await
-            .unwrap();
-        match resp {
-            AdmissionResponse::Deny(_) => {}
-            other => panic!("op {op:?} must be denied, got {other:?}"),
+    let gvk = GroupVersionKind {
+        group: "example.com".into(),
+        version: "v1".into(),
+        kind: "Foo".into(),
+    };
+    let gvr = GroupVersionResource {
+        group: "example.com".into(),
+        version: "v1".into(),
+        resource: "foos".into(),
+    };
+    let cr = |name: &str, marker: &str| {
+        json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Foo",
+            "metadata": {"name": name, "namespace": "default"},
+            "data": {"webhook-e2e-test": marker}
+        })
+    };
+    let run = |op: Operation, name: &'static str, object: Option<Value>, old: Option<Value>| {
+        let (manager, gvk, gvr) = (&manager, &gvk, &gvr);
+        async move {
+            manager
+                .run_validating_webhooks(
+                    &op,
+                    gvk,
+                    gvr,
+                    Some("default"),
+                    name,
+                    object,
+                    old,
+                    &admin_user_info(),
+                )
+                .await
+                .unwrap()
         }
+    };
+
+    // testCustomResourceWebhook (webhook.go:2112-2134): a CR carrying
+    // `webhook-disallow` must be rejected on create.
+    let resp = run(
+        Operation::Create,
+        "cr-instance-1",
+        Some(cr("cr-instance-1", "webhook-disallow")),
+        None,
+    )
+    .await;
+    match resp {
+        AdmissionResponse::Deny(reason) => assert!(
+            reason.contains("the custom resource contains unwanted data"),
+            "unexpected deny reason: {reason}"
+        ),
+        other => panic!("create of a disallowed CR must be denied, got {other:?}"),
     }
+
+    // testBlockingCustomResourceUpdateDeletion (webhook.go:2136-2194).
+    // 1. a CR marked `webhook-nondeletable` is created *successfully*.
+    let resp = run(
+        Operation::Create,
+        "cr-instance-2",
+        Some(cr("cr-instance-2", "webhook-nondeletable")),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(resp, AdmissionResponse::Allow),
+        "a nondeletable CR must still be creatable, got {resp:?}"
+    );
+
+    // 2. updating it to disallowed data is denied.
+    let resp = run(
+        Operation::Update,
+        "cr-instance-2",
+        Some(cr("cr-instance-2", "webhook-disallow")),
+        Some(cr("cr-instance-2", "webhook-nondeletable")),
+    )
+    .await;
+    match resp {
+        AdmissionResponse::Deny(reason) => assert!(
+            reason.contains("the custom resource contains unwanted data"),
+            "unexpected deny reason: {reason}"
+        ),
+        other => panic!("update to disallowed data must be denied, got {other:?}"),
+    }
+
+    // 3. deleting it is denied — and the decision can only come from the
+    //    *stored* object, because a delete AdmissionReview carries no new
+    //    object (handlers/admission_helper.rs passes `object: None`,
+    //    `old_object: Some(stored)`).
+    let resp = run(
+        Operation::Delete,
+        "cr-instance-2",
+        None,
+        Some(cr("cr-instance-2", "webhook-nondeletable")),
+    )
+    .await;
+    match resp {
+        AdmissionResponse::Deny(reason) => assert!(
+            reason.contains(
+                "the custom resource cannot be deleted because it contains unwanted key and value"
+            ),
+            "unexpected deny reason: {reason}"
+        ),
+        other => panic!("delete of a nondeletable CR must be denied, got {other:?}"),
+    }
+
+    // 4. rewriting the offending value to `webhook-allow` is admitted.
+    let resp = run(
+        Operation::Update,
+        "cr-instance-2",
+        Some(cr("cr-instance-2", "webhook-allow")),
+        Some(cr("cr-instance-2", "webhook-nondeletable")),
+    )
+    .await;
+    assert!(
+        matches!(resp, AdmissionResponse::Allow),
+        "update to compliant data must be admitted, got {resp:?}"
+    );
+
+    // 5. and the delete now succeeds — the same operation that was blocked in
+    //    step 3, unblocked purely by the stored object's content.
+    let resp = run(
+        Operation::Delete,
+        "cr-instance-2",
+        None,
+        Some(cr("cr-instance-2", "webhook-allow")),
+    )
+    .await;
+    assert!(
+        matches!(resp, AdmissionResponse::Allow),
+        "delete must succeed once the offending value is gone, got {resp:?}"
+    );
 }
 
 /// [sig-api-machinery] AdmissionWebhook should unconditionally reject
@@ -1064,9 +1217,9 @@ async fn should_mutate_configmap() {
     // registers them (webhook.go:1259-1260): stage 1 keys off the configmap's
     // own `mutation-start`, stage 2 keys off stage 1's output.
     let (url1, _s1) =
-        start_mutator_configmap_stage("mutation-start".into(), "mutation-stage-1".into()).await;
+        start_mutator_data_stage("mutation-start".into(), "mutation-stage-1".into()).await;
     let (url2, _s2) =
-        start_mutator_configmap_stage("mutation-stage-1".into(), "mutation-stage-2".into()).await;
+        start_mutator_data_stage("mutation-stage-1".into(), "mutation-stage-2".into()).await;
 
     let cfg = MutatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".to_string(),
@@ -1328,22 +1481,53 @@ async fn should_not_be_able_to_mutate_or_prevent_deletion_of_webhook_configurati
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:284
 ///   ("should mutate custom resource")
-///   Assertions live in testMutatingCustomResourceWebhook (webhook.go:2196-2225).
+///   Assertions live in testMutatingCustomResourceWebhook with prune=false
+///   (webhook.go:2196-2224).
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Same two-stage chained shape as the configmap case, over the CR's
+/// top-level `data` map, compared with `reflect.DeepEqual`. The mirror ran one
+/// unconditional webhook against `metadata.labels` and asserted a single
+/// label, so neither the ordering nor the exact-map contract was tested.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn should_mutate_custom_resource() {
     let mem = Arc::new(MemoryStorage::new());
     let manager = AdmissionWebhookManager::new(mem.clone());
-    let (url, _shutdown) = start_mutator_label("mutated-by".into(), "webhook".into()).await;
+
+    // The same two chained stages upstream registers for custom resources
+    // (registerMutatingWebhookForCustomResource, webhook.go:2036-2111).
+    let (url1, _s1) =
+        start_mutator_data_stage("mutation-start".into(), "mutation-stage-1".into()).await;
+    let (url2, _s2) =
+        start_mutator_data_stage("mutation-stage-1".into(), "mutation-stage-2".into()).await;
 
     let cfg = MutatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".to_string(),
         kind: "MutatingWebhookConfiguration".to_string(),
         metadata: rusternetes_common::types::ObjectMeta::new("mutate-cr"),
-        webhooks: Some(vec![MutatingWebhook {
-            rules: vec![rule_for("example.com", "v1", "foos")],
-            ..mutating("mutate.cr.io", url, vec![], None, None)
-        }]),
+        webhooks: Some(vec![
+            MutatingWebhook {
+                rules: vec![rule_for("example.com", "v1", "foos")],
+                ..mutating(
+                    "adding-custom-resource-data-stage-1.k8s.io",
+                    url1,
+                    vec![],
+                    None,
+                    None,
+                )
+            },
+            MutatingWebhook {
+                rules: vec![rule_for("example.com", "v1", "foos")],
+                ..mutating(
+                    "adding-custom-resource-data-stage-2.k8s.io",
+                    url2,
+                    vec![],
+                    None,
+                    None,
+                )
+            },
+        ]),
     };
     mem.create(
         &build_key("mutatingwebhookconfigurations", None, "mutate-cr"),
@@ -1355,7 +1539,8 @@ async fn should_mutate_custom_resource() {
     let cr = Some(json!({
         "apiVersion": "example.com/v1",
         "kind": "Foo",
-        "metadata": {"name": "cr-1", "labels": {}}
+        "metadata": {"name": "cr-instance-1", "namespace": "default"},
+        "data": {"mutation-start": "yes"}
     }));
     let (_resp, mutated) = manager
         .run_mutating_webhooks(
@@ -1371,7 +1556,7 @@ async fn should_mutate_custom_resource() {
                 resource: "foos".into(),
             },
             Some("default"),
-            "cr-1",
+            "cr-instance-1",
             cr,
             None,
             &admin_user_info(),
@@ -1379,7 +1564,19 @@ async fn should_mutate_custom_resource() {
         .await
         .unwrap();
     let obj = mutated.expect("mutated CR");
-    assert_eq!(obj["metadata"]["labels"]["mutated-by"], json!("webhook"));
+
+    // Upstream compares the whole `data` map with reflect.DeepEqual
+    // (webhook.go:2214-2223) — exact equality, and with `prune == false` all
+    // three keys must be present.
+    assert_eq!(
+        obj["data"],
+        json!({
+            "mutation-start": "yes",
+            "mutation-stage-1": "yes",
+            "mutation-stage-2": "yes"
+        }),
+        "expected both stages to have fired: {obj}"
+    );
 }
 
 /// [sig-api-machinery] AdmissionWebhook should deny crd creation [Conformance]
@@ -1525,7 +1722,17 @@ async fn should_mutate_custom_resource_with_different_stored_version() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:331
 ///   ("should mutate custom resource with pruning")
-///   Assertions live in testMutatingCustomResourceWebhook with prune=true (webhook.go:2196-2225).
+///   Assertions live in testMutatingCustomResourceWebhook with prune=true
+///   (webhook.go:2196-2224).
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// The pruning variant is the same two chained webhooks against a structural
+/// schema that declares `mutation-start` and `mutation-stage-1` but not
+/// `mutation-stage-2`: stage 2 still runs, and its key must be pruned back off
+/// after admission, leaving exactly the two declared keys. The mirror tested
+/// the right *concept* with its own `spec.replicas` / `spec.notInSchema`
+/// fixture, but not upstream's object shape and not as an exact-map
+/// comparison.
 ///
 /// Verifies the K8s contract: after a mutating webhook injects a field into
 /// a CR via JSON patch, the api-server runs structural-schema pruning. Any
@@ -1541,8 +1748,12 @@ async fn should_mutate_custom_resource_with_pruning() {
     let mem = Arc::new(MemoryStorage::new());
     let manager = AdmissionWebhookManager::new(mem.clone());
 
-    // Persist a CRD whose structural schema declares only `spec.replicas`.
-    // Pruning must remove any other field a webhook injects under `spec`.
+    // Upstream's pruning variant declares a structural schema that knows
+    // `mutation-start` and `mutation-stage-1` but *not* `mutation-stage-2`,
+    // with `x-kubernetes-preserve-unknown-fields` absent — so the key stage 2
+    // adds is pruned back off after admission
+    // (webhook.go:331-357 sets the CRD up, testMutatingCustomResourceWebhook
+    // asserts the result with prune=true).
     let crd_json = json!({
         "apiVersion": "apiextensions.k8s.io/v1",
         "kind": "CustomResourceDefinition",
@@ -1559,10 +1770,11 @@ async fn should_mutate_custom_resource_with_pruning() {
                     "openAPIV3Schema": {
                         "type": "object",
                         "properties": {
-                            "spec": {
+                            "data": {
                                 "type": "object",
                                 "properties": {
-                                    "replicas": {"type": "integer"}
+                                    "mutation-start": {"type": "string"},
+                                    "mutation-stage-1": {"type": "string"}
                                 }
                             }
                         }
@@ -1580,23 +1792,40 @@ async fn should_mutate_custom_resource_with_pruning() {
     .await
     .unwrap();
 
-    // Mutator adds an unknown field under `spec`. With the CRD above this
-    // field is NOT in the schema, so the api-server must strip it after the
-    // webhook returns.
-    let (url, _shutdown) =
-        start_mutator_path("/spec/notInSchema".into(), json!("should-be-pruned")).await;
+    let (url1, _s1) =
+        start_mutator_data_stage("mutation-start".into(), "mutation-stage-1".into()).await;
+    let (url2, _s2) =
+        start_mutator_data_stage("mutation-stage-1".into(), "mutation-stage-2".into()).await;
 
     let cfg = MutatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".to_string(),
         kind: "MutatingWebhookConfiguration".to_string(),
-        metadata: rusternetes_common::types::ObjectMeta::new("mutate-prune"),
-        webhooks: Some(vec![MutatingWebhook {
-            rules: vec![rule_for("example.com", "v1", "foos")],
-            ..mutating("mutate.prune.io", url, vec![], None, None)
-        }]),
+        metadata: rusternetes_common::types::ObjectMeta::new("mutate-cr-prune"),
+        webhooks: Some(vec![
+            MutatingWebhook {
+                rules: vec![rule_for("example.com", "v1", "foos")],
+                ..mutating(
+                    "adding-custom-resource-data-stage-1.k8s.io",
+                    url1,
+                    vec![],
+                    None,
+                    None,
+                )
+            },
+            MutatingWebhook {
+                rules: vec![rule_for("example.com", "v1", "foos")],
+                ..mutating(
+                    "adding-custom-resource-data-stage-2.k8s.io",
+                    url2,
+                    vec![],
+                    None,
+                    None,
+                )
+            },
+        ]),
     };
     mem.create(
-        &build_key("mutatingwebhookconfigurations", None, "mutate-prune"),
+        &build_key("mutatingwebhookconfigurations", None, "mutate-cr-prune"),
         &cfg,
     )
     .await
@@ -1605,8 +1834,8 @@ async fn should_mutate_custom_resource_with_pruning() {
     let cr = Some(json!({
         "apiVersion": "example.com/v1",
         "kind": "Foo",
-        "metadata": {"name": "cr-prune"},
-        "spec": {"replicas": 3}
+        "metadata": {"name": "cr-instance-1", "namespace": "default"},
+        "data": {"mutation-start": "yes"}
     }));
     let (_resp, mutated) = manager
         .run_mutating_webhooks(
@@ -1622,7 +1851,7 @@ async fn should_mutate_custom_resource_with_pruning() {
                 resource: "foos".into(),
             },
             Some("default"),
-            "cr-prune",
+            "cr-instance-1",
             cr,
             None,
             &admin_user_info(),
@@ -1630,14 +1859,17 @@ async fn should_mutate_custom_resource_with_pruning() {
         .await
         .unwrap();
     let obj = mutated.expect("mutated CR");
+
+    // With prune=true upstream expects exactly the two declared keys —
+    // stage 2 still ran, but its output is not in the schema and must be
+    // pruned away (webhook.go:2216-2223).
     assert_eq!(
-        obj["spec"]["replicas"],
-        json!(3),
-        "declared schema fields must survive pruning; got {obj}"
-    );
-    assert!(
-        obj["spec"].get("notInSchema").is_none(),
-        "schema pruning must remove the webhook-added field after mutation; got {obj}"
+        obj["data"],
+        json!({
+            "mutation-start": "yes",
+            "mutation-stage-1": "yes"
+        }),
+        "mutation-stage-2 is undeclared and must be pruned after mutation: {obj}"
     );
 }
 
