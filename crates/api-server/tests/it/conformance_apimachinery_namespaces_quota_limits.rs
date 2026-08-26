@@ -35,8 +35,9 @@
 //! | resource_quota.go:869 best effort scope | both scopes now asserted |
 //! | resource_quota.go:1009 manage the lifecycle | patch now changes metadata + spec in one request, as upstream does |
 //! | limit_range.go:65 defaults applied to pod | now driven through the real create route and re-fetched |
+//! | resource_quota.go:1078 apply changes to a status | /status write path added; watch confirmation not mirrored |
 //!
-//! Not yet re-derived: `resource_quota.go` :87, :754, :950, :1078, and
+//! Not yet re-derived: `resource_quota.go` :87, :950, and
 //! `namespace.go` :247, :256, :309, :376, :404, and `limit_range.go` :256.
 //! Nine upstream conformance cases in these sources have **no mirror at all** —
 //! the quota cases covering the life of a service, secret, configMap,
@@ -1044,7 +1045,7 @@ async fn resource_quota_status_subresource_returns_used() {
         .unwrap();
 
     let (status, body) = send_json(
-        router,
+        router.clone(),
         "GET",
         &format!("/api/v1/namespaces/{}/resourcequotas/q/status", ns),
         None,
@@ -1059,6 +1060,43 @@ async fn resource_quota_status_subresource_returns_used() {
         body["status"]["used"]["pods"], "1",
         "/status GET must reflect reconciled used.pods: body={}",
         body
+    );
+
+    // Upstream's case is about *writing* the subresource: it calls
+    // `UpdateStatus` to set `status.hard` and then confirms the new value
+    // (resource_quota.go:1118-1132). The mirror only ever read `/status`, so
+    // the write path — the point of the subresource — went untested.
+    let mut to_update = body.clone();
+    to_update["status"]["hard"] = json!({ "pods": "9" });
+    let (status, updated) = send_json(
+        router.clone(),
+        "PUT",
+        &format!("/api/v1/namespaces/{}/resourcequotas/q/status", ns),
+        Some(&to_update),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "status subresource PUT must return 200: body={}",
+        updated
+    );
+    assert_eq!(
+        updated["status"]["hard"]["pods"], "9",
+        "the written status.hard must land: {updated}"
+    );
+
+    // And the subresource boundary must hold: writing /status must not have
+    // altered spec.
+    let (_, after) = send_json(
+        router,
+        "GET",
+        &format!("/api/v1/namespaces/{}/resourcequotas/q", ns),
+        None,
+    )
+    .await;
+    assert_eq!(
+        after["spec"]["hard"]["pods"], "3",
+        "a /status write must not change spec.hard: {after}"
     );
 }
 
@@ -1228,9 +1266,18 @@ async fn resource_quota_scopes_best_effort_filter() {
 /// [sig-api-machinery] ResourceQuota terminal pods (Succeeded/Failed) must
 /// NOT be counted against `pods` usage.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/resource_quota.go:754
-///   ("should verify ResourceQuota with terminating scopes.")
-/// Mirror audit (#1749, 2026-08-26): re-cited to the named case.
+/// Upstream: no conformance case. This test covers the **terminal-phase**
+/// exclusion in `QuotaV1Pod`
+/// (k8s.io/kubernetes/pkg/quota/v1/evaluator/core/pods.go:491-493): a pod in
+/// `Succeeded` or `Failed` is not counted against quota.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited a second time, correcting an
+/// error made on 2026-08-26. That pass cited
+/// `resource_quota.go:754` ("should verify ResourceQuota with terminating
+/// scopes."), which is a **different mechanism**: the Terminating /
+/// NotTerminating *scope* keys off `spec.activeDeadlineSeconds`
+/// (pods.go:418), not off the pod's phase. The two are unrelated, and
+/// `resource_quota.go:754` has no mirror at all — recorded in #1770.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn resource_quota_terminal_pods_not_counted() {
