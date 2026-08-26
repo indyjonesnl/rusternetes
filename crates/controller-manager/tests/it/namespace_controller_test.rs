@@ -29,7 +29,7 @@ use chrono::Utc;
 use rusternetes_common::resources::{
     namespace::{NamespaceSpec, NamespaceStatus},
     rbac::{PolicyRule, RoleBinding, RoleRef, Subject},
-    Container, Namespace, NetworkPolicy, NetworkPolicySpec, Pod, PodSpec, ResourceQuota,
+    ConfigMap, Container, Namespace, NetworkPolicy, NetworkPolicySpec, Pod, PodSpec, ResourceQuota,
     ResourceQuotaSpec, Role,
 };
 use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
@@ -754,5 +754,90 @@ async fn kube_root_ca_crt_is_reconciled_after_modification() {
     assert_eq!(
         ca, TEST_CA_PEM,
         "reconciled ca.crt must match the cluster CA"
+    );
+}
+
+/// Ordered namespace deletion: while ANY pod remains, no other content may be
+/// deleted — on every reconcile, not just the first.
+///
+/// Upstream returns early from `deleteAllContent` for as long as pods remain
+/// (`pkg/controller/namespace/deletion/namespaced_resources_deleter.go:553-562`):
+///
+/// ```text
+/// // Check if any pods remain before proceeding to delete other resources
+/// if numRemainingTotals.gvrToNumRemaining[podsGVR] > 0 {
+///     ... conditionUpdater.Update(ns) ... UpdateStatus ...
+///     return estimate, utilerrors.NewAggregate(errs)
+/// }
+/// ```
+///
+/// This pins the Conformance spec `[sig-api-machinery] OrderedNamespaceDeletion
+/// namespace deletion should delete pod first`
+/// (`test/e2e/apimachinery/namespace.go:497-600`): it creates a pod carrying a
+/// finalizer plus a ConfigMap, deletes the namespace, waits for the
+/// `NamespaceDeletionContentFailure` condition, then asserts the **ConfigMap
+/// still exists** and the pod is still present with a `deletionTimestamp`. The
+/// pod's finalizer is never removed, so a correct controller never advances.
+///
+/// The controller used to gate phase 2 on "have we written the conditions
+/// once?", so the *second* reconcile deleted the ConfigMap out from under a pod
+/// that was still terminating.
+#[tokio::test]
+async fn pods_with_finalizers_block_other_content_on_every_reconcile() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller = NamespaceController::new(storage.clone());
+    let ns_name = "ordered-deletion";
+
+    let namespace = terminating_ns(ns_name, vec!["kubernetes".to_string()]);
+    let ns_key = build_key("namespaces", None, ns_name);
+    storage.create(&ns_key, &namespace).await.unwrap();
+
+    // A pod that can never finish deleting: it carries a finalizer.
+    let mut pod = make_pod("test-pod", ns_name);
+    pod.metadata.uid = uuid::Uuid::new_v4().to_string();
+    pod.metadata.finalizers = Some(vec!["e2e.example.com/finalizer".to_string()]);
+    let pod_key = build_key("pods", Some(ns_name), "test-pod");
+    storage.create(&pod_key, &pod).await.unwrap();
+
+    // Other content that must survive while the pod is stuck.
+    let mut cm = ConfigMap::new("test-configmap", ns_name);
+    cm.data = Some(HashMap::from([("key".to_string(), "value".to_string())]));
+    let cm_key = build_key("configmaps", Some(ns_name), "test-configmap");
+    storage.create(&cm_key, &cm).await.unwrap();
+
+    // Reconcile repeatedly — the spec polls for minutes, so "blocks once" is
+    // not good enough.
+    for round in 1..=3 {
+        controller.reconcile_all().await.unwrap();
+
+        let cm_still_there = storage.get::<ConfigMap>(&cm_key).await;
+        assert!(
+            cm_still_there.is_ok(),
+            "round {round}: ConfigMap must still exist while a pod is terminating"
+        );
+
+        let live_pod = storage
+            .get::<Pod>(&pod_key)
+            .await
+            .expect("pod must still exist (its finalizer blocks removal)");
+        assert!(
+            live_pod.metadata.deletion_timestamp.is_some(),
+            "round {round}: the pod must be marked for deletion first"
+        );
+    }
+
+    // And the namespace must be Terminating with the content-failure condition,
+    // which is what the spec waits for before checking the ConfigMap.
+    let ns: Namespace = storage.get(&ns_key).await.unwrap();
+    let conditions = ns
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .expect("terminating namespace must publish conditions");
+    assert!(
+        conditions
+            .iter()
+            .any(|c| c.condition_type == "NamespaceDeletionContentFailure"),
+        "namespace must publish NamespaceDeletionContentFailure while content remains"
     );
 }
