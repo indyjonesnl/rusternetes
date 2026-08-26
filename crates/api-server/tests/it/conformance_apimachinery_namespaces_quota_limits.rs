@@ -8,7 +8,7 @@
 //!   - test/e2e/apimachinery/resource_quota.go
 //!   - test/e2e/scheduling/limit_range.go
 //!
-//! ## Mirror audit — #1749, 2026-08-26 (IN PROGRESS)
+//! ## Mirror audit — #1749, 2026-08-27 (mirrors audited; coverage incomplete)
 //!
 //! Citations: **complete**. All 23 upstream references in this file have been
 //! re-derived against the pinned `release-1.35` (v1.35.5) checkout and now name
@@ -37,10 +37,21 @@
 //! | limit_range.go:65 defaults applied to pod | now driven through the real create route and re-fetched |
 //! | resource_quota.go:1078 apply changes to a status | /status write path added; watch confirmation not mirrored |
 //! | resource_quota.go:87 status promptly calculated | self-counting `resourcequotas` usage now asserted |
+//! | resource_quota.go:950 update and delete | post-update re-read added |
 //! | namespace.go:404 apply a finalizer | both halves (add + remove) now asserted |
+//! | limit_range.go:256 list, patch, delete by collection | cross-namespace label-selected list + collection delete added |
 //!
-//! Not yet re-derived: `resource_quota.go` :950, `namespace.go` :247, :256,
-//! :309, :376, and `limit_range.go` :256.
+//! **Every mirror in this file has now been re-derived.** What remains is not
+//! re-derivation but absence: ten upstream conformance cases in these sources
+//! have no mirror at all — `resource_quota.go` :112, :172, :339, :406, :462,
+//! :754 and `namespace.go` :247, :256, :309, :376. All ten are enumerated in
+//! #1770. Two of them (namespace :247, :256 — pods and services removed on
+//! namespace deletion) are controller-owned and their mirrors likely belong in
+//! `crates/controller-manager/tests/it/`, as the kube-root-ca requirements did
+//! in #1755.
+//!
+//! The record stays marked in-progress for that reason: the file's mirrors are
+//! audited, the area's coverage is not.
 //! Nine upstream conformance cases in these sources have **no mirror at all** —
 //! the quota cases covering the life of a service, secret, configMap,
 //! replication controller and replica set among them. Enumerated and tracked in
@@ -703,6 +714,23 @@ async fn resource_quota_crud_round_trip_over_http() {
     .await;
     assert_eq!(status, 200);
     assert_eq!(after_put["spec"]["hard"]["pods"], "10");
+
+    // Upstream follows the update with a separate "Verifying a ResourceQuota
+    // was modified" Get and re-asserts the changed hard values on the fetched
+    // object (resource_quota.go:981-985). Asserting only the PUT response
+    // cannot catch an update echoed back but not stored.
+    let (status, re_read) = send_json(
+        router.clone(),
+        "GET",
+        "/api/v1/namespaces/default/resourcequotas/rq-crud",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "re-read after update: body={}", re_read);
+    assert_eq!(
+        re_read["spec"]["hard"]["pods"], "10",
+        "the update must be persisted, not just echoed: {re_read}"
+    );
 
     // Delete.
     let (status, _) = send_json(
@@ -1601,13 +1629,72 @@ async fn limit_range_crud_round_trip_over_http() {
 
     // Delete.
     let (status, _) = send_json(
-        router,
+        router.clone(),
         "DELETE",
         "/api/v1/namespaces/default/limitranges/lr-full",
         None,
     )
     .await;
     assert_eq!(status, 200);
+
+    // Upstream's case is "list, patch and delete a LimitRange **by
+    // collection**": it creates one LimitRange in the test namespace and
+    // another in a *second* namespace, then lists across all namespaces by a
+    // shared label and requires exactly two
+    // (limit_range.go:295-312), before deleting the collection. Neither the
+    // cross-namespace label-selected list nor the collection delete had a
+    // counterpart here — `limit_range_list_is_namespace_scoped` asserts the
+    // complementary property (a namespaced list stays scoped), not this one.
+    for (ns, name) in [("lr-coll-a", "lr-a"), ("lr-coll-b", "lr-b")] {
+        let mut body = limitrange_body(name, json!({ "type": "Container", "max": { "cpu": "2" } }));
+        body["metadata"]["labels"] = json!({ "e2e-lr": "collection" });
+        let (s, created) = send_json(
+            router.clone(),
+            "POST",
+            &format!("/api/v1/namespaces/{}/limitranges", ns),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(s, 201, "create {name} in {ns}: body={}", created);
+    }
+
+    let (s, listed) = send_json(
+        router.clone(),
+        "GET",
+        "/api/v1/limitranges?labelSelector=e2e-lr%3Dcollection",
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "cross-namespace list: body={}", listed);
+    assert_eq!(
+        listed["items"].as_array().map(Vec::len),
+        Some(2),
+        "the label-selected list must span namespaces and return both: {listed}"
+    );
+
+    // Delete one namespace's collection by the same selector; the other
+    // namespace's LimitRange must survive.
+    let (s, _) = send_json(
+        router.clone(),
+        "DELETE",
+        "/api/v1/namespaces/lr-coll-a/limitranges?labelSelector=e2e-lr%3Dcollection",
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "deletecollection must succeed");
+
+    let (_, remaining) = send_json(
+        router,
+        "GET",
+        "/api/v1/limitranges?labelSelector=e2e-lr%3Dcollection",
+        None,
+    )
+    .await;
+    assert_eq!(
+        remaining["items"].as_array().map(Vec::len),
+        Some(1),
+        "deletecollection must be namespace-scoped, leaving the sibling: {remaining}"
+    );
 }
 
 /// [sig-api-machinery] LimitRange list + namespace isolation
