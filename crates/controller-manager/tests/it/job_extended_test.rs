@@ -338,11 +338,33 @@ async fn job_should_release_non_matching_pods() {
     let controller = JobController::new(storage.clone());
     controller.reconcile_all().await.unwrap();
 
-    // The non-matching pod should be marked for deletion
+    // Releasing means DISOWNING, not deleting. Upstream `ReleasePod`
+    // (pkg/controller/controller_ref_manager.go:238-264) issues a single patch
+    // that removes the controller ownerRef and nothing else — the pod keeps
+    // running, now unowned, and it is the user's to deal with.
+    //
+    // This assertion used to require a deletionTimestamp, pinning a divergence
+    // that fails the upstream Conformance spec "Job should adopt matching
+    // orphans and release non-matching pods" (test/e2e/apps/job.go:960-973):
+    // that spec strips the pod's labels and then polls the pod until its
+    // controllerRef is nil. If the controller also marks it for deletion, the
+    // pod terminates and the poll fails.
     let updated_pod: Pod = storage.get(&old_pod_key).await.unwrap();
+
+    let still_owned = updated_pod
+        .metadata
+        .owner_references
+        .as_ref()
+        .map(|refs| refs.iter().any(|r| r.uid == job.metadata.uid))
+        .unwrap_or(false);
     assert!(
-        updated_pod.metadata.deletion_timestamp.is_some(),
-        "Non-matching pod should be marked for deletion"
+        !still_owned,
+        "a pod whose labels no longer match must have the job's ownerRef removed"
+    );
+
+    assert!(
+        updated_pod.metadata.deletion_timestamp.is_none(),
+        "releasing a pod must not delete it — upstream ReleasePod only patches away the ownerRef"
     );
 }
 
