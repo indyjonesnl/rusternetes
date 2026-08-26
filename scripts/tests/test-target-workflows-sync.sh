@@ -47,16 +47,29 @@ for f in "$WF_DIR"/conformance-*.yml; do
         || fail "stale generated workflow $f — $target not in targets.json"
 done
 
-# A branch build must stay reachable from a dispatch. The engine builds from
-# source on an EMPTY image-tag, but an empty dispatch value never arrives:
-# GitHub substitutes the input's own `default: main`. So the workflows map a
-# literal `local` sentinel to the empty string. Without it, a run dispatched to
-# prove a PR silently tests the published image and reports on unrelated code.
+# A branch build must stay reachable from a dispatch. The bring-up action
+# compiles this ref when image-tag is EMPTY, but an empty dispatch value never
+# arrives: GitHub substitutes the input's own `default: main`. Hence the `local`
+# sentinel -- and it MUST be resolved in a shell step, not a `${{ }}` expression,
+# because an expression cannot yield an empty string (`A && '' || B` takes the
+# B branch, since '' is falsy). Two merged attempts got this wrong (#1758,
+# #1760) and silently tested the published image instead of the branch.
+ENGINE="$WF_DIR/conformance-target.yml"
+[ -f "$ENGINE" ] || fail "missing reusable engine workflow: $ENGINE"
+
+grep -qF 'if [ "$REQUESTED" = "local" ]' "$ENGINE" \
+    || fail "conformance-target.yml must resolve the 'local' sentinel in a shell step (see #1760: a \${{ }} expression cannot produce an empty string)"
+
+grep -qF 'image-tag: ${{ steps.tag.outputs.value }}' "$ENGINE" \
+    || fail "conformance-target.yml must pass the RESOLVED tag to bring-up-cluster, not inputs.image-tag directly"
+
+# The callers forward the raw value; mapping there is what failed before.
 for f in "$WF_DIR"/conformance-*.yml; do
     [ -e "$f" ] || continue
     grep -qF "$MARKER" "$f" || continue          # generated files only
-    grep -qF "github.event.inputs.image-tag == 'local'" "$f" \
-        || fail "$(basename "$f"): image-tag must map the 'local' sentinel to an empty value, or a branch build is unreachable"
+    if grep -qF "github.event.inputs.image-tag == 'local'" "$f"; then
+        fail "$(basename "$f"): map the 'local' sentinel in the engine's shell step, not in a caller expression (#1760)"
+    fi
 done
 
 echo "PASS: per-target workflows in sync with targets.json ($(jq length "$MANIFEST") targets)"

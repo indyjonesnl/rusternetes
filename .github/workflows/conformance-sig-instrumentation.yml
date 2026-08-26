@@ -35,12 +35,9 @@ jobs:
     with:
       target: sig-instrumentation
       focus: ${{ github.event.inputs.focus || '' }}
-      # The engine builds from source when image-tag is EMPTY, but an empty
-      # dispatch value cannot reach it: GitHub substitutes this input's own
-      # `default: main` for an omitted-or-empty value, so `-f image-tag=''`
-      # arrives as 'main'. (An earlier attempt keyed on `== null` for the same
-      # reason and still resolved to 'main' -- see the run log line
-      # `image-tag: main`.) A literal sentinel is the only value that survives
-      # the round trip, so 'local' means "build this ref" and maps to the empty
-      # string the engine expects.
-      image-tag: ${{ github.event.inputs.image-tag == 'local' && '' || (github.event.inputs.image-tag || 'main') }}
+      # Forwarded verbatim. 'local' means "build this ref from source"; the
+      # engine turns it into the empty tag the bring-up action wants, in a
+      # shell step. Do NOT try to map it here: a `${{ }}` expression cannot
+      # produce an empty string via `A && '' || B` -- '' is falsy, so `||`
+      # wins and the sentinel leaks through unmapped (#1760).
+      image-tag: ${{ github.event.inputs.image-tag || 'main' }}
