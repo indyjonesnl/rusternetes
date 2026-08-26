@@ -593,7 +593,9 @@ impl<S: Storage + 'static> NamespaceController<S> {
                     phase: Some(Phase::Terminating),
                     conditions: Some(conditions),
                 });
-                let _ = self.storage.update(&key, &ns).await;
+                // Status subresource write: a full-object PUT through the
+                // api-server strips `.status` (#1723).
+                let _ = self.storage.update_status(&key, &ns).await;
                 info!(
                     "Namespace {} has pods with finalizers, conditions set (will delete other resources next cycle)",
                     name
@@ -685,7 +687,8 @@ impl<S: Storage + 'static> NamespaceController<S> {
                             phase: Some(Phase::Terminating),
                             conditions: Some(conditions),
                         });
-                        match self.storage.update(&key, &fresh_ns).await {
+                        // Status subresource write (#1723).
+                        match self.storage.update_status(&key, &fresh_ns).await {
                             Ok(_) => {
                                 info!("Namespace {} conditions set successfully", name);
                                 break;

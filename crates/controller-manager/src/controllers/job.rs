@@ -302,7 +302,8 @@ impl<S: Storage + 'static> JobController<S> {
                                 if let Some(ref mut s) = fresh_job.status {
                                     s.terminating = Some(terminating);
                                 }
-                                let _ = self.storage.update(&key, &fresh_job).await;
+                                // Status subresource write (#1723).
+                                let _ = self.storage.update_status(&key, &fresh_job).await;
                             }
                         }
                     }
@@ -521,11 +522,10 @@ impl<S: Storage + 'static> JobController<S> {
                 observed_generation: job.metadata.generation,
             });
             let key = format!("/registry/jobs/{}/{}", namespace, name);
-            // Refresh RV before update to avoid CAS conflict
-            if let Ok(mut fresh) = self.storage.get::<Job>(&key).await {
+            // Status subresource write — see the note above (#1723).
+            if let Ok(fresh) = self.storage.get::<Job>(&key).await {
                 if fresh.status != job.status {
-                    fresh.status = job.status.clone();
-                    self.storage.update(&key, &fresh).await?;
+                    self.storage.update_status(&key, &*job).await?;
                 }
             }
             return Ok(());
@@ -575,11 +575,13 @@ impl<S: Storage + 'static> JobController<S> {
                         observed_generation: job.metadata.generation,
                     });
                     let key = format!("/registry/jobs/{}/{}", namespace, name);
-                    // Refresh RV before update to avoid CAS conflict
-                    if let Ok(mut fresh) = self.storage.get::<Job>(&key).await {
+                    // Status subresource write: a full-object PUT through the
+                    // api-server strips `.status`, so status must go via
+                    // update_status — which does its own CAS read-modify-write,
+                    // making the manual re-read redundant (#1723).
+                    if let Ok(fresh) = self.storage.get::<Job>(&key).await {
                         if fresh.status != job.status {
-                            fresh.status = job.status.clone();
-                            self.storage.update(&key, &fresh).await?;
+                            self.storage.update_status(&key, &*job).await?;
                         }
                     }
                     return Ok(());
@@ -951,11 +953,10 @@ impl<S: Storage + 'static> JobController<S> {
                 observed_generation: job.metadata.generation,
             });
             let key = format!("/registry/jobs/{}/{}", namespace, name);
-            // Refresh RV before update to avoid CAS conflict
-            if let Ok(mut fresh) = self.storage.get::<Job>(&key).await {
+            // Status subresource write — see the note above (#1723).
+            if let Ok(fresh) = self.storage.get::<Job>(&key).await {
                 if fresh.status != job.status {
-                    fresh.status = job.status.clone();
-                    self.storage.update(&key, &fresh).await?;
+                    self.storage.update_status(&key, &*job).await?;
                 }
             }
             return Ok(());
@@ -1267,7 +1268,8 @@ impl<S: Storage + 'static> JobController<S> {
                         break;
                     }
                     fresh_job.status = status_to_save.clone();
-                    match self.storage.update(&key, &fresh_job).await {
+                    // Status subresource write (#1723).
+                    match self.storage.update_status(&key, &fresh_job).await {
                         Ok(_) => {
                             if has_complete || has_failed {
                                 info!(

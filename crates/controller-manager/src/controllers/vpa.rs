@@ -613,7 +613,8 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
         updated_vpa.status = Some(new_status);
 
         let key = rusternetes_storage::build_key("verticalpodautoscalers", Some(namespace), name);
-        self.storage.update(&key, &updated_vpa).await?;
+        // Status subresource write: a full-object PUT strips `.status` (#1723).
+        self.storage.update_status(&key, &updated_vpa).await?;
 
         debug!(
             "Updated VPA {}/{} status with recommendations",

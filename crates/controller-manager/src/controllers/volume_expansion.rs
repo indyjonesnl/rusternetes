@@ -284,7 +284,8 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
         updated_pvc.status = Some(status.clone());
 
         let pvc_key = build_key("persistentvolumeclaims", Some(namespace), pvc_name);
-        self.storage.update(&pvc_key, &updated_pvc).await?;
+        // Status subresource write: a full-object PUT strips `.status` (#1723).
+        self.storage.update_status(&pvc_key, &updated_pvc).await?;
 
         info!(
             "Updated PVC {}/{} status to ControllerResizeInProgress",
@@ -313,7 +314,8 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
                 status.resize_status = None; // Clear resize status when complete
                 updated_pvc.status = Some(status);
 
-                self.storage.update(&pvc_key, &updated_pvc).await?;
+                // Status subresource write: a full-object PUT strips `.status` (#1723).
+                self.storage.update_status(&pvc_key, &updated_pvc).await?;
 
                 info!("Expansion completed for PVC {}/{}", namespace, pvc_name);
                 Ok(())
@@ -326,7 +328,8 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
                     Some(PersistentVolumeClaimResizeStatus::ControllerResizeFailed);
                 updated_pvc.status = Some(status);
 
-                self.storage.update(&pvc_key, &updated_pvc).await?;
+                // Status subresource write: a full-object PUT strips `.status` (#1723).
+                self.storage.update_status(&pvc_key, &updated_pvc).await?;
 
                 Err(e)
             }

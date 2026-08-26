@@ -566,7 +566,8 @@ impl<S: Storage + 'static> NodeController<S> {
                 }
             }
         }
-        self.storage.update(&key, &updated).await?;
+        // Status subresource write: a full-object PUT strips `.status` (#1723).
+        self.storage.update_status(&key, &updated).await?;
 
         // Record the refreshed timestamps so the next reconcile sees no flip.
         {
@@ -654,8 +655,9 @@ impl<S: Storage + 'static> NodeController<S> {
             });
         }
 
-        // Update the node in storage
-        self.storage.update(&node_key, &updated_node).await?;
+        // Status subresource write: node conditions live under `.status`, which a
+        // full-object PUT strips (#1723).
+        self.storage.update_status(&node_key, &updated_node).await?;
 
         info!("Updated node {} status to ready={}", node_name, is_ready);
         Ok(())

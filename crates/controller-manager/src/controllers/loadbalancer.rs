@@ -375,7 +375,8 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
                 }),
                 conditions,
             });
-            if let Err(e) = self.storage.update(&key, &fresh).await {
+            // Status subresource write: a full-object PUT strips `.status` (#1723).
+            if let Err(e) = self.storage.update_status(&key, &fresh).await {
                 warn!(
                     "Failed to populate stub LB status for {}/{}: {}",
                     ns, name, e
@@ -584,7 +585,8 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
             conditions: existing_conditions,
         });
 
-        if let Err(e) = self.storage.update(&key, &current).await {
+        // Status subresource write (#1723).
+        if let Err(e) = self.storage.update_status(&key, &current).await {
             warn!(
                 "update_service_status for {}/{} failed: {} (workqueue will retry)",
                 namespace, name, e

@@ -265,7 +265,8 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
 
         // Save updated ResourceClaim
         let key = build_key("resourceclaims", Some(namespace), name);
-        self.storage.update(&key, claim).await?;
+        // Status subresource write: a full-object PUT strips `.status` (#1723).
+        self.storage.update_status(&key, claim).await?;
 
         info!(
             "Successfully allocated devices for ResourceClaim {}/{}",

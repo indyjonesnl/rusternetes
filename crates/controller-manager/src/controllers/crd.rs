@@ -467,7 +467,8 @@ impl<S: Storage + 'static> CRDController<S> {
         }
 
         crd.status = Some(new_status);
-        self.storage.update(&crd_key, &crd).await?;
+        // Status subresource write: a full-object PUT strips `.status` (#1723).
+        self.storage.update_status(&crd_key, &crd).await?;
 
         Ok(())
     }
