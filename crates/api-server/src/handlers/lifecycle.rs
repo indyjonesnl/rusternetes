@@ -44,9 +44,23 @@ pub fn maybe_increment_generation(
     }
     rusternetes_common::validation::pod::strip_empty_objects(&mut old_spec);
     rusternetes_common::validation::pod::strip_empty_objects(&mut new_spec);
+
+    // The sequence is owned by the stored object, never by the request body.
+    // Upstream `BeforeUpdate` unconditionally reinstates the stored generation
+    // before the strategy hook can bump it
+    // (staging/src/k8s.io/apiserver/pkg/registry/rest/update.go:127 —
+    // `objectMeta.SetGeneration(oldMeta.GetGeneration())`), so a client that
+    // PUTs a locally-built object with no generation — what the dynamic
+    // client's `Update()` sends — cannot reset the counter to 1.
+    let stored = old_json
+        .get("metadata")
+        .and_then(|m| m.get("generation"))
+        .and_then(|g| g.as_i64())
+        .unwrap_or(0);
+    metadata.generation = Some(stored);
+
     if old_spec != new_spec {
-        let current = metadata.generation.unwrap_or(0);
-        metadata.generation = Some(current + 1);
+        metadata.generation = Some(stored + 1);
     }
 }
 
@@ -206,6 +220,65 @@ mod tests {
         };
         maybe_increment_generation(&old, &new, &mut meta);
         assert_eq!(meta.generation, Some(1));
+    }
+
+    /// Upstream `registry/rest/update.go:127` does
+    /// `objectMeta.SetGeneration(oldMeta.GetGeneration())` *before* the
+    /// per-resource `PrepareForUpdate` hook runs, so whatever generation a
+    /// client happens to send is always discarded in favour of the stored one.
+    /// A dynamic-client `Update()` built from a locally-constructed object
+    /// sends no generation at all; basing the bump on that value restarts the
+    /// sequence at 1 and leaves `status.observedGeneration` ahead of
+    /// `metadata.generation` — seen in conformance
+    /// "[sig-apps] Deployment should run the lifecycle of a Deployment".
+    #[test]
+    fn generation_is_based_on_the_stored_object_not_the_request_body() {
+        let old = serde_json::json!({
+            "metadata": {"name": "test", "generation": 2},
+            "spec": {"replicas": 1},
+        });
+        let new = serde_json::json!({
+            "metadata": {"name": "test"},
+            "spec": {"replicas": 3},
+        });
+        // The incoming object carries no generation, exactly as a
+        // locally-built object PUT through the dynamic client would.
+        let mut meta = ObjectMeta::default();
+        maybe_increment_generation(&old, &new, &mut meta);
+        assert_eq!(meta.generation, Some(3));
+    }
+
+    #[test]
+    fn generation_is_restored_from_the_stored_object_when_the_spec_is_unchanged() {
+        let old = serde_json::json!({
+            "metadata": {"name": "test", "generation": 7},
+            "spec": {"replicas": 1},
+        });
+        let new = serde_json::json!({
+            "metadata": {"name": "test"},
+            "spec": {"replicas": 1},
+        });
+        let mut meta = ObjectMeta::default();
+        maybe_increment_generation(&old, &new, &mut meta);
+        assert_eq!(meta.generation, Some(7));
+    }
+
+    #[test]
+    fn a_client_supplied_generation_cannot_advance_the_sequence() {
+        let old = serde_json::json!({
+            "metadata": {"name": "test", "generation": 2},
+            "spec": {"replicas": 1},
+        });
+        let new = serde_json::json!({
+            "metadata": {"name": "test", "generation": 99},
+            "spec": {"replicas": 3},
+        });
+        let mut meta = ObjectMeta {
+            generation: Some(99),
+            ..Default::default()
+        };
+        maybe_increment_generation(&old, &new, &mut meta);
+        assert_eq!(meta.generation, Some(3));
     }
 
     #[test]
