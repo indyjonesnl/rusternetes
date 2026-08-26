@@ -23,16 +23,32 @@ use std::path::{Path, PathBuf};
 const DATA_DIR: &str = "..data";
 const NEW_DATA_DIR: &str = "..data_tmp";
 
-/// Project `payload` (relative user-visible path -> bytes) into `target_dir`,
-/// atomically and idempotently, applying `file_mode` to each projected file.
+/// One projected file: its bytes and **its own** mode.
+///
+/// Port of upstream `FileProjection` (`pkg/volume/util/atomic_writer.go:64-68`,
+/// minus `FsUser`, which we do not plumb yet). The mode is per file because a
+/// ConfigMap/Secret volume may set `items[].mode` on individual keys while the
+/// rest of the volume keeps `defaultMode` — collapsing it to one mode for the
+/// whole volume makes `items[].mode` unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileProjection {
+    pub data: Vec<u8>,
+    pub mode: u32,
+}
+
+/// Project `payload` (relative user-visible path -> [`FileProjection`]) into
+/// `target_dir`, atomically and idempotently, applying each entry's own mode.
+///
+/// This is the shape upstream's `AtomicWriter.Write` takes
+/// (`map[string]FileProjection`), so a volume with mixed per-item modes
+/// projects in one pass.
 ///
 /// No-op (no writes, no chmod, no symlink swap) when the on-disk `..data`
 /// payload already equals `payload` — the property that keeps kube-proxy and
 /// other config-file watchers stable across the kubelet's periodic re-SetUp.
-pub fn write_payload(
+pub fn write_projected_payload(
     target_dir: &Path,
-    payload: &BTreeMap<String, Vec<u8>>,
-    file_mode: u32,
+    payload: &BTreeMap<String, FileProjection>,
 ) -> io::Result<()> {
     std::fs::create_dir_all(target_dir)?;
     let data_link = target_dir.join(DATA_DIR);
@@ -55,13 +71,15 @@ pub fn write_payload(
         // 0755 so group/other can traverse into the data dir (upstream parity).
         std::fs::set_permissions(&ts_dir, std::fs::Permissions::from_mode(0o755))?;
 
-        for (rel, content) in payload {
+        for (rel, projection) in payload {
             let dest = ts_dir.join(rel);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&dest, content)?;
-            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(file_mode))?;
+            std::fs::write(&dest, &projection.data)?;
+            // Per-file mode: `items[].mode` when the volume set one for this
+            // key, else the volume's defaultMode (upstream FileProjection.Mode).
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(projection.mode))?;
         }
 
         // Atomically point `..data` at the new ts dir: create `..data_tmp`
@@ -111,10 +129,15 @@ pub fn write_payload(
 /// True when `payload` differs from what is stored under `old_ts_path` — any
 /// file whose bytes differ or is missing, or an extra file present on disk that
 /// is no longer in the payload.
-fn payload_differs(payload: &BTreeMap<String, Vec<u8>>, old_ts_path: &Path) -> bool {
-    for (rel, content) in payload {
+fn payload_differs(payload: &BTreeMap<String, FileProjection>, old_ts_path: &Path) -> bool {
+    for (rel, projection) in payload {
+        // Content only, not mode — upstream's `shouldWriteFile` compares bytes
+        // (`atomic_writer.go`), so a mode-only change does not trigger a
+        // rewrite there either. Comparing mode here would also break the
+        // unchanged-re-projection no-op that config-file watchers depend on
+        // (#1652).
         match std::fs::read(old_ts_path.join(rel)) {
-            Ok(existing) if existing == *content => {}
+            Ok(existing) if existing == projection.data => {}
             _ => return true,
         }
     }
@@ -142,11 +165,86 @@ fn new_timestamp_dirname() -> String {
 mod tests {
     use super::*;
 
-    fn payload(pairs: &[(&str, &[u8])]) -> BTreeMap<String, Vec<u8>> {
+    /// Uniform-mode payload, the common shape in these tests.
+    fn payload(pairs: &[(&str, &[u8])]) -> BTreeMap<String, FileProjection> {
         pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_vec()))
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    FileProjection {
+                        data: v.to_vec(),
+                        mode: 0o644,
+                    },
+                )
+            })
             .collect()
+    }
+
+    /// A `ConfigMap`/`Secret` volume may set a mode **per item**
+    /// (`items[].mode`), which upstream carries in `FileProjection.Mode`
+    /// (`pkg/volume/util/atomic_writer.go:64-68`) rather than as one mode for
+    /// the whole volume.
+    ///
+    /// Pins the upstream Conformance spec "ConfigMap should be consumable from
+    /// pods in volume with mappings and Item mode set [LinuxOnly]", which sets
+    /// `Items[0].Mode = 0400` on a nested path and asserts the projected file's
+    /// mode (`test/e2e/common/storage/configmap_volume.go:99-102`, via
+    /// `doConfigMapE2EWithMappings`).
+    #[tokio::test]
+    async fn per_item_mode_is_applied_to_each_projected_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aw-mode-{nanos}"));
+
+        // The spec's shape: a nested mapped path carrying its own mode, next to
+        // a file that keeps the volume default.
+        let mut projections: BTreeMap<String, FileProjection> = BTreeMap::new();
+        projections.insert(
+            "path/to/data-2".to_string(),
+            FileProjection {
+                data: b"value-2\n".to_vec(),
+                mode: 0o400,
+            },
+        );
+        projections.insert(
+            "plain".to_string(),
+            FileProjection {
+                data: b"value-1\n".to_vec(),
+                mode: 0o644,
+            },
+        );
+
+        write_projected_payload(&dir, &projections).unwrap();
+
+        let nested = dir.join("path/to/data-2");
+        assert_eq!(
+            std::fs::read(&nested).unwrap(),
+            b"value-2\n",
+            "nested mapped path must be readable through the ..data symlink"
+        );
+
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o400,
+            "items[].mode must reach the projected file (got {mode:o})"
+        );
+
+        let plain_mode = std::fs::metadata(dir.join("plain"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            plain_mode, 0o644,
+            "a sibling without items[].mode keeps the volume default"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Core regression: re-projecting an UNCHANGED payload must not touch the
@@ -162,7 +260,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aw-test-{nanos}"));
         let p = payload(&[("config.conf", b"hello=world\n")]);
 
-        write_payload(&dir, &p, 0o644).unwrap();
+        write_projected_payload(&dir, &p).unwrap();
         let visible = dir.join("config.conf");
         assert!(std::fs::symlink_metadata(&visible)
             .unwrap()
@@ -178,7 +276,7 @@ mod tests {
 
         // Re-project identical payload several times.
         for _ in 0..3 {
-            write_payload(&dir, &p, 0o644).unwrap();
+            write_projected_payload(&dir, &p).unwrap();
         }
         // `..data` must NOT have swapped, and the real file must be untouched.
         let data_link2 = std::fs::read_link(dir.join("..data")).unwrap();
@@ -194,7 +292,7 @@ mod tests {
 
         // A real change swaps ..data and updates content.
         let p2 = payload(&[("config.conf", b"hello=changed\n")]);
-        write_payload(&dir, &p2, 0o644).unwrap();
+        write_projected_payload(&dir, &p2).unwrap();
         assert_eq!(std::fs::read(&visible).unwrap(), b"hello=changed\n");
         assert_ne!(std::fs::read_link(dir.join("..data")).unwrap(), data_link2);
 
