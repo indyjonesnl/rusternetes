@@ -16,7 +16,7 @@ on:
         required: false
         default: ''
       image-tag:
-        description: "GHCR image tag to test (default main). Empty = build locally."
+        description: "GHCR image tag to test, or 'local' to build this ref from source (use 'local' to prove a PR)."
         required: false
         default: main
 
@@ -35,12 +35,12 @@ jobs:
     with:
       target: sig-network
       focus: ${{ github.event.inputs.focus || '' }}
-      # NOT `inputs.image-tag || 'main'`: an empty string is falsy in GitHub
-      # expressions, so an explicit `-f image-tag=''` collapsed back to 'main'
-      # and the run silently tested the published image instead of the branch
-      # under review. That made the documented "Empty = build locally" (honoured
-      # by conformance-target.yml and ci/actions/bring-up-cluster) unreachable
-      # from every per-target workflow, so no PR could be proven before merge.
-      # `== null` distinguishes "input omitted" (scheduled run -> default main)
-      # from "explicitly empty" (build the branch).
-      image-tag: ${{ github.event.inputs.image-tag == null && 'main' || github.event.inputs.image-tag }}
+      # The engine builds from source when image-tag is EMPTY, but an empty
+      # dispatch value cannot reach it: GitHub substitutes this input's own
+      # `default: main` for an omitted-or-empty value, so `-f image-tag=''`
+      # arrives as 'main'. (An earlier attempt keyed on `== null` for the same
+      # reason and still resolved to 'main' -- see the run log line
+      # `image-tag: main`.) A literal sentinel is the only value that survives
+      # the round trip, so 'local' means "build this ref" and maps to the empty
+      # string the engine expects.
+      image-tag: ${{ github.event.inputs.image-tag == 'local' && '' || (github.event.inputs.image-tag || 'main') }}
