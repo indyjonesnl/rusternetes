@@ -204,6 +204,45 @@ async fn start_cr_data_validator() -> (String, oneshot::Sender<()>) {
     (format!("http://{}", addr), tx)
 }
 
+/// Validating mock keyed off `metadata.labels["webhook-e2e-test"]`, the way
+/// upstream's CRD-denying webhook is: `testCRDDenyWebhook`
+/// (webhook.go:2342-2400) creates a CustomResourceDefinition carrying
+/// `webhook-e2e-test: webhook-disallow` and requires the create to fail with
+/// "the crd contains unwanted label". A CRD without that label must be
+/// admitted.
+async fn start_label_deny_validator() -> (String, oneshot::Sender<()>) {
+    let (tx, rx) = oneshot::channel();
+    let route = warp::post()
+        .and(warp::body::json())
+        .map(|r: AdmissionReview| {
+            let request = match r.request {
+                Some(req) => req,
+                None => {
+                    return warp::reply::json(&wrap(AdmissionReviewResponse::allow("u".into())))
+                }
+            };
+            let disallowed = request
+                .object
+                .as_ref()
+                .and_then(|o| o.pointer("/metadata/labels/webhook-e2e-test"))
+                .and_then(Value::as_str)
+                == Some("webhook-disallow");
+            if disallowed {
+                warp::reply::json(&wrap(AdmissionReviewResponse::deny(
+                    request.uid,
+                    "the crd contains unwanted label".to_string(),
+                )))
+            } else {
+                warp::reply::json(&wrap(AdmissionReviewResponse::allow(request.uid)))
+            }
+        });
+    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+        rx.await.ok();
+    });
+    tokio::spawn(srv);
+    (format!("http://{}", addr), tx)
+}
+
 /// Mutating mock that adds `/metadata/labels/{key}={value}`.
 async fn start_mutator_label(key: String, value: String) -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
@@ -1402,7 +1441,18 @@ async fn should_mutate_pod_and_apply_defaults_after_mutation() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:272
 ///   ("should not be able to mutate or prevent deletion of webhook configuration objects")
-///   Assertions live in testWebhooksForWebhookConfigurations (webhook.go:1696-1986).
+///   Assertions live in testWebhooksForWebhookConfigurations
+///   (webhook.go:1696-1830).
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// The case has two halves, and the mirror only had one. Webhook
+/// *configuration* objects are exempt from admission webhooks — the lockout
+/// protection — which upstream checks by (a) registering a mutating webhook
+/// that stamps a label onto everything and requiring the freshly-created
+/// configuration NOT to carry it, and (b) deleting the configuration while a
+/// deletion-denying webhook is registered. The mirror covered only the
+/// deletion half, and only for ValidatingWebhookConfiguration; upstream does
+/// both halves for both kinds.
 /// Sonobuoy (Round 160): PASS
 ///
 /// A deny-everything webhook that registers itself against admissionregistration
@@ -1469,11 +1519,138 @@ async fn should_not_be_able_to_mutate_or_prevent_deletion_of_webhook_configurati
 
     // DELETE must also succeed (200/202/204 — any 2xx).
     let status = delete_status(
-        router,
+        router.clone(),
         "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations/self-targeting",
     )
     .await;
     assert!(status.is_success(), "delete must succeed, got {status}");
+
+    // The other half of the upstream case: webhook *configuration* objects
+    // must also come back unmutated. Upstream registers a mutating webhook
+    // that stamps `addedLabelKey=addedLabelValue` onto everything it sees and
+    // then requires that the freshly-created configuration does NOT carry it
+    // (webhook.go:1746-1748 for the validating config, and again for the
+    // mutating one at webhook.go:1806-1808).
+    let (label_url_raw, _label_shutdown) =
+        start_mutator_label("webhook-e2e-test".into(), "webhook-added-label".into()).await;
+    let label_url = label_url_raw.replacen("http://", "https://", 1);
+    let mutate_everything = MutatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "MutatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("adding-label"),
+        webhooks: Some(vec![
+            MutatingWebhook {
+                rules: vec![rule_for(
+                    "admissionregistration.k8s.io",
+                    "v1",
+                    "validatingwebhookconfigurations",
+                )],
+                ..mutating("adding-label.k8s.io", label_url.clone(), vec![], None, None)
+            },
+            MutatingWebhook {
+                rules: vec![rule_for(
+                    "admissionregistration.k8s.io",
+                    "v1",
+                    "mutatingwebhookconfigurations",
+                )],
+                ..mutating("adding-label-2.k8s.io", label_url, vec![], None, None)
+            },
+        ]),
+    };
+    mem.create(
+        &build_key("mutatingwebhookconfigurations", None, "adding-label"),
+        &mutate_everything,
+    )
+    .await
+    .unwrap();
+
+    // A dummy validating configuration, created through the router.
+    let dummy_validating = json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingWebhookConfiguration",
+        "metadata": {"name": "dummy-validating"},
+        "webhooks": [{
+            "name": "dummy-validating-webhook.k8s.io",
+            "clientConfig": {"url": "https://127.0.0.1:1/"},
+            // Deliberately matches no real resource, as upstream's does.
+            "rules": [{
+                "operations": ["CREATE"],
+                "apiGroups": [""],
+                "apiVersions": ["v1"],
+                "resources": ["invalid"]
+            }],
+            "failurePolicy": "Ignore",
+            "sideEffects": "None",
+            "admissionReviewVersions": ["v1"]
+        }]
+    });
+    let (status, created) = post_json(
+        router.clone(),
+        "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations",
+        &dummy_validating,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "creating a validating webhook configuration must succeed: {created}"
+    );
+    assert!(
+        created["metadata"]["labels"]["webhook-e2e-test"].is_null(),
+        "expected the validating webhook configuration not to be mutated by          mutating webhooks, but it was: {created}"
+    );
+
+    // And the same for a mutating configuration.
+    let dummy_mutating = json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "MutatingWebhookConfiguration",
+        "metadata": {"name": "dummy-mutating"},
+        "webhooks": [{
+            "name": "dummy-mutating-webhook.k8s.io",
+            "clientConfig": {"url": "https://127.0.0.1:1/"},
+            "rules": [{
+                "operations": ["CREATE"],
+                "apiGroups": [""],
+                "apiVersions": ["v1"],
+                "resources": ["invalid"]
+            }],
+            "failurePolicy": "Ignore",
+            "sideEffects": "None",
+            "admissionReviewVersions": ["v1"]
+        }]
+    });
+    let (status, created) = post_json(
+        router.clone(),
+        "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations",
+        &dummy_mutating,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "creating a mutating webhook configuration must succeed: {created}"
+    );
+    assert!(
+        created["metadata"]["labels"]["webhook-e2e-test"].is_null(),
+        "expected the mutating webhook configuration not to be mutated by          mutating webhooks, but it was: {created}"
+    );
+
+    // Both must remain deletable — upstream deletes each one right after
+    // creating it (webhook.go:1754-1757 and :1814-1817).
+    for (plural, name) in [
+        ("validatingwebhookconfigurations", "dummy-validating"),
+        ("mutatingwebhookconfigurations", "dummy-mutating"),
+    ] {
+        let status = delete_status(
+            router.clone(),
+            &format!("/apis/admissionregistration.k8s.io/v1/{plural}/{name}"),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "deleting {plural}/{name} must succeed, got {status}"
+        );
+    }
 }
 
 /// [sig-api-machinery] AdmissionWebhook should mutate custom resource
@@ -1583,7 +1760,14 @@ async fn should_mutate_custom_resource() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:300
 ///   ("should deny crd creation")
-///   Assertions live in testCRDDenyWebhook (webhook.go:2342-2417).
+///   Assertions live in testCRDDenyWebhook (webhook.go:2342-2400).
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Upstream's webhook denies on a *label*: the CRD it submits carries
+/// `webhook-e2e-test: webhook-disallow` and the create must fail with "the crd
+/// contains unwanted label". The mirror pointed a deny-everything validator at
+/// a CRD with no labels at all, so the label condition was never exercised and
+/// no Allow was asserted. Both the denied and the admitted case now run.
 /// Sonobuoy (Round 160): PASS
 ///
 /// A validating webhook scoped to
@@ -1592,7 +1776,7 @@ async fn should_mutate_custom_resource() {
 async fn should_deny_crd_creation() {
     let mem = Arc::new(MemoryStorage::new());
     let manager = AdmissionWebhookManager::new(mem.clone());
-    let (url, _shutdown) = start_deny_validator("crd denied".into()).await;
+    let (url, _shutdown) = start_label_deny_validator().await;
 
     let cfg = ValidatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".to_string(),
@@ -1604,7 +1788,13 @@ async fn should_deny_crd_creation() {
                 "v1",
                 "customresourcedefinitions",
             )],
-            ..validating("deny.crd.io", url, vec![], Some(FailurePolicy::Fail), None)
+            ..validating(
+                "deny-crd.k8s.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
         }]),
     };
     mem.create(
@@ -1614,31 +1804,59 @@ async fn should_deny_crd_creation() {
     .await
     .unwrap();
 
-    let resp = manager
-        .run_validating_webhooks(
-            &Operation::Create,
-            &GroupVersionKind {
-                group: "apiextensions.k8s.io".into(),
-                version: "v1".into(),
-                kind: "CustomResourceDefinition".into(),
-            },
-            &GroupVersionResource {
-                group: "apiextensions.k8s.io".into(),
-                version: "v1".into(),
-                resource: "customresourcedefinitions".into(),
-            },
-            None,
-            "foos.example.com",
-            Some(json!({"metadata":{"name":"foos.example.com"}})),
-            None,
-            &admin_user_info(),
-        )
-        .await
-        .unwrap();
+    let crd = |labels: Value| {
+        json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "foos.example.com", "labels": labels}
+        })
+    };
+    let run = |object: Value| {
+        let manager = &manager;
+        async move {
+            manager
+                .run_validating_webhooks(
+                    &Operation::Create,
+                    &GroupVersionKind {
+                        group: "apiextensions.k8s.io".into(),
+                        version: "v1".into(),
+                        kind: "CustomResourceDefinition".into(),
+                    },
+                    &GroupVersionResource {
+                        group: "apiextensions.k8s.io".into(),
+                        version: "v1".into(),
+                        resource: "customresourcedefinitions".into(),
+                    },
+                    None,
+                    "foos.example.com",
+                    Some(object),
+                    None,
+                    &admin_user_info(),
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    // Upstream's CRD carries the disallowed label and the create must fail
+    // with the webhook's message (webhook.go:2396-2400).
+    let resp = run(crd(json!({"webhook-e2e-test": "webhook-disallow"}))).await;
     match resp {
-        AdmissionResponse::Deny(reason) => assert!(reason.contains("crd denied")),
-        other => panic!("expected Deny, got {other:?}"),
+        AdmissionResponse::Deny(reason) => assert!(
+            reason.contains("the crd contains unwanted label"),
+            "unexpected deny reason: {reason}"
+        ),
+        other => panic!("a CRD with the disallowed label must be denied, got {other:?}"),
     }
+
+    // The denial is label-conditional: without it the same CRD is admitted.
+    // Nothing in the mirror asserted an Allow before, so a deny-everything
+    // webhook satisfied it.
+    let resp = run(crd(json!({"webhook-e2e-test": "webhook-allow"}))).await;
+    assert!(
+        matches!(resp, AdmissionResponse::Allow),
+        "a CRD without the disallowed label must be admitted, got {resp:?}"
+    );
 }
 
 /// [sig-api-machinery] AdmissionWebhook should mutate custom resource with
@@ -1646,7 +1864,25 @@ async fn should_deny_crd_creation() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:314
 ///   ("should mutate custom resource with different stored version")
-///   Assertions live in testMultiVersionCustomResourceWebhook (webhook.go:2226-2288).
+///   Assertions live in testMultiVersionCustomResourceWebhook
+///   (webhook.go:2226-2287).
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Upstream's sequence is: create a CR while **v1** is the storage version;
+/// patch the CRD so **v2** becomes storage; then JSON-patch the CR through the
+/// **v2** client adding `/dummy`. It then asserts the mutating webhook's three
+/// `data` keys are all present *and* `dummy == "test"` — i.e. the webhook
+/// still fires, and its mutations survive, when the requested version is not
+/// the stored one.
+///
+/// Not mirrored, and why: the storage-version switch and the read-modify-write
+/// through a different served version need the CRD conversion path (a
+/// storage-version patch on the CRD, then a versioned client round-trip),
+/// which `AdmissionWebhookManager` does not sit on. What is decidable here is
+/// the half the manager owns — that the mutating webhook is selected and
+/// applies for each served version — and that is what this mirror asserts.
+/// Making the conversion half assertable is a bigger piece of work than the
+/// mirror audit; it is not silently claimed as covered.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn should_mutate_custom_resource_with_different_stored_version() {
