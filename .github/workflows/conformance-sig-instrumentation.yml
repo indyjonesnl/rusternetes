@@ -35,4 +35,12 @@ jobs:
     with:
       target: sig-instrumentation
       focus: ${{ github.event.inputs.focus || '' }}
-      image-tag: ${{ github.event.inputs.image-tag || 'main' }}
+      # NOT `inputs.image-tag || 'main'`: an empty string is falsy in GitHub
+      # expressions, so an explicit `-f image-tag=''` collapsed back to 'main'
+      # and the run silently tested the published image instead of the branch
+      # under review. That made the documented "Empty = build locally" (honoured
+      # by conformance-target.yml and ci/actions/bring-up-cluster) unreachable
+      # from every per-target workflow, so no PR could be proven before merge.
+      # `== null` distinguishes "input omitted" (scheduled run -> default main)
+      # from "explicitly empty" (build the branch).
+      image-tag: ${{ github.event.inputs.image-tag == null && 'main' || github.event.inputs.image-tag }}
