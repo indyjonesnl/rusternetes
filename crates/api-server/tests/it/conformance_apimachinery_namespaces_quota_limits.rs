@@ -33,13 +33,14 @@
 //! | namespace.go:276 should patch a Namespace | full, minus resourceVersion (#1751) |
 //! | resource_quota.go:243 capture the life of a pod | usage assertions + CREATE-path denial added; extended-resources denial still missing |
 //! | resource_quota.go:869 best effort scope | both scopes now asserted |
+//! | resource_quota.go:1009 manage the lifecycle | patch now changes metadata + spec in one request, as upstream does |
+//! | limit_range.go:65 defaults applied to pod | now driven through the real create route and re-fetched |
 //!
-//! Not yet re-derived: the remaining `resource_quota.go` cases (:87, :754,
-//! :950, :1009, :1078), `namespace.go` (:247, :256, :309, :376, :404) and
-//! `limit_range.go` (:65, :256). Nine upstream conformance cases in these
-//! sources have **no mirror at all** — the quota cases covering the life of a
-//! service, secret, configMap, replication controller and replica set among
-//! them.
+//! Not yet re-derived: `resource_quota.go` :87, :754, :950, :1078, and
+//! `namespace.go` :247, :256, :309, :376, :404, and `limit_range.go` :256.
+//! Nine upstream conformance cases in these sources have **no mirror at all** —
+//! the quota cases covering the life of a service, secret, configMap,
+//! replication controller and replica set among them.
 //!
 //! Do not treat this file as audited: the record above is explicitly partial.
 //!
@@ -1079,7 +1080,14 @@ async fn resource_quota_patch_spec_hard_persists() {
     .await;
     assert_eq!(s, 201);
 
-    let patch = json!({ "spec": { "hard": { "pods": "12", "configmaps": "5" } } });
+    // Upstream patches metadata and spec in a *single* request and asserts both
+    // landed (resource_quota.go:1044-1049): a label plus a changed
+    // `spec.hard.memory`. Patching two subtrees at once exercises merge
+    // behaviour that a spec-only patch does not.
+    let patch = json!({
+        "metadata": { "labels": { "rq-patch": "patched" } },
+        "spec": { "hard": { "pods": "12", "configmaps": "5", "requests.memory": "750Mi" } }
+    });
     let (status, body) = send_patch(
         router.clone(),
         "/api/v1/namespaces/default/resourcequotas/rq-patch",
@@ -1090,6 +1098,14 @@ async fn resource_quota_patch_spec_hard_persists() {
     assert_eq!(status, 200, "PATCH must return 200: body={}", body);
     assert_eq!(body["spec"]["hard"]["pods"], "12");
     assert_eq!(body["spec"]["hard"]["configmaps"], "5");
+    assert_eq!(
+        body["spec"]["hard"]["requests.memory"], "750Mi",
+        "the patched hard memory must land: {body}"
+    );
+    assert_eq!(
+        body["metadata"]["labels"]["rq-patch"], "patched",
+        "the patched label must land in the same request: {body}"
+    );
 
     let (_, get_body) = send_json(
         router,
@@ -1600,6 +1616,69 @@ async fn pod_admission_applies_limitrange_defaults() {
     let requests = resources.requests.expect("requests injected");
     assert_eq!(requests.get("cpu"), Some(&"250m".to_string()));
     assert_eq!(requests.get("memory"), Some(&"256Mi".to_string()));
+
+    // The check above drives the admission helper directly. Upstream creates
+    // the pod through the API and then **re-fetches it** before asserting the
+    // defaults (limit_range.go:128-137) — defaulting that is echoed in the
+    // create response but never persisted would pass a response-only check.
+    // Drive the real route and read the stored object back.
+    let (router, _mem) = spawn_router();
+    let ns = "lr-defaults-http";
+    let (s, body) = send_json(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/namespaces/{}/limitranges", ns),
+        Some(&limitrange_body(
+            "lr-http",
+            json!({
+                "type": "Container",
+                "default": { "cpu": "500m", "memory": "512Mi" },
+                "defaultRequest": { "cpu": "250m", "memory": "256Mi" }
+            }),
+        )),
+    )
+    .await;
+    assert_eq!(s, 201, "limitrange create: body={}", body);
+
+    let (s, body) = send_json(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/namespaces/{}/pods", ns),
+        Some(&json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "no-resources", "namespace": ns },
+            "spec": { "containers": [{ "name": "c", "image": "pause:latest" }] }
+        })),
+    )
+    .await;
+    assert_eq!(s, 201, "pod create must be admitted: body={}", body);
+
+    let (s, fetched) = send_json(
+        router,
+        "GET",
+        &format!("/api/v1/namespaces/{}/pods/no-resources", ns),
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "pod get: body={}", fetched);
+    let c = &fetched["spec"]["containers"][0]["resources"];
+    assert_eq!(
+        c["limits"]["cpu"], "500m",
+        "LimitRange default cpu must be persisted: {fetched}"
+    );
+    assert_eq!(
+        c["limits"]["memory"], "512Mi",
+        "LimitRange default memory must be persisted: {fetched}"
+    );
+    assert_eq!(
+        c["requests"]["cpu"], "250m",
+        "LimitRange defaultRequest cpu must be persisted: {fetched}"
+    );
+    assert_eq!(
+        c["requests"]["memory"], "256Mi",
+        "LimitRange defaultRequest memory must be persisted: {fetched}"
+    );
 }
 
 /// [sig-api-machinery] LimitRange admission rejects a pod whose container
