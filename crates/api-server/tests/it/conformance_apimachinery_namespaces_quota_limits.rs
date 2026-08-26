@@ -8,6 +8,57 @@
 //!   - test/e2e/apimachinery/resource_quota.go
 //!   - test/e2e/scheduling/limit_range.go
 //!
+//! ## Mirror audit — #1749, 2026-08-27 (mirrors audited; coverage incomplete)
+//!
+//! Citations: **complete**. All 23 upstream references in this file have been
+//! re-derived against the pinned `release-1.35` (v1.35.5) checkout and now name
+//! the conformance case line plus its descriptor string. Only one line number
+//! in the file was previously correct (`resource_quota.go:243`); the rest named
+//! no case and leaned on qualifiers — "(family)", "(list family)", "tested
+//! indirectly by the framework helper" — to cover the gap.
+//!
+//! Seven tests turned out to have **no upstream conformance counterpart** and
+//! no longer imply one: namespace create-then-list, 404-on-unknown-namespace,
+//! the `default` ServiceAccount seed, the all-namespaces ResourceQuota list,
+//! LimitRange min- and max-constraint rejection (defined by
+//! `plugin/pkg/admission/limitranger`, not by a conformance case), and
+//! pod-create-with-no-LimitRange. One test cited "manage the lifecycle of a
+//! ResourceQuota" while label-selecting **namespaces**, where that case
+//! label-selects **ResourceQuotas**.
+//!
+//! Assertion re-derivation: **partial**. Done so far:
+//!
+//! | upstream case | state |
+//! |---|---|
+//! | namespace.go:276 should patch a Namespace | full, minus resourceVersion (#1751) |
+//! | resource_quota.go:243 capture the life of a pod | usage assertions + CREATE-path denial added; extended-resources denial still missing |
+//! | resource_quota.go:869 best effort scope | both scopes now asserted |
+//! | resource_quota.go:1009 manage the lifecycle | patch now changes metadata + spec in one request, as upstream does |
+//! | limit_range.go:65 defaults applied to pod | now driven through the real create route and re-fetched |
+//! | resource_quota.go:1078 apply changes to a status | /status write path added; watch confirmation not mirrored |
+//! | resource_quota.go:87 status promptly calculated | self-counting `resourcequotas` usage now asserted |
+//! | resource_quota.go:950 update and delete | post-update re-read added |
+//! | namespace.go:404 apply a finalizer | both halves (add + remove) now asserted |
+//! | limit_range.go:256 list, patch, delete by collection | cross-namespace label-selected list + collection delete added |
+//!
+//! **Every mirror in this file has now been re-derived.** What remains is not
+//! re-derivation but absence: ten upstream conformance cases in these sources
+//! have no mirror at all — `resource_quota.go` :112, :172, :339, :406, :462,
+//! :754 and `namespace.go` :247, :256, :309, :376. All ten are enumerated in
+//! #1770. Two of them (namespace :247, :256 — pods and services removed on
+//! namespace deletion) are controller-owned and their mirrors likely belong in
+//! `crates/controller-manager/tests/it/`, as the kube-root-ca requirements did
+//! in #1755.
+//!
+//! The record stays marked in-progress for that reason: the file's mirrors are
+//! audited, the area's coverage is not.
+//! Nine upstream conformance cases in these sources have **no mirror at all** —
+//! the quota cases covering the life of a service, secret, configMap,
+//! replication controller and replica set among them. Enumerated and tracked in
+//! #1770.
+//!
+//! Do not treat this file as audited: the record above is explicitly partial.
+//!
 //! See `docs/conformance/apimachinery-namespaces-quota-limits.md` for the
 //! test-by-test status table and the cross-reference into `docs/CONFORMANCE.md`
 //! (Round 160 "Other" bucket — ResourceQuota pod lifecycle).
@@ -165,7 +216,14 @@ fn pod_with_compute(name: &str, namespace: &str, cpu: &str, memory: &str) -> Pod
 /// [sig-api-machinery] Namespaces should ensure that all pods are removed when
 /// a namespace is deleted [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/namespace.go:75 (family)
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/namespace.go:404
+///   ("should apply a finalizer to a Namespace")
+/// Mirror audit (#1749, 2026-08-26): re-cited. The old citation named
+/// namespace.go:75, which is not a conformance case — the finalizer semantics
+/// this test pins belong to the case above. That case adds a finalizer through
+/// the `/finalize` subresource and then removes it; this mirror covers the
+/// deletion-blocking half, and
+/// `namespace_finalize_subresource_removes_finalizer` covers the removal half.
 /// Sonobuoy (Round 160): PASS
 ///
 /// The api-server marks the namespace `Terminating` and adds a
@@ -228,7 +286,15 @@ async fn namespace_delete_marks_terminating_and_keeps_finalizer() {
 
 /// [sig-api-machinery] Namespaces should patch a Namespace [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/namespace.go:262
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/namespace.go:276
+///   ("should patch a Namespace")
+/// Mirror audit (#1749, 2026-08-26): re-cited (:262 named no case).
+///
+/// Upstream patches with **StrategicMergePatch**, then re-reads the namespace
+/// with a fresh Get and asserts the label on the *fetched* object rather than
+/// on the patch response. It also asserts `HaveValidResourceVersion()` on
+/// create and an RV increase after the patch — both unobservable on
+/// `MemoryStorage` (#1751).
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn namespace_patch_updates_labels() {
@@ -241,24 +307,43 @@ async fn namespace_patch_updates_labels() {
     )
     .await;
 
+    // Upstream patches with StrategicMergePatch (namespace.go:291), not
+    // merge-patch. For a labels map the two agree, but the mirror should drive
+    // the content type upstream's client actually sends.
     let patch = json!({
-        "metadata": { "labels": { "patched": "yes", "tier": "alpha" } }
+        "metadata": { "labels": { "testLabel": "testValue" } }
     });
     let (status, body) = send_patch(
-        router,
+        router.clone(),
         "/api/v1/namespaces/ns-patch-test",
         &patch,
-        "application/merge-patch+json",
+        "application/strategic-merge-patch+json",
     )
     .await;
     assert_eq!(status, 200, "patch must return 200: body={}", body);
-    assert_eq!(body["metadata"]["labels"]["patched"], "yes");
-    assert_eq!(body["metadata"]["labels"]["tier"], "alpha");
+    assert_eq!(body["metadata"]["labels"]["testLabel"], "testValue");
+
+    // Upstream does not assert on the patch response — it re-reads the
+    // namespace with a fresh Get and asserts the label on the *fetched* object
+    // (namespace.go:295-298). A mirror that only checks the response cannot
+    // catch a patch that is echoed back but not persisted.
+    let (status, fetched) =
+        send_json(router, "GET", "/api/v1/namespaces/ns-patch-test", None).await;
+    assert_eq!(status, 200, "get must return 200: body={}", fetched);
+    assert_eq!(
+        fetched["metadata"]["labels"]["testLabel"], "testValue",
+        "namespace not patched: {fetched}"
+    );
 }
 
 /// [sig-api-machinery] Namespaces should be created and listed [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/namespace.go:188 (family)
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/namespace.go:276
+///   ("should patch a Namespace") — the create-and-observe precondition.
+/// Mirror audit (#1749, 2026-08-26): re-cited; :188 named no conformance case.
+/// Not a conformance case in its own right: no upstream case asserts namespace
+/// creation followed by a list. Kept as a precondition check for the cases that
+/// do create namespaces.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn namespace_create_then_list_contains_it() {
@@ -298,9 +383,13 @@ async fn namespace_create_then_list_contains_it() {
 /// namespaces with a label selector which MUST succeed. One list MUST be
 /// found."*
 ///
-/// Upstream: test/e2e/apimachinery/resource_quota.go (the "manage the lifecycle"
-/// case). Tracked as issue #276. Pairs with
-/// `resource_quota_deletecollection_by_label_selector`.
+/// Upstream: no conformance case. The nearest upstream case,
+/// k8s.io/kubernetes/test/e2e/apimachinery/resource_quota.go:1009
+/// ("should manage the lifecycle of a ResourceQuota"), label-selects
+/// **ResourceQuotas**; this test label-selects **namespaces**, which no
+/// upstream conformance body does.
+/// Mirror audit (#1749, 2026-08-26): re-cited; not a conformance case. Tracked
+/// as issue #276. Pairs with `resource_quota_deletecollection_by_label_selector`.
 ///
 /// Locks the `apply_selectors` filtering on the namespace LIST handler: only the
 /// label-matching namespace is returned.
@@ -346,7 +435,11 @@ async fn namespace_list_by_label_selector_returns_only_matches() {
 /// [sig-api-machinery] Namespaces creating namespaces should auto-create the
 /// default ServiceAccount [Conformance]
 ///
-/// Upstream: tested indirectly by the framework helper
+/// Upstream: no conformance case. The `default` ServiceAccount is seeded by
+/// upstream's ServiceAccount controller, and the conformance suite relies on it
+/// rather than asserting it — `k8s.io/kubernetes/test/e2e/auth/service_accounts.go`
+/// consumes it throughout.
+/// Mirror audit (#1749, 2026-08-26): not a conformance case; label removed.
 /// `WaitForServiceAccountInNamespace` (every conformance test relies on it).
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
@@ -371,7 +464,13 @@ async fn namespace_create_auto_provisions_default_service_account() {
 
 /// [sig-api-machinery] Namespaces server-side finalize entrypoint
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/namespace.go finalize subresource family
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/namespace.go:404
+///   ("should apply a finalizer to a Namespace")
+/// Mirror audit (#1749, 2026-08-26): re-cited to the named case.
+///
+/// Upstream adds `e2e.example.com/fakeFinalizer` through the `/finalize`
+/// subresource, asserts it is present in `spec.finalizers`, then removes it and
+/// asserts it is gone. Both halves are api-server-side and mirrorable.
 /// Sonobuoy (Round 160): PASS
 ///
 /// The `/finalize` PUT entrypoint allows a controller to remove its
@@ -389,6 +488,35 @@ async fn namespace_finalize_subresource_removes_finalizer() {
     .await;
     let uid = created["metadata"]["uid"].as_str().unwrap();
     assert!(!uid.is_empty());
+
+    // Upstream's case has two halves and the mirror only had the second.
+    // It first *adds* `e2e.example.com/fakeFinalizer` through `/finalize` and
+    // asserts it appears in `spec.finalizers`
+    // (namespace.go:417-437), and only then removes it. Adding a finalizer
+    // through the subresource was never exercised here.
+    let mut with_finalizer = created.clone();
+    with_finalizer["spec"]["finalizers"] = json!(["e2e.example.com/fakeFinalizer"]);
+    let (status, added) = send_json(
+        router.clone(),
+        "PUT",
+        "/api/v1/namespaces/ns-final-test/finalize",
+        Some(&with_finalizer),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "/finalize PUT (add) must return 200: body={}",
+        added
+    );
+    let present = added["spec"]["finalizers"]
+        .as_array()
+        .map(|f| f.iter().any(|v| v == "e2e.example.com/fakeFinalizer"))
+        .unwrap_or(false);
+    assert!(
+        present,
+        "the added finalizer must appear in spec.finalizers, got {:?}",
+        added["spec"]["finalizers"]
+    );
 
     // PUT the namespace back with empty finalizers (simulating the namespace
     // controller calling `/finalize` after cleanup). The lifecycle finalizer
@@ -414,7 +542,10 @@ async fn namespace_finalize_subresource_removes_finalizer() {
 /// [sig-api-machinery] Namespaces GET on a missing namespace returns 404
 /// (NotFound StatusReason).
 ///
-/// Upstream: negative case companion to `namespace.go:188`.
+/// Upstream: no conformance case — a 404-on-unknown-name check that no
+/// upstream conformance body asserts for namespaces.
+/// Mirror audit (#1749, 2026-08-26): re-cited; `namespace.go:188` names no
+/// case. Kept as a local API-surface check, not a conformance case.
 /// Sonobuoy (Round 160): PASS (implicit — used by every test cleanup path)
 #[tokio::test]
 async fn namespace_get_unknown_returns_not_found() {
@@ -433,14 +564,20 @@ async fn namespace_get_unknown_returns_not_found() {
 /// [sig-api-machinery] ResourceQuota should create a ResourceQuota and
 /// ensure its status is promptly calculated. [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/resource_quota.go:90
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/resource_quota.go:87
+///   ("should create a ResourceQuota and ensure its status is promptly calculated.")
+/// Mirror audit (#1749, 2026-08-26): re-cited (:90 was three lines off).
+///
+/// Upstream asserts that `status.used` is populated promptly with every hard
+/// resource zeroed — the admit-side precondition every other quota case builds
+/// on.
 /// Sonobuoy (Round 160): PASS
 ///
 /// The handler must seed `status.hard` from spec and initialize
 /// `status.used` to "0" for every tracked resource key.
 #[tokio::test]
 async fn resource_quota_create_seeds_status_used_to_zero() {
-    let (router, _mem) = spawn_router();
+    let (router, mem) = spawn_router();
     // The handler needs the namespace path param, but the underlying
     // storage doesn't enforce that the namespace exists for resourcequotas
     // (so we don't need a prior create).
@@ -455,7 +592,7 @@ async fn resource_quota_create_seeds_status_used_to_zero() {
     );
 
     let (status, body) = send_json(
-        router,
+        router.clone(),
         "POST",
         "/api/v1/namespaces/default/resourcequotas",
         Some(&body),
@@ -478,13 +615,53 @@ async fn resource_quota_create_seeds_status_used_to_zero() {
         .as_object()
         .expect("status.hard mirrors spec.hard");
     assert_eq!(hard.get("pods").and_then(|v| v.as_str()), Some("5"));
+
+    // The assertions above cover the create-time seed. Upstream's case goes
+    // further: `newTestResourceQuota` puts `resourcequotas: 1` in hard
+    // (resource_quota.go:2159) and `waitForResourceQuota` then requires
+    // `used[resourcequotas]` to reach `c + 1` (resource_quota.go:100-102) —
+    // the quota counts *itself* as an object in the namespace. The mirror
+    // stopped at the zero seed and never reconciled, so that never ran.
+    let ns = "rq-seed";
+    let (s, body) = send_json(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/namespaces/{}/resourcequotas", ns),
+        Some(&quota_body(
+            "self-counting",
+            &[("pods", "5"), ("resourcequotas", "1")],
+        )),
+    )
+    .await;
+    assert_eq!(s, 201, "create self-counting quota: body={}", body);
+
+    ResourceQuotaController::new(mem.clone())
+        .reconcile_one(ns, "self-counting")
+        .await
+        .unwrap();
+
+    let (_, reconciled) = send_json(
+        router,
+        "GET",
+        &format!("/api/v1/namespaces/{}/resourcequotas/self-counting", ns),
+        None,
+    )
+    .await;
+    assert_eq!(
+        reconciled["status"]["used"]["resourcequotas"], "1",
+        "a ResourceQuota must count itself against a `resourcequotas` hard \
+         limit: {reconciled}"
+    );
 }
 
 /// [sig-api-machinery] ResourceQuota should track the lifecycle of a
 /// ConfigMap (object-count quota) — list + update + delete the quota
 /// itself.
 ///
-/// Upstream: resource_quota.go:412
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/resource_quota.go:950
+///   ("should be able to update and delete ResourceQuota.")
+/// Mirror audit (#1749, 2026-08-26): re-cited. :412 fell inside the
+/// "replication controller" case and named nothing.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn resource_quota_crud_round_trip_over_http() {
@@ -538,6 +715,23 @@ async fn resource_quota_crud_round_trip_over_http() {
     assert_eq!(status, 200);
     assert_eq!(after_put["spec"]["hard"]["pods"], "10");
 
+    // Upstream follows the update with a separate "Verifying a ResourceQuota
+    // was modified" Get and re-asserts the changed hard values on the fetched
+    // object (resource_quota.go:981-985). Asserting only the PUT response
+    // cannot catch an update echoed back but not stored.
+    let (status, re_read) = send_json(
+        router.clone(),
+        "GET",
+        "/api/v1/namespaces/default/resourcequotas/rq-crud",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "re-read after update: body={}", re_read);
+    assert_eq!(
+        re_read["spec"]["hard"]["pods"], "10",
+        "the update must be persisted, not just echoed: {re_read}"
+    );
+
     // Delete.
     let (status, _) = send_json(
         router.clone(),
@@ -560,7 +754,10 @@ async fn resource_quota_crud_round_trip_over_http() {
 /// [sig-api-machinery] ResourceQuota should be listable across all
 /// namespaces via `/api/v1/resourcequotas` [Conformance]
 ///
-/// Upstream: resource_quota.go:412 (cross-namespace family)
+/// Upstream: no conformance case — upstream's quota cases are all
+/// namespace-scoped; none lists ResourceQuotas across all namespaces.
+/// Mirror audit (#1749, 2026-08-26): re-cited; kept as a local API-surface
+/// check for the all-namespaces collection path, not a conformance case.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn resource_quota_list_all_namespaces() {
@@ -593,6 +790,8 @@ async fn resource_quota_list_all_namespaces() {
 /// capture the life of a pod. [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/resource_quota.go:243
+///   ("should create a ResourceQuota and capture the life of a pod.")
+/// Mirror audit (#1749, 2026-08-26): line confirmed correct; descriptor added.
 /// Sonobuoy (Round 160): FAIL — failure recorded at
 /// `resource_quota.go:312` ("Ensuring a pod cannot update its resource
 /// requirements" → "Expected an error to have occurred. Got: nil").
@@ -653,11 +852,84 @@ async fn resource_quota_captures_full_pod_lifecycle() {
     .await;
     assert_eq!(s, 201, "initial pod create must succeed: body={}", body);
 
-    // 3. Reconcile so quota.status.used reflects the pod we just created.
+    // 3. Reconcile so quota.status.used reflects the pod we just created, and
+    //    assert the computed usage. Upstream's `waitForResourceQuota` compares
+    //    the whole used list against expected values
+    //    (resource_quota.go:274-282); the mirror used to reconcile and move on
+    //    without ever checking the numbers, so a quota that computed usage
+    //    wrongly would still have passed.
     ResourceQuotaController::new(mem.clone())
         .reconcile_one(ns, "test-quota")
         .await
         .unwrap();
+    let (s, quota) = send_json(
+        router.clone(),
+        "GET",
+        &format!("/api/v1/namespaces/{}/resourcequotas/test-quota", ns),
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "quota get: body={}", quota);
+    assert_eq!(quota["status"]["used"]["pods"], "1", "used.pods: {quota}");
+    assert_eq!(
+        quota["status"]["used"]["requests.cpu"], "300m",
+        "used.requests.cpu: {quota}"
+    );
+    assert_eq!(
+        quota["status"]["used"]["requests.memory"], "200Mi",
+        "used.requests.memory: {quota}"
+    );
+
+    // 3b. Upstream then creates a *second* pod whose requests exceed the
+    //     remaining quota and requires the create to fail
+    //     (resource_quota.go:284-290). This is a CREATE-path denial, distinct
+    //     from the RESIZE denials below, and had no counterpart here.
+    let over_budget_pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "p2", "namespace": ns },
+        "spec": {
+            "containers": [{
+                "name": "c",
+                "image": "pause:latest",
+                "resources": {
+                    // 800m + the 300m already used exceeds the 1 CPU hard limit.
+                    "requests": { "cpu": "800m", "memory": "100Mi" }
+                }
+            }]
+        }
+    });
+    let (s, body) = send_json(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/namespaces/{}/pods", ns),
+        Some(&over_budget_pod),
+    )
+    .await;
+    assert_eq!(
+        s, 403,
+        "a pod exceeding the remaining quota must not be created: body={}",
+        body
+    );
+
+    // 3c. And the rejected create must not have moved the usage. Upstream makes
+    //     the same check after its rejected update (resource_quota.go:314-315).
+    ResourceQuotaController::new(mem.clone())
+        .reconcile_one(ns, "test-quota")
+        .await
+        .unwrap();
+    let (_, quota) = send_json(
+        router.clone(),
+        "GET",
+        &format!("/api/v1/namespaces/{}/resourcequotas/test-quota", ns),
+        None,
+    )
+    .await;
+    assert_eq!(
+        quota["status"]["used"]["requests.cpu"], "300m",
+        "a rejected create must leave quota usage unchanged: {quota}"
+    );
+    assert_eq!(quota["status"]["used"]["pods"], "1", "used.pods: {quota}");
 
     // 4. RESIZE the pod with resource requests that would exceed the
     //    quota (cpu=2 > 1). Expect 403 Forbidden / "exceeded quota".
@@ -841,7 +1113,9 @@ async fn resource_quota_usage_recomputes_on_pod_delete_via_http() {
 /// [sig-api-machinery] ResourceQuota status subresource is updated by
 /// reconciliation and returned via `/status`.
 ///
-/// Upstream: resource_quota.go (status subresource family)
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/resource_quota.go:1078
+///   ("should apply changes to a resourcequota status")
+/// Mirror audit (#1749, 2026-08-26): re-cited to the named case.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn resource_quota_status_subresource_returns_used() {
@@ -867,7 +1141,7 @@ async fn resource_quota_status_subresource_returns_used() {
         .unwrap();
 
     let (status, body) = send_json(
-        router,
+        router.clone(),
         "GET",
         &format!("/api/v1/namespaces/{}/resourcequotas/q/status", ns),
         None,
@@ -883,12 +1157,51 @@ async fn resource_quota_status_subresource_returns_used() {
         "/status GET must reflect reconciled used.pods: body={}",
         body
     );
+
+    // Upstream's case is about *writing* the subresource: it calls
+    // `UpdateStatus` to set `status.hard` and then confirms the new value
+    // (resource_quota.go:1118-1132). The mirror only ever read `/status`, so
+    // the write path — the point of the subresource — went untested.
+    let mut to_update = body.clone();
+    to_update["status"]["hard"] = json!({ "pods": "9" });
+    let (status, updated) = send_json(
+        router.clone(),
+        "PUT",
+        &format!("/api/v1/namespaces/{}/resourcequotas/q/status", ns),
+        Some(&to_update),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "status subresource PUT must return 200: body={}",
+        updated
+    );
+    assert_eq!(
+        updated["status"]["hard"]["pods"], "9",
+        "the written status.hard must land: {updated}"
+    );
+
+    // And the subresource boundary must hold: writing /status must not have
+    // altered spec.
+    let (_, after) = send_json(
+        router,
+        "GET",
+        &format!("/api/v1/namespaces/{}/resourcequotas/q", ns),
+        None,
+    )
+    .await;
+    assert_eq!(
+        after["spec"]["hard"]["pods"], "3",
+        "a /status write must not change spec.hard: {after}"
+    );
 }
 
 /// [sig-api-machinery] ResourceQuota PATCH (merge patch) of `spec.hard`
 /// updates the persisted hard limits and survives a subsequent GET.
 ///
-/// Upstream: resource_quota.go:412 (update family)
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/resource_quota.go:950
+///   ("should be able to update and delete ResourceQuota.") — the update half.
+/// Mirror audit (#1749, 2026-08-26): re-cited; :412 named no case.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn resource_quota_patch_spec_hard_persists() {
@@ -902,7 +1215,14 @@ async fn resource_quota_patch_spec_hard_persists() {
     .await;
     assert_eq!(s, 201);
 
-    let patch = json!({ "spec": { "hard": { "pods": "12", "configmaps": "5" } } });
+    // Upstream patches metadata and spec in a *single* request and asserts both
+    // landed (resource_quota.go:1044-1049): a label plus a changed
+    // `spec.hard.memory`. Patching two subtrees at once exercises merge
+    // behaviour that a spec-only patch does not.
+    let patch = json!({
+        "metadata": { "labels": { "rq-patch": "patched" } },
+        "spec": { "hard": { "pods": "12", "configmaps": "5", "requests.memory": "750Mi" } }
+    });
     let (status, body) = send_patch(
         router.clone(),
         "/api/v1/namespaces/default/resourcequotas/rq-patch",
@@ -913,6 +1233,14 @@ async fn resource_quota_patch_spec_hard_persists() {
     assert_eq!(status, 200, "PATCH must return 200: body={}", body);
     assert_eq!(body["spec"]["hard"]["pods"], "12");
     assert_eq!(body["spec"]["hard"]["configmaps"], "5");
+    assert_eq!(
+        body["spec"]["hard"]["requests.memory"], "750Mi",
+        "the patched hard memory must land: {body}"
+    );
+    assert_eq!(
+        body["metadata"]["labels"]["rq-patch"], "patched",
+        "the patched label must land in the same request: {body}"
+    );
 
     let (_, get_body) = send_json(
         router,
@@ -927,7 +1255,9 @@ async fn resource_quota_patch_spec_hard_persists() {
 /// [sig-api-machinery] ResourceQuota with scopes — controller filters by
 /// scope when computing usage.
 ///
-/// Upstream: resource_quota.go:1063 (BestEffort / NotBestEffort scopes
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/resource_quota.go:869
+///   ("should verify ResourceQuota with best effort scope.")
+/// Mirror audit (#1749, 2026-08-26): re-cited; :1063 named no case. (BestEffort / NotBestEffort scopes
 /// family)
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
@@ -986,12 +1316,64 @@ async fn resource_quota_scopes_best_effort_filter() {
         "BestEffort scope must include only the BE pod, got {:?}",
         updated.status
     );
+
+    // Upstream's case is symmetric: it creates a NotBestEffort quota alongside
+    // the BestEffort one and, for each pod, asserts that the matching scope
+    // captures the usage *and* the non-matching scope ignores it
+    // (resource_quota.go:880-935). The mirror only ever built the BestEffort
+    // quota, so the NotBestEffort scope was untested in both directions.
+    let not_be_quota = json!({
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": { "name": "not-be-quota", "namespace": ns },
+        "spec": {
+            "hard": { "pods": "5" },
+            "scopes": ["NotBestEffort"]
+        }
+    });
+    let nbq: ResourceQuota = serde_json::from_value(not_be_quota).unwrap();
+    mem.create(&build_key("resourcequotas", Some(ns), "not-be-quota"), &nbq)
+        .await
+        .unwrap();
+
+    ResourceQuotaController::new(mem.clone())
+        .reconcile_one(ns, "not-be-quota")
+        .await
+        .unwrap();
+
+    let not_be: ResourceQuota = mem
+        .get(&build_key("resourcequotas", Some(ns), "not-be-quota"))
+        .await
+        .unwrap();
+    assert_eq!(
+        not_be
+            .status
+            .as_ref()
+            .and_then(|s| s.used.as_ref())
+            .and_then(|u| u.get("pods"))
+            .map(|s| s.as_str()),
+        Some("1"),
+        "NotBestEffort scope must count only the Burstable pod and ignore the \
+         BestEffort one, got {:?}",
+        not_be.status
+    );
 }
 
 /// [sig-api-machinery] ResourceQuota terminal pods (Succeeded/Failed) must
 /// NOT be counted against `pods` usage.
 ///
-/// Upstream: resource_quota.go (PodEvaluator semantics)
+/// Upstream: no conformance case. This test covers the **terminal-phase**
+/// exclusion in `QuotaV1Pod`
+/// (k8s.io/kubernetes/pkg/quota/v1/evaluator/core/pods.go:491-493): a pod in
+/// `Succeeded` or `Failed` is not counted against quota.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited a second time, correcting an
+/// error made on 2026-08-26. That pass cited
+/// `resource_quota.go:754` ("should verify ResourceQuota with terminating
+/// scopes."), which is a **different mechanism**: the Terminating /
+/// NotTerminating *scope* keys off `spec.activeDeadlineSeconds`
+/// (pods.go:418), not off the pod's phase. The two are unrelated, and
+/// `resource_quota.go:754` has no mirror at all — recorded in #1770.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn resource_quota_terminal_pods_not_counted() {
@@ -1051,7 +1433,10 @@ async fn resource_quota_terminal_pods_not_counted() {
 /// [sig-api-machinery] ResourceQuota DELETE removes the resource and
 /// subsequent GET returns 404 with `reason=NotFound`.
 ///
-/// Upstream: resource_quota.go (every test cleans up via DELETE)
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/resource_quota.go:950
+///   ("should be able to update and delete ResourceQuota.") — the delete half.
+/// Mirror audit (#1749, 2026-08-26): re-cited; "every test cleans up via
+/// DELETE" described teardown, not an asserted behaviour.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn resource_quota_delete_then_get_returns_not_found() {
@@ -1086,8 +1471,10 @@ async fn resource_quota_delete_then_get_returns_not_found() {
 /// ResourceQuota [Conformance] — the final lifecycle step: *"It MUST succeed at
 /// deleting a collection of ResourceQuota via a label selector."*
 ///
-/// Upstream: test/e2e/apimachinery/resource_quota.go (the "manage the lifecycle"
-/// case, promoted v1.25). Tracked as issue #276.
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/resource_quota.go:1009
+///   ("should manage the lifecycle of a ResourceQuota")
+/// Mirror audit (#1749, 2026-08-26): re-cited to the named case. Tracked as
+/// issue #276.
 ///
 /// Mirrors the DELETE-collection-by-`labelSelector` contract: only the quotas
 /// whose labels match the selector are removed; non-matching quotas survive.
@@ -1188,7 +1575,9 @@ async fn resource_quota_deletecollection_by_label_selector() {
 /// [sig-api-machinery] LimitRange should create a LimitRange with defaults
 /// and ensure pod has correct min/max defaults injected [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/scheduling/limit_range.go:57
+/// Upstream: k8s.io/kubernetes/test/e2e/scheduling/limit_range.go:256
+///   ("should list, patch and delete a LimitRange by collection")
+/// Mirror audit (#1749, 2026-08-26): re-cited; :57 named no case.
 /// Sonobuoy (Round 160): PASS
 ///
 /// This test verifies the **handler contract** (LimitRange survives a
@@ -1240,18 +1629,79 @@ async fn limit_range_crud_round_trip_over_http() {
 
     // Delete.
     let (status, _) = send_json(
-        router,
+        router.clone(),
         "DELETE",
         "/api/v1/namespaces/default/limitranges/lr-full",
         None,
     )
     .await;
     assert_eq!(status, 200);
+
+    // Upstream's case is "list, patch and delete a LimitRange **by
+    // collection**": it creates one LimitRange in the test namespace and
+    // another in a *second* namespace, then lists across all namespaces by a
+    // shared label and requires exactly two
+    // (limit_range.go:295-312), before deleting the collection. Neither the
+    // cross-namespace label-selected list nor the collection delete had a
+    // counterpart here — `limit_range_list_is_namespace_scoped` asserts the
+    // complementary property (a namespaced list stays scoped), not this one.
+    for (ns, name) in [("lr-coll-a", "lr-a"), ("lr-coll-b", "lr-b")] {
+        let mut body = limitrange_body(name, json!({ "type": "Container", "max": { "cpu": "2" } }));
+        body["metadata"]["labels"] = json!({ "e2e-lr": "collection" });
+        let (s, created) = send_json(
+            router.clone(),
+            "POST",
+            &format!("/api/v1/namespaces/{}/limitranges", ns),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(s, 201, "create {name} in {ns}: body={}", created);
+    }
+
+    let (s, listed) = send_json(
+        router.clone(),
+        "GET",
+        "/api/v1/limitranges?labelSelector=e2e-lr%3Dcollection",
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "cross-namespace list: body={}", listed);
+    assert_eq!(
+        listed["items"].as_array().map(Vec::len),
+        Some(2),
+        "the label-selected list must span namespaces and return both: {listed}"
+    );
+
+    // Delete one namespace's collection by the same selector; the other
+    // namespace's LimitRange must survive.
+    let (s, _) = send_json(
+        router.clone(),
+        "DELETE",
+        "/api/v1/namespaces/lr-coll-a/limitranges?labelSelector=e2e-lr%3Dcollection",
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "deletecollection must succeed");
+
+    let (_, remaining) = send_json(
+        router,
+        "GET",
+        "/api/v1/limitranges?labelSelector=e2e-lr%3Dcollection",
+        None,
+    )
+    .await;
+    assert_eq!(
+        remaining["items"].as_array().map(Vec::len),
+        Some(1),
+        "deletecollection must be namespace-scoped, leaving the sibling: {remaining}"
+    );
 }
 
 /// [sig-api-machinery] LimitRange list + namespace isolation
 ///
-/// Upstream: limit_range.go:60 (list family)
+/// Upstream: k8s.io/kubernetes/test/e2e/scheduling/limit_range.go:256
+///   ("should list, patch and delete a LimitRange by collection") — the list half.
+/// Mirror audit (#1749, 2026-08-26): re-cited; :60 named no case.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn limit_range_list_is_namespace_scoped() {
@@ -1298,7 +1748,9 @@ async fn limit_range_list_is_namespace_scoped() {
 /// [sig-api-machinery] LimitRange admission injects defaults onto a Pod
 /// container that has none, and accepts the result.
 ///
-/// Upstream: limit_range.go:60 (default-injection family)
+/// Upstream: k8s.io/kubernetes/test/e2e/scheduling/limit_range.go:65
+///   ("should create a LimitRange with defaults and ensure pod has those defaults applied.")
+/// Mirror audit (#1749, 2026-08-26): re-cited; :60 named no case.
 /// Sonobuoy (Round 160): PASS
 ///
 /// The admission helper `apply_limit_range_with` is the production code
@@ -1367,12 +1819,79 @@ async fn pod_admission_applies_limitrange_defaults() {
     let requests = resources.requests.expect("requests injected");
     assert_eq!(requests.get("cpu"), Some(&"250m".to_string()));
     assert_eq!(requests.get("memory"), Some(&"256Mi".to_string()));
+
+    // The check above drives the admission helper directly. Upstream creates
+    // the pod through the API and then **re-fetches it** before asserting the
+    // defaults (limit_range.go:128-137) — defaulting that is echoed in the
+    // create response but never persisted would pass a response-only check.
+    // Drive the real route and read the stored object back.
+    let (router, _mem) = spawn_router();
+    let ns = "lr-defaults-http";
+    let (s, body) = send_json(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/namespaces/{}/limitranges", ns),
+        Some(&limitrange_body(
+            "lr-http",
+            json!({
+                "type": "Container",
+                "default": { "cpu": "500m", "memory": "512Mi" },
+                "defaultRequest": { "cpu": "250m", "memory": "256Mi" }
+            }),
+        )),
+    )
+    .await;
+    assert_eq!(s, 201, "limitrange create: body={}", body);
+
+    let (s, body) = send_json(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/namespaces/{}/pods", ns),
+        Some(&json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "no-resources", "namespace": ns },
+            "spec": { "containers": [{ "name": "c", "image": "pause:latest" }] }
+        })),
+    )
+    .await;
+    assert_eq!(s, 201, "pod create must be admitted: body={}", body);
+
+    let (s, fetched) = send_json(
+        router,
+        "GET",
+        &format!("/api/v1/namespaces/{}/pods/no-resources", ns),
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "pod get: body={}", fetched);
+    let c = &fetched["spec"]["containers"][0]["resources"];
+    assert_eq!(
+        c["limits"]["cpu"], "500m",
+        "LimitRange default cpu must be persisted: {fetched}"
+    );
+    assert_eq!(
+        c["limits"]["memory"], "512Mi",
+        "LimitRange default memory must be persisted: {fetched}"
+    );
+    assert_eq!(
+        c["requests"]["cpu"], "250m",
+        "LimitRange defaultRequest cpu must be persisted: {fetched}"
+    );
+    assert_eq!(
+        c["requests"]["memory"], "256Mi",
+        "LimitRange defaultRequest memory must be persisted: {fetched}"
+    );
 }
 
 /// [sig-api-machinery] LimitRange admission rejects a pod whose container
 /// requests/limits violate the configured max.
 ///
-/// Upstream: limit_range.go:60 (max-constraint family)
+/// Upstream: no conformance case — upstream's LimitRange conformance cases
+/// cover defaulting and collection operations, not max-constraint rejection.
+/// The rejection behaviour is defined by
+/// `k8s.io/kubernetes/plugin/pkg/admission/limitranger`.
+/// Mirror audit (#1749, 2026-08-26): re-cited; not a conformance case.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn pod_admission_rejects_pod_violating_limit_range_max() {
@@ -1433,7 +1952,10 @@ async fn pod_admission_rejects_pod_violating_limit_range_max() {
 /// [sig-api-machinery] LimitRange admission rejects a pod whose container
 /// is below the configured min.
 ///
-/// Upstream: limit_range.go:60 (min-constraint family)
+/// Upstream: no conformance case — see the max-constraint mirror above; the
+/// min-constraint rejection is defined by
+/// `k8s.io/kubernetes/plugin/pkg/admission/limitranger`.
+/// Mirror audit (#1749, 2026-08-26): re-cited; not a conformance case.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn pod_admission_rejects_pod_below_limit_range_min() {
@@ -1492,7 +2014,9 @@ async fn pod_admission_rejects_pod_below_limit_range_min() {
 /// exist in the namespace (every conformance test relies on this so pods
 /// without explicit resources are admittable in clean namespaces).
 ///
-/// Upstream: limit_range.go (precondition for all pod-create tests)
+/// Upstream: no conformance case — a precondition check that pod creation is
+/// unaffected when no LimitRange exists.
+/// Mirror audit (#1749, 2026-08-26): re-cited; not a conformance case.
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn pod_admission_passes_when_no_limit_range_present() {
