@@ -25,22 +25,43 @@
 //!     /var/run/secrets/kubernetes.io/serviceaccount; kubelet materialisation
 //!     of the files is covered live.
 //!
-//! IGNORED (failing, gap annotated):
-//!   - SubjectReview full conformance (end-to-end impersonation not wired)
-//!
 //! The CSR full lifecycle (create → approve → issued certificate) now passes:
 //! the signer lives in the controller-manager (`controllers::cert_authority`),
 //! and the api-server half (storing/serving `status.certificate`) is covered by
 //! `csr_full_lifecycle_with_signer_issues_certificate` below.
+//!
+//! ## Mirror audit — #1749, 2026-08-25
+//!
+//! Every `framework.ConformanceIt` cited by this file has been opened and
+//! re-derived assertion by assertion. Do not treat this file as audited again
+//! after a change: re-run the same check and move the date, or drop this
+//! block.
+//!
+//! | upstream case | state |
+//! |---|---|
+//! | service_accounts.go:193 automount opt-out | full — all nine table cases |
+//! | service_accounts.go:307 projected token | admission half; kubelet materialisation is live-only |
+//! | service_accounts.go:561 OIDC discovery | document contract full; in-cluster validator is live-only; the bootstrap ClusterRole precondition is #1753 |
+//! | service_accounts.go:775 kube-root-ca | requirement 1 here; 2 and 3 in controller-manager's `namespace_controller_test.rs` |
+//! | certificates.go:202 CSR API operations | full, minus resourceVersion (#1751) |
+//!
+//! A previous header block listed "IGNORED (failing, gap annotated):
+//! SubjectReview full conformance (end-to-end impersonation not wired)". Both
+//! halves were stale — no test in this file is `#[ignore]`d, and inbound
+//! impersonation is wired and exercised by
+//! `self_subject_review_reflects_the_impersonated_identity`.
 
 use rusternetes_common::{
     resources::ServiceAccount,
     types::{ObjectMeta, TypeMeta},
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, WatchEvent};
 use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
+use tokio_stream::StreamExt;
 
 // ---------------------------------------------------------------------------
 // HTTP harness — thin shims over the shared `TestApiServer`. The token-signing
@@ -143,48 +164,86 @@ async fn seed_service_account(mem: &Arc<MemoryStorage>, namespace: &str, name: &
 // conformance case.
 // ---------------------------------------------------------------------------
 
-/// `/.well-known/openid-configuration` must return a 200 with a JSON body
-/// containing at least `issuer`, `jwks_uri` and
-/// `id_token_signing_alg_values_supported`.
+/// [sig-auth] ServiceAccounts ServiceAccountIssuerDiscovery should support OIDC
+/// discovery of service account issuer [Conformance] — the discovery-document
+/// half.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go ServiceAccountIssuerDiscovery
+/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:561-668
 /// Sonobuoy (batch-64, 2026-05-28): PASS
+/// Mirror audit (#1749, 2026-08-25): re-derived.
+///
+/// The upstream body itself asserts nothing about the document: it grants the
+/// namespace's `default` SA the `system:service-account-issuer-discovery`
+/// ClusterRole, runs an agnhost pod with
+/// `--args test-service-account-issuer-discovery`, and asserts only that the
+/// pod succeeds. The document contract it is exercising is the struct the
+/// api-server serves, `openIDMetadata` in
+/// k8s.io/kubernetes/pkg/serviceaccount/openidmetadata.go:199-211, whose five
+/// fields are each annotated "REQUIRED in OIDC", with the fixed values set at
+/// openidmetadata.go:222-228 (`response_types_supported: ["id_token"]` —
+/// "Kubernetes only produces ID tokens" — and `subject_types_supported:
+/// ["public"]`). This mirror asserts all five; before the audit it asserted
+/// three, omitting `response_types_supported` and `subject_types_supported`.
+///
+/// Not mirrored, and why: running the validator in-cluster needs a live
+/// kubelet and a pod that reaches the endpoints over the network.
+///
+/// Also not mirrored: upstream's precondition that
+/// `system:service-account-issuer-discovery` "should have already been
+/// automatically created as part of the RBAC bootstrap policy"
+/// (service_accounts.go:563-565). `crates/api-server/src/bootstrap.rs` seeds
+/// only `cluster-admin` and its binding, so that ClusterRole and its binding
+/// to `system:serviceaccounts` (upstream policy.go:555-566 and :709) do not
+/// exist here. Porting them is #1753, not this test-only change.
 #[tokio::test]
 async fn oidc_discovery_document_is_valid() {
     let (state, _) = spawn_state();
     let (status, body) = get_json(state, "/.well-known/openid-configuration").await;
     assert_eq!(status, 200, "OIDC discovery must return 200: {body}");
-    assert!(
-        body["issuer"].as_str().is_some(),
-        "OIDC discovery must have 'issuer': {body}"
-    );
-    assert!(
-        body["jwks_uri"].as_str().is_some(),
-        "OIDC discovery must have 'jwks_uri': {body}"
-    );
-    assert!(
-        body["id_token_signing_alg_values_supported"]
-            .as_array()
-            .is_some(),
-        "OIDC discovery must have 'id_token_signing_alg_values_supported': {body}"
-    );
-    // The issuer and jwks_uri must be non-empty strings.
-    let issuer = body["issuer"].as_str().unwrap();
+
+    // openIDMetadata.Issuer / .JWKSURI — REQUIRED, and meaningful to relying
+    // parties, so they must be non-empty.
+    let issuer = body["issuer"]
+        .as_str()
+        .unwrap_or_else(|| panic!("OIDC discovery must have 'issuer': {body}"));
     assert!(
         !issuer.is_empty(),
         "OIDC discovery issuer must be non-empty: {body}"
     );
-    let jwks_uri = body["jwks_uri"].as_str().unwrap();
+    let jwks_uri = body["jwks_uri"]
+        .as_str()
+        .unwrap_or_else(|| panic!("OIDC discovery must have 'jwks_uri': {body}"));
     assert!(
         !jwks_uri.is_empty(),
         "OIDC discovery jwks_uri must be non-empty: {body}"
     );
+
+    // openIDMetadata.ResponseTypes / .SubjectTypes — REQUIRED, and fixed
+    // upstream (openidmetadata.go:225-226).
+    assert_eq!(
+        body["response_types_supported"],
+        json!(["id_token"]),
+        "Kubernetes only produces ID tokens: {body}"
+    );
+    assert_eq!(
+        body["subject_types_supported"],
+        json!(["public"]),
+        "OIDC subject identifier type: {body}"
+    );
+
+    // openIDMetadata.SigningAlgs — REQUIRED; upstream derives it from the
+    // key set, so only its shape is fixed.
+    let algs = body["id_token_signing_alg_values_supported"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("OIDC discovery must have 'id_token_signing_alg_values_supported': {body}")
+        });
+    assert!(
+        !algs.is_empty(),
+        "id_token_signing_alg_values_supported must not be empty: {body}"
+    );
 }
 
-/// `/openid/v1/jwks` must return a 200 with a `keys` array (may be empty if
-/// no RSA signing key is present in the test environment, but the shape must
-/// be correct — upstream conformance checks the document parses as JWKS).
-///
 /// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go ServiceAccountIssuerDiscovery
 /// Sonobuoy (batch-64, 2026-05-28): PASS
 #[tokio::test]
@@ -209,87 +268,171 @@ async fn oidc_jwks_endpoint_returns_key_set() {
 // [sig-auth] ServiceAccounts should allow opting out of API token automount
 // [Conformance]
 //
-// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:
-//   "should allow opting out of API token automount"
+// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:193-297
 // Sonobuoy (batch-64, 2026-05-28): PASS
-//
-// If a ServiceAccount has `automountServiceAccountToken: false`, a Pod that
-// omits the field must NOT get a projected SA token volume injected.
 // ---------------------------------------------------------------------------
 
-/// Creating an SA with `automountServiceAccountToken: false` and a pod that
-/// explicitly opts out must result in no projected SA-token volume.
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go opt-out block
+/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:193-297
 /// Sonobuoy (batch-64, 2026-05-28): PASS
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Upstream is a **nine-case table** — three ServiceAccounts (`default` with
+/// the field unset, `mount` with it `true`, `nomount` with it `false`) crossed
+/// with three pod-spec values (unset, `true`, `false`) — and the point of the
+/// test is the precedence, stated in its own comments as "Make sure pod spec
+/// trumps when opting in" and "…when opting out". Every case asserts on the
+/// **created pod object**, not on a running container: upstream walks
+/// `createdPod.Spec.Containers[*].VolumeMounts[*]` looking for a mount at
+/// `serviceaccount.DefaultAPITokenMountPath`
+/// (plugin/pkg/admission/serviceaccount/admission.go:57 —
+/// "/var/run/secrets/kubernetes.io/serviceaccount"). That makes the whole
+/// table mirrorable through the create handler.
+///
+/// Before the #1749 audit this mirror ran exactly one of the nine cases — SA
+/// `false` + pod-spec `false`, the case where the two agree — so the
+/// precedence the test exists to pin was never exercised. It also asserted on
+/// `spec.volumes[*].projected.sources[*].serviceAccountToken` rather than on
+/// the container mount path upstream checks.
 #[tokio::test]
-async fn service_account_automount_opt_out_suppresses_projected_token_volume() {
+async fn service_account_automount_opt_out_table() {
     let (state, _) = spawn_state();
     let ns = "sa-automount-optout";
 
-    // Create a ServiceAccount with automount disabled.
-    let sa_body = json!({
-        "apiVersion": "v1",
-        "kind": "ServiceAccount",
-        "metadata": {"name": "no-automount"},
-        "automountServiceAccountToken": false
-    });
-    let (status, created_sa) = post_json(
+    // Upstream's framework creates the namespace, and the ServiceAccount
+    // controller seeds `default` into it with the field unset.
+    let (status, created_ns) = post_json(
         state.clone(),
-        &format!("/api/v1/namespaces/{ns}/serviceaccounts"),
-        &sa_body,
+        "/api/v1/namespaces",
+        &json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": ns}
+        }),
     )
     .await;
-    assert_eq!(status, 201, "create SA with automount=false: {created_sa}");
-    assert_eq!(created_sa["automountServiceAccountToken"], false);
+    assert_eq!(status, 201, "create namespace: {created_ns}");
 
-    // Create a Pod that explicitly opts out at the pod level as well.
-    // Upstream uses a pod-level override that mirrors the SA setting to
-    // guarantee no injection.
-    let pod_body = json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {"name": "no-mount-pod"},
-        "spec": {
-            "serviceAccountName": "no-automount",
-            "automountServiceAccountToken": false,
-            "containers": [{"name": "c", "image": "nginx:latest"}]
+    for (sa_name, automount) in [("mount", true), ("nomount", false)] {
+        let (status, created) = post_json(
+            state.clone(),
+            &format!("/api/v1/namespaces/{ns}/serviceaccounts"),
+            &json!({
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": {"name": sa_name},
+                "automountServiceAccountToken": automount
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "create SA {sa_name}: {created}");
+        assert_eq!(created["automountServiceAccountToken"], automount);
+    }
+
+    // The table, verbatim from service_accounts.go:205-267.
+    let cases: [(&str, &str, Option<bool>, bool); 9] = [
+        ("pod-service-account-defaultsa", "default", None, true),
+        ("pod-service-account-mountsa", "mount", None, true),
+        ("pod-service-account-nomountsa", "nomount", None, false),
+        // Make sure pod spec trumps when opting in.
+        (
+            "pod-service-account-defaultsa-mountspec",
+            "default",
+            Some(true),
+            true,
+        ),
+        (
+            "pod-service-account-mountsa-mountspec",
+            "mount",
+            Some(true),
+            true,
+        ),
+        (
+            "pod-service-account-nomountsa-mountspec",
+            "nomount",
+            Some(true),
+            true,
+        ),
+        // Make sure pod spec trumps when opting out.
+        (
+            "pod-service-account-defaultsa-nomountspec",
+            "default",
+            Some(false),
+            false,
+        ),
+        (
+            "pod-service-account-mountsa-nomountspec",
+            "mount",
+            Some(false),
+            false,
+        ),
+        (
+            "pod-service-account-nomountsa-nomountspec",
+            "nomount",
+            Some(false),
+            false,
+        ),
+    ];
+
+    for (pod_name, sa_name, automount_pod_spec, expect_token_volume) in cases {
+        let mut spec = json!({
+            "serviceAccountName": sa_name,
+            "restartPolicy": "Never",
+            "containers": [{"name": "token-test", "image": "agnhost"}]
+        });
+        if let Some(v) = automount_pod_spec {
+            spec["automountServiceAccountToken"] = json!(v);
         }
-    });
-    let (status, created_pod) = post_json(
-        state.clone(),
-        &format!("/api/v1/namespaces/{ns}/pods"),
-        &pod_body,
-    )
-    .await;
-    assert_eq!(
-        status, 201,
-        "create pod with automount=false: {created_pod}"
-    );
 
-    // The pod must NOT have a projected ServiceAccountToken volume.
-    let volumes = created_pod["spec"]["volumes"].as_array();
-    let has_projected_sa_token = volumes
-        .map(|vols| {
-            vols.iter().any(|v| {
-                v["projected"]["sources"]
+        let (status, created_pod) = post_json(
+            state.clone(),
+            &format!("/api/v1/namespaces/{ns}/pods"),
+            &json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": pod_name},
+                "spec": spec
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "create pod {pod_name}: {created_pod}");
+
+        // Upstream: any container volumeMount whose mountPath is
+        // DefaultAPITokenMountPath.
+        let has_token_volume = created_pod["spec"]["containers"]
+            .as_array()
+            .expect("containers array")
+            .iter()
+            .any(|c| {
+                c["volumeMounts"]
                     .as_array()
-                    .map(|srcs| srcs.iter().any(|s| !s["serviceAccountToken"].is_null()))
+                    .map(|mounts| {
+                        mounts.iter().any(|m| {
+                            m["mountPath"] == "/var/run/secrets/kubernetes.io/serviceaccount"
+                        })
+                    })
                     .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
-    assert!(
-        !has_projected_sa_token,
-        "Pod with automount=false must NOT have projected SA token volume: {created_pod}"
-    );
+            });
+
+        assert_eq!(
+            has_token_volume, expect_token_volume,
+            "{pod_name}: expected volume={expect_token_volume}, got {has_token_volume} \
+             (SA {sa_name}, pod spec {automount_pod_spec:?}): {created_pod}"
+        );
+    }
 }
 
 /// A ServiceAccount with `automountServiceAccountToken: false` can be toggled
 /// back to `true` via a PATCH; the field must be persisted correctly.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go opt-out block
+/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:843-871
+/// (`should update a ServiceAccount` — same false -> true transition, driven
+/// through Update rather than Patch; the PUT form is mirrored by
+/// `service_account_should_update` in
+/// `conformance_auth_rbac_serviceaccount.rs`).
 /// Sonobuoy (batch-64, 2026-05-28): PASS
+/// Mirror audit (#1749, 2026-08-25): re-cited. The old citation pointed at the
+/// "opt out of API token automount" block, which creates ServiceAccounts but
+/// never mutates one — this test has no counterpart there.
 #[tokio::test]
 async fn service_account_automount_field_is_mutable_via_patch() {
     let (state, _) = spawn_state();
@@ -340,8 +483,26 @@ async fn service_account_automount_field_is_mutable_via_patch() {
 /// with a `ca.crt` data key (may be empty in the test environment where no
 /// real CA is configured, but the ConfigMap itself must be present).
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go kube-root-ca block
+/// [sig-auth] ServiceAccounts should guarantee kube-root-ca.crt exist in any
+/// namespace [Conformance]
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:775-833
 /// Sonobuoy (batch-64, 2026-05-28): PASS
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// The upstream Description block lists three requirements, and the body
+/// asserts all three in sequence:
+///   1. created automatically — mirrored here
+///   2. recreated if deleted — `kube_root_ca_crt_is_recreated_after_deletion`
+///   3. reconciled if modified —
+///      `kube_root_ca_crt_is_reconciled_after_modification`
+///
+/// (2) and (3) belong to `NamespaceController::reconcile_namespace`, the port
+/// of `pkg/controller/certificates/rootcacertpublisher/publisher.go`
+/// `syncNamespace()`, so they live in
+/// `crates/controller-manager/tests/it/namespace_controller_test.rs`. Before
+/// the #1749 audit neither had a counterpart anywhere, and this file carried
+/// two mirrors of requirement (1) — the second a strict subset of the first.
 #[tokio::test]
 async fn kube_root_ca_crt_configmap_exists_in_new_namespace() {
     // Use the CA-cert-aware state so the namespace handler creates the
@@ -373,39 +534,15 @@ async fn kube_root_ca_crt_configmap_exists_in_new_namespace() {
         cm["metadata"]["name"], "kube-root-ca.crt",
         "ConfigMap name mismatch: {cm}"
     );
-    // The ConfigMap must have a 'data' field (even if ca.crt is empty string
-    // in a test environment with no real TLS cert configured).
+    // Upstream's poll only accepts the ConfigMap once `data["ca.crt"]` exists
+    // and is non-empty (service_accounts.go:826-830).
+    let ca = cm["data"]["ca.crt"]
+        .as_str()
+        .unwrap_or_else(|| panic!("kube-root-ca.crt must contain a 'ca.crt' key: {cm}"));
     assert!(
-        cm["data"].is_object(),
-        "kube-root-ca.crt ConfigMap must have a 'data' object: {cm}"
+        !ca.is_empty(),
+        "kube-root-ca.crt 'ca.crt' must be non-empty: {cm}"
     );
-    // `ca.crt` key must exist.
-    assert!(
-        cm["data"]["ca.crt"].is_string(),
-        "kube-root-ca.crt ConfigMap must contain a 'ca.crt' key: {cm}"
-    );
-}
-
-/// `kube-root-ca.crt` ConfigMap must be present immediately after namespace
-/// creation (synchronous; the namespace handler creates it inline).
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go kube-root-ca block
-/// Sonobuoy (batch-64, 2026-05-28): PASS
-#[tokio::test]
-async fn kube_root_ca_crt_configmap_is_present_on_create() {
-    let (state, _) = spawn_state_with_ca_cert();
-    let ns = "kube-root-ca-presence";
-
-    let ns_body = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns}});
-    let (status, _) = post_json(state.clone(), "/api/v1/namespaces", &ns_body).await;
-    assert_eq!(status, 201, "namespace create");
-
-    let (cm_status, _) = get_json(
-        state.clone(),
-        &format!("/api/v1/namespaces/{ns}/configmaps/kube-root-ca.crt"),
-    )
-    .await;
-    assert_eq!(cm_status, 200, "kube-root-ca.crt must be auto-created");
 }
 
 // ---------------------------------------------------------------------------
@@ -910,7 +1047,21 @@ async fn csr_full_lifecycle_with_signer_issues_certificate() {
 /// remove a condition of type \"Approved\"". They now apply a genuine
 /// merge/JSON patch onto the stored object and run the subresource validator.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/certificates.go
+/// Upstream: k8s.io/kubernetes/test/e2e/auth/certificates.go:202-437
+/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
+///
+/// Upstream opens with three discovery checks before touching a CSR — `/apis`
+/// must advertise the `certificates.k8s.io` group at `v1`,
+/// `/apis/certificates.k8s.io` must list that version, and
+/// `/apis/certificates.k8s.io/v1` must list `certificatesigningrequests` plus
+/// both subresources (certificates.go:231-291). Those had no counterpart here
+/// and are now the first thing this mirror does.
+///
+/// Two upstream assertions remain unmirrorable for the reason recorded on
+/// `service_account_should_run_through_lifecycle`: `HaveValidResourceVersion()`
+/// on the get (certificates.go:310) and the RV-increase after the main patch
+/// (certificates.go:326). `MemoryStorage` writes no `metadata.resourceVersion`
+/// — #1751.
 #[tokio::test]
 async fn csr_api_operations_full_surface() {
     // A valid base64-encoded PKCS#10 CSR PEM (same fixture the sibling CSR
@@ -922,7 +1073,55 @@ async fn csr_api_operations_full_surface() {
     const SIGNER: &str = "example.com/e2e-csr-1607";
     const COLLECTION: &str = "/apis/certificates.k8s.io/v1/certificatesigningrequests";
 
-    let (state, _) = spawn_state();
+    let (state, mem) = spawn_state();
+
+    // Discovery — upstream's three `ginkgo.By("getting /apis…")` blocks.
+    let (s, groups) = get_json(state.clone(), "/apis").await;
+    assert_eq!(s, 200, "GET /apis: {groups}");
+    assert!(
+        groups["groups"]
+            .as_array()
+            .expect("groups array")
+            .iter()
+            .any(|g| {
+                g["name"] == "certificates.k8s.io"
+                    && g["versions"]
+                        .as_array()
+                        .map(|vs| vs.iter().any(|v| v["version"] == "v1"))
+                        .unwrap_or(false)
+            }),
+        "expected certificates API group/version in /apis: {groups}"
+    );
+
+    let (s, group) = get_json(state.clone(), "/apis/certificates.k8s.io").await;
+    assert_eq!(s, 200, "GET /apis/certificates.k8s.io: {group}");
+    assert!(
+        group["versions"]
+            .as_array()
+            .expect("versions array")
+            .iter()
+            .any(|v| v["version"] == "v1"),
+        "expected certificates API version: {group}"
+    );
+
+    let (s, resources) = get_json(state.clone(), "/apis/certificates.k8s.io/v1").await;
+    assert_eq!(s, 200, "GET /apis/certificates.k8s.io/v1: {resources}");
+    let names: Vec<&str> = resources["resources"]
+        .as_array()
+        .expect("resources array")
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    for expected in [
+        "certificatesigningrequests",
+        "certificatesigningrequests/approval",
+        "certificatesigningrequests/status",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "expected {expected} in the v1 resource list, got {names:?}"
+        );
+    }
 
     let template = json!({
         "apiVersion": "certificates.k8s.io/v1",
@@ -975,6 +1174,18 @@ async fn csr_api_operations_full_surface() {
         "field-selector list must have 3 items: {list}"
     );
 
+    // watching — upstream opens the watch here, after the list and before the
+    // patch, with `FieldSelector: "metadata.name=" + createdCSR.Name`
+    // (certificates.go:319-321), then requires a `watch.Modified` carrying the
+    // `patched` annotation. Same harness constraint as
+    // `service_account_should_run_through_lifecycle`: the oneshot HTTP client
+    // cannot hold a streaming response open across the patch, so the mirror
+    // observes the storage stream and filters on the object's own name.
+    let mut csr_watch = mem
+        .watch("/registry/certificatesigningrequests/")
+        .await
+        .expect("watch CSRs");
+
     // patch (main resource) — merge-patch an annotation.
     let (s, patched) = patch_merge(
         state.clone(),
@@ -991,6 +1202,32 @@ async fn csr_api_operations_full_surface() {
     let (s, updated) = state.put(&format!("{COLLECTION}/{name}"), &to_update).await;
     assert_eq!(s.as_u16(), 200, "main update: {updated}");
     assert_eq!(updated["metadata"]["annotations"]["updated"], "true");
+
+    // The watch must have delivered a MODIFIED event for this CSR carrying the
+    // patched annotation.
+    let mut saw_patched = false;
+    for _ in 0..8 {
+        let ev = timeout(Duration::from_millis(500), csr_watch.next())
+            .await
+            .expect("timed out waiting for watch event")
+            .expect("watch channel should not close")
+            .expect("watch event error");
+        let WatchEvent::Modified(key, value) = ev else {
+            continue;
+        };
+        if !key.ends_with(&format!("/{name}")) {
+            continue;
+        }
+        let obj: Value = serde_json::from_str(&value).expect("watch payload is JSON");
+        if obj["metadata"]["annotations"]["patched"] == "true" {
+            saw_patched = true;
+            break;
+        }
+    }
+    assert!(
+        saw_patched,
+        "watch must deliver a MODIFIED event carrying the patched annotation"
+    );
 
     // GET /approval — must return a CertificateSigningRequest with the UID.
     let (s, appr_get) = get_json(state.clone(), &format!("{COLLECTION}/{name}/approval")).await;
@@ -1051,6 +1288,7 @@ async fn csr_api_operations_full_surface() {
     let (s, stat_get) = get_json(state.clone(), &format!("{COLLECTION}/{name}/status")).await;
     assert_eq!(s, 200, "get /status: {stat_get}");
     assert_eq!(stat_get["kind"], "CertificateSigningRequest");
+    assert_eq!(stat_get["apiVersion"], "certificates.k8s.io/v1");
     assert_eq!(stat_get["metadata"]["uid"], created["metadata"]["uid"]);
 
     // PATCH /status — set the certificate; the Approved condition set by the
@@ -1202,9 +1440,20 @@ async fn subject_access_review_non_resource_url_returns_allowed() {
 ///
 /// Upstream impersonation filter:
 ///   staging/src/k8s.io/apiserver/pkg/endpoints/filters/impersonation
-/// Upstream e2e: k8s.io/kubernetes/test/e2e/auth/subjectreviews.go:50
+/// Upstream e2e: k8s.io/kubernetes/test/e2e/auth/selfsubjectreviews.go:115
+///   ("should support SelfSubjectReview API operations")
+///
+/// Mirror audit (#1749, 2026-08-25): re-cited and renamed. This drives
+/// `POST /apis/authentication.k8s.io/v1/selfsubjectreviews`, which
+/// subjectreviews.go:50 never issues — that case only creates a
+/// SubjectAccessReview and a LocalSubjectAccessReview, and its agreement
+/// contract is mirrored by
+/// `subject_access_review_agrees_with_the_impersonated_request` in
+/// `conformance_auth_rbac_serviceaccount.rs`. Note also that
+/// selfsubjectreviews.go:115 is a plain `ginkgo.It`, not a
+/// `framework.ConformanceIt`, so this is not a Conformance case.
 #[tokio::test]
-async fn subject_review_full_conformance_with_impersonated_client() {
+async fn self_subject_review_reflects_the_impersonated_identity() {
     let (state, mem) = spawn_state();
     let ns = "subjectreview-impersonation-ns";
     let sa = "e2e-impersonated";
