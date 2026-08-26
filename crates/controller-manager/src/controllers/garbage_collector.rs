@@ -653,9 +653,35 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     async fn delete_dependents_foreground(
         &self,
         resource: &ResourceInfo,
+        dependent_map: &HashMap<String, Vec<String>>,
+    ) -> rusternetes_common::Result<()> {
+        let mut visited = HashSet::new();
+        self.delete_dependents_foreground_visiting(resource, dependent_map, &mut visited)
+            .await
+    }
+
+    /// Cycle-safe body of [`Self::delete_dependents_foreground`].
+    ///
+    /// `visited` holds the UIDs already descended into during THIS foreground
+    /// pass. Ownership graphs may legitimately contain cycles — the upstream
+    /// Conformance spec "Garbage collector should not be blocked by dependency
+    /// circle" builds one deliberately — and without this the recursion never
+    /// terminates: pod1 -> pod2 -> pod3 -> pod1 overflowed the stack and took
+    /// the whole controller-manager process down with it.
+    async fn delete_dependents_foreground_visiting(
+        &self,
+        resource: &ResourceInfo,
         _dependent_map: &HashMap<String, Vec<String>>,
+        visited: &mut HashSet<String>,
     ) -> rusternetes_common::Result<()> {
         let resource_uid = &resource.metadata.uid;
+        if !visited.insert(resource_uid.clone()) {
+            debug!(
+                "Foreground deletion: already descended into {} this pass (ownership cycle)",
+                resource.key
+            );
+            return Ok(());
+        }
 
         // Find all resources that have this resource as an owner
         let all_resources = self.get_all_resources().await?;
@@ -728,8 +754,12 @@ impl<S: Storage + 'static> GarbageCollector<S> {
 
                     // Recursively handle foreground deletion for this dependent's dependents
                     let (_, sub_dependent_map) = self.build_relationship_maps(&all_resources);
-                    Box::pin(self.delete_dependents_foreground(dependent, &sub_dependent_map))
-                        .await?;
+                    Box::pin(self.delete_dependents_foreground_visiting(
+                        dependent,
+                        &sub_dependent_map,
+                        visited,
+                    ))
+                    .await?;
 
                     if let Err(e) = self.storage.delete(&dependent.key).await {
                         error!("Failed to delete dependent {}: {}", dependent.key, e);
@@ -1266,6 +1296,84 @@ mod tests {
         // Test remove_finalizer
         metadata.remove_finalizer("my-finalizer");
         assert!(!metadata.has_finalizers());
+    }
+
+    /// A foreground deletion inside an ownership CYCLE must still complete.
+    ///
+    /// Three pods each own the next and each carries `blockOwnerDeletion: true`,
+    /// so every member blocks its owner. Deleting one with foreground
+    /// propagation deadlocks a naive implementation: pod1 waits for pod2, pod2
+    /// waits for pod3, pod3 waits for pod1.
+    ///
+    /// Upstream breaks the ring in `attemptToDeleteItem`
+    /// (`pkg/controller/garbagecollector/garbagecollector.go:595-620`): when an
+    /// item has a dependent that is ITSELF deleting dependents, it patches its
+    /// own ownerReferences to be non-blocking and proceeds with the foreground
+    /// delete. The comment there calls the check a deliberate false-positive-
+    /// prone circle detection.
+    ///
+    /// Pins `[sig-api-machinery] Garbage collector should not be blocked by
+    /// dependency circle [Conformance]`
+    /// (`test/e2e/apimachinery/garbage_collector.go:826-880`), which builds this
+    /// exact three-pod ring and requires ALL of them to disappear.
+    #[tokio::test]
+    async fn foreground_deletion_breaks_an_ownership_cycle() {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let gc = GarbageCollector::new(storage.clone());
+
+        // pod1 <- pod2 <- pod3 <- pod1: each owned by the previous one.
+        let uids = ["pod1-uid", "pod2-uid", "pod3-uid"];
+        let names = ["pod1", "pod2", "pod3"];
+
+        for i in 0..3 {
+            // owner is the PREVIOUS pod in the ring
+            let owner_idx = (i + 2) % 3;
+            let mut meta = ObjectMeta::new(names[i]);
+            meta.namespace = Some("default".to_string());
+            meta.uid = uids[i].to_string();
+            meta.owner_references = Some(vec![OwnerReference {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                name: names[owner_idx].to_string(),
+                uid: uids[owner_idx].to_string(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]);
+            // The one being deleted enters foreground deletion.
+            if i == 0 {
+                meta.deletion_timestamp = Some(chrono::Utc::now());
+                meta.finalizers = Some(vec!["foregroundDeletion".to_string()]);
+            }
+            let pod = Pod {
+                type_meta: TypeMeta {
+                    kind: "Pod".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: meta,
+                spec: None,
+                status: None,
+            };
+            let key = format!("/registry/pods/default/{}", names[i]);
+            storage.create(&key, &pod).await.unwrap();
+        }
+
+        // A bounded number of scans must drain the whole ring. Upstream needs
+        // several passes too (each pass unblocks/deletes one more member), but
+        // it must CONVERGE rather than spin forever.
+        for _ in 0..10 {
+            gc.scan_and_collect().await.unwrap();
+            let remaining: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+            if remaining.is_empty() {
+                return;
+            }
+        }
+
+        let remaining: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        let names: Vec<&str> = remaining.iter().map(|p| p.metadata.name.as_str()).collect();
+        panic!("ownership cycle deadlocked foreground deletion; still present: {names:?}");
     }
 
     /// Foreground deletion must NOT remove the `foregroundDeletion` finalizer
