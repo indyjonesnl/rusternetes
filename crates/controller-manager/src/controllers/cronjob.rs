@@ -254,7 +254,8 @@ impl<S: Storage + 'static> CronJobController<S> {
                 if cronjob.status != new_status {
                     cronjob.status = new_status;
                     let key = format!("/registry/cronjobs/{}/{}", namespace, name);
-                    let _ = self.storage.update(&key, cronjob).await;
+                    // Status subresource write: a full-object PUT strips `.status` (#1723).
+                    let _ = self.storage.update_status(&key, cronjob).await;
                 }
                 return Ok(());
             }
@@ -329,7 +330,8 @@ impl<S: Storage + 'static> CronJobController<S> {
         if cronjob.status != new_status {
             cronjob.status = new_status;
             let key = format!("/registry/cronjobs/{}/{}", namespace, name);
-            self.storage.update(&key, cronjob).await?;
+            // Status subresource write (#1723).
+            self.storage.update_status(&key, cronjob).await?;
         }
 
         // Clean up old jobs based on history limits

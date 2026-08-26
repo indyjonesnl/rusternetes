@@ -858,7 +858,8 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
             return Ok(());
         }
 
-        self.storage.update(&key, &updated_hpa).await?;
+        // Status subresource write: a full-object PUT strips `.status` (#1723).
+        self.storage.update_status(&key, &updated_hpa).await?;
         debug!("Updated HPA status: {}/{}", namespace, hpa.metadata.name);
 
         Ok(())
@@ -908,7 +909,8 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
             conditions: Some(conditions),
         });
 
-        self.storage.update(&key, &updated_hpa).await?;
+        // Status subresource write: a full-object PUT strips `.status` (#1723).
+        self.storage.update_status(&key, &updated_hpa).await?;
         debug!(
             "Updated HPA status with error: {}/{}",
             namespace, hpa.metadata.name

@@ -395,9 +395,11 @@ impl<S: Storage + 'static> IngressController<S> {
             ),
         });
 
-        // Update in storage
+        // Status subresource write: a full-object PUT strips `.status` (#1723).
         let ingress_key = build_key("ingresses", Some(namespace), ingress_name);
-        self.storage.update(&ingress_key, &updated_ingress).await?;
+        self.storage
+            .update_status(&ingress_key, &updated_ingress)
+            .await?;
 
         info!(
             "Updated Ingress {}/{} status with load balancer IP: {}",

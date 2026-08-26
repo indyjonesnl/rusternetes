@@ -209,7 +209,8 @@ impl<S: Storage + 'static> PVBinderController<S> {
                     );
                 }
                 _ => {
-                    self.storage.update(&pv_key, &pv).await?;
+                    // Phase-only write → status subresource (#1723).
+                    self.storage.update_status(&pv_key, &pv).await?;
                     info!(
                         "Released PV {} (claim {}/{} gone); reclaim policy retains it",
                         pv.metadata.name, ns, name
@@ -368,7 +369,14 @@ impl<S: Storage + 'static> PVBinderController<S> {
             last_phase_transition_time: None,
         });
         let pv_key = build_key("persistentvolumes", None, &pv_name);
+        // Upstream binds in two writes, and so must we: the spec half
+        // (`claimRef`) goes through the main resource
+        // (`PersistentVolumes().Update`, pv_controller.go:1019) and the phase
+        // through the status subresource (`UpdateStatus`, pv_controller.go:925).
+        // A single full-object PUT would have its `.status` stripped by a
+        // conformant api-server, leaving the PV bound but never Bound (#1723).
         self.storage.update(&pv_key, &pv).await?;
+        self.storage.update_status(&pv_key, &pv).await?;
 
         pvc.spec.volume_name = Some(pv_name.clone());
         pvc.status = Some(PersistentVolumeClaimStatus {
@@ -383,7 +391,11 @@ impl<S: Storage + 'static> PVBinderController<S> {
             modify_volume_status: None,
         });
         let pvc_key = build_key("persistentvolumeclaims", Some(&namespace), &pvc_name);
+        // Same two-write split for the claim: `spec.volumeName` via the main
+        // resource, phase/capacity via the status subresource
+        // (pv_controller.go:866).
         self.storage.update(&pvc_key, pvc).await?;
+        self.storage.update_status(&pvc_key, pvc).await?;
 
         info!(
             "Successfully bound PVC {}/{} to PV {}",

@@ -67,6 +67,7 @@ mod servicecidr_controller_test;
 mod statefulset_controller_test;
 mod statefulset_extended_test;
 mod statefulset_status_correctness_test;
+mod status_subresource_guard;
 mod storageclass_controller_test;
 mod ttl_controller_test;
 mod volume_attachment_test;

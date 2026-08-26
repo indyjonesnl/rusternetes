@@ -312,8 +312,10 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
         });
 
         // Save approval
+        // Status subresource write: CSR conditions and the issued certificate both
+        // live under `.status`, which a full-object PUT strips (#1723).
         self.storage
-            .update(
+            .update_status(
                 &format!("/registry/certificatesigningrequests/{}", csr.metadata.name),
                 &updated_csr,
             )
@@ -357,8 +359,10 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
             });
         status.certificate = Some(cert_pem);
 
+        // Status subresource write: CSR conditions and the issued certificate both
+        // live under `.status`, which a full-object PUT strips (#1723).
         self.storage
-            .update(
+            .update_status(
                 &format!("/registry/certificatesigningrequests/{}", csr.metadata.name),
                 &updated,
             )
@@ -394,8 +398,10 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
             conditions: Some(conditions),
             certificate,
         });
+        // Status subresource write: CSR conditions and the issued certificate both
+        // live under `.status`, which a full-object PUT strips (#1723).
         self.storage
-            .update(
+            .update_status(
                 &format!("/registry/certificatesigningrequests/{}", csr.metadata.name),
                 &updated,
             )
@@ -431,8 +437,10 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
             certificate: None,
         });
 
+        // Status subresource write: CSR conditions and the issued certificate both
+        // live under `.status`, which a full-object PUT strips (#1723).
         self.storage
-            .update(
+            .update_status(
                 &format!("/registry/certificatesigningrequests/{}", csr.metadata.name),
                 &updated_csr,
             )

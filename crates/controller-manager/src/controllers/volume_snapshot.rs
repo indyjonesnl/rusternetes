@@ -361,7 +361,8 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
 
         let mut updated_vs = vs.clone();
         updated_vs.status = Some(new_status);
-        self.storage.update(&vs_key, &updated_vs).await?;
+        // Status subresource write: a full-object PUT strips `.status` (#1723).
+        self.storage.update_status(&vs_key, &updated_vs).await?;
 
         info!(
             "Updated VolumeSnapshot {}/{} status (ready: {})",
