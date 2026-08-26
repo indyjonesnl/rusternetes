@@ -31,9 +31,23 @@
 //! upstream case: its old citation fell inside the version-rename case, which
 //! another mirror already covers. Re-cited as a non-conformance check.
 //!
-//! Assertion re-derivation against the nine `crd_publish_openapi.go` cases and
-//! the two conversion-webhook cases is **not yet done**. Do not treat this file
-//! as audited.
+//! Assertion re-derivation is **in progress**:
+//!
+//! | upstream case | state |
+//! |---|---|
+//! | crd_publish_openapi.go:74 works for CRD with validation schema | schema *enforcement* added — accept, enum rejection, prune-vs-strict, required field |
+//!
+//! The remaining eight `crd_publish_openapi.go` cases and the two
+//! conversion-webhook cases are not yet re-derived. Do not treat this file as
+//! audited.
+//!
+//! Note on the :74 case: most of its upstream body asserts that the *server*
+//! enforces the published schema, via `kubectl create`/`apply`. The mirror
+//! asserted only that the document was published, so a server that published a
+//! schema and enforced none of it would have passed. Enforcement now runs. One
+//! distinction the audit had to get right: a plain create **prunes** an unknown
+//! field (structural-schema semantics), while `?fieldValidation=Strict` — which
+//! kubectl sends by default since v1.25 — **rejects** it. Both are asserted.
 //!
 
 use rusternetes_test_support::harness::TestApiServer;
@@ -364,6 +378,107 @@ async fn crd_with_validation_schema_publishes_to_openapi_v2() {
         .and_then(|v| v.as_array())
         .expect("enum constraint must survive the publish pipeline (line 101)");
     assert_eq!(enum_values.len(), 2);
+    // Publishing the schema is only half of upstream's case. The other half is
+    // that the server **enforces** it: `works for CRD with validation schema`
+    // spends most of its body asserting that `kubectl create`/`apply` is
+    // rejected for a value outside the enum, for unknown properties, and for a
+    // missing required property, and accepted for a valid CR
+    // (crd_publish_openapi.go:83-122). kubectl delegates that validation to the
+    // server, so all four are observable here. The mirror asserted only that
+    // the document was published — a server that published a schema and
+    // enforced none of it would have passed.
+    let cr = |name: &str, bar: Value| {
+        json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Foo",
+            "metadata": { "name": name },
+            "spec": { "bars": [bar] }
+        })
+    };
+    let create = |state: &TestApiServer, body: Value| {
+        let state = state.clone();
+        async move {
+            let (s, b) = router_request(
+                &state,
+                "POST",
+                "/apis/example.com/v1/namespaces/default/e2e-test-foos",
+                Some(&body),
+            )
+            .await;
+            (s, b)
+        }
+    };
+
+    // Valid CR: known and required properties present, enum value legal.
+    let (s, b) = create(
+        &state,
+        cr("cr-valid", json!({ "name": "bar-1", "feeling": "Great" })),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&s),
+        "a CR with known and required properties must be accepted: {s} {b}"
+    );
+
+    // Value outside the defined enum values.
+    let (s, b) = create(
+        &state,
+        cr("cr-bad-enum", json!({ "name": "bar-2", "feeling": "Bad" })),
+    )
+    .await;
+    assert_eq!(
+        s, 422,
+        "a CR whose enum field is outside the declared values must be rejected: {b}"
+    );
+
+    // Unknown property. Two distinct behaviours, and it matters which is which:
+    // a plain create **prunes** the unknown field (structural-schema semantics,
+    // no `x-kubernetes-preserve-unknown-fields`), while kubectl's server-side
+    // field validation — `?fieldValidation=Strict`, which kubectl sends by
+    // default since v1.25 — **rejects** it. Upstream's case exercises the
+    // latter through `kubectl create`.
+    let (s, b) = create(
+        &state,
+        cr(
+            "cr-unknown-field",
+            json!({ "name": "bar-3", "unknownField": "nope" }),
+        ),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&s),
+        "a plain create must prune the unknown field, not reject it: {s} {b}"
+    );
+    assert!(
+        b["spec"]["bars"][0].get("unknownField").is_none(),
+        "the unknown field must be pruned from the stored object: {b}"
+    );
+
+    let (s, b) = router_request(
+        &state,
+        "POST",
+        "/apis/example.com/v1/namespaces/default/e2e-test-foos?fieldValidation=Strict",
+        Some(&cr(
+            "cr-unknown-strict",
+            json!({ "name": "bar-4", "unknownField": "nope" }),
+        )),
+    )
+    .await;
+    assert_eq!(
+        s, 422,
+        "under fieldValidation=Strict an unknown property must be rejected: {b}"
+    );
+
+    // Missing the required property.
+    let (s, b) = create(
+        &state,
+        cr("cr-missing-required", json!({ "feeling": "Great" })),
+    )
+    .await;
+    assert_eq!(
+        s, 422,
+        "a CR missing a required property must be rejected: {b}"
+    );
 }
 
 /// [sig-api-machinery] CustomResourcePublishOpenAPI works for CRD without validation schema [Conformance]
