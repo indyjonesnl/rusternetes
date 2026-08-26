@@ -27,7 +27,7 @@ on:
         type: string
         default: ''
       image-tag:
-        description: "GHCR image tag to test (default main). Empty = build locally."
+        description: "GHCR image tag to test, 'local' to build this ref from source, or empty (same as 'local')."
         required: false
         type: string
         default: main
@@ -48,7 +48,7 @@ on:
         type: string
         default: ''
       image-tag:
-        description: "GHCR image tag to test (default main). Empty = build locally."
+        description: "GHCR image tag to test, 'local' to build this ref from source, or empty (same as 'local')."
         required: false
         type: string
         default: main
@@ -82,12 +82,36 @@ jobs:
         with:
           submodules: recursive
 
+      # Resolve `local` to an EMPTY image-tag, which is how
+      # ci/actions/bring-up-cluster is told to compile this ref instead of
+      # pulling a published tag.
+      #
+      # This normalization has to happen in shell, not in a `${{ }}` expression:
+      # GitHub expressions cannot yield an empty string from the `A && B || C`
+      # idiom, because the empty string is falsy and `||` therefore takes the C
+      # branch. Two earlier attempts (#1758, #1760) both tripped on exactly that
+      # and silently tested the published image instead of the branch under
+      # review. Bash has no such problem.
+      - name: Resolve image tag
+        id: tag
+        env:
+          REQUESTED: ${{ inputs.image-tag }}
+        run: |
+          set -euo pipefail
+          if [ "$REQUESTED" = "local" ]; then
+            echo "value=" >> "$GITHUB_OUTPUT"
+            echo "image-tag=local -> building this ref from source" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "value=$REQUESTED" >> "$GITHUB_OUTPUT"
+            echo "image-tag=$REQUESTED -> pulling the published tag" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Bring up cluster
         uses: ./ci/actions/bring-up-cluster
         with:
           hydrophone-version: ${{ env.HYDROPHONE_VERSION }}
           kubectl-version: v1.35.0
-          image-tag: ${{ inputs.image-tag }}
+          image-tag: ${{ steps.tag.outputs.value }}
 
       - name: Run target conformance
         id: run
