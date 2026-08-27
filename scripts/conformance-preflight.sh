@@ -17,12 +17,14 @@
 #     e2e-conformance-test pod is evicted ("Pod evicted due to resource
 #     pressure: ImageFsAvailable") after the run has already logged
 #     "Will run 406 of 7348 specs".
-#   * Per-node service images drifting apart. kubelet/kubelet2,
-#     kube-proxy/kube-proxy2 and containerd/containerd2 are separate compose
-#     services with separate tags, so `compose build kubelet` leaves node-2 on
-#     old code. Whichever node the scheduler happens to pick then decides the
-#     result — the same spec passes and fails alternately and reads exactly
-#     like a flake (#1792).
+#   * Per-node binaries drifting apart. kubelet/kubelet2 and
+#     kube-proxy/kube-proxy2 are separate compose services, so
+#     `compose build kubelet` leaves node-2 on old code. Whichever node the
+#     scheduler happens to pick then decides the result — the same spec passes
+#     and fails alternately and reads exactly like a flake (#1792). Compare the
+#     BINARY, not the image ID: compose builds each service as its own tagged
+#     image, so the two IDs differ even when built in one invocation from the
+#     same Dockerfile and target, while the binaries are byte-identical.
 #   * A saturated storage backend. After a few hours of runs the rhino store
 #     reached state.db 512 MB + WAL 192 MB with rhino pegged at 1364% CPU, and
 #     list+delete-heavy specs began failing with `context deadline exceeded`.
@@ -59,7 +61,7 @@
 #                       the store to ~85 MB, so 256 means "more than a couple
 #                       of suites of never-reclaimed pages")
 #   --skip-node-image-check
-#                       Skip only the per-node image-equality assertion
+#                       Skip only the per-node binary-equality assertion
 #   --timeout SECONDS   Budget for the whole preflight (default: 60)
 #   -h, --help          Show this help
 #
@@ -82,12 +84,13 @@ SKIP_IMAGE_PULL=0
 STORAGE_CONTAINER="rusternetes-rhino"
 MAX_STORAGE_MB=256
 SKIP_NODE_IMAGE_CHECK=0
-# Per-node compose service pairs that MUST run the same image. Each entry is
-# "node-1 container:node-2 container".
+# Per-node compose service pairs that MUST run the same build. Each entry is
+# "node-1 container:node-2 container:binary path". containerd/containerd2 are
+# absent deliberately: they pin `image: rusternetes-containerd:latest` in the
+# compose file, so both nodes resolve one tag and cannot drift.
 NODE_SERVICE_PAIRS=(
-    "rusternetes-kubelet:rusternetes-kubelet2"
-    "rusternetes-kube-proxy:rusternetes-kube-proxy2"
-    "rusternetes-containerd:rusternetes-containerd2"
+    "rusternetes-kubelet:rusternetes-kubelet2:/app/kubelet"
+    "rusternetes-kube-proxy:rusternetes-kube-proxy2:/app/kube-proxy"
 )
 BUDGET_SECONDS=60
 
@@ -251,36 +254,42 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Both nodes run the SAME build of each per-node service. kubelet/kubelet2,
-#    kube-proxy/kube-proxy2 and containerd/containerd2 are separate compose
-#    services with separate image tags, so `compose build kubelet` updates
-#    node-1 only. On 2026-08-27 that cost two wrong conclusions in a row about
-#    a kubelet fix: node-2 was running a binary from hours earlier, and the
-#    spec's verdict depended on which node the scheduler happened to pick
-#    (#1792). Compare image IDs, not tags — both sides say ":latest".
+# 7. Both nodes run the SAME build of each per-node service. kubelet/kubelet2
+#    and kube-proxy/kube-proxy2 are separate compose services, so
+#    `compose build kubelet` updates node-1 only. On 2026-08-27 that cost two
+#    wrong conclusions in a row about a kubelet fix: node-2 was running a binary
+#    from hours earlier, and the spec's verdict depended on which node the
+#    scheduler happened to pick (#1792).
+#
+#    Compare the BINARY, not the image ID. Compose builds each service as its
+#    own tagged image, so `docker inspect -f {{.Image}}` differs between the two
+#    even when both are built in a single invocation from the same Dockerfile and
+#    target — measured: both pairs differed while `sha256sum /app/<binary>`
+#    matched exactly. An image-ID comparison is a guaranteed false positive here.
 # ---------------------------------------------------------------------------
 if [ "$SKIP_NODE_IMAGE_CHECK" = "1" ]; then
-    pass "per-node image-equality assertion skipped (--skip-node-image-check)"
+    pass "per-node binary-equality assertion skipped (--skip-node-image-check)"
 elif ! command -v "$CONTAINER_RT" >/dev/null 2>&1; then
-    pass "$CONTAINER_RT not available — skipping per-node image assertion"
+    pass "$CONTAINER_RT not available — skipping per-node binary assertion"
 else
     checked=0
     for pair in "${NODE_SERVICE_PAIRS[@]}"; do
         first="${pair%%:*}"
-        second="${pair##*:}"
-        id_first="$(timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" inspect "$first" -f '{{.Image}}' 2>/dev/null)"
-        id_second="$(timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" inspect "$second" -f '{{.Image}}' 2>/dev/null)"
-        # A single-node stack (or an all-in-one one) legitimately has no pair.
-        [ -n "$id_first" ] && [ -n "$id_second" ] || continue
+        rest="${pair#*:}"
+        second="${rest%%:*}"
+        binary="${rest#*:}"
+        sum_first="$(timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" exec "$first" sha256sum "$binary" 2>/dev/null | awk '{print $1}')"
+        sum_second="$(timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" exec "$second" sha256sum "$binary" 2>/dev/null | awk '{print $1}')"
+        # A single-node stack (or an all-in-one one) legitimately has no peer,
+        # and a container without that binary is not this assertion's business.
+        [ -n "$sum_first" ] && [ -n "$sum_second" ] || continue
         checked=$(( checked + 1 ))
-        if [ "$id_first" = "$id_second" ]; then
-            pass "$first and $second run the same image (${id_first:0:19})"
+        if [ "$sum_first" = "$sum_second" ]; then
+            pass "$first and $second run the same $binary (${sum_first:0:12})"
         else
-            # Compose service names, not container names, so the remediation
-            # is copy-pasteable.
             svc_first="${first#rusternetes-}"
             svc_second="${second#rusternetes-}"
-            fail "$first and $second run DIFFERENT images (${id_first:0:19} vs ${id_second:0:19}) — identical inputs would share one image ID via the build cache, so these builds genuinely differ; rebuild both ('compose build $svc_first $svc_second') or the node the scheduler picks decides the result"
+            fail "$first and $second run DIFFERENT $binary (${sum_first:0:12} vs ${sum_second:0:12}) — rebuild both ('compose build $svc_first $svc_second') and recreate them, or the node the scheduler picks decides the result"
         fi
     done
     [ "$checked" -eq 0 ] && pass "no per-node service pairs present — single-node or all-in-one stack"

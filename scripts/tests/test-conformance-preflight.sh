@@ -84,13 +84,6 @@ case "${1:-}" in
             rusternetes-rhino)     [ "${RHINO_PRESENT:-1}"    = "1" ] || exit 1 ;;
         esac
         case "$fmt" in
-            *Image*)
-                # node-1 services share one ID, node-2 services another.
-                case "$name" in
-                    *2) printf '%s\n' "${IMG_NODE2:-sha256:aaaabbbbccccddddeeeeffff0000111122223333444455556666777788889999}" ;;
-                    *)  printf '%s\n' "${IMG_NODE1:-sha256:aaaabbbbccccddddeeeeffff0000111122223333444455556666777788889999}" ;;
-                esac
-                exit 0 ;;
             "")
                 # Existence probe: no format, no output.
                 exit 0 ;;
@@ -103,11 +96,29 @@ case "${1:-}" in
                 exit 0 ;;
         esac ;;
     exec)
-        # Only the store-size probe runs through exec.
-        [ "${STORAGE_READABLE:-1}" = "1" ] || exit 1
-        printf '%s\n' "${STORAGE_DB_BYTES:-1048576}"
-        printf '%s\n' "${STORAGE_WAL_BYTES:-1048576}"
-        exit 0 ;;
+        shift
+        target="${1:-}"
+        case "$*" in
+            *sha256sum*)
+                # Per-node binary equality. node-2 peers report BIN_NODE2 so a
+                # drift case can be expressed; both default to the same hash.
+                # Presence is checked FIRST: an absent peer must yield no output
+                # at all, which is how the real docker exec behaves.
+                case "$target" in
+                    *2) [ "${NODE2_PRESENT:-1}" = "1" ] || exit 1 ;;
+                esac
+                case "$target" in
+                    *2) printf '%s  /app/x\n' "${BIN_NODE2:-aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa7777bbbb8888}" ;;
+                    *)  printf '%s  /app/x\n' "${BIN_NODE1:-aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa7777bbbb8888}" ;;
+                esac
+                exit 0 ;;
+            *)
+                # The store-size probe.
+                [ "${STORAGE_READABLE:-1}" = "1" ] || exit 1
+                printf '%s\n' "${STORAGE_DB_BYTES:-1048576}"
+                printf '%s\n' "${STORAGE_WAL_BYTES:-1048576}"
+                exit 0 ;;
+        esac ;;
     pull)
         [ "${PULL_OK:-1}" = "1" ] || { echo "Error response from daemon: timeout" >&2; exit 1; }
         exit 0 ;;
@@ -216,12 +227,18 @@ else
     fail=1
 fi
 
-# Per-node image drift (#1792): node-1 rebuilt, node-2 left on old code. The
+# Per-node binary drift (#1792): node-1 rebuilt, node-2 left on old code. The
 # spec then passes or fails depending on which node the scheduler picks.
-expect_case "per-node image drift is refused" 2 "DIFFERENT images" \
-    "IMG_NODE2=sha256:9999888877776666555544443333222211110000ffffeeeeddddccccbbbbaaaa"
+#
+# The comparison is on the BINARY, not the image ID: compose builds each service
+# as its own tagged image, so kubelet and kubelet2 have different image IDs even
+# when built in one invocation from the same Dockerfile and target. Measured on
+# a live cluster — both pairs' IDs differed while sha256sum /app/<binary>
+# matched, so an image-ID assertion fails 100% of the time on a healthy cluster.
+expect_case "per-node binary drift is refused" 2 "DIFFERENT /app" \
+    "BIN_NODE2=9999888877776666555544443333222211110000ffffeeeeddddccccbbbbaaaa"
 
-expect_case "matching per-node images pass" 0 "run the same image"
+expect_case "matching per-node binaries pass" 0 "run the same /app"
 
 # A single-node or all-in-one stack has no node-2 peer, which is not a fault.
 expect_case "absent node-2 peers are not a fault" 0 "no per-node service pairs present" \
@@ -229,11 +246,11 @@ expect_case "absent node-2 peers are not a fault" 0 "no per-node service pairs p
 
 # --skip-node-image-check bypasses only that assertion.
 out_skip_img="$(env PATH="$STUBS:$PATH" CERTS_PATH="$FAKE_CERTS" \
-    IMG_NODE2=sha256:9999888877776666555544443333222211110000ffffeeeeddddccccbbbbaaaa \
+    BIN_NODE2=9999888877776666555544443333222211110000ffffeeeeddddccccbbbbaaaa \
     bash "$PREFLIGHT" --kubeconfig "$FAKE_KUBECONFIG" --certs-path "$FAKE_CERTS" \
     --skip-node-image-check --timeout 30 2>&1)"
 rc_skip_img=$?
-if [ "$rc_skip_img" = "0" ] && grep -q "image-equality assertion skipped" <<<"$out_skip_img"; then
+if [ "$rc_skip_img" = "0" ] && grep -q "binary-equality assertion skipped" <<<"$out_skip_img"; then
     echo "ok   [--skip-node-image-check bypasses only that assertion]"
 else
     echo "FAIL [--skip-node-image-check]: exit $rc_skip_img"
