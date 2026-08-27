@@ -182,6 +182,17 @@ pub async fn update(
     // Status only mutates via /status; mirror upstream PrepareForUpdate.
     daemonset.status = old_daemonset.status.clone();
 
+    // Reinstate the server-owned metadata a PUT body may omit (uid,
+    // creationTimestamp, a pending deletion). A locally-built object — what the
+    // dynamic client's Update() sends — carries none of them, and storing the
+    // blanks orphans every child: the ownerReferences[].uid no longer matches a
+    // live owner, so the garbage collector deletes the children (#1605).
+    // Upstream: registry/rest/update.go::BeforeUpdate (lines 123-146).
+    crate::handlers::lifecycle::inherit_server_owned_metadata(
+        &mut daemonset.metadata,
+        &old_daemonset.metadata,
+    );
+
     // Increment generation if spec changed
     let old_value = serde_json::to_value(&old_daemonset)
         .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
