@@ -36,9 +36,14 @@
 //! | upstream case | state |
 //! |---|---|
 //! | crd_publish_openapi.go:74 works for CRD with validation schema | schema *enforcement* added — accept, enum rejection, prune-vs-strict, required field |
+//! | crd_publish_openapi.go:158 works for CRD without validation schema | unknown properties now asserted accepted **and preserved** |
+//! | crd_publish_openapi.go:199 preserving unknown fields at the schema root | same |
+//! | crd_conversion_webhook.go:140 convert from CR v1 to CR v2 | already complete — all four `verifyV2Object` assertions present |
+//! | crd_conversion_webhook.go:175 convert a non homogeneous list | v1-direction list added; upstream lists in both versions |
 //!
-//! The remaining eight `crd_publish_openapi.go` cases and the two
-//! conversion-webhook cases are not yet re-derived. Do not treat this file as
+//! The remaining six `crd_publish_openapi.go` cases (:241, :281, :314, :362,
+//! :396, :447) are document-shape cases whose mirrors already assert the
+//! published spec; they have not been line-by-line re-derived. Do not treat this file as
 //! audited.
 //!
 //! Note on the :74 case: most of its upstream body asserts that the *server*
@@ -516,6 +521,38 @@ async fn crd_without_validation_schema_publishes_to_openapi_v2() {
         .get("x-kubernetes-group-version-kind")
         .expect("GVK extension present");
     assert_eq!(gvk[0]["kind"], "Bar");
+    // Upstream's case does not stop at the published document: it requires the
+    // server to **accept a CR carrying arbitrary unknown properties**, for both
+    // create and apply (crd_publish_openapi.go:158-197). For a CRD with no validation schema those properties must also
+    // survive — the complement of the pruning asserted in
+    // `crd_with_validation_schema_publishes_to_openapi_v2`. Getting the two the
+    // wrong way round would be invisible in a document-only check.
+    let (s, b) = router_request(
+        &state,
+        "POST",
+        "/apis/example.com/v1/namespaces/default/e2e-test-bars",
+        Some(&json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Bar",
+            "metadata": { "name": "random-cr" },
+            "someUnknownField": "value",
+            "nested": { "alsoUnknown": [1, 2, 3] }
+        })),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&s),
+        "a CR with arbitrary unknown properties must be accepted: {s} {b}"
+    );
+    assert_eq!(
+        b["someUnknownField"], "value",
+        "an unknown top-level property must be preserved, not pruned: {b}"
+    );
+    assert_eq!(
+        b["nested"]["alsoUnknown"],
+        json!([1, 2, 3]),
+        "an unknown nested property must be preserved: {b}"
+    );
 }
 
 /// [sig-api-machinery] CustomResourcePublishOpenAPI preserving unknown fields at schema root [Conformance]
@@ -570,6 +607,38 @@ async fn crd_preserves_unknown_fields_at_root_in_openapi_v2() {
         user_keys.is_empty(),
         "root preserve-unknown-fields must collapse user-defined properties; found: {:?}",
         user_keys
+    );
+    // Upstream's case does not stop at the published document: it requires the
+    // server to **accept a CR carrying arbitrary unknown properties**, for both
+    // create and apply (crd_publish_openapi.go:199-239). For a CRD preserving unknown fields at the root those properties must also
+    // survive — the complement of the pruning asserted in
+    // `crd_with_validation_schema_publishes_to_openapi_v2`. Getting the two the
+    // wrong way round would be invisible in a document-only check.
+    let (s, b) = router_request(
+        &state,
+        "POST",
+        "/apis/example.com/v1/namespaces/default/e2e-test-pur",
+        Some(&json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Pur",
+            "metadata": { "name": "random-cr" },
+            "someUnknownField": "value",
+            "nested": { "alsoUnknown": [1, 2, 3] }
+        })),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&s),
+        "a CR with arbitrary unknown properties must be accepted: {s} {b}"
+    );
+    assert_eq!(
+        b["someUnknownField"], "value",
+        "an unknown top-level property must be preserved, not pruned: {b}"
+    );
+    assert_eq!(
+        b["nested"]["alsoUnknown"],
+        json!([1, 2, 3]),
+        "an unknown nested property must be preserved: {b}"
     );
 }
 
@@ -1168,6 +1237,42 @@ async fn crd_conversion_webhook_converts_non_homogeneous_list() {
             }
             other => panic!("unexpected item name {:?}: {}", other, item),
         }
+    }
+    // Upstream lists the same non-homogeneous collection in **both** versions,
+    // requiring two items each time (crd_conversion_webhook.go:419-434). The
+    // mirror listed only at v2, so conversion in the other direction —
+    // recombining a v2-stored object's `host`/`port` back into a v1 `hostPort`
+    // — was never exercised.
+    let (ls, lb) = router_request(
+        &state,
+        "GET",
+        "/apis/example.com/v1/namespaces/default/mixeds",
+        None,
+    )
+    .await;
+    assert!((200..300).contains(&ls), "LIST v1 failed: {} {}", ls, lb);
+    let items = lb["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 2, "LIST v1 must return both objects: {lb}");
+    for item in items {
+        assert_eq!(
+            item["apiVersion"].as_str(),
+            Some("example.com/v1"),
+            "every listed item must be served at v1: {item}"
+        );
+        assert!(
+            item.get("host").is_none() && item.get("port").is_none(),
+            "a v1-served item must not carry the v2 split fields: {item}"
+        );
+        let expected = match item["metadata"]["name"].as_str() {
+            Some("from-v1") => "alpha:1000",
+            Some("from-v2") => "beta:2000",
+            other => panic!("unexpected item name {other:?}"),
+        };
+        assert_eq!(
+            item["hostPort"].as_str(),
+            Some(expected),
+            "v1 hostPort must be recombined from the stored representation: {item}"
+        );
     }
 }
 
