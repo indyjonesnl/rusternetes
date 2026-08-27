@@ -1118,6 +1118,25 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             return None;
         }
 
+        // A pod that already preempted must wait for the room it made instead of
+        // preempting a second set of victims somewhere else. Victims terminate
+        // gracefully, so for up to their grace period the node still accounts for
+        // them and the preemptor still doesn't fit; retrying without this gate
+        // killed a medium-priority pod on the *other* node and broke
+        // [sig-scheduling] SchedulerPreemption (#1130).
+        // Upstream: PodEligibleToPreemptOthers
+        // (pkg/scheduler/framework/plugins/defaultpreemption/default_preemption.go:317-341).
+        if !crate::advanced::pod_eligible_to_preempt_others(pod, all_pods) {
+            debug!(
+                "Pod {} already nominated to {:?} with a victim still terminating; not preempting again",
+                pod.metadata.name,
+                pod.status
+                    .as_ref()
+                    .and_then(|s| s.nominated_node_name.as_deref())
+            );
+            return None;
+        }
+
         // Check each node to see if preemption is possible
         // Only consider nodes that pass basic scheduling constraints (except resources)
         for node in nodes {

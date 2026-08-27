@@ -543,6 +543,104 @@ pub(crate) fn parse_resource_quantity(quantity: &str, resource_type: &str) -> i6
 #[allow(dead_code)]
 const SYSTEM_CRITICAL_PRIORITY: i32 = 2_000_000_000;
 
+/// Is this pod allowed to preempt *again*?
+///
+/// A pod that has already preempted carries `status.nominatedNodeName`, and its
+/// victims take their termination grace period to actually disappear. Until they
+/// do, the node still accounts for their resources, so the preemptor still does
+/// not fit — and a scheduler that simply retries will preempt a *second* set of
+/// victims, on another node.
+///
+/// That is what broke `[sig-scheduling] SchedulerPreemption [Serial]`: the
+/// low-priority pod on the first node was correctly preempted, then the next
+/// scheduling cycle preempted a medium-priority pod on the *other* node, and the
+/// spec's assertion that every other pod survives failed with
+/// `pods "pod1-1-sched-preemption-medium-priority" not found`
+/// (test/e2e/scheduling/preemption.go:206).
+///
+/// Upstream gates this in `PodEligibleToPreemptOthers`
+/// (pkg/scheduler/framework/plugins/defaultpreemption/default_preemption.go:317-341):
+///
+/// ```go
+/// nomNodeName := pod.Status.NominatedNodeName
+/// if len(nomNodeName) > 0 {
+///     if nodeInfo, _ := nodeInfos.Get(nomNodeName); nodeInfo != nil {
+///         for _, p := range nodeInfo.GetPods() {
+///             if pl.isPreemptionAllowed(nodeInfo, p, pod) && podTerminatingByPreemption(p.GetPod()) {
+///                 // There is a terminating pod on the nominated node.
+///                 return false, "not eligible due to a terminating pod on the nominated node."
+/// ```
+///
+/// Returns `false` when a lower-priority pod on the nominated node is still
+/// terminating, i.e. the preemptor should wait for the room it already made.
+pub fn pod_eligible_to_preempt_others(pod: &Pod, all_pods: &[Pod]) -> bool {
+    let nominated = match pod
+        .status
+        .as_ref()
+        .and_then(|s| s.nominated_node_name.as_deref())
+    {
+        Some(n) if !n.is_empty() => n,
+        _ => return true,
+    };
+
+    let incoming_priority = pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
+
+    !all_pods.iter().any(|p| {
+        let on_nominated_node = p
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_deref())
+            .map(|n| n == nominated)
+            .unwrap_or(false);
+        if !on_nominated_node {
+            return false;
+        }
+        // Same lower-priority test the victim selection uses.
+        let victim_priority = p.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
+        if victim_priority >= incoming_priority {
+            return false;
+        }
+        pod_terminating_by_preemption(p)
+    })
+}
+
+/// Is this pod terminating *because the scheduler preempted it*?
+///
+/// Port of upstream `podTerminatingByPreemption`
+/// (pkg/scheduler/framework/plugins/defaultpreemption/default_preemption.go:355-366):
+///
+/// ```go
+/// if p.DeletionTimestamp == nil { return false }
+/// for _, condition := range p.Status.Conditions {
+///     if condition.Type == v1.DisruptionTarget {
+///         return condition.Status == v1.ConditionTrue && condition.Reason == v1.PodReasonPreemptionByScheduler
+///     }
+/// }
+/// return false
+/// ```
+///
+/// The `DisruptionTarget` requirement is not decoration. Testing only for a
+/// `deletionTimestamp` treats *any* terminating pod — a finished Job's pod, the
+/// previous conformance spec's cleanup, a rolling update's old replica — as
+/// evidence that this preemptor already made room, so
+/// [`pod_eligible_to_preempt_others`] blocks a legitimate first preemption and
+/// nothing gets preempted at all. That regression showed up immediately as
+/// `expected pod to be preempted, instead got pod pod0-0-sched-preemption-low-priority`
+/// (test/e2e/scheduling/preemption.go:202).
+fn pod_terminating_by_preemption(p: &Pod) -> bool {
+    if p.metadata.deletion_timestamp.is_none() {
+        return false;
+    }
+    p.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .into_iter()
+        .flatten()
+        .find(|c| c.condition_type == "DisruptionTarget")
+        .map(|c| c.status == "True" && c.reason.as_deref() == Some("PreemptionByScheduler"))
+        .unwrap_or(false)
+}
+
 /// Check if preemption should occur and return pods to evict.
 ///
 /// This is the PDB-unaware entry point retained for callers that don't have
@@ -1837,5 +1935,159 @@ mod tests {
         assert!(host_ips_overlap("10.0.0.1", "10.0.0.1"));
         assert!(!host_ips_overlap("10.0.0.1", "10.0.0.2"));
         assert!(!host_ips_overlap("192.168.1.1", "10.0.0.1"));
+    }
+    /// Mark a pod as terminating *by preemption*, the way our eviction path does:
+    /// deletionTimestamp plus DisruptionTarget=True/PreemptionByScheduler.
+    fn mark_preempted(pod: &mut Pod) {
+        pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        let status = pod.status.get_or_insert_with(Default::default);
+        status.conditions.get_or_insert_with(Vec::new).push(
+            rusternetes_common::resources::PodCondition {
+                condition_type: "DisruptionTarget".to_string(),
+                status: "True".to_string(),
+                last_probe_time: None,
+                last_transition_time: Some(chrono::Utc::now()),
+                reason: Some("PreemptionByScheduler".to_string()),
+                message: Some("Preempted by a higher-priority pod".to_string()),
+                observed_generation: None,
+            },
+        );
+    }
+
+    /// #1130: a pod that already preempted must not preempt again while its
+    /// victim is still terminating on the node it was nominated to.
+    ///
+    /// Without this gate the scheduler retried, found the preemptor still did
+    /// not fit (the victim's resources are accounted for until it really goes
+    /// away), and preempted a second victim on another node — which is how
+    /// `pod1-1-sched-preemption-medium-priority` was deleted and
+    /// `[sig-scheduling] SchedulerPreemption [Serial]` failed at
+    /// test/e2e/scheduling/preemption.go:206.
+    #[test]
+    fn a_pod_with_a_terminating_victim_on_its_nominated_node_is_not_eligible() {
+        let mut preemptor = make_incoming_pod("preemptor", 1000, "100m", "128Mi", None);
+        preemptor.status = Some(rusternetes_common::resources::PodStatus {
+            nominated_node_name: Some("node-1".to_string()),
+            ..Default::default()
+        });
+
+        let mut victim = make_scheduled_pod("victim", 1, "100m", "128Mi", "node-1");
+        mark_preempted(&mut victim);
+
+        assert!(
+            !pod_eligible_to_preempt_others(&preemptor, &[victim]),
+            "must wait for the room it already made"
+        );
+    }
+
+    /// Once the victim is gone, the pod may preempt again (it will normally just
+    /// schedule instead).
+    #[test]
+    fn a_pod_whose_victim_has_gone_is_eligible_again() {
+        let mut preemptor = make_incoming_pod("preemptor", 1000, "100m", "128Mi", None);
+        preemptor.status = Some(rusternetes_common::resources::PodStatus {
+            nominated_node_name: Some("node-1".to_string()),
+            ..Default::default()
+        });
+
+        // Only a healthy, higher-priority neighbour remains on the node.
+        let neighbour = make_scheduled_pod("neighbour", 2000, "100m", "128Mi", "node-1");
+
+        assert!(pod_eligible_to_preempt_others(&preemptor, &[neighbour]));
+    }
+
+    /// A terminating pod on a DIFFERENT node must not block preemption — the
+    /// gate is about the node this pod was nominated to.
+    #[test]
+    fn a_terminating_pod_on_another_node_does_not_block_preemption() {
+        let mut preemptor = make_incoming_pod("preemptor", 1000, "100m", "128Mi", None);
+        preemptor.status = Some(rusternetes_common::resources::PodStatus {
+            nominated_node_name: Some("node-1".to_string()),
+            ..Default::default()
+        });
+
+        let mut elsewhere = make_scheduled_pod("elsewhere", 1, "100m", "128Mi", "node-2");
+        mark_preempted(&mut elsewhere);
+
+        assert!(pod_eligible_to_preempt_others(&preemptor, &[elsewhere]));
+    }
+
+    /// A terminating pod of EQUAL or higher priority is not a victim of this
+    /// preemptor, so it must not gate it either.
+    #[test]
+    fn a_terminating_higher_priority_pod_does_not_block_preemption() {
+        let mut preemptor = make_incoming_pod("preemptor", 1000, "100m", "128Mi", None);
+        preemptor.status = Some(rusternetes_common::resources::PodStatus {
+            nominated_node_name: Some("node-1".to_string()),
+            ..Default::default()
+        });
+
+        let mut other = make_scheduled_pod("other", 5000, "100m", "128Mi", "node-1");
+        mark_preempted(&mut other);
+
+        assert!(pod_eligible_to_preempt_others(&preemptor, &[other]));
+    }
+
+    /// Regression: a pod terminating for an ordinary reason must NOT count as
+    /// "this preemptor already made room".
+    ///
+    /// The first version of this gate tested only `deletionTimestamp`, so any
+    /// terminating lower-priority pod on the nominated node — a finished Job's
+    /// pod, the previous spec's cleanup — blocked preemption forever and
+    /// `[sig-scheduling] SchedulerPreemption` failed the other way round:
+    /// `expected pod to be preempted, instead got pod pod0-0-…-low-priority`.
+    /// Upstream requires DisruptionTarget=True with reason
+    /// PreemptionByScheduler (podTerminatingByPreemption).
+    #[test]
+    fn a_pod_terminating_for_an_unrelated_reason_does_not_block_preemption() {
+        let mut preemptor = make_incoming_pod("preemptor", 1000, "100m", "128Mi", None);
+        preemptor.status = Some(rusternetes_common::resources::PodStatus {
+            nominated_node_name: Some("node-1".to_string()),
+            ..Default::default()
+        });
+
+        // Terminating, but not by preemption: no DisruptionTarget condition.
+        let mut ordinary = make_scheduled_pod("ordinary", 1, "100m", "128Mi", "node-1");
+        ordinary.metadata.deletion_timestamp = Some(chrono::Utc::now());
+
+        assert!(
+            pod_eligible_to_preempt_others(&preemptor, &[ordinary]),
+            "an ordinary termination must not be mistaken for our own victim"
+        );
+    }
+
+    /// A DisruptionTarget condition from a *different* disruptor (eviction API,
+    /// node drain) also must not gate preemption.
+    #[test]
+    fn a_pod_disrupted_by_something_else_does_not_block_preemption() {
+        let mut preemptor = make_incoming_pod("preemptor", 1000, "100m", "128Mi", None);
+        preemptor.status = Some(rusternetes_common::resources::PodStatus {
+            nominated_node_name: Some("node-1".to_string()),
+            ..Default::default()
+        });
+
+        let mut drained = make_scheduled_pod("drained", 1, "100m", "128Mi", "node-1");
+        drained.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        let status = drained.status.get_or_insert_with(Default::default);
+        status.conditions.get_or_insert_with(Vec::new).push(
+            rusternetes_common::resources::PodCondition {
+                condition_type: "DisruptionTarget".to_string(),
+                status: "True".to_string(),
+                last_probe_time: None,
+                last_transition_time: Some(chrono::Utc::now()),
+                reason: Some("EvictionByEvictionAPI".to_string()),
+                message: None,
+                observed_generation: None,
+            },
+        );
+
+        assert!(pod_eligible_to_preempt_others(&preemptor, &[drained]));
+    }
+
+    /// A pod that has never preempted (no nominatedNodeName) is always eligible.
+    #[test]
+    fn a_pod_without_a_nominated_node_is_eligible() {
+        let preemptor = make_incoming_pod("fresh", 1000, "100m", "128Mi", None);
+        assert!(pod_eligible_to_preempt_others(&preemptor, &[]));
     }
 }
