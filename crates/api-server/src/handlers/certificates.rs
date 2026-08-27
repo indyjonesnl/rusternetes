@@ -144,6 +144,19 @@ pub async fn update_certificate_signing_request(
         }
     }
 
+    // Reinstate the server-owned metadata a PUT body may omit: uid,
+    // creationTimestamp and a pending deletion. A locally built object —
+    // what the dynamic client's Update() sends — carries none of them, and
+    // storing the blanks orphans every child, because ownerReferences[].uid
+    // then matches no live owner and the garbage collector deletes them
+    // (#1605, #1793). Upstream applies this to every resource at once in
+    // registry/rest/update.go::BeforeUpdate (lines 131-146).
+    if let Ok(stored) = state.storage.get::<CertificateSigningRequest>(&key).await {
+        crate::handlers::lifecycle::inherit_server_owned_metadata(
+            &mut csr.metadata,
+            &stored.metadata,
+        );
+    }
     let result = match state.storage.update(&key, &csr).await {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &csr).await?,

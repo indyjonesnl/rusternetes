@@ -779,6 +779,20 @@ pub async fn update_custom_resource(
     // Validate the resource against CRD schema + CEL rules
     validate_custom_resource_with_old(&crd, &version, &cr, old_cr.as_ref())?;
 
+    // Reinstate the server-owned metadata a PUT body may omit: uid,
+    // creationTimestamp and a pending deletion. Custom resources own and are
+    // owned like any other object, so storing the client's blanks orphans
+    // children and lets the garbage collector delete them (#1605, #1793).
+    // Upstream applies this to every resource at once in
+    // registry/rest/update.go::BeforeUpdate (lines 131-146) — custom resources
+    // included, since they go through the same generic registry store.
+    if let Some(ref stored) = old_cr {
+        crate::handlers::lifecycle::inherit_server_owned_metadata(
+            &mut cr.metadata,
+            &stored.metadata,
+        );
+    }
+
     // Check authorization
     let attrs = if let Some(ref ns) = namespace {
         RequestAttributes::new(auth_ctx.user.clone(), "update", &plural)

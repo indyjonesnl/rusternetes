@@ -159,6 +159,7 @@ mod protobuf_test;
 mod proxy_method_routing_test;
 mod proxy_node_name_port_test;
 mod proxy_test;
+mod put_metadata_inheritance_guard_test;
 mod pv_defaults_test;
 mod pvc_default_volume_mode_test;
 mod rbac_authorization_test;

@@ -735,6 +735,15 @@ pub async fn update(
         &name,
     )?;
 
+    // Reinstate the server-owned metadata a PUT body may omit: uid,
+    // creationTimestamp and a pending deletion. Storing the client's blanks
+    // orphans every child, because ownerReferences[].uid then matches no live
+    // owner and the garbage collector deletes them (#1605, #1793). Upstream
+    // applies this to every resource at once in
+    // registry/rest/update.go::BeforeUpdate (lines 131-146). `old_pod` is
+    // already in hand from the resourceVersion check, so this costs no read.
+    crate::handlers::lifecycle::inherit_server_owned_metadata(&mut pod.metadata, &old_pod.metadata);
+
     // K8s ref: pkg/registry/core/pod/strategy.go statusStrategy +
     // ephemeralContainersStrategy. Ephemeral containers can only ever be ADDED
     // through the dedicated /ephemeralcontainers subresource; the regular
