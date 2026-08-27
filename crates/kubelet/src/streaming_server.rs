@@ -135,6 +135,21 @@ pub struct LogParams {
     pub timestamps: bool,
     /// Only lines at or after this RFC3339 timestamp (resolved to Unix epoch).
     pub since_time: Option<String>,
+    /// Only lines emitted within the last N seconds.
+    ///
+    /// `kubectl logs --since=1s` sends `sinceSeconds=1`, NOT `sinceTime`, so a
+    /// kubelet that only understands `sinceTime` silently returns the whole log.
+    /// That is what made
+    /// `[sig-cli] Kubectl logs logs should be able to retrieve and filter logs`
+    /// flaky: it asserts `recent(--since=1s) < older(--since=24h)` and both
+    /// queries returned every line, so it only passed when the pod happened to
+    /// emit more output between the two calls
+    /// (`expected recent(26) to be less than older(26)`).
+    ///
+    /// Upstream carries both fields in `v1.PodLogOptions` and rejects setting
+    /// both at once ("at most one of `sinceTime` or `sinceSeconds` may be
+    /// specified"), so `since_time` wins here when both arrive.
+    pub since_seconds: Option<i64>,
 }
 
 impl LogParams {
@@ -149,6 +164,7 @@ impl LogParams {
         let mut follow = false;
         let mut timestamps = false;
         let mut since_time: Option<String> = None;
+        let mut since_seconds: Option<i64> = None;
 
         for pair in query.split('&') {
             let (key, value) = if let Some(pos) = pair.find('=') {
@@ -165,6 +181,7 @@ impl LogParams {
                 "sinceTime" if !value.is_empty() => {
                     since_time = Some(value);
                 }
+                "sinceSeconds" => since_seconds = value.parse().ok().filter(|s: &i64| *s > 0),
                 _ => {}
             }
         }
@@ -174,17 +191,29 @@ impl LogParams {
             follow,
             timestamps,
             since_time,
+            since_seconds,
         }
     }
 }
 
 /// Map [`LogParams`] to [`rusternetes_cri::stream::LogReadOptions`].
 fn log_read_options(params: &LogParams) -> rusternetes_cri::stream::LogReadOptions {
-    let since_unix = params.since_time.as_deref().and_then(|s| {
-        chrono::DateTime::parse_from_rfc3339(s)
-            .ok()
-            .map(|t| t.timestamp())
-    });
+    // sinceTime wins when both are present (upstream validation forbids that
+    // combination outright); otherwise sinceSeconds becomes an absolute cutoff
+    // relative to now, which is what the CRI log reader filters on.
+    let since_unix = params
+        .since_time
+        .as_deref()
+        .and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|t| t.timestamp())
+        })
+        .or_else(|| {
+            params
+                .since_seconds
+                .map(|secs| chrono::Utc::now().timestamp() - secs)
+        });
     rusternetes_cri::stream::LogReadOptions {
         timestamps: params.timestamps,
         tail_lines: params.tail_lines,
@@ -967,5 +996,67 @@ mod tests {
             "log bytes must be flushed ahead of the chunked terminator; every \
              attempt delivered both in one read"
         );
+    }
+    /// `kubectl logs --since=1s` sends `sinceSeconds=1`, not `sinceTime`.
+    ///
+    /// Dropping it silently returned the whole log, which made
+    /// `[sig-cli] Kubectl logs logs should be able to retrieve and filter logs`
+    /// flaky: it asserts recent(--since=1s) < older(--since=24h) and got
+    /// `expected recent(26) to be less than older(26)`. Measured directly
+    /// before the fix: 20 lines for --since=1s, --since=24h and unfiltered
+    /// alike.
+    #[test]
+    fn log_params_parse_since_seconds() {
+        let p = LogParams::from_query("sinceSeconds=1&timestamps=true");
+        assert_eq!(p.since_seconds, Some(1));
+        assert!(p.timestamps);
+        assert!(p.since_time.is_none());
+    }
+
+    #[test]
+    fn log_params_ignore_a_nonpositive_or_unparsable_since_seconds() {
+        assert_eq!(LogParams::from_query("sinceSeconds=0").since_seconds, None);
+        assert_eq!(LogParams::from_query("sinceSeconds=-5").since_seconds, None);
+        assert_eq!(
+            LogParams::from_query("sinceSeconds=abc").since_seconds,
+            None
+        );
+        assert_eq!(LogParams::from_query("sinceSeconds=").since_seconds, None);
+    }
+
+    /// sinceSeconds becomes an absolute cutoff near "now minus N".
+    #[test]
+    fn since_seconds_resolves_to_a_recent_cutoff() {
+        let before = chrono::Utc::now().timestamp();
+        let opts = log_read_options(&LogParams::from_query("sinceSeconds=60"));
+        let after = chrono::Utc::now().timestamp();
+
+        let cutoff = opts.since_unix.expect("sinceSeconds must produce a cutoff");
+        assert!(
+            cutoff >= before - 61 && cutoff <= after - 59,
+            "cutoff {cutoff} should be ~60s before now ({before}..{after})"
+        );
+    }
+
+    /// Upstream forbids sending both; if both arrive anyway, the explicit
+    /// timestamp wins over the relative one.
+    #[test]
+    fn since_time_takes_precedence_over_since_seconds() {
+        let opts = log_read_options(&LogParams::from_query(
+            "sinceTime=2020-01-01T00:00:00Z&sinceSeconds=60",
+        ));
+        assert_eq!(
+            opts.since_unix,
+            Some(1_577_836_800),
+            "sinceTime (2020-01-01T00:00:00Z) must win"
+        );
+    }
+
+    /// No since* params means no cutoff — the whole log, as before.
+    #[test]
+    fn no_since_params_means_no_cutoff() {
+        let opts = log_read_options(&LogParams::from_query("tailLines=5"));
+        assert!(opts.since_unix.is_none());
+        assert_eq!(opts.tail_lines, Some(5));
     }
 }
