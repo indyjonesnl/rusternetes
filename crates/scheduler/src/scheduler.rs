@@ -1137,7 +1137,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             return None;
         }
 
-        // Check each node to see if preemption is possible
+        // Collect EVERY node preemption could use, then score them. Returning
+        // the first feasible node made the victim depend on node iteration
+        // order: with a low-priority victim on node-1 and a medium-priority one
+        // on node-2 we preempted whichever came first, so
+        // [sig-scheduling] SchedulerPreemption passed or failed by luck (#1130).
+        // Upstream: pickOneNodeForPreemption
+        // (pkg/scheduler/framework/preemption/preemption.go:651-730).
+        let mut candidates: Vec<crate::advanced::PreemptionCandidate> = Vec::new();
+
         // Only consider nodes that pass basic scheduling constraints (except resources)
         for node in nodes {
             // Skip unschedulable nodes
@@ -1170,10 +1178,23 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
             let (can_preempt, pods_to_evict) = check_preemption(node, pod, all_pods);
             if can_preempt && !pods_to_evict.is_empty() {
-                return Some((node.metadata.name.clone(), pods_to_evict));
+                candidates.push(crate::advanced::PreemptionCandidate {
+                    node_name: node.metadata.name.clone(),
+                    victims: pods_to_evict,
+                    // check_preemption is the PDB-unaware entry point, so no
+                    // violation count is available on this path; the score
+                    // chain still applies it, and it becomes meaningful once
+                    // PDBs are threaded through.
+                    num_pdb_violations: 0,
+                });
             }
         }
-        None
+
+        let chosen = crate::advanced::pick_one_node_for_preemption(&candidates, all_pods)?;
+        candidates
+            .into_iter()
+            .find(|c| c.node_name == chosen)
+            .map(|c| (c.node_name, c.victims))
     }
 
     /// Evict a pod by setting its deletionTimestamp (graceful delete).

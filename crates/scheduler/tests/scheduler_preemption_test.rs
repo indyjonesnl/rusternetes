@@ -458,6 +458,102 @@ async fn scheduler_queue_sorting_orders_pending_pods_by_priority_desc() {
     assert_eq!(resolve_priority(&p_explicit_low, &classes), 5);
 }
 
+/// The victim must be chosen by cost, not by node iteration order (#1130).
+///
+/// Mirrors upstream `pickOneNodeForPreemption`
+/// (pkg/scheduler/framework/preemption/preemption.go:651-730), whose second
+/// criterion is "a node with a minimum highest priority victim is preferable".
+///
+/// This is the residual half of #1130, found on 2026-08-27 while validating the
+/// eligibility gate. `try_preempt` returned the FIRST node preemption was
+/// feasible on, so the victim depended on the order `list_nodes()` happened to
+/// return — which is fixed for a cluster's lifetime and flips when the cluster
+/// is rebuilt. Same binaries, ~1 h apart:
+///
+/// ```text
+/// Preempting 1 pod(s) on node node-1 ... Evicted pod0-0-sched-preemption-low-priority
+/// Preempting 1 pod(s) on node node-2 ... Evicted pod1-1-sched-preemption-medium-priority
+/// ```
+///
+/// The second kills a medium-priority pod while a low-priority one sits
+/// untouched on the other node, which is exactly what
+/// `[sig-scheduling] SchedulerPreemption validates basic preemption works`
+/// asserts must not happen — and it read as a flake because it alternated
+/// between cluster rebuilds.
+///
+/// Node names here are deliberately chosen so the WRONG node sorts first:
+/// `node-a` holds the medium-priority victim, `node-b` the low-priority one. A
+/// first-feasible-node implementation evicts `medium-victim` and fails.
+#[tokio::test]
+async fn preemption_picks_lowest_priority_victim_regardless_of_node_order() {
+    let storage = setup_test().await;
+    let scheduler = Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+
+    storage
+        .create(
+            &build_key("priorityclasses", None, "high"),
+            &PriorityClass::new("high", 1_000_000),
+        )
+        .await
+        .unwrap();
+
+    // Two identical, fully-occupied nodes. Preemption is feasible on both.
+    for node_name in ["node-a", "node-b"] {
+        storage
+            .create(
+                &build_key("nodes", None, node_name),
+                &make_node(node_name, "1", "1Gi"),
+            )
+            .await
+            .unwrap();
+    }
+
+    // node-a (sorts first) carries the EXPENSIVE victim.
+    let medium = make_scheduled_pod("medium-victim", 500, "1", "512Mi", "node-a");
+    storage
+        .create(
+            &build_key("pods", Some("default"), "medium-victim"),
+            &medium,
+        )
+        .await
+        .unwrap();
+
+    // node-b (sorts second) carries the CHEAP victim — the correct choice.
+    let low = make_scheduled_pod("low-victim", 100, "1", "512Mi", "node-b");
+    storage
+        .create(&build_key("pods", Some("default"), "low-victim"), &low)
+        .await
+        .unwrap();
+
+    let preemptor = make_pending_pod("preemptor", None, Some("high"));
+    storage
+        .create(&build_key("pods", Some("default"), "preemptor"), &preemptor)
+        .await
+        .unwrap();
+
+    scheduler.schedule_pending_pods().await.unwrap();
+
+    let low_after: Pod = storage
+        .get(&build_key("pods", Some("default"), "low-victim"))
+        .await
+        .unwrap();
+    let medium_after: Pod = storage
+        .get(&build_key("pods", Some("default"), "medium-victim"))
+        .await
+        .unwrap();
+
+    assert!(
+        low_after.metadata.deletion_timestamp.is_some(),
+        "the LOW-priority pod must be the victim, even though its node sorts second"
+    );
+    assert!(
+        medium_after.metadata.deletion_timestamp.is_none(),
+        "the medium-priority pod must survive: preempting it because its node \
+         sorts first is the #1130 failure — victim chosen by iteration order \
+         rather than by cost"
+    );
+}
+
 /// End-to-end preemption through the scheduling loop (repointed from the
 /// retired controller-level pin; mirrors upstream
 /// `test/e2e/scheduling/preemption.go::"validates basic preemption works"`).
