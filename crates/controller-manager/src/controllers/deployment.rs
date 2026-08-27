@@ -2709,4 +2709,216 @@ mod tests {
             revision
         );
     }
+    /// Build a Deployment plus one owned, template-matching ReplicaSet in storage.
+    ///
+    /// This is the state a Deployment sits in for its whole steady life: exactly
+    /// one active ReplicaSet and no old ones, so `old_rs_total` is 0 — which is
+    /// what made every scale branch unreachable (#1605).
+    async fn seed_single_rs_deployment(
+        storage: &Arc<rusternetes_storage::memory::MemoryStorage>,
+        desired: i32,
+        rs_replicas: i32,
+        annotated_desired: Option<&str>,
+    ) -> (Deployment, String) {
+        use rusternetes_common::resources::{PodTemplateSpec, ReplicaSetStatus};
+        use rusternetes_common::types::LabelSelector;
+        use std::collections::HashMap;
+
+        let mut labels = HashMap::new();
+        labels.insert("app".to_string(), "test".to_string());
+
+        let deployment = Deployment {
+            type_meta: TypeMeta {
+                kind: "Deployment".to_string(),
+                api_version: "apps/v1".to_string(),
+            },
+            metadata: ObjectMeta::new("test-deploy").with_namespace("default"),
+            spec: rusternetes_common::resources::DeploymentSpec {
+                replicas: Some(desired),
+                selector: LabelSelector {
+                    match_labels: Some(labels.clone()),
+                    match_expressions: None,
+                },
+                template: PodTemplateSpec {
+                    metadata: Some(ObjectMeta::new("").with_labels(labels.clone())),
+                    spec: rusternetes_common::resources::PodSpec {
+                        containers: vec![test_container("test", "agnhost:2.59")],
+                        ..Default::default()
+                    },
+                },
+                strategy: None,
+                min_ready_seconds: None,
+                revision_history_limit: None,
+                paused: None,
+                progress_deadline_seconds: None,
+            },
+            status: None,
+        };
+        let dep_key = build_key("deployments", Some("default"), "test-deploy");
+        storage.create(&dep_key, &deployment).await.unwrap();
+
+        // Same template as the Deployment with only the pod-template-hash label
+        // added, so EqualIgnoreHash treats this as the ACTIVE ReplicaSet. The
+        // template metadata is cloned rather than rebuilt: ObjectMeta::new()
+        // stamps a fresh uid and creationTimestamp, which the whole-template
+        // JSON comparison would see as a mismatch.
+        let mut rs_labels = labels.clone();
+        rs_labels.insert("pod-template-hash".to_string(), "abc123".to_string());
+        let mut rs_template = deployment.spec.template.clone();
+        if let Some(meta) = rs_template.metadata.as_mut() {
+            meta.labels = Some(rs_labels.clone());
+        }
+
+        let annotations = annotated_desired.map(|d| {
+            let mut a = HashMap::new();
+            a.insert(
+                "deployment.kubernetes.io/desired-replicas".to_string(),
+                d.to_string(),
+            );
+            a.insert(
+                "deployment.kubernetes.io/max-replicas".to_string(),
+                d.to_string(),
+            );
+            a
+        });
+
+        let rs = ReplicaSet {
+            type_meta: TypeMeta {
+                kind: "ReplicaSet".to_string(),
+                api_version: "apps/v1".to_string(),
+            },
+            metadata: ObjectMeta {
+                name: "test-deploy-abc123".to_string(),
+                namespace: Some("default".to_string()),
+                labels: Some(rs_labels.clone()),
+                annotations,
+                owner_references: Some(vec![rusternetes_common::types::OwnerReference {
+                    api_version: "apps/v1".to_string(),
+                    kind: "Deployment".to_string(),
+                    name: "test-deploy".to_string(),
+                    uid: deployment.metadata.uid.clone(),
+                    controller: Some(true),
+                    block_owner_deletion: Some(true),
+                }]),
+                ..Default::default()
+            },
+            spec: ReplicaSetSpec {
+                replicas: rs_replicas,
+                selector: LabelSelector {
+                    match_labels: Some(rs_labels.clone()),
+                    match_expressions: None,
+                },
+                template: rs_template,
+                min_ready_seconds: None,
+            },
+            status: Some(ReplicaSetStatus {
+                replicas: rs_replicas,
+                ready_replicas: rs_replicas,
+                available_replicas: rs_replicas,
+                fully_labeled_replicas: Some(rs_replicas),
+                observed_generation: None,
+                conditions: None,
+                terminating_replicas: None,
+            }),
+        };
+        let rs_key = build_key("replicasets", Some("default"), "test-deploy-abc123");
+        storage.create(&rs_key, &rs).await.unwrap();
+
+        (deployment, rs_key)
+    }
+
+    /// #1605: a plain scale-up of a Deployment whose only ReplicaSet is the
+    /// active one must reach the requested count.
+    ///
+    /// Before the fix every scale branch was gated on `old_rs_total > 0`
+    /// (`is_scaling_event`, the rolling scale-up, the recreate and rollover
+    /// paths), so this state entered none of them: the ReplicaSet stayed at 1
+    /// and "[sig-apps] Deployment should run the lifecycle of a Deployment"
+    /// waited out its 5-minute timeout observing `ReadyReplicas 1`.
+    ///
+    /// Upstream runs the FindActiveOrLatest short-circuit unconditionally, at
+    /// the top of scale():
+    ///   pkg/controller/deployment/sync.go — scale()
+    ///   pkg/controller/deployment/util/deployment_util.go:357-377 — FindActiveOrLatest
+    #[tokio::test]
+    async fn a_single_active_replicaset_scales_up_to_spec_replicas() {
+        use rusternetes_storage::memory::MemoryStorage;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DeploymentController::new(storage.clone(), 5);
+
+        let (deployment, rs_key) = seed_single_rs_deployment(&storage, 2, 1, Some("1")).await;
+
+        controller.reconcile_deployment(&deployment).await.unwrap();
+
+        let scaled: ReplicaSet = storage.get(&rs_key).await.unwrap();
+        assert_eq!(
+            scaled.spec.replicas, 2,
+            "the sole active ReplicaSet must be scaled to spec.replicas (2); it is at {}",
+            scaled.spec.replicas
+        );
+    }
+
+    /// #1605 in the other direction: a scale-DOWN of a single-ReplicaSet
+    /// Deployment must also converge, and must not overshoot to 0.
+    #[tokio::test]
+    async fn a_single_active_replicaset_scales_down_to_spec_replicas() {
+        use rusternetes_storage::memory::MemoryStorage;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DeploymentController::new(storage.clone(), 5);
+
+        let (deployment, rs_key) = seed_single_rs_deployment(&storage, 1, 3, Some("3")).await;
+
+        controller.reconcile_deployment(&deployment).await.unwrap();
+
+        let scaled: ReplicaSet = storage.get(&rs_key).await.unwrap();
+        assert_eq!(
+            scaled.spec.replicas, 1,
+            "the sole active ReplicaSet must be scaled down to spec.replicas (1), not to 0"
+        );
+    }
+
+    /// #1605: scaling must work when the ReplicaSet carries no
+    /// desired-replicas annotation — that annotation is rolling-update
+    /// bookkeeping, not a precondition for plain scaling.
+    #[tokio::test]
+    async fn a_single_active_replicaset_scales_without_a_desired_replicas_annotation() {
+        use rusternetes_storage::memory::MemoryStorage;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DeploymentController::new(storage.clone(), 5);
+
+        let (deployment, rs_key) = seed_single_rs_deployment(&storage, 3, 1, None).await;
+
+        controller.reconcile_deployment(&deployment).await.unwrap();
+
+        let scaled: ReplicaSet = storage.get(&rs_key).await.unwrap();
+        assert_eq!(
+            scaled.spec.replicas, 3,
+            "scaling must not depend on the deployment.kubernetes.io/desired-replicas annotation"
+        );
+    }
+
+    /// Guard for the #1605 fix: a PAUSED Deployment is still never scaled.
+    #[tokio::test]
+    async fn a_paused_deployment_is_not_scaled_even_with_one_active_replicaset() {
+        use rusternetes_storage::memory::MemoryStorage;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DeploymentController::new(storage.clone(), 5);
+
+        let (mut deployment, rs_key) = seed_single_rs_deployment(&storage, 4, 1, Some("1")).await;
+        deployment.spec.paused = Some(true);
+        let dep_key = build_key("deployments", Some("default"), "test-deploy");
+        storage.update(&dep_key, &deployment).await.unwrap();
+
+        controller.reconcile_deployment(&deployment).await.unwrap();
+
+        let untouched: ReplicaSet = storage.get(&rs_key).await.unwrap();
+        assert_eq!(
+            untouched.spec.replicas, 1,
+            "a paused Deployment must not be scaled"
+        );
+    }
 }

@@ -160,9 +160,133 @@ pub fn check_delete_preconditions(
     Ok(())
 }
 
+/// Reinstate the server-owned metadata a PUT body may not set, taking it from
+/// the stored object.
+///
+/// Port of upstream `BeforeUpdate`
+/// (staging/src/k8s.io/apiserver/pkg/registry/rest/update.go:123-146):
+///
+/// ```text
+/// // Use the existing UID if none is provided
+/// if len(objectMeta.GetUID()) == 0 { objectMeta.SetUID(oldMeta.GetUID()) }
+/// // ClusterName is ignored / creationTimestamp is preserved
+/// if oldCreationTime := oldMeta.GetCreationTimestamp(); !oldCreationTime.IsZero() {
+///     objectMeta.SetCreationTimestamp(oldMeta.GetCreationTimestamp())
+/// }
+/// if !oldMeta.GetDeletionTimestamp().IsZero() { objectMeta.SetDeletionTimestamp(...) }
+/// if oldMeta.GetDeletionGracePeriodSeconds() != nil && objectMeta.GetDeletionGracePeriodSeconds() == nil { ... }
+/// ```
+///
+/// Why this matters (#1605): a client that builds the object locally and PUTs it
+/// — exactly what the dynamic client's `Update()` does, and what
+/// `[sig-apps] Deployment should run the lifecycle of a Deployment` uses — sends
+/// no `uid` and no `creationTimestamp`. Storing those blanks **orphans every
+/// child**: a ReplicaSet's `ownerReferences[].uid` then matches no live owner, so
+/// the garbage collector deletes the ReplicaSets and their pods while the
+/// Deployment's status still describes them. The workload silently loses its
+/// pods and `observedGeneration` freezes.
+///
+/// `generation` is handled separately by [`maybe_increment_generation`], which
+/// reinstates the stored value before deciding whether to bump it.
+pub fn inherit_server_owned_metadata(new_meta: &mut ObjectMeta, old_meta: &ObjectMeta) {
+    // Upstream only fills the UID when the request omits it; a *mismatched* UID
+    // is caught later by the common metadata validation, not silently rewritten.
+    if new_meta.uid.is_empty() {
+        new_meta.uid = old_meta.uid.clone();
+    }
+
+    if old_meta.creation_timestamp.is_some() {
+        new_meta.creation_timestamp = old_meta.creation_timestamp;
+    }
+
+    // A client cannot start or clear a deletion through a plain update.
+    if old_meta.deletion_timestamp.is_some() {
+        new_meta.deletion_timestamp = old_meta.deletion_timestamp;
+    }
+    if old_meta.deletion_grace_period_seconds.is_some()
+        && new_meta.deletion_grace_period_seconds.is_none()
+    {
+        new_meta.deletion_grace_period_seconds = old_meta.deletion_grace_period_seconds;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1605: a PUT that omits uid/creationTimestamp must not blank them —
+    /// blanking the uid orphans every child and the GC deletes the workload's
+    /// ReplicaSets and pods.
+    #[test]
+    fn inherit_server_owned_metadata_fills_uid_and_creation_timestamp() {
+        let created = chrono::Utc::now();
+        let old = ObjectMeta {
+            uid: "0ca12357-84c2-45e4-9a08-b1891e1931da".to_string(),
+            creation_timestamp: Some(created),
+            ..Default::default()
+        };
+        // What the dynamic client's Update() sends: a locally built object.
+        let mut new_meta = ObjectMeta {
+            uid: String::new(),
+            creation_timestamp: None,
+            ..Default::default()
+        };
+
+        inherit_server_owned_metadata(&mut new_meta, &old);
+
+        assert_eq!(
+            new_meta.uid, old.uid,
+            "a PUT omitting the uid must inherit the stored one"
+        );
+        assert_eq!(
+            new_meta.creation_timestamp,
+            Some(created),
+            "a PUT omitting creationTimestamp must inherit the stored one"
+        );
+    }
+
+    #[test]
+    fn inherit_server_owned_metadata_keeps_a_client_supplied_uid() {
+        let old = ObjectMeta {
+            uid: "stored-uid".to_string(),
+            ..Default::default()
+        };
+        let mut new_meta = ObjectMeta {
+            uid: "client-uid".to_string(),
+            ..Default::default()
+        };
+
+        inherit_server_owned_metadata(&mut new_meta, &old);
+
+        assert_eq!(
+            new_meta.uid, "client-uid",
+            "a supplied uid is left for the metadata validation to reject, not silently rewritten"
+        );
+    }
+
+    #[test]
+    fn inherit_server_owned_metadata_preserves_a_pending_deletion() {
+        let deleted_at = chrono::Utc::now();
+        let old = ObjectMeta {
+            uid: "u".to_string(),
+            deletion_timestamp: Some(deleted_at),
+            deletion_grace_period_seconds: Some(30),
+            ..Default::default()
+        };
+        let mut new_meta = ObjectMeta {
+            uid: "u".to_string(),
+            ..Default::default()
+        };
+
+        inherit_server_owned_metadata(&mut new_meta, &old);
+
+        assert_eq!(
+            new_meta.deletion_timestamp,
+            Some(deleted_at),
+            "an update must not clear a pending deletion"
+        );
+        assert_eq!(new_meta.deletion_grace_period_seconds, Some(30));
+    }
 
     #[test]
     fn test_set_initial_generation() {
