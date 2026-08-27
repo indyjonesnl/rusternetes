@@ -5,13 +5,78 @@
 //! https://github.com/kubernetes/kubernetes/tree/release-1.35/test/e2e/apimachinery/
 //!
 //! Mirrored files:
-//!   * `test/e2e/apimachinery/aggregator.go`  — TestSampleAPIServer (~line 285)
-//!   * `test/e2e/apimachinery/discovery.go`   — 4 ginkgo It descriptors
-//!   * `test/e2e/apimachinery/resource_quota.go` — none related to discovery
-//!     (listed for completeness; resource_quota lives in its own unit doc)
+//!   * `test/e2e/apimachinery/aggregator.go`  — 1 `framework.ConformanceIt`
+//!   * `test/e2e/apimachinery/discovery.go`   — 2 `framework.ConformanceIt`
+//!     (plus 2 plain `ginkgo.It`, which are NOT conformance cases)
 //!
 //! See docs/conformance/apimachinery-aggregation-discovery.md for the
 //! test-by-test status table.
+//!
+//! ---------------------------------------------------------------------------
+//! Mirror audit (#1749, 2026-08-27)
+//! ---------------------------------------------------------------------------
+//!
+//! Every citation in this file was re-derived from the upstream body it names,
+//! against `../kubernetes` at `release-1.35`. Findings do NOT carry over to
+//! other mirror files: coverage was checked suite-wide, not per-file, because
+//! a mirror may live in a different file from the one whose source it cites.
+//!
+//! Upstream conformance cases in this area, and where each is mirrored:
+//!
+//!   * discovery.go:126 "should validate PreferredVersion for each APIGroup"
+//!     → `discovery_apis_preferred_version_is_one_of_versions`
+//!   * discovery.go:172 "should locate the groupVersion and a resource within
+//!     each APIGroup"
+//!     → `discovery_locates_group_version_and_resource_in_each_api_group`
+//!   * aggregator.go:102 "Should be able to support the 1.17 Sample API Server
+//!     using the current Aggregator [LinuxOnly]"
+//!     → `aggregator_sample_apiserver_full_lifecycle` (+ the REST tail in
+//!     `aggregator_apiservice_patch_list_and_delete_collection`)
+//!   * table_conversion.go:154 "should return a 406 for a backend which does
+//!     not implement metadata" → mirrored in
+//!     `conformance_apimachinery_vap_apf_server.rs`, not here.
+//!
+//! Citations repaired: 8 of 10. `discovery.go:54` (×2) named the closing brace
+//! of a `BeforeEach`; `:110` named the storage-version-hash `ginkgo.It`;
+//! `:149` (×2) named a line inside the *PreferredVersion* body while labelling
+//! the *groupVersion* case; `aggregator.go:382` named the remote poll loop
+//! under a local-seed test; `:535` named a `versionPriority` patch under a
+//! deletion test; one citation was a bare path with a hedged "line ~348".
+//!
+//! Conformance claims withdrawn: 3. The two "present and missing resources"
+//! legs mirror a plain `ginkgo.It`, and the aggregated-discovery V2 tests
+//! mirror no upstream case at all — the previous citation asserted they were
+//! "tested in discovery.go:149 via the dynamic client", which is false.
+//!
+//! Assertions re-derived:
+//!   * discovery.go:172 is a table of NINETEEN (group, version, resource)
+//!     tuples. The mirror asserted two of them, split across two tests. It is
+//!     now the whole table, in upstream's order. All nineteen pass.
+//!   * discovery.go:126 validates PreferredVersion against the version list
+//!     returned by a SECOND request to `/apis/{group}/`, not the copy embedded
+//!     in the group list. The mirror read only the group list.
+//!   * aggregator.go's teardown is a label-selected `DeleteCollection`
+//!     (:743-751). The mirror deleted straight out of `MemoryStorage`, so no
+//!     DELETE-handler defect could fail it.
+//!
+//! Defect found: `list_apiservices` did not apply `?labelSelector=` — only the
+//! watch path did. Upstream's `checkApiServiceListQuantity` lists *with* the
+//! selector and waits for zero, so against Rusternetes it would have counted
+//! every APIService in the cluster and never converged. Fixed in
+//! `crates/api-server/src/handlers/generic.rs` in the same change; the test
+//! that catches it is `aggregator_apiservice_patch_list_and_delete_collection`,
+//! whose unlabelled bystander object is what makes the selector observable.
+//!
+//! Test removed: 1. `aggregator_create_local_apiservice_returns_available_true`
+//! was a strict subset of
+//! `aggregator_create_local_apiservice_uses_upstream_local_condition`, and
+//! cited the wrong upstream line.
+//!
+//! Excluded (cannot be reached at this layer):
+//!   * `metadata.resourceVersion` growth across a patch (aggregator.go:547) —
+//!     `MemoryStorage` does not stamp it; etcd and rhino do.
+//!   * Everything gated on a real kubelet — see the exclusion list on
+//!     `aggregator_sample_apiserver_full_lifecycle`.
 //!
 //! Harness: in-process axum router over `StorageBackend::Memory`, driven via
 //! `tower::ServiceExt::oneshot`. No Docker, no etcd, no kubelet.
@@ -93,16 +158,121 @@ fn apiservice_remote(
 // ---------------------------------------------------------------------------
 
 /// [sig-api-machinery] Discovery should locate the groupVersion and a resource
-/// within each APIGroup [Conformance] (core /api/v1 leg)
+/// within each APIGroup [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/discovery.go:149
-/// Sonobuoy (Round 160, 2026-04-26): PASS (not in failure list)
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/discovery.go:172
+///   ("should locate the groupVersion and a resource within each APIGroup")
+///   Table of (apiBasePath, apiGroup, apiVersion, validResource) tuples at
+///   discovery.go:180-293; assertions at discovery.go:296-311.
+///
+/// Mirror audit (#1749, 2026-08-27): re-derived. The old citation was
+/// `discovery.go:149`, which is inside the *PreferredVersion* case body — a
+/// different conformance case. Worse, the mirror asserted only two of
+/// upstream's nineteen tuples (core `v1`/namespaces and `apps/v1`/deployments),
+/// split across two tests. Upstream iterates the whole table and fails on the
+/// first tuple that is missing, so a mirror covering two of them could not
+/// fail for the seventeen groups it never asked about. The table below is
+/// upstream's, verbatim and in order.
 #[tokio::test]
-async fn discovery_core_api_lists_v1_and_resources() {
-    let router = spawn_state();
+async fn discovery_locates_group_version_and_resource_in_each_api_group() {
+    // discovery.go:180-293, verbatim.
+    const CASES: &[(&str, &str, &str, &str)] = &[
+        ("/api", "", "v1", "namespaces"),
+        (
+            "/apis",
+            "admissionregistration.k8s.io",
+            "v1",
+            "validatingwebhookconfigurations",
+        ),
+        (
+            "/apis",
+            "apiextensions.k8s.io",
+            "v1",
+            "customresourcedefinitions",
+        ),
+        ("/apis", "apiregistration.k8s.io", "v1", "apiservices"),
+        ("/apis", "apps", "v1", "deployments"),
+        ("/apis", "authentication.k8s.io", "v1", "tokenreviews"),
+        (
+            "/apis",
+            "authorization.k8s.io",
+            "v1",
+            "selfsubjectaccessreviews",
+        ),
+        ("/apis", "autoscaling", "v1", "horizontalpodautoscalers"),
+        ("/apis", "autoscaling", "v2", "horizontalpodautoscalers"),
+        ("/apis", "batch", "v1", "jobs"),
+        (
+            "/apis",
+            "certificates.k8s.io",
+            "v1",
+            "certificatesigningrequests",
+        ),
+        ("/apis", "coordination.k8s.io", "v1", "leases"),
+        ("/apis", "discovery.k8s.io", "v1", "endpointslices"),
+        ("/apis", "events.k8s.io", "v1", "events"),
+        ("/apis", "networking.k8s.io", "v1", "ingresses"),
+        ("/apis", "node.k8s.io", "v1", "runtimeclasses"),
+        ("/apis", "policy", "v1", "poddisruptionbudgets"),
+        ("/apis", "scheduling.k8s.io", "v1", "priorityclasses"),
+        ("/apis", "storage.k8s.io", "v1", "csinodes"),
+    ];
 
-    // GET /api → APIVersions object listing core API versions.
-    let (status, body) = http_get(router.clone(), "/api").await;
+    let router = spawn_state();
+    for (base_path, group, version, valid_resource) in CASES {
+        // `path.Join(t.apiBasePath, t.apiGroup, t.apiVersion)` — the empty
+        // core group collapses to `/api/v1`.
+        let api_path = if group.is_empty() {
+            format!("{base_path}/{version}")
+        } else {
+            format!("{base_path}/{group}/{version}")
+        };
+        // `schema.GroupVersion{Group, Version}.String()` — bare version for
+        // the core group, `group/version` otherwise.
+        let expected_group_version = if group.is_empty() {
+            (*version).to_string()
+        } else {
+            format!("{group}/{version}")
+        };
+
+        let (status, body) = http_get(router.clone(), &api_path).await;
+        assert_eq!(status, StatusCode::OK, "Fail to access: {api_path}");
+        assert_eq!(
+            body["groupVersion"].as_str(),
+            Some(expected_group_version.as_str()),
+            "{api_path} reported groupVersion {:?}",
+            body["groupVersion"]
+        );
+
+        let names: Vec<&str> = body["resources"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{api_path} has no resources array: {body}"))
+            .iter()
+            .filter_map(|r| r["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(valid_resource),
+            "Resource {valid_resource:?} was not found inside of resourceList for \
+             {api_path}: {names:?}"
+        );
+    }
+}
+
+/// [sig-api-machinery] Discovery — `/api` advertises the core group's versions
+///
+/// Upstream: no conformance case asserts the `/api` `APIVersions` document
+/// directly; discovery.go:172 enters the core group at `/api/v1`. The
+/// `APIVersions` document is what `clientdiscovery.IsResourceEnabled`
+/// traverses first (discovery.go:56), so it is asserted here on its own
+/// footing rather than under a conformance claim.
+///
+/// Mirror audit (#1749, 2026-08-27): split out of the former
+/// `discovery_core_api_lists_v1_and_resources`, whose conformance claim
+/// belonged to the table case above.
+#[tokio::test]
+async fn discovery_core_api_advertises_v1() {
+    let router = spawn_state();
+    let (status, body) = http_get(router, "/api").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["kind"].as_str(), Some("APIVersions"));
     let versions: Vec<&str> = body["versions"]
@@ -113,31 +283,21 @@ async fn discovery_core_api_lists_v1_and_resources() {
         .collect();
     assert!(
         versions.contains(&"v1"),
-        "core /api must advertise v1, got {:?}",
-        versions
+        "core /api must advertise v1, got {versions:?}"
     );
-
-    // GET /api/v1 → APIResourceList; must declare groupVersion=v1 and include
-    // both namespaces and pods (the two upstream-tested core resources).
-    let (status, body) = http_get(router, "/api/v1").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["kind"].as_str(), Some("APIResourceList"));
-    assert_eq!(body["groupVersion"].as_str(), Some("v1"));
-    let names: Vec<&str> = body["resources"]
-        .as_array()
-        .expect("resources array")
-        .iter()
-        .filter_map(|r| r["name"].as_str())
-        .collect();
-    assert!(names.contains(&"namespaces"), "missing namespaces");
-    assert!(names.contains(&"pods"), "missing pods");
 }
 
 /// [sig-api-machinery] Discovery should accurately determine present and
 /// missing resources (positive case)
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/discovery.go:54
-/// Sonobuoy (Round 160): PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/discovery.go:56
+///   ("should accurately determine present and missing resources") — a plain
+///   `ginkgo.It`, NOT a `framework.ConformanceIt`, so this is not a
+///   conformance case and carries no `[Conformance]` marker.
+///   Assertions via `clientdiscovery.IsResourceEnabled` at discovery.go:58-76.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited. `:54` is the closing brace of the
+/// enclosing `ginkgo.BeforeEach`, not a test.
 #[tokio::test]
 async fn discovery_reports_enabled_resources_present() {
     let router = spawn_state();
@@ -170,8 +330,12 @@ async fn discovery_reports_enabled_resources_present() {
 /// [sig-api-machinery] Discovery should accurately determine present and
 /// missing resources (negative case)
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/discovery.go:54
-/// Sonobuoy (Round 160): PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/discovery.go:56
+///   ("should accurately determine present and missing resources") — a plain
+///   `ginkgo.It`, NOT a `framework.ConformanceIt`; not a conformance case.
+///   The missing-resource half is at discovery.go:78-90.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:54` was the `BeforeEach` closing brace.
 #[tokio::test]
 async fn discovery_reports_missing_resources_absent() {
     let router = spawn_state();
@@ -208,12 +372,21 @@ async fn discovery_reports_missing_resources_absent() {
 /// [sig-api-machinery] Discovery should validate PreferredVersion for each
 /// APIGroup [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/discovery.go:110
-/// Sonobuoy (Round 160): PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/discovery.go:126
+///   ("should validate PreferredVersion for each APIGroup")
+///   Assertions at discovery.go:128-162.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:110` is inside the
+/// storage-version-hash `ginkgo.It` above, which is not a conformance case.
+/// Also re-derived: upstream does not read `preferredVersion` out of the
+/// `/apis` group list alone — for every group it issues a SECOND request to
+/// `/apis/{group}/` and validates the PreferredVersion against the version
+/// list *that endpoint* returns (discovery.go:141-146). A mirror that only
+/// reads `/apis` cannot catch the two documents disagreeing.
 #[tokio::test]
 async fn discovery_apis_preferred_version_is_one_of_versions() {
     let router = spawn_state();
-    let (status, body) = http_get(router, "/apis").await;
+    let (status, body) = http_get(router.clone(), "/apis").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["kind"].as_str(), Some("APIGroupList"));
 
@@ -226,35 +399,54 @@ async fn discovery_apis_preferred_version_is_one_of_versions() {
             // upstream skips example.com test groups; we mirror that
             continue;
         }
-        let preferred = group["preferredVersion"]["groupVersion"]
-            .as_str()
-            .unwrap_or("");
-        assert!(
-            !preferred.is_empty(),
-            "group {} must have a non-empty preferredVersion.groupVersion",
-            name
-        );
-        let versions: Vec<&str> = group["versions"]
+        // Upstream re-fetches the group's own endpoint and validates against
+        // the version list *that* document reports (discovery.go:141-146),
+        // not the copy embedded in the group list.
+        let api_path = format!("/apis/{name}/");
+        let (status, check_group) = http_get(router.clone(), &api_path).await;
+        assert_eq!(status, StatusCode::OK, "Fail to access: {api_path}");
+
+        let versions: Vec<&str> = check_group["versions"]
             .as_array()
-            .expect("versions")
+            .unwrap_or_else(|| panic!("No version found for {name}: {check_group}"))
             .iter()
             .filter_map(|v| v["groupVersion"].as_str())
             .collect();
+        assert!(!versions.is_empty(), "No version found for {name}");
+
+        let preferred = check_group["preferredVersion"]["groupVersion"]
+            .as_str()
+            .unwrap_or("");
         assert!(
             versions.contains(&preferred),
-            "preferredVersion {} for group {} not in versions {:?}",
-            preferred,
-            name,
-            versions
+            "Failed to find a valid version for PreferredVersion {preferred} of \
+             group {name} in versions {versions:?}"
+        );
+
+        // The group list and the group endpoint must agree; upstream reads
+        // only the latter, so a divergence would be invisible to it, but a
+        // client that trusts the list would then follow a version the group
+        // endpoint does not serve.
+        let listed_preferred = group["preferredVersion"]["groupVersion"]
+            .as_str()
+            .unwrap_or("");
+        assert_eq!(
+            listed_preferred, preferred,
+            "/apis and {api_path} disagree on preferredVersion for {name}"
         );
     }
 }
 
-/// [sig-api-machinery] Discovery should locate the groupVersion and a
-/// resource within each APIGroup [Conformance] (group leg — apps/v1)
+/// [sig-api-machinery] Discovery — apps/v1 exposes the workload resources
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/discovery.go:149
-/// Sonobuoy (Round 160): PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/discovery.go:172
+///   ("should locate the groupVersion and a resource within each APIGroup")
+///   covers the `apps`/`v1`/`deployments` tuple; `statefulsets` and
+///   `daemonsets` are asserted here beyond upstream's table.
+///
+/// Mirror audit (#1749, 2026-08-27): the `[Conformance]` marker moved to
+/// `discovery_locates_group_version_and_resource_in_each_api_group`, which
+/// mirrors the whole table. This test is now a superset detail, not the case.
 #[tokio::test]
 async fn discovery_group_apps_v1_returns_groupversion_and_deployments() {
     let router = spawn_state();
@@ -309,12 +501,17 @@ async fn discovery_apiregistration_v1_lists_apiservices_resource() {
 
 /// [sig-api-machinery] Aggregated Discovery V2 — Accept negotiation on /apis
 ///
-/// Mirrors the K8s client default Accept header that requests the
-/// `apidiscovery.k8s.io/v2` `APIGroupDiscoveryList` representation. Upstream
-/// reference: `staging/src/k8s.io/apimachinery/pkg/util/managedfields` +
-/// discovery.go integration; tested in discovery.go:149 via the dynamic
-/// client which speaks aggregated discovery transparently.
-/// Sonobuoy (Round 160): PASS
+/// Upstream: no conformance case. `test/e2e/apimachinery/discovery.go`
+/// contains no `framework.ConformanceIt` that negotiates aggregated
+/// discovery; the two cases there read the unaggregated `/apis` and
+/// `/apis/{group}/{version}` documents. The wire contract asserted here is
+/// `staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/...` +
+/// `staging/src/k8s.io/apiserver/pkg/endpoints/discovery/aggregated/handler.go`.
+///
+/// Mirror audit (#1749, 2026-08-27): the previous citation claimed this was
+/// "tested in discovery.go:149 via the dynamic client". It is not: `:149` is
+/// inside the PreferredVersion case, and no conformance case in that file
+/// exercises the `apidiscovery.k8s.io` representation at all.
 #[tokio::test]
 async fn discovery_aggregated_v2_negotiated_via_accept_header() {
     let router = spawn_state();
@@ -350,9 +547,11 @@ async fn discovery_aggregated_v2_negotiated_via_accept_header() {
 
 /// [sig-api-machinery] Aggregated Discovery V2 — core /api leg
 ///
-/// Mirrors the apidiscovery.k8s.io flavour of the core API endpoint that the
-/// upstream client uses to populate the discovery cache.
-/// Sonobuoy (Round 160): PASS
+/// Upstream: no conformance case — see the sibling test above. The
+/// aggregated representation of `/api` is served by
+/// `staging/src/k8s.io/apiserver/pkg/endpoints/discovery/aggregated/handler.go`.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; not a conformance case.
 #[tokio::test]
 async fn discovery_aggregated_v2_on_core_api() {
     let router = spawn_state();
@@ -756,38 +955,6 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
     let _ = mock_handle.await;
 }
 
-/// [sig-api-machinery] Aggregator — local APIService seeds Available=True
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/aggregator.go:382
-/// (`apiservice.Status.Conditions` read after creation)
-/// Sonobuoy (Round 160): PASS (this code path is the seed; aggregator FAIL
-/// occurs downstream at sample-apiserver deployment).
-#[tokio::test]
-async fn aggregator_create_local_apiservice_returns_available_true() {
-    let state = spawn_state();
-    let body = apiservice_local(
-        "v1alpha1.wardle.example.com",
-        "wardle.example.com",
-        "v1alpha1",
-    );
-    seed_apiservice(&state, body).await;
-
-    let key = build_key("apiservices", None, "v1alpha1.wardle.example.com");
-    let stored: Value = state.storage.get(&key).await.unwrap();
-    let avail = stored["status"]["conditions"]
-        .as_array()
-        .expect("conditions present")
-        .iter()
-        .find(|c| c["type"].as_str() == Some("Available"))
-        .expect("Available condition present");
-    assert_eq!(
-        avail["status"].as_str(),
-        Some("True"),
-        "local APIService should seed Available=True, got {:?}",
-        avail
-    );
-}
-
 /// [sig-api-machinery] Aggregator — create leaves a remote APIService's status empty
 ///
 /// Upstream: `apiServerStrategy.PrepareForCreate`
@@ -887,11 +1054,16 @@ async fn aggregator_create_local_apiservice_uses_upstream_local_condition() {
 /// [sig-api-machinery] Aggregator — APIService discovery merge: a registered
 /// APIService group appears in /apis (HTTP surface)
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/aggregator.go (the
-/// sample-apiserver group `wardle.example.com` must show up in discovery
-/// after registration — used implicitly by the dynamic client at line ~348).
-/// Sonobuoy (Round 160): PASS (the merge happens server-side; FAIL is
-/// downstream when proxying to a non-Ready Pod)
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/aggregator.go:102
+///   ("Should be able to support the 1.17 Sample API Server using the current
+///   Aggregator [LinuxOnly]") — the discovery-merge step of that case, whose
+///   poll loop at aggregator.go:384-390 requires
+///   `/apis/wardle.example.com/v1alpha1/...` to become reachable, which is
+///   only possible once the group is merged into discovery.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited. The old citation gave a bare
+/// file path plus a hedged "line ~348", which pins nothing and cannot be
+/// invalidated when upstream moves.
 #[tokio::test]
 async fn aggregator_registered_apiservice_appears_in_discovery() {
     let state = spawn_state();
@@ -927,10 +1099,18 @@ async fn aggregator_registered_apiservice_appears_in_discovery() {
 /// [sig-api-machinery] Aggregator — APIService removal drops the group from
 /// /apis discovery on the next request
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/aggregator.go:535
-/// (DeleteCollection by label; we assert the simpler single-delete path
-/// because the upstream collection delete is covered by the watch/gc unit).
-/// Sonobuoy (Round 160): PASS (REST surface)
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/aggregator.go:102
+///   ("Should be able to support the 1.17 Sample API Server using the current
+///   Aggregator [LinuxOnly]") — the teardown step at aggregator.go:743-751:
+///   `APIServices().DeleteCollection(labelSelector)` followed by
+///   `checkApiServiceListQuantity(..., 0)`.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited and re-derived. `:535` is a
+/// `versionPriority` merge-patch, not a delete. The mirror also deleted the
+/// object straight out of storage, which is the same shortcut this file's
+/// own header comment calls out for creation: it turned a test of the DELETE
+/// handler into a test of `MemoryStorage`. Both the single DELETE and
+/// upstream's label-selected collection delete now go through the router.
 #[tokio::test]
 async fn aggregator_delete_apiservice_removes_from_discovery() {
     let state = spawn_state();
@@ -957,10 +1137,21 @@ async fn aggregator_delete_apiservice_removes_from_discovery() {
         .collect();
     assert!(before_names.contains(&"wardle.example.com"));
 
-    // Drop the APIService from storage (equivalent to the DELETE handler
-    // path; see the public-routes auth note at the top of this section).
-    let key = build_key("apiservices", None, "v1alpha1.wardle.example.com");
-    state.storage.delete(&key).await.expect("delete apiservice");
+    // Delete through the route, not through storage: a DELETE handler that
+    // failed to remove the object (or removed the wrong one) has to be able
+    // to fail this test.
+    let (status, _, body) = state
+        .send_raw(
+            "DELETE",
+            "/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.wardle.example.com",
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        status.is_success(),
+        "DELETE apiservice must succeed: {status} {body}"
+    );
 
     let (status, after) = http_get(state, "/apis").await;
     assert_eq!(status, StatusCode::OK);
@@ -974,5 +1165,175 @@ async fn aggregator_delete_apiservice_removes_from_discovery() {
         !after_names.contains(&"wardle.example.com"),
         "aggregated group still present after deletion: {:?}",
         after_names
+    );
+}
+
+/// [sig-api-machinery] Aggregator — APIService patch, list, label and
+/// deleteCollection (the REST tail of the Sample API Server case)
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/aggregator.go:102
+///   ("Should be able to support the 1.17 Sample API Server using the current
+///   Aggregator [LinuxOnly]") — the REST sequence at aggregator.go:536-751:
+///   merge-patch `spec.versionPriority` to 400 (:537-546), list APIServices
+///   and locate the registered one (:549-570), add a label so the object can
+///   be selected (:573-...), then `DeleteCollection` by that label selector
+///   and confirm the list count drops to zero (:743-751).
+///
+/// Mirror audit (#1749, 2026-08-27): added. None of this tail was mirrored;
+/// the file's only deletion test used a single DELETE and reached into
+/// storage to do it. The label-selected collection delete is the mechanism
+/// upstream actually uses, and it is the one that can regress independently
+/// of single-object DELETE.
+///
+/// Excluded: upstream also asserts the patched object carries a larger
+/// `metadata.resourceVersion` than the pre-patch one
+/// (`resourceversion.CompareResourceVersion`, aggregator.go:547).
+/// `MemoryStorage` does not stamp `metadata.resourceVersion` on write — the
+/// etcd (`crates/storage/src/etcd.rs:43-52`) and rhino
+/// (`crates/storage/src/rhino.rs:100-105`) backends do — so this harness
+/// cannot observe it. Asserting it here would test the harness, not the
+/// server.
+#[tokio::test]
+async fn aggregator_apiservice_patch_list_and_delete_collection() {
+    let state = spawn_state();
+    let name = "v1alpha1.wardle.example.com";
+    seed_apiservice(
+        &state,
+        apiservice_remote(
+            name,
+            "wardle.example.com",
+            "v1alpha1",
+            "wardle",
+            "sample-apiserver",
+            7443,
+        ),
+    )
+    .await;
+
+    // A second, unlabelled APIService. Upstream labels its object precisely so
+    // the collection delete is *scoped*; without a bystander that must survive,
+    // a handler that ignored `labelSelector` and deleted everything would pass
+    // this test just as happily.
+    let bystander = "v1.bystander.example.com";
+    seed_apiservice(
+        &state,
+        apiservice_local(bystander, "bystander.example.com", "v1"),
+    )
+    .await;
+
+    let object_path = format!("/apis/apiregistration.k8s.io/v1/apiservices/{name}");
+
+    // aggregator.go:537-546 — merge-patch spec.versionPriority to 400.
+    let (status, _, patched) = state
+        .send_raw(
+            "PATCH",
+            &object_path,
+            Some("application/merge-patch+json"),
+            Some(&json!({ "spec": { "versionPriority": 400 } })),
+        )
+        .await;
+    assert!(
+        status.is_success(),
+        "Patch failed for {object_path}: {status} {patched}"
+    );
+    assert_eq!(
+        patched["spec"]["versionPriority"].as_i64(),
+        Some(400),
+        "The VersionPriority returned was {:?}",
+        patched["spec"]["versionPriority"]
+    );
+
+    // aggregator.go:549-570 — the APIService must be locatable in the list.
+    let (status, list) =
+        http_get(state.clone(), "/apis/apiregistration.k8s.io/v1/apiservices").await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: Vec<&str> = list["items"]
+        .as_array()
+        .expect("APIServiceList items")
+        .iter()
+        .filter_map(|i| i["metadata"]["name"].as_str())
+        .collect();
+    assert!(
+        listed.contains(&name),
+        "Unable to find {name} in APIServiceList: {listed:?}"
+    );
+
+    // aggregator.go:573+ — the object carries no labels, so upstream adds one
+    // specifically to have something to select on.
+    let (status, _, labelled) = state
+        .send_raw(
+            "PATCH",
+            &object_path,
+            Some("application/merge-patch+json"),
+            Some(&json!({ "metadata": { "labels": { "e2e-apiservice": "patched" } } })),
+        )
+        .await;
+    assert!(
+        status.is_success(),
+        "labelling patch failed: {status} {labelled}"
+    );
+    assert_eq!(
+        labelled["metadata"]["labels"]["e2e-apiservice"].as_str(),
+        Some("patched"),
+        "label not persisted: {labelled}"
+    );
+
+    // aggregator.go:743-747 — DeleteCollection restricted by that selector.
+    let (status, _, deleted) = state
+        .send_raw(
+            "DELETE",
+            "/apis/apiregistration.k8s.io/v1/apiservices?labelSelector=e2e-apiservice%3Dpatched",
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        status.is_success(),
+        "Unable to delete apiservice {name}: {status} {deleted}"
+    );
+
+    // aggregator.go:749-751 — the selected set must now be empty.
+    let (status, remaining) = http_get(
+        state.clone(),
+        "/apis/apiregistration.k8s.io/v1/apiservices?labelSelector=e2e-apiservice%3Dpatched",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        remaining["items"].as_array().map(Vec::len),
+        Some(0),
+        "failed to count the required APIServices: {remaining}"
+    );
+
+    // The unlabelled APIService must be untouched.
+    let (status, all) =
+        http_get(state.clone(), "/apis/apiregistration.k8s.io/v1/apiservices").await;
+    assert_eq!(status, StatusCode::OK);
+    let survivors: Vec<&str> = all["items"]
+        .as_array()
+        .expect("APIServiceList items")
+        .iter()
+        .filter_map(|i| i["metadata"]["name"].as_str())
+        .collect();
+    assert!(
+        survivors.contains(&bystander),
+        "deleteCollection ignored its labelSelector and removed {bystander}: {survivors:?}"
+    );
+    assert!(
+        !survivors.contains(&name),
+        "{name} survived the label-selected deleteCollection: {survivors:?}"
+    );
+
+    // ...and the aggregated group must be gone from discovery with it.
+    let (_, apis) = http_get(state, "/apis").await;
+    let group_names: Vec<&str> = apis["groups"]
+        .as_array()
+        .expect("groups")
+        .iter()
+        .filter_map(|g| g["name"].as_str())
+        .collect();
+    assert!(
+        !group_names.contains(&"wardle.example.com"),
+        "aggregated group still present after deleteCollection: {group_names:?}"
     );
 }

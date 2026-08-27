@@ -345,7 +345,18 @@ pub async fn list_apiservices(
     }
 
     let prefix = build_prefix("apiservices", None);
-    let items: Vec<Value> = state.storage.list(&prefix).await.unwrap_or_default();
+    let mut items: Vec<Value> = state.storage.list(&prefix).await.unwrap_or_default();
+
+    // `?labelSelector=` / `?fieldSelector=` must narrow the list, as they do
+    // on every other collection endpoint in this server. Upstream applies the
+    // predicate inside the generic registry store
+    // (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go,
+    // `List` → `ListPredicate`), so no resource opts out of it. This handler
+    // was the exception: it applied selectors on the watch path above but not
+    // on the list path, so `checkApiServiceListQuantity`
+    // (test/e2e/apimachinery/aggregator.go:749) counted every APIService in
+    // the cluster rather than the selected ones and could never reach zero.
+    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
 
     let list = serde_json::json!({
         "apiVersion": "apiregistration.k8s.io/v1",
