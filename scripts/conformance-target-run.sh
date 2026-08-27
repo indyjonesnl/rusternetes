@@ -24,7 +24,9 @@
 #   bash scripts/conformance-target-run.sh --target sig-node [flags]
 #
 # Flags: --target --focus --skip --parallel --kubeconfig --conformance-image
-#        --output-dir --hydrophone -h|--help
+#        --output-dir --hydrophone --skip-preflight -h|--help
+#        --skip-preflight  Skip the cluster health gate (conformance-preflight.sh);
+#                          results then describe the cluster, not the code (#1777)
 #        --parallel N   ginkgo procs (default 2; ginkgo isolates [Serial] specs)
 set -euo pipefail
 IFS=$'\n\t'
@@ -149,6 +151,7 @@ TARGET=""; FOCUS=""; SKIP=""; FOCUS_OVERRIDDEN=0
 KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/rusternetes-config}"
 CONFORMANCE_IMAGE="registry.k8s.io/conformance:v1.35.0"
 OUTPUT_DIR=""; HYDROPHONE_BIN=""; PARALLEL=2
+SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
 
 die() { echo "[conformance-target-run] ERROR: $*" >&2; exit 2; }
 
@@ -163,6 +166,7 @@ while [[ $# -gt 0 ]]; do
         --output-dir) [[ $# -ge 2 ]] || die "--output-dir requires a value"; OUTPUT_DIR="$2"; shift 2 ;;
         --hydrophone) [[ $# -ge 2 ]] || die "--hydrophone requires a value"; HYDROPHONE_BIN="$2"; shift 2 ;;
         --parallel) [[ $# -ge 2 ]] || die "--parallel requires a value"; PARALLEL="$2"; shift 2 ;;
+        --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
         *) die "unknown flag: $1 (use --help)" ;;
     esac
 done
@@ -194,6 +198,20 @@ echo "[conformance-target-run] target=$TARGET focused=$FOCUS_OVERRIDDEN"
 echo "  focus : $FOCUS"
 echo "  skip  : $SKIP"
 echo "  image : $CONFORMANCE_IMAGE"
+
+# Cluster preflight: refuse to produce a failure list that describes a broken
+# cluster instead of the code under test (#1777). Same gate, same exit-code class
+# (2 = usage/preflight) as conformance-tags-run.sh.
+PREFLIGHT_BIN="$SCRIPT_DIR/conformance-preflight.sh"
+if [ "$SKIP_PREFLIGHT" = "1" ]; then
+    echo "  preflight : SKIPPED (--skip-preflight)"
+elif [ ! -x "$PREFLIGHT_BIN" ]; then
+    echo "  preflight : not found at $PREFLIGHT_BIN — continuing without it"
+else
+    echo "  preflight : $PREFLIGHT_BIN"
+    "$PREFLIGHT_BIN" --kubeconfig "$KUBECONFIG_PATH" \
+        || die "cluster preflight failed — fix the conditions above or pass --skip-preflight"
+fi
 
 # Clear any leftover conformance namespace before deploying (hydrophone refuses
 # to deploy into an existing one) — same self-containment as conformance-tags-run.sh.

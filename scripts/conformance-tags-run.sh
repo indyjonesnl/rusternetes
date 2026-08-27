@@ -38,6 +38,9 @@
 #                         always single-threaded.
 #   --phase 1|2|both      Which phase(s) to run (default: both).
 #   --hydrophone PATH     Override hydrophone binary path (default: discover via $PATH).
+#   --skip-preflight      Skip the cluster health gate (scripts/conformance-preflight.sh).
+#                         Only for deliberately probing a degraded cluster — the
+#                         results then describe the cluster, not the code (#1777).
 #   -h, --help            Show this help.
 #
 # Exit codes:
@@ -63,6 +66,7 @@ OUTPUT_DIR=""
 HYDROPHONE_BIN=""
 PARALLEL=2
 PHASE="both"
+SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
 
 # Tag regexes. Hydrophone passes --focus/--skip straight to Ginkgo (Go
 # regexp/syntax), so the literal brackets are escaped.
@@ -108,6 +112,8 @@ while [[ $# -gt 0 ]]; do
         --hydrophone)
             [[ $# -ge 2 ]] || die "--hydrophone requires a value"
             HYDROPHONE_BIN="$2"; shift 2 ;;
+        --skip-preflight)
+            SKIP_PREFLIGHT=1; shift ;;
         --)
             shift; break ;;
         -*)
@@ -146,6 +152,27 @@ info "kubeconfig        : $KUBECONFIG_PATH"
 info "output dir        : $OUTPUT_DIR"
 info "hydrophone        : $HYDROPHONE_BIN"
 info "phase(s)          : $PHASE"
+
+# ---------- cluster preflight ----------
+# Refuse to spend an hour producing a failure list that describes a broken
+# cluster rather than the code under test (#1777). Three environment faults have
+# each done exactly that: CERTS_PATH unset at `compose up` (control-plane static
+# pods Pending while bootstrap still exits 0), CONTROL_PLANE_IMAGE_REGISTRY unset
+# on the prebuilt path (unresolvable control-plane images), and a host over the
+# kubelet imagefs eviction threshold (hydrophone's own e2e pod evicted).
+# Preflight exit code 2 is the same usage/preflight class this script already
+# documents, so callers need no new handling.
+PREFLIGHT_BIN="$SCRIPT_DIR/conformance-preflight.sh"
+if [[ "$SKIP_PREFLIGHT" == "1" ]]; then
+    info "preflight         : SKIPPED (--skip-preflight) — results may describe the cluster, not the code"
+elif [[ ! -x "$PREFLIGHT_BIN" ]]; then
+    info "preflight         : not found at $PREFLIGHT_BIN — continuing without it"
+else
+    info "preflight         : $PREFLIGHT_BIN"
+    if ! "$PREFLIGHT_BIN" --kubeconfig "$KUBECONFIG_PATH"; then
+        die "cluster preflight failed — fix the conditions above or pass --skip-preflight to run anyway"
+    fi
+fi
 
 # ---------- per-phase runner ----------
 #

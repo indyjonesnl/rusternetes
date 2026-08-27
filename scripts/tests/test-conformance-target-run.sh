@@ -163,6 +163,14 @@ chmod +x "$FAKE"
 
 GITHUB_OUTPUT="$TMP/github-output"
 export GITHUB_OUTPUT
+
+# The cases below exercise argument handling and junit counting, not cluster
+# health, and this file promises "no cluster required". The preflight gate
+# added for #1777 would otherwise refuse every one of them. Disable it by
+# default here and test the gate itself explicitly at the end of the file —
+# silencing it without covering it would leave the new wiring untested.
+export SKIP_PREFLIGHT=1
+
 run_cli() { : > "$GITHUB_OUTPUT"; bash "$RUNNER" "$@"; }
 gho() { grep -E "^$1=" "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-; }
 
@@ -229,6 +237,30 @@ set -e
 # no junit (infra fail) => exit 1
 if FAKE_MODE=nojunit run_cli --target sig-node --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/o4" >/dev/null 2>&1; then
   bad "no junit should exit 1"; else rc=$?; [ "$rc" -eq 1 ] && ok "no junit => exit 1" || bad "no junit exit=$rc"; fi
+
+# ---- the preflight gate itself (#1777) ----
+# With the gate ENABLED and no cluster reachable, the runner must refuse to run
+# rather than emit a failure list that describes the environment instead of the
+# code. conformance-preflight.sh exits 2 as soon as /healthz is unreachable —
+# or, where kubectl is absent, at its `command -v` check — so this stays fast
+# and needs no cluster in either environment.
+if SKIP_PREFLIGHT=0 FAKE_MODE=pass run_cli --target sig-node --kubeconfig "$KC" \
+     --hydrophone "$FAKE" --output-dir "$TMP/opf" >/dev/null 2>&1; then
+  bad "preflight gate should refuse to run against an unreachable cluster"
+else
+  rc=$?; [ "$rc" -eq 2 ] && ok "preflight gate: unusable cluster => exit 2" \
+    || bad "preflight gate exit=$rc (want 2)"
+fi
+
+# ...and --skip-preflight must override it, so an operator who knows the gate
+# is wrong for their environment can still run. Gate left enabled in the env so
+# it is the FLAG being tested, not the variable.
+if SKIP_PREFLIGHT=0 FAKE_MODE=pass run_cli --target sig-node --skip-preflight \
+     --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/opf2" >/dev/null 2>&1; then
+  ok "--skip-preflight overrides the gate"
+else
+  bad "--skip-preflight should allow the run to proceed (exit=$?)"
+fi
 
 echo
 if [ "$failcnt" -eq 0 ]; then echo "PASS: conformance-target-run ($pass checks)"; else echo "FAILED: $failcnt of $((pass + failcnt))" >&2; exit 1; fi

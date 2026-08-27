@@ -129,6 +129,16 @@ COMPOSE_ARGS=(-f "$BASE_COMPOSE")
 # kubelet needs an absolute host path for its volume mounts.
 export KUBELET_VOLUMES_PATH="${KUBELET_VOLUMES_PATH:-$PROJECT_ROOT/.rusternetes/volumes}"
 
+# CERTS_PATH must be exported BEFORE the first `compose up`, not just before
+# bootstrap: the node-1 kubelet mounts ${CERTS_PATH}:${CERTS_PATH} so that the
+# control-plane static pods' hostPath resolves to the same absolute path inside
+# the kubelet container as on the host. Left unset, compose falls back to
+# /etc/rusternetes/certs, the hostPath stat() fails inside the kubelet, and
+# kube-scheduler + kube-controller-manager sit Pending forever while
+# bootstrap-cluster.sh still reports success — a conformance run then blames the
+# code for a cluster with no control plane (#1777, #1152).
+export CERTS_PATH="${CERTS_PATH:-$PROJECT_ROOT/.rusternetes/certs}"
+
 # Pre-create every bind-mount host directory as the invoking user BEFORE the
 # first `compose up`. Docker/Podman create a missing bind-mount source as root,
 # and the non-root scripts that write into them afterwards then fail with
@@ -259,6 +269,16 @@ step "API server is healthy."
 # ---- bootstrap ------------------------------------------------------------
 if [[ "$DO_BOOTSTRAP" == 1 ]]; then
     step "Bootstrapping cluster (namespaces, kube-dns, ServiceAccount tokens)..."
+    # On the prebuilt-image path bootstrap must template GHCR refs into the
+    # control-plane static pods and the dns Deployment; without
+    # CONTROL_PLANE_IMAGE_REGISTRY it emits local `rusternetes-<component>:latest`
+    # names, which the separate containerd image store cannot resolve, so those
+    # pods never start (#1777). Only set it when we did NOT build locally — the
+    # local-build path relies on bootstrap's `docker save | ctr images import`.
+    if [[ "$DO_BUILD" == 0 && -z "${CONTROL_PLANE_IMAGE_REGISTRY:-}" ]]; then
+        export CONTROL_PLANE_IMAGE_REGISTRY="ghcr.io/indyjonesnl/rusternetes"
+        step "Using prebuilt control-plane images from $CONTROL_PLANE_IMAGE_REGISTRY (tag ${RUSTERNETES_IMAGE_TAG:-main})"
+    fi
     KUBECTL="$KUBECTL_BIN" KUBECONFIG="$KUBECONFIG_PATH" \
         bash "$SCRIPT_DIR/bootstrap-cluster.sh"
 else
