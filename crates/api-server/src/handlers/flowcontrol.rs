@@ -145,6 +145,19 @@ pub async fn update_priority_level_configuration(
         }
     }
 
+    // Reinstate the server-owned metadata a PUT body may omit: uid,
+    // creationTimestamp and a pending deletion. A locally built object —
+    // what the dynamic client's Update() sends — carries none of them, and
+    // storing the blanks orphans every child, because ownerReferences[].uid
+    // then matches no live owner and the garbage collector deletes them
+    // (#1605, #1793). Upstream applies this to every resource at once in
+    // registry/rest/update.go::BeforeUpdate (lines 131-146).
+    if let Ok(stored) = state.storage.get::<PriorityLevelConfiguration>(&key).await {
+        crate::handlers::lifecycle::inherit_server_owned_metadata(
+            &mut plc.metadata,
+            &stored.metadata,
+        );
+    }
     let result = match state.storage.update(&key, &plc).await {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &plc).await?,

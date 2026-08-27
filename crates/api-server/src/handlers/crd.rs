@@ -593,6 +593,15 @@ pub async fn update_crd(
         .map_err(|e| rusternetes_common::Error::Internal(format!("re-parse for storage: {}", e)))?;
 
     enrich_updated_crd(&mut raw_value, &crd, old_crd_value.as_ref());
+
+    // Reinstate the server-owned metadata a PUT body may omit: uid,
+    // creationTimestamp and a pending deletion. This handler persists a raw
+    // document, so it uses the Value form of the same rule (#1605, #1793).
+    // Upstream: registry/rest/update.go::BeforeUpdate (lines 131-146).
+    if let Some(ref stored) = old_crd_value {
+        crate::handlers::lifecycle::inherit_server_owned_metadata_json(&mut raw_value, stored);
+    }
+
     let updated: serde_json::Value = state.storage.update(&key, &raw_value).await?;
 
     // Notify dynamic route manager about CRD update

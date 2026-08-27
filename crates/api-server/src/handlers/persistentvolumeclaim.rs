@@ -335,6 +335,19 @@ pub async fn update_pvc(
         return Ok(Json(pvc));
     }
 
+    // Reinstate the server-owned metadata a PUT body may omit: uid,
+    // creationTimestamp and a pending deletion. A locally built object —
+    // what the dynamic client's Update() sends — carries none of them, and
+    // storing the blanks orphans every child, because ownerReferences[].uid
+    // then matches no live owner and the garbage collector deletes them
+    // (#1605, #1793). Upstream applies this to every resource at once in
+    // registry/rest/update.go::BeforeUpdate (lines 131-146).
+    if let Ok(stored) = state.storage.get::<PersistentVolumeClaim>(&key).await {
+        crate::handlers::lifecycle::inherit_server_owned_metadata(
+            &mut pvc.metadata,
+            &stored.metadata,
+        );
+    }
     let updated = state.storage.update(&key, &pvc).await?;
 
     Ok(Json(updated))

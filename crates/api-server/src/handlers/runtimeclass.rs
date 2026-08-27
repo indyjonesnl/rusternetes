@@ -150,6 +150,20 @@ pub async fn update_runtimeclass(
         return Ok(Json(runtime_class));
     }
 
+    // Reinstate the server-owned metadata a PUT body may omit: uid,
+    // creationTimestamp and a pending deletion. A locally built object —
+    // what the dynamic client's Update() sends — carries none of them, and
+    // storing the blanks orphans every child, because ownerReferences[].uid
+    // then matches no live owner and the garbage collector deletes them
+    // (#1605, #1793). Upstream applies this to every resource at once in
+    // registry/rest/update.go::BeforeUpdate (lines 131-146).
+    if let Ok(stored) = state.storage.get::<RuntimeClass>(&key).await {
+        crate::handlers::lifecycle::inherit_server_owned_metadata(
+            &mut runtime_class.metadata,
+            &stored.metadata,
+        );
+    }
+
     // Try to update first, if not found then create (upsert behavior)
     let result = match state.storage.update(&key, &runtime_class).await {
         Ok(updated) => updated,
