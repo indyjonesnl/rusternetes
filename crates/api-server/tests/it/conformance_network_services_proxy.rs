@@ -8,8 +8,41 @@
 //! `crates/kube-proxy/tests/conformance_network_services_proxy.rs`. That
 //! file asserts the iptables rules built from the same storage shape.
 //! This file drives the `/proxy` HTTP path through a real axum router
-//! against an in-process backend so the upstream
-//! `proxy.go:432–503` response-code matrix can be reproduced end-to-end.
+//! against an in-process backend.
+//!
+//! ---------------------------------------------------------------------------
+//! Mirror audit (#1749, 2026-08-27)
+//! ---------------------------------------------------------------------------
+//!
+//! Verified against `../kubernetes` at `release-1.35`.
+//!
+//! `proxy.go` holds three `framework.ConformanceIt` cases (`:100`, `:338`,
+//! `:432`). Only `:432` is mirrored here, and its citation was already
+//! correct — the one citation in this area that was.
+//!
+//! Its description was not. It claimed to reproduce "the upstream
+//! `proxy.go:432-503` response-code matrix" of 200/404/503/301 keyed on
+//! path. Upstream has no such matrix. Its matrix is over HTTP METHODS
+//! (proxy.go:496-515): DELETE, OPTIONS, PATCH, POST and PUT must each return
+//! 200 through both the pod-proxy and the service-proxy URL, with the
+//! received method echoed back. The 404 and 503 codes appear nowhere in the
+//! case.
+//!
+//! So the mirror sent only GET, and pinned status codes it chose itself — the
+//! same "invented output" problem #1746 fixed elsewhere. A proxy that
+//! hardcoded GET when talking to the backend would have passed every
+//! assertion in this file while failing the upstream case outright. Added
+//! `proxy_forwards_request_method_for_pod_and_service`, which walks
+//! upstream's verb list verbatim through both routes and asserts the backend
+//! saw the method the client sent. It passes.
+//!
+//! The path-keyed test is kept — forwarding a backend status and `Location`
+//! header verbatim is a real contract — but relabelled to say it is not
+//! upstream's matrix.
+//!
+//! Not mirrored: `proxy.go:100` ("should proxy through a service and a pod")
+//! and `:338` ("A set of valid responses are returned for both pod and
+//! service ProxyWithPath"). Tracked separately.
 //!
 //! Strategy: spawn a tokio TcpListener that returns a known response per
 //! request path (200 OK, 404, 503, 301-with-Location). Register a Pod
@@ -218,14 +251,26 @@ async fn proxy_get(router: &TestApiServer, uri: &str) -> (u16, String, Option<St
 /// [sig-network] Proxy version v1 [Conformance] — A set of valid responses
 /// are returned for both pod and service Proxy
 ///
-/// Upstream: `test/e2e/network/proxy.go:432–503`
+/// Upstream: `k8s.io/kubernetes/test/e2e/network/proxy.go:432`
+///   ("A set of valid responses are returned for both pod and service
+///   Proxy")
 ///
-/// Walks the upstream response matrix (200, 404, 503, 301) through both
-/// the pod-proxy URL (`/api/v1/namespaces/{ns}/pods/{pod}/proxy/{path}`)
-/// and the service-proxy URL
-/// (`/api/v1/namespaces/{ns}/services/{svc}/proxy/{path}`). Each request
-/// must reach the same backend (the pod's IP:containerPort) and the
-/// upstream response code + body must be forwarded verbatim.
+/// Asserts that both the pod-proxy URL
+/// (`/api/v1/namespaces/{ns}/pods/{pod}/proxy/{path}`) and the service-proxy
+/// URL (`/api/v1/namespaces/{ns}/services/{svc}/proxy/{path}`) reach the same
+/// backend (the pod's IP:containerPort) and forward its status, body and
+/// `Location` header verbatim.
+///
+/// Mirror audit (#1749, 2026-08-27): the citation is correct — `:432` is the
+/// `framework.ConformanceIt` — but the description was not. It claimed to
+/// walk "the upstream response matrix (200, 404, 503, 301)". Upstream has no
+/// such matrix: its matrix is over HTTP METHODS (proxy.go:496-515), and the
+/// 404/503 codes appear nowhere in the case. Those status codes are this
+/// mirror's own invention, so this test pins locally-decided output rather
+/// than upstream behaviour. It is kept — forwarding a backend status and
+/// `Location` verbatim is a real contract worth pinning — but on that
+/// footing, with the method matrix upstream actually asserts covered by
+/// `proxy_forwards_request_method_for_pod_and_service` below.
 ///
 /// This is the api-server half of the conformance mirror; the
 /// kube-proxy-side companion (iptables-surface invariants) lives in
@@ -326,4 +371,120 @@ async fn proxy_valid_responses_for_pod_and_service() {
         Some("/elsewhere"),
         "service proxy must forward Location header verbatim"
     );
+}
+
+/// Backend that echoes the HTTP method it received, so the caller can prove
+/// the proxy forwarded the verb rather than substituting one of its own.
+/// Mirrors upstream's agnhost `?method=` endpoint, whose response body
+/// carries the received method (`validateProxyVerbRequest`, proxy.go:534).
+async fn spawn_method_echo_backend(max_requests: usize) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        for _ in 0..max_requests {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let n = match sock.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => return,
+                };
+                let request_line = String::from_utf8_lossy(&buf[..n])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let method = request_line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let body = format!("foo {method}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.flush().await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    (port, handle)
+}
+
+/// [sig-network] Proxy version v1 [Conformance] — the proxy MUST forward the
+/// request method to the backend, for both pod and service Proxy
+///
+/// Upstream: `k8s.io/kubernetes/test/e2e/network/proxy.go:432`
+///   ("A set of valid responses are returned for both pod and service
+///   Proxy"). The case's matrix is over HTTP METHODS, not paths
+///   (proxy.go:496-515):
+///
+/// ```text
+/// httpVerbs := []string{"DELETE", "OPTIONS", "PATCH", "POST", "PUT"}
+/// ```
+///
+/// each of which must return 200 through the pod-proxy URL and again
+/// through the service-proxy URL, with the received method echoed in the
+/// response body (`validateProxyVerbRequest`, proxy.go:534).
+///
+/// Mirror audit (#1749, 2026-08-27): added. The existing mirror in this file
+/// sends only GET and walks a 200/404/503/301 matrix keyed on PATH. Upstream
+/// has no such matrix — those codes are this mirror's own invention. A proxy
+/// that hardcoded GET when talking to the backend would have passed every
+/// assertion in this file while failing the upstream case outright.
+#[tokio::test]
+async fn proxy_forwards_request_method_for_pod_and_service() {
+    // 5 verbs × 2 routes, plus slack for connection retries.
+    let (backend_port, _backend_handle) = spawn_method_echo_backend(24).await;
+
+    let api = TestApiServer::new();
+    let pod = pod_listening_on("default", "proxy-pod", backend_port);
+    api.storage
+        .create(&build_key("pods", Some("default"), "proxy-pod"), &pod)
+        .await
+        .expect("create pod");
+    let svc = service_to_pod_port("default", "proxy-svc", 80, backend_port);
+    api.storage
+        .create(&build_key("services", Some("default"), "proxy-svc"), &svc)
+        .await
+        .expect("create service");
+    let slice = endpoint_slice_for("default", "proxy-svc", "127.0.0.1", backend_port);
+    api.storage
+        .create(
+            &build_key("endpointslices", Some("default"), &slice.metadata.name),
+            &slice,
+        )
+        .await
+        .expect("create endpointslice");
+
+    // proxy.go:496 — verbatim.
+    const HTTP_VERBS: &[&str] = &["DELETE", "OPTIONS", "PATCH", "POST", "PUT"];
+
+    for base in [
+        "/api/v1/namespaces/default/pods/proxy-pod/proxy",
+        "/api/v1/namespaces/default/services/proxy-svc/proxy",
+    ] {
+        for verb in HTTP_VERBS {
+            let (status, _headers, body_bytes, _) = api
+                .send_full(verb, &format!("{base}/"), None, None, None)
+                .await;
+            let body = String::from_utf8_lossy(&body_bytes).to_string();
+            assert_eq!(
+                status.as_u16(),
+                200,
+                "{verb} {base}/ should return 200, got {status}: {body}"
+            );
+            assert_eq!(
+                body,
+                format!("foo {verb}"),
+                "{base} must forward the {verb} method to the backend; backend saw {body:?}"
+            );
+        }
+    }
 }
