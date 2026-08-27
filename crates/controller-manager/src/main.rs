@@ -394,8 +394,16 @@ async fn main() -> Result<()> {
                         }
                         info!("{} starting (leader acquired)", $name);
 
-                        // Run controller
-                        $fut.await;
+                        // Run controller under crash supervision: a panic inside
+                        // tokio::spawn is otherwise swallowed and the controller
+                        // silently stops reconciling forever (#1775).
+                        rusternetes_controller_manager::supervise_controller(
+                            $name,
+                            None,
+                            std::time::Duration::from_secs(1),
+                            || $fut,
+                        )
+                        .await;
 
                         // Check if we're still the leader
                         if !elector.is_leader().await {
@@ -405,8 +413,18 @@ async fn main() -> Result<()> {
                         break;
                     }
                 } else {
-                    // No leader election, run directly
-                    $fut.await;
+                    // No leader election, run directly — still supervised, so a
+                    // panicking controller is logged and restarted rather than
+                    // disappearing (#1775: a futures Unfold panic killed the
+                    // ResourceQuota controller and froze every quota's
+                    // status.used until the process was restarted).
+                    rusternetes_controller_manager::supervise_controller(
+                        $name,
+                        None,
+                        std::time::Duration::from_secs(1),
+                        || $fut,
+                    )
+                    .await;
                 }
             })
         }};

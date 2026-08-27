@@ -44,6 +44,81 @@ use rusternetes_storage::{Storage, StorageBackend};
 use std::sync::Arc;
 use tracing::{error, info};
 
+/// Run a controller loop under crash supervision.
+///
+/// A controller that panics inside `tokio::spawn` dies **silently**: the panic
+/// is captured in a `JoinHandle` nobody joins, the task disappears, and the
+/// resource it reconciles is simply never reconciled again. That is exactly how
+/// #1775 presented — quota `status.used` stopped being published under
+/// conformance load, and restarting the controller-manager "fixed" it. The
+/// panic seen live was:
+///
+/// ```text
+/// thread 'tokio-rt-worker' panicked at futures-util/src/stream/unfold.rs:108:21:
+/// Unfold must not be polled after it returned `Poll::Ready(None)`
+/// ```
+///
+/// Upstream never lets a controller crash take reconciliation with it: every
+/// controller loop runs under `runtime.HandleCrash` and is driven by
+/// `wait.UntilWithContext`, so a crash is logged and the loop restarts
+/// (`k8s.io/apimachinery/pkg/util/runtime/runtime.go`,
+/// `k8s.io/apimachinery/pkg/util/wait/backoff.go`). This is that behaviour: log
+/// loudly, then restart with capped exponential backoff.
+///
+/// `make_future` is called once per attempt, so each restart gets a fresh
+/// future. `max_attempts` is `None` in production (restart forever) and `Some(n)`
+/// in tests so they terminate; `backoff_base` is the first delay (doubling to a
+/// 30s cap) and is `Duration::ZERO` in tests.
+pub async fn supervise_controller<F, Fut>(
+    name: &str,
+    max_attempts: Option<u32>,
+    backoff_base: std::time::Duration,
+    mut make_future: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use futures::FutureExt;
+
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let outcome = std::panic::AssertUnwindSafe(make_future())
+            .catch_unwind()
+            .await;
+
+        match outcome {
+            Ok(()) => {
+                // A controller's run() is an infinite loop, so returning at all
+                // means it gave up (usually after logging its own error).
+                error!("{name} returned unexpectedly (attempt {attempt}); restarting");
+            }
+            Err(panic) => {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                error!("{name} PANICKED (attempt {attempt}): {detail}; restarting");
+            }
+        }
+
+        if let Some(limit) = max_attempts {
+            if attempt >= limit {
+                error!("{name} exceeded {limit} attempts; giving up");
+                return;
+            }
+        }
+
+        // Capped exponential backoff, doubling per attempt up to 30s.
+        if !backoff_base.is_zero() {
+            let factor = 1u32 << std::cmp::min(attempt.saturating_sub(1), 5);
+            let delay = std::cmp::min(backoff_base * factor, std::time::Duration::from_secs(30));
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
 /// Configuration for the controller-manager component.
 pub struct ControllerManagerConfig {
     pub sync_interval: u64,
@@ -397,4 +472,76 @@ async fn run_controllers<S: Storage + Send + Sync + 'static>(
     info!("Shutting down controller manager");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    /// #1775: a panicking controller must be restarted, not silently lost.
+    ///
+    /// The live failure was a `futures` Unfold panic inside the ResourceQuota
+    /// controller; `tokio::spawn` swallowed it, the task vanished, and quota
+    /// `status.used` was never published again until the process restarted.
+    #[tokio::test]
+    async fn a_panicking_controller_is_restarted() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&attempts);
+
+        super::supervise_controller(
+            "test controller",
+            Some(3),
+            std::time::Duration::ZERO,
+            move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    panic!("simulated controller crash");
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "the supervisor must restart a panicking controller up to the attempt limit"
+        );
+    }
+
+    /// A controller whose run() returns has given up — an infinite reconcile
+    /// loop returning at all is a failure, so it is restarted too.
+    #[tokio::test]
+    async fn a_returning_controller_is_restarted() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&attempts);
+
+        super::supervise_controller(
+            "test controller",
+            Some(2),
+            std::time::Duration::ZERO,
+            move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    /// The panic payload must be recoverable for the log — a silent restart
+    /// would hide the defect that caused it.
+    #[test]
+    fn the_panic_payload_is_recovered_for_logging() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(format!("boom {}", 1));
+        let as_string = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned());
+        assert_eq!(as_string.as_deref(), Some("boom 1"));
+    }
 }
