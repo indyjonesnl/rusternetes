@@ -36,8 +36,10 @@
 //! | upstream case | state |
 //! |---|---|
 //! | crd_publish_openapi.go:74 works for CRD with validation schema | schema *enforcement* added — accept, enum rejection, prune-vs-strict, required field |
+//! | crd_publish_openapi.go:158 works for CRD without validation schema | unknown properties now asserted accepted **and preserved** |
+//! | crd_publish_openapi.go:199 preserving unknown fields at the schema root | same |
 //!
-//! The remaining eight `crd_publish_openapi.go` cases and the two
+//! The remaining six `crd_publish_openapi.go` cases and the two
 //! conversion-webhook cases are not yet re-derived. Do not treat this file as
 //! audited.
 //!
@@ -516,6 +518,38 @@ async fn crd_without_validation_schema_publishes_to_openapi_v2() {
         .get("x-kubernetes-group-version-kind")
         .expect("GVK extension present");
     assert_eq!(gvk[0]["kind"], "Bar");
+    // Upstream's case does not stop at the published document: it requires the
+    // server to **accept a CR carrying arbitrary unknown properties**, for both
+    // create and apply (crd_publish_openapi.go:158-197). For a CRD with no validation schema those properties must also
+    // survive — the complement of the pruning asserted in
+    // `crd_with_validation_schema_publishes_to_openapi_v2`. Getting the two the
+    // wrong way round would be invisible in a document-only check.
+    let (s, b) = router_request(
+        &state,
+        "POST",
+        "/apis/example.com/v1/namespaces/default/e2e-test-bars",
+        Some(&json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Bar",
+            "metadata": { "name": "random-cr" },
+            "someUnknownField": "value",
+            "nested": { "alsoUnknown": [1, 2, 3] }
+        })),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&s),
+        "a CR with arbitrary unknown properties must be accepted: {s} {b}"
+    );
+    assert_eq!(
+        b["someUnknownField"], "value",
+        "an unknown top-level property must be preserved, not pruned: {b}"
+    );
+    assert_eq!(
+        b["nested"]["alsoUnknown"],
+        json!([1, 2, 3]),
+        "an unknown nested property must be preserved: {b}"
+    );
 }
 
 /// [sig-api-machinery] CustomResourcePublishOpenAPI preserving unknown fields at schema root [Conformance]
@@ -570,6 +604,38 @@ async fn crd_preserves_unknown_fields_at_root_in_openapi_v2() {
         user_keys.is_empty(),
         "root preserve-unknown-fields must collapse user-defined properties; found: {:?}",
         user_keys
+    );
+    // Upstream's case does not stop at the published document: it requires the
+    // server to **accept a CR carrying arbitrary unknown properties**, for both
+    // create and apply (crd_publish_openapi.go:199-239). For a CRD preserving unknown fields at the root those properties must also
+    // survive — the complement of the pruning asserted in
+    // `crd_with_validation_schema_publishes_to_openapi_v2`. Getting the two the
+    // wrong way round would be invisible in a document-only check.
+    let (s, b) = router_request(
+        &state,
+        "POST",
+        "/apis/example.com/v1/namespaces/default/e2e-test-pur",
+        Some(&json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Pur",
+            "metadata": { "name": "random-cr" },
+            "someUnknownField": "value",
+            "nested": { "alsoUnknown": [1, 2, 3] }
+        })),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&s),
+        "a CR with arbitrary unknown properties must be accepted: {s} {b}"
+    );
+    assert_eq!(
+        b["someUnknownField"], "value",
+        "an unknown top-level property must be preserved, not pruned: {b}"
+    );
+    assert_eq!(
+        b["nested"]["alsoUnknown"],
+        json!([1, 2, 3]),
+        "an unknown nested property must be preserved: {b}"
     );
 }
 
