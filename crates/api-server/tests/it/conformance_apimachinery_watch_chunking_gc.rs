@@ -24,6 +24,44 @@
 //! `handlers::watch`, and the resource types in `rusternetes_common` to
 //! validate the same wire-level semantics that the upstream Ginkgo tests
 //! observe through the REST surface.
+//!
+//! ## Mirror audit — #1749, 2026-08-27 (citations complete; assertions pending)
+//!
+//! Citations: **complete**. This file failed differently from the earlier
+//! areas. Where the admission-webhook, quota and CRD files carried line numbers
+//! that were wrong, **not one citation here named a line or a descriptor at
+//! all** — every reference was a bare file path ("test/e2e/apimachinery/watch.go")
+//! or a staging library directory. That is issue #1749's fourth item exactly:
+//! citing a whole e2e file rather than a `framework.ConformanceIt` body.
+//!
+//! Every citation now resolves. The 14 upstream conformance cases behind this
+//! file are watch.go :60, :142, :191, :257, :334; chunking.go :83, :144; and
+//! garbage_collector.go :330, :388, :488, :547, :647, :722, :826.
+//!
+//! Four tests had their `[Conformance]` claim withdrawn: the field- and
+//! label-selector cases cite
+//! `staging/src/k8s.io/apimachinery/pkg/{fields,labels}/selector.go`, which
+//! define real behaviour but register no conformance tests. Six more were
+//! re-cited as non-conformance checks (multiple ownerReferences, ownerReference
+//! storage round-trip, delete-then-list, set-notation label selectors).
+//! `[Conformance]` markers dropped from 12 to 8; each survivor maps to a real
+//! case.
+//!
+//! watch.go:257 ("should observe an object deletion if it stops meeting the
+//! requirements of the selector") had no mirror; one was added
+//! (`watch_selector_exit_surfaces_as_deleted`). The contract is that an object
+//! updated *out* of the watch's selector surfaces as DELETED even though it
+//! still exists, and re-entering surfaces as ADDED. The implementation gets all
+//! four transitions right; nothing asserted them before.
+//!
+//! Six upstream cases still have **no mirror at all**: watch.go:191 (restart
+//! watching from the last observed resourceVersion), watch.go:334 (concurrent
+//! watches receive events in the same order), and garbage_collector.go :488,
+//! :547, :722, :826. Enumerated in #1770.
+//!
+//! Assertion re-derivation against the mapped cases is **not yet done**. Do not
+//! treat this file as audited.
+//!
 
 use rusternetes_api_server::handlers::filtering::apply_selectors;
 use rusternetes_api_server::handlers::watch::{
@@ -80,7 +118,10 @@ fn qp(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 /// [sig-api-machinery] Watch should observe add, update, and delete watch
 /// notifications on configmaps [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go:60
+///   ("should observe add, update, and delete watch notifications on
+///   configmaps")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named the file with no case or line.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn watch_should_observe_add_update_delete_on_configmaps() {
@@ -124,7 +165,9 @@ async fn watch_should_observe_add_update_delete_on_configmaps() {
 /// [sig-api-machinery] Watch should be able to start watching from a specific
 /// resource version [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go:142
+///   ("should be able to start watching from a specific resource version")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named the file only.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn watch_should_start_from_specific_resource_version() {
@@ -140,7 +183,10 @@ async fn watch_should_start_from_specific_resource_version() {
 /// [sig-api-machinery] Watch should receive events for every added, modified,
 /// and deleted object [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go:60
+///   ("should observe add, update, and delete watch notifications on
+///   configmaps") — the per-operation aspect of the same case.
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named the file only.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn watch_should_receive_event_per_object_lifecycle_op() {
@@ -224,7 +270,10 @@ async fn watch_envelope_includes_type_and_object() {
 /// [sig-api-machinery] Watch DELETE event must include the object body even
 /// when prev_kv is absent.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go and the
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go:60
+///   ("should observe add, update, and delete watch notifications on
+///   configmaps") — the delete-event payload.
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named the file only.
 /// per-resource lifecycle tests under test/e2e/network/service.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
@@ -242,7 +291,16 @@ async fn watch_delete_event_includes_body_from_key_fallback() {
 /// [sig-api-machinery] Watch DELETE event preserves the full prev value when
 /// valid JSON is available.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go
+/// Upstream: no conformance case — the DELETE event's payload shape (that it
+///   carries the prior object) is defined by
+///   staging/src/k8s.io/apimachinery/pkg/watch/watch.go, not asserted by an
+///   upstream conformance body.
+/// Mirror audit (#1749, 2026-08-27): re-cited a second time. The first pass
+/// today cited watch.go:257 ("should observe an object deletion if it stops
+/// meeting the requirements of the selector"), which is a different
+/// mechanism: that case is about an object leaving a *selector*, not about
+/// what a real delete carries. :257 is mirrored by
+/// `watch_selector_exit_surfaces_as_deleted` below.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn watch_delete_event_preserves_prev_object_when_present() {
@@ -293,7 +351,10 @@ async fn watch_query_param_recognised_for_list_endpoints() {
 /// [sig-api-machinery] Watch must filter events by namespace prefix — events
 /// for `kube-system/cm` must NOT reach a watcher subscribed to `default/`.
 ///
-/// Upstream: test/e2e/apimachinery/watch.go (watch scoped to namespace)
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go:60
+///   ("should observe add, update, and delete watch notifications on
+///   configmaps") — the namespace-scoping precondition.
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named the file only.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn watch_filters_events_outside_subscribed_namespace_prefix() {
@@ -385,7 +446,9 @@ async fn watch_bookmark_optin_is_query_parameter() {
 /// [sig-api-machinery] Servers should return chunks of results for list
 /// calls [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go:83
+///   ("should return chunks of results for list calls")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named the file only.
 /// Implemented via `Storage::list_paginated` + `?limit=`/`?continue=` parsing
 /// in the list handlers.
 ///
@@ -450,7 +513,10 @@ async fn chunking_servers_should_return_chunks_of_results() {
 /// [sig-api-machinery] Servers should support chunking with limit=1
 /// [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go:83
+///   ("should return chunks of results for list calls") — the limit=1
+///   boundary of the same case.
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named the file only.
 /// Exercising the smallest non-zero chunk size guards against off-by-ones in
 /// the slice arithmetic.
 #[tokio::test]
@@ -491,7 +557,10 @@ async fn chunking_servers_should_support_limit_one() {
 /// [sig-api-machinery] Continue token rejected after compaction returns
 /// status 410 Gone with reason Expired.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go:144
+///   ("should support continue listing from the last key if the original
+///   version has been compacted away, though the list is inconsistent")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named the file only.
 /// Storage surfaces `Error::Gone` when
 /// the continue token references a revision older than the compaction
 /// watermark; the api-server error-to-Status mapping translates that to
@@ -581,7 +650,7 @@ async fn chunking_default_listmeta_omits_continue_and_remaining() {
 // =========================================================================
 
 /// [sig-api-machinery] FieldSelectors should filter `metadata.name`
-/// equality [Conformance]
+/// equality
 ///
 /// Upstream: k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/fields/selector.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS
@@ -599,7 +668,7 @@ async fn field_selector_filters_by_metadata_name_equality() {
 }
 
 /// [sig-api-machinery] FieldSelectors support inequality (`metadata.name!=x`)
-/// [Conformance]
+///
 ///
 /// Upstream: k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/fields/selector.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS
@@ -613,7 +682,7 @@ async fn field_selector_filters_by_metadata_name_inequality() {
 }
 
 /// [sig-api-machinery] FieldSelectors support comma-separated AND of
-/// predicates [Conformance]
+/// predicates
 ///
 /// Upstream: k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/fields/selector.go
 /// Sonobuoy (Round 160, 2026-04-26): PASS
@@ -634,7 +703,7 @@ async fn field_selector_supports_comma_and_of_predicates() {
     assert_eq!(items[0].metadata.namespace.as_deref(), Some("default"));
 }
 
-/// [sig-api-machinery] LabelSelectors should filter by equality [Conformance]
+/// [sig-api-machinery] LabelSelectors should filter by equality
 ///
 /// Upstream: k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/labels/selector.go
 /// (exercised end-to-end by test/e2e/apimachinery/watch.go:257)
@@ -654,7 +723,11 @@ async fn label_selector_filters_by_equality() {
 
 /// [sig-api-machinery] LabelSelectors support `key in (a,b)` set notation.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go (filter scenarios)
+/// Upstream: no conformance case. Set-notation label selectors are
+///   defined by staging/src/k8s.io/apimachinery/pkg/labels/selector.go;
+///   the watch cases in k8s.io/kubernetes/test/e2e/apimachinery/watch.go
+///   use selectors but do not assert set notation.
+/// Mirror audit (#1749, 2026-08-27): re-cited; not a conformance case.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn label_selector_supports_set_in_notation() {
@@ -789,7 +862,11 @@ async fn gc_owner_reference_omits_optional_fields_when_unset() {
 
 /// [sig-api-machinery] An object may have multiple owner references.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/garbage_collector.go
+/// Upstream: no conformance case — multiple ownerReferences on one object
+///   is a metadata shape defined by
+///   staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go; the GC
+///   conformance cases each use a single owner.
+/// Mirror audit (#1749, 2026-08-27): re-cited; not a conformance case.
 /// (multiple ownerReferences scenarios)
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
@@ -828,7 +905,9 @@ async fn gc_deletion_propagation_policies_match_wire_format() {
 /// [sig-api-machinery] Garbage collector should delete pods created by RC when
 /// propagation policy is Background [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/garbage_collector.go
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/garbage_collector.go:330
+///   ("should delete pods created by rc when not orphaning")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named the file with no case or line.
 /// Sonobuoy (Round 160, 2026-04-26): PASS — the GC controller deletes
 /// dependents whose owners are gone. We model the storage-level invariant
 /// (no orphan keys remain once both owner and dependents are deleted).
@@ -881,7 +960,9 @@ async fn gc_background_deletion_leaves_no_orphan_dependents() {
 /// [sig-api-machinery] Garbage collector should orphan dependents when the
 /// owner is deleted with propagationPolicy=Orphan [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/garbage_collector.go
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/garbage_collector.go:388
+///   ("should orphan pods created by rc if delete options say so")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named the file only.
 /// (TestSimpleOrphan / "should orphan pods created by rc if delete options
 /// say so").
 /// Sonobuoy (Round 160, 2026-04-26): FAIL — the GC controller deleted
@@ -970,7 +1051,10 @@ async fn gc_orphan_propagation_should_strip_owner_refs_not_delete() {
 /// [sig-api-machinery] Garbage collector should delete RS and pods when
 /// foreground deletion is invoked [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/garbage_collector.go
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/garbage_collector.go:647
+///   ("should keep the rc around until all its pods are deleted if the
+///   deleteOptions says so") — the foreground-propagation wire form.
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named the file only.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn gc_foreground_deletion_propagation_serializes_in_delete_options() {
@@ -985,7 +1069,9 @@ async fn gc_foreground_deletion_propagation_serializes_in_delete_options() {
 /// [sig-api-machinery] Owner references must be retained across a round-trip
 /// through storage (otherwise GC cannot resolve dependents).
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/garbage_collector.go
+/// Upstream: no conformance case — ownerReference persistence is a
+///   storage round-trip check, not an upstream conformance assertion.
+/// Mirror audit (#1749, 2026-08-27): re-cited; not a conformance case.
 /// (the test asserts dependents continue to point at their owner after a
 /// PUT)
 /// Sonobuoy (Round 160, 2026-04-26): PASS
@@ -1054,7 +1140,9 @@ async fn gc_namespace_deletion_emits_delete_watch_event() {
 /// [sig-api-machinery] Deleting an object also clears it from subsequent
 /// list calls — basic GC consistency contract.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/garbage_collector.go
+/// Upstream: no conformance case — a delete-then-list check that no
+///   upstream garbage-collector conformance body asserts directly.
+/// Mirror audit (#1749, 2026-08-27): re-cited; not a conformance case.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn gc_delete_then_list_reflects_removal() {
@@ -1074,4 +1162,67 @@ async fn gc_delete_then_list_reflects_removal() {
     let mut names: Vec<&str> = listed.iter().map(|c| c.metadata.name.as_str()).collect();
     names.sort();
     assert_eq!(names, vec!["c-0", "c-2"]);
+}
+
+/// [sig-api-machinery] Watch should observe an object deletion if it stops
+/// meeting the requirements of the selector [Conformance]
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go:257
+///   ("should observe an object deletion if it stops meeting the requirements
+///   of the selector")
+/// Mirror audit (#1749, 2026-08-27): new mirror; this case had none.
+///
+/// The contract is subtle and worth stating: when a watched object is updated
+/// so that it no longer matches the watch's label selector, the watcher must
+/// see a **DELETED** event even though the object still exists. Upstream walks
+/// ADDED -> MODIFIED -> DELETED (label changed away) and then, on restoring the
+/// label, ADDED again (watch.go:285-305).
+///
+/// Driven through `watch_modified_event_type`, the function the streaming
+/// handler uses to decide the transition (handlers/watch.rs). The oneshot HTTP
+/// harness cannot hold a streaming watch open across the intervening updates —
+/// the same constraint recorded on the ServiceAccount lifecycle mirror.
+#[tokio::test]
+async fn watch_selector_exit_surfaces_as_deleted() {
+    use rusternetes_api_server::handlers::watch::watch_modified_event_type;
+
+    let selector = Some("watch-this=yes".to_string());
+    let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Matching object, updated while still matching -> MODIFIED.
+    let matching = cm("e2e-cm", "default", &[("watch-this", "yes")]);
+    assert!(
+        matches!(
+            watch_modified_event_type(&matching, &selector, &None, &mut excluded),
+            Some(WatchEventType::Modified)
+        ),
+        "an object that matches before and after must surface as MODIFIED"
+    );
+
+    // Label changed away: the object still exists, but the watcher must be told
+    // it left the selector — as a DELETED event.
+    let no_longer_matching = cm("e2e-cm", "default", &[("watch-this", "no")]);
+    assert!(
+        matches!(
+            watch_modified_event_type(&no_longer_matching, &selector, &None, &mut excluded),
+            Some(WatchEventType::Deleted)
+        ),
+        "an object leaving the selector must surface as DELETED even though it \
+         still exists"
+    );
+
+    // Still not matching: suppressed entirely, not repeated as DELETED.
+    assert!(
+        watch_modified_event_type(&no_longer_matching, &selector, &None, &mut excluded).is_none(),
+        "a further update to an already-excluded object must emit nothing"
+    );
+
+    // Label restored: the object re-enters the selector and surfaces as ADDED.
+    assert!(
+        matches!(
+            watch_modified_event_type(&matching, &selector, &None, &mut excluded),
+            Some(WatchEventType::Added)
+        ),
+        "an object re-entering the selector must surface as ADDED"
+    );
 }
