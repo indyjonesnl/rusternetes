@@ -17,6 +17,17 @@
 #     e2e-conformance-test pod is evicted ("Pod evicted due to resource
 #     pressure: ImageFsAvailable") after the run has already logged
 #     "Will run 406 of 7348 specs".
+#   * Per-node service images drifting apart. kubelet/kubelet2,
+#     kube-proxy/kube-proxy2 and containerd/containerd2 are separate compose
+#     services with separate tags, so `compose build kubelet` leaves node-2 on
+#     old code. Whichever node the scheduler happens to pick then decides the
+#     result — the same spec passes and fails alternately and reads exactly
+#     like a flake (#1792).
+#   * A saturated storage backend. After a few hours of runs the rhino store
+#     reached state.db 512 MB + WAL 192 MB with rhino pegged at 1364% CPU, and
+#     list+delete-heavy specs began failing with `context deadline exceeded`.
+#     Nothing is unhealthy — /healthz answers in 96 ms — but the failure list
+#     is fiction (#1794).
 #
 # This script asserts and REPORTS. It never repairs: it does not export
 # variables, restart containers, relax kubelet thresholds, or create objects.
@@ -39,6 +50,16 @@
 #   --sandbox-image REF Image whose pull is exercised
 #                       (default: registry.k8s.io/pause:3.10.1)
 #   --skip-image-pull   Skip only the image-pull assertion (offline work)
+#   --storage-container NAME
+#                       Container holding the storage backend, inspected for
+#                       size (default: rusternetes-rhino; absent = skipped,
+#                       which is the etcd/remote case)
+#   --max-storage-mb N  Refuse to run when state.db + WAL exceed N MB
+#                       (default: 256; one full suite on a fresh cluster grows
+#                       the store to ~85 MB, so 256 means "more than a couple
+#                       of suites of never-reclaimed pages")
+#   --skip-node-image-check
+#                       Skip only the per-node image-equality assertion
 #   --timeout SECONDS   Budget for the whole preflight (default: 60)
 #   -h, --help          Show this help
 #
@@ -58,11 +79,26 @@ CERTS_PATH_EXPECTED="${CERTS_PATH:-$REPO_ROOT/.rusternetes/certs}"
 KUBELET_CONTAINER="rusternetes-kubelet"
 SANDBOX_IMAGE="registry.k8s.io/pause:3.10.1"
 SKIP_IMAGE_PULL=0
+STORAGE_CONTAINER="rusternetes-rhino"
+MAX_STORAGE_MB=256
+SKIP_NODE_IMAGE_CHECK=0
+# Per-node compose service pairs that MUST run the same image. Each entry is
+# "node-1 container:node-2 container".
+NODE_SERVICE_PAIRS=(
+    "rusternetes-kubelet:rusternetes-kubelet2"
+    "rusternetes-kube-proxy:rusternetes-kube-proxy2"
+    "rusternetes-containerd:rusternetes-containerd2"
+)
 BUDGET_SECONDS=60
 
 die() { echo "[$SCRIPT_NAME] ERROR: $*" >&2; exit 2; }
 
-usage() { sed -n '2,58p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# Print the header comment block, whatever length it happens to be: everything
+# after the shebang up to the first line that is not a comment.
+usage() {
+    awk 'NR == 1 { next } !/^#/ { exit } { print }' "${BASH_SOURCE[0]}" \
+        | sed 's/^# \{0,1\}//'
+}
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -71,6 +107,9 @@ while [ $# -gt 0 ]; do
         --kubelet)         [ $# -ge 2 ] || die "--kubelet requires a value"; KUBELET_CONTAINER="$2"; shift 2 ;;
         --sandbox-image)   [ $# -ge 2 ] || die "--sandbox-image requires a value"; SANDBOX_IMAGE="$2"; shift 2 ;;
         --skip-image-pull) SKIP_IMAGE_PULL=1; shift ;;
+        --storage-container) [ $# -ge 2 ] || die "--storage-container requires a value"; STORAGE_CONTAINER="$2"; shift 2 ;;
+        --max-storage-mb)  [ $# -ge 2 ] || die "--max-storage-mb requires a value"; MAX_STORAGE_MB="$2"; shift 2 ;;
+        --skip-node-image-check) SKIP_NODE_IMAGE_CHECK=1; shift ;;
         --timeout)         [ $# -ge 2 ] || die "--timeout requires a value"; BUDGET_SECONDS="$2"; shift 2 ;;
         -h|--help)         usage; exit 0 ;;
         *)                 die "unknown flag: $1 (use --help)" ;;
@@ -78,6 +117,7 @@ while [ $# -gt 0 ]; do
 done
 
 [[ "$BUDGET_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "--timeout must be a positive integer"
+[[ "$MAX_STORAGE_MB" =~ ^[1-9][0-9]*$ ]] || die "--max-storage-mb must be a positive integer"
 
 KUBECTL="${KUBECTL:-kubectl}"
 CONTAINER_RT="${CONTAINER_RUNTIME:-docker}"
@@ -86,9 +126,9 @@ command -v "$KUBECTL" >/dev/null 2>&1 || die "kubectl not found (set \$KUBECTL t
 [ -f "$KUBECONFIG_PATH" ] || die "kubeconfig not found: $KUBECONFIG_PATH"
 export KUBECONFIG="$KUBECONFIG_PATH"
 
-# Per-assertion timeout so one hung call cannot eat the whole budget. Six
-# assertions share the budget; give each a sixth, floor 5s.
-PER_CHECK_TIMEOUT=$(( BUDGET_SECONDS / 6 ))
+# Per-assertion timeout so one hung call cannot eat the whole budget. Eight
+# assertions share the budget; give each an eighth, floor 5s.
+PER_CHECK_TIMEOUT=$(( BUDGET_SECONDS / 8 ))
 [ "$PER_CHECK_TIMEOUT" -lt 5 ] && PER_CHECK_TIMEOUT=5
 
 FAILURES=()
@@ -207,6 +247,76 @@ else
         pass "pulled $SANDBOX_IMAGE (upstream registry path works end to end)"
     else
         fail "cannot pull $SANDBOX_IMAGE — registry.k8s.io redirects blobs to pkg.dev; a 401 from the front door does not mean pulls work"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Both nodes run the SAME build of each per-node service. kubelet/kubelet2,
+#    kube-proxy/kube-proxy2 and containerd/containerd2 are separate compose
+#    services with separate image tags, so `compose build kubelet` updates
+#    node-1 only. On 2026-08-27 that cost two wrong conclusions in a row about
+#    a kubelet fix: node-2 was running a binary from hours earlier, and the
+#    spec's verdict depended on which node the scheduler happened to pick
+#    (#1792). Compare image IDs, not tags — both sides say ":latest".
+# ---------------------------------------------------------------------------
+if [ "$SKIP_NODE_IMAGE_CHECK" = "1" ]; then
+    pass "per-node image-equality assertion skipped (--skip-node-image-check)"
+elif ! command -v "$CONTAINER_RT" >/dev/null 2>&1; then
+    pass "$CONTAINER_RT not available — skipping per-node image assertion"
+else
+    checked=0
+    for pair in "${NODE_SERVICE_PAIRS[@]}"; do
+        first="${pair%%:*}"
+        second="${pair##*:}"
+        id_first="$(timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" inspect "$first" -f '{{.Image}}' 2>/dev/null)"
+        id_second="$(timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" inspect "$second" -f '{{.Image}}' 2>/dev/null)"
+        # A single-node stack (or an all-in-one one) legitimately has no pair.
+        [ -n "$id_first" ] && [ -n "$id_second" ] || continue
+        checked=$(( checked + 1 ))
+        if [ "$id_first" = "$id_second" ]; then
+            pass "$first and $second run the same image (${id_first:0:19})"
+        else
+            # Compose service names, not container names, so the remediation
+            # is copy-pasteable.
+            svc_first="${first#rusternetes-}"
+            svc_second="${second#rusternetes-}"
+            fail "$first and $second run DIFFERENT images (${id_first:0:19} vs ${id_second:0:19}) — identical inputs would share one image ID via the build cache, so these builds genuinely differ; rebuild both ('compose build $svc_first $svc_second') or the node the scheduler picks decides the result"
+        fi
+    done
+    [ "$checked" -eq 0 ] && pass "no per-node service pairs present — single-node or all-in-one stack"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. The storage backend is not saturated. A cluster that has carried several
+#    suites reaches state.db 512 MB + WAL 192 MB, at which point rhino pegs
+#    ~13 cores and list+delete-heavy specs fail on `context deadline exceeded`
+#    while /healthz still answers in under 100 ms (#1794). Those failures are
+#    indistinguishable from product defects by inspection — one full suite on
+#    a fresh cluster ends at ~85 MB, so the default ceiling of 256 MB means
+#    "this store is carrying more than a couple of suites of pages that were
+#    never reclaimed".
+# ---------------------------------------------------------------------------
+if ! command -v "$CONTAINER_RT" >/dev/null 2>&1; then
+    pass "$CONTAINER_RT not available — skipping storage-size assertion"
+elif ! timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" inspect "$STORAGE_CONTAINER" >/dev/null 2>&1; then
+    # etcd, a remote backend, or the all-in-one binary: nothing to measure.
+    pass "storage container '$STORAGE_CONTAINER' not present — skipping storage-size assertion"
+else
+    # stat every file that exists; a missing WAL is normal right after start.
+    storage_bytes="$(timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" exec "$STORAGE_CONTAINER" \
+        sh -c 'cat /dev/null; for f in /data/db/state.db /data/db/state.db-wal; do [ -f "$f" ] && stat -c %s "$f"; done' 2>/dev/null \
+        | awk '{ total += $1 } END { printf "%d", total }')"
+    if [ -z "$storage_bytes" ] || [ "$storage_bytes" -eq 0 ] 2>/dev/null; then
+        # Not fatal: the layout may differ, and refusing to run over an
+        # unreadable size would block more than it protects.
+        pass "could not size the store in '$STORAGE_CONTAINER' — skipping storage-size assertion"
+    else
+        storage_mb=$(( storage_bytes / 1048576 ))
+        if [ "$storage_mb" -gt "$MAX_STORAGE_MB" ]; then
+            fail "storage backend is saturated: state.db + WAL = ${storage_mb} MB (ceiling ${MAX_STORAGE_MB} MB) — recreate the stack with 'down -v' before measuring; specs will otherwise fail on 'context deadline exceeded' and look like product defects (#1794)"
+        else
+            pass "storage backend holds ${storage_mb} MB (ceiling ${MAX_STORAGE_MB} MB)"
+        fi
     fi
 fi
 

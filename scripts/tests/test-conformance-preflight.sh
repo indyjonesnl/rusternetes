@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Validate scripts/conformance-preflight.sh (#1777).
 #
-# The preflight exists because three environment faults each let a conformance
-# run start and emit a complete, wrong failure list. Each case below reproduces
-# one of those faults with a stubbed kubectl/docker on $PATH and asserts that
+# The preflight exists because five environment faults each let a conformance
+# run start and emit a complete, wrong failure list — the original three
+# (#1777), plus per-node image drift (#1792) and a saturated storage backend
+# (#1794). Each case below reproduces one of those faults with a stubbed
+# kubectl/docker on $PATH and asserts that
 #   * the exit code is 2 (the runners' usage/preflight class), and
 #   * the message names the specific failing condition,
 # plus the happy path where every stub reports health and the exit code is 0.
@@ -56,19 +58,55 @@ STUB
 
     cat >"$dir/docker" <<'STUB'
 #!/usr/bin/env bash
-# Stub docker: inspect (certs mount) and pull (registry path) only.
+# Stub docker. Answers the four shapes conformance-preflight.sh uses:
+#   inspect <name>                 existence probe
+#   inspect <name> -f {{.Mounts}}  certs mount
+#   inspect <name> -f {{.Image}}   image ID (per-node equality)
+#   exec <name> sh -c ...          storage size
+#   pull <ref>                     registry path
+name=""
+fmt=""
 case "${1:-}" in
     inspect)
         shift
-        [ "${KUBELET_PRESENT:-1}" = "1" ] || exit 1
-        # `docker inspect <name>` with no -f is the existence probe.
-        for a in "$@"; do [ "$a" = "-f" ] && has_fmt=1; done
-        [ "${has_fmt:-0}" = "1" ] || exit 0
-        if [ "${CERTS_MOUNTED:-1}" = "1" ]; then
-            printf '%s:%s\n' "${CERTS_PATH}" "${CERTS_PATH}"
-        else
-            printf '%s:/etc/rusternetes/certs\n' "${CERTS_PATH}"
-        fi
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -f) fmt="$2"; shift 2 ;;
+                *)  name="$1"; shift ;;
+            esac
+        done
+        # Which containers exist. node-2 peers and the store are individually
+        # switchable so the "no pair present" and "no store" paths get covered.
+        case "$name" in
+            rusternetes-kubelet)   [ "${KUBELET_PRESENT:-1}"  = "1" ] || exit 1 ;;
+            rusternetes-kubelet2|rusternetes-kube-proxy2|rusternetes-containerd2)
+                                   [ "${NODE2_PRESENT:-1}"    = "1" ] || exit 1 ;;
+            rusternetes-rhino)     [ "${RHINO_PRESENT:-1}"    = "1" ] || exit 1 ;;
+        esac
+        case "$fmt" in
+            *Image*)
+                # node-1 services share one ID, node-2 services another.
+                case "$name" in
+                    *2) printf '%s\n' "${IMG_NODE2:-sha256:aaaabbbbccccddddeeeeffff0000111122223333444455556666777788889999}" ;;
+                    *)  printf '%s\n' "${IMG_NODE1:-sha256:aaaabbbbccccddddeeeeffff0000111122223333444455556666777788889999}" ;;
+                esac
+                exit 0 ;;
+            "")
+                # Existence probe: no format, no output.
+                exit 0 ;;
+            *)
+                if [ "${CERTS_MOUNTED:-1}" = "1" ]; then
+                    printf '%s:%s\n' "${CERTS_PATH}" "${CERTS_PATH}"
+                else
+                    printf '%s:/etc/rusternetes/certs\n' "${CERTS_PATH}"
+                fi
+                exit 0 ;;
+        esac ;;
+    exec)
+        # Only the store-size probe runs through exec.
+        [ "${STORAGE_READABLE:-1}" = "1" ] || exit 1
+        printf '%s\n' "${STORAGE_DB_BYTES:-1048576}"
+        printf '%s\n' "${STORAGE_WAL_BYTES:-1048576}"
         exit 0 ;;
     pull)
         [ "${PULL_OK:-1}" = "1" ] || { echo "Error response from daemon: timeout" >&2; exit 1; }
@@ -175,6 +213,91 @@ if [ "$rc_skip" = "0" ] && grep -q "skipped" <<<"$out_skip"; then
 else
     echo "FAIL [--skip-image-pull]: exit $rc_skip"
     echo "$out_skip" | sed 's/^/    /'
+    fail=1
+fi
+
+# Per-node image drift (#1792): node-1 rebuilt, node-2 left on old code. The
+# spec then passes or fails depending on which node the scheduler picks.
+expect_case "per-node image drift is refused" 2 "DIFFERENT images" \
+    "IMG_NODE2=sha256:9999888877776666555544443333222211110000ffffeeeeddddccccbbbbaaaa"
+
+expect_case "matching per-node images pass" 0 "run the same image"
+
+# A single-node or all-in-one stack has no node-2 peer, which is not a fault.
+expect_case "absent node-2 peers are not a fault" 0 "no per-node service pairs present" \
+    "NODE2_PRESENT=0"
+
+# --skip-node-image-check bypasses only that assertion.
+out_skip_img="$(env PATH="$STUBS:$PATH" CERTS_PATH="$FAKE_CERTS" \
+    IMG_NODE2=sha256:9999888877776666555544443333222211110000ffffeeeeddddccccbbbbaaaa \
+    bash "$PREFLIGHT" --kubeconfig "$FAKE_KUBECONFIG" --certs-path "$FAKE_CERTS" \
+    --skip-node-image-check --timeout 30 2>&1)"
+rc_skip_img=$?
+if [ "$rc_skip_img" = "0" ] && grep -q "image-equality assertion skipped" <<<"$out_skip_img"; then
+    echo "ok   [--skip-node-image-check bypasses only that assertion]"
+else
+    echo "FAIL [--skip-node-image-check]: exit $rc_skip_img"
+    echo "$out_skip_img" | sed 's/^/    /'
+    fail=1
+fi
+
+# Storage saturation (#1794): 512 MB db + 192 MB WAL is the state at which
+# list+delete-heavy specs start timing out while /healthz still answers fast.
+expect_case "saturated storage is refused" 2 "storage backend is saturated" \
+    "STORAGE_DB_BYTES=536870912" "STORAGE_WAL_BYTES=201326592"
+
+# One fresh suite ends around 85 MB, which must NOT be refused.
+expect_case "one suite worth of storage passes" 0 "storage backend holds" \
+    "STORAGE_DB_BYTES=89128960" "STORAGE_WAL_BYTES=39845888"
+
+# Exactly at the ceiling is allowed; only above it is refused.
+expect_case "storage exactly at the ceiling passes" 0 "storage backend holds" \
+    "STORAGE_DB_BYTES=268435456" "STORAGE_WAL_BYTES=0"
+
+# etcd / remote backend: no rhino container to measure, which is not a fault.
+expect_case "absent storage container is not a fault" 0 "skipping storage-size assertion" \
+    "RHINO_PRESENT=0"
+
+# An unreadable store must not block the run — refusing there would block more
+# than it protects.
+expect_case "unreadable storage size is not a fault" 0 "could not size the store" \
+    "STORAGE_READABLE=0"
+
+# --max-storage-mb moves the ceiling.
+out_ceiling="$(env PATH="$STUBS:$PATH" CERTS_PATH="$FAKE_CERTS" \
+    STORAGE_DB_BYTES=104857600 STORAGE_WAL_BYTES=0 \
+    bash "$PREFLIGHT" --kubeconfig "$FAKE_KUBECONFIG" --certs-path "$FAKE_CERTS" \
+    --max-storage-mb 64 --timeout 30 2>&1)"
+rc_ceiling=$?
+if [ "$rc_ceiling" = "2" ] && grep -q "ceiling 64 MB" <<<"$out_ceiling"; then
+    echo "ok   [--max-storage-mb moves the ceiling]"
+else
+    echo "FAIL [--max-storage-mb]: exit $rc_ceiling"
+    echo "$out_ceiling" | sed 's/^/    /'
+    fail=1
+fi
+
+# A non-numeric ceiling is a usage error, not a silent default.
+out_bad_mb="$(env PATH="$STUBS:$PATH" CERTS_PATH="$FAKE_CERTS" \
+    bash "$PREFLIGHT" --kubeconfig "$FAKE_KUBECONFIG" --max-storage-mb yes 2>&1)"
+rc_bad_mb=$?
+if [ "$rc_bad_mb" = "2" ] && grep -q "must be a positive integer" <<<"$out_bad_mb"; then
+    echo "ok   [non-numeric --max-storage-mb is a usage error]"
+else
+    echo "FAIL [non-numeric --max-storage-mb]: exit $rc_bad_mb"
+    echo "$out_bad_mb" | sed 's/^/    /'
+    fail=1
+fi
+
+# --help must print the header and stop there. It used to spill the first ten
+# lines of code, because the range was hardcoded as lines 2-58 and every header
+# edit shifted it.
+out_help="$(bash "$PREFLIGHT" --help 2>&1)"
+if grep -q "Exit codes:" <<<"$out_help" && ! grep -q 'SCRIPT_NAME=' <<<"$out_help"; then
+    echo "ok   [--help prints the header without spilling code]"
+else
+    echo "FAIL [--help spills code or omits the exit-code contract]"
+    echo "$out_help" | tail -12 | sed 's/^/    /'
     fail=1
 fi
 
