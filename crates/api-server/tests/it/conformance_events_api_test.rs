@@ -18,6 +18,42 @@
 //!
 //! Harness mirrors `list_empty_items_router_test.rs`: `Arc<MemoryStorage>`,
 //! `AlwaysAllowAuthorizer` + `skip_auth=true`, one `oneshot` per request.
+//!
+//! ---------------------------------------------------------------------------
+//! Mirror audit (#1749, 2026-08-27)
+//! ---------------------------------------------------------------------------
+//!
+//! Verified against `../kubernetes` at `release-1.35`. This file is the
+//! case-level mirror for the sig-instrumentation area: its four tests map
+//! one-to-one onto the four `framework.ConformanceIt` cases, and the
+//! file-level mapping above was already correct — unusually for this audit.
+//! The sibling `conformance_instrumentation_events.rs` decomposes the same
+//! four cases into finer per-step tests; see its own audit record.
+//!
+//! Citations added: 4. Every test now names its upstream case line and the
+//! line ranges of the steps it mirrors. Previously the mapping existed only
+//! in this module doc, so no individual test could be checked against, or
+//! invalidated by, upstream.
+//!
+//! Assertions re-derived: upstream does not spot-check the field it just
+//! changed. After both the patch and the update it clears
+//! `metadata.resourceVersion` and `metadata.managedFields` on both sides and
+//! requires `apiequality.Semantic.DeepEqual` over the WHOLE object
+//! (core_events.go:137-145, events.go:165-168 and :178-185). All three sites
+//! asserted only `series.count` and `series.lastObservedTime`, so a server
+//! that dropped or rewrote `note`, `action`, `reportingInstance`, `regarding`
+//! or any other field during patch/update would have passed. They now compare
+//! whole objects. The server round-trips correctly; the mirror was the weak
+//! part. Verified non-vacuous by removing a field from one side and
+//! confirming the assertion fails.
+//!
+//! Not a gap: upstream also requires the patched object to carry a larger
+//! `metadata.resourceVersion` than the created one
+//! (`resourceversion.CompareResourceVersion`, events.go:158). `MemoryStorage`
+//! does not stamp `metadata.resourceVersion`; the etcd
+//! (`crates/storage/src/etcd.rs:43-52`) and rhino
+//! (`crates/storage/src/rhino.rs:100-105`) backends do. Asserting it here
+//! would test the harness.
 
 use axum::http::StatusCode;
 use rusternetes_test_support::harness::TestApiServer;
@@ -72,6 +108,17 @@ async fn patch_merge(state: &TestApiServer, uri: &str, body: &Value) -> (StatusC
     .await
 }
 
+/// Strip the two fields upstream clears before comparing objects:
+/// `metadata.resourceVersion` and `metadata.managedFields` are written by the
+/// control plane, so both sides of an `apiequality.Semantic.DeepEqual` have
+/// them removed first (core_events.go:130-142, events.go:159-163).
+fn strip_control_plane_fields(v: &mut Value) {
+    if let Some(meta) = v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        meta.remove("resourceVersion");
+        meta.remove("managedFields");
+    }
+}
+
 async fn create_namespace(state: &TestApiServer, ns: &str) {
     let body = json!({
         "apiVersion": "v1",
@@ -115,6 +162,17 @@ fn items_len(list: &Value) -> usize {
 // Spec 1 (core/v1): "should manage the lifecycle of an event"
 // ===========================================================================
 
+/// [sig-instrumentation] Events should manage the lifecycle of an event
+/// [Conformance]
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/core_events.go:58
+///   ("should manage the lifecycle of an event")
+///   Steps: create :64-82, list all namespaces :83-102, patch :103-113,
+///   fetch :114-119, update :120-136, get + DeepEqual :137-145,
+///   delete :147-151, list all namespaces :152-175.
+///
+/// Mirror audit (#1749, 2026-08-27): citation added; the file previously
+/// carried the mapping only in its module doc.
 #[tokio::test]
 async fn core_v1_should_manage_lifecycle_of_an_event() {
     let state = make_state();
@@ -206,21 +264,22 @@ async fn core_v1_should_manage_lifecycle_of_an_event() {
     .await;
     assert_eq!(status, StatusCode::OK, "update failed");
 
-    // --- getting the test event: series MUST round-trip ---
-    let (status, event) = get_json(
+    // --- getting the test event: the whole object MUST match what was sent ---
+    // core_events.go:137-145 requires `apiequality.Semantic.DeepEqual` between
+    // the object sent and the object read back, not a spot-check of the field
+    // that changed. A server that dropped `note`, `action`, `reportingInstance`
+    // or any other field on update would satisfy a per-field assertion.
+    let (status, mut event) = get_json(
         &state,
         &format!("/api/v1/namespaces/{ns}/events/{event_name}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(event["series"]["count"], 100, "series.count not updated");
-    assert!(
-        event["series"]["lastObservedTime"]
-            .as_str()
-            .unwrap_or("")
-            .starts_with("2017-09-19T13:49:16"),
-        "series.lastObservedTime not round-tripped: {:?}",
-        event["series"],
+    strip_control_plane_fields(&mut test_event);
+    strip_control_plane_fields(&mut event);
+    assert_eq!(
+        test_event, event,
+        "test event wasn't properly updated:\n  sent: {test_event}\n  got: {event}"
     );
 
     // --- deleting the test event ---
@@ -248,6 +307,15 @@ async fn core_v1_should_manage_lifecycle_of_an_event() {
 // Spec 2 (core/v1): "should delete a collection of events"
 // ===========================================================================
 
+/// [sig-instrumentation] Events should delete a collection of events
+/// [Conformance]
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/core_events.go:176
+///   ("should delete a collection of events")
+///   Steps: create set :179-200, list by label :201-209,
+///   deletecollection :210-217, `checkEventListQuantity(..., 0)` :218-225.
+///
+/// Mirror audit (#1749, 2026-08-27): citation added.
 #[tokio::test]
 async fn core_v1_should_delete_a_collection_of_events() {
     let state = make_state();
@@ -343,6 +411,20 @@ fn new_events_v1_event(ns: &str, name: &str, label: &str) -> Value {
 //   "should ensure that an event can be fetched, patched, deleted, and listed"
 // ===========================================================================
 
+/// [sig-instrumentation] Events API should ensure that an event can be
+/// fetched, patched, deleted, and listed [Conformance]
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/events.go:100
+///   ("should ensure that an event can be fetched, patched, deleted, and
+///   listed")
+///   Steps: create :103-107, list all namespaces :108-113, list test
+///   namespace :114-119, field selection on `source` via the CORE client
+///   :120-126, field selection on `reportingController` via the events client
+///   :127-133, get :134-137, patch :138-154, get + DeepEqual :155-168,
+///   update :170-177, get + DeepEqual :178-185, delete :188-191,
+///   list all namespaces :192-197, list test namespace :198-210.
+///
+/// Mirror audit (#1749, 2026-08-27): citation added.
 #[tokio::test]
 async fn events_v1_should_fetch_patch_delete_list() {
     let state = make_state();
@@ -448,7 +530,7 @@ async fn events_v1_should_fetch_patch_delete_list() {
     );
 
     // --- getting the test event ---
-    let (status, _test_event) = get_json(&state, &format!("{ns_path}/{event_name}")).await;
+    let (status, mut test_event) = get_json(&state, &format!("{ns_path}/{event_name}")).await;
     assert_eq!(status, StatusCode::OK);
 
     // --- patching the test event (add Series) ---
@@ -468,16 +550,24 @@ async fn events_v1_should_fetch_patch_delete_list() {
     // RV; that monotonic-RV contract is a storage-layer guarantee not provided
     // by the in-process MemoryStorage backend, so the series round-trip below
     // is what proves the patch was applied.)
-    let (status, event) = get_json(&state, &format!("{ns_path}/{event_name}")).await;
+    let (status, mut event) = get_json(&state, &format!("{ns_path}/{event_name}")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(event["series"]["count"], 2, "patched series.count wrong");
-    assert!(
-        event["series"]["lastObservedTime"]
-            .as_str()
-            .unwrap_or("")
-            .starts_with("2017-09-19T13:49:11"),
-        "patched series.lastObservedTime not round-tripped: {:?}",
-        event["series"],
+
+    // Upstream does not spot-check the patched field: it takes the object as
+    // it was *before* the patch, applies the expected series to its own copy,
+    // and requires the whole object to match what the server returns
+    // (events.go:165-168, `apiequality.Semantic.DeepEqual`). A field the
+    // patch silently dropped or the server silently rewrote is invisible to a
+    // per-field check and is exactly what this catches.
+    test_event["series"] = json!({
+        "count": 2,
+        "lastObservedTime": "2017-09-19T13:49:11.000000Z",
+    });
+    strip_control_plane_fields(&mut test_event);
+    strip_control_plane_fields(&mut event);
+    assert_eq!(
+        test_event, event,
+        "test event wasn't properly patched:\n  sent+expected: {test_event}\n  got: {event}"
     );
 
     // --- updating the test event (replace Series) ---
@@ -502,17 +592,15 @@ async fn events_v1_should_fetch_patch_delete_list() {
         put_json(&state, &format!("{ns_path}/{event_name}"), &update_event).await;
     assert_eq!(status, StatusCode::OK, "update failed");
 
-    // --- getting the test event: updated series MUST be visible ---
-    let (status, event) = get_json(&state, &format!("{ns_path}/{event_name}")).await;
+    // --- getting the test event: the whole object MUST match what was sent ---
+    // events.go:178-185 — same DeepEqual contract as the patch step above.
+    let (status, mut event) = get_json(&state, &format!("{ns_path}/{event_name}")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(event["series"]["count"], 100, "updated series.count wrong");
-    assert!(
-        event["series"]["lastObservedTime"]
-            .as_str()
-            .unwrap_or("")
-            .starts_with("2017-09-19T13:49:16"),
-        "updated series.lastObservedTime not round-tripped: {:?}",
-        event["series"],
+    strip_control_plane_fields(&mut update_event);
+    strip_control_plane_fields(&mut event);
+    assert_eq!(
+        update_event, event,
+        "test event wasn't properly updated:\n  sent: {update_event}\n  got: {event}"
     );
 
     // --- deleting the test event ---
@@ -548,6 +636,15 @@ async fn events_v1_should_fetch_patch_delete_list() {
 // Spec 4 (events.k8s.io/v1): "should delete a collection of events"
 // ===========================================================================
 
+/// [sig-instrumentation] Events API should delete a collection of events
+/// [Conformance]
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/events.go:211
+///   ("should delete a collection of events")
+///   Steps: create set :214-219, list by label :220-226,
+///   delete list :227-233, check quantity :234-240.
+///
+/// Mirror audit (#1749, 2026-08-27): citation added.
 #[tokio::test]
 async fn events_v1_should_delete_a_collection_of_events() {
     let state = make_state();

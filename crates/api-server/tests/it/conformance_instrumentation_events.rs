@@ -1,18 +1,23 @@
-//! Conformance mirror for `[sig-instrumentation]` — Events lifecycle.
+//! Per-step assertions for the `[sig-instrumentation]` Events area.
 //!
-//! Upstream Go source:
-//!   `k8s.io/kubernetes/test/e2e/instrumentation/events.go`
-//!   (release-1.35, https://github.com/kubernetes/kubernetes/blob/release-1.35/test/e2e/instrumentation/events.go)
+//! Upstream Go sources (release-1.35):
+//!   `k8s.io/kubernetes/test/e2e/instrumentation/core_events.go` — the
+//!     core/v1 Event cases
+//!   `k8s.io/kubernetes/test/e2e/instrumentation/events.go` — the
+//!     `events.k8s.io/v1` cases
 //!
-//! Ginkgo descriptions mirrored:
-//!   - `[sig-instrumentation] Events should manage the lifecycle of an event`
-//!     (events.go:55 — `It("should manage the lifecycle of an event",…)`)
-//!   - `[sig-instrumentation] Events API should ensure that an event can be
-//!     fetched, patched, deleted, and listed`
-//!     (events.go:112 — `It("should ensure that an event can be …")`)
-//!   - `[sig-instrumentation] Events API should delete a collection of events
-//!     [Conformance]`
-//!     (events.go:217 — already in `newly-passing.txt` for this batch)
+//! The four `framework.ConformanceIt` cases in this area are:
+//!   - core_events.go:58  "should manage the lifecycle of an event" (core/v1)
+//!   - core_events.go:176 "should delete a collection of events"    (core/v1)
+//!   - events.go:100      "should ensure that an event can be fetched,
+//!     patched, deleted, and listed" (events.k8s.io/v1)
+//!   - events.go:211      "should delete a collection of events"
+//!     (events.k8s.io/v1)
+//!
+//! **All four are mirrored end-to-end in `conformance_events_api_test.rs`,
+//! not here.** This file decomposes them into one test per step, which is
+//! useful for localising a failure but means no test in it is itself a
+//! conformance case. Nothing here carries a `[Conformance]` marker.
 //!
 //! Harness:
 //!   `spawn_router()` → `TestApiServer::new()` (the shared
@@ -20,6 +25,53 @@
 //!   `AlwaysAllowAuthorizer`), driven via a `send` helper that returns
 //!   `(u16, serde_json::Value)`. Both the core/v1 (`/api/v1/…`) and
 //!   `events.k8s.io/v1` (`/apis/events.k8s.io/v1/…`) surfaces are exercised.
+//!
+//! ---------------------------------------------------------------------------
+//! Mirror audit (#1749, 2026-08-27)
+//! ---------------------------------------------------------------------------
+//!
+//! Verified against `../kubernetes` at `release-1.35`. Findings do NOT carry
+//! over to other mirror files; coverage was checked suite-wide.
+//!
+//! Every citation in this file was wrong, in one of three ways:
+//!
+//!   1. **Wrong file.** The core/v1 cases live in `core_events.go`, but every
+//!      core/v1 test here cited `events.go`, which holds only the
+//!      `events.k8s.io/v1` cases. The module doc conflated the two files, and
+//!      each test inherited the conflation.
+//!   2. **Past end of file.** `events.go` is 241 lines long. The label-
+//!      selector deletecollection test cited `events.go:244-270`. A citation
+//!      pointing beyond EOF cannot be checked against anything, so it could
+//!      never have been invalidated by an upstream change.
+//!   3. **Wrong step within the right case.** Where the file was right, the
+//!      line ranges named a different `ginkgo.By` block than the one the test
+//!      mirrors — the create test cited the update step, the get test cited a
+//!      line inside update, the patch test cited the post-update get.
+//!
+//! Two citations described assertions upstream does not make: a `HaveLen(1)`
+//! on the event list (upstream searches an all-namespaces list for a
+//! (name, namespace) pair, because a live cluster has other events), and a
+//! `NotFound` check after delete (upstream asserts absence from a list).
+//!
+//! Conformance framing withdrawn. The four `framework.ConformanceIt` cases in
+//! this area are mirrored end-to-end in `conformance_events_api_test.rs`.
+//! This file decomposes them into per-step tests, so no test in it is itself
+//! a conformance case; the `[Conformance]` marker on the deletecollection
+//! banner has been removed.
+//!
+//! Two tests mirror no upstream step and are now cited on their own footing:
+//!   * `events_lifecycle_update_count_core_v1` — the core/v1 case sets
+//!     `count: 1` at creation and never increments it. It patches `message`
+//!     and updates `series`. `Event.count` is a real API field, so the test
+//!     stands, but it mirrors nothing.
+//!   * `events_get_nonexistent_returns_404` — neither case asserts a 404 on a
+//!     direct GET.
+//!
+//! Kept deliberately: `events_deletecollection_label_selector_only_removes_matching`
+//! asserts that a NON-matching event survives a label-selected delete. Neither
+//! upstream case does, and that bystander is what makes the selector
+//! observable rather than incidental — the same assertion shape that exposed
+//! the `list_apiservices` selector bug in the aggregation/discovery area.
 
 use axum::http::Method;
 use rusternetes_storage::memory::MemoryStorage;
@@ -111,17 +163,27 @@ fn events_v1_event(ns: &str, name: &str) -> Value {
 }
 
 // ===========================================================================
-// [sig-instrumentation] Events should manage the lifecycle of an event
+// Per-step assertions for [sig-instrumentation] Events should manage the
+// lifecycle of an event (core/v1)
 //
-// Upstream: events.go:55 — creates a core/v1 Event, retrieves it by name,
-// lists it (verifying the name appears in items), updates it (count++),
-// deletes it, then asserts the list is empty.
+// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/core_events.go:58.
+// The case itself is mirrored end-to-end in `conformance_events_api_test.rs`
+// as `core_v1_should_manage_lifecycle_of_an_event`.
+//
+// Mirror audit (#1749, 2026-08-27): the old banner cited `events.go:55`,
+// which is inside the `newTestEvent` helper of the *events.k8s.io/v1* file.
+// The core/v1 cases live in `core_events.go`; the two files were conflated
+// throughout this section.
 // ===========================================================================
 
 /// POST a core/v1 Event → 201 Created; body contains the name and apiVersion.
 ///
-/// Upstream: events.go:96-99 (`Expect(createdEvent).NotTo(BeNil())`).
-/// Sonobuoy: PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/core_events.go:58
+///   ("should manage the lifecycle of an event") — the create step at
+///   core_events.go:64-82.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `events.go:96-99` is in the
+/// wrong file and names a `ginkgo.By` block of a different case.
 #[tokio::test]
 async fn events_lifecycle_create_core_v1() {
     let (_, router) = spawn_router();
@@ -149,8 +211,11 @@ async fn events_lifecycle_create_core_v1() {
 
 /// GET a previously created core/v1 Event → 200; fields are preserved.
 ///
-/// Upstream: events.go:100-103 (`Expect(foundEvent.Name).To(Equal(…))`).
-/// Sonobuoy: PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/core_events.go:58 — the fetch step
+///   at core_events.go:114-119.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old range was in the wrong
+/// file and straddled the `events.go:100` case boundary.
 #[tokio::test]
 async fn events_lifecycle_get_core_v1() {
     let (_, router) = spawn_router();
@@ -183,8 +248,14 @@ async fn events_lifecycle_get_core_v1() {
 
 /// LIST events in namespace returns the seeded event in `items`.
 ///
-/// Upstream: events.go:104-107 (`Expect(eventList.Items).To(HaveLen(1))`).
-/// Sonobuoy: PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/core_events.go:58 — the
+///   "listing all events in all namespaces" step at core_events.go:83-102.
+///   Note upstream lists across ALL namespaces with a label selector and
+///   searches for the (name, namespace) pair; it does not assert a list
+///   length of 1, because other events exist in a live cluster.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; wrong file. The old citation
+/// also described a `HaveLen(1)` assertion that upstream does not make.
 #[tokio::test]
 async fn events_lifecycle_list_core_v1() {
     let (_, router) = spawn_router();
@@ -216,8 +287,14 @@ async fn events_lifecycle_list_core_v1() {
 
 /// PUT (update) a core/v1 Event — count increments and is reflected.
 ///
-/// Upstream: events.go:108-115 (patches count, asserts `updatedEvent.Count`).
-/// Sonobuoy: PASS
+/// Upstream: no conformance case. The core/v1 lifecycle case sets `count: 1`
+/// at creation (core_events.go:76) and never increments it — it patches
+/// `message` (core_events.go:103-113) and updates `series`
+/// (core_events.go:120-136). `Event.count` is a real field of the core/v1
+/// API, so this test stands on its own, but it mirrors no upstream step.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `events.go:108-115` is in the
+/// wrong file and describes a step that does not exist.
 #[tokio::test]
 async fn events_lifecycle_update_count_core_v1() {
     let (_, router) = spawn_router();
@@ -258,9 +335,13 @@ async fn events_lifecycle_update_count_core_v1() {
 
 /// DELETE a core/v1 Event → 200; subsequent GET returns 404.
 ///
-/// Upstream: events.go:116-122 (`Expect(err).NotTo(HaveOccurred())` after
-/// Delete, then `Expect(err).To(MatchError(…NotFound…))`).
-/// Sonobuoy: PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/core_events.go:58 — the delete
+///   step at core_events.go:147-151, followed by the all-namespaces list at
+///   :152-175 which requires the event to be gone. Upstream asserts absence
+///   from that list rather than a 404 on a direct GET.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; wrong file, and the old
+/// citation described a `NotFound` assertion upstream does not make here.
 #[tokio::test]
 async fn events_lifecycle_delete_core_v1() {
     let (_, router) = spawn_router();
@@ -304,15 +385,21 @@ async fn events_lifecycle_delete_core_v1() {
 // [sig-instrumentation] Events API should ensure that an event can be
 // fetched, patched, deleted, and listed
 //
-// Upstream: events.go:112 — exercises the `events.k8s.io/v1` API group:
-// creates an Event, fetches it, patches it (merge-patch, reason++),
-// deletes it.
+// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/events.go:100.
+// The case itself is mirrored end-to-end in `conformance_events_api_test.rs`
+// as `events_v1_should_fetch_patch_delete_list`.
+//
+// Mirror audit (#1749, 2026-08-27): the banner cited `events.go:112`, which
+// is a `ginkgo.By` line inside the case, not the case.
 // ===========================================================================
 
 /// POST to `events.k8s.io/v1` surface → 201 with correct apiVersion.
 ///
-/// Upstream: events.go:169-173.
-/// Sonobuoy: PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/events.go:100 — the create step
+///   at events.go:103-107.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:169-173` is the update step
+/// of the same case, not the create step.
 #[tokio::test]
 async fn events_api_create_events_k8s_io_v1() {
     let (_, router) = spawn_router();
@@ -340,8 +427,11 @@ async fn events_api_create_events_k8s_io_v1() {
 
 /// GET via `events.k8s.io/v1` returns the stored event.
 ///
-/// Upstream: events.go:174-177.
-/// Sonobuoy: PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/events.go:100 — the get step at
+///   events.go:134-137.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:174-177` is inside the update
+/// step.
 #[tokio::test]
 async fn events_api_get_events_k8s_io_v1() {
     let (_, router) = spawn_router();
@@ -372,8 +462,14 @@ async fn events_api_get_events_k8s_io_v1() {
 
 /// PATCH (merge-patch) via `events.k8s.io/v1` updates a field.
 ///
-/// Upstream: events.go:178-191 (patches `reason`, asserts updated value).
-/// Sonobuoy: PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/events.go:100 — the patch step
+///   at events.go:138-154. Upstream patches `series`, not `reason`, and
+///   verifies it with a whole-object `apiequality.Semantic.DeepEqual`
+///   (events.go:155-168) rather than by reading back the patched field.
+///   That DeepEqual is mirrored in `conformance_events_api_test.rs`.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:178-191` is the post-update
+/// get, and the old citation described a field upstream never patches.
 #[tokio::test]
 async fn events_api_patch_events_k8s_io_v1() {
     let (_, router) = spawn_router();
@@ -411,8 +507,12 @@ async fn events_api_patch_events_k8s_io_v1() {
 
 /// DELETE via `events.k8s.io/v1`; subsequent GET returns 404.
 ///
-/// Upstream: events.go:192-202.
-/// Sonobuoy: PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/events.go:100 — the delete step
+///   at events.go:188-191. Upstream then requires the event to be absent
+///   from both the all-namespaces and the namespaced list (:192-210); it
+///   does not assert a 404 on a direct GET.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited.
 #[tokio::test]
 async fn events_api_delete_events_k8s_io_v1() {
     let (_, router) = spawn_router();
@@ -454,8 +554,11 @@ async fn events_api_delete_events_k8s_io_v1() {
 
 /// LIST via `events.k8s.io/v1` returns all events in the namespace.
 ///
-/// Upstream: events.go:203-213.
-/// Sonobuoy: PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/events.go:100 — the list steps
+///   at events.go:108-119 (all namespaces, then the test namespace).
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:203-213` straddles the end of
+/// this case and the start of `events.go:211`.
 #[tokio::test]
 async fn events_api_list_events_k8s_io_v1() {
     let (_, router) = spawn_router();
@@ -487,21 +590,26 @@ async fn events_api_list_events_k8s_io_v1() {
 }
 
 // ===========================================================================
-// [sig-instrumentation] Events API should delete a collection of events
-// [Conformance]
+// Per-step assertions for the two "should delete a collection of events"
+// cases — core/v1 (core_events.go:176) and events.k8s.io/v1 (events.go:211).
 //
-// Upstream: events.go:217 — seeds several events, calls
-// DeleteCollection on the namespace, asserts the list is empty.
+// Both cases are mirrored end-to-end in `conformance_events_api_test.rs`.
 //
-// NOTE: this test was in `newly-passing.txt` for the current batch; the
-// suite already passes it end-to-end. This unit test pins the same
-// invariant at the handler level.
+// Mirror audit (#1749, 2026-08-27): the banner carried a `[Conformance]`
+// marker and cited `events.go:217`, a `ginkgo.By` line inside the case. It
+// also conflated the two cases into one, so the core/v1 variant below was
+// attributed to the events.k8s.io/v1 file.
 // ===========================================================================
 
 /// DELETE collection on core/v1 surface wipes all events in the namespace.
 ///
-/// Upstream: events.go:217-243 (core/v1 variant).
-/// Sonobuoy: PASS (newly-passing.txt 2026-05-28)
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/core_events.go:176
+///   ("should delete a collection of events") — create set :179-200,
+///   list by label :201-209, deletecollection :210-217, then
+///   `checkEventListQuantity(..., 0)` at :218-225.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; the core/v1 case lives in
+/// `core_events.go`, not `events.go`.
 #[tokio::test]
 async fn events_deletecollection_core_v1_clears_namespace() {
     let (_, router) = spawn_router();
@@ -570,8 +678,12 @@ async fn events_deletecollection_core_v1_clears_namespace() {
 /// DELETE collection on `events.k8s.io/v1` surface wipes all events in the
 /// namespace.
 ///
-/// Upstream: events.go:217-243 (`events.k8s.io/v1` variant).
-/// Sonobuoy: PASS (newly-passing.txt 2026-05-28)
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/events.go:211
+///   ("should delete a collection of events") — create set :214-219,
+///   list by label :220-226, delete list :227-233, check quantity :234-240.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:217-243` names a `ginkgo.By`
+/// line and runs past the end of the case.
 #[tokio::test]
 async fn events_deletecollection_events_k8s_io_v1_clears_namespace() {
     let (_, router) = spawn_router();
@@ -631,7 +743,15 @@ async fn events_deletecollection_events_k8s_io_v1_clears_namespace() {
 
 /// DELETE collection with a label selector only removes matching events.
 ///
-/// Upstream: events.go:244-270 (label-selector variant of deletecollection).
+/// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/events.go:211 and
+///   k8s.io/kubernetes/test/e2e/instrumentation/core_events.go:176 — both cases delete
+///   by label selector (events.go:227-233, core_events.go:210-217). Neither
+///   asserts that a NON-matching object survives; this test adds that, which
+///   is what makes the selector observable rather than incidental.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited. `events.go:244-270` is past the
+/// end of the file — `events.go` is 241 lines long — so the old citation
+/// could never have been checked against anything.
 /// Sonobuoy: PASS — the handler forwards `?labelSelector=…` through
 /// `apply_selectors` before deleting.
 #[tokio::test]
@@ -699,9 +819,14 @@ async fn events_deletecollection_label_selector_only_removes_matching() {
 
 /// GET on a non-existent Event returns 404.
 ///
-/// Upstream: implicit in every conformance flow that first deletes, then
-/// expects NotFound. events.go:116-122.
-/// Sonobuoy: PASS
+/// Upstream: no conformance case. Neither Events case asserts a 404 on a
+/// direct GET — both check absence from a list after deletion
+/// (core_events.go:152-175, events.go:192-210). The 404 contract itself is
+/// `staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go`
+/// (`Get` → `NewNotFound`), which is what this test pins.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named
+/// `events.go:116-122`, which is in the wrong file and is a list step.
 #[tokio::test]
 async fn events_get_nonexistent_returns_404() {
     let (_, router) = spawn_router();
@@ -719,10 +844,11 @@ async fn events_get_nonexistent_returns_404() {
 /// Events in different namespaces do not bleed across: list in ns-a must not
 /// include events created in ns-b.
 ///
-/// Upstream: standard Kubernetes namespace isolation invariant exercised by
-/// every e2e test that uses per-test namespaces (events.go sets up a fresh
-/// `f.Namespace` for each `It` block).
-/// Sonobuoy: PASS
+/// Upstream: no conformance case. Namespace isolation is a precondition
+/// every e2e case relies on via `framework.NewDefaultFramework`, but no
+/// Events case asserts it. Kept on that footing.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; not a conformance case.
 #[tokio::test]
 async fn events_namespace_isolation() {
     let (_, router) = spawn_router();
