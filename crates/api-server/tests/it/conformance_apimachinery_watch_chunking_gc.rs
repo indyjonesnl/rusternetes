@@ -54,10 +54,17 @@
 //! still exists, and re-entering surfaces as ADDED. The implementation gets all
 //! four transitions right; nothing asserted them before.
 //!
-//! Six upstream cases still have **no mirror at all**: watch.go:191 (restart
-//! watching from the last observed resourceVersion), watch.go:334 (concurrent
-//! watches receive events in the same order), and garbage_collector.go :488,
+//! Five upstream cases have **no mirror at all**: watch.go:334 (concurrent
+//! watches receive events in the same order) and garbage_collector.go :488,
 //! :547, :722, :826. Enumerated in #1770.
+//!
+//! Correction (#1749, 2026-08-27): an earlier version of this block also listed
+//! watch.go:191 (restart watching from the last observed resourceVersion) as
+//! unmirrored. It is mirrored — by
+//! `watchers_should_restart_from_last_resource_version_observed` in
+//! `conformance_apimachinery_vap_apf_server.rs`. The claim came from
+//! enumerating coverage **per file** rather than across the suite; a mirror for
+//! a case can live in a different file from the one that cites its source.
 //!
 //! Assertion re-derivation against the mapped cases is **not yet done**. Do not
 //! treat this file as audited.

@@ -19,6 +19,31 @@
 //! Tests mirroring GREEN Sonobuoy outcomes (newly-passing.txt) are plain
 //! `#[tokio::test]` and must pass. Tests mirroring still-FAILING outcomes
 //! (failing.txt) are `#[ignore = "GAP: …; upstream …"]`.
+//!
+//! ## Mirror audit — #1749, 2026-08-27 (citations complete; assertions pending)
+//!
+//! Citations: **complete**, and this file was in noticeably better shape than
+//! the four audited before it. Four of ten citations were already exactly
+//! right — the ValidatingAdmissionPolicy ones (:79, :223, :413, :682) and
+//! table_conversion.go:154. That is the first time in this audit that a
+//! majority of a file's line numbers survived checking.
+//!
+//! Five were repaired: server_version.go was three lines off; both
+//! flowcontrol.go citations named lines inside no case and had the two
+//! API-operations cases the wrong way round relative to their mirrors;
+//! chunking.go:214 named no case; and the resume-watch citation gave a file
+//! plus an informal label ("ResumeWatch") rather than a case.
+//!
+//! The eight upstream conformance cases behind this file are
+//! validatingadmissionpolicy.go :79, :223, :413, :682; flowcontrol.go :272,
+//! :518; server_version.go :41; table_conversion.go :154. Two more mirrors here
+//! cite cases owned by other areas — watch.go:191 and chunking.go:144 — which
+//! is worth knowing: a case's mirror does not always live in the file named
+//! after its source.
+//!
+//! Assertion re-derivation is **not yet done**. Do not treat this file as
+//! audited.
+//!
 
 use rusternetes_storage::memory::MemoryStorage;
 use rusternetes_test_support::harness::TestApiServer;
@@ -92,7 +117,9 @@ async fn patch_json(
 /// [sig-api-machinery] server version should find the server version
 /// [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/server_version.go:38
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/server_version.go:41
+///   ("should find the server version")
+/// Mirror audit (#1749, 2026-08-27): re-cited; :38 was three lines off.
 /// Sonobuoy (2026-05-29): PASS
 ///
 /// GET /version must return 200 and a JSON body with `gitVersion`,
@@ -503,7 +530,9 @@ async fn vap_should_validate_against_a_deployment() {
 /// [sig-api-machinery] API priority and fairness should support
 /// PriorityLevelConfiguration API operations [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/flowcontrol.go:56
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/flowcontrol.go:518
+///   ("should support PriorityLevelConfiguration API operations")
+/// Mirror audit (#1749, 2026-08-27): re-cited; :56 named no case.
 /// Sonobuoy (2026-05-29): FAIL — included as GAP stub
 ///
 /// Full CRUD on PriorityLevelConfiguration via
@@ -597,7 +626,9 @@ async fn apf_should_support_priority_level_configuration_api_operations() {
 /// [sig-api-machinery] API priority and fairness should support FlowSchema
 /// API operations [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/flowcontrol.go:134
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/flowcontrol.go:272
+///   ("should support FlowSchema API operations")
+/// Mirror audit (#1749, 2026-08-27): re-cited; :134 named no case.
 /// Sonobuoy (2026-05-29): FAIL — included as GAP stub
 ///
 /// Full CRUD on FlowSchema via
@@ -707,7 +738,10 @@ async fn apf_should_support_flow_schema_api_operations() {
 /// [sig-api-machinery] Watchers should be able to restart watching from the
 /// last resource version observed by the previous watch [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go (ResumeWatch)
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go:191
+///   ("should be able to restart watching from the last resource version
+///   observed by the previous watch")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named the file and an informal label.
 /// Sonobuoy (2026-05-29): PASS
 ///
 /// The K8s contract: if a client stores the `resourceVersion` from the
@@ -872,7 +906,12 @@ async fn table_transformation_should_return_406_for_backend_without_metadata() {
 /// continue listing from the last key if the original version has been
 /// compacted away, though the list is inconsistent [Slow] [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go:214
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go:144
+///   ("should support continue listing from the last key if the original
+///   version has been compacted away, though the list is inconsistent")
+/// Mirror audit (#1749, 2026-08-27): re-cited; :214 named no case. Note this case is also mirrored in
+/// `conformance_apimachinery_watch_chunking_gc.rs`; the two cover different
+/// halves and both cite it deliberately.
 /// Sonobuoy (2026-05-29): FAIL — included as GAP stub
 ///
 /// After compaction, a continue token whose resourceVersion is older than the
