@@ -9,6 +9,68 @@
 //! See docs/conformance/network-ingress-netpol-topology.md for the
 //! test-by-test status table.
 //!
+//! ---------------------------------------------------------------------------
+//! Mirror audit (#1749, 2026-08-27)
+//! ---------------------------------------------------------------------------
+//!
+//! Verified against `../kubernetes` at `release-1.35`. Coverage was checked
+//! suite-wide, not per-file.
+//!
+//! This file names five upstream sources. Only TWO of them contain a
+//! `framework.ConformanceIt`:
+//!
+//!   * `ingress.go:57`      "should support creating Ingress API operations"
+//!   * `ingressclass.go:270` "should support creating IngressClass API
+//!     operations"
+//!
+//! The other three contain NONE:
+//!
+//!   * `netpol/network_policy_api.go` — 2 plain `ginkgo.It`
+//!   * `netpol/network_policy.go` — 48 plain `ginkgo.It`, all asserting
+//!     dataplane reachability through a real CNI
+//!   * `topology_hints.go` — 1 plain `ginkgo.It`, which additionally skips
+//!     unless the cluster is multi-zone (`e2eskipper.SkipUnlessMultizone`)
+//!
+//! Citations: 14 of 16 were wrong, and the wrongness here is of a different
+//! order than in the other areas audited. Two pointed at BLANK LINES
+//! (`network_policy.go:260` and `:630`). One pointed at a variable
+//! declaration (`topology_hints.go:50`, `var c clientset.Interface`). Two
+//! pointed at doc-comment lines, two at bare assertion lines mid-body, one at
+//! a helper call. Both `ingressclass.go` citations pointed into a serial
+//! `f.It` rather than the conformance case.
+//!
+//! One citation asserted something demonstrably false: the IngressClass
+//! `parameters` test claimed "the spec-level `parameters` field is part of
+//! the ConformanceIt block at :198". `:198` is inside the serial `f.It`, and
+//! the real ConformanceIt at `:270` never touches `parameters`.
+//!
+//! Conformance framing withdrawn from 9 tests. The 6 NetworkPolicy and 3
+//! Topology-hints tests are kept — they pin real schema-preservation
+//! contracts from `staging/src/k8s.io/api/...` — but they mirror no
+//! conformance case and no longer imply they do. One previous note argued a
+//! netpol test counted because its doc comment carries a `Testname:` line;
+//! `Testname:` appears on non-conformance tests too, and it is
+//! `framework.ConformanceIt` that registers a case.
+//!
+//! Assertions re-derived: both real cases open with THREE discovery steps
+//! before touching any object, and both case descriptions state them as
+//! requirements (ingress.go:50-52, ingressclass.go:265-267) along with the
+//! full verb set including `watch`. No mirror asserted any of it. A server
+//! that served the objects but published neither the group, the version, the
+//! resource, nor the verbs — which is how a client finds them at all —
+//! passed every test in this file. Added
+//! `ingress_api_group_version_and_resource_appear_in_discovery` and
+//! `ingress_and_ingressclass_advertise_required_verbs`.
+//!
+//! Area coverage, stated honestly: `test/e2e/network` holds 43
+//! `framework.ConformanceIt` cases across 12 files. Only 4 of those files are
+//! cited anywhere in this suite. Most of the rest are legitimately live-only
+//! (dns, proxy, hostport, service_latency need real pods and a real
+//! dataplane), but seven are pure API-operations cases of exactly the shape
+//! this file already mirrors for Ingress and IngressClass — including both
+//! `service_cidrs.go` cases, whose resources this server already serves.
+//! Tracked separately; not in scope for a citation audit.
+//!
 //! This crate owns the REST surface for `networking.k8s.io/v1` Ingress,
 //! IngressClass and NetworkPolicy plus the `discovery.k8s.io/v1`
 //! EndpointSlice resource that carries `hints.forZones` used by
@@ -140,9 +202,13 @@ fn endpointslice_with_hints(name: &str, namespace: &str, zone: &str) -> Value {
 
 /// [sig-network] Ingress API should support creating Ingress API operations [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/ingress.go:54
-/// Sonobuoy (Round 160, 2026-04-26): PASS — Ingress is not in any of the
-/// nine failure buckets enumerated in docs/CONFORMANCE.md:40-53.
+/// Upstream: k8s.io/kubernetes/test/e2e/network/ingress.go:57
+///   ("should support creating Ingress API operations")
+///   The create/get/list verbs of that case; its assertions run from
+///   ingress.go:58 to the end of the block.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:54` is a line of the
+/// preceding doc comment, not the case.
 #[tokio::test]
 async fn ingress_api_supports_create_get_list_round_trip() {
     let state = spawn_state();
@@ -183,9 +249,11 @@ async fn ingress_api_supports_create_get_list_round_trip() {
 
 /// [sig-network] Ingress API should support update (PUT) and partial update (PATCH) [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/ingress.go:54 (verbs:
-///   update + patch in the same ConformanceIt block)
-/// Sonobuoy (Round 160): PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/network/ingress.go:57
+///   ("should support creating Ingress API operations") — the update and
+///   patch verbs of the same case.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:54` is a doc-comment line.
 #[tokio::test]
 async fn ingress_api_supports_put_and_patch() {
     let state = spawn_state();
@@ -245,9 +313,11 @@ async fn ingress_api_supports_put_and_patch() {
 
 /// [sig-network] Ingress API should support delete and deletecollection [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/ingress.go:54 (verbs:
-///   delete + deletecollection)
-/// Sonobuoy (Round 160): PASS
+/// Upstream: k8s.io/kubernetes/test/e2e/network/ingress.go:57
+///   ("should support creating Ingress API operations") — the delete and
+///   deletecollection verbs of the same case.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:54` is a doc-comment line.
 #[tokio::test]
 async fn ingress_api_supports_delete_and_deletecollection() {
     let state = spawn_state();
@@ -296,7 +366,7 @@ async fn ingress_api_supports_delete_and_deletecollection() {
 
 /// [sig-network] Ingress API should support the /status subresource [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/ingress.go:54 (status
+/// Upstream: k8s.io/kubernetes/test/e2e/network/ingress.go:57 (status
 ///   subresource verbs: get + update + patch)
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
@@ -422,7 +492,7 @@ async fn ingress_backend_resolution_preserves_named_and_numeric_ports() {
 
 /// [sig-network] IngressClass API should support creating IngressClass API operations [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/ingressclass.go:198
+/// Upstream: k8s.io/kubernetes/test/e2e/network/ingressclass.go:270
 /// Sonobuoy (Round 160): PASS — IngressClass not in failure buckets.
 ///
 /// IngressClass is cluster-scoped (no namespace segment in the URL).
@@ -478,11 +548,18 @@ async fn ingressclass_api_supports_create_get_list_delete() {
 
 /// [sig-network] IngressClass with parameters reference is preserved on read
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/ingressclass.go:167
-///   (`should allow IngressClass to have Namespace-scoped parameters`)
-/// Sonobuoy (Round 160): PASS — the spec-level `parameters` field is part
-///   of the ConformanceIt block at :198 even though the dedicated scenario
-///   at :167 is not itself flagged [Conformance].
+/// Upstream: no conformance case. `spec.parameters` is exercised only by
+/// `k8s.io/kubernetes/test/e2e/network/ingressclass.go:170`
+/// (`f.It("should allow IngressClass to have Namespace-scoped parameters",
+/// f.WithSerial())`), which is a serial `f.It`, not a
+/// `framework.ConformanceIt`. The field itself is defined by
+/// `staging/src/k8s.io/api/networking/v1/types.go`
+/// (`IngressClassParametersReference`).
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited. The previous note claimed
+/// "the spec-level `parameters` field is part of the ConformanceIt block at
+/// :198". Both halves are wrong: `:198` is inside the serial `f.It`, and the
+/// real ConformanceIt (ingressclass.go:270) never touches `parameters`.
 #[tokio::test]
 async fn ingressclass_with_namespace_scoped_parameters_round_trip() {
     let state = spawn_state();
@@ -526,12 +603,19 @@ async fn ingressclass_with_namespace_scoped_parameters_round_trip() {
 
 /// [sig-network] NetworkPolicy API should support creating NetworkPolicy API operations
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/netpol/network_policy_api.go:47
-/// Sonobuoy (Round 160): PASS — NetworkPolicy not in failure buckets.
+/// Upstream: k8s.io/kubernetes/test/e2e/network/netpol/network_policy_api.go:52
+///   (`ginkgo.It("should support creating NetworkPolicy API operations")`)
 ///
-/// Note: the upstream test is not [Conformance]-tagged but the file
-/// header documents `Testname: NetworkPolicies API` (Release: v1.20) and
-/// it is part of the canonical sig-network suite Sonobuoy runs.
+/// NOT a conformance case. The `netpol` package contains ZERO
+/// `framework.ConformanceIt` — every descriptor in it is a plain
+/// `ginkgo.It`. It runs in the sig-network suite, not the conformance
+/// suite.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited. `:47` is a line of the doc
+/// comment above the descriptor. The old note argued the test counts
+/// because its doc comment carries a `Testname:` line; `Testname:` appears
+/// on non-conformance tests too, and it is `framework.ConformanceIt` that
+/// registers a conformance case.
 #[tokio::test]
 async fn networkpolicy_api_supports_create_get_list_delete() {
     let state = spawn_state();
@@ -587,7 +671,12 @@ async fn networkpolicy_api_supports_create_get_list_delete() {
 
 /// [sig-network] NetworkPolicy API with endport field
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/netpol/network_policy_api.go:180
+/// Upstream: k8s.io/kubernetes/test/e2e/network/netpol/network_policy_api.go:242
+///   (`ginkgo.It("should support creating NetworkPolicy API with endport
+///   field")`) — NOT a conformance case; the `netpol` package has none.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:180` is a bare assertion
+/// line inside the preceding descriptor
 ///   (`should support creating NetworkPolicy API with endport field`)
 /// Sonobuoy (Round 160): PASS
 ///
@@ -628,7 +717,14 @@ async fn networkpolicy_endport_field_is_preserved() {
 
 /// [sig-network] NetworkPolicy should preserve PodSelector and NamespaceSelector on a peer
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/netpol/network_policy.go:260
+/// Upstream: no conformance case. `netpol/network_policy.go`
+///   holds 48 plain `ginkgo.It` descriptors and ZERO
+///   `framework.ConformanceIt`; they assert dataplane reachability through
+///   a real CNI, which no api-server-level mirror can reach. What this test
+///   actually pins is schema preservation of the NetworkPolicy spec, defined
+///   by `staging/src/k8s.io/api/networking/v1/types.go`.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:260` is a BLANK LINE.
 ///   (`should enforce policy based on PodSelector and NamespaceSelector`)
 /// Sonobuoy (Round 160): PASS — dataplane assertion not testable against
 ///   MemoryStorage; mirror verifies the spec-level contract instead.
@@ -669,7 +765,14 @@ async fn networkpolicy_combined_pod_and_namespace_selectors_preserved() {
 
 /// [sig-network] NetworkPolicy egress ipBlock with except clause is preserved
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/netpol/network_policy.go:874
+/// Upstream: no conformance case. `netpol/network_policy.go`
+///   holds 48 plain `ginkgo.It` descriptors and ZERO
+///   `framework.ConformanceIt`; they assert dataplane reachability through
+///   a real CNI, which no api-server-level mirror can reach. What this test
+///   actually pins is schema preservation of the NetworkPolicy spec, defined
+///   by `staging/src/k8s.io/api/networking/v1/types.go`.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:874` is a call to the `initializeResources` helper.
 ///   (`should enforce except clause while egress access to server in CIDR block`)
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
@@ -708,7 +811,14 @@ async fn networkpolicy_egress_ipblock_with_except_clause() {
 
 /// [sig-network] NetworkPolicy supports Ingress and Egress rules in the same policy
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/netpol/network_policy.go:630
+/// Upstream: no conformance case. `netpol/network_policy.go`
+///   holds 48 plain `ginkgo.It` descriptors and ZERO
+///   `framework.ConformanceIt`; they assert dataplane reachability through
+///   a real CNI, which no api-server-level mirror can reach. What this test
+///   actually pins is schema preservation of the NetworkPolicy spec, defined
+///   by `staging/src/k8s.io/api/networking/v1/types.go`.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:630` is a BLANK LINE.
 ///   (`should work with Ingress, Egress specified together`)
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
@@ -743,7 +853,14 @@ async fn networkpolicy_ingress_and_egress_together() {
 
 /// [sig-network] NetworkPolicy patch updates metadata without dropping spec siblings
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/netpol/network_policy.go:485
+/// Upstream: no conformance case. `netpol/network_policy.go`
+///   holds 48 plain `ginkgo.It` descriptors and ZERO
+///   `framework.ConformanceIt`; they assert dataplane reachability through
+///   a real CNI, which no api-server-level mirror can reach. What this test
+///   actually pins is schema preservation of the NetworkPolicy spec, defined
+///   by `staging/src/k8s.io/api/networking/v1/types.go`.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:485` is a bare assertion line mid-body.
 ///   (`should enforce updated policy`)
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
@@ -790,7 +907,15 @@ async fn networkpolicy_patch_metadata_preserves_spec_fields() {
 
 /// [sig-network] Topology Hints should persist forZones on EndpointSlice
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/topology_hints.go:50
+/// Upstream: no conformance case. k8s.io/kubernetes/test/e2e/network/topology_hints.go:55
+///   (`ginkgo.It("should distribute endpoints evenly")`) is a plain
+///   `ginkgo.It`, and it skips unless the cluster is multi-zone
+///   (`e2eskipper.SkipUnlessMultizone`, topology_hints.go:52). What this
+///   test pins is the `hints.forZones` field of EndpointSlice, defined by
+///   `staging/src/k8s.io/api/discovery/v1/types.go`.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:50` is the line
+///   `var c clientset.Interface`.
 ///   (`should distribute endpoints evenly`)
 /// Sonobuoy (Round 160): PASS — dataplane behaviour; the mirror tests the
 ///   API surface the upstream test relies on (EndpointSlice persists
@@ -826,7 +951,15 @@ async fn topology_hints_for_zones_persist_on_endpointslice() {
 
 /// [sig-network] Topology Hints — update flips the forZones target zone
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/topology_hints.go:50
+/// Upstream: no conformance case. k8s.io/kubernetes/test/e2e/network/topology_hints.go:55
+///   (`ginkgo.It("should distribute endpoints evenly")`) is a plain
+///   `ginkgo.It`, and it skips unless the cluster is multi-zone
+///   (`e2eskipper.SkipUnlessMultizone`, topology_hints.go:52). What this
+///   test pins is the `hints.forZones` field of EndpointSlice, defined by
+///   `staging/src/k8s.io/api/discovery/v1/types.go`.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:50` is the line
+///   `var c clientset.Interface`.
 ///   (the EndpointSliceController writes hints on every reconcile; the
 ///    upstream test verifies the controller re-distributes hints as nodes
 ///    move zones — we mirror the API contract that an UPDATE can change
@@ -868,7 +1001,15 @@ async fn topology_hints_update_replaces_for_zones_set() {
 
 /// [sig-network] Topology Hints — endpoint without hints is also valid
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/topology_hints.go:50
+/// Upstream: no conformance case. k8s.io/kubernetes/test/e2e/network/topology_hints.go:55
+///   (`ginkgo.It("should distribute endpoints evenly")`) is a plain
+///   `ginkgo.It`, and it skips unless the cluster is multi-zone
+///   (`e2eskipper.SkipUnlessMultizone`, topology_hints.go:52). What this
+///   test pins is the `hints.forZones` field of EndpointSlice, defined by
+///   `staging/src/k8s.io/api/discovery/v1/types.go`.
+///
+/// Mirror audit (#1749, 2026-08-27): re-cited; `:50` is the line
+///   `var c clientset.Interface`.
 ///   (when topology-aware routing is disabled or the service has only one
 ///    zone, the controller writes endpoints with no `hints` block;
 ///    consumers must accept that shape too)
@@ -910,4 +1051,154 @@ async fn topology_hints_optional_for_unhinted_endpoints() {
         "endpoint without hints must round-trip without a hints field; got {got}"
     );
     assert_eq!(got["endpoints"][0]["nodeName"], "node-b");
+}
+
+// ---------------------------------------------------------------------------
+// Discovery preconditions of the two Ingress/IngressClass API-operations cases
+// ---------------------------------------------------------------------------
+
+/// [sig-network] Ingress API — the networking.k8s.io group, its v1 version and
+/// the ingresses resource MUST appear in discovery [Conformance]
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/network/ingress.go:57
+///   ("should support creating Ingress API operations"). The case opens with
+///   three discovery steps before it touches any object, and its own
+///   description states them as requirements (ingress.go:50-52):
+///
+/// ```text
+/// The networking.k8s.io API group MUST exist in the /apis discovery document.
+/// The networking.k8s.io/v1 API group/version MUST exist in the
+///   /apis/networking.k8s.io discovery document.
+/// The ingresses resources MUST exist in the /apis/networking.k8s.io/v1
+///   discovery document.
+/// ```
+///
+/// Mirror audit (#1749, 2026-08-27): added. No mirror asserted any of the
+/// three. Upstream fails the whole case at the first missing document, so a
+/// server that served the objects but not the discovery entries — which is
+/// what a client uses to find them in the first place — passed every mirror.
+#[tokio::test]
+async fn ingress_api_group_version_and_resource_appear_in_discovery() {
+    let state = spawn_state();
+
+    // getting /apis
+    let (status, groups) = get_json(state.clone(), "/apis").await;
+    assert_eq!(status, 200);
+    let group = groups["groups"]
+        .as_array()
+        .expect("groups")
+        .iter()
+        .find(|g| g["name"].as_str() == Some("networking.k8s.io"))
+        .unwrap_or_else(|| panic!("expected networking API group, got {groups}"));
+    assert!(
+        group["versions"]
+            .as_array()
+            .expect("versions")
+            .iter()
+            .any(|v| v["version"].as_str() == Some("v1")),
+        "expected networking API group/version, got {group}"
+    );
+
+    // getting /apis/networking.k8s.io
+    let (status, group_doc) = get_json(state.clone(), "/apis/networking.k8s.io").await;
+    assert_eq!(status, 200);
+    assert!(
+        group_doc["versions"]
+            .as_array()
+            .expect("versions")
+            .iter()
+            .any(|v| v["version"].as_str() == Some("v1")),
+        "expected networking API version, got {group_doc}"
+    );
+
+    // getting /apis/networking.k8s.io/v1
+    let (status, resources) = get_json(state, "/apis/networking.k8s.io/v1").await;
+    assert_eq!(status, 200);
+    assert_eq!(resources["groupVersion"], "networking.k8s.io/v1");
+    let names: Vec<&str> = resources["resources"]
+        .as_array()
+        .expect("resources")
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    // Both API-operations cases share this document: ingress.go:57 requires
+    // `ingresses` (and `ingresses/status`), ingressclass.go:270 requires
+    // `ingressclasses`.
+    for required in ["ingresses", "ingresses/status", "ingressclasses"] {
+        assert!(
+            names.contains(&required),
+            "expected {required} in /apis/networking.k8s.io/v1, got {names:?}"
+        );
+    }
+}
+
+/// [sig-network] Ingress and IngressClass MUST advertise the full verb set
+/// their API-operations cases exercise [Conformance]
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/network/ingress.go:57 and
+///   k8s.io/kubernetes/test/e2e/network/ingressclass.go:270. Both case
+///   descriptions enumerate the required verbs (ingress.go:53-54,
+///   ingressclass.go:268):
+///
+/// ```text
+/// The ingresses resource must support create, get, list, watch, update,
+///   patch, delete, and deletecollection.
+/// The ingresses/status resource must support update and patch
+/// The ingressclass resource must support create, get, list, watch, update,
+///   patch, delete, and deletecollection.
+/// ```
+///
+/// Mirror audit (#1749, 2026-08-27): added. The mirrors exercised create,
+/// get, list, update, patch, delete and deletecollection but never `watch` —
+/// neither by calling it nor by checking it is advertised. `watch` is the
+/// verb every informer-based client depends on, and it is the one verb of
+/// the eight that no other test in this file touches.
+#[tokio::test]
+async fn ingress_and_ingressclass_advertise_required_verbs() {
+    let state = spawn_state();
+    let (status, resources) = get_json(state, "/apis/networking.k8s.io/v1").await;
+    assert_eq!(status, 200);
+
+    let verbs_of = |resource: &str| -> Vec<String> {
+        resources["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .find(|r| r["name"].as_str() == Some(resource))
+            .unwrap_or_else(|| panic!("{resource} missing from discovery"))["verbs"]
+            .as_array()
+            .expect("verbs")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    };
+
+    const COLLECTION_VERBS: &[&str] = &[
+        "create",
+        "get",
+        "list",
+        "watch",
+        "update",
+        "patch",
+        "delete",
+        "deletecollection",
+    ];
+    for resource in ["ingresses", "ingressclasses"] {
+        let verbs = verbs_of(resource);
+        for required in COLLECTION_VERBS {
+            assert!(
+                verbs.iter().any(|v| v == required),
+                "{resource} must advertise {required}, got {verbs:?}"
+            );
+        }
+    }
+
+    // ingress.go:54 — the status subresource supports update and patch only.
+    let status_verbs = verbs_of("ingresses/status");
+    for required in ["update", "patch"] {
+        assert!(
+            status_verbs.iter().any(|v| v == required),
+            "ingresses/status must advertise {required}, got {status_verbs:?}"
+        );
+    }
 }
