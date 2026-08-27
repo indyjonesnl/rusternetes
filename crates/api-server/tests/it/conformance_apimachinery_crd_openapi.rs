@@ -17,6 +17,38 @@
 //! `/openapi/v3/apis/<group>/<version>`. This is the canonical surface the
 //! upstream conformance suite exercises; mocking the handler functions
 //! directly would mask the very routing/publish bugs Sonobuoy catches.
+//!
+//! ## Mirror audit — #1749, 2026-08-27 (citations complete; assertions pending)
+//!
+//! Citations: **complete**. All 13 upstream references re-derived against the
+//! pinned `release-1.35` (v1.35.5) checkout. Every `crd_publish_openapi.go`
+//! line number was stale, drifting monotonically from -6 at the first citation
+//! to -86 at the last — the same signature as the admission-webhook file in
+//! #1756, and the third file in this audit to show it. The mapping itself was
+//! 1:1 and in the right order.
+//!
+//! `crd_publish_does_not_collide_with_builtin_plural_name` has no distinct
+//! upstream case: its old citation fell inside the version-rename case, which
+//! another mirror already covers. Re-cited as a non-conformance check.
+//!
+//! Assertion re-derivation is **in progress**:
+//!
+//! | upstream case | state |
+//! |---|---|
+//! | crd_publish_openapi.go:74 works for CRD with validation schema | schema *enforcement* added — accept, enum rejection, prune-vs-strict, required field |
+//!
+//! The remaining eight `crd_publish_openapi.go` cases and the two
+//! conversion-webhook cases are not yet re-derived. Do not treat this file as
+//! audited.
+//!
+//! Note on the :74 case: most of its upstream body asserts that the *server*
+//! enforces the published schema, via `kubectl create`/`apply`. The mirror
+//! asserted only that the document was published, so a server that published a
+//! schema and enforced none of it would have passed. Enforcement now runs. One
+//! distinction the audit had to get right: a plain create **prunes** an unknown
+//! field (structural-schema semantics), while `?fieldValidation=Strict` — which
+//! kubectl sends by default since v1.25 — **rejects** it. Both are asserted.
+//!
 
 use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
@@ -295,7 +327,9 @@ fn multi_version_crd(crd_name: &str, group: &str, plural: &str, kind: &str) -> V
 
 /// [sig-api-machinery] CustomResourcePublishOpenAPI works for CRD with validation schema [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:68
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:74
+///   ("works for CRD with validation schema")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old line named no case.
 /// Sonobuoy (R160, 2026-04-26): FAIL → PASS after publish-on-request fix.
 ///
 /// Two-part conformance check: (a) the CRD is published under
@@ -344,11 +378,114 @@ async fn crd_with_validation_schema_publishes_to_openapi_v2() {
         .and_then(|v| v.as_array())
         .expect("enum constraint must survive the publish pipeline (line 101)");
     assert_eq!(enum_values.len(), 2);
+    // Publishing the schema is only half of upstream's case. The other half is
+    // that the server **enforces** it: `works for CRD with validation schema`
+    // spends most of its body asserting that `kubectl create`/`apply` is
+    // rejected for a value outside the enum, for unknown properties, and for a
+    // missing required property, and accepted for a valid CR
+    // (crd_publish_openapi.go:83-122). kubectl delegates that validation to the
+    // server, so all four are observable here. The mirror asserted only that
+    // the document was published — a server that published a schema and
+    // enforced none of it would have passed.
+    let cr = |name: &str, bar: Value| {
+        json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Foo",
+            "metadata": { "name": name },
+            "spec": { "bars": [bar] }
+        })
+    };
+    let create = |state: &TestApiServer, body: Value| {
+        let state = state.clone();
+        async move {
+            let (s, b) = router_request(
+                &state,
+                "POST",
+                "/apis/example.com/v1/namespaces/default/e2e-test-foos",
+                Some(&body),
+            )
+            .await;
+            (s, b)
+        }
+    };
+
+    // Valid CR: known and required properties present, enum value legal.
+    let (s, b) = create(
+        &state,
+        cr("cr-valid", json!({ "name": "bar-1", "feeling": "Great" })),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&s),
+        "a CR with known and required properties must be accepted: {s} {b}"
+    );
+
+    // Value outside the defined enum values.
+    let (s, b) = create(
+        &state,
+        cr("cr-bad-enum", json!({ "name": "bar-2", "feeling": "Bad" })),
+    )
+    .await;
+    assert_eq!(
+        s, 422,
+        "a CR whose enum field is outside the declared values must be rejected: {b}"
+    );
+
+    // Unknown property. Two distinct behaviours, and it matters which is which:
+    // a plain create **prunes** the unknown field (structural-schema semantics,
+    // no `x-kubernetes-preserve-unknown-fields`), while kubectl's server-side
+    // field validation — `?fieldValidation=Strict`, which kubectl sends by
+    // default since v1.25 — **rejects** it. Upstream's case exercises the
+    // latter through `kubectl create`.
+    let (s, b) = create(
+        &state,
+        cr(
+            "cr-unknown-field",
+            json!({ "name": "bar-3", "unknownField": "nope" }),
+        ),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&s),
+        "a plain create must prune the unknown field, not reject it: {s} {b}"
+    );
+    assert!(
+        b["spec"]["bars"][0].get("unknownField").is_none(),
+        "the unknown field must be pruned from the stored object: {b}"
+    );
+
+    let (s, b) = router_request(
+        &state,
+        "POST",
+        "/apis/example.com/v1/namespaces/default/e2e-test-foos?fieldValidation=Strict",
+        Some(&cr(
+            "cr-unknown-strict",
+            json!({ "name": "bar-4", "unknownField": "nope" }),
+        )),
+    )
+    .await;
+    assert_eq!(
+        s, 422,
+        "under fieldValidation=Strict an unknown property must be rejected: {b}"
+    );
+
+    // Missing the required property.
+    let (s, b) = create(
+        &state,
+        cr("cr-missing-required", json!({ "feeling": "Great" })),
+    )
+    .await;
+    assert_eq!(
+        s, 422,
+        "a CR missing a required property must be rejected: {b}"
+    );
 }
 
 /// [sig-api-machinery] CustomResourcePublishOpenAPI works for CRD without validation schema [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:126
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:158
+///   ("works for CRD without validation schema")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old line named no case.
 /// Sonobuoy (R160, 2026-04-26): PASS
 ///
 /// A CRD with no schema must still be published with a placeholder definition
@@ -383,7 +520,9 @@ async fn crd_without_validation_schema_publishes_to_openapi_v2() {
 
 /// [sig-api-machinery] CustomResourcePublishOpenAPI preserving unknown fields at schema root [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:157
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:199
+///   ("works for CRD preserving unknown fields at the schema root")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old line named no case.
 /// Sonobuoy (R160, 2026-04-26): PASS
 ///
 /// Upstream's `builder.go:393-395` collapses a root-level
@@ -436,7 +575,9 @@ async fn crd_preserves_unknown_fields_at_root_in_openapi_v2() {
 
 /// [sig-api-machinery] CustomResourcePublishOpenAPI preserving unknown fields in embedded object [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:190
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:241
+///   ("works for CRD preserving unknown fields in an embedded object")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old line named no case.
 /// Sonobuoy (R160, 2026-04-26): PASS
 #[tokio::test]
 async fn crd_preserves_unknown_fields_in_embedded_object_in_openapi_v2() {
@@ -466,7 +607,9 @@ async fn crd_preserves_unknown_fields_in_embedded_object_in_openapi_v2() {
 
 /// [sig-api-machinery] CustomResourcePublishOpenAPI works for multiple CRDs of different groups [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:224
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:281
+///   ("works for multiple CRDs of different groups")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old line named no case.
 /// Sonobuoy (R160, 2026-04-26): PASS
 #[tokio::test]
 async fn multiple_crds_of_different_groups_publish_independently() {
@@ -491,7 +634,9 @@ async fn multiple_crds_of_different_groups_publish_independently() {
 
 /// [sig-api-machinery] CustomResourcePublishOpenAPI multiple CRDs of same group but different versions [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:251
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:314
+///   ("works for multiple CRDs of same group but different versions")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old line named no case.
 /// Sonobuoy (R160, 2026-04-26): PASS
 #[tokio::test]
 async fn multiple_crds_same_group_different_versions_publish_separately() {
@@ -514,7 +659,9 @@ async fn multiple_crds_same_group_different_versions_publish_separately() {
 
 /// [sig-api-machinery] CustomResourcePublishOpenAPI multiple CRDs same group/version different kinds [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:290
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:362
+///   ("works for multiple CRDs of same group and version but different kinds")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old line named no case.
 /// Sonobuoy (R160, 2026-04-26): PASS
 #[tokio::test]
 async fn multiple_crds_same_group_version_different_kinds_publish_separately() {
@@ -533,7 +680,9 @@ async fn multiple_crds_same_group_version_different_kinds_publish_separately() {
 
 /// [sig-api-machinery] CustomResourcePublishOpenAPI updates the published spec when one version gets renamed [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:318
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:396
+///   ("updates the published spec when one version gets renamed")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old line named no case.
 /// Sonobuoy (R160, 2026-04-26): FAIL → PASS after publish-on-request fix.
 ///
 /// The CRD is created with versions v2+v3, then updated to rename v3→v4.
@@ -567,7 +716,9 @@ async fn crd_rename_version_updates_published_openapi_v2() {
 
 /// [sig-api-machinery] CustomResourcePublishOpenAPI removes definition from spec when version is unserved [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:361
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:447
+///   ("removes definition from spec when one version gets changed to not be served")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old line named no case.
 /// Sonobuoy (R160, 2026-04-26): FAIL → PASS after publish-on-request fix.
 /// Setting `served=false` on a CRD version now drops it from `/openapi/v2`
 /// on the next request because the handler reads live storage state.
@@ -598,7 +749,13 @@ async fn crd_unserved_version_is_removed_from_published_openapi_v2() {
 
 /// [sig-api-machinery] CustomResourcePublishOpenAPI kubectl explain works for CR with same name as built-in [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:406
+/// Upstream: no distinct conformance case — :406 falls inside
+///   k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:396
+///   ("updates the published spec when one version gets renamed"), which is
+///   already mirrored by `crd_rename_version_updates_published_openapi_v2`.
+///   This test covers a plural-name collision with a built-in resource,
+///   which no upstream conformance case asserts.
+/// Mirror audit (#1749, 2026-08-27): re-cited; not a conformance case.
 /// Sonobuoy (R160, 2026-04-26): PASS
 ///
 /// kubectl explain reads `/openapi/v2` and disambiguates by group/version.
@@ -759,7 +916,9 @@ async fn router_request(
 
 /// [sig-api-machinery] CustomResourceConversionWebhook should be able to convert from CR v1 to CR v2 [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_conversion_webhook.go:142
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_conversion_webhook.go:140
+///   ("should be able to convert from CR v1 to CR v2")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old line named no case.
 ///
 /// Drives the full webhook conversion path end-to-end through the Axum router:
 /// register a multi-version CRD whose `spec.conversion.strategy=Webhook` points
@@ -881,7 +1040,9 @@ async fn crd_conversion_webhook_converts_v1_to_v2() {
 
 /// [sig-api-machinery] CustomResourceConversionWebhook should be able to convert non-homogeneous list of CRs [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_conversion_webhook.go:179
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_conversion_webhook.go:175
+///   ("should be able to convert a non homogeneous list of CRs")
+/// Mirror audit (#1749, 2026-08-27): re-cited; the old line named no case.
 ///
 /// Creates two CRs at different stored versions (v1 + v2), LISTs at v2, and
 /// asserts the webhook converted the v1-stored item into the v2 shape while
@@ -1056,8 +1217,12 @@ async fn crd_definition_appears_under_openapi_v3_group_version() {
 /// [sig-api-machinery] CRD `description` survives the publish round-trip
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:74
-/// Supporting check — upstream `expectMatchingItems` compares descriptions
-/// when verifying the schema is correctly published.
+///   ("works for CRD with validation schema") — the description-metadata
+///   aspect of the same case that
+///   `crd_with_validation_schema_publishes_to_openapi_v2` mirrors;
+///   upstream's `expectMatchingItems` compares descriptions when it
+///   verifies the published schema.
+/// Mirror audit (#1749, 2026-08-27): line confirmed; descriptor added.
 #[tokio::test]
 async fn crd_publish_preserves_description_metadata() {
     let state = spawn_state();
