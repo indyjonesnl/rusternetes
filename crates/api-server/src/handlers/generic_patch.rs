@@ -365,24 +365,57 @@ where
     }
 
     // Update in storage with retry on conflict.
-    // PATCH operations are idempotent — on rv conflict, re-read the resource,
-    // re-apply the patch, and retry. This handles the common case where the
-    // kubelet updates pod status between the client's read and patch.
-    let updated = match state.storage.update(&key, &patched_resource).await {
-        Ok(updated) => updated,
-        Err(rusternetes_common::Error::Conflict(_)) => {
-            // Re-read, re-apply patch, retry once
-            let fresh: T = state.storage.get(&key).await?;
-            let fresh_json = serde_json::to_value(&fresh)
-                .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
-            let re_patched = apply_patch(&fresh_json, &patch_json, patch_type_for_retry)
-                .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
-            let re_patched_resource: T = serde_json::from_value(re_patched).map_err(|e| {
-                rusternetes_common::Error::InvalidResource(format!("Invalid result: {}", e))
-            })?;
-            state.storage.update(&key, &re_patched_resource).await?
-        }
-        Err(e) => return Err(e),
+    //
+    // PATCH carries no precondition of its own, so a conflict here comes from
+    // the server's own read-modify-write racing another writer (typically the
+    // kubelet updating pod status between our read and write). Re-read and
+    // RE-APPLY the patch — re-writing the bytes computed from the stale read
+    // would discard the other writer's change.
+    //
+    // This used to retry exactly once, which is thinner than upstream's bound of
+    // 5 (MaxRetryWhenPatchConflicts, registry/rest/patch.go) and inconsistent
+    // with the other read-modify-write paths in this crate. Both scopes now
+    // share one policy (#1776).
+    let updated = {
+        let state = &state;
+        let key = key.clone();
+        let patch_json = patch_json.clone();
+        let first = std::cell::RefCell::new(Some(patched_resource));
+        crate::handlers::conflict_retry::with_conflict_retry(
+            &format!("patching {} {}/{}", resource_type, namespace, name),
+            move |attempt| {
+                let key = key.clone();
+                let patch_json = patch_json.clone();
+                let patch_type = patch_type_for_retry.clone();
+                let first_attempt = if attempt == 0 {
+                    first.borrow_mut().take()
+                } else {
+                    None
+                };
+                async move {
+                    let candidate: T = match first_attempt {
+                        Some(resource) => resource,
+                        None => {
+                            let fresh: T = state.storage.get(&key).await?;
+                            let fresh_json = serde_json::to_value(&fresh)
+                                .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+                            let re_patched = apply_patch(&fresh_json, &patch_json, patch_type)
+                                .map_err(|e| {
+                                    rusternetes_common::Error::InvalidResource(e.to_string())
+                                })?;
+                            serde_json::from_value(re_patched).map_err(|e| {
+                                rusternetes_common::Error::InvalidResource(format!(
+                                    "Invalid result: {}",
+                                    e
+                                ))
+                            })?
+                        }
+                    };
+                    state.storage.update(&key, &candidate).await
+                }
+            },
+        )
+        .await?
     };
 
     // Upstream ShouldDeleteDuringUpdate: if the patch drained the last finalizer
@@ -590,7 +623,7 @@ where
         .map_err(|e| rusternetes_common::Error::InvalidResource(format!("Invalid patch: {}", e)))?;
 
     // Apply patch (clone patch_type for potential retry on rv conflict)
-    let _patch_type_for_retry = patch_type.clone();
+    let patch_type_for_retry = patch_type.clone();
     let mut patched_json = apply_patch(&current_json, &patch_json, patch_type)
         .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
 
@@ -640,8 +673,62 @@ where
         return Ok(Json(patched_resource));
     }
 
-    // Update in storage
-    let updated = state.storage.update(&key, &patched_resource).await?;
+    // Update in storage, absorbing conflicts the client never asked for.
+    //
+    // The read-modify-write above inherits the stored object's resourceVersion,
+    // so a concurrent writer turns the server's own CAS into a 409 on a PATCH
+    // that carried no precondition. This path had NO retry at all (the
+    // `_patch_type_for_retry` binding was computed and dropped), which is the
+    // measured PersistentVolume defect:
+    //   Failed to patch PV "pv-1238-f53f7": resourceVersion mismatch:
+    //     resource was modified (expected: 469, current: 471)
+    // Retry by re-reading and RE-APPLYING the patch — re-writing the bytes from
+    // the stale read would silently discard the other writer's change.
+    // Upstream bound: MaxRetryWhenPatchConflicts = 5 (registry/rest/patch.go).
+    let updated = {
+        let state = &state;
+        let key = key.clone();
+        let patch_json = patch_json.clone();
+        let first = std::cell::RefCell::new(Some(patched_resource));
+        crate::handlers::conflict_retry::with_conflict_retry(
+            &format!("patching {} {}", resource_type, name),
+            move |attempt| {
+                let key = key.clone();
+                let patch_json = patch_json.clone();
+                let patch_type = patch_type_for_retry.clone();
+                let first_attempt = if attempt == 0 {
+                    first.borrow_mut().take()
+                } else {
+                    None
+                };
+                async move {
+                    let candidate: T = match first_attempt {
+                        // First try: reuse the object already patched above, so
+                        // the common no-contention case costs no extra read.
+                        Some(resource) => resource,
+                        // Retry: re-read and re-apply onto the fresh object.
+                        None => {
+                            let fresh: T = state.storage.get(&key).await?;
+                            let fresh_json = serde_json::to_value(&fresh)
+                                .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+                            let re_patched = apply_patch(&fresh_json, &patch_json, patch_type)
+                                .map_err(|e| {
+                                    rusternetes_common::Error::InvalidResource(e.to_string())
+                                })?;
+                            serde_json::from_value(re_patched).map_err(|e| {
+                                rusternetes_common::Error::InvalidResource(format!(
+                                    "Invalid result: {}",
+                                    e
+                                ))
+                            })?
+                        }
+                    };
+                    state.storage.update(&key, &candidate).await
+                }
+            },
+        )
+        .await?
+    };
 
     // If the patch drained the last finalizer of an object already pending
     // deletion, remove it now (upstream ShouldDeleteDuringUpdate). The GC drives
