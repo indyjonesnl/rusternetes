@@ -1554,7 +1554,19 @@ fn watch_added_matches<T: Serialize + HasMetadata>(
 /// kinds: into-match → ADDED, out-of-match → DELETED (once), match→match →
 /// MODIFIED. Returns `None` when the event must be suppressed (object still
 /// doesn't match and was already excluded).
-fn watch_modified_event_type<T: Serialize + HasMetadata>(
+/// Decide the event type a MODIFIED storage event should surface as, under the
+/// watch's combined label+field selector.
+///
+/// `None` means suppress: the object did not match before and still does not.
+/// An object transitioning INTO the selector surfaces as `Added`; one
+/// transitioning OUT surfaces as `Deleted`, which is the contract upstream's
+/// "should observe an object deletion if it stops meeting the requirements of
+/// the selector" case asserts
+/// (k8s.io/kubernetes/test/e2e/apimachinery/watch.go:257).
+///
+/// Exposed for the conformance mirror; the sibling helpers in this module are
+/// public for the same reason.
+pub fn watch_modified_event_type<T: Serialize + HasMetadata>(
     object: &T,
     label_selector: &Option<String>,
     field_selector: &Option<String>,

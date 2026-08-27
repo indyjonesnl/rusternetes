@@ -47,10 +47,17 @@
 //! `[Conformance]` markers dropped from 12 to 8; each survivor maps to a real
 //! case.
 //!
-//! Three upstream cases have **no mirror at all**: watch.go:191 (restart
+//! watch.go:257 ("should observe an object deletion if it stops meeting the
+//! requirements of the selector") had no mirror; one was added
+//! (`watch_selector_exit_surfaces_as_deleted`). The contract is that an object
+//! updated *out* of the watch's selector surfaces as DELETED even though it
+//! still exists, and re-entering surfaces as ADDED. The implementation gets all
+//! four transitions right; nothing asserted them before.
+//!
+//! Six upstream cases still have **no mirror at all**: watch.go:191 (restart
 //! watching from the last observed resourceVersion), watch.go:334 (concurrent
-//! watches receive events in the same order), and several
-//! garbage_collector.go cases (:488, :547, :722, :826).
+//! watches receive events in the same order), and garbage_collector.go :488,
+//! :547, :722, :826. Enumerated in #1770.
 //!
 //! Assertion re-derivation against the mapped cases is **not yet done**. Do not
 //! treat this file as audited.
@@ -284,10 +291,16 @@ async fn watch_delete_event_includes_body_from_key_fallback() {
 /// [sig-api-machinery] Watch DELETE event preserves the full prev value when
 /// valid JSON is available.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go:257
-///   ("should observe an object deletion if it stops meeting the
-///   requirements of the selector")
-/// Mirror audit (#1749, 2026-08-27): re-cited; the old citation named the file only.
+/// Upstream: no conformance case — the DELETE event's payload shape (that it
+///   carries the prior object) is defined by
+///   staging/src/k8s.io/apimachinery/pkg/watch/watch.go, not asserted by an
+///   upstream conformance body.
+/// Mirror audit (#1749, 2026-08-27): re-cited a second time. The first pass
+/// today cited watch.go:257 ("should observe an object deletion if it stops
+/// meeting the requirements of the selector"), which is a different
+/// mechanism: that case is about an object leaving a *selector*, not about
+/// what a real delete carries. :257 is mirrored by
+/// `watch_selector_exit_surfaces_as_deleted` below.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn watch_delete_event_preserves_prev_object_when_present() {
@@ -1149,4 +1162,67 @@ async fn gc_delete_then_list_reflects_removal() {
     let mut names: Vec<&str> = listed.iter().map(|c| c.metadata.name.as_str()).collect();
     names.sort();
     assert_eq!(names, vec!["c-0", "c-2"]);
+}
+
+/// [sig-api-machinery] Watch should observe an object deletion if it stops
+/// meeting the requirements of the selector [Conformance]
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/watch.go:257
+///   ("should observe an object deletion if it stops meeting the requirements
+///   of the selector")
+/// Mirror audit (#1749, 2026-08-27): new mirror; this case had none.
+///
+/// The contract is subtle and worth stating: when a watched object is updated
+/// so that it no longer matches the watch's label selector, the watcher must
+/// see a **DELETED** event even though the object still exists. Upstream walks
+/// ADDED -> MODIFIED -> DELETED (label changed away) and then, on restoring the
+/// label, ADDED again (watch.go:285-305).
+///
+/// Driven through `watch_modified_event_type`, the function the streaming
+/// handler uses to decide the transition (handlers/watch.rs). The oneshot HTTP
+/// harness cannot hold a streaming watch open across the intervening updates —
+/// the same constraint recorded on the ServiceAccount lifecycle mirror.
+#[tokio::test]
+async fn watch_selector_exit_surfaces_as_deleted() {
+    use rusternetes_api_server::handlers::watch::watch_modified_event_type;
+
+    let selector = Some("watch-this=yes".to_string());
+    let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Matching object, updated while still matching -> MODIFIED.
+    let matching = cm("e2e-cm", "default", &[("watch-this", "yes")]);
+    assert!(
+        matches!(
+            watch_modified_event_type(&matching, &selector, &None, &mut excluded),
+            Some(WatchEventType::Modified)
+        ),
+        "an object that matches before and after must surface as MODIFIED"
+    );
+
+    // Label changed away: the object still exists, but the watcher must be told
+    // it left the selector — as a DELETED event.
+    let no_longer_matching = cm("e2e-cm", "default", &[("watch-this", "no")]);
+    assert!(
+        matches!(
+            watch_modified_event_type(&no_longer_matching, &selector, &None, &mut excluded),
+            Some(WatchEventType::Deleted)
+        ),
+        "an object leaving the selector must surface as DELETED even though it \
+         still exists"
+    );
+
+    // Still not matching: suppressed entirely, not repeated as DELETED.
+    assert!(
+        watch_modified_event_type(&no_longer_matching, &selector, &None, &mut excluded).is_none(),
+        "a further update to an already-excluded object must emit nothing"
+    );
+
+    // Label restored: the object re-enters the selector and surfaces as ADDED.
+    assert!(
+        matches!(
+            watch_modified_event_type(&matching, &selector, &None, &mut excluded),
+            Some(WatchEventType::Added)
+        ),
+        "an object re-entering the selector must surface as ADDED"
+    );
 }
