@@ -71,6 +71,55 @@ where
     handle_delete_with_finalizers_and_propagation(storage, key, resource, None).await
 }
 
+/// `DeleteCollection` variant: delete one item of a collection, tolerating an
+/// item that has already gone away.
+///
+/// A collection delete lists first and then deletes each item, so anything else
+/// deleting concurrently — a controller finishing a reclaim, the garbage
+/// collector, another client — makes an item vanish between the two steps. That
+/// is a race, not a failure of the request, and upstream says so explicitly
+/// (`staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go`,
+/// `DeleteCollection`):
+///
+/// ```go
+/// if _, _, err := e.Delete(ctx, accessor.GetName(), deleteValidation, options.DeepCopy());
+///     err != nil && !apierrors.IsNotFound(err) {
+///     klog.V(4).InfoS("Delete object in DeleteCollection failed", "object", klog.KObj(accessor), "err", err)
+///     errs <- err
+///     return
+/// }
+/// ```
+///
+/// Propagating the `NotFound` instead is what made
+/// `[sig-storage] PersistentVolumes CSI Conformance should run through the
+/// lifecycle of a PV and a PVC` fail intermittently: the spec deletes its PVC by
+/// collection, waits for it to go, then deletes the PV by collection — and our
+/// own PV reclaim had already removed the volume, so the second DeleteCollection
+/// answered
+/// `Failed to delete PV "pvc-c697e": persistentvolumes "pv-7783-d0990" not found`.
+///
+/// Returns `Ok(Some(true))` when the item was deleted outright, `Ok(Some(false))`
+/// when it is now pending finalizers, and `Ok(None)` when it had already been
+/// deleted by someone else.
+pub async fn delete_collection_item<S, T>(
+    storage: &S,
+    key: &str,
+    resource: &T,
+) -> Result<Option<bool>>
+where
+    S: Storage,
+    T: HasMetadata + Serialize + DeserializeOwned + Clone + Send + Sync,
+{
+    match handle_delete_with_finalizers_and_propagation(storage, key, resource, None).await {
+        Ok(pending_finalizers) => Ok(Some(!pending_finalizers)),
+        Err(rusternetes_common::Error::NotFound(_)) => {
+            debug!("{key} already deleted concurrently; skipping it in the collection delete");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Handle deletion with propagation policy support.
 /// When propagation_policy is "Foreground", adds the "foregroundDeletion" finalizer
 /// so the garbage collector knows to delete dependents before the owner.
@@ -944,5 +993,80 @@ mod tests {
 
         let result = storage.get::<Pod>(key).await;
         assert!(result.is_err(), "Resource should be deleted from storage");
+    }
+    /// #1776: a collection delete must tolerate an item that vanished between
+    /// the list and the per-item delete.
+    ///
+    /// The PV/PVC lifecycle spec deletes its PVC by collection, waits for it to
+    /// go, then deletes the PV by collection — by which time our own reclaim has
+    /// often already removed the volume, and propagating that NotFound failed
+    /// the whole request:
+    ///   Failed to delete PV "pvc-c697e": persistentvolumes "pv-7783-d0990" not found
+    /// Upstream store.go::DeleteCollection ignores NotFound per item.
+    #[tokio::test]
+    async fn delete_collection_item_tolerates_an_already_deleted_item() {
+        let storage = MemoryStorage::new();
+        let pod = make_test_pod("vanished");
+        let key = "pods/default/vanished";
+
+        // Never stored: this is the state after a concurrent deleter won.
+        let outcome = delete_collection_item(&storage, key, &pod)
+            .await
+            .expect("a concurrently deleted item must not fail the collection delete");
+
+        assert!(
+            outcome.is_none(),
+            "an already-deleted item reports None so the caller can skip it"
+        );
+    }
+
+    /// The normal path still reports the deletion, so DeleteCollection's count
+    /// stays accurate.
+    #[tokio::test]
+    async fn delete_collection_item_reports_a_real_deletion() {
+        let storage = MemoryStorage::new();
+        let pod = make_test_pod("present");
+        let key = "pods/default/present";
+        storage.create(key, &pod).await.unwrap();
+
+        let outcome = delete_collection_item(&storage, key, &pod)
+            .await
+            .expect("deleting a present item succeeds");
+
+        assert_eq!(
+            outcome,
+            Some(true),
+            "an item with no finalizers is deleted outright"
+        );
+        assert!(
+            storage.get::<Pod>(key).await.is_err(),
+            "and it is really gone"
+        );
+    }
+
+    /// An item that still has finalizers is reported as pending, not deleted —
+    /// the same distinction the single-item path makes.
+    #[tokio::test]
+    async fn delete_collection_item_reports_a_pending_finalizer() {
+        let storage = MemoryStorage::new();
+        let mut pod = make_test_pod("held");
+        pod.metadata.finalizers = Some(vec!["example.com/hold".to_string()]);
+        let key = "pods/default/held";
+        storage.create(key, &pod).await.unwrap();
+
+        let outcome = delete_collection_item(&storage, key, &pod)
+            .await
+            .expect("marking for deletion succeeds");
+
+        assert_eq!(
+            outcome,
+            Some(false),
+            "an item with finalizers is pending, not deleted"
+        );
+        let stored: Pod = storage.get(key).await.expect("still present");
+        assert!(
+            stored.metadata.deletion_timestamp.is_some(),
+            "and it carries a deletionTimestamp"
+        );
     }
 }
