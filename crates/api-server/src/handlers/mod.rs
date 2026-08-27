@@ -7,6 +7,7 @@ pub mod cel_validation;
 pub mod certificates;
 pub mod componentstatus;
 pub mod configmap;
+pub mod conflict_retry;
 pub mod controllerrevision;
 pub mod crd;
 pub mod cronjob;

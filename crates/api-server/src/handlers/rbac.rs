@@ -1475,12 +1475,15 @@ pub async fn deletecollection_roles(
         .await?;
 
         // Handle deletion with finalizers
-        let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-            &state.storage,
-            &key,
-            &role,
-        )
-        .await?;
+        let deleted_immediately =
+            match crate::handlers::finalizers::delete_collection_item(&state.storage, &key, &role)
+                .await?
+            {
+                Some(deleted) => deleted,
+                // Already gone — a concurrent deleter won the race; upstream
+                // DeleteCollection ignores NotFound rather than failing the request.
+                None => continue,
+            };
 
         if deleted_immediately {
             deleted_count += 1;
@@ -1553,12 +1556,18 @@ pub async fn deletecollection_rolebindings(
         .await?;
 
         // Handle deletion with finalizers
-        let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
+        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
             &state.storage,
             &key,
             &rolebinding,
         )
-        .await?;
+        .await?
+        {
+            Some(deleted) => deleted,
+            // Already gone — a concurrent deleter won the race; upstream
+            // DeleteCollection ignores NotFound rather than failing the request.
+            None => continue,
+        };
 
         if deleted_immediately {
             deleted_count += 1;
@@ -1626,12 +1635,18 @@ pub async fn deletecollection_clusterroles(
         .await?;
 
         // Handle deletion with finalizers
-        let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
+        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
             &state.storage,
             &key,
             &clusterrole,
         )
-        .await?;
+        .await?
+        {
+            Some(deleted) => deleted,
+            // Already gone — a concurrent deleter won the race; upstream
+            // DeleteCollection ignores NotFound rather than failing the request.
+            None => continue,
+        };
 
         if deleted_immediately {
             deleted_count += 1;
@@ -1706,12 +1721,18 @@ pub async fn deletecollection_clusterrolebindings(
         .await?;
 
         // Handle deletion with finalizers
-        let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
+        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
             &state.storage,
             &key,
             &clusterrolebinding,
         )
-        .await?;
+        .await?
+        {
+            Some(deleted) => deleted,
+            // Already gone — a concurrent deleter won the race; upstream
+            // DeleteCollection ignores NotFound rather than failing the request.
+            None => continue,
+        };
 
         if deleted_immediately {
             deleted_count += 1;

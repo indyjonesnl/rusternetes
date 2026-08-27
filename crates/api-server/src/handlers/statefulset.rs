@@ -542,12 +542,15 @@ pub async fn deletecollection_statefulsets(
         .await?;
 
         // Handle deletion with finalizers
-        let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-            &state.storage,
-            &key,
-            &item,
-        )
-        .await?;
+        let deleted_immediately =
+            match crate::handlers::finalizers::delete_collection_item(&state.storage, &key, &item)
+                .await?
+            {
+                Some(deleted) => deleted,
+                // Already gone — a concurrent deleter won the race; upstream
+                // DeleteCollection ignores NotFound rather than failing the request.
+                None => continue,
+            };
 
         if deleted_immediately {
             deleted_count += 1;
