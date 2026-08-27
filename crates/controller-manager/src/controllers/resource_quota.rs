@@ -29,6 +29,61 @@ const QUOTA_COMPUTE_KEYS: &[&str] = &[
     "limits.ephemeral-storage",
 ];
 
+/// Poll one *auxiliary* watch stream, retiring it when it ends or errors.
+///
+/// `WatchStream` is built on `futures::stream::unfold`, which **panics** when
+/// polled after it has returned `Poll::Ready(None)`:
+///
+/// ```text
+/// thread 'tokio-rt-worker' panicked at futures-util/src/stream/unfold.rs:108:21:
+/// Unfold must not be polled after it returned `Poll::Ready(None)`
+/// ```
+///
+/// The usage-driving watches (pods, services, configmaps, secrets, PVCs) live in
+/// the same `select!` as the ResourceQuota watch. Matching only `Some(Ok(ev))`
+/// and ignoring `None` left the arm enabled, so the next loop iteration polled an
+/// exhausted stream and panicked — killing the whole controller task, because
+/// `tokio::spawn` swallows panics. Quota `status.used` then stopped being
+/// published until the controller-manager was restarted (#1775; the panic was
+/// observed live twice, each time in the burst of "Watch stream ended,
+/// reconnecting" that follows an api-server disconnect).
+///
+/// Taking the stream out of the `Option` on termination is what makes the arm's
+/// `if aux.is_some()` guard disable it — the same "resync/reconnect rather than
+/// re-poll a dead stream" property upstream gets from a reflector's
+/// ListAndWatch loop (`k8s.io/client-go/tools/cache/reflector.go`).
+///
+/// Returns `Some(event)` while the stream is alive, `None` once it has been
+/// retired (the caller should reconnect).
+async fn next_aux_event(
+    aux: &mut Option<rusternetes_storage::WatchStream>,
+    what: &str,
+) -> Option<rusternetes_storage::WatchEvent> {
+    use futures::StreamExt;
+
+    let stream = aux.as_mut()?;
+    match stream.next().await {
+        Some(Ok(ev)) => Some(ev),
+        Some(Err(e)) => {
+            tracing::warn!(
+                "{} watch error: {} — retiring the stream, will reconnect",
+                what,
+                e
+            );
+            *aux = None;
+            None
+        }
+        None => {
+            tracing::warn!(
+                "{} watch stream ended — retiring the stream, will reconnect",
+                what
+            );
+            *aux = None;
+            None
+        }
+    }
+}
+
 /// ResourceQuotaController tracks resource usage per namespace and enforces quota limits.
 /// It:
 /// 1. Watches ResourceQuotas across all namespaces
@@ -120,29 +175,44 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
                             }
                         }
                     }
-                    event = async { pod_watch.as_mut().unwrap().next().await }, if pod_watch.is_some() => {
-                        if let Some(Ok(ev)) = event {
-                            self.enqueue_quotas_for_event(&queue, &ev).await;
+                    event = next_aux_event(&mut pod_watch, "Pod"), if pod_watch.is_some() => {
+                        match event {
+                            Some(ev) => self.enqueue_quotas_for_event(&queue, &ev).await,
+                            // Stream retired inside next_aux_event; reconnect all
+                            // watches rather than run on with a dead one.
+                            None => watch_broken = true,
                         }
                     }
-                    event = async { svc_watch.as_mut().unwrap().next().await }, if svc_watch.is_some() => {
-                        if let Some(Ok(ev)) = event {
-                            self.enqueue_quotas_for_event(&queue, &ev).await;
+                    event = next_aux_event(&mut svc_watch, "Service"), if svc_watch.is_some() => {
+                        match event {
+                            Some(ev) => self.enqueue_quotas_for_event(&queue, &ev).await,
+                            // Stream retired inside next_aux_event; reconnect all
+                            // watches rather than run on with a dead one.
+                            None => watch_broken = true,
                         }
                     }
-                    event = async { cm_watch.as_mut().unwrap().next().await }, if cm_watch.is_some() => {
-                        if let Some(Ok(ev)) = event {
-                            self.enqueue_quotas_for_event(&queue, &ev).await;
+                    event = next_aux_event(&mut cm_watch, "ConfigMap"), if cm_watch.is_some() => {
+                        match event {
+                            Some(ev) => self.enqueue_quotas_for_event(&queue, &ev).await,
+                            // Stream retired inside next_aux_event; reconnect all
+                            // watches rather than run on with a dead one.
+                            None => watch_broken = true,
                         }
                     }
-                    event = async { secret_watch.as_mut().unwrap().next().await }, if secret_watch.is_some() => {
-                        if let Some(Ok(ev)) = event {
-                            self.enqueue_quotas_for_event(&queue, &ev).await;
+                    event = next_aux_event(&mut secret_watch, "Secret"), if secret_watch.is_some() => {
+                        match event {
+                            Some(ev) => self.enqueue_quotas_for_event(&queue, &ev).await,
+                            // Stream retired inside next_aux_event; reconnect all
+                            // watches rather than run on with a dead one.
+                            None => watch_broken = true,
                         }
                     }
-                    event = async { pvc_watch.as_mut().unwrap().next().await }, if pvc_watch.is_some() => {
-                        if let Some(Ok(ev)) = event {
-                            self.enqueue_quotas_for_event(&queue, &ev).await;
+                    event = next_aux_event(&mut pvc_watch, "PersistentVolumeClaim"), if pvc_watch.is_some() => {
+                        match event {
+                            Some(ev) => self.enqueue_quotas_for_event(&queue, &ev).await,
+                            // Stream retired inside next_aux_event; reconnect all
+                            // watches rather than run on with a dead one.
+                            None => watch_broken = true,
                         }
                     }
                     _ = resync.tick() => {
@@ -1289,5 +1359,93 @@ mod tests {
         let used = stored.status.unwrap().used.unwrap();
         assert_eq!(used.keys().collect::<Vec<_>>(), vec!["requests.cpu"]);
         assert_eq!(used.get("requests.cpu").map(String::as_str), Some("0"));
+    }
+    /// #1775: an auxiliary watch stream that has ended must be retired, never
+    /// polled again.
+    ///
+    /// `WatchStream` is a `futures::stream::unfold`, which panics with
+    /// "Unfold must not be polled after it returned `Poll::Ready(None)`" on a
+    /// second poll. Before the fix the select arm matched only `Some(Ok(ev))`,
+    /// so a terminated stream stayed enabled and the next iteration panicked —
+    /// killing the controller task (tokio::spawn swallows panics) and freezing
+    /// every quota's `status.used` until the controller-manager restarted.
+    ///
+    /// Polling the raw stream twice here is what the old code did; going
+    /// through `next_aux_event` twice must be safe.
+    #[tokio::test]
+    async fn an_exhausted_auxiliary_watch_is_retired_not_repolled() {
+        use futures::stream::StreamExt;
+
+        // A stream that ends immediately, built the same way storage builds its
+        // watches (unfold), so it carries the same "no polling after None" rule.
+        let make_stream = || -> rusternetes_storage::WatchStream {
+            futures::stream::unfold(false, |done| async move {
+                if done {
+                    None
+                } else {
+                    // End on the first poll: no events, just termination.
+                    None::<(
+                        rusternetes_common::Result<rusternetes_storage::WatchEvent>,
+                        bool,
+                    )>
+                }
+            })
+            .boxed()
+        };
+
+        let mut aux: Option<rusternetes_storage::WatchStream> = Some(make_stream());
+
+        // First call observes the end of the stream and retires it.
+        let first = next_aux_event(&mut aux, "Pod").await;
+        assert!(first.is_none(), "a terminated stream yields no event");
+        assert!(
+            aux.is_none(),
+            "the stream must be retired so the select arm's `is_some()` guard disables it"
+        );
+
+        // Second call must short-circuit on the None rather than poll the dead
+        // stream — this is the call that used to panic.
+        let second = next_aux_event(&mut aux, "Pod").await;
+        assert!(
+            second.is_none(),
+            "a retired stream must keep yielding None without being polled again"
+        );
+    }
+
+    /// #1775: an auxiliary watch that errors is retired too — the same
+    /// re-poll panic applies once an unfold stream has reported failure and
+    /// terminated.
+    #[tokio::test]
+    async fn an_erroring_auxiliary_watch_is_retired() {
+        use futures::stream::StreamExt;
+
+        let stream: rusternetes_storage::WatchStream = futures::stream::once(async {
+            Err(rusternetes_common::Error::Storage("watch died".to_string()))
+        })
+        .boxed();
+        let mut aux: Option<rusternetes_storage::WatchStream> = Some(stream);
+
+        assert!(next_aux_event(&mut aux, "Pod").await.is_none());
+        assert!(
+            aux.is_none(),
+            "an errored stream must be retired, not left enabled for another poll"
+        );
+    }
+
+    /// A live auxiliary watch still delivers its events — the fix must not
+    /// silence the fast path that keeps `status.used` fresh between resyncs.
+    #[tokio::test]
+    async fn a_live_auxiliary_watch_still_delivers_events() {
+        use futures::stream::StreamExt;
+
+        let stream: rusternetes_storage::WatchStream = futures::stream::iter(vec![Ok(
+            rusternetes_storage::WatchEvent::Added("pods/default/p1".to_string(), "{}".to_string()),
+        )])
+        .boxed();
+        let mut aux: Option<rusternetes_storage::WatchStream> = Some(stream);
+
+        let ev = next_aux_event(&mut aux, "Pod").await;
+        assert!(ev.is_some(), "a live stream's event must be delivered");
+        assert!(aux.is_some(), "a live stream must stay enabled");
     }
 }
