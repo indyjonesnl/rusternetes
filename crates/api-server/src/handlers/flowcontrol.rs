@@ -152,7 +152,10 @@ pub async fn update_priority_level_configuration(
     // then matches no live owner and the garbage collector deletes them
     // (#1605, #1793). Upstream applies this to every resource at once in
     // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    if let Ok(stored) = state.storage.get::<PriorityLevelConfiguration>(&key).await {
+    // The stored object is already in hand from the read above; re-reading it
+    // here would cost a second round-trip on every PUT and widen the window
+    // between read and write for no benefit.
+    if let Some(stored) = existing.as_ref() {
         crate::handlers::lifecycle::inherit_server_owned_metadata(
             &mut plc.metadata,
             &stored.metadata,
