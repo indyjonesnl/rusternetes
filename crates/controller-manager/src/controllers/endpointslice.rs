@@ -880,13 +880,25 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                         Err(e) => return Err(e.into()),
                     }
                 }
-                Err(_) => {
+                // Only an ABSENT slice may be created. Treating every read
+                // error as "absent" turned a transient (or decode) failure into
+                // an endless create/AlreadyExists loop that never updated the
+                // slice, so endpoints went stale for as long as the error
+                // lasted.
+                Err(rusternetes_common::Error::NotFound(_)) => {
                     slice.metadata.resource_version = None;
                     self.storage.create(&slice_key, &slice).await?;
                     info!(
                         "Created endpointslice {}/{} for service",
                         namespace, slice_name
                     );
+                }
+                Err(e) => {
+                    error!(
+                        "Cannot read endpointslice {}/{}: {} — not creating a duplicate",
+                        namespace, slice_name, e
+                    );
+                    return Err(e.into());
                 }
             }
         }

@@ -20,7 +20,22 @@ pub struct EndpointSlice {
     pub address_type: String,
 
     /// endpoints is a list of unique endpoints in this slice.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// `deserialize_null_default` (not just `default`): an api-server that
+    /// stores an empty slice serialises it back as `"endpoints": null`, and
+    /// `default` only covers an ABSENT field, not an explicit null. Decoding
+    /// then failed, which the EndpointSlice controller could not tell apart
+    /// from "slice does not exist" — it retried `create` forever against a
+    /// slice that was right there:
+    ///   Failed to reconcile services/<ns>/test: Resource already exists:
+    ///   endpointslices.discovery.k8s.io "test" already exists
+    /// Go decodes a JSON null into a nil slice without complaint, so upstream
+    /// never sees this. `ports` below already carries the same attribute.
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub endpoints: Vec<Endpoint>,
 
     /// ports specifies the list of network ports exposed by each endpoint in this slice.
@@ -315,4 +330,60 @@ pub struct ForZone {
 #[serde(rename_all = "camelCase")]
 pub struct ForNode {
     pub name: String,
+}
+
+#[cfg(test)]
+mod null_field_tests {
+    use super::*;
+
+    /// An api-server that holds an EndpointSlice with no endpoints serialises
+    /// the field as an explicit `null`, not `[]`:
+    ///
+    /// ```json
+    /// {"kind":"EndpointSlice","apiVersion":"discovery.k8s.io/v1","endpoints":null}
+    /// ```
+    ///
+    /// `#[serde(default)]` alone does NOT cover that — it only fills in an
+    /// absent key — so decoding failed. The EndpointSlice controller reads the
+    /// existing slice to decide update-vs-create, and a decode failure is
+    /// indistinguishable from "not found": it retried `create` every reconcile
+    /// and logged `endpointslices.discovery.k8s.io "test" already exists`
+    /// forever while the slice never got updated.
+    #[test]
+    fn endpoints_null_decodes_as_empty() {
+        let slice: EndpointSlice = serde_json::from_str(
+            r#"{
+                "kind": "EndpointSlice",
+                "apiVersion": "discovery.k8s.io/v1",
+                "metadata": { "name": "test", "namespace": "sts-check" },
+                "addressType": "IPv4",
+                "endpoints": null,
+                "ports": [{ "name": "web", "port": 80, "protocol": "TCP" }]
+            }"#,
+        )
+        .expect("an explicit null endpoints list must decode, as it does in Go");
+
+        assert!(slice.endpoints.is_empty());
+        assert_eq!(slice.ports.len(), 1);
+    }
+
+    /// The same for a null ports list, and for both at once — the shape a
+    /// freshly created, endpoint-less slice comes back as.
+    #[test]
+    fn both_lists_null_decode_as_empty() {
+        let slice: EndpointSlice = serde_json::from_str(
+            r#"{
+                "kind": "EndpointSlice",
+                "apiVersion": "discovery.k8s.io/v1",
+                "metadata": { "name": "test", "namespace": "sts-check" },
+                "addressType": "IPv4",
+                "endpoints": null,
+                "ports": null
+            }"#,
+        )
+        .expect("null lists must decode");
+
+        assert!(slice.endpoints.is_empty());
+        assert!(slice.ports.is_empty());
+    }
 }
