@@ -354,7 +354,7 @@ fi
 # Describe this cluster's shape to the runner's preflight gate: kind names its
 # control-plane mirror pods after the node and serves DNS from CoreDNS, so the
 # gate's compose-stack defaults would refuse a perfectly healthy leg.
-mapfile -t VS_PREFLIGHT_ARGS < <(vs_preflight_args "$CLUSTER")
+mapfile -t VS_PREFLIGHT_ARGS < <(vs_preflight_args "$CLUSTER" "$MODULE")
 
 vs_log "running scoped subset (target=$VS_TARGET focus=$VS_FOCUS) via conformance-target-run.sh"
 RESULT_OUT="$VS_WORKDIR/target-run.out"

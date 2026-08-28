@@ -210,7 +210,7 @@ vs_create_baseline() {
 # vs_control_plane_node <cluster>
 vs_control_plane_node() { printf '%s-control-plane\n' "$1"; }
 
-# vs_preflight_args <cluster>
+# vs_preflight_args <cluster> [module]
 # --preflight-arg pairs for conformance-target-run.sh that describe THIS
 # cluster to conformance-preflight.sh (#1777). The gate's defaults describe the
 # compose stack — kube-scheduler-node-1 / kube-controller-manager-node-1 and the
@@ -230,13 +230,24 @@ vs_control_plane_node() { printf '%s-control-plane\n' "$1"; }
 # stops the run, a cluster with no DNS backend still does, and so do node
 # eviction pressure and a broken registry path.
 vs_preflight_args() {
-  local cluster="$1" node
+  local cluster="$1" module="${2:-${VS_MODULE:-}}" node pods dns
   node="$(vs_control_plane_node "$cluster")"
+  pods="kube-scheduler-${node},kube-controller-manager-${node}"
+  dns="coredns"
+  # Swapping the api-server swaps the OBJECT STORE with it: the rusternetes
+  # api-server starts on an empty database, so kind's control-plane mirror pods
+  # and the CoreDNS Deployment are not visible through it. That is the leg's
+  # subject, not a broken environment — asserting them refuses the run before a
+  # single spec executes (run 33159492201) and hides the leg's real pass rate.
+  if [ "$module" = "api-server" ]; then
+    pods="none"
+    dns="none"
+  fi
   printf '%s\n' \
     --preflight-arg --control-plane-pods \
-    --preflight-arg "kube-scheduler-${node},kube-controller-manager-${node}" \
+    --preflight-arg "$pods" \
     --preflight-arg --dns-deployment \
-    --preflight-arg coredns \
+    --preflight-arg "$dns" \
     --preflight-arg --kubelet \
     --preflight-arg none \
     --preflight-arg --storage-container \
