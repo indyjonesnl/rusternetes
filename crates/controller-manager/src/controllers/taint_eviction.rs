@@ -227,11 +227,21 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
                             let conditions = status.conditions.get_or_insert_with(Vec::new);
                             conditions.push(condition);
                         }
-                        // Set deletionTimestamp for graceful delete
-                        evict_pod.metadata.deletion_timestamp = Some(Utc::now());
-                        let _ = self.storage.update(&key, &evict_pod).await;
+                        // Publish the condition on the STATUS subresource, then
+                        // DELETE the pod — the two steps upstream's taint
+                        // manager takes in `addConditionAndDeletePod`
+                        // (pkg/controller/tainteviction/taint_eviction.go:129):
+                        // PatchPodStatus for the DisruptionTarget condition,
+                        // then `Pods(ns).Delete(...)`.
+                        //
+                        // The eviction must NOT stamp deletionTimestamp itself:
+                        // the field is immutable on update, so an api-server
+                        // that enforces that rejects the write and the pod is
+                        // never evicted at all.
+                        let _ = self.storage.update_status(&key, &evict_pod).await;
+                        let _ = self.storage.delete_gracefully(&key).await;
                         info!(
-                            "Evicted pod {}/{} from node {} (set deletionTimestamp)",
+                            "Evicted pod {}/{} from node {} (deleted)",
                             namespace, pod_name, node_name
                         );
                     }

@@ -251,6 +251,14 @@ fn force_delete_query() -> Vec<(String, String)> {
     vec![("gracePeriodSeconds".to_string(), "0".to_string())]
 }
 
+/// Query params for a GRACEFUL delete: none. The api-server then applies its
+/// own defaults — for a pod, `spec.terminationGracePeriodSeconds` — exactly as
+/// upstream's controllers do when they call `Pods(ns).Delete(ctx, name,
+/// metav1.DeleteOptions{})` (pkg/controller/statefulset/stateful_pod_control.go:97).
+fn graceful_delete_query() -> Vec<(String, String)> {
+    Vec::new()
+}
+
 /// Fold an `APIResourceList` (`{resources: [{name, namespaced}, ...]}`) into the
 /// dynamic map under `root`, skipping subresources (names containing `/`).
 fn ingest_resource_list(map: &mut HashMap<String, (String, bool)>, root: &str, list: &Value) {
@@ -616,6 +624,31 @@ impl Storage for ApiStorage {
         }
     }
 
+    /// Graceful delete: a plain DELETE with no `gracePeriodSeconds` override,
+    /// so the api-server terminates the object on its own terms. Controllers
+    /// that used to stamp `deletionTimestamp` themselves must come through
+    /// here — that field is immutable on update and an upstream api-server
+    /// rejects the write outright ("field is immutable"), which left
+    /// StatefulSet scale-downs hanging forever against a vanilla control plane.
+    async fn delete_gracefully(&self, key: &str) -> Result<()> {
+        let path = self.object_path(key).await?;
+        let status = self
+            .client
+            .delete_with_options(&path, &graceful_delete_query(), None)
+            .await
+            .map_err(|e| Error::Storage(format!("{e:#}")))?;
+        if status.is_success() {
+            Ok(())
+        } else if status.as_u16() == 404 {
+            // Already gone — the caller wanted it deleted, so this is success.
+            Ok(())
+        } else {
+            Err(Error::Storage(format!(
+                "graceful delete {key} failed: HTTP {status}"
+            )))
+        }
+    }
+
     async fn list<T>(&self, prefix: &str) -> Result<Vec<T>>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
@@ -802,6 +835,18 @@ mod tests {
     /// a pod (stamps deletionTimestamp), so the kubelet's finalize never
     /// removes an already-terminated pod and loops forever (#1150 pod-deletion
     /// regression — conformance "wait for pod to disappear" 300s timeouts).
+    /// The graceful path must send NO delete options: the api-server then
+    /// applies the pod's own terminationGracePeriodSeconds, which is what
+    /// upstream's controllers rely on. Sending gracePeriodSeconds=0 here would
+    /// force-kill every scaled-down StatefulSet pod.
+    #[test]
+    fn graceful_delete_sends_no_options() {
+        assert!(
+            graceful_delete_query().is_empty(),
+            "graceful delete must not override the server's deletion defaults"
+        );
+    }
+
     #[test]
     fn delete_forces_zero_grace_period() {
         let q = force_delete_query();

@@ -878,7 +878,11 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     }
 
     /// Delete all pods owned by a DaemonSet that is being deleted.
-    /// Sets deletionTimestamp on each owned pod so the kubelet tears down containers.
+    ///
+    /// Issues a DELETE per pod, as upstream's DaemonSet controller does
+    /// (pkg/controller/daemon/daemon_controller.go -> podControl.DeletePod).
+    /// Writing `deletionTimestamp` directly is rejected by any api-server that
+    /// enforces its immutability, leaving the pods running forever.
     async fn delete_owned_pods(&self, daemonset: &DaemonSet) -> Result<()> {
         let ns = daemonset.metadata.namespace.as_deref().unwrap_or("default");
         let ds_name = &daemonset.metadata.name;
@@ -889,18 +893,16 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             // Check if pod is owned by this DaemonSet
             if let Some(refs) = &pod.metadata.owner_references {
                 for owner_ref in refs {
-                    if owner_ref.kind == "DaemonSet" && owner_ref.name == *ds_name {
-                        // Set deletionTimestamp if not already set
-                        if pod.metadata.deletion_timestamp.is_none() {
-                            let mut updated_pod = pod.clone();
-                            updated_pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
-                            let pod_key = build_key("pods", Some(ns), &pod.metadata.name);
-                            let _ = self.storage.update(&pod_key, &updated_pod).await;
-                            info!(
-                                "Marked pod {} for deletion (DaemonSet {} being deleted)",
-                                pod.metadata.name, ds_name
-                            );
-                        }
+                    if owner_ref.kind == "DaemonSet"
+                        && owner_ref.name == *ds_name
+                        && pod.metadata.deletion_timestamp.is_none()
+                    {
+                        let pod_key = build_key("pods", Some(ns), &pod.metadata.name);
+                        let _ = self.storage.delete_gracefully(&pod_key).await;
+                        info!(
+                            "Deleted pod {} (DaemonSet {} being deleted)",
+                            pod.metadata.name, ds_name
+                        );
                     }
                 }
             }
