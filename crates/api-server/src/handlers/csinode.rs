@@ -175,12 +175,10 @@ pub async fn update_csinode(
     // then matches no live owner and the garbage collector deletes them
     // (#1605, #1793). Upstream applies this to every resource at once in
     // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    if let Ok(stored) = state.storage.get::<CSINode>(&key).await {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut node.metadata,
-            &stored.metadata,
-        );
-    }
+    // The stored object is already in hand from the read above; re-reading it
+    // here would cost a second round-trip on every PUT and widen the window
+    // between read and write for no benefit.
+    crate::handlers::lifecycle::inherit_server_owned_metadata(&mut node.metadata, &old.metadata);
     let updated = state.storage.update(&key, &node).await?;
 
     Ok(Json(updated))
