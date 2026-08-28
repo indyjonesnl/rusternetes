@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::advanced::{
     check_host_port_conflicts, check_node_affinity, check_pod_affinity, check_pod_anti_affinity,
-    check_preemption, check_taints_tolerations, check_topology_spread_constraints,
+    check_preemption_with_pdbs, check_taints_tolerations, check_topology_spread_constraints,
     parse_resource_quantity, NodeScore,
 };
 use crate::data_plane::{ApiBackend, DataPlane};
@@ -392,6 +392,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             return Ok(());
         }
         let priority_classes = self.load_priority_classes().await?;
+        // Preemption needs these; a failure to list them must not stop
+        // scheduling, so fall back to "no budgets" and log rather than bail.
+        let pdbs = self.load_pod_disruption_budgets().await;
         let mut all_pods: Vec<Pod> = self.data.list_pods().await?;
         // Stamp resolved priority onto every in-memory pod from its
         // priorityClassName. Controller-created pods (ReplicaSet, etc.) never
@@ -428,7 +431,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 error!("Failed to bind pod {}/{} to node: {}", ns, name, e);
             }
         } else if let Some((node_name, victims)) = self
-            .try_preempt(&pod, &nodes, &all_pods, &priority_classes)
+            .try_preempt(&pod, &nodes, &all_pods, &priority_classes, &pdbs)
             .await
         {
             // No node fits — preempt lower-priority pods. The production
@@ -539,6 +542,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         // Load all PriorityClasses for pod priority resolution
         let priority_classes = self.load_priority_classes().await?;
+        // Preemption needs these; a failure to list them must not stop
+        // scheduling, so fall back to "no budgets" and log rather than bail.
+        let pdbs = self.load_pod_disruption_budgets().await;
 
         // Sort pending pods by priority (descending) — K8s scheduling queue
         // processes higher-priority pods first. Without this, lower-priority
@@ -613,7 +619,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             {
                 // No suitable node found, try preemption if pod has priority
                 if let Some(preemption_result) = self
-                    .try_preempt(&pod, &nodes, &all_pods, &priority_classes)
+                    .try_preempt(&pod, &nodes, &all_pods, &priority_classes, &pdbs)
                     .await
                 {
                     let (node_name, pods_to_evict) = preemption_result;
@@ -1092,6 +1098,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         nodes: &[Node],
         all_pods: &[Pod],
         priority_classes: &HashMap<String, PriorityClass>,
+        pdbs: &[rusternetes_common::resources::PodDisruptionBudget],
     ) -> Option<(String, Vec<String>)> {
         // If the pod's preemptionPolicy is "Never", skip preemption entirely.
         // Fall back to the PriorityClass's policy when the pod spec doesn't
@@ -1176,16 +1183,24 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 continue;
             }
 
-            let (can_preempt, pods_to_evict) = check_preemption(node, pod, all_pods);
+            // PDB-aware selection: check_preemption_with_pdbs sorts
+            // budget-protected pods last and reprieves them where the
+            // preemptor still fits without them, which is upstream's
+            // filterPodsWithPDBViolation
+            // (pkg/scheduler/framework/preemption/preemption.go). Passing an
+            // empty slice here — as this path did until #1797 — silently
+            // disabled all of it.
+            let (can_preempt, pods_to_evict) =
+                check_preemption_with_pdbs(node, pod, all_pods, pdbs, priority_classes);
             if can_preempt && !pods_to_evict.is_empty() {
                 candidates.push(crate::advanced::PreemptionCandidate {
+                    num_pdb_violations: crate::advanced::count_pdb_violating_victims(
+                        &pods_to_evict,
+                        all_pods,
+                        pdbs,
+                    ),
                     node_name: node.metadata.name.clone(),
                     victims: pods_to_evict,
-                    // check_preemption is the PDB-unaware entry point, so no
-                    // violation count is available on this path; the score
-                    // chain still applies it, and it becomes meaningful once
-                    // PDBs are threaded through.
-                    num_pdb_violations: 0,
                 });
             }
         }
@@ -1263,6 +1278,26 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     }
 
     /// Load all PriorityClasses from storage into a HashMap for fast lookup
+    /// List PodDisruptionBudgets for preemption victim selection.
+    ///
+    /// Never fatal: a listing failure degrades preemption to budget-blind
+    /// (which is what it always did before #1797) rather than stopping the
+    /// scheduling cycle outright.
+    async fn load_pod_disruption_budgets(
+        &self,
+    ) -> Vec<rusternetes_common::resources::PodDisruptionBudget> {
+        match self.data.list_pod_disruption_budgets().await {
+            Ok(pdbs) => pdbs,
+            Err(e) => {
+                warn!(
+                    "Failed to list PodDisruptionBudgets ({}); preemption will not honour budgets this cycle",
+                    e
+                );
+                Vec::new()
+            }
+        }
+    }
+
     async fn load_priority_classes(
         &self,
     ) -> rusternetes_common::Result<HashMap<String, PriorityClass>> {

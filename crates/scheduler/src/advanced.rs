@@ -1140,6 +1140,39 @@ pub fn check_preemption_with_pdbs(
 /// Percentage minAvailable values are also evaluated against the current
 /// matching population. `maxUnavailable` is treated as "1 disruption allowed"
 /// from the current matching set (we don't track historical disruptions here).
+/// How many of `victims` would break a PodDisruptionBudget if evicted.
+///
+/// Feeds [`PreemptionCandidate::num_pdb_violations`], which is the first of
+/// upstream's victim-node score functions — `minNumPDBViolatingScoreFunc` in
+/// `pickOneNodeForPreemption`
+/// (pkg/scheduler/framework/preemption/preemption.go:662-665), scoring
+/// `-nodesToVictims[node].NumPDBViolations`.
+///
+/// Upstream counts violations while *selecting* victims
+/// (`selectVictimsOnNode` returns `numViolatingVictim` alongside the list); our
+/// [`check_preemption_with_pdbs`] returns only the names, so the count is
+/// recomputed here over the victims it chose. Same inputs, same predicate
+/// ([`pod_violates_any_pdb`]) — so the number agrees with the selection that
+/// produced it.
+///
+/// Victim names that match no live pod are ignored rather than counted: an
+/// unknown pod cannot be shown to violate a budget, and guessing "yes" would
+/// steer node choice on no evidence.
+pub fn count_pdb_violating_victims(
+    victims: &[String],
+    all_pods: &[Pod],
+    pdbs: &[PodDisruptionBudget],
+) -> i64 {
+    if pdbs.is_empty() {
+        return 0;
+    }
+    victims
+        .iter()
+        .filter_map(|name| all_pods.iter().find(|p| &p.metadata.name == name))
+        .filter(|victim| pod_violates_any_pdb(victim, pdbs, all_pods))
+        .count() as i64
+}
+
 fn pod_violates_any_pdb(victim: &Pod, pdbs: &[PodDisruptionBudget], all_pods: &[Pod]) -> bool {
     for pdb in pdbs {
         if !pdb_covers_pod(pdb, victim) {
@@ -2362,6 +2395,146 @@ mod tests {
             pick_one_node_for_preemption(&candidates, &all_pods).as_deref(),
             Some("node-1"),
             "a lone candidate is used even when it violates a PDB — upstream has no better option either"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PDB-aware preemption (#1797). try_preempt called the PDB-UNAWARE
+    // check_preemption, so budget-protected pods were evicted as freely as
+    // unprotected ones and upstream's first victim-node criterion
+    // (minNumPDBViolatingScoreFunc) had nothing to score.
+    // -----------------------------------------------------------------------
+
+    fn make_pdb_min_available(
+        name: &str,
+        ns: &str,
+        app: &str,
+        min_available: i32,
+    ) -> PodDisruptionBudget {
+        let mut selector_labels = HashMap::new();
+        selector_labels.insert("app".to_string(), app.to_string());
+        PodDisruptionBudget::new(
+            name,
+            ns,
+            rusternetes_common::resources::PodDisruptionBudgetSpec {
+                min_available: Some(IntOrString::Int(min_available)),
+                max_unavailable: None,
+                selector: rusternetes_common::types::LabelSelector {
+                    match_labels: Some(selector_labels),
+                    match_expressions: None,
+                },
+                unhealthy_pod_eviction_policy: None,
+            },
+        )
+    }
+
+    fn labelled_pod(name: &str, priority: i32, node: &str, app: &str) -> Pod {
+        let mut pod = make_scheduled_pod(name, priority, "100m", "64Mi", node);
+        pod.metadata.namespace = Some("default".to_string());
+        let mut labels = HashMap::new();
+        labels.insert("app".to_string(), app.to_string());
+        pod.metadata.labels = Some(labels);
+        pod
+    }
+
+    #[test]
+    fn test_count_pdb_violating_victims_zero_without_budgets() {
+        let pods = vec![labelled_pod("a", 100, "node-1", "web")];
+        assert_eq!(
+            count_pdb_violating_victims(&["a".to_string()], &pods, &[]),
+            0,
+            "no budgets means nothing can violate one"
+        );
+    }
+
+    #[test]
+    fn test_count_pdb_violating_victims_counts_covered_pod() {
+        // One replica, minAvailable=1: evicting it breaks the budget.
+        let pods = vec![labelled_pod("only-web", 100, "node-1", "web")];
+        let pdbs = vec![make_pdb_min_available("web-pdb", "default", "web", 1)];
+        assert_eq!(
+            count_pdb_violating_victims(&["only-web".to_string()], &pods, &pdbs),
+            1,
+        );
+    }
+
+    #[test]
+    fn test_count_pdb_violating_victims_ignores_uncovered_pod() {
+        // The budget selects app=web; the victim is app=batch.
+        let pods = vec![
+            labelled_pod("web-1", 100, "node-1", "web"),
+            labelled_pod("web-2", 100, "node-1", "web"),
+            labelled_pod("batch-1", 100, "node-1", "batch"),
+        ];
+        let pdbs = vec![make_pdb_min_available("web-pdb", "default", "web", 1)];
+        assert_eq!(
+            count_pdb_violating_victims(&["batch-1".to_string()], &pods, &pdbs),
+            0,
+        );
+    }
+
+    #[test]
+    fn test_count_pdb_violating_victims_ignores_unknown_victim_name() {
+        // A name matching no live pod cannot be shown to violate anything;
+        // counting it would steer node choice on no evidence.
+        let pods = vec![labelled_pod("web-1", 100, "node-1", "web")];
+        let pdbs = vec![make_pdb_min_available("web-pdb", "default", "web", 1)];
+        assert_eq!(
+            count_pdb_violating_victims(&["ghost".to_string()], &pods, &pdbs),
+            0,
+        );
+    }
+
+    #[test]
+    fn test_count_pdb_violating_victims_sums_across_victims() {
+        let pods = vec![
+            labelled_pod("web-1", 100, "node-1", "web"),
+            labelled_pod("api-1", 100, "node-1", "api"),
+        ];
+        let pdbs = vec![
+            make_pdb_min_available("web-pdb", "default", "web", 1),
+            make_pdb_min_available("api-pdb", "default", "api", 1),
+        ];
+        assert_eq!(
+            count_pdb_violating_victims(&["web-1".to_string(), "api-1".to_string()], &pods, &pdbs),
+            2,
+        );
+    }
+
+    #[test]
+    fn test_pdb_violation_count_steers_node_choice() {
+        // The whole point of the count: node-1's victim is cheaper by priority
+        // but protected, so the score chain must prefer node-2 even though its
+        // victim has the higher priority.
+        let pods = vec![
+            labelled_pod("guarded-low", 100, "node-1", "web"),
+            labelled_pod("free-medium", 500, "node-2", "batch"),
+        ];
+        let pdbs = vec![make_pdb_min_available("web-pdb", "default", "web", 1)];
+        let candidates = vec![
+            PreemptionCandidate {
+                node_name: "node-1".to_string(),
+                victims: vec!["guarded-low".to_string()],
+                num_pdb_violations: count_pdb_violating_victims(
+                    &["guarded-low".to_string()],
+                    &pods,
+                    &pdbs,
+                ),
+            },
+            PreemptionCandidate {
+                node_name: "node-2".to_string(),
+                victims: vec!["free-medium".to_string()],
+                num_pdb_violations: count_pdb_violating_victims(
+                    &["free-medium".to_string()],
+                    &pods,
+                    &pdbs,
+                ),
+            },
+        ];
+        assert_eq!(
+            pick_one_node_for_preemption(&candidates, &pods).as_deref(),
+            Some("node-2"),
+            "a PDB violation must outrank a lower victim priority"
         );
     }
 }

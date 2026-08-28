@@ -39,7 +39,7 @@ use std::sync::Arc;
 use rusternetes_client::events::ClientEventRecorder;
 use rusternetes_client::http::{ApiClient, GetError};
 use rusternetes_client::reflector::Reflector;
-use rusternetes_common::resources::{EventType, Node, Pod, PriorityClass};
+use rusternetes_common::resources::{EventType, Node, Pod, PodDisruptionBudget, PriorityClass};
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::{build_key, Storage};
 use serde_json::json;
@@ -174,6 +174,32 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
                     .await
             }
             DataPlane::Api(a) => Ok(a.priority_classes.store().items()),
+        }
+    }
+
+    /// List every PodDisruptionBudget, cluster-wide.
+    ///
+    /// Storage: `list(/registry/poddisruptionbudgets)`. API: GET the
+    /// all-namespaces collection — like PriorityClasses these change rarely, so
+    /// there is no informer for them.
+    ///
+    /// Preemption needs these. Without them `try_preempt` fell back to the
+    /// PDB-unaware [`check_preemption`] and evicted budget-protected pods as
+    /// freely as unprotected ones (#1797).
+    pub async fn list_pod_disruption_budgets(&self) -> Result<Vec<PodDisruptionBudget>> {
+        match self {
+            DataPlane::Storage(s) => {
+                s.list(&rusternetes_storage::build_prefix(
+                    "poddisruptionbudgets",
+                    None,
+                ))
+                .await
+            }
+            DataPlane::Api(a) => a
+                .client
+                .get_list("/apis/policy/v1/poddisruptionbudgets")
+                .await
+                .map_err(get_err_to_common),
         }
     }
 
