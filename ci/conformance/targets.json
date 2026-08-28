@@ -61,19 +61,5 @@
     "focus": "\\[sig-instrumentation\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-instrumentation\\]",
     "skip": "\\[Flaky\\]",
     "description": "Events API lifecycle: create/patch/delete/list"
-  },
-  {
-    "name": "sysctls",
-    "kind": "feature",
-    "focus": "\\[(Feature|NodeFeature):Sysctls\\]",
-    "skip": "\\[Flaky\\]",
-    "description": "sig-node feature-gated sysctls (safe + unsafe allowlist); largely non-[Conformance], additive to the sig-node slice"
-  },
-  {
-    "name": "downward-api",
-    "kind": "feature",
-    "focus": "\\[Feature:DownwardAPI\\]",
-    "skip": "\\[Flaky\\]",
-    "description": "sig-node feature-gated Downward API variants; additive to the sig-node slice"
   }
 ]
