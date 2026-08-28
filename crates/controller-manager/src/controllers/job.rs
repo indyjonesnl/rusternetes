@@ -29,6 +29,41 @@ pub struct JobController<S: Storage> {
 ///
 /// so a lone `Failed=True` makes the api-server reject the whole status write,
 /// the Job stays `active: 1`, and every spec that waits for it to fail hangs.
+/// Terminal-success conditions for a Job, in the order the api-server demands.
+///
+/// The mirror of [`failed_job_conditions`]: the interim `SuccessCriteriaMet`
+/// is appended first and `Complete` inherits its reason and message
+/// (`job_controller.go:1317-1327`). Validation enforces the pair —
+/// `pkg/apis/batch/validation/validation.go:525-527`:
+///
+/// ```text
+/// status.conditions: Invalid value: cannot set Complete=True condition
+///   without the SuccessCriteriaMet=true condition
+/// ```
+///
+/// A lone `Complete=True` is rejected, so the Job never leaves `active`.
+fn complete_job_conditions(reason: String, message: String) -> Vec<JobCondition> {
+    let now = chrono::Utc::now();
+    vec![
+        JobCondition {
+            condition_type: "SuccessCriteriaMet".to_string(),
+            status: "True".to_string(),
+            last_probe_time: Some(now),
+            last_transition_time: Some(now),
+            reason: Some(reason.clone()),
+            message: Some(message.clone()),
+        },
+        JobCondition {
+            condition_type: "Complete".to_string(),
+            status: "True".to_string(),
+            last_probe_time: Some(now),
+            last_transition_time: Some(now),
+            reason: Some(reason),
+            message: Some(message),
+        },
+    ]
+}
+
 fn failed_job_conditions(reason: String, message: String) -> Vec<JobCondition> {
     let now = chrono::Utc::now();
     vec![
@@ -973,24 +1008,10 @@ impl<S: Storage + 'static> JobController<S> {
                 active: Some(0),
                 succeeded: Some(succeeded_count),
                 failed: Some(failed),
-                conditions: Some(vec![
-                    JobCondition {
-                        condition_type: "SuccessCriteriaMet".to_string(),
-                        status: "True".to_string(),
-                        last_probe_time: Some(chrono::Utc::now()),
-                        last_transition_time: Some(chrono::Utc::now()),
-                        reason: Some("SuccessPolicy".to_string()),
-                        message: Some("Job met success policy criteria".to_string()),
-                    },
-                    JobCondition {
-                        condition_type: "Complete".to_string(),
-                        status: "True".to_string(),
-                        last_probe_time: Some(chrono::Utc::now()),
-                        last_transition_time: Some(chrono::Utc::now()),
-                        reason: Some("SuccessPolicy".to_string()),
-                        message: Some("Job completed via success policy".to_string()),
-                    },
-                ]),
+                conditions: Some(complete_job_conditions(
+                    "SuccessPolicy".to_string(),
+                    "Matched rules in the SuccessPolicy".to_string(),
+                )),
                 start_time,
                 completion_time: Some(chrono::Utc::now()),
                 ready: Some(0), // Job is complete, no ready pods
@@ -1019,14 +1040,10 @@ impl<S: Storage + 'static> JobController<S> {
                 active: Some(0),
                 succeeded: Some(succeeded),
                 failed: Some(failed),
-                conditions: Some(vec![JobCondition {
-                    condition_type: "Complete".to_string(),
-                    status: "True".to_string(),
-                    last_probe_time: Some(chrono::Utc::now()),
-                    last_transition_time: Some(chrono::Utc::now()),
-                    reason: Some("CompletionsReached".to_string()),
-                    message: Some("Job completed successfully".to_string()),
-                }]),
+                conditions: Some(complete_job_conditions(
+                    "CompletionsReached".to_string(),
+                    "Reached expected number of succeeded pods".to_string(),
+                )),
                 start_time,
                 completion_time: Some(chrono::Utc::now()),
                 // K8s sets ready and terminating to 0 when a job completes.
@@ -1858,6 +1875,74 @@ mod tests {
     /// `newFailedConditionForFailureTarget` — and sets `completionTime` only
     /// for Complete jobs. The rejected write left the Job `active: 1` forever,
     /// so `WaitForJobFailed` timed out in all seven Job [Conformance] specs.
+    /// A Job that reaches its completions must stage `SuccessCriteriaMet`
+    /// before `Complete`, the mirror of the FailureTarget rule.
+    ///
+    /// Live, a two-of-two successful Job stalled at `succeeded: 1, active: 1`
+    /// forever because the api-server rejected every status write:
+    ///
+    /// ```text
+    /// Failed to reconcile jobs/job-complete/ok: Bad request:
+    ///   Error from server (Invalid): Job.batch "ok" is invalid:
+    ///   status.conditions: Invalid value: cannot set Complete=True condition
+    ///     without the SuccessCriteriaMet=true condition
+    /// ```
+    ///
+    /// (pkg/apis/batch/validation/validation.go:525-527). Upstream appends the
+    /// interim SuccessCriteriaMet condition and derives Complete from it with
+    /// the same reason and message (job_controller.go:1317-1327). Three Job
+    /// [Conformance] specs died on "failed to ensure job completion ... Timed
+    /// out after 900s" because of this. The success-policy path already staged
+    /// the pair; the ordinary completions-reached path did not.
+    ///
+    /// `completionTime` stays REQUIRED here — validation.go:505-513 demands it
+    /// for Complete jobs (the inverse of the failed-job rule).
+    #[tokio::test]
+    async fn completed_job_stages_success_criteria_met_before_complete() {
+        let storage = Arc::new(MemoryStorage::new());
+        let job = make_job("ok", "default", 2, 2);
+        let job_key = build_key("jobs", Some("default"), "ok");
+        storage.create(&job_key, &job).await.unwrap();
+
+        for name in ["ok-1", "ok-2"] {
+            let pod = make_pod(name, "default", Phase::Succeeded, "ok", "job-uid-1");
+            storage
+                .create(&build_key("pods", Some("default"), name), &pod)
+                .await
+                .unwrap();
+        }
+
+        let controller = JobController::new(storage.clone());
+        controller.reconcile_all().await.unwrap();
+
+        let status = storage
+            .get::<Job>(&job_key)
+            .await
+            .unwrap()
+            .status
+            .expect("job must have status");
+        let conditions = status.conditions.unwrap_or_default();
+
+        let complete = conditions
+            .iter()
+            .find(|c| c.condition_type == "Complete" && c.status == "True")
+            .expect("a job that reached its completions must be Complete");
+        let met = conditions
+            .iter()
+            .find(|c| c.condition_type == "SuccessCriteriaMet" && c.status == "True")
+            .expect(
+                "Complete=True requires SuccessCriteriaMet=True, or the api-server rejects the write",
+            );
+        assert_eq!(
+            met.reason, complete.reason,
+            "the Complete condition inherits the interim condition's reason"
+        );
+        assert!(
+            status.completion_time.is_some(),
+            "completionTime is required for Complete jobs"
+        );
+    }
+
     #[tokio::test]
     async fn failed_job_sets_failure_target_and_no_completion_time() {
         let storage = Arc::new(MemoryStorage::new());
