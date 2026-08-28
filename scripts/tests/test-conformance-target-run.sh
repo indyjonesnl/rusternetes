@@ -201,9 +201,14 @@ echo "$out" | grep -q "FAILED tests:" && echo "$out" | grep -qE '^\s+- y$' \
   && ok "failed-spec list names the spec" \
   || bad "failed-spec list missing/wrong: $(echo "$out" | grep -A2 'FAILED tests' | tr '\n' ' ')"
 
-# a FEATURE target resolves from the manifest too (identical path)
-FAKE_MODE=pass run_cli --target sysctls --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/of" >/dev/null 2>&1 \
-  && ok "feature target (sysctls) resolves + runs" || bad "feature target sysctls should exit 0"
+# a second manifest target resolves through the identical path. This used to
+# assert it for a kind:feature target (sysctls), but the two feature targets were
+# removed in #1796 — their focus regexes matched ZERO specs on v1.35 while the
+# badge logic reported 100% for 0/0. The manifest schema still accepts
+# kind:feature and the generator/engine treat both kinds identically, so nothing
+# else changed.
+FAKE_MODE=pass run_cli --target sig-storage --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/of" >/dev/null 2>&1 \
+  && ok "second manifest target (sig-storage) resolves + runs" || bad "sig-storage target should exit 0"
 
 # focus override => focused=1
 FAKE_MODE=pass run_cli --target sig-node --focus 'x' --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/o2" >/dev/null 2>&1

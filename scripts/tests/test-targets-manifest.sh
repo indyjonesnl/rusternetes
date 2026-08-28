@@ -37,7 +37,7 @@ jq -e 'all(.[].kind; . == "sig" or . == "feature")' "$MANIFEST" >/dev/null \
 dupes=$(jq -r '[.[].name] | group_by(.) | map(select(length>1)) | .[][0] // empty' "$MANIFEST")
 [ -z "$dupes" ] || fail "duplicate target names: $dupes"
 
-# Names path-safe: lowercase alnum + hyphens (sig-node, sysctls, downward-api).
+# Names path-safe: lowercase alnum + hyphens (sig-node, sig-api-machinery).
 jq -e 'all(.[].name; test("^[a-z][a-z0-9-]*$"))' "$MANIFEST" >/dev/null \
     || fail "target names must match ^[a-z][a-z0-9-]*\$ (path-safe)"
 
