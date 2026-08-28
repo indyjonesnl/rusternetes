@@ -148,7 +148,8 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             *pending = orphans.iter().map(|o| o.key.clone()).collect();
         }
 
-        if !orphans.is_empty() {
+        let mut found_orphans = !orphans.is_empty();
+        if found_orphans {
             info!(
                 "Found {} orphaned resources to verify and delete",
                 orphans.len()
@@ -157,16 +158,57 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             let mut deleted_count = 0;
             let mut failed_count = 0;
 
-            for orphan in &orphans {
-                match self.delete_orphan(orphan).await {
-                    Ok(_) => deleted_count += 1,
-                    Err(e) => {
-                        failed_count += 1;
-                        error!("Failed to delete orphan {}: {}", orphan.key, e);
+            // Collect TRANSITIVELY, not one level per scan. Deleting an orphan
+            // orphans whatever pointed at it, and re-listing here is what makes
+            // a chain (pod2 -> pod1, pod3 -> pod2) collapse in a single sweep.
+            //
+            // Upstream never waits for its next pass either: the deletion feeds
+            // the graph builder, which enqueues every dependent of the removed
+            // node (pkg/controller/garbagecollector/graph_builder.go
+            // `processGraphChanges` → `attemptToDelete` over `n.dependents`).
+            // Peeling one level per scan cost the conformance spec
+            // "Garbage collector should not be blocked by dependency circle"
+            // its 150s budget once scans got slow under load: the chain needed
+            // as many full-cluster scans as it was long.
+            //
+            // Bounded so a pathological graph (or a resource that keeps
+            // reappearing) cannot spin a scan forever — the next scan picks up
+            // whatever is left.
+            const MAX_CASCADE_ROUNDS: usize = 10;
+            let mut round_orphans = orphans.clone();
+            for round in 0..MAX_CASCADE_ROUNDS {
+                for orphan in &round_orphans {
+                    match self.delete_orphan(orphan).await {
+                        Ok(_) => deleted_count += 1,
+                        Err(e) => {
+                            failed_count += 1;
+                            error!("Failed to delete orphan {}: {}", orphan.key, e);
+                        }
                     }
                 }
+
+                // Re-list and re-derive: anything that just lost its last owner
+                // is an orphan now. Stop as soon as a round finds nothing new.
+                let refreshed = self.get_all_resources().await?;
+                let (refreshed_owner_map, _) = self.build_relationship_maps(&refreshed);
+                let next = self.find_orphans(&refreshed, &refreshed_owner_map);
+                let previous: HashSet<String> =
+                    round_orphans.iter().map(|o| o.key.clone()).collect();
+                round_orphans = next
+                    .into_iter()
+                    .filter(|o| !previous.contains(&o.key))
+                    .collect();
+                if round_orphans.is_empty() {
+                    break;
+                }
+                debug!(
+                    "GC cascade round {}: {} newly orphaned resource(s)",
+                    round + 1,
+                    round_orphans.len()
+                );
             }
 
+            found_orphans = true;
             info!(
                 "GC orphan deletion complete: {} deleted, {} failed",
                 deleted_count, failed_count
@@ -211,7 +253,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         // "Did work" = something was actionable this scan. Drives idle backoff
         // in `run`; when both are empty the cluster is quiet and the next scan
         // waits longer.
-        Ok(!orphans.is_empty() || had_being_deleted)
+        Ok(found_orphans || had_being_deleted)
     }
 
     /// Get all resources from storage
@@ -1664,6 +1706,75 @@ mod tests {
             pods.is_empty(),
             "orphan must be deleted on the first GC scan, got {} remaining",
             pods.len()
+        );
+    }
+
+    /// One GC scan must drain a whole ownership CHAIN, not one level of it.
+    ///
+    /// `[sig-api-machinery] Garbage collector should not be blocked by
+    /// dependency circle` (test/e2e/apimachinery/garbage_collector.go:826)
+    /// builds pod1 -> pod3 -> pod2 -> pod1, deletes pod1, and gives the cluster
+    /// 150s for ALL THREE to disappear. The pods carry
+    /// terminationGracePeriodSeconds=0, so the api-server removes pod1 at once
+    /// and the GC inherits a 2-long dangling chain: pod2 (owner pod1, gone) and
+    /// pod3 (owner pod2, still present).
+    ///
+    /// Deleting only the orphans present in this scan's snapshot peels one
+    /// level per scan, so the chain needs as many scans as it is long. Each
+    /// scan lists every resource type across the cluster and the interval backs
+    /// off to 60s while idle — under conformance load that ran past the spec's
+    /// 150s budget and left pod3 behind (run 33155140545, 2026-08-28).
+    ///
+    /// Upstream does not wait for its next sweep: deleting a dependent feeds
+    /// the graph builder, which enqueues everything that pointed at it, so a
+    /// chain collapses transitively in one go
+    /// (pkg/controller/garbagecollector/graph_builder.go `processGraphChanges`
+    /// → `attemptToDelete` enqueue of `n.dependents`). A scan-based GC gets the
+    /// same property by re-running the orphan pass until it reaches a fixpoint.
+    #[tokio::test]
+    async fn one_scan_drains_a_whole_orphan_chain() {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let gc = GarbageCollector::new(storage.clone());
+
+        // pod2 -> pod1 (already deleted by the api-server), pod3 -> pod2.
+        let chain = [("pod2", "pod1", "pod1-uid"), ("pod3", "pod2", "pod2-uid")];
+        for (name, owner_name, owner_uid) in chain {
+            let mut meta = ObjectMeta::new(name);
+            meta.namespace = Some("gc-ns".to_string());
+            meta.uid = format!("{name}-uid");
+            meta.owner_references = Some(vec![OwnerReference {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                name: owner_name.to_string(),
+                uid: owner_uid.to_string(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]);
+            let pod = Pod {
+                type_meta: TypeMeta {
+                    kind: "Pod".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: meta,
+                spec: None,
+                status: None,
+            };
+            storage
+                .create(&format!("/registry/pods/gc-ns/{name}"), &pod)
+                .await
+                .unwrap();
+        }
+
+        gc.scan_and_collect().await.unwrap();
+
+        let remaining: Vec<Pod> = storage.list("/registry/pods/gc-ns/").await.unwrap();
+        let names: Vec<&str> = remaining.iter().map(|p| p.metadata.name.as_str()).collect();
+        assert!(
+            remaining.is_empty(),
+            "a single scan must collect the whole chain, not one level per scan; still present: {names:?}"
         );
     }
 }
