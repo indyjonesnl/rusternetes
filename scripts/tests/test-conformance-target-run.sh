@@ -262,5 +262,28 @@ else
   bad "--skip-preflight should allow the run to proceed (exit=$?)"
 fi
 
+# ...and the gate must be tunable per cluster shape, not only on/off. The
+# preflight's control-plane pod names and DNS Deployment are compose-stack
+# facts; vanilla-swap drives this runner against a kind cluster and has to say
+# so. Without a pass-through, every vanilla-swap leg reported
+# "module-did-not-come-up" on three preflight FAILs about pods that only exist
+# in the compose stack.
+set +e
+out_pfarg=$(SKIP_PREFLIGHT=0 FAKE_MODE=pass run_cli --target sig-node \
+    --preflight-arg --dns-deployment --preflight-arg none \
+    --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/opf3" 2>&1)
+rc_pfarg=$?
+set -e
+[ "$rc_pfarg" -eq 2 ] || bad "--preflight-arg run exit=$rc_pfarg (want 2: cluster still unreachable)"
+echo "$out_pfarg" | grep -q -- "--dns-deployment none" \
+  && ok "--preflight-arg is forwarded to conformance-preflight.sh" \
+  || bad "--preflight-arg was not forwarded (runner never named it)"
+
+# An unknown flag is still a usage error — the pass-through must not swallow
+# typos by forwarding everything.
+if run_cli --target sig-node --not-a-flag --kubeconfig "$KC" --hydrophone "$FAKE" >/dev/null 2>&1; then
+  bad "unknown flag should exit 2"; else
+  rc=$?; [ "$rc" -eq 2 ] && ok "unknown flag => exit 2" || bad "unknown flag exit=$rc"; fi
+
 echo
 if [ "$failcnt" -eq 0 ]; then echo "PASS: conformance-target-run ($pass checks)"; else echo "FAILED: $failcnt of $((pass + failcnt))" >&2; exit 1; fi
