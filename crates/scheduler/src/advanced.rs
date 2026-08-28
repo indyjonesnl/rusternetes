@@ -641,6 +641,131 @@ fn pod_terminating_by_preemption(p: &Pod) -> bool {
         .unwrap_or(false)
 }
 
+/// One node preemption could use, paired with the victims it would cost.
+///
+/// Upstream's equivalent is `extenderv1.Victims` keyed by node name inside
+/// `pickOneNodeForPreemption` (pkg/scheduler/framework/preemption/preemption.go:651).
+#[derive(Debug, Clone)]
+pub struct PreemptionCandidate {
+    pub node_name: String,
+    /// Victim pod names, as returned by [`check_preemption`].
+    pub victims: Vec<String>,
+    /// How many of those victims violate a PodDisruptionBudget. The live
+    /// scheduling path calls the PDB-unaware [`check_preemption`], so this is
+    /// currently always 0 there; the field exists so the score chain is the
+    /// real one and becomes correct the moment PDBs are threaded through.
+    pub num_pdb_violations: i64,
+}
+
+/// Choose which node's victims to preempt.
+///
+/// Port of upstream `pickOneNodeForPreemption`
+/// (pkg/scheduler/framework/preemption/preemption.go:651-730). Upstream applies
+/// five score functions in order of precedence, moving to the next only while
+/// more than one node ties for the best score:
+///
+/// 1. fewest PodDisruptionBudget violations,
+/// 2. **lowest highest-priority victim** ("a node with a minimum highest
+///    priority victim is preferable"),
+/// 3. smallest sum of victim priorities,
+/// 4. fewest victims,
+/// 5. latest start time among the highest-priority victims.
+///
+/// Taking the *first* feasible node instead — which is what this scheduler did
+/// until now — makes the outcome depend on node iteration order. That is the
+/// whole of the remaining #1130 failure: with a low-priority victim on node-1
+/// and a medium-priority victim on node-2, we preempted whichever node came
+/// first, so `[sig-scheduling] SchedulerPreemption validates basic preemption
+/// works` passed or failed by luck of ordering:
+///
+/// ```text
+/// passing: Preempting 1 pod(s) on node node-1 ... Evicted pod0-0-sched-preemption-low-priority
+/// failing: Preempting 1 pod(s) on node node-2 ... Evicted pod1-1-sched-preemption-medium-priority
+/// ```
+///
+/// The spec asserts the lowest-priority pod is the one that dies, which is
+/// exactly what criterion 2 guarantees.
+///
+/// Returns `None` only when `candidates` is empty.
+pub fn pick_one_node_for_preemption(
+    candidates: &[PreemptionCandidate],
+    all_pods: &[Pod],
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let priority_of = |name: &str| -> i32 {
+        all_pods
+            .iter()
+            .find(|p| p.metadata.name == name)
+            .and_then(|p| p.spec.as_ref())
+            .and_then(|s| s.priority)
+            .unwrap_or(0)
+    };
+
+    // Highest victim priority on a candidate. Upstream reads
+    // `nodesToVictims[node].Pods[0]` because its victim list is sorted
+    // highest-priority-first; we take the max explicitly rather than depend on
+    // check_preemption's ordering.
+    let highest_victim_priority = |c: &PreemptionCandidate| -> i32 {
+        c.victims.iter().map(|v| priority_of(v)).max().unwrap_or(0)
+    };
+
+    // Upstream adds MaxInt32+1 to every priority before summing, so that a node
+    // with a few negative-priority pods is not preferred over a node with fewer
+    // pods of the same negative priority. i64 keeps the shifted sum exact.
+    let sum_shifted_priorities = |c: &PreemptionCandidate| -> i64 {
+        c.victims
+            .iter()
+            .map(|v| priority_of(v) as i64 + i32::MAX as i64 + 1)
+            .sum()
+    };
+
+    // Earliest start time among the highest-priority victims; the *latest* such
+    // time scores best (upstream latestStartTimeScoreFunc via
+    // util.GetEarliestPodStartTime). A victim with no startTime is treated as
+    // the epoch, matching upstream's nil handling being the worst score.
+    let latest_start_time = |c: &PreemptionCandidate| -> i64 {
+        let top = highest_victim_priority(c);
+        c.victims
+            .iter()
+            .filter(|v| priority_of(v) == top)
+            .map(|v| {
+                all_pods
+                    .iter()
+                    .find(|p| p.metadata.name == *v)
+                    .and_then(|p| p.status.as_ref())
+                    .and_then(|st| st.start_time)
+                    .map(|t| t.timestamp_nanos_opt().unwrap_or(i64::MIN))
+                    .unwrap_or(i64::MIN)
+            })
+            .min()
+            .unwrap_or(i64::MIN)
+    };
+
+    // Each closure scores a candidate; higher is better, as upstream.
+    let score_funcs: [&dyn Fn(&PreemptionCandidate) -> i64; 5] = [
+        &|c| -c.num_pdb_violations,
+        &|c| -(highest_victim_priority(c) as i64),
+        &|c| -sum_shifted_priorities(c),
+        &|c| -(c.victims.len() as i64),
+        &latest_start_time,
+    ];
+
+    let mut remaining: Vec<&PreemptionCandidate> = candidates.iter().collect();
+    for score in score_funcs {
+        if remaining.len() == 1 {
+            break;
+        }
+        let best = remaining.iter().map(|c| score(c)).max()?;
+        remaining.retain(|c| score(c) == best);
+    }
+
+    // Still tied: upstream selects the first node in the list.
+    remaining.first().map(|c| c.node_name.clone())
+}
+
 /// Check if preemption should occur and return pods to evict.
 ///
 /// This is the PDB-unaware entry point retained for callers that don't have
@@ -2089,5 +2214,154 @@ mod tests {
     fn a_pod_without_a_nominated_node_is_eligible() {
         let preemptor = make_incoming_pod("fresh", 1000, "100m", "128Mi", None);
         assert!(pod_eligible_to_preempt_others(&preemptor, &[]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Victim-node selection (the residual half of #1130).
+    //
+    // try_preempt used to return the FIRST feasible node, so with a
+    // low-priority victim on node-1 and a medium-priority one on node-2 the
+    // outcome depended on node iteration order. Observed live, same binaries,
+    // ~1 h apart:
+    //
+    //   Preempting 1 pod(s) on node node-1 ... Evicted pod0-0-…-low-priority
+    //   Preempting 1 pod(s) on node node-2 ... Evicted pod1-1-…-medium-priority
+    //
+    // The second reads as a flake and fails
+    // `SchedulerPreemption validates basic preemption works`, which asserts the
+    // LOWEST-priority pod is the one preempted.
+    // -----------------------------------------------------------------------
+
+    fn candidate(node: &str, victims: &[&str], pdb_violations: i64) -> PreemptionCandidate {
+        PreemptionCandidate {
+            node_name: node.to_string(),
+            victims: victims.iter().map(|v| v.to_string()).collect(),
+            num_pdb_violations: pdb_violations,
+        }
+    }
+
+    #[test]
+    fn test_pick_node_prefers_lowest_priority_victim() {
+        let all_pods = vec![
+            make_scheduled_pod("pod0-0-low", 100, "100m", "64Mi", "node-1"),
+            make_scheduled_pod("pod1-1-medium", 500, "100m", "64Mi", "node-2"),
+        ];
+        let candidates = vec![
+            candidate("node-1", &["pod0-0-low"], 0),
+            candidate("node-2", &["pod1-1-medium"], 0),
+        ];
+        assert_eq!(
+            pick_one_node_for_preemption(&candidates, &all_pods).as_deref(),
+            Some("node-1"),
+            "must preempt the low-priority victim, not the medium-priority one"
+        );
+    }
+
+    #[test]
+    fn test_pick_node_is_independent_of_candidate_order() {
+        // The live bug was order dependence, so the reversed list must agree.
+        let all_pods = vec![
+            make_scheduled_pod("pod0-0-low", 100, "100m", "64Mi", "node-1"),
+            make_scheduled_pod("pod1-1-medium", 500, "100m", "64Mi", "node-2"),
+        ];
+        let reversed = vec![
+            candidate("node-2", &["pod1-1-medium"], 0),
+            candidate("node-1", &["pod0-0-low"], 0),
+        ];
+        assert_eq!(
+            pick_one_node_for_preemption(&reversed, &all_pods).as_deref(),
+            Some("node-1"),
+        );
+    }
+
+    #[test]
+    fn test_pick_node_pdb_violations_outrank_priority() {
+        // Upstream's first criterion. node-1 costs a PDB violation, so node-2
+        // wins even though its victim has the higher priority.
+        let all_pods = vec![
+            make_scheduled_pod("low-but-guarded", 100, "100m", "64Mi", "node-1"),
+            make_scheduled_pod("medium-free", 500, "100m", "64Mi", "node-2"),
+        ];
+        let candidates = vec![
+            candidate("node-1", &["low-but-guarded"], 1),
+            candidate("node-2", &["medium-free"], 0),
+        ];
+        assert_eq!(
+            pick_one_node_for_preemption(&candidates, &all_pods).as_deref(),
+            Some("node-2"),
+        );
+    }
+
+    #[test]
+    fn test_pick_node_breaks_priority_tie_on_summed_priorities() {
+        // Same highest victim priority on both nodes; node-2 costs less in total.
+        let all_pods = vec![
+            make_scheduled_pod("a-top", 500, "100m", "64Mi", "node-1"),
+            make_scheduled_pod("a-extra", 400, "100m", "64Mi", "node-1"),
+            make_scheduled_pod("b-top", 500, "100m", "64Mi", "node-2"),
+            make_scheduled_pod("b-extra", 100, "100m", "64Mi", "node-2"),
+        ];
+        let candidates = vec![
+            candidate("node-1", &["a-top", "a-extra"], 0),
+            candidate("node-2", &["b-top", "b-extra"], 0),
+        ];
+        assert_eq!(
+            pick_one_node_for_preemption(&candidates, &all_pods).as_deref(),
+            Some("node-2"),
+        );
+    }
+
+    #[test]
+    fn test_pick_node_breaks_remaining_tie_on_victim_count() {
+        // Identical priorities and sums per victim, so fewest victims wins.
+        let all_pods = vec![
+            make_scheduled_pod("a1", 100, "100m", "64Mi", "node-1"),
+            make_scheduled_pod("b1", 100, "100m", "64Mi", "node-2"),
+            make_scheduled_pod("b2", 100, "100m", "64Mi", "node-2"),
+        ];
+        let candidates = vec![
+            candidate("node-2", &["b1", "b2"], 0),
+            candidate("node-1", &["a1"], 0),
+        ];
+        assert_eq!(
+            pick_one_node_for_preemption(&candidates, &all_pods).as_deref(),
+            Some("node-1"),
+        );
+    }
+
+    #[test]
+    fn test_pick_node_prefers_latest_started_victim_on_full_tie() {
+        // Everything else equal: the victim that started most recently is the
+        // cheaper one to kill (upstream latestStartTimeScoreFunc).
+        let mut older = make_scheduled_pod("older", 100, "100m", "64Mi", "node-1");
+        let mut newer = make_scheduled_pod("newer", 100, "100m", "64Mi", "node-2");
+        let base = chrono::Utc::now();
+        older.status.as_mut().unwrap().start_time = Some(base - chrono::Duration::hours(2));
+        newer.status.as_mut().unwrap().start_time = Some(base);
+        let all_pods = vec![older, newer];
+        let candidates = vec![
+            candidate("node-1", &["older"], 0),
+            candidate("node-2", &["newer"], 0),
+        ];
+        assert_eq!(
+            pick_one_node_for_preemption(&candidates, &all_pods).as_deref(),
+            Some("node-2"),
+        );
+    }
+
+    #[test]
+    fn test_pick_node_returns_none_without_candidates() {
+        assert_eq!(pick_one_node_for_preemption(&[], &[]), None);
+    }
+
+    #[test]
+    fn test_pick_node_single_candidate_is_chosen() {
+        let all_pods = vec![make_scheduled_pod("only", 100, "100m", "64Mi", "node-1")];
+        let candidates = vec![candidate("node-1", &["only"], 7)];
+        assert_eq!(
+            pick_one_node_for_preemption(&candidates, &all_pods).as_deref(),
+            Some("node-1"),
+            "a lone candidate is used even when it violates a PDB — upstream has no better option either"
+        );
     }
 }
