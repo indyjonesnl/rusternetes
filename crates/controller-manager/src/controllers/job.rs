@@ -14,6 +14,43 @@ pub struct JobController<S: Storage> {
     storage: Arc<S>,
 }
 
+/// Terminal-failure conditions for a Job, in the order the api-server demands.
+///
+/// Upstream stages a failing Job in two conditions: the interim
+/// `FailureTarget` is appended first, and the final `Failed` carries the SAME
+/// reason and message (`job_controller.go:1307-1316` ->
+/// `newFailedConditionForFailureTarget`, `job_controller.go:1562`). Validation
+/// enforces the pair — `pkg/apis/batch/validation/validation.go:520-522`:
+///
+/// ```text
+/// status.conditions: Invalid value: cannot set Failed=True condition
+///   without the FailureTarget=true condition
+/// ```
+///
+/// so a lone `Failed=True` makes the api-server reject the whole status write,
+/// the Job stays `active: 1`, and every spec that waits for it to fail hangs.
+fn failed_job_conditions(reason: String, message: String) -> Vec<JobCondition> {
+    let now = chrono::Utc::now();
+    vec![
+        JobCondition {
+            condition_type: "FailureTarget".to_string(),
+            status: "True".to_string(),
+            last_probe_time: Some(now),
+            last_transition_time: Some(now),
+            reason: Some(reason.clone()),
+            message: Some(message.clone()),
+        },
+        JobCondition {
+            condition_type: "Failed".to_string(),
+            status: "True".to_string(),
+            last_probe_time: Some(now),
+            last_transition_time: Some(now),
+            reason: Some(reason),
+            message: Some(message),
+        },
+    ]
+}
+
 impl<S: Storage + 'static> JobController<S> {
     pub fn new(storage: Arc<S>) -> Self {
         Self { storage }
@@ -262,11 +299,19 @@ impl<S: Storage + 'static> JobController<S> {
                                     namespace, name, ttl, elapsed
                                 );
                                 let key = build_key("jobs", Some(namespace), name);
-                                if let Ok(mut fresh_job) = self.storage.get::<Job>(&key).await {
+                                if let Ok(fresh_job) = self.storage.get::<Job>(&key).await {
                                     if fresh_job.metadata.deletion_timestamp.is_none() {
-                                        fresh_job.metadata.deletion_timestamp =
-                                            Some(chrono::Utc::now());
-                                        let _ = self.storage.update(&key, &fresh_job).await;
+                                        // DELETE, never stamp deletionTimestamp:
+                                        // the field is immutable on update, so an
+                                        // api-server that enforces that rejects the
+                                        // write and the finished Job is never
+                                        // collected. Upstream's TTL controller
+                                        // deletes through the API
+                                        // (pkg/controller/ttlafterfinished/
+                                        // ttlafterfinished_controller.go:256 ->
+                                        // Jobs(ns).Delete). Same defect class
+                                        // as #1812.
+                                        let _ = self.storage.delete_gracefully(&key).await;
                                     }
                                 }
                                 return Ok(());
@@ -561,19 +606,18 @@ impl<S: Storage + 'static> JobController<S> {
                         active: Some(0),
                         succeeded: Some(succeeded),
                         failed: Some(failed),
-                        conditions: Some(vec![JobCondition {
-                            condition_type: "Failed".to_string(),
-                            status: "True".to_string(),
-                            last_probe_time: Some(chrono::Utc::now()),
-                            last_transition_time: Some(chrono::Utc::now()),
-                            reason: Some("DeadlineExceeded".to_string()),
-                            message: Some(format!(
+                        conditions: Some(failed_job_conditions(
+                            "DeadlineExceeded".to_string(),
+                            format!(
                                 "Job was active longer than specified deadline of {} seconds",
                                 deadline
-                            )),
-                        }]),
+                            ),
+                        )),
                         start_time: job.status.as_ref().and_then(|s| s.start_time),
-                        completion_time: Some(chrono::Utc::now()),
+                        // completionTime is valid ONLY on a Complete job
+                        // (validation.go:505-513: "cannot set completionTime
+                        // when there is no Complete=True condition").
+                        completion_time: None,
                         ready: Some(ready),
                         terminating: None,
                         completed_indexes: None,
@@ -1027,16 +1071,11 @@ impl<S: Storage + 'static> JobController<S> {
                 active: Some(0),
                 succeeded: Some(succeeded),
                 failed: Some(failed),
-                conditions: Some(vec![JobCondition {
-                    condition_type: "Failed".to_string(),
-                    status: "True".to_string(),
-                    last_probe_time: Some(chrono::Utc::now()),
-                    last_transition_time: Some(chrono::Utc::now()),
-                    reason: Some(reason),
-                    message: Some(message),
-                }]),
+                conditions: Some(failed_job_conditions(reason, message)),
                 start_time,
-                completion_time: Some(chrono::Utc::now()),
+                // completionTime is valid ONLY on a Complete job
+                // (validation.go:505-513).
+                completion_time: None,
                 // K8s sets ready and terminating to 0 when a job is terminal.
                 ready: Some(0),
                 terminating: Some(0),
@@ -1797,6 +1836,75 @@ mod tests {
         assert_eq!(format_index_ranges(&[0, 1, 2]), "0-2");
         assert_eq!(format_index_ranges(&[0, 1, 2, 5]), "0-2,5");
         assert_eq!(format_index_ranges(&[0, 2, 3, 4, 7, 8]), "0,2-4,7-8");
+    }
+
+    /// A failing Job must reach `Failed` the way upstream stages it, or the
+    /// api-server rejects the whole status write.
+    ///
+    /// Live, against a vanilla control plane, every failing-Job spec died here:
+    ///
+    /// ```text
+    /// Failed to reconcile jobs/job-check/failjob: Bad request:
+    ///   Error from server (Invalid): Job.batch "failjob" is invalid:
+    ///   [status.completionTime: Invalid value: "...": cannot set completionTime
+    ///      when there is no Complete=True condition,
+    ///    status.conditions: Invalid value: cannot set Failed=True condition
+    ///      without the FailureTarget=true condition]
+    /// ```
+    ///
+    /// (pkg/apis/batch/validation/validation.go:505-522). Upstream appends the
+    /// interim `FailureTarget` condition first and only then adds `Failed` with
+    /// the same reason/message — `job_controller.go:1307-1316` ->
+    /// `newFailedConditionForFailureTarget` — and sets `completionTime` only
+    /// for Complete jobs. The rejected write left the Job `active: 1` forever,
+    /// so `WaitForJobFailed` timed out in all seven Job [Conformance] specs.
+    #[tokio::test]
+    async fn failed_job_sets_failure_target_and_no_completion_time() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("failjob", "default", 1, 1);
+        job.spec.backoff_limit = Some(0);
+        let job_key = build_key("jobs", Some("default"), "failjob");
+        storage.create(&job_key, &job).await.unwrap();
+
+        // One pod, already Failed: with backoffLimit 0 the job must fail.
+        let pod = make_pod(
+            "failjob-1",
+            "default",
+            Phase::Failed,
+            "failjob",
+            "job-uid-1",
+        );
+        storage
+            .create(&build_key("pods", Some("default"), "failjob-1"), &pod)
+            .await
+            .unwrap();
+
+        let controller = JobController::new(storage.clone());
+        controller.reconcile_all().await.unwrap();
+
+        let stored: Job = storage.get(&job_key).await.unwrap();
+        let status = stored.status.expect("job must have status");
+        let conditions = status.conditions.unwrap_or_default();
+
+        let failed = conditions
+            .iter()
+            .find(|c| c.condition_type == "Failed" && c.status == "True");
+        assert!(failed.is_some(), "job must end Failed, got {conditions:?}");
+
+        let target = conditions
+            .iter()
+            .find(|c| c.condition_type == "FailureTarget" && c.status == "True")
+            .expect("Failed=True requires FailureTarget=True, or the api-server rejects the write");
+        assert_eq!(
+            target.reason,
+            failed.unwrap().reason,
+            "FailureTarget carries the same reason the Failed condition reports"
+        );
+
+        assert!(
+            status.completion_time.is_none(),
+            "completionTime is only valid for Complete jobs; a failed job must not set it"
+        );
     }
 
     #[tokio::test]
