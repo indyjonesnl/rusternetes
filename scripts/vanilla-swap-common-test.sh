@@ -616,6 +616,33 @@ case "$PF_ARGS" in
   *) bad "preflight args must pass --skip-node-image-check, got: $PF_ARGS" ;;
 esac
 
+# The api-server leg is the exception. Swapping the api-server swaps the OBJECT
+# STORE with it: the rusternetes api-server comes up on an empty database, so
+# the kind control-plane mirror pods and the CoreDNS Deployment are not visible
+# through it — not because the module failed, but because that is what this
+# leg tests. Asserting them refuses the leg outright (run 33159492201:
+# "kube-scheduler-vanilla-swap-api-server-control-plane does not exist",
+# module-did-not-come-up) and we never see the leg's real pass rate.
+PF_API="$(vs_preflight_args my-cluster api-server | tr '\n' ' ')"
+case "$PF_API" in
+  *"--control-plane-pods --preflight-arg none"*) ok "api-server leg does not assert kind control-plane pods" ;;
+  *) bad "the api-server leg must pass --control-plane-pods none, got: $PF_API" ;;
+esac
+case "$PF_API" in
+  *"--dns-deployment --preflight-arg none"*) ok "api-server leg does not assert cluster DNS" ;;
+  *) bad "the api-server leg must pass --dns-deployment none, got: $PF_API" ;;
+esac
+# ...but the environment-level assertions it can still make must stay on.
+case "$PF_API" in
+  *"--kubelet --preflight-arg none"*) ok "api-server leg keeps the container-scoped opt-outs" ;;
+  *) bad "the api-server leg must still pass --kubelet none, got: $PF_API" ;;
+esac
+# Every other module keeps the real gate.
+case "$(vs_preflight_args my-cluster kubelet | tr '\n' ' ')" in
+  *"kube-scheduler-my-cluster-control-plane"*) ok "other modules still assert the kind control-plane pods" ;;
+  *) bad "only the api-server leg may skip the control-plane assertion" ;;
+esac
+
 # ...and the runner has to actually pass them. A helper nothing calls would
 # leave the legs exactly as broken.
 RUN_SH="$(cat "$SCRIPT_DIR/vanilla-swap-run.sh")"
