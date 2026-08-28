@@ -191,9 +191,30 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         // 4. Calculate desired_healthy based on min_available or max_unavailable
         let desired_healthy = self.calculate_desired_healthy(pdb, total_pods)?;
 
-        // 5. Calculate disruptions_allowed
-        // disruptions_allowed = current_healthy - desired_healthy
-        let disruptions_allowed = healthy_pods - desired_healthy;
+        // 5. Calculate disruptions_allowed, clamped at 0.
+        //
+        // Upstream (pkg/controller/disruption/disruption.go:1008-1011):
+        //
+        //     disruptionsAllowed := currentHealthy - desiredHealthy
+        //     if expectedCount <= 0 || disruptionsAllowed <= 0 {
+        //         disruptionsAllowed = 0
+        //     }
+        //
+        // The field is `+optional` but validated `Minimum=0`, so a negative
+        // value (0 healthy under `minAvailable: 2` gives -2) makes the whole
+        // status write fail:
+        //
+        //     Error from server (Invalid): PodDisruptionBudget.policy "foo" is
+        //     invalid: status.disruptionsAllowed: Invalid value: -2: must be
+        //     greater than or equal to 0
+        //
+        // observedGeneration then never advances and upstream's
+        // waitForPdbToBeProcessed polls until the spec times out.
+        let disruptions_allowed = if total_pods <= 0 {
+            0
+        } else {
+            (healthy_pods - desired_healthy).max(0)
+        };
 
         debug!(
             "PDB {}/{}: desired_healthy={}, disruptions_allowed={}",
@@ -983,6 +1004,91 @@ mod tests {
             Some(1),
             "observedGeneration must reach metadata.generation, else upstream's \
              waitForPdbToBeProcessed polls until it times out"
+        );
+    }
+
+    /// `status.disruptionsAllowed` must never go negative.
+    ///
+    /// With no matching pods and `minAvailable: 2`, `currentHealthy -
+    /// desiredHealthy` is -2. Upstream clamps that to 0
+    /// (pkg/controller/disruption/disruption.go:1008-1011):
+    ///
+    /// ```go
+    /// disruptionsAllowed := currentHealthy - desiredHealthy
+    /// if expectedCount <= 0 || disruptionsAllowed <= 0 {
+    ///     disruptionsAllowed = 0
+    /// }
+    /// ```
+    ///
+    /// and the API type declares the field `+kubebuilder:validation:Minimum=0`,
+    /// so an api-server that validates it rejects the whole status write:
+    ///
+    /// ```text
+    /// Failed to reconcile poddisruptionbudgets/pdb-check/foo: Bad request:
+    ///   Error from server (Invalid): PodDisruptionBudget.policy "foo" is invalid:
+    ///   status.disruptionsAllowed: Invalid value: -2: must be greater than or equal to 0
+    /// ```
+    ///
+    /// The rejected write took observedGeneration with it, so upstream's
+    /// `waitForPdbToBeProcessed` (test/e2e/apps/disruption.go:760) polled for
+    /// its full 10-minute budget and FOUR DisruptionController [Conformance]
+    /// specs failed on it.
+    #[tokio::test]
+    async fn disruptions_allowed_is_never_negative() {
+        let storage = Arc::new(StatusStrippingStorage {
+            inner: MemoryStorage::new(),
+        });
+        // minAvailable: 2, and not a single pod matches the selector.
+        let mut pdb = pdb_fixture();
+        pdb.spec.min_available = Some(IntOrString::Int(2));
+        let key = build_key("poddisruptionbudgets", Some("default"), "pdb-1");
+        storage.create(&key, &pdb).await.unwrap();
+
+        let controller = PodDisruptionBudgetController::new(storage.clone());
+        controller.reconcile_pdb(&pdb).await.unwrap();
+
+        let status = storage
+            .get::<PodDisruptionBudget>(&key)
+            .await
+            .unwrap()
+            .status
+            .expect("reconcile must persist status");
+        assert_eq!(
+            status.disruptions_allowed, 0,
+            "disruptionsAllowed must clamp at 0, not report {}",
+            status.disruptions_allowed
+        );
+        assert_eq!(
+            status.observed_generation,
+            Some(1),
+            "the clamped write must still advance observedGeneration"
+        );
+    }
+
+    /// The clamp is not a blanket zero: a PDB with slack still reports it.
+    #[tokio::test]
+    async fn disruptions_allowed_reports_real_slack() {
+        let storage = Arc::new(StatusStrippingStorage {
+            inner: MemoryStorage::new(),
+        });
+        let mut pdb = pdb_fixture();
+        pdb.spec.min_available = Some(IntOrString::Int(0));
+        let key = build_key("poddisruptionbudgets", Some("default"), "pdb-1");
+        storage.create(&key, &pdb).await.unwrap();
+
+        let controller = PodDisruptionBudgetController::new(storage.clone());
+        controller.reconcile_pdb(&pdb).await.unwrap();
+
+        let status = storage
+            .get::<PodDisruptionBudget>(&key)
+            .await
+            .unwrap()
+            .status
+            .expect("reconcile must persist status");
+        assert!(
+            status.disruptions_allowed >= 0,
+            "never negative: {}",
+            status.disruptions_allowed
         );
     }
 

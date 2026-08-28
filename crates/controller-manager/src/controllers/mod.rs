@@ -37,6 +37,8 @@ pub mod service;
 pub mod serviceaccount;
 pub mod servicecidr;
 pub mod statefulset;
+#[cfg(test)]
+pub mod status_subresource_double;
 pub mod storage_class;
 pub mod taint_eviction;
 pub mod ttl_controller;
