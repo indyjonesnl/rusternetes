@@ -780,13 +780,22 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         let new_status_clone = new_status.clone();
         updated_rc.status = Some(new_status);
 
-        if let Err(e) = self.storage.update(&key, &updated_rc).await {
+        // update_status, NOT update: a full-object PUT has its `.status`
+        // stripped by any api-server that exposes a status subresource (see
+        // crates/storage/src/api_storage.rs). Against a vanilla control plane
+        // every RC status write vanished — a Running single-replica RC reported
+        // `status={"replicas":0}` forever, so the lifecycle spec's watch for
+        // `replicas == readyReplicas == 1` timed out, the scale spec could not
+        // confirm its replica count, and the ReplicaFailure condition this
+        // function builds never reached the object. Same defect the PDB
+        // controller had in #1712.
+        if let Err(e) = self.storage.update_status(&key, &updated_rc).await {
             // CAS conflict — re-read and retry once to ensure condition updates persist
             debug!("RC status update CAS conflict, retrying: {}", e);
             if let Ok(mut fresh_rc) = self.storage.get::<ReplicationController>(&key).await {
                 if fresh_rc.status.as_ref() != Some(&new_status_clone) {
                     fresh_rc.status = Some(new_status_clone);
-                    let _ = self.storage.update(&key, &fresh_rc).await;
+                    let _ = self.storage.update_status(&key, &fresh_rc).await;
                 }
             }
         }
@@ -1012,6 +1021,78 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    /// RC status must be written through the STATUS SUBRESOURCE.
+    ///
+    /// `Storage::update` is a full-object PUT, and an api-server that exposes
+    /// `/status` for a type strips `.status` from those. Driving a vanilla
+    /// control plane, every RC status write vanished — a Running single-replica
+    /// RC reported `status={"replicas":0}` forever:
+    ///
+    /// * `[sig-apps] ReplicationController should test the lifecycle of a
+    ///   ReplicationController` watches for `status.replicas == 1 &&
+    ///   status.readyReplicas == 1` (test/e2e/apps/rc.go:190) and timed out.
+    /// * `... should get and update a ReplicationController scale` could not
+    ///   "confirm the quantity of ReplicationController replicas" (rc.go:442).
+    /// * `... should surface a failure condition on a common issue like
+    ///   exceeded quota` never saw the ReplicaFailure condition the controller
+    ///   does build (rc.go:594) — conditions live in `.status` too.
+    ///
+    /// MemoryStorage cannot catch this (its `update_status` funnels through
+    /// `update`), hence `StatusSubresourceStorage`.
+    #[tokio::test]
+    async fn rc_status_survives_an_apiserver_that_strips_status_on_put() {
+        use crate::controllers::status_subresource_double::StatusSubresourceStorage;
+
+        let storage = Arc::new(StatusSubresourceStorage::new());
+        let mut selector = HashMap::new();
+        selector.insert("name".to_string(), "test-rc".to_string());
+        let rc = make_rc("test-rc", "default", 1, selector.clone(), None);
+        let key = build_key("replicationcontrollers", Some("default"), "test-rc");
+        storage.create(&key, &rc).await.unwrap();
+
+        let controller = ReplicationControllerController::new(storage.clone(), 1);
+        // One reconcile creates the pod; mark it Ready, then reconcile again so
+        // the controller observes a ready replica and reports it.
+        controller.reconcile_all().await.unwrap();
+        let pods: Vec<Pod> = storage
+            .list(&rusternetes_storage::build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert_eq!(pods.len(), 1, "reconcile must create the replica");
+        let pod_key = build_key("pods", Some("default"), &pods[0].metadata.name);
+        let mut pod = pods[0].clone();
+        let mut status = pod.status.clone().unwrap_or_default();
+        status.phase = Some(Phase::Running);
+        status.conditions = Some(vec![rusternetes_common::resources::PodCondition {
+            condition_type: "Ready".to_string(),
+            status: "True".to_string(),
+            reason: None,
+            message: None,
+            last_probe_time: None,
+            last_transition_time: None,
+            observed_generation: None,
+        }]);
+        pod.status = Some(status);
+        storage.update_status(&pod_key, &pod).await.unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        let stored: ReplicationController = storage.get(&key).await.unwrap();
+        let st = stored
+            .status
+            .expect("RC status must persist through the status subresource");
+        assert_eq!(
+            st.replicas, 1,
+            "status.replicas must report the live replica"
+        );
+        assert_eq!(
+            st.ready_replicas,
+            Some(1),
+            "status.readyReplicas must report the ready replica; the lifecycle \
+             spec watches for exactly this"
+        );
     }
 
     #[tokio::test]
