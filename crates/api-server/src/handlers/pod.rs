@@ -1128,35 +1128,50 @@ pub async fn delete_pod(
         return Ok(Json(updated_pod));
     }
 
-    // Update the pod in storage with deletionTimestamp set.
-    // Re-read for fresh resourceVersion to avoid CAS conflict.
-    // K8s doesn't use CAS for deletion — it reads the latest, sets
-    // deletionTimestamp, and writes. If there's a conflict, retry.
-    // K8s ref: staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go
-    let mut fresh_pod: Pod = state.storage.get(&key).await?;
-    if fresh_pod.metadata.deletion_timestamp.is_none() {
-        fresh_pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
-    }
-    fresh_pod.metadata.deletion_grace_period_seconds = Some(grace_period);
-    let current_gen = fresh_pod.metadata.generation.unwrap_or(1);
-    fresh_pod.metadata.generation = Some(current_gen + 1);
-
-    match state.storage.update(&key, &fresh_pod).await {
-        Ok(saved) => Ok(Json(saved)),
-        Err(rusternetes_common::Error::Conflict(_)) => {
-            // CAS conflict — retry once with latest version
-            let mut retry_pod: Pod = state.storage.get(&key).await?;
-            if retry_pod.metadata.deletion_timestamp.is_none() {
-                retry_pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
-            }
-            retry_pod.metadata.deletion_grace_period_seconds = Some(grace_period);
-            let gen = retry_pod.metadata.generation.unwrap_or(1);
-            retry_pod.metadata.generation = Some(gen + 1);
-            let saved: Pod = state.storage.update(&key, &retry_pod).await?;
-            Ok(Json(saved))
+    // Stamp deletionTimestamp with a read-modify-write that RETRIES on CAS
+    // conflict, the way upstream runs graceful deletion through
+    // `GuaranteedUpdate` — which re-reads and re-applies until it wins or a
+    // caller-supplied precondition fails
+    // (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go,
+    // `updateForGracefulDeletionAndFinalizers` → `Storage.GuaranteedUpdate`).
+    //
+    // A just-scheduled pod has several concurrent writers (scheduler binding,
+    // kubelet status), so its resourceVersion moves between our read and our
+    // write. That conflict is the server's own race — the client sent no
+    // resourceVersion — and must never reach it as a 409. Retrying only once
+    // was enough for a quiet cluster and failed under conformance load:
+    // `[sig-node] ... should be possible to delete` died on
+    // "resourceVersion mismatch: resource was modified (expected: 3560,
+    // current: 3561)".
+    const DELETE_CAS_ATTEMPTS: usize = 8;
+    let mut last_conflict = None;
+    for _ in 0..DELETE_CAS_ATTEMPTS {
+        let mut fresh_pod: Pod = state.storage.get(&key).await?;
+        if fresh_pod.metadata.deletion_timestamp.is_none() {
+            fresh_pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
         }
-        Err(e) => Err(e),
+        fresh_pod.metadata.deletion_grace_period_seconds = Some(grace_period);
+        let current_gen = fresh_pod.metadata.generation.unwrap_or(1);
+        fresh_pod.metadata.generation = Some(current_gen + 1);
+
+        match state.storage.update(&key, &fresh_pod).await {
+            Ok(saved) => return Ok(Json(saved)),
+            Err(rusternetes_common::Error::Conflict(msg)) => {
+                last_conflict = Some(msg);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
+
+    Err(rusternetes_common::Error::Conflict(
+        last_conflict.unwrap_or_else(|| {
+            format!(
+                "could not stamp deletionTimestamp on {} — object kept changing",
+                key
+            )
+        }),
+    ))
 }
 
 pub async fn list(

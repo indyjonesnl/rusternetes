@@ -137,6 +137,7 @@ mod persistentvolume_handler_test;
 mod persistentvolumeclaim_handler_test;
 mod plc_update_validation_test;
 mod pod_binding_target_kind_test;
+mod pod_delete_cas_retry_test;
 mod pod_enable_service_links_default_test;
 mod pod_handler_test;
 mod pod_lifecycle_extended_test;
