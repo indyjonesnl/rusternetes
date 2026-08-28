@@ -37,6 +37,7 @@ make_stubs() {
 #!/usr/bin/env bash
 # Stub kubectl: answers only the queries conformance-preflight.sh makes.
 args="$*"
+[ -n "${STUB_LOG:-}" ] && echo "kubectl $args" >>"$STUB_LOG"
 case "$args" in
     *"--raw /healthz"*)
         [ "${HEALTHZ_OK:-1}" = "1" ] || exit 1
@@ -46,6 +47,17 @@ case "$args" in
     *"pod -n kube-system kube-controller-manager-node-1"*)
         printf '%s' "${CM_PHASE-Running}"; exit 0 ;;
     *"deploy -n kube-system rusternetes-dns"*)
+        printf '%s' "${DNS_READY-1}"; exit 0 ;;
+    *"get pod -n kube-system"*)
+        # Any other pod name: the caller overrode --control-plane-pods, so
+        # answer by role rather than by the compose-stack name.
+        case "$args" in
+            *scheduler*)          printf '%s' "${SCHED_PHASE-Running}" ;;
+            *controller-manager*) printf '%s' "${CM_PHASE-Running}" ;;
+        esac
+        exit 0 ;;
+    *"get deploy -n kube-system"*)
+        # Any other deployment name (--dns-deployment override).
         printf '%s' "${DNS_READY-1}"; exit 0 ;;
     *"get nodes"*)
         # Mirrors the jsonpath shape: name=<disk>,<mem> per node, space separated.
@@ -139,10 +151,11 @@ mkdir -p "$FAKE_CERTS"
 
 # Run the preflight with stubs first on PATH, plus any scenario knobs.
 # Scenario knobs are passed as NAME=VALUE pairs and reach the stubs via env.
+PREFLIGHT_FLAGS=()
 run_preflight() {
     env PATH="$STUBS:$PATH" CERTS_PATH="$FAKE_CERTS" "$@" \
         bash "$PREFLIGHT" --kubeconfig "$FAKE_KUBECONFIG" --certs-path "$FAKE_CERTS" \
-        --timeout 30 2>&1
+        --timeout 30 ${PREFLIGHT_FLAGS[@]+"${PREFLIGHT_FLAGS[@]}"} 2>&1
 }
 
 # expect_case <name> <expected_rc> <expected substring> [NAME=VALUE ...]
@@ -243,6 +256,81 @@ expect_case "matching per-node binaries pass" 0 "run the same /app"
 # A single-node or all-in-one stack has no node-2 peer, which is not a fault.
 expect_case "absent node-2 peers are not a fault" 0 "no per-node service pairs present" \
     "NODE2_PRESENT=0"
+
+# The control-plane pod names and the DNS Deployment name are compose-stack
+# facts, not universal ones. vanilla-swap (#1629) runs this same preflight
+# against a kind cluster, where the mirror pods are
+# kube-scheduler-<kind-node> and DNS is CoreDNS — hardcoding the compose names
+# made every vanilla-swap leg report "module-did-not-come-up" from 2026-08-27
+# on, with three preflight FAILs that described the harness, not the module.
+PREFLIGHT_FLAGS=(--control-plane-pods "kube-scheduler-kind-cp,kube-controller-manager-kind-cp")
+STUB_LOG_FILE="$TMPROOT/kubectl-queries.log"
+: >"$STUB_LOG_FILE"
+expect_case "custom control-plane pod names are accepted" 0 "kube-scheduler-kind-cp is Running" \
+    "STUB_LOG=$STUB_LOG_FILE"
+if grep -q "pod -n kube-system kube-scheduler-kind-cp" "$STUB_LOG_FILE" \
+   && grep -q "pod -n kube-system kube-controller-manager-kind-cp" "$STUB_LOG_FILE"; then
+    echo "ok   [--control-plane-pods changes which pods are queried]"
+else
+    echo "FAIL [--control-plane-pods]: the overridden names were never queried"
+    sed 's/^/    /' "$STUB_LOG_FILE"
+    fail=1
+fi
+
+# A cluster whose control plane is not rusternetes' (vanilla kind) can opt out
+# of the assertion entirely — 'none' must not degrade into a pod literally
+# named "none".
+PREFLIGHT_FLAGS=(--control-plane-pods none)
+: >"$STUB_LOG_FILE"
+expect_case "--control-plane-pods none skips the assertion" 0 "static-pod assertion skipped" \
+    "SCHED_PHASE=" "CM_PHASE=" "STUB_LOG=$STUB_LOG_FILE"
+if grep -q "pod -n kube-system" "$STUB_LOG_FILE"; then
+    echo "FAIL [--control-plane-pods none]: still queried a pod"
+    sed 's/^/    /' "$STUB_LOG_FILE"
+    fail=1
+else
+    echo "ok   [--control-plane-pods none queries no pod at all]"
+fi
+
+PREFLIGHT_FLAGS=(--dns-deployment coredns)
+: >"$STUB_LOG_FILE"
+expect_case "custom dns deployment name is accepted" 0 "coredns has 1 ready replica" \
+    "STUB_LOG=$STUB_LOG_FILE"
+if grep -q "deploy -n kube-system coredns" "$STUB_LOG_FILE"; then
+    echo "ok   [--dns-deployment changes which Deployment is queried]"
+else
+    echo "FAIL [--dns-deployment]: coredns was never queried"
+    sed 's/^/    /' "$STUB_LOG_FILE"
+    fail=1
+fi
+
+PREFLIGHT_FLAGS=(--dns-deployment none)
+: >"$STUB_LOG_FILE"
+expect_case "--dns-deployment none skips the assertion" 0 "cluster-DNS assertion skipped" \
+    "DNS_READY=0" "STUB_LOG=$STUB_LOG_FILE"
+if grep -q "deploy -n kube-system" "$STUB_LOG_FILE"; then
+    echo "FAIL [--dns-deployment none]: still queried a Deployment"
+    sed 's/^/    /' "$STUB_LOG_FILE"
+    fail=1
+else
+    echo "ok   [--dns-deployment none queries no Deployment at all]"
+fi
+PREFLIGHT_FLAGS=()
+
+# The container-scoped assertions (certs mount, storage size) address
+# containers by NAME on the local daemon, which says nothing about the cluster
+# under test: run against a kind cluster on a workstation that also has a
+# compose stack up, they inspect the OTHER cluster's containers and refuse the
+# run over its certs mount. A caller whose cluster has neither container says
+# so with 'none'.
+PREFLIGHT_FLAGS=(--kubelet none)
+expect_case "--kubelet none skips the certs-mount assertion" 0 "certs-mount assertion skipped" \
+    "CERTS_MOUNTED=0"
+
+PREFLIGHT_FLAGS=(--storage-container none)
+expect_case "--storage-container none skips the storage-size assertion" 0 "storage-size assertion skipped" \
+    "STORAGE_DB_BYTES=999999999"
+PREFLIGHT_FLAGS=()
 
 # --skip-node-image-check bypasses only that assertion.
 out_skip_img="$(env PATH="$STUBS:$PATH" CERTS_PATH="$FAKE_CERTS" \

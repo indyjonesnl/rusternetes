@@ -351,6 +351,11 @@ if [ "$VS_SWAP" = "join-worker" ] && [ -n "${VS_NODE_NAME:-}" ]; then
   vs_pin_tests_to_swapped_node "$KUBECONFIG_FILE" "$VS_NODE_NAME" &
 fi
 
+# Describe this cluster's shape to the runner's preflight gate: kind names its
+# control-plane mirror pods after the node and serves DNS from CoreDNS, so the
+# gate's compose-stack defaults would refuse a perfectly healthy leg.
+mapfile -t VS_PREFLIGHT_ARGS < <(vs_preflight_args "$CLUSTER")
+
 vs_log "running scoped subset (target=$VS_TARGET focus=$VS_FOCUS) via conformance-target-run.sh"
 RESULT_OUT="$VS_WORKDIR/target-run.out"
 set +e
@@ -365,7 +370,8 @@ env -u GITHUB_OUTPUT timeout "${VS_TEST_TIMEOUT:-4500}" bash "$SCRIPT_DIR/confor
   --focus "$VS_FOCUS" \
   --skip "$VS_SKIP" \
   --kubeconfig "$KUBECONFIG_FILE" \
-  --output-dir "$VS_WORKDIR" | tee "$RESULT_OUT"
+  --output-dir "$VS_WORKDIR" \
+  "${VS_PREFLIGHT_ARGS[@]}" | tee "$RESULT_OUT"
 runner_rc=${PIPESTATUS[0]}
 set -e
 [ "$runner_rc" -eq 124 ] && vs_warn "conformance step hit VS_TEST_TIMEOUT (likely a hung post-test cleanup); using junit on disk for the verdict"

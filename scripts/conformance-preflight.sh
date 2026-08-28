@@ -48,14 +48,27 @@
 #   --certs-path PATH   Host-absolute certs dir expected inside the kubelet
 #                       (default: $CERTS_PATH, else <repo>/.rusternetes/certs)
 #   --kubelet NAME      Kubelet container to inspect for the certs mount
-#                       (default: rusternetes-kubelet)
+#                       (default: rusternetes-kubelet; 'none' skips the
+#                       assertion — the containers are addressed by name on the
+#                       local daemon, so a cluster that is not this compose
+#                       stack must opt out rather than inspect someone else's)
+#   --control-plane-pods LIST
+#                       Comma-separated kube-system pods that must be Running
+#                       (default: kube-scheduler-node-1,kube-controller-manager-node-1;
+#                       'none' skips the assertion). vanilla-swap runs this
+#                       against a kind cluster, where the mirror pods are
+#                       named after the kind control-plane node.
+#   --dns-deployment NAME
+#                       kube-system Deployment that must have a ready replica
+#                       (default: rusternetes-dns; 'none' skips the assertion,
+#                       e.g. a kind cluster serving DNS from CoreDNS)
 #   --sandbox-image REF Image whose pull is exercised
 #                       (default: registry.k8s.io/pause:3.10.1)
 #   --skip-image-pull   Skip only the image-pull assertion (offline work)
 #   --storage-container NAME
 #                       Container holding the storage backend, inspected for
-#                       size (default: rusternetes-rhino; absent = skipped,
-#                       which is the etcd/remote case)
+#                       size (default: rusternetes-rhino; 'none' or absent =
+#                       skipped, which is the etcd/remote case)
 #   --max-storage-mb N  Refuse to run when state.db + WAL exceed N MB
 #                       (default: 256; one full suite on a fresh cluster grows
 #                       the store to ~85 MB, so 256 means "more than a couple
@@ -79,6 +92,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/rusternetes-config}"
 CERTS_PATH_EXPECTED="${CERTS_PATH:-$REPO_ROOT/.rusternetes/certs}"
 KUBELET_CONTAINER="rusternetes-kubelet"
+CONTROL_PLANE_PODS="kube-scheduler-node-1,kube-controller-manager-node-1"
+DNS_DEPLOYMENT="rusternetes-dns"
 SANDBOX_IMAGE="registry.k8s.io/pause:3.10.1"
 SKIP_IMAGE_PULL=0
 STORAGE_CONTAINER="rusternetes-rhino"
@@ -108,6 +123,8 @@ while [ $# -gt 0 ]; do
         --kubeconfig)      [ $# -ge 2 ] || die "--kubeconfig requires a value"; KUBECONFIG_PATH="$2"; shift 2 ;;
         --certs-path)      [ $# -ge 2 ] || die "--certs-path requires a value"; CERTS_PATH_EXPECTED="$2"; shift 2 ;;
         --kubelet)         [ $# -ge 2 ] || die "--kubelet requires a value"; KUBELET_CONTAINER="$2"; shift 2 ;;
+        --control-plane-pods) [ $# -ge 2 ] || die "--control-plane-pods requires a value"; CONTROL_PLANE_PODS="$2"; shift 2 ;;
+        --dns-deployment)  [ $# -ge 2 ] || die "--dns-deployment requires a value"; DNS_DEPLOYMENT="$2"; shift 2 ;;
         --sandbox-image)   [ $# -ge 2 ] || die "--sandbox-image requires a value"; SANDBOX_IMAGE="$2"; shift 2 ;;
         --skip-image-pull) SKIP_IMAGE_PULL=1; shift ;;
         --storage-container) [ $# -ge 2 ] || die "--storage-container requires a value"; STORAGE_CONTAINER="$2"; shift 2 ;;
@@ -160,24 +177,40 @@ fi
 #    failure mode, and a run without a scheduler or controller-manager is
 #    worthless — so assert the phase, not mere existence.
 # ---------------------------------------------------------------------------
-for pod in kube-scheduler-node-1 kube-controller-manager-node-1; do
-    phase="$(kc get pod -n kube-system "$pod" -o jsonpath='{.status.phase}')"
-    case "$phase" in
-        Running) pass "$pod is Running" ;;
-        "")      fail "$pod does not exist — bootstrap did not template the static pod, or the kubelet never accepted it" ;;
-        *)       fail "$pod is $phase (expected Running) — commonly CERTS_PATH unset at 'compose up', or an unresolvable control-plane image" ;;
-    esac
-done
+#
+#    The names are a compose-stack fact, not a universal one: vanilla-swap
+#    (#1629) runs this preflight against a kind cluster whose mirror pods are
+#    kube-<component>-<kind-node>, and a cluster whose control plane is none of
+#    rusternetes' business passes 'none'.
+if [ "$CONTROL_PLANE_PODS" = "none" ] || [ -z "$CONTROL_PLANE_PODS" ]; then
+    pass "control-plane static-pod assertion skipped (--control-plane-pods none)"
+else
+    IFS=',' read -r -a control_plane_pods <<<"$CONTROL_PLANE_PODS"
+    for pod in "${control_plane_pods[@]}"; do
+        [ -n "$pod" ] || continue
+        phase="$(kc get pod -n kube-system "$pod" -o jsonpath='{.status.phase}')"
+        case "$phase" in
+            Running) pass "$pod is Running" ;;
+            "")      fail "$pod does not exist — bootstrap did not template the static pod, or the kubelet never accepted it" ;;
+            *)       fail "$pod is $phase (expected Running) — commonly CERTS_PATH unset at 'compose up', or an unresolvable control-plane image" ;;
+        esac
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Cluster DNS has a ready backend. rusternetes-dns is a kube-system
 #    Deployment (not CoreDNS); without it every DNS-dependent spec times out.
+#    --dns-deployment names a different one (kind serves DNS from CoreDNS).
 # ---------------------------------------------------------------------------
-dns_ready="$(kc get deploy -n kube-system rusternetes-dns -o jsonpath='{.status.readyReplicas}')"
-if [ "${dns_ready:-0}" -ge 1 ] 2>/dev/null; then
-    pass "rusternetes-dns has ${dns_ready} ready replica(s)"
+if [ "$DNS_DEPLOYMENT" = "none" ] || [ -z "$DNS_DEPLOYMENT" ]; then
+    pass "cluster-DNS assertion skipped (--dns-deployment none)"
 else
-    fail "rusternetes-dns readyReplicas=${dns_ready:-0} — cluster DNS has no backend"
+    dns_ready="$(kc get deploy -n kube-system "$DNS_DEPLOYMENT" -o jsonpath='{.status.readyReplicas}')"
+    if [ "${dns_ready:-0}" -ge 1 ] 2>/dev/null; then
+        pass "$DNS_DEPLOYMENT has ${dns_ready} ready replica(s)"
+    else
+        fail "$DNS_DEPLOYMENT readyReplicas=${dns_ready:-0} — cluster DNS has no backend"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -216,7 +249,9 @@ fi
 #    ${CERTS_PATH}:${CERTS_PATH}. This is the root cause behind #2 above, and
 #    catching it directly makes the failure self-explanatory.
 # ---------------------------------------------------------------------------
-if command -v "$CONTAINER_RT" >/dev/null 2>&1; then
+if [ "$KUBELET_CONTAINER" = "none" ] || [ -z "$KUBELET_CONTAINER" ]; then
+    pass "certs-mount assertion skipped (--kubelet none)"
+elif command -v "$CONTAINER_RT" >/dev/null 2>&1; then
     if timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" inspect "$KUBELET_CONTAINER" >/dev/null 2>&1; then
         mounts="$(timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" inspect "$KUBELET_CONTAINER" \
             -f '{{range .Mounts}}{{.Source}}:{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null)"
@@ -305,7 +340,9 @@ fi
 #    "this store is carrying more than a couple of suites of pages that were
 #    never reclaimed".
 # ---------------------------------------------------------------------------
-if ! command -v "$CONTAINER_RT" >/dev/null 2>&1; then
+if [ "$STORAGE_CONTAINER" = "none" ] || [ -z "$STORAGE_CONTAINER" ]; then
+    pass "storage-size assertion skipped (--storage-container none)"
+elif ! command -v "$CONTAINER_RT" >/dev/null 2>&1; then
     pass "$CONTAINER_RT not available — skipping storage-size assertion"
 elif ! timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" inspect "$STORAGE_CONTAINER" >/dev/null 2>&1; then
     # etcd, a remote backend, or the all-in-one binary: nothing to measure.

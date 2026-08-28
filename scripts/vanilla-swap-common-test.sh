@@ -574,6 +574,61 @@ WF="$SCRIPT_DIR/../.github/workflows/vanilla-swap-module.yml"
 if grep -q "test-timeout" "$WF"; then ok "workflow marks a partial run on the badge"; else bad "workflow must label a test-timeout badge as partial"; fi
 
 
+# --- the conformance preflight must be told this is a kind cluster ----------
+# conformance-preflight.sh (#1777) asserts the COMPOSE stack's shape:
+# kube-scheduler-node-1 / kube-controller-manager-node-1 and the rusternetes-dns
+# Deployment. vanilla-swap drives the same runner against a kind cluster, whose
+# mirror pods are kube-<component>-<cluster>-control-plane and whose DNS is
+# CoreDNS — so from 2026-08-27 every leg died in preflight with three FAILs
+# about objects that cannot exist here, and reported module-did-not-come-up
+# (runs 33103401201, 33119674890) for modules that had come up fine.
+PF_ARGS="$(vs_preflight_args my-cluster | tr '\n' ' ')"
+case "$PF_ARGS" in
+  *"--control-plane-pods --preflight-arg kube-scheduler-my-cluster-control-plane,kube-controller-manager-my-cluster-control-plane"*)
+    ok "preflight args name the kind mirror pods" ;;
+  *) bad "preflight args must name kube-<component>-<cluster>-control-plane, got: $PF_ARGS" ;;
+esac
+case "$PF_ARGS" in
+  *"--dns-deployment --preflight-arg coredns"*) ok "preflight args point DNS at CoreDNS" ;;
+  *) bad "preflight args must point the DNS assertion at coredns, got: $PF_ARGS" ;;
+esac
+case "$PF_ARGS" in
+  *rusternetes-dns*|*node-1*) bad "preflight args must not carry compose-stack names: $PF_ARGS" ;;
+  *) ok "preflight args carry no compose-stack names" ;;
+esac
+
+# The container-scoped assertions address containers by NAME on the local
+# daemon. A vanilla-swap cluster is kind, so rusternetes-kubelet /
+# rusternetes-rhino / the kubelet2 peers either do not exist or — on a
+# workstation running a compose stack next to this kind cluster — belong to a
+# DIFFERENT cluster, whose certs mount then refuses this run (observed
+# locally: "kubelet does not mount the certs dir ..." against a kind cluster).
+case "$PF_ARGS" in
+  *"--kubelet --preflight-arg none"*) ok "preflight args disable the certs-mount assertion" ;;
+  *) bad "preflight args must pass --kubelet none, got: $PF_ARGS" ;;
+esac
+case "$PF_ARGS" in
+  *"--storage-container --preflight-arg none"*) ok "preflight args disable the storage-size assertion" ;;
+  *) bad "preflight args must pass --storage-container none, got: $PF_ARGS" ;;
+esac
+case "$PF_ARGS" in
+  *"--skip-node-image-check"*) ok "preflight args disable the per-node binary assertion" ;;
+  *) bad "preflight args must pass --skip-node-image-check, got: $PF_ARGS" ;;
+esac
+
+# ...and the runner has to actually pass them. A helper nothing calls would
+# leave the legs exactly as broken.
+RUN_SH="$(cat "$SCRIPT_DIR/vanilla-swap-run.sh")"
+case "$RUN_SH" in
+  *"vs_preflight_args"*) ok "vanilla-swap-run.sh builds the preflight args" ;;
+  *) bad "vanilla-swap-run.sh must call vs_preflight_args" ;;
+esac
+TARGET_CALL="$(sed -n '/conformance-target-run.sh/,/^set -e$/p' "$SCRIPT_DIR/vanilla-swap-run.sh")"
+case "$TARGET_CALL" in
+  *'VS_PREFLIGHT_ARGS[@]'*) ok "the conformance-target-run.sh call forwards them" ;;
+  *) bad "the conformance-target-run.sh invocation must forward VS_PREFLIGHT_ARGS" ;;
+esac
+
 # --- cluster name must be overridable --------------------------------------
 # kind creates/deletes by name, so debugging a leg locally would otherwise wipe an
 # existing vanilla-swap-<module> cluster someone is using.

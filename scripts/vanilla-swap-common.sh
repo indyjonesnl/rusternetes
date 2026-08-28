@@ -210,6 +210,40 @@ vs_create_baseline() {
 # vs_control_plane_node <cluster>
 vs_control_plane_node() { printf '%s-control-plane\n' "$1"; }
 
+# vs_preflight_args <cluster>
+# --preflight-arg pairs for conformance-target-run.sh that describe THIS
+# cluster to conformance-preflight.sh (#1777). The gate's defaults describe the
+# compose stack — kube-scheduler-node-1 / kube-controller-manager-node-1 and the
+# rusternetes-dns Deployment — none of which exist in a kind cluster, where the
+# static-pod mirrors are named after the kind control-plane node and DNS is
+# CoreDNS. Left unset, the gate refused every vanilla-swap leg on three FAILs
+# describing the harness rather than the module under test.
+#
+# The container-scoped assertions (certs mount, store size, per-node binary
+# equality) are switched off outright: they address containers by NAME on the
+# local daemon, so against a kind cluster they either find nothing or — on a
+# workstation that also has a compose stack up — measure a DIFFERENT cluster
+# and refuse this run over its certs mount.
+#
+# Note this KEEPS the gate meaningful rather than turning it off: a swapped
+# scheduler or controller-manager whose static pod never reached Running still
+# stops the run, a cluster with no DNS backend still does, and so do node
+# eviction pressure and a broken registry path.
+vs_preflight_args() {
+  local cluster="$1" node
+  node="$(vs_control_plane_node "$cluster")"
+  printf '%s\n' \
+    --preflight-arg --control-plane-pods \
+    --preflight-arg "kube-scheduler-${node},kube-controller-manager-${node}" \
+    --preflight-arg --dns-deployment \
+    --preflight-arg coredns \
+    --preflight-arg --kubelet \
+    --preflight-arg none \
+    --preflight-arg --storage-container \
+    --preflight-arg none \
+    --preflight-arg --skip-node-image-check
+}
+
 # ---------------------------------------------------------------------------
 # Swap functions
 # ---------------------------------------------------------------------------

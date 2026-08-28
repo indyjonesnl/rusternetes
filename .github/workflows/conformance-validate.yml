@@ -24,6 +24,8 @@ on:
       - 'scripts/gen-target-workflows.sh'
       - 'scripts/tests/test-targets-manifest.sh'
       - 'scripts/tests/test-conformance-target-run.sh'
+      - 'scripts/conformance-preflight.sh'
+      - 'scripts/tests/test-conformance-preflight.sh'
       - 'scripts/tests/test-target-workflows-sync.sh'
       - 'scripts/tests/test-target-coverage.sh'
       - 'scripts/tests/testdata/sig-coverage-sample.txt'
@@ -79,6 +81,8 @@ jobs:
         run: bash scripts/tests/test-targets-manifest.sh
       - name: Runner unit tests
         run: bash scripts/tests/test-conformance-target-run.sh
+      - name: Cluster preflight unit tests
+        run: bash scripts/tests/test-conformance-preflight.sh
       - name: Per-target workflow drift
         run: bash scripts/tests/test-target-workflows-sync.sh
       - name: Per-module vanilla-swap workflow drift

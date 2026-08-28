@@ -24,7 +24,7 @@
 #   bash scripts/conformance-target-run.sh --target sig-node [flags]
 #
 # Flags: --target --focus --skip --parallel --kubeconfig --conformance-image
-#        --output-dir --hydrophone --skip-preflight -h|--help
+#        --output-dir --hydrophone --skip-preflight --preflight-arg -h|--help
 #        --skip-preflight  Skip the cluster health gate (conformance-preflight.sh);
 #                          results then describe the cluster, not the code (#1777)
 #        --parallel N   ginkgo procs (default 2; ginkgo isolates [Serial] specs)
@@ -152,6 +152,11 @@ KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/rusternetes-config}"
 CONFORMANCE_IMAGE="registry.k8s.io/conformance:v1.35.0"
 OUTPUT_DIR=""; HYDROPHONE_BIN=""; PARALLEL=2
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
+# Extra flags handed to conformance-preflight.sh. The gate's defaults describe
+# the compose stack (kube-scheduler-node-1, rusternetes-dns); a caller running
+# against a differently-shaped cluster — vanilla-swap's kind cluster, #1629 —
+# says so here instead of turning the gate off wholesale.
+PREFLIGHT_ARGS=()
 
 die() { echo "[conformance-target-run] ERROR: $*" >&2; exit 2; }
 
@@ -167,6 +172,7 @@ while [[ $# -gt 0 ]]; do
         --hydrophone) [[ $# -ge 2 ]] || die "--hydrophone requires a value"; HYDROPHONE_BIN="$2"; shift 2 ;;
         --parallel) [[ $# -ge 2 ]] || die "--parallel requires a value"; PARALLEL="$2"; shift 2 ;;
         --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
+        --preflight-arg) [[ $# -ge 2 ]] || die "--preflight-arg requires a value"; PREFLIGHT_ARGS+=("$2"); shift 2 ;;
         *) die "unknown flag: $1 (use --help)" ;;
     esac
 done
@@ -208,8 +214,10 @@ if [ "$SKIP_PREFLIGHT" = "1" ]; then
 elif [ ! -x "$PREFLIGHT_BIN" ]; then
     echo "  preflight : not found at $PREFLIGHT_BIN — continuing without it"
 else
-    echo "  preflight : $PREFLIGHT_BIN"
-    "$PREFLIGHT_BIN" --kubeconfig "$KUBECONFIG_PATH" \
+    # Join with spaces explicitly: this script sets IFS=$'\n\t', so "${a[*]}"
+    # would print one flag per line and hide the forwarded arguments.
+    echo "  preflight : $PREFLIGHT_BIN $(IFS=' '; echo "${PREFLIGHT_ARGS[*]:-}")"
+    "$PREFLIGHT_BIN" --kubeconfig "$KUBECONFIG_PATH" ${PREFLIGHT_ARGS[@]+"${PREFLIGHT_ARGS[@]}"} \
         || die "cluster preflight failed — fix the conditions above or pass --skip-preflight"
 fi
 
