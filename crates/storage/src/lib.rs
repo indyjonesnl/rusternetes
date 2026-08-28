@@ -126,6 +126,62 @@ pub trait Storage: Send + Sync {
     /// Delete a resource
     async fn delete(&self, key: &str) -> Result<()>;
 
+    /// Delete a resource the way a CLIENT would: hand the deletion to the
+    /// server and let it apply its own semantics — for pods, graceful
+    /// termination (stamp `deletionTimestamp`, let the kubelet drain, remove
+    /// the object afterwards).
+    ///
+    /// This is what upstream's controllers do. The StatefulSet controller
+    /// scales down through `podControl.DeleteStatefulPod` →
+    /// `client.CoreV1().Pods(ns).Delete(...)`
+    /// (pkg/controller/statefulset/stateful_pod_control.go:97); the DaemonSet
+    /// controller and the taint-eviction manager delete the same way. None of
+    /// them writes `deletionTimestamp` themselves — it is immutable on update,
+    /// and an api-server that enforces that (any upstream one) rejects the
+    /// write with
+    /// `metadata.deletionTimestamp: Invalid value: ...: field is immutable`,
+    /// leaving the pod running forever.
+    ///
+    /// The default here is for the direct-store backends (etcd/rhino/memory),
+    /// where there is no api-server in the path: emulate what the api-server
+    /// would have done, which is what those controllers used to do inline.
+    /// `ApiStorage` overrides it with a real DELETE.
+    async fn delete_gracefully(&self, key: &str) -> Result<()> {
+        let mut obj: serde_json::Value = match self.get(key).await {
+            Ok(v) => v,
+            // Already gone: deleting is idempotent, same as the api-server's
+            // 404 being benign to a controller that wanted it deleted.
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let Some(metadata) = obj.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
+            // No ObjectMeta to stamp — nothing graceful to emulate.
+            return self.delete(key).await;
+        };
+        if metadata.contains_key("deletionTimestamp") {
+            return Ok(()); // deletion already in progress
+        }
+        metadata.insert(
+            "deletionTimestamp".to_string(),
+            serde_json::Value::String(
+                chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    .to_string(),
+            ),
+        );
+        let grace = obj
+            .pointer("/spec/terminationGracePeriodSeconds")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(30);
+        if let Some(metadata) = obj.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+            metadata.insert(
+                "deletionGracePeriodSeconds".to_string(),
+                serde_json::Value::from(grace),
+            );
+        }
+        self.update_raw(key, &obj).await
+    }
+
     /// List resources with a given prefix
     async fn list<T>(&self, prefix: &str) -> Result<Vec<T>>
     where
@@ -366,6 +422,10 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
 
     async fn delete(&self, key: &str) -> Result<()> {
         (**self).delete(key).await
+    }
+
+    async fn delete_gracefully(&self, key: &str) -> Result<()> {
+        (**self).delete_gracefully(key).await
     }
 
     async fn list<T>(&self, prefix: &str) -> Result<Vec<T>>
@@ -786,6 +846,19 @@ impl Storage for StorageBackend {
         }
     }
 
+    async fn delete_gracefully(&self, key: &str) -> Result<()> {
+        match self {
+            StorageBackend::Etcd(s) => Storage::delete_gracefully(s, key).await,
+            #[cfg(feature = "sqlite")]
+            StorageBackend::Sqlite(s) => Storage::delete_gracefully(s, key).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::delete_gracefully(s, key).await,
+            StorageBackend::Memory(s) => Storage::delete_gracefully(s.as_ref(), key).await,
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::delete_gracefully(s, key).await,
+        }
+    }
+
     async fn list<T>(&self, prefix: &str) -> Result<Vec<T>>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
@@ -980,5 +1053,79 @@ mod evict_tests {
             stored["metadata"]["deletionTimestamp"].is_string(),
             "deletionTimestamp must persist in storage mode: {stored}"
         );
+    }
+}
+
+#[cfg(test)]
+mod graceful_delete_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn running_pod(name: &str, grace: i64) -> serde_json::Value {
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": name, "namespace": "default" },
+            "spec": { "terminationGracePeriodSeconds": grace },
+            "status": { "phase": "Running" }
+        })
+    }
+
+    /// Direct-store backends have no api-server in the path, so the graceful
+    /// delete emulates one: stamp deletionTimestamp + the pod's own grace
+    /// period and leave the object for the kubelet to drain. This is exactly
+    /// what the StatefulSet/DaemonSet/taint-eviction controllers used to do
+    /// inline, so their behaviour on the compose and all-in-one stacks is
+    /// unchanged by moving them onto this call.
+    #[tokio::test]
+    async fn graceful_delete_stamps_deletion_timestamp_without_a_server() {
+        let backend = StorageBackend::new_memory();
+        let key = "/registry/pods/default/ss-2";
+        let _: serde_json::Value = Storage::create(&backend, key, &running_pod("ss-2", 30))
+            .await
+            .unwrap();
+
+        Storage::delete_gracefully(&backend, key).await.unwrap();
+
+        let stored: serde_json::Value = Storage::get(&backend, key).await.unwrap();
+        assert!(
+            stored["metadata"]["deletionTimestamp"].is_string(),
+            "graceful delete must stamp deletionTimestamp: {stored}"
+        );
+        assert_eq!(
+            stored["metadata"]["deletionGracePeriodSeconds"], 30,
+            "grace must come from the pod's own terminationGracePeriodSeconds: {stored}"
+        );
+    }
+
+    /// Re-issuing it is a no-op, not a second timestamp: controllers reconcile
+    /// repeatedly and must not keep rewriting a pod that is already draining
+    /// (rewriting it is what an upstream api-server rejects as immutable).
+    #[tokio::test]
+    async fn graceful_delete_is_idempotent() {
+        let backend = StorageBackend::new_memory();
+        let key = "/registry/pods/default/ss-1";
+        let _: serde_json::Value = Storage::create(&backend, key, &running_pod("ss-1", 5))
+            .await
+            .unwrap();
+
+        Storage::delete_gracefully(&backend, key).await.unwrap();
+        let first: serde_json::Value = Storage::get(&backend, key).await.unwrap();
+        Storage::delete_gracefully(&backend, key).await.unwrap();
+        let second: serde_json::Value = Storage::get(&backend, key).await.unwrap();
+
+        assert_eq!(
+            first["metadata"]["deletionTimestamp"], second["metadata"]["deletionTimestamp"],
+            "a second graceful delete must not re-stamp the timestamp"
+        );
+    }
+
+    /// And an object that is already gone is success, not an error — the
+    /// caller wanted it deleted.
+    #[tokio::test]
+    async fn graceful_delete_of_a_missing_object_succeeds() {
+        let backend = StorageBackend::new_memory();
+        Storage::delete_gracefully(&backend, "/registry/pods/default/never-existed")
+            .await
+            .expect("deleting an absent object is not an error");
     }
 }

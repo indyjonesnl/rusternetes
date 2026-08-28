@@ -19,35 +19,6 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         Self { storage }
     }
 
-    /// Re-read the pod, apply `mutate`, and write it back. On a resource-version
-    /// conflict, re-read and reapply once. NotFound is a no-op (the pod is
-    /// already gone). Other errors are logged via tracing::error!. Avoids
-    /// silently dropping storage failures from `let _ = storage.update(...)`.
-    async fn update_pod_with_retry<F>(&self, pod_key: &str, mutate: F)
-    where
-        F: Fn(&mut Pod) + Send,
-    {
-        for attempt in 0..2 {
-            let mut pod: Pod = match self.storage.get(pod_key).await {
-                Ok(p) => p,
-                Err(rusternetes_common::Error::NotFound(_)) => return,
-                Err(e) => {
-                    error!(error = %e, pod = pod_key, "failed to read pod for update");
-                    return;
-                }
-            };
-            mutate(&mut pod);
-            match self.storage.update(pod_key, &pod).await {
-                Ok(_) => return,
-                Err(rusternetes_common::Error::Conflict(_)) if attempt == 0 => continue,
-                Err(e) => {
-                    error!(error = %e, pod = pod_key, "failed to update pod");
-                    return;
-                }
-            }
-        }
-    }
-
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting StatefulSetController (watch-based)");
         let retry_interval = Duration::from_secs(5);
@@ -306,13 +277,18 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 Some(Phase::Failed) | Some(Phase::Succeeded)
             );
             if is_terminal && pod.metadata.deletion_timestamp.is_none() {
-                // Delete the terminal pod so it gets recreated
+                // Delete the terminal pod so it gets recreated. Issue a DELETE
+                // rather than writing deletionTimestamp: that field is
+                // immutable on update, so an api-server that enforces it
+                // rejects the write and the replica is never replaced.
+                // Upstream deletes a Failed/Succeeded replica the same way,
+                // with default DeleteOptions
+                // (pkg/controller/statefulset/stateful_set_control.go:428 ->
+                // DeleteStatefulPod).
                 let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-                self.update_pod_with_retry(&pod_key, |p| {
-                    p.metadata.deletion_timestamp = Some(chrono::Utc::now());
-                    p.metadata.deletion_grace_period_seconds = Some(0);
-                })
-                .await;
+                if let Err(e) = self.storage.delete_gracefully(&pod_key).await {
+                    error!("failed to delete terminal pod {}: {}", pod_key, e);
+                }
                 info!(
                     "StatefulSet {}/{}: deleted terminal pod {} (phase: {:?})",
                     namespace,
@@ -577,33 +553,28 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 match self.storage.get::<Pod>(&pod_key).await {
                     Ok(pod_to_delete) => {
                         if pod_to_delete.metadata.deletion_timestamp.is_none() {
-                            self.update_pod_with_retry(&pod_key, |p| {
-                                if p.metadata.deletion_timestamp.is_some() {
-                                    return;
-                                }
-                                p.metadata.deletion_timestamp = Some(chrono::Utc::now());
-                                // Use pod's terminationGracePeriodSeconds (K8s default behavior
-                                // when DeleteOptions.GracePeriodSeconds is not set)
-                                p.metadata.deletion_grace_period_seconds = p
-                                    .spec
-                                    .as_ref()
-                                    .and_then(|s| s.termination_grace_period_seconds);
-                                // Set pod phase to indicate it's terminating
-                                if let Some(ref mut status) = p.status {
-                                    if !matches!(
-                                        status.phase,
-                                        Some(Phase::Succeeded) | Some(Phase::Failed)
-                                    ) {
-                                        status.reason = Some("StatefulSetScaleDown".to_string());
-                                    }
-                                }
-                            })
-                            .await;
-                            info!(
-                                "Scale down: set deletionTimestamp on pod {} ({} -> {})",
-                                pod.metadata.name, current_replicas, desired_replicas
-                            );
-                            deleted_one = true;
+                            // DELETE the pod; do NOT write deletionTimestamp.
+                            // Upstream scales down with
+                            // `podControl.DeleteStatefulPod` ->
+                            // `client.CoreV1().Pods(ns).Delete(...)`
+                            // (pkg/controller/statefulset/stateful_pod_control.go:97),
+                            // and for good reason: deletionTimestamp is
+                            // immutable on update, so stamping it ourselves is
+                            // rejected by any api-server that enforces that
+                            // ("Pod \"ss-2\" is invalid: metadata.deletionTimestamp:
+                            // field is immutable") and the replica never goes
+                            // away. The graceful variant keeps the server's own
+                            // termination semantics (the pod's
+                            // terminationGracePeriodSeconds).
+                            if let Err(e) = self.storage.delete_gracefully(&pod_key).await {
+                                error!("failed to delete pod {}: {}", pod_key, e);
+                            } else {
+                                info!(
+                                    "Scale down: deleted pod {} ({} -> {})",
+                                    pod.metadata.name, current_replicas, desired_replicas
+                                );
+                                deleted_one = true;
+                            }
                         }
                     }
                     Err(_) => {
@@ -698,22 +669,19 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                     if !pod_revision.is_empty() && (pod_is_ready || pod_is_active) {
                         let pod_key = format!("/registry/pods/{}/{}", namespace, pod.metadata.name);
                         if pod.metadata.deletion_timestamp.is_none() {
-                            self.update_pod_with_retry(&pod_key, |p| {
-                                if p.metadata.deletion_timestamp.is_some() {
-                                    return;
-                                }
-                                p.metadata.deletion_timestamp = Some(chrono::Utc::now());
-                                p.metadata.deletion_grace_period_seconds = p
-                                    .spec
-                                    .as_ref()
-                                    .and_then(|s| s.termination_grace_period_seconds)
-                                    .or(Some(30));
-                            })
-                            .await;
-                            info!(
-                                "Rolling update: set deletionTimestamp on pod {} (old revision {}, update revision {})",
-                                pod.metadata.name, pod_revision, update_revision
-                            );
+                            // Same as scale-down: DELETE, never stamp. Upstream
+                            // rolls pods by deleting them
+                            // (stateful_set_control.go:721 ->
+                            // DeleteStatefulPod) and recreating at the new
+                            // revision.
+                            if let Err(e) = self.storage.delete_gracefully(&pod_key).await {
+                                error!("failed to delete pod {} for update: {}", pod_key, e);
+                            } else {
+                                info!(
+                                    "Rolling update: deleted pod {} (old revision {}, update revision {})",
+                                    pod.metadata.name, pod_revision, update_revision
+                                );
+                            }
                         }
                         deleted_one = true;
                         break; // Delete one at a time for OrderedReady rolling updates
