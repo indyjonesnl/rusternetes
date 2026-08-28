@@ -458,6 +458,129 @@ async fn scheduler_queue_sorting_orders_pending_pods_by_priority_desc() {
     assert_eq!(resolve_priority(&p_explicit_low, &classes), 5);
 }
 
+/// A PodDisruptionBudget in storage must actually reach victim selection (#1797).
+///
+/// `try_preempt` called the PDB-**unaware** `check_preemption`, which forwards an
+/// empty PDB slice, so every budget in the cluster was invisible to preemption:
+/// `check_preemption_with_pdbs` had the upstream
+/// `filterPodsWithPDBViolation` logic all along and was simply never given
+/// anything to filter with.
+///
+/// Two victims sit on one node, both able to free enough room on their own. The
+/// lower-priority one is the natural choice, but a `minAvailable: 1` budget
+/// covers it while the other is unprotected — so the budget-protected pod must
+/// be spared and the unprotected pod evicted instead.
+///
+/// This fails whenever PDBs are not plumbed through, regardless of the score
+/// chain, because the victim list itself is chosen budget-blind.
+#[tokio::test]
+async fn preemption_spares_pdb_protected_pod_when_another_victim_suffices() {
+    let storage = setup_test().await;
+    let scheduler = Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+
+    storage
+        .create(
+            &build_key("priorityclasses", None, "high"),
+            &PriorityClass::new("high", 1_000_000),
+        )
+        .await
+        .unwrap();
+
+    storage
+        .create(
+            &build_key("nodes", None, "node-1"),
+            &make_node("node-1", "1", "1Gi"),
+        )
+        .await
+        .unwrap();
+
+    // Each victim holds half the node; the preemptor needs one of them gone.
+    let app_label = |v: &str| {
+        let mut m = std::collections::HashMap::new();
+        m.insert("app".to_string(), v.to_string());
+        Some(m)
+    };
+    let mut guarded = make_pod_with_labels(
+        "guarded",
+        100,
+        "500m",
+        "256Mi",
+        Some("node-1"),
+        app_label("web"),
+    );
+    guarded.metadata.namespace = Some("default".to_string());
+    let mut unguarded = make_pod_with_labels(
+        "unguarded",
+        200,
+        "500m",
+        "256Mi",
+        Some("node-1"),
+        app_label("batch"),
+    );
+    unguarded.metadata.namespace = Some("default".to_string());
+
+    storage
+        .create(&build_key("pods", Some("default"), "guarded"), &guarded)
+        .await
+        .unwrap();
+    storage
+        .create(&build_key("pods", Some("default"), "unguarded"), &unguarded)
+        .await
+        .unwrap();
+
+    // minAvailable: 1 over a single app=web replica — evicting `guarded` breaks it.
+    let mut selector_labels = std::collections::HashMap::new();
+    selector_labels.insert("app".to_string(), "web".to_string());
+    let pdb = PodDisruptionBudget::new(
+        "web-pdb",
+        "default",
+        PodDisruptionBudgetSpec {
+            min_available: Some(IntOrString::Int(1)),
+            max_unavailable: None,
+            selector: LabelSelector {
+                match_labels: Some(selector_labels),
+                match_expressions: None,
+            },
+            unhealthy_pod_eviction_policy: None,
+        },
+    );
+    storage
+        .create(
+            &build_key("poddisruptionbudgets", Some("default"), "web-pdb"),
+            &pdb,
+        )
+        .await
+        .unwrap();
+
+    let preemptor = make_pending_pod("preemptor", None, Some("high"));
+    storage
+        .create(&build_key("pods", Some("default"), "preemptor"), &preemptor)
+        .await
+        .unwrap();
+
+    scheduler.schedule_pending_pods().await.unwrap();
+
+    let guarded_after: Pod = storage
+        .get(&build_key("pods", Some("default"), "guarded"))
+        .await
+        .unwrap();
+    let unguarded_after: Pod = storage
+        .get(&build_key("pods", Some("default"), "unguarded"))
+        .await
+        .unwrap();
+
+    assert!(
+        guarded_after.metadata.deletion_timestamp.is_none(),
+        "the PDB-protected pod must be spared while another victim suffices — \
+         a deletionTimestamp here means budgets never reached victim selection"
+    );
+    assert!(
+        unguarded_after.metadata.deletion_timestamp.is_some(),
+        "the unprotected pod must be evicted instead; neither being evicted \
+         means preemption gave up rather than choosing the budget-safe victim"
+    );
+}
+
 /// The victim must be chosen by cost, not by node iteration order (#1130).
 ///
 /// Mirrors upstream `pickOneNodeForPreemption`
