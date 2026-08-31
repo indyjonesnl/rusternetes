@@ -624,6 +624,35 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             Ok(value) => {
                 if let Ok(meta) = self.extract_metadata(&value) {
                     if !meta.has_finalizers() {
+                        // An object still inside its deletion grace period belongs
+                        // to whoever is draining it — for a pod, the kubelet, which
+                        // removes it once the container actually stops. Upstream's
+                        // GC never competes for that: `attemptToDeleteItem` returns
+                        // at once for an item that is being deleted and is not
+                        // deleting dependents
+                        // (pkg/controller/garbagecollector/garbagecollector.go:511),
+                        // and the object's removal is the api-server's
+                        // `deleteAfterGracePeriod` / `ShouldDeleteDuringUpdate` job.
+                        //
+                        // We cannot drop this sweep outright yet:
+                        // `ShouldDeleteDuringUpdate` is implemented only on the
+                        // PATCH path (crates/api-server/src/handlers/generic_patch.rs),
+                        // so an object whose last finalizer is removed by a PUT —
+                        // or by a controller writing straight to storage — has
+                        // nothing else to finish it. Waiting out the grace period
+                        // fixes the harm that matters (a terminating pod dropping
+                        // out of the API before its grace period had run) while
+                        // keeping the sweep as the backstop it currently is. #1828
+                        // tracks removing it once every write path honours
+                        // ShouldDeleteDuringUpdate.
+                        if !Self::deletion_grace_period_elapsed(&meta) {
+                            debug!(
+                                "Resource {} is still inside its deletion grace \
+                                 period, leaving it to its owner",
+                                resource.key
+                            );
+                            return Ok(());
+                        }
                         info!(
                             "Deleting resource (no finalizers remaining): {}",
                             resource.key
@@ -644,6 +673,23 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         }
 
         Ok(())
+    }
+
+    /// Whether an object's deletion grace period has run out.
+    ///
+    /// `true` when there is no grace period to wait on (nothing set, or it is
+    /// zero), so callers keep their existing behaviour for every resource that
+    /// is not gracefully deleted.
+    fn deletion_grace_period_elapsed(meta: &ObjectMeta) -> bool {
+        let Some(deleted_at) = meta.deletion_timestamp else {
+            return true;
+        };
+        match meta.deletion_grace_period_seconds {
+            Some(secs) if secs > 0 => {
+                chrono::Utc::now() >= deleted_at + chrono::Duration::seconds(secs)
+            }
+            _ => true,
+        }
     }
 
     /// Remove a specific finalizer from a resource in storage
@@ -1866,6 +1912,103 @@ mod tests {
         assert!(
             finalizers.contains(&"example.com/blocker".to_string()),
             "the third-party finalizer must remain, got {finalizers:?}"
+        );
+    }
+
+    /// A pod in graceful termination — `deletionTimestamp` and a grace period
+    /// set, no finalizers — belongs to the kubelet, which removes it once the
+    /// container actually stops. The GC must leave it alone until then.
+    ///
+    /// Upstream returns immediately for exactly this shape, in
+    /// `attemptToDeleteItem`
+    /// (pkg/controller/garbagecollector/garbagecollector.go:511):
+    ///
+    /// ```text
+    /// // "being deleted" is an one-way trip to the final deletion. We'll just
+    /// // wait for the final deletion, and then process the object's dependents.
+    /// if item.isBeingDeleted() && !item.isDeletingDependents() {
+    ///     return nil
+    /// }
+    /// ```
+    ///
+    /// `isDeletingDependents` is the `foregroundDeletion` finalizer, so an
+    /// object carrying no GC finalizer is never the GC's to remove. Ours
+    /// deleted it on the next scan, racing the kubelet's shutdown and taking
+    /// the pod out of the API before its grace period had run.
+    ///
+    /// The sweep is deferred, not dropped: it is still the only thing that
+    /// finishes an object whose last finalizer is removed by a PUT, since
+    /// `ShouldDeleteDuringUpdate` is implemented on the PATCH path alone.
+    /// #1828 tracks retiring it.
+    #[tokio::test]
+    async fn gc_leaves_a_gracefully_terminating_pod_alone() {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let gc = GarbageCollector::new(storage.clone());
+
+        let mut meta = ObjectMeta::new("terminating-pod");
+        meta.namespace = Some("default".to_string());
+        meta.uid = "terminating-pod-uid".to_string();
+        meta.deletion_timestamp = Some(chrono::Utc::now());
+        meta.deletion_grace_period_seconds = Some(30);
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: meta,
+            spec: None,
+            status: None,
+        };
+        let key = "/registry/pods/default/terminating-pod";
+        storage.create(key, &pod).await.unwrap();
+
+        gc.scan_and_collect().await.unwrap();
+
+        let after: rusternetes_common::Result<Value> = storage.get(key).await;
+        assert!(
+            after.is_ok(),
+            "a terminating pod inside its grace period must survive the GC scan — \
+             the kubelet removes it when the container stops"
+        );
+    }
+
+    /// The same sweep must still fire once the grace period has run out: it is
+    /// the only thing that finishes an object whose last finalizer was removed
+    /// by a PUT (see `deletion_grace_period_elapsed`).
+    #[tokio::test]
+    async fn gc_still_sweeps_a_pod_past_its_grace_period() {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let gc = GarbageCollector::new(storage.clone());
+
+        let mut meta = ObjectMeta::new("expired-pod");
+        meta.namespace = Some("default".to_string());
+        meta.uid = "expired-pod-uid".to_string();
+        meta.deletion_timestamp = Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+        meta.deletion_grace_period_seconds = Some(30);
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: meta,
+            spec: None,
+            status: None,
+        };
+        let key = "/registry/pods/default/expired-pod";
+        storage.create(key, &pod).await.unwrap();
+
+        gc.scan_and_collect().await.unwrap();
+
+        let after: rusternetes_common::Result<Value> = storage.get(key).await;
+        assert!(
+            after.is_err(),
+            "a pod whose grace period expired long ago must still be swept"
         );
     }
 }
