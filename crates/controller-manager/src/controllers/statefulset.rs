@@ -296,10 +296,28 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                     pod.metadata.name,
                     pod.status.as_ref().and_then(|s| s.phase.as_ref())
                 );
-            } else if !is_terminal {
+                // Deliberately NOT kept below: this pod has just been asked to go
+                // away, and upstream ends the sync here anyway (see below).
+            } else {
+                // Everything else stays — INCLUDING a terminal pod that is already
+                // terminating. Dropping those was the second half of the
+                // scale-down cascade (#1821): once the kubelet killed `ss-2` its
+                // phase went Failed while its deletionTimestamp was set, so it
+                // vanished from this list, `ss-1` became the head of the condemned
+                // list, and the next reconcile deleted it — then `ss-0`. All three
+                // pods got "Killing: Stopping container webserver" on the same
+                // second and `[sig-apps] StatefulSet ... Scaling should happen in
+                // predictable order` timed out on the ordered DELETED events.
+                //
+                // Upstream never drops them: `processReplica`
+                // (pkg/controller/statefulset/stateful_set_control.go:426-434)
+                // returns `shouldExit = true` for a Failed/Succeeded replica
+                // whether or not it already carries a deletionTimestamp, so the
+                // sync ends before the condemned loop runs at all; and the
+                // condemned loop itself blocks on `isTerminating` (:510-518).
+                // Keeping the pod visible is what lets that guard fire.
                 active_pods.push(pod);
             }
-            // Terminal pods with deletionTimestamp already set are being cleaned up
         }
         let mut statefulset_pods = active_pods;
 
@@ -503,18 +521,46 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 )
             });
 
-            let mut deleted_one = false;
-            for pod in &condemned {
-                // If pod is already terminating, wait for it
-                if pod.metadata.deletion_timestamp.is_some() {
+            // Upstream `processCondemned`
+            // (pkg/controller/statefulset/stateful_set_control.go:508-535) returns
+            // `shouldExit = true` from EVERY branch when `monotonic` (OrderedReady),
+            // and `runForAll` (:537-549) stops the loop on the first `shouldExit`.
+            // So exactly ONE condemned pod is processed per sync — whatever the
+            // outcome of processing it: blocked, skipped, deleted, or failed to
+            // delete.
+            //
+            // (Upstream fans out over all condemned pods under the Parallel policy
+            // via `slowStartBatch`; this loop serialises there too. That divergence
+            // is pre-existing and deliberately left alone here — see #1822.)
+            //
+            // This used to be a loop that exited only on a SUCCESSFUL delete, and
+            // fell through to the next (lower) ordinal in three cases: the
+            // freshly-read pod already had a deletionTimestamp, the delete errored,
+            // or the pod was already gone. Against a vanilla api-server the reconcile list is a moment stale,
+            // so the first case fires constantly: `ss-2` looks alive in the list, the
+            // fresh GET shows it already terminating, we skip it and delete `ss-1` in
+            // the SAME pass — and `ss-0` in the next. A 3->0 scale-down killed all
+            // three pods within one second, out of order, instead of one at a time in
+            // reverse ordinal order (vanilla-swap controller-manager leg: every pod
+            // got "Killing: Stopping container webserver" at the same timestamp, and
+            // `[sig-apps] StatefulSet ... Scaling should happen in predictable order
+            // and halt if any stateful pod is unhealthy` timed out waiting on the
+            // ordered Pod DELETED events). Direct-storage mode never showed it: the
+            // list is always fresh there, so the stale branch was unreachable.
+            // Exactly one condemned pod per sync, so this is the head of the list
+            // — not a loop.
+            if let Some(pod) = condemned.first() {
+                // If pod is already terminating, wait for it (upstream :510-518).
+                let terminating = pod.metadata.deletion_timestamp.is_some();
+                if terminating {
                     debug!(
                         "StatefulSet {}/{}: waiting for pod {} to terminate",
                         namespace, name, pod.metadata.name
                     );
-                    break; // Block further deletions
                 }
 
-                if is_ordered_ready {
+                let mut blocked = terminating;
+                if !blocked && is_ordered_ready {
                     let is_ready = pod
                         .status
                         .as_ref()
@@ -541,7 +587,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                                 "StatefulSet {}/{}: pod {} is unhealthy but not first unhealthy, blocking scale-down",
                                 namespace, name, pod.metadata.name
                             );
-                            break; // Block — can't skip unhealthy pods
+                            blocked = true; // Block — can't skip unhealthy pods
                         }
                     }
                 }
@@ -550,9 +596,13 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 // K8s calls Pods(ns).Delete(name, DeleteOptions{}) which sets
                 // deletionTimestamp and lets the kubelet handle graceful shutdown.
                 let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
+                // The re-read is a safety net against a stale list (do not re-delete a
+                // pod that is already terminating). It must NOT steer control flow:
+                // this pod is the one and only one processed this sync, whatever the
+                // re-read finds.
                 match self.storage.get::<Pod>(&pod_key).await {
                     Ok(pod_to_delete) => {
-                        if pod_to_delete.metadata.deletion_timestamp.is_none() {
+                        if !blocked && pod_to_delete.metadata.deletion_timestamp.is_none() {
                             // DELETE the pod; do NOT write deletionTimestamp.
                             // Upstream scales down with
                             // `podControl.DeleteStatefulPod` ->
@@ -573,16 +623,12 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                                     "Scale down: deleted pod {} ({} -> {})",
                                     pod.metadata.name, current_replicas, desired_replicas
                                 );
-                                deleted_one = true;
                             }
                         }
                     }
                     Err(_) => {
                         info!("Scale down: pod {} already gone", pod.metadata.name);
                     }
-                }
-                if deleted_one {
-                    break; // Only delete one per reconcile
                 }
             }
         }

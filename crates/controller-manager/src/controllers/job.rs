@@ -819,22 +819,7 @@ impl<S: Storage + 'static> JobController<S> {
 
         if is_indexed && backoff_limit_per_index.is_some() {
             let per_index_limit = backoff_limit_per_index.unwrap_or(0);
-            // Count failures per index
-            let mut failures_per_index: HashMap<i32, i32> = HashMap::new();
-            for pod in job_pods.iter() {
-                if let Some(status) = &pod.status {
-                    if matches!(&status.phase, Some(Phase::Failed)) {
-                        if let Some(index) = get_pod_index(pod) {
-                            *failures_per_index.entry(index).or_insert(0) += 1;
-                        }
-                    }
-                }
-            }
-            for (idx, count) in &failures_per_index {
-                if *count > per_index_limit {
-                    backoff_failed_index_set.insert(*idx);
-                }
-            }
+            backoff_failed_index_set = indexes_over_backoff_limit(job_pods.iter(), per_index_limit);
         }
 
         // Merge FailIndex and backoff-per-index failed sets
@@ -1157,6 +1142,26 @@ impl<S: Storage + 'static> JobController<S> {
                             }
                         }
                     }
+                    // The exhausted-index set must be recomputed from the SAME
+                    // fresh list the active/succeeded counts came from.
+                    // `all_failed_index_set` was derived from the snapshot taken at
+                    // the top of this reconcile; against a vanilla api-server that
+                    // snapshot lags, so an index that has already burned its
+                    // `backoffLimitPerIndex` retries can still look retryable and
+                    // get one pod too many. With `backoffLimitPerIndex: 1` and two
+                    // failing indexes that made `status.failed` 5 instead of 4, and
+                    // `[sig-apps] Job should execute all indexes despite some
+                    // failing when using backoffLimitPerIndex` failed on
+                    // `Expected <int32>: 5 to equal <int32>: 4` (#1821). Union, never
+                    // replace: a fresher view can only ADD exhausted indexes, and the
+                    // FailIndex half of the set has no fresh equivalent here.
+                    let mut exhausted_indexes = all_failed_index_set.clone();
+                    if let Some(per_index_limit) = backoff_limit_per_index {
+                        exhausted_indexes.extend(indexes_over_backoff_limit(
+                            fresh_job_pods.iter().copied(),
+                            per_index_limit,
+                        ));
+                    }
                     (0..completions)
                         .filter(|i| {
                             // Skip indexes that already have active or succeeded pods
@@ -1164,7 +1169,7 @@ impl<S: Storage + 'static> JobController<S> {
                                 return false;
                             }
                             // Skip indexes that are permanently failed (backoffLimitPerIndex or FailIndex)
-                            if all_failed_index_set.contains(i) {
+                            if exhausted_indexes.contains(i) {
                                 return false;
                             }
                             true
@@ -1541,6 +1546,39 @@ fn get_pod_index(pod: &Pod) -> Option<i32> {
 
 /// Collect the set of unique completion indexes whose pods are in the given
 /// phase. Used for K8s-compatible Indexed Job status accounting.
+/// Indexes whose failed-pod count **exceeds** `backoffLimitPerIndex`, i.e. the
+/// indexes that are permanently failed and must never get another pod.
+///
+/// Upstream counts one pod per index per attempt and marks the index failed
+/// once the count is greater than the limit
+/// (`pkg/controller/job/indexed_job_utils.go`, `calculateFailedIndexes`), so
+/// `backoffLimitPerIndex: 1` allows exactly two pods per failing index.
+///
+/// Shared by the status computation and the pod-creation gate on purpose: those
+/// two used to derive it from different pod lists. See
+/// `indexes_over_backoff_limit` at the creation site for what that cost.
+fn indexes_over_backoff_limit<'a, I>(pods: I, per_index_limit: i32) -> HashSet<i32>
+where
+    I: IntoIterator<Item = &'a Pod>,
+{
+    let mut failures_per_index: HashMap<i32, i32> = HashMap::new();
+    for pod in pods {
+        if matches!(
+            pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+            Some(Phase::Failed)
+        ) {
+            if let Some(index) = get_pod_index(pod) {
+                *failures_per_index.entry(index).or_insert(0) += 1;
+            }
+        }
+    }
+    failures_per_index
+        .into_iter()
+        .filter(|(_, count)| *count > per_index_limit)
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 fn collect_indexes_in_phase<'a, I>(pods: I, phase: Phase) -> HashSet<i32>
 where
     I: IntoIterator<Item = &'a Pod>,

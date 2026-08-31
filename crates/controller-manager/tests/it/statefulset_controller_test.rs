@@ -1,6 +1,7 @@
 // StatefulSet Controller Integration Tests
 // Tests the StatefulSet controller's ability to manage stateful workloads with stable identities
 
+use crate::stale_list_double::StaleListStorage;
 use rusternetes_common::resources::pod::PodCondition;
 use rusternetes_common::resources::pod::*;
 use rusternetes_common::resources::*;
@@ -525,4 +526,229 @@ async fn test_statefulset_recreates_evicted_pod() {
         ),
         "recreated pod must not be in the Failed phase"
     );
+}
+
+/// Mark a pod Running+Ready through any `Storage`, not just `MemoryStorage`.
+async fn mark_pod_ready_in<S: Storage>(storage: &Arc<S>, namespace: &str, pod_name: &str) {
+    let pod_key = build_key("pods", Some(namespace), pod_name);
+    let mut pod: Pod = storage.get(&pod_key).await.unwrap();
+    pod.status = Some(PodStatus {
+        phase: Some(Phase::Running),
+        conditions: Some(vec![PodCondition {
+            condition_type: "Ready".to_string(),
+            status: "True".to_string(),
+            reason: None,
+            message: None,
+            last_probe_time: None,
+            last_transition_time: Some(chrono::Utc::now()),
+            observed_generation: None,
+        }]),
+        ..pod.status.unwrap_or_default()
+    });
+    storage.update(&pod_key, &pod).await.unwrap();
+}
+
+/// Names of the pods currently carrying a `deletionTimestamp`, sorted.
+///
+/// Reads the double's `inner` store directly: its `list` deliberately hides
+/// `deletionTimestamp` (that is the skew under test), so the assertion has to
+/// look at the real state rather than the stale view the controller sees.
+async fn terminating_pods(storage: &Arc<StaleListStorage>, namespace: &str) -> Vec<String> {
+    let raw: Vec<serde_json::Value> = storage
+        .inner
+        .list(&format!("/registry/pods/{namespace}/"))
+        .await
+        .unwrap();
+    let mut names: Vec<String> = raw
+        .iter()
+        .filter(|p| p.pointer("/metadata/deletionTimestamp").is_some())
+        .map(|p| {
+            p.pointer("/metadata/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// OrderedReady scale-down must terminate exactly ONE pod per reconcile, in
+/// reverse ordinal order, **even when the reconcile list is stale** about the
+/// pod it already condemned.
+///
+/// Upstream `processCondemned`
+/// (pkg/controller/statefulset/stateful_set_control.go:508-535) returns
+/// `shouldExit = true` from every branch under `monotonic`, and `runForAll`
+/// (:537-549) stops on the first `shouldExit` — so one condemned pod per sync,
+/// whatever the outcome of processing it.
+///
+/// The loop used to exit only on a *successful* delete. Against a vanilla
+/// api-server the list a reconcile works from lags the store, so `ss-2` still
+/// looked alive, the fresh GET showed it already terminating, and the loop fell
+/// through and deleted `ss-1` in the same pass — then `ss-0`. In CI all three
+/// pods got "Killing: Stopping container webserver" on the same second and
+/// `[sig-apps] StatefulSet ... Scaling should happen in predictable order and
+/// halt if any stateful pod is unhealthy` timed out on the ordered Pod DELETED
+/// events (#1821). Direct-storage mode never reproduced it — the list is always
+/// fresh there.
+#[tokio::test]
+async fn ordered_ready_scale_down_terminates_one_pod_per_reconcile_on_a_stale_list() {
+    let storage = Arc::new(StaleListStorage::new().hiding_deletion_timestamps());
+    let ns = "default";
+
+    let mut statefulset = create_test_statefulset("ss", ns, 3);
+    statefulset.spec.pod_management_policy = Some("OrderedReady".to_string());
+    let key = build_key("statefulsets", Some(ns), "ss");
+    storage.create(&key, &statefulset).await.unwrap();
+
+    let controller = StatefulSetController::new(storage.clone());
+
+    // Bring all three up. OrderedReady creates one at a time, gated on the
+    // previous pod being Ready.
+    for i in 0..3 {
+        controller.reconcile_all().await.unwrap();
+        mark_pod_ready_in(&storage, ns, &format!("ss-{i}")).await;
+    }
+    let pods: Vec<Pod> = storage
+        .list(&format!("/registry/pods/{ns}/"))
+        .await
+        .unwrap();
+    assert_eq!(pods.len(), 3, "expected ss-0..ss-2, got {:?}", pods.len());
+
+    // Scale to zero.
+    statefulset.spec.replicas = Some(0);
+    storage.update(&key, &statefulset).await.unwrap();
+
+    // First reconcile: only the highest ordinal is condemned.
+    controller.reconcile_all().await.unwrap();
+    assert_eq!(
+        terminating_pods(&storage, ns).await,
+        vec!["ss-2".to_string()],
+        "first reconcile must terminate ss-2 and nothing else"
+    );
+
+    // Second reconcile, with the list still hiding ss-2's deletionTimestamp —
+    // the exact window the vanilla api-server leaves open. ss-2 is still
+    // terminating, so nothing new may be deleted.
+    controller.reconcile_all().await.unwrap();
+    assert_eq!(
+        terminating_pods(&storage, ns).await,
+        vec!["ss-2".to_string()],
+        "a stale list must not let the scale-down skip ahead to ss-1"
+    );
+
+    // ...and it must not creep further on subsequent passes either.
+    controller.reconcile_all().await.unwrap();
+    assert_eq!(
+        terminating_pods(&storage, ns).await,
+        vec!["ss-2".to_string()],
+        "ss-0 must still be untouched while ss-2 terminates"
+    );
+
+    // Once the kubelet finishes ss-2, the next ordinal — and only that one —
+    // goes.
+    storage
+        .delete(&build_key("pods", Some(ns), "ss-2"))
+        .await
+        .unwrap();
+    controller.reconcile_all().await.unwrap();
+    assert_eq!(
+        terminating_pods(&storage, ns).await,
+        vec!["ss-1".to_string()],
+        "reverse ordinal order: ss-1 is next, ss-0 waits"
+    );
+}
+
+/// A condemned pod that the kubelet has already killed — phase `Failed`, with a
+/// `deletionTimestamp` — must stay visible to the scale-down loop, so the
+/// terminating guard still blocks the next ordinal.
+///
+/// This was the second half of the CI cascade (#1821). The terminal-pod sweep at
+/// the top of the reconcile deleted Failed/Succeeded pods and pushed everything
+/// else into the working list — but a pod that was *both* terminal *and* already
+/// terminating fell through the gap and was dropped entirely. `ss-2` then
+/// disappeared from the condemned list the moment the kubelet killed it, `ss-1`
+/// became the head, and the next reconcile deleted it — then `ss-0`. All three
+/// pods got "Killing: Stopping container webserver" on the same second.
+///
+/// Upstream never drops them: `processReplica`
+/// (pkg/controller/statefulset/stateful_set_control.go:426-434) returns
+/// `shouldExit` for a Failed/Succeeded replica whether or not it already carries
+/// a deletionTimestamp, so the sync ends before the condemned loop runs; and the
+/// condemned loop blocks on `isTerminating` (:510-518).
+#[tokio::test]
+async fn scale_down_blocks_on_a_condemned_pod_the_kubelet_already_killed() {
+    let storage = setup_test().await;
+    let ns = "default";
+
+    let mut statefulset = create_test_statefulset("ss", ns, 3);
+    statefulset.spec.pod_management_policy = Some("OrderedReady".to_string());
+    let key = build_key("statefulsets", Some(ns), "ss");
+    storage.create(&key, &statefulset).await.unwrap();
+
+    let controller = StatefulSetController::new(storage.clone());
+    for i in 0..3 {
+        controller.reconcile_all().await.unwrap();
+        mark_pod_ready(&storage, ns, &format!("ss-{i}")).await;
+    }
+
+    // Scale to zero and let the controller condemn the highest ordinal.
+    statefulset.spec.replicas = Some(0);
+    storage.update(&key, &statefulset).await.unwrap();
+    controller.reconcile_all().await.unwrap();
+    assert_eq!(
+        terminating_pod_names(&storage, ns).await,
+        vec!["ss-2".to_string()],
+        "first reconcile condemns ss-2 only"
+    );
+
+    // The kubelet kills ss-2: it is now Failed AND terminating — terminal and
+    // mid-deletion at the same time, the state that used to make it vanish.
+    let ss2_key = build_key("pods", Some(ns), "ss-2");
+    let mut ss2: Pod = storage.get(&ss2_key).await.unwrap();
+    ss2.status = Some(PodStatus {
+        phase: Some(Phase::Failed),
+        ..ss2.status.unwrap_or_default()
+    });
+    storage.update(&ss2_key, &ss2).await.unwrap();
+
+    // Reconciles while ss-2 is still going away must not touch ss-1 or ss-0.
+    for _ in 0..3 {
+        controller.reconcile_all().await.unwrap();
+        assert_eq!(
+            terminating_pod_names(&storage, ns).await,
+            vec!["ss-2".to_string()],
+            "a killed-but-not-yet-gone ss-2 must keep blocking the scale-down"
+        );
+    }
+
+    // Once it is really gone, and only then, ss-1 is next.
+    storage.delete(&ss2_key).await.unwrap();
+    controller.reconcile_all().await.unwrap();
+    assert_eq!(
+        terminating_pod_names(&storage, ns).await,
+        vec!["ss-1".to_string()],
+        "reverse ordinal order resumes with ss-1"
+    );
+}
+
+/// `terminating_pods` for a plain `MemoryStorage`.
+async fn terminating_pod_names(storage: &Arc<MemoryStorage>, namespace: &str) -> Vec<String> {
+    let raw: Vec<serde_json::Value> = storage
+        .list(&format!("/registry/pods/{namespace}/"))
+        .await
+        .unwrap();
+    let mut names: Vec<String> = raw
+        .iter()
+        .filter(|p| p.pointer("/metadata/deletionTimestamp").is_some())
+        .map(|p| {
+            p.pointer("/metadata/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    names
 }
