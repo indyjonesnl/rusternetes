@@ -126,13 +126,110 @@ pub fn list_resource_version<T: serde::Serialize>(items: &[T]) -> String {
 /// back to the maximum item resourceVersion via [`list_resource_version`],
 /// which itself never returns `""` (it falls back to `"1"`). The result is
 /// therefore guaranteed to be a non-empty `^[0-9]+$` string.
+///
+/// **The result is never below an item the list returned.** The two sources
+/// were previously independent — the revision came from the store, the items
+/// from a separate read — so nothing tied them together, and a
+/// `current_revision()` that answered even one revision stale handed back a
+/// collection RV below an object in its own `items`. A client that then
+/// watches from that RV (`Reflector.ListAndWatch`, and every e2e
+/// `List` -> `Watch(ResourceVersion: list.ResourceVersion)` pair) gets that
+/// object's CREATE replayed: the first event is `ADDED` where the client
+/// expects `MODIFIED`. Verified against a rhino-backed api-server — a watch
+/// one revision below an object's creation replays it as `ADDED` (#1824).
+///
+/// Upstream cannot express this bug: the list and its `ResourceVersion` come
+/// from one etcd range response (`storage/etcd3.GetList` stamps
+/// `getResp.Header.Revision`), so the RV is the revision the snapshot was
+/// taken at by construction. Taking the max restores that invariant here.
 pub async fn list_collection_resource_version<T: serde::Serialize>(
     storage: &rusternetes_storage::StorageBackend,
     items: &[T],
 ) -> String {
     use rusternetes_storage::Storage;
-    match storage.current_revision().await {
-        Ok(rev) if rev > 0 => rev.to_string(),
-        _ => list_resource_version(items),
+    let current = match storage.current_revision().await {
+        Ok(rev) if rev > 0 => Some(rev),
+        _ => None,
+    };
+    collection_resource_version(current, &list_resource_version(items))
+}
+
+/// Pure core of [`list_collection_resource_version`]: the greater of the store
+/// revision and the highest item resourceVersion, as a decimal string.
+pub fn collection_resource_version(current_revision: Option<i64>, items_max_rv: &str) -> String {
+    let items_rv = items_max_rv.parse::<i64>().unwrap_or(0);
+    match current_revision {
+        Some(rev) => rev.max(items_rv).to_string(),
+        None => items_max_rv.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod collection_rv_tests {
+    use super::{collection_resource_version, list_resource_version};
+    use serde_json::json;
+
+    /// A LIST's `metadata.resourceVersion` must never be below an item the
+    /// same LIST returned.
+    ///
+    /// The store revision and the items are read separately here, so a
+    /// `current_revision()` that answers even one revision stale used to win
+    /// outright. A client watching from that RV
+    /// (`List` -> `Watch(ResourceVersion: list.ResourceVersion)`) then gets the
+    /// newest object's CREATE replayed and sees `ADDED` where it expects
+    /// `MODIFIED` — verified against a rhino-backed api-server, where a watch
+    /// one revision below an object's creation replays it as `ADDED` (#1824).
+    #[test]
+    fn collection_rv_is_never_below_a_returned_item() {
+        // Stale store revision, fresher items: the items win.
+        assert_eq!(collection_resource_version(Some(17), "18"), "18");
+        assert_eq!(collection_resource_version(Some(1), "4143"), "4143");
+        // Store ahead of the items (writes to other collections): store wins.
+        assert_eq!(collection_resource_version(Some(4200), "4143"), "4200");
+        // Agreement.
+        assert_eq!(collection_resource_version(Some(18), "18"), "18");
+        // No store revision available: fall back to the items untouched.
+        assert_eq!(collection_resource_version(None, "18"), "18");
+        // Empty collection keeps `list_resource_version`'s non-empty guarantee.
+        assert_eq!(collection_resource_version(None, "1"), "1");
+        assert_eq!(collection_resource_version(Some(42), "1"), "42");
+    }
+
+    /// The result stays a non-empty decimal string in every branch — a
+    /// reflector cannot start a watch from `""` or `"0"`.
+    #[test]
+    fn collection_rv_is_always_a_positive_decimal() {
+        for (cur, items) in [
+            (Some(5_i64), "3"),
+            (Some(3), "5"),
+            (None, "7"),
+            (None, "1"),
+            (Some(1), "1"),
+        ] {
+            let rv = collection_resource_version(cur, items);
+            assert!(
+                rv.chars().all(|c| c.is_ascii_digit()) && rv != "0" && !rv.is_empty(),
+                "bad collection rv {rv:?} for ({cur:?}, {items})"
+            );
+        }
+    }
+
+    /// The item-side input this composes with: highest RV wins, and an empty
+    /// collection still yields a usable value.
+    #[test]
+    fn items_max_rv_feeds_the_collection_rv() {
+        let items = vec![
+            json!({"metadata": {"resourceVersion": "16"}}),
+            json!({"metadata": {"resourceVersion": "18"}}),
+            json!({"metadata": {"resourceVersion": "17"}}),
+        ];
+        assert_eq!(list_resource_version(&items), "18");
+        assert_eq!(
+            collection_resource_version(Some(17), &list_resource_version(&items)),
+            "18",
+            "the third FlowSchema's revision must not be left outside the list RV"
+        );
+        let empty: Vec<serde_json::Value> = vec![];
+        assert_eq!(list_resource_version(&empty), "1");
     }
 }

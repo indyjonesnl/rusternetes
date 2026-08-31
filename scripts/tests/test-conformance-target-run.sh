@@ -290,5 +290,42 @@ if run_cli --target sig-node --not-a-flag --kubeconfig "$KC" --hydrophone "$FAKE
   bad "unknown flag should exit 2"; else
   rc=$?; [ "$rc" -eq 2 ] && ok "unknown flag => exit 2" || bad "unknown flag exit=$rc"; fi
 
+# --- component logs are captured on a failing run (#1824) -------------------
+# An intermittent api-server failure is unactionable without the api-server's
+# own log, and the results artifact is the only place a nightly's reader will
+# find it. The teardown step's `compose logs --tail=100` goes to the job log,
+# truncated, and not into the artifact.
+RUN_SRC="$(cat "$RUNNER")"
+case "$RUN_SRC" in
+  *"capture_component_logs()"*) ok "conformance-target-run defines capture_component_logs" ;;
+  *) bad "conformance-target-run must define capture_component_logs" ;;
+esac
+# It has to be wired into the FAILED path, not merely defined.
+FAILBLOCK="$(sed -n '/if \[ "\$FAILED" -gt 0 \]/,/^fi$/p' "$RUNNER")"
+case "$FAILBLOCK" in
+  *capture_component_logs*) ok "failing runs capture the component logs" ;;
+  *) bad "the FAILED branch must call capture_component_logs" ;;
+esac
+
+# The helper must write into the results dir (so it rides along in the artifact)
+# and be best-effort — it runs on a cluster that is by definition unhealthy.
+HELPER="$(sed -n '/^capture_component_logs()/,/^}$/p' "$RUNNER")"
+case "$HELPER" in
+  *'command -v "$runtime"'*) ok "capture_component_logs tolerates a missing container runtime" ;;
+  *) bad "capture_component_logs must check the runtime exists before using it" ;;
+esac
+case "$HELPER" in
+  *'[ -n "$out" ] && [ -d "$out" ] || return 0'*) ok "capture_component_logs tolerates a missing output dir" ;;
+  *) bad "capture_component_logs must tolerate a missing/empty output dir" ;;
+esac
+case "$HELPER" in
+  *'return 0'*) ok "capture_component_logs always returns success (best-effort)" ;;
+  *) bad "capture_component_logs must never fail the run" ;;
+esac
+case "$HELPER" in
+  *api-server*) ok "capture_component_logs captures the api-server log" ;;
+  *) bad "capture_component_logs must capture the api-server log" ;;
+esac
+
 echo
 if [ "$failcnt" -eq 0 ]; then echo "PASS: conformance-target-run ($pass checks)"; else echo "FAILED: $failcnt of $((pass + failcnt))" >&2; exit 1; fi
