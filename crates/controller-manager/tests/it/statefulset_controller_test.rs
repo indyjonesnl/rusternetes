@@ -659,3 +659,96 @@ async fn ordered_ready_scale_down_terminates_one_pod_per_reconcile_on_a_stale_li
         "reverse ordinal order: ss-1 is next, ss-0 waits"
     );
 }
+
+/// A condemned pod that the kubelet has already killed — phase `Failed`, with a
+/// `deletionTimestamp` — must stay visible to the scale-down loop, so the
+/// terminating guard still blocks the next ordinal.
+///
+/// This was the second half of the CI cascade (#1821). The terminal-pod sweep at
+/// the top of the reconcile deleted Failed/Succeeded pods and pushed everything
+/// else into the working list — but a pod that was *both* terminal *and* already
+/// terminating fell through the gap and was dropped entirely. `ss-2` then
+/// disappeared from the condemned list the moment the kubelet killed it, `ss-1`
+/// became the head, and the next reconcile deleted it — then `ss-0`. All three
+/// pods got "Killing: Stopping container webserver" on the same second.
+///
+/// Upstream never drops them: `processReplica`
+/// (pkg/controller/statefulset/stateful_set_control.go:426-434) returns
+/// `shouldExit` for a Failed/Succeeded replica whether or not it already carries
+/// a deletionTimestamp, so the sync ends before the condemned loop runs; and the
+/// condemned loop blocks on `isTerminating` (:510-518).
+#[tokio::test]
+async fn scale_down_blocks_on_a_condemned_pod_the_kubelet_already_killed() {
+    let storage = setup_test().await;
+    let ns = "default";
+
+    let mut statefulset = create_test_statefulset("ss", ns, 3);
+    statefulset.spec.pod_management_policy = Some("OrderedReady".to_string());
+    let key = build_key("statefulsets", Some(ns), "ss");
+    storage.create(&key, &statefulset).await.unwrap();
+
+    let controller = StatefulSetController::new(storage.clone());
+    for i in 0..3 {
+        controller.reconcile_all().await.unwrap();
+        mark_pod_ready(&storage, ns, &format!("ss-{i}")).await;
+    }
+
+    // Scale to zero and let the controller condemn the highest ordinal.
+    statefulset.spec.replicas = Some(0);
+    storage.update(&key, &statefulset).await.unwrap();
+    controller.reconcile_all().await.unwrap();
+    assert_eq!(
+        terminating_pod_names(&storage, ns).await,
+        vec!["ss-2".to_string()],
+        "first reconcile condemns ss-2 only"
+    );
+
+    // The kubelet kills ss-2: it is now Failed AND terminating — terminal and
+    // mid-deletion at the same time, the state that used to make it vanish.
+    let ss2_key = build_key("pods", Some(ns), "ss-2");
+    let mut ss2: Pod = storage.get(&ss2_key).await.unwrap();
+    ss2.status = Some(PodStatus {
+        phase: Some(Phase::Failed),
+        ..ss2.status.unwrap_or_default()
+    });
+    storage.update(&ss2_key, &ss2).await.unwrap();
+
+    // Reconciles while ss-2 is still going away must not touch ss-1 or ss-0.
+    for _ in 0..3 {
+        controller.reconcile_all().await.unwrap();
+        assert_eq!(
+            terminating_pod_names(&storage, ns).await,
+            vec!["ss-2".to_string()],
+            "a killed-but-not-yet-gone ss-2 must keep blocking the scale-down"
+        );
+    }
+
+    // Once it is really gone, and only then, ss-1 is next.
+    storage.delete(&ss2_key).await.unwrap();
+    controller.reconcile_all().await.unwrap();
+    assert_eq!(
+        terminating_pod_names(&storage, ns).await,
+        vec!["ss-1".to_string()],
+        "reverse ordinal order resumes with ss-1"
+    );
+}
+
+/// `terminating_pods` for a plain `MemoryStorage`.
+async fn terminating_pod_names(storage: &Arc<MemoryStorage>, namespace: &str) -> Vec<String> {
+    let raw: Vec<serde_json::Value> = storage
+        .list(&format!("/registry/pods/{namespace}/"))
+        .await
+        .unwrap();
+    let mut names: Vec<String> = raw
+        .iter()
+        .filter(|p| p.pointer("/metadata/deletionTimestamp").is_some())
+        .map(|p| {
+            p.pointer("/metadata/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    names
+}

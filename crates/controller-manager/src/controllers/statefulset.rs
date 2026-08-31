@@ -296,10 +296,28 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                     pod.metadata.name,
                     pod.status.as_ref().and_then(|s| s.phase.as_ref())
                 );
-            } else if !is_terminal {
+                // Deliberately NOT kept below: this pod has just been asked to go
+                // away, and upstream ends the sync here anyway (see below).
+            } else {
+                // Everything else stays — INCLUDING a terminal pod that is already
+                // terminating. Dropping those was the second half of the
+                // scale-down cascade (#1821): once the kubelet killed `ss-2` its
+                // phase went Failed while its deletionTimestamp was set, so it
+                // vanished from this list, `ss-1` became the head of the condemned
+                // list, and the next reconcile deleted it — then `ss-0`. All three
+                // pods got "Killing: Stopping container webserver" on the same
+                // second and `[sig-apps] StatefulSet ... Scaling should happen in
+                // predictable order` timed out on the ordered DELETED events.
+                //
+                // Upstream never drops them: `processReplica`
+                // (pkg/controller/statefulset/stateful_set_control.go:426-434)
+                // returns `shouldExit = true` for a Failed/Succeeded replica
+                // whether or not it already carries a deletionTimestamp, so the
+                // sync ends before the condemned loop runs at all; and the
+                // condemned loop itself blocks on `isTerminating` (:510-518).
+                // Keeping the pod visible is what lets that guard fire.
                 active_pods.push(pod);
             }
-            // Terminal pods with deletionTimestamp already set are being cleaned up
         }
         let mut statefulset_pods = active_pods;
 
