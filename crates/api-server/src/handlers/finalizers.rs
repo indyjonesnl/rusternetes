@@ -120,6 +120,108 @@ where
     }
 }
 
+/// The two garbage-collection finalizers a graceful DELETE may leave on an
+/// object, computed from the effective propagation policy.
+///
+/// Port of upstream `deletionFinalizersForGarbageCollection`
+/// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:976),
+/// which strips both GC finalizers and adds back whichever the policy calls
+/// for, using `shouldOrphanDependents` (store.go:883) and
+/// `shouldDeleteDependents` (store.go:932) for the precedence:
+///
+/// 1. the deprecated `deleteOptions.orphanDependents` bool wins over everything
+///    (`true` orphans, `false` means "not orphan" and never foreground),
+/// 2. then `deleteOptions.propagationPolicy`,
+/// 3. then a GC finalizer already on the object,
+/// 4. otherwise neither (background).
+///
+/// Finalizer literals are upstream's `metav1.FinalizerOrphanDependents` /
+/// `FinalizerDeleteDependents` (apimachinery/pkg/apis/meta/v1/types.go:105-106).
+pub fn gc_deletion_finalizers(
+    existing: Option<&Vec<String>>,
+    propagation_policy: Option<&str>,
+    orphan_dependents: Option<bool>,
+) -> Vec<String> {
+    const ORPHAN: &str = "orphan";
+    const FOREGROUND: &str = "foregroundDeletion";
+
+    let existing: &[String] = existing.map(|v| v.as_slice()).unwrap_or(&[]);
+
+    // upstream shouldOrphanDependents
+    let should_orphan = if let Some(orphan) = orphan_dependents {
+        orphan
+    } else {
+        match propagation_policy {
+            Some("Orphan") => true,
+            Some("Background") | Some("Foreground") => false,
+            _ => existing
+                .iter()
+                .find_map(|f| match f.as_str() {
+                    ORPHAN => Some(true),
+                    FOREGROUND => Some(false),
+                    _ => None,
+                })
+                .unwrap_or(false),
+        }
+    };
+
+    // upstream shouldDeleteDependents
+    let should_delete_dependents = if orphan_dependents.is_some() {
+        false
+    } else {
+        match propagation_policy {
+            Some("Foreground") => true,
+            Some("Background") | Some("Orphan") => false,
+            _ => existing
+                .iter()
+                .find_map(|f| match f.as_str() {
+                    FOREGROUND => Some(true),
+                    ORPHAN => Some(false),
+                    _ => None,
+                })
+                .unwrap_or(false),
+        }
+    };
+
+    let mut finalizers: Vec<String> = existing
+        .iter()
+        .filter(|f| f.as_str() != ORPHAN && f.as_str() != FOREGROUND)
+        .cloned()
+        .collect();
+    if should_orphan {
+        finalizers.push(ORPHAN.to_string());
+    }
+    if should_delete_dependents {
+        finalizers.push(FOREGROUND.to_string());
+    }
+    finalizers
+}
+
+/// Read the effective propagation policy and the deprecated `orphanDependents`
+/// bool out of a DELETE request: query parameters first, then the
+/// `DeleteOptions` body. Upstream decodes both into the same `DeleteOptions`,
+/// so either transport is valid.
+pub fn parse_delete_propagation(
+    params: &std::collections::HashMap<String, String>,
+    body_delete_options: Option<&serde_json::Value>,
+) -> (Option<String>, Option<bool>) {
+    let policy = params.get("propagationPolicy").cloned().or_else(|| {
+        body_delete_options
+            .and_then(|v| v.get("propagationPolicy"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    });
+    let orphan = params
+        .get("orphanDependents")
+        .and_then(|v| v.parse::<bool>().ok())
+        .or_else(|| {
+            body_delete_options
+                .and_then(|v| v.get("orphanDependents"))
+                .and_then(|v| v.as_bool())
+        });
+    (policy, orphan)
+}
+
 /// Handle deletion with propagation policy support.
 /// When propagation_policy is "Foreground", adds the "foregroundDeletion" finalizer
 /// so the garbage collector knows to delete dependents before the owner.
@@ -1067,6 +1169,84 @@ mod tests {
         assert!(
             stored.metadata.deletion_timestamp.is_some(),
             "and it carries a deletionTimestamp"
+        );
+    }
+
+    /// Precedence table straight out of upstream `shouldOrphanDependents`
+    /// (store.go:883) and `shouldDeleteDependents` (store.go:932).
+    #[test]
+    fn gc_deletion_finalizers_follows_upstream_precedence() {
+        let none: Option<&Vec<String>> = None;
+        type Case<'a> = (
+            Option<&'a Vec<String>>,
+            Option<&'a str>,
+            Option<bool>,
+            Vec<&'a str>,
+        );
+        let cases: &[Case] = &[
+            // No policy, no finalizers → background, nothing added.
+            (none, None, None, vec![]),
+            (none, Some("Background"), None, vec![]),
+            (none, Some("Foreground"), None, vec!["foregroundDeletion"]),
+            (none, Some("Orphan"), None, vec!["orphan"]),
+            // The deprecated bool wins over propagationPolicy, both ways.
+            (none, Some("Foreground"), Some(true), vec!["orphan"]),
+            (none, Some("Orphan"), Some(false), vec![]),
+        ];
+        for (existing, policy, orphan, expected) in cases {
+            let got = gc_deletion_finalizers(*existing, *policy, *orphan);
+            assert_eq!(
+                got, *expected,
+                "policy={policy:?} orphanDependents={orphan:?}"
+            );
+        }
+
+        // A GC finalizer already on the object decides when no option is set,
+        // and unrelated finalizers are always preserved in place.
+        let existing = vec![
+            "example.com/keep".to_string(),
+            "foregroundDeletion".to_string(),
+        ];
+        assert_eq!(
+            gc_deletion_finalizers(Some(&existing), None, None),
+            vec!["example.com/keep", "foregroundDeletion"]
+        );
+        // An explicit policy replaces the GC finalizer that was there.
+        assert_eq!(
+            gc_deletion_finalizers(Some(&existing), Some("Orphan"), None),
+            vec!["example.com/keep", "orphan"]
+        );
+        assert_eq!(
+            gc_deletion_finalizers(Some(&existing), Some("Background"), None),
+            vec!["example.com/keep"]
+        );
+    }
+
+    #[test]
+    fn parse_delete_propagation_reads_query_then_body() {
+        use std::collections::HashMap;
+
+        let mut params = HashMap::new();
+        params.insert("propagationPolicy".to_string(), "Foreground".to_string());
+        assert_eq!(
+            parse_delete_propagation(&params, None),
+            (Some("Foreground".to_string()), None)
+        );
+
+        // Body DeleteOptions when the query says nothing.
+        let body = serde_json::json!({
+            "propagationPolicy": "Orphan",
+            "orphanDependents": true,
+        });
+        assert_eq!(
+            parse_delete_propagation(&HashMap::new(), Some(&body)),
+            (Some("Orphan".to_string()), Some(true))
+        );
+
+        // Query wins over body.
+        assert_eq!(
+            parse_delete_propagation(&params, Some(&body)),
+            (Some("Foreground".to_string()), Some(true))
         );
     }
 }

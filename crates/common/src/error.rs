@@ -240,6 +240,24 @@ impl axum::response::IntoResponse for Error {
             });
         }
 
+        // A 5xx is the server's own fault and never carries its cause anywhere
+        // else: upstream logs it (`apiserver/pkg/endpoints/handlers/responsewriters`
+        // routes 5xx through `runtime.HandleError`), we did not, so the only
+        // record of e.g. a storage-layer LIST failure was the client's copy of
+        // the message. `[sig-api-machinery] Garbage collector should not be
+        // blocked by dependency circle` aborts its poll on the first LIST error
+        // and then discards the message through an upstream `%w`-of-nil bug
+        // (test/e2e/apimachinery/garbage_collector.go:868), leaving
+        // `failed to list pods: %!w(<nil>)` and nothing to debug from (#1804).
+        if status.is_server_error() {
+            tracing::error!(
+                status = status.as_u16(),
+                reason = reason,
+                "api-server returning a server error: {}",
+                message
+            );
+        }
+
         (status, Json(status_obj)).into_response()
     }
 }
