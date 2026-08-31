@@ -99,6 +99,37 @@ fn extract_resource_type_from_uri(uri: &Uri) -> String {
     }
 }
 
+/// Extract the API group from a request path.
+///
+/// Ported from upstream `RequestInfoFactory.NewRequestInfo`
+/// (`staging/src/k8s.io/apiserver/pkg/endpoints/request/requestinfo.go:146-159`,
+/// release-1.35): `APIPrefixes` is `{"api", "apis"}` and `GrouplessAPIPrefixes`
+/// is `{"api"}`, so `/api/v1/...` is the legacy core group (`""`) while
+/// `/apis/<group>/<version>/...` carries the group in the segment right after
+/// the prefix (`requestInfo.APIGroup = currentParts[0]`).
+///
+/// Without this every `/status` request was authorized with an empty API group.
+/// That is accidentally correct for core-group resources (pods, nodes,
+/// namespaces, …) and wrong for every other group: upstream's
+/// `system:controller:deployment-controller` grants `update` on
+/// `deployments/status` in the `apps`/`extensions` groups only
+/// (`plugin/pkg/auth/authorizer/rbac/bootstrappolicy/controller_policy.go:119`),
+/// so an `""`-group check never matches and the write is Forbidden. Against a
+/// stock kube-controller-manager that froze every Deployment and ReplicaSet
+/// status at zero (#1817).
+fn extract_api_group_from_uri(uri: &Uri) -> String {
+    let segments: Vec<&str> = uri.path().split('/').filter(|s| !s.is_empty()).collect();
+    match segments.first() {
+        // Groupless prefix: the core ("legacy") group.
+        Some(&"api") => String::new(),
+        Some(&"apis") => segments
+            .get(1)
+            .map(|g| (*g).to_string())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// Map resource type to Kind and apiVersion for TypeMeta injection.
 fn resource_type_to_kind_api_version(resource_type: &str) -> (String, String) {
     match resource_type {
@@ -277,6 +308,7 @@ pub async fn update_status(
         .unwrap_or("application/json");
 
     let resource_type = extract_resource_type_from_uri(&uri);
+    let api_group = extract_api_group_from_uri(&uri);
     info!(
         "Updating status for {}/{}/{}",
         resource_type, namespace, name
@@ -285,6 +317,7 @@ pub async fn update_status(
     // Check authorization - use 'update' verb with '/status' subresource
     let attrs = RequestAttributes::new(auth_ctx.user, "update", &resource_type)
         .with_namespace(&namespace)
+        .with_api_group(&api_group)
         .with_name(&name)
         .with_subresource("status");
 
@@ -454,10 +487,12 @@ pub async fn update_cluster_status(
         .unwrap_or("application/json");
 
     let resource_type = extract_resource_type_from_uri(&uri);
+    let api_group = extract_api_group_from_uri(&uri);
     info!("Updating status for {}/{}", resource_type, name);
 
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "update", &resource_type)
+        .with_api_group(&api_group)
         .with_name(&name)
         .with_subresource("status");
 
@@ -695,6 +730,7 @@ pub async fn get_status(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
     let resource_type = extract_resource_type_from_uri(&uri);
+    let api_group = extract_api_group_from_uri(&uri);
     info!(
         "Getting status for {}/{}/{}",
         resource_type, namespace, name
@@ -703,6 +739,7 @@ pub async fn get_status(
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "get", &resource_type)
         .with_namespace(&namespace)
+        .with_api_group(&api_group)
         .with_name(&name)
         .with_subresource("status");
 
@@ -736,10 +773,12 @@ pub async fn get_cluster_status(
     Path(name): Path<String>,
 ) -> Result<Json<Value>> {
     let resource_type = extract_resource_type_from_uri(&uri);
+    let api_group = extract_api_group_from_uri(&uri);
     debug!("Getting status for {}/{}", resource_type, name);
 
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "get", &resource_type)
+        .with_api_group(&api_group)
         .with_name(&name)
         .with_subresource("status");
 
@@ -769,6 +808,47 @@ pub async fn get_cluster_status(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The API group a `/status` request is authorized under must come from the
+    /// request path, not be hard-coded to the core group.
+    ///
+    /// Upstream `RequestInfoFactory.NewRequestInfo`
+    /// (`staging/src/k8s.io/apiserver/pkg/endpoints/request/requestinfo.go:146-159`):
+    /// `/api/...` is groupless, `/apis/<group>/...` is not. A `""` group made
+    /// `update deployments/status` unmatchable against upstream's
+    /// `system:controller:deployment-controller` rule, which names the
+    /// `apps`/`extensions` groups (#1817).
+    #[test]
+    fn status_api_group_comes_from_the_request_path() {
+        let cases: &[(&str, &str)] = &[
+            // Core group — the groupless `/api` prefix.
+            ("/api/v1/namespaces/ns/pods/p/status", ""),
+            ("/api/v1/nodes/n/status", ""),
+            ("/api/v1/namespaces/ns/status", ""),
+            ("/api/v1/persistentvolumes/pv/status", ""),
+            // Grouped resources.
+            ("/apis/apps/v1/namespaces/ns/deployments/d/status", "apps"),
+            ("/apis/apps/v1/namespaces/ns/replicasets/rs/status", "apps"),
+            ("/apis/apps/v1/namespaces/ns/statefulsets/ss/status", "apps"),
+            ("/apis/batch/v1/namespaces/ns/jobs/j/status", "batch"),
+            (
+                "/apis/networking.k8s.io/v1/namespaces/ns/ingresses/i/status",
+                "networking.k8s.io",
+            ),
+            (
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/c/status",
+                "apiextensions.k8s.io",
+            ),
+        ];
+        for (path, want) in cases {
+            let uri: Uri = path.parse().unwrap();
+            assert_eq!(
+                extract_api_group_from_uri(&uri),
+                *want,
+                "api group for {path}"
+            );
+        }
+    }
 
     #[test]
     fn test_status_update_preserves_generation() {
