@@ -670,6 +670,95 @@ vs_wait_ready() {
   return "$VS_EX_NOTUP"
 }
 
+# ---------------------------------------------------------------------------
+# Substrate reachability gate (#1819)
+# ---------------------------------------------------------------------------
+#
+# `readyz` proves the SWAPPED MODULE is up. It does not prove the cluster can
+# still run a test pod. The api-server leg reported `module-did-not-come-up`
+# 0/0 on three of five recent `:main` nightlies (runs 33207027510, 33198790192,
+# 33098411470) with the module demonstrably healthy — `readiness 'readyz'
+# satisfied after 35s`, preflight all-OK — and the e2e pod dying in
+# [SynchronizedBeforeSuite] on
+#
+#     Get "https://10.96.0.1:443/api/v1/nodes?...": dial tcp 10.96.0.1:443:
+#     connect: connection refused
+#
+# `connection refused` (not a timeout) is kube-proxy's REJECT rule for a Service
+# it believes has no ready endpoints. The api-server swap wipes the object store
+# and restarts the worker kubelets, so kube-proxy re-syncs from a store that is
+# still being repopulated; whether it has re-programmed the `kubernetes` Service
+# by the time hydrophone's pod dials was left to chance.
+#
+# So: gate on the thing the suite actually depends on, try to repair it the same
+# way the block above bounces a wedged KCM, and — if it still will not come —
+# report `substrate-not-ready` rather than blaming the module.
+
+# vs_dial_cluster_ip <node-container> <ip> <port>
+# TCP-connect to <ip>:<port> from inside a cluster node. The node netns is where
+# kube-proxy's KUBE-SERVICES chain lives (hooked into both PREROUTING and
+# OUTPUT), so this traverses the same DNAT/REJECT rules a pod's traffic would —
+# without needing a pod, a CNI IP, or an image pull. bash's /dev/tcp keeps it
+# free of `nc`/`curl` availability assumptions in the kind node image.
+# `VS_DIAL_CMD` is a test seam.
+vs_dial_cluster_ip() {
+  local node="$1" ip="$2" port="$3"
+  if [ -n "${VS_DIAL_CMD:-}" ]; then
+    "$VS_DIAL_CMD" "$node" "$ip" "$port"
+    return $?
+  fi
+  docker exec "$node" bash -c "exec 3<>/dev/tcp/${ip}/${port}" >/dev/null 2>&1
+}
+
+# vs_restart_kube_proxy <cluster>
+# Bounce every kube-proxy container so it re-syncs iptables from the current
+# EndpointSlices. Same remedy, and same crictl mechanism, as the KCM bounce in
+# the driver's post-restore block. Best-effort throughout: this runs on a
+# cluster that is by definition unhealthy.
+vs_restart_kube_proxy() {
+  local cluster="$1" node cid
+  for node in $(kind get nodes --name "$cluster" 2>/dev/null); do
+    cid="$(docker exec "$node" crictl ps --name kube-proxy -q 2>/dev/null | head -1)"
+    [ -n "$cid" ] && docker exec "$node" crictl stop "$cid" >/dev/null 2>&1
+  done
+  return 0
+}
+
+# vs_kubernetes_clusterip <kubeconfig> — echo "<ip> <port>" for default/kubernetes.
+vs_kubernetes_clusterip() {
+  local kubeconfig="$1"
+  KUBECONFIG="$kubeconfig" kubectl -n default get service kubernetes \
+    -o jsonpath='{.spec.clusterIP} {.spec.ports[0].port}' 2>/dev/null
+}
+
+# vs_wait_dial <node> <ip> <port> <timeout-seconds> <interval-seconds>
+# Poll until <ip>:<port> answers from inside <node>. Halfway through the budget,
+# fire the repair hook ONCE (default: restart kube-proxy) and keep polling.
+# Returns 0 as soon as it connects, non-zero when the budget is spent.
+vs_wait_dial() {
+  local node="$1" ip="$2" port="$3"
+  local timeout="${4:-180}" interval="${5:-5}"
+  local repair="${VS_REPAIR_CMD:-}"
+  local halfway=$(( timeout / 2 ))
+  local repaired=0 i
+
+  vs_log "waiting for ClusterIP ${ip}:${port} to answer from inside the cluster (≤${timeout}s)"
+  for (( i=0; i<timeout; i+=interval )); do
+    if vs_dial_cluster_ip "$node" "$ip" "$port"; then
+      vs_log "ClusterIP ${ip}:${port} reachable after ${i}s"
+      return 0
+    fi
+    if [ "$repaired" -eq 0 ] && [ "$i" -ge "$halfway" ]; then
+      repaired=1
+      vs_warn "ClusterIP ${ip}:${port} still refusing after ${i}s — restarting kube-proxy to re-sync iptables"
+      if [ -n "$repair" ]; then "$repair"; else vs_restart_kube_proxy "${VS_CLUSTER:-}"; fi
+    fi
+    sleep "$interval"
+  done
+  vs_warn "ClusterIP ${ip}:${port} never answered within ${timeout}s"
+  return 1
+}
+
 # vs_dump_readiness_diagnostics <cluster> <kubeconfig>
 # What the run looked like at the moment readiness gave up. Without this a
 # readiness timeout is three minutes of silence followed by a bare
