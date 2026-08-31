@@ -19,7 +19,10 @@
 #   --k8s-version vX.Y baseline version (default v1.35; non-default => skew check)
 #
 # Exit codes: 0 test-passed · 1 test-failed · 2 usage · 3 guard-rejected
-#             4 version-skew-unsupported · 5 module-did-not-come-up
+#             4 version-skew-unsupported · 5 module-did-not-come-up /
+#                                            substrate-not-ready (#1819: the
+#                                            module is up but the cluster cannot
+#                                            route the kubernetes ClusterIP)
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -322,6 +325,37 @@ if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
     vs_warn "warmup canary: quota usage not observed within 480s — proceeding anyway"
   fi
   KUBECONFIG="$RESTORE_KC" kubectl delete ns vs-warmup --wait=false >/dev/null 2>&1 || true
+
+  # Substrate gate (#1819). Everything above proves the api-server and the
+  # controllers are live. The suite additionally needs the `kubernetes`
+  # ClusterIP to be routable from inside the cluster — that is the very first
+  # thing the e2e framework does ([SynchronizedBeforeSuite] lists nodes through
+  # https://10.96.0.1:443), and it is the one piece the api-server swap breaks
+  # by wiping the store out from under kube-proxy.
+  #
+  # ONLY the api-server leg gates here. For the kube-proxy leg an unroutable
+  # ClusterIP IS the module failing, and must stay reported as such.
+  export VS_CLUSTER="$CLUSTER"
+  probe_node="$(kind get nodes --name "$CLUSTER" 2>/dev/null | grep -v 'control-plane' | head -1)"
+  [ -n "$probe_node" ] || probe_node="$(vs_control_plane_node "$CLUSTER")"
+  read -r svc_ip svc_port <<<"$(vs_kubernetes_clusterip "$RESTORE_KC")"
+  if [ -z "$probe_node" ]; then
+    # --env cloud has no kind nodes to exec into; the gate is kind-specific.
+    vs_warn "no cluster node container to probe from — skipping the substrate gate"
+  elif [ -z "${svc_ip:-}" ]; then
+    vs_warn "could not read the default/kubernetes ClusterIP — skipping the substrate gate"
+  elif ! vs_wait_dial "$probe_node" "$svc_ip" "${svc_port:-443}" \
+         "${VS_SUBSTRATE_TIMEOUT:-180}" 5; then
+    # Not the swapped module's fault: report it as its own outcome so the badge
+    # and the run-result say what actually broke.
+    vs_warn "substrate gate failed: the kubernetes ClusterIP is unroutable from inside the cluster"
+    KUBECONFIG="$RESTORE_KC" kubectl -n default get endpointslices \
+      -l kubernetes.io/service-name=kubernetes -o wide >&2 2>&1 || true
+    KUBECONFIG="$RESTORE_KC" kubectl -n kube-system get pods -o wide >&2 2>&1 || true
+    set -e
+    vs_emit_result "substrate-not-ready" 0 0 "$VS_K8S_VERSION"
+    exit "$VS_EX_NOTUP"
+  fi
   set -e
 fi
 

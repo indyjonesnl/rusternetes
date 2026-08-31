@@ -666,5 +666,96 @@ case "$DRV" in
   *) bad "CLUSTER must be overridable via VS_CLUSTER_NAME" ;;
 esac
 
+# --- substrate reachability gate (#1819) -----------------------------------
+# The api-server leg reported `module-did-not-come-up` 0/0 on 3 of 5 recent
+# `:main` nightlies because the e2e pod could not dial the `kubernetes`
+# ClusterIP -- `dial tcp 10.96.0.1:443: connect: connection refused`, which is
+# kube-proxy's REJECT for a Service it believes has no endpoints. The module was
+# up (`readyz` in 35s); the SUBSTRATE was not. Gate on it explicitly, try to
+# repair it, and never blame the swapped module for it.
+
+# A stub dial: fails the first `$VS_TEST_DIAL_FAILS` calls, then succeeds. The
+# call count lives in a file so it survives the subshells the loop runs in.
+DIAL_STUB="$TMP/dial-stub.sh"
+cat >"$DIAL_STUB" <<'STUB'
+#!/usr/bin/env bash
+n=$(cat "$VS_TEST_DIAL_COUNT" 2>/dev/null || echo 0)
+n=$((n+1)); printf '%s' "$n" >"$VS_TEST_DIAL_COUNT"
+[ "$n" -gt "${VS_TEST_DIAL_FAILS:-0}" ]
+STUB
+chmod +x "$DIAL_STUB"
+export VS_TEST_DIAL_COUNT="$TMP/dial-count"
+
+# reachable on the first dial => success, no repair attempted
+printf '0' >"$VS_TEST_DIAL_COUNT"
+VS_TEST_DIAL_FAILS=0 VS_DIAL_CMD="$DIAL_STUB" VS_REPAIR_CMD=/bin/true \
+  vs_wait_dial node 10.96.0.1 443 10 1 >/dev/null 2>&1 \
+  && ok "vs_wait_dial: reachable immediately => 0" \
+  || bad "vs_wait_dial should succeed when the first dial succeeds"
+
+# reachable only after a few retries => still success
+printf '0' >"$VS_TEST_DIAL_COUNT"
+VS_TEST_DIAL_FAILS=3 VS_DIAL_CMD="$DIAL_STUB" VS_REPAIR_CMD=/bin/true \
+  vs_wait_dial node 10.96.0.1 443 10 1 >/dev/null 2>&1 \
+  && ok "vs_wait_dial: reachable after retries => 0" \
+  || bad "vs_wait_dial should keep retrying within its budget"
+
+# never reachable => non-zero, so the caller can report substrate-not-ready
+printf '0' >"$VS_TEST_DIAL_COUNT"
+VS_TEST_DIAL_FAILS=9999 VS_DIAL_CMD="$DIAL_STUB" VS_REPAIR_CMD=/bin/true \
+  vs_wait_dial node 10.96.0.1 443 4 1 >/dev/null 2>&1 \
+  && bad "vs_wait_dial must fail when the ClusterIP never answers" \
+  || ok "vs_wait_dial: never reachable => non-zero"
+
+# the repair hook fires exactly once, halfway through the budget -- a wedged
+# kube-proxy re-syncs its iptables on restart, which is what turns the coin
+# flip into a pass rather than just a better error message.
+printf '0' >"$VS_TEST_DIAL_COUNT"
+REPAIR_LOG="$TMP/repair.log"; : >"$REPAIR_LOG"
+REPAIR_STUB="$TMP/repair-stub.sh"
+printf '#!/usr/bin/env bash\necho fired >>"%s"\n' "$REPAIR_LOG" >"$REPAIR_STUB"
+chmod +x "$REPAIR_STUB"
+VS_TEST_DIAL_FAILS=9999 VS_DIAL_CMD="$DIAL_STUB" VS_REPAIR_CMD="$REPAIR_STUB" \
+  vs_wait_dial node 10.96.0.1 443 10 1 >/dev/null 2>&1
+repairs="$(wc -l <"$REPAIR_LOG" | tr -d ' ')"
+[ "$repairs" = "1" ] \
+  && ok "vs_wait_dial: repair hook fires once on a wedged substrate" \
+  || bad "vs_wait_dial should fire the repair hook exactly once (fired $repairs times)"
+
+# ...and never when the substrate was fine all along.
+printf '0' >"$VS_TEST_DIAL_COUNT"
+: >"$REPAIR_LOG"
+VS_TEST_DIAL_FAILS=0 VS_DIAL_CMD="$DIAL_STUB" VS_REPAIR_CMD="$REPAIR_STUB" \
+  vs_wait_dial node 10.96.0.1 443 10 1 >/dev/null 2>&1
+[ ! -s "$REPAIR_LOG" ] \
+  && ok "vs_wait_dial: no repair when the ClusterIP answers" \
+  || bad "vs_wait_dial must not restart kube-proxy on a healthy substrate"
+
+# the driver has to actually gate on it, and report the distinct outcome --
+# `module-did-not-come-up` blamed the swapped module for a substrate problem and
+# made the badge unreadable.
+GATE_SH="$(cat "$SCRIPT_DIR/vanilla-swap-run.sh")"
+case "$GATE_SH" in
+  *"vs_wait_dial"*) ok "vanilla-swap-run.sh gates on ClusterIP reachability" ;;
+  *) bad "vanilla-swap-run.sh must call vs_wait_dial before running the suite" ;;
+esac
+case "$GATE_SH" in
+  *"substrate-not-ready"*) ok "the driver reports substrate-not-ready, not module-did-not-come-up" ;;
+  *) bad "vanilla-swap-run.sh must emit 'substrate-not-ready' when the gate fails" ;;
+esac
+
+# vs_kubernetes_clusterip parses the Service into "<ip> <port>".
+KC_STUB_BIN="$TMP/kc-stub-bin"
+mkdir -p "$KC_STUB_BIN"
+cat >"$KC_STUB_BIN/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '10.96.0.1 443'
+STUB
+chmod +x "$KC_STUB_BIN/kubectl"
+got="$(PATH="$KC_STUB_BIN:$PATH" vs_kubernetes_clusterip /dev/null)"
+[ "$got" = "10.96.0.1 443" ] \
+  && ok "vs_kubernetes_clusterip: returns '<ip> <port>'" \
+  || bad "vs_kubernetes_clusterip got '$got' (want '10.96.0.1 443')"
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }
