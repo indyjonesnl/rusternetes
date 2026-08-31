@@ -1,6 +1,7 @@
 // Job Controller Integration Tests
 // Tests the Job controller's ability to manage batch workloads
 
+use crate::stale_list_double::StaleListStorage;
 use rusternetes_common::resources::pod::*;
 use rusternetes_common::resources::workloads::*;
 use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
@@ -601,4 +602,155 @@ async fn test_job_unsuspend_resumes_pod_creation() {
     controller.reconcile_all().await.unwrap();
     let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
     assert_eq!(pods.len(), 2, "Unsuspended job should create pods");
+}
+
+/// A pod belonging to `job_name`/`job_uid` at completion index `index`.
+fn indexed_job_pod(
+    name: &str,
+    namespace: &str,
+    phase: Phase,
+    job_name: &str,
+    job_uid: &str,
+    index: i32,
+) -> Pod {
+    let mut labels = HashMap::new();
+    labels.insert("job-name".to_string(), job_name.to_string());
+    labels.insert(
+        "batch.kubernetes.io/job-completion-index".to_string(),
+        index.to_string(),
+    );
+    let mut annotations = HashMap::new();
+    annotations.insert(
+        "batch.kubernetes.io/job-completion-index".to_string(),
+        index.to_string(),
+    );
+    Pod {
+        type_meta: TypeMeta {
+            kind: "Pod".to_string(),
+            api_version: "v1".to_string(),
+        },
+        metadata: {
+            let mut meta = ObjectMeta::new(name);
+            meta.namespace = Some(namespace.to_string());
+            meta.uid = uuid::Uuid::new_v4().to_string();
+            meta.labels = Some(labels);
+            meta.annotations = Some(annotations);
+            meta.owner_references = Some(vec![rusternetes_common::types::OwnerReference {
+                api_version: "batch/v1".to_string(),
+                kind: "Job".to_string(),
+                name: job_name.to_string(),
+                uid: job_uid.to_string(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]);
+            meta
+        },
+        spec: None,
+        status: Some(PodStatus {
+            phase: Some(phase),
+            ..Default::default()
+        }),
+    }
+}
+
+/// An index that has already burned its `backoffLimitPerIndex` retries must not
+/// get another pod, **even when the reconcile's opening snapshot has not yet
+/// observed the last failure**.
+///
+/// The pod-creation gate re-lists pods right before creating ("to minimize race
+/// window"), and took its active/succeeded counts from that fresh list — but its
+/// per-index failure budget from the stale snapshot taken at the top of the
+/// reconcile. Against a vanilla api-server the two disagree, so an exhausted
+/// index still looked retryable and got one pod too many. With
+/// `backoffLimitPerIndex: 1` over two failing indexes that made `status.failed`
+/// 5 instead of 4, and `[sig-apps] Job should execute all indexes despite some
+/// failing when using backoffLimitPerIndex` failed on
+/// `Expected <int32>: 5 to equal <int32>: 4` (test/e2e/apps/job.go:630, #1821).
+/// Direct-storage mode never reproduced it — both lists are always identical.
+#[tokio::test]
+async fn exhausted_index_gets_no_extra_pod_when_the_opening_list_is_stale() {
+    let storage = Arc::new(
+        // The opening snapshot has not yet seen index 1's SECOND failure; the
+        // re-list right before creation has.
+        StaleListStorage::new().hiding_next_list(&["p1-b"]),
+    );
+    let ns = "default";
+
+    // completions=4, parallelism=2, backoffLimitPerIndex=1 — the upstream spec's
+    // shape: odd indexes fail, even ones succeed.
+    let mut job = create_test_job("with-backoff-limit-per-index", ns, 4, 2);
+    job.spec.completion_mode = Some("Indexed".to_string());
+    job.spec.backoff_limit_per_index = Some(1);
+    job.spec.backoff_limit = Some(100); // keep the global limit out of it
+    let job_uid = job.metadata.uid.clone();
+    let job_key = build_key("jobs", Some(ns), "with-backoff-limit-per-index");
+    storage.create(&job_key, &job).await.unwrap();
+
+    // Index 0 and 2 succeeded. Index 1 has failed twice — its budget is spent
+    // (backoffLimitPerIndex=1 allows two pods). Index 3 has failed once and is
+    // still legitimately retryable.
+    for (name, phase, index) in [
+        ("p0", Phase::Succeeded, 0),
+        ("p2", Phase::Succeeded, 2),
+        ("p1-a", Phase::Failed, 1),
+        ("p1-b", Phase::Failed, 1),
+        ("p3-a", Phase::Failed, 3),
+    ] {
+        let pod = indexed_job_pod(
+            name,
+            ns,
+            phase,
+            "with-backoff-limit-per-index",
+            &job_uid,
+            index,
+        );
+        storage
+            .create(&build_key("pods", Some(ns), name), &pod)
+            .await
+            .unwrap();
+    }
+
+    let controller = JobController::new(storage.clone());
+    controller.reconcile_all().await.unwrap();
+
+    let pods: Vec<Pod> = storage
+        .inner
+        .list(&format!("/registry/pods/{ns}/"))
+        .await
+        .unwrap();
+    let created_for_index_1 = pods
+        .iter()
+        .filter(|p| {
+            p.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("batch.kubernetes.io/job-completion-index"))
+                .map(|v| v == "1")
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(
+        created_for_index_1,
+        2,
+        "index 1 spent its backoffLimitPerIndex budget (2 pods); a stale opening \
+         list must not earn it a third. Pods now: {:?}",
+        pods.iter().map(|p| &p.metadata.name).collect::<Vec<_>>()
+    );
+
+    // The still-retryable index must be unaffected by the fix.
+    let created_for_index_3 = pods
+        .iter()
+        .filter(|p| {
+            p.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("batch.kubernetes.io/job-completion-index"))
+                .map(|v| v == "3")
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(
+        created_for_index_3, 2,
+        "index 3 has one failure and a budget of one retry, so it gets a second pod"
+    );
 }
