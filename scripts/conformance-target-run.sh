@@ -118,6 +118,42 @@ suite_level_failures() {
 # Names of the real specs that FAILED, one per line ("  - <name>"), with junit's
 # XML entities decoded. Same suite-level-node exclusion as target_counts, so the
 # printed list always matches the reported `failed=` count.
+# capture_component_logs <output-dir>
+# Copy the control-plane component logs INTO the results directory on a failing
+# run, so they ride along in the uploaded artifact.
+#
+# The teardown step already pipes `compose logs --tail=100` to the job log, but
+# that is a different thing: it is truncated, it is not in the artifact, and by
+# the time anyone reads a nightly the job log is the last place they look. An
+# intermittent api-server failure is unactionable without it — the FlowSchema
+# watch flake (#1824) delivered `ADDED` where the client expected `MODIFIED`,
+# reproduced on no local configuration tried, and the one artifact that could
+# have settled it (the api-server's own `Watch ADDED event for key=...,
+# should_send_initial=...` line, already logged at debug) was never captured.
+#
+# Best-effort throughout: a failing dump must never change the run's verdict.
+capture_component_logs() {
+    local out="${1:-}"
+    [ -n "$out" ] && [ -d "$out" ] || return 0
+    local runtime="${CONTAINER_RUNTIME:-docker}"
+    command -v "$runtime" >/dev/null 2>&1 || return 0
+
+    local svc
+    for svc in api-server rhino controller-manager scheduler; do
+        local dest="$out/component-$svc.log"
+        if "$runtime" compose -f compose.sqlite.yml logs --no-color --tail="${COMPONENT_LOG_TAIL:-5000}" "$svc" \
+             >"$dest" 2>/dev/null && [ -s "$dest" ]; then
+            echo "[conformance-target-run] captured $svc log -> $dest"
+        elif "$runtime" logs --tail="${COMPONENT_LOG_TAIL:-5000}" "rusternetes-$svc" \
+             >"$dest" 2>&1 && [ -s "$dest" ]; then
+            echo "[conformance-target-run] captured $svc log (direct) -> $dest"
+        else
+            rm -f "$dest"
+        fi
+    done
+    return 0
+}
+
 spec_failures() {
     local junit="$1/junit_01.xml"
     [ -f "$junit" ] || return 0
@@ -277,6 +313,7 @@ echo "[conformance-target-run] target=$TARGET hydrophone_exit=$hydro_exit passed
 if [ "$FAILED" -gt 0 ]; then
     echo "[conformance-target-run] FAILED tests:"
     spec_failures "$OUTPUT_DIR" || true
+    capture_component_logs "$OUTPUT_DIR"
 fi
 
 # Badge total (attempted) EXCLUDES skipped, per the existing update-badge counting.
