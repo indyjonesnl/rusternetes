@@ -1106,6 +1106,17 @@ pub async fn delete_pod(
         updated_pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
     }
 
+    // Effective garbage-collection propagation policy for this DELETE. Upstream
+    // resolves it in the generic registry for every resource, pods included
+    // (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:976
+    // `deletionFinalizersForGarbageCollection`); the pod strategy declares no
+    // `DefaultGarbageCollectionPolicy`, so the generic rules apply unchanged.
+    let (propagation_policy, orphan_dependents) =
+        crate::handlers::finalizers::parse_delete_propagation(
+            &params,
+            body_delete_options.as_ref(),
+        );
+
     // Parse gracePeriodSeconds from query params, request body (DeleteOptions), or pod spec
     let body_grace_period = body_delete_options
         .as_ref()
@@ -1151,6 +1162,21 @@ pub async fn delete_pod(
             fresh_pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
         }
         fresh_pod.metadata.deletion_grace_period_seconds = Some(grace_period);
+
+        // Leave the GC finalizer the policy calls for, so the garbage collector
+        // runs the cascade the client asked for instead of defaulting to
+        // background (`determine_propagation_policy` reads exactly these).
+        let gc_finalizers = crate::handlers::finalizers::gc_deletion_finalizers(
+            fresh_pod.metadata.finalizers.as_ref(),
+            propagation_policy.as_deref(),
+            orphan_dependents,
+        );
+        fresh_pod.metadata.finalizers = if gc_finalizers.is_empty() {
+            None
+        } else {
+            Some(gc_finalizers)
+        };
+
         let current_gen = fresh_pod.metadata.generation.unwrap_or(1);
         fresh_pod.metadata.generation = Some(current_gen + 1);
 
@@ -2128,5 +2154,100 @@ mod tests {
         assert!(error_msg.contains("forbidden"));
         assert!(error_msg.contains("unsafe sysctl"));
         assert!(error_msg.contains("kernel.msgmax"));
+    }
+
+    async fn create_pod_test_state() -> Arc<ApiServerState> {
+        use rusternetes_common::auth::TokenManager;
+        use rusternetes_common::authz::AlwaysAllowAuthorizer;
+        use rusternetes_common::observability::MetricsRegistry;
+        use rusternetes_storage::StorageBackend;
+
+        let storage = Arc::new(StorageBackend::new_memory());
+        let token_manager = Arc::new(TokenManager::new(b"test-secret"));
+        let authorizer =
+            Arc::new(AlwaysAllowAuthorizer) as Arc<dyn rusternetes_common::authz::Authorizer>;
+        let metrics = Arc::new(MetricsRegistry::new());
+
+        Arc::new(ApiServerState::new(
+            storage,
+            token_manager,
+            authorizer,
+            metrics,
+            true,
+        ))
+    }
+
+    /// A graceful pod DELETE must leave the garbage-collection finalizer the
+    /// requested propagation policy calls for, exactly as upstream's generic
+    /// registry does for every resource
+    /// (`deletionFinalizersForGarbageCollection`,
+    /// staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:976).
+    ///
+    /// Without it the GC sees a pod with a deletionTimestamp and no finalizer,
+    /// picks `Background` in `determine_propagation_policy`, and the foreground
+    /// cascade the client asked for never runs — which is what
+    /// `[sig-api-machinery] Garbage collector should not be blocked by
+    /// dependency circle [Conformance]` depends on.
+    #[tokio::test]
+    async fn delete_pod_applies_propagation_policy_finalizer() {
+        for (policy, body, expected) in [
+            (Some("Foreground"), None, vec!["foregroundDeletion"]),
+            (Some("Orphan"), None, vec!["orphan"]),
+            (Some("Background"), None, Vec::<&str>::new()),
+            (None, None, Vec::<&str>::new()),
+            // DeleteOptions may arrive in the request body instead of the query.
+            (
+                None,
+                Some(serde_json::json!({
+                    "apiVersion": "v1", "kind": "DeleteOptions",
+                    "propagationPolicy": "Foreground",
+                })),
+                vec!["foregroundDeletion"],
+            ),
+        ] {
+            let state = create_pod_test_state().await;
+            let key = build_key("pods", Some("default"), "gc-pod");
+            let seeded = serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "gc-pod", "namespace": "default", "uid": "gc-pod-uid"},
+                "spec": {"containers": [{"name": "c", "image": "nginx"}]},
+            });
+            let _: serde_json::Value = state.storage.create(&key, &seeded).await.unwrap();
+
+            let mut params = HashMap::new();
+            if let Some(p) = policy {
+                params.insert("propagationPolicy".to_string(), p.to_string());
+            }
+            let bytes = body
+                .map(|b| axum::body::Bytes::from(serde_json::to_vec(&b).unwrap()))
+                .unwrap_or_default();
+
+            let _resp = delete_pod(
+                State(state.clone()),
+                Extension(AuthContext {
+                    user: rusternetes_common::auth::UserInfo::anonymous(),
+                }),
+                Path(("default".to_string(), "gc-pod".to_string())),
+                axum::extract::Query(params),
+                bytes,
+            )
+            .await
+            .expect("delete must succeed");
+
+            let stored: Pod = state.storage.get(&key).await.expect("pod must still exist");
+            assert!(
+                stored.metadata.deletion_timestamp.is_some(),
+                "policy {policy:?}: graceful delete must stamp deletionTimestamp"
+            );
+            let got: Vec<&str> = stored
+                .metadata
+                .finalizers
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(got, expected, "finalizers for propagationPolicy {policy:?}");
+        }
     }
 }

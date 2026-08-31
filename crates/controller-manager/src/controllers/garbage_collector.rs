@@ -787,6 +787,23 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                     {
                         error!("Failed to update dependent {}: {}", dependent.key, e);
                     }
+                } else if visited.contains(&dependent.metadata.uid) {
+                    // Ownership cycle: this dependent is already on the walk, so
+                    // it is the object whose own foreground deletion started it.
+                    // Leave it entirely alone. Deleting it here would take it out
+                    // of storage behind its own finalizers — including the
+                    // `foregroundDeletion` one that must not be dropped until
+                    // every blocking dependent is gone
+                    // (upstream `processDeletingDependentsItem`,
+                    // pkg/controller/garbagecollector/garbagecollector.go). The
+                    // nodes between here and it are deleted as this recursion
+                    // unwinds, which clears its gate; `process_deletion` then
+                    // removes the finalizer and deletes it properly.
+                    debug!(
+                        "Foreground deletion: {} closes an ownership cycle with {}, \
+                         leaving it to its own deletion pass",
+                        dependent.key, resource.key
+                    );
                 } else {
                     // Dependent's only owner is the one being deleted — delete it
                     info!(
@@ -1775,6 +1792,80 @@ mod tests {
         assert!(
             remaining.is_empty(),
             "a single scan must collect the whole chain, not one level per scan; still present: {names:?}"
+        );
+    }
+
+    /// The object whose foreground deletion started the walk must never be
+    /// removed from storage BY the walk. In an ownership cycle the walk comes
+    /// back around to it (pod3's dependent is pod1, the object being deleted);
+    /// deleting it there takes it out from behind its own finalizers.
+    ///
+    /// Upstream never does this: `attemptToDeleteItem` returns immediately for
+    /// an item that is already being deleted, and an item's own
+    /// `foregroundDeletion` finalizer is only dropped by
+    /// `processDeletingDependentsItem` once its blocking dependents are gone
+    /// (pkg/controller/garbagecollector/garbagecollector.go). A third-party
+    /// finalizer makes the difference observable: the pod must survive the scan.
+    #[tokio::test]
+    async fn foreground_cycle_does_not_delete_the_walk_root_behind_its_finalizers() {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let gc = GarbageCollector::new(storage.clone());
+
+        let uids = ["root-uid", "mid-uid", "tail-uid"];
+        let names = ["root", "mid", "tail"];
+
+        for i in 0..3 {
+            let owner_idx = (i + 2) % 3;
+            let mut meta = ObjectMeta::new(names[i]);
+            meta.namespace = Some("default".to_string());
+            meta.uid = uids[i].to_string();
+            meta.owner_references = Some(vec![OwnerReference {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                name: names[owner_idx].to_string(),
+                uid: uids[owner_idx].to_string(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]);
+            if i == 0 {
+                meta.deletion_timestamp = Some(chrono::Utc::now());
+                // A third-party finalizer alongside the GC one: nothing in the
+                // GC is allowed to remove the object while this is present.
+                meta.finalizers = Some(vec![
+                    "foregroundDeletion".to_string(),
+                    "example.com/blocker".to_string(),
+                ]);
+            }
+            let pod = Pod {
+                type_meta: TypeMeta {
+                    kind: "Pod".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: meta,
+                spec: None,
+                status: None,
+            };
+            storage
+                .create(&format!("/registry/pods/default/{}", names[i]), &pod)
+                .await
+                .unwrap();
+        }
+
+        gc.scan_and_collect().await.unwrap();
+
+        let root: rusternetes_common::Result<Value> =
+            storage.get("/registry/pods/default/root").await;
+        let root = root.expect("root must survive: its third-party finalizer is still set");
+        let finalizers: Vec<String> = root
+            .pointer("/metadata/finalizers")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        assert!(
+            finalizers.contains(&"example.com/blocker".to_string()),
+            "the third-party finalizer must remain, got {finalizers:?}"
         );
     }
 }
