@@ -222,6 +222,82 @@ pub fn parse_delete_propagation(
     (policy, orphan)
 }
 
+/// Apply upstream's `ShouldDeleteDuringUpdate` to an object that a PUT has just
+/// stored: if the update drained the last finalizer off an object already
+/// pending deletion, the object must disappear as part of that request.
+///
+/// Returns `true` when the object was removed.
+///
+/// Upstream runs this inside the generic registry's `Update`
+/// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:565,
+/// applied via `deleteWithoutFinalizers`), so it covers PUT and PATCH alike.
+/// We had it on the PATCH path only
+/// ([`crate::handlers::generic_patch::should_delete_during_update`]), which left
+/// the GC's end-of-pass sweep as the only thing finishing an object whose last
+/// finalizer was removed by a PUT — and most controllers remove finalizers with
+/// Update, not Patch (#1831).
+///
+/// ## Why the stored object is compared against itself
+///
+/// Upstream's predicate reads the *new* object's finalizers and the *old*
+/// object's `deletionTimestamp` / `deletionGracePeriodSeconds`. Those two old
+/// fields are exactly what [`crate::handlers::lifecycle::inherit_server_owned_metadata`]
+/// reinstates from storage before the write — upstream's `BeforeUpdate` rule
+/// that "an update can never remove/change a deletion timestamp"
+/// (staging/src/k8s.io/apiserver/pkg/registry/rest/update.go:139-146). So on a
+/// handler that inherits, the stored object carries the old values and one
+/// object is enough; the rule itself still lives in a single place.
+///
+/// **Only call this from a handler that calls `inherit_server_owned_metadata`.**
+/// Without that inheritance a client could put a `deletionTimestamp` of its own
+/// in the request body and have the object deleted, which upstream prevents by
+/// overwriting that field before the predicate ever runs.
+pub async fn finish_deletion_if_finalizers_drained<S, T>(
+    storage: &S,
+    key: &str,
+    stored: &T,
+) -> Result<bool>
+where
+    S: Storage,
+    T: Serialize,
+{
+    let stored_json =
+        serde_json::to_value(stored).map_err(rusternetes_common::Error::Serialization)?;
+    // Namespaces are the one resource whose registry overrides the predicate:
+    // `ShouldDeleteNamespaceDuringUpdate`
+    // (pkg/registry/core/namespace/storage/storage.go:258) is
+    //
+    //     return len(ns.Spec.Finalizers) == 0 && genericregistry.ShouldDeleteDuringUpdate(...)
+    //
+    // A Terminating namespace normally has an EMPTY `metadata.finalizers` and a
+    // `spec.finalizers` of ["kubernetes"], which the namespace controller clears
+    // through /finalize only once the namespace is drained. Without this the
+    // generic predicate would delete the namespace on the first PUT it received,
+    // while its contents were still being removed. `spec.finalizers` exists on
+    // no other resource, so the check is safe to apply unconditionally.
+    let spec_finalizers_remain = stored_json
+        .get("spec")
+        .and_then(|sp| sp.get("finalizers"))
+        .and_then(|f| f.as_array())
+        .is_some_and(|a| !a.is_empty());
+    if spec_finalizers_remain {
+        return Ok(false);
+    }
+
+    if !crate::handlers::generic_patch::should_delete_during_update(&stored_json, &stored_json) {
+        return Ok(false);
+    }
+    match storage.delete(key).await {
+        Ok(_) => {
+            info!("{key} deleted (finalizers drained during update)");
+            Ok(true)
+        }
+        // Something else finished it first; the outcome the caller wanted holds.
+        Err(rusternetes_common::Error::NotFound(_)) => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
 /// Handle deletion with propagation policy support.
 /// When propagation_policy is "Foreground", adds the "foregroundDeletion" finalizer
 /// so the garbage collector knows to delete dependents before the owner.

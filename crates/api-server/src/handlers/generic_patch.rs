@@ -25,10 +25,11 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Upstream `ShouldDeleteDuringUpdate`
-/// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go): an
+/// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:565): an
 /// update/patch removes the object from storage when the *new* object has no
-/// finalizers left AND the *existing* object was already pending deletion
-/// (deletionTimestamp set). This is how the garbage collector finishes
+/// finalizers left, the *existing* object was already pending deletion
+/// (deletionTimestamp set), AND that object is not sitting inside a non-zero
+/// deletion grace period. This is how the garbage collector finishes
 /// orphan/foreground deletion — it PATCHes away the last finalizer (e.g.
 /// `orphan`) and the object must then disappear. Without this a Terminating
 /// object whose finalizers the GC has drained lingers forever, so
@@ -46,11 +47,28 @@ pub(crate) fn should_delete_during_update(
     if !new_finalizers_empty {
         return false;
     }
-    existing_json
+    let existing_terminating = existing_json
         .get("metadata")
         .and_then(|m| m.get("deletionTimestamp"))
         .map(|v| !v.is_null())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !existing_terminating {
+        return false;
+    }
+    // Upstream's last clause (store.go:584-585):
+    //
+    //     // delete if the existing object has no grace period or a grace period of 0
+    //     return oldMeta.GetDeletionGracePeriodSeconds() == nil || *oldMeta.GetDeletionGracePeriodSeconds() == 0
+    //
+    // An object still inside a non-zero grace period belongs to the graceful
+    // deletion path — for a pod, the kubelet, which removes it when the
+    // container actually stops. A finalizer-draining update must not cut that
+    // short.
+    existing_json
+        .get("metadata")
+        .and_then(|m| m.get("deletionGracePeriodSeconds"))
+        .and_then(|v| v.as_i64())
+        .is_none_or(|secs| secs == 0)
 }
 
 /// Generic PATCH handler for namespaced resources
@@ -855,5 +873,43 @@ mod finalizer_drain_tests {
         let existing = json!({"metadata":{"finalizers":["x"]}});
         let new = json!({"metadata":{"finalizers":[]}});
         assert!(!should_delete_during_update(&new, &existing));
+    }
+
+    // Upstream's final clause: an object still inside a non-zero deletion grace
+    // period is NOT removed by a finalizer-draining update — it belongs to the
+    // graceful-deletion path (the kubelet, for a pod), which removes it when the
+    // container stops. `ShouldDeleteDuringUpdate`
+    // (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:584-585):
+    //
+    //     // delete if the existing object has no grace period or a grace period of 0
+    //     return oldMeta.GetDeletionGracePeriodSeconds() == nil || *oldMeta.GetDeletionGracePeriodSeconds() == 0
+    #[test]
+    fn keeps_a_pod_inside_its_deletion_grace_period() {
+        let existing = json!({"metadata":{
+            "deletionTimestamp":"2026-07-25T00:00:00Z",
+            "deletionGracePeriodSeconds": 30,
+            "finalizers":["example.com/x"],
+        }});
+        let new = json!({"metadata":{
+            "deletionTimestamp":"2026-07-25T00:00:00Z",
+            "deletionGracePeriodSeconds": 30,
+        }});
+        assert!(
+            !should_delete_during_update(&new, &existing),
+            "a terminating pod with a 30s grace period must not be removed by a \
+             finalizer-draining update"
+        );
+    }
+
+    // A grace period of 0 is a force delete: upstream removes it.
+    #[test]
+    fn deletes_when_grace_period_is_zero() {
+        let existing = json!({"metadata":{
+            "deletionTimestamp":"2026-07-25T00:00:00Z",
+            "deletionGracePeriodSeconds": 0,
+            "finalizers":["example.com/x"],
+        }});
+        let new = json!({"metadata":{"deletionTimestamp":"2026-07-25T00:00:00Z"}});
+        assert!(should_delete_during_update(&new, &existing));
     }
 }
