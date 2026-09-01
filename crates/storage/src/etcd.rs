@@ -127,6 +127,92 @@ impl EtcdStorage {
         )))
     }
 
+    /// The shared paging walk behind [`Storage::list`] and
+    /// [`Storage::list_at_revision`] — the only difference between them is
+    /// whether the range reads at a pinned `revision` or live.
+    ///
+    /// Paginate list calls to avoid hitting the default 4MB gRPC message size
+    /// limit.
+    ///
+    /// Every page is an explicit range bounded by the prefix — `[start,
+    /// prefix_range_end)` — continuing at `lastKey + "\x00"`, exactly as
+    /// upstream does (`etcd3/store.go`: `continueKey = string(lastKey) +
+    /// "\x00"`). The previous code combined `with_prefix()` with
+    /// `with_from_key()`; the latter wins in `etcd-client`, so page 2 asked for
+    /// the unbounded range `[lastKey, +inf)` and relied on a manual prefix
+    /// re-check to trim the overshoot. That is outside the RPC subset and, on
+    /// backends that do not implement open-ended ranges, silently returned
+    /// nothing — truncating long lists to their first page.
+    async fn list_inner<T>(&self, prefix: &str, revision: Option<i64>) -> Result<Vec<T>>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        let mut client = self.client.clone();
+        let page_size = self.page_size;
+        let range_end = prefix_range_end(prefix.as_bytes());
+        let mut results = Vec::new();
+        let mut next_start: Vec<u8> = prefix.as_bytes().to_vec();
+
+        loop {
+            let mut get_options = GetOptions::new()
+                .with_range(range_end.clone())
+                .with_limit(page_size);
+            if let Some(rev) = revision {
+                get_options = get_options.with_revision(rev);
+            }
+
+            let resp = client
+                .get(next_start.clone(), Some(get_options))
+                .await
+                .map_err(|e| match revision {
+                    Some(rev) => {
+                        Error::Storage(format!("Failed to list at revision {}: {}", rev, e))
+                    }
+                    None => Error::Storage(format!("Failed to list resources: {}", e)),
+                })?;
+
+            let kvs = resp.kvs();
+            for kv in kvs {
+                let key_str = kv
+                    .key_str()
+                    .map_err(|e| Error::Storage(format!("Invalid UTF-8 in key: {}", e)))?;
+
+                let json = kv
+                    .value_str()
+                    .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
+                let mod_revision = kv.mod_revision();
+
+                // Inject resourceVersion and deserialize in one step
+                let json_with_rv = Self::inject_resource_version(json, mod_revision);
+                match serde_json::from_str::<T>(&json_with_rv) {
+                    Ok(value) => {
+                        results.push(value);
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize value at {}: {}", key_str, e);
+                        continue;
+                    }
+                }
+            }
+
+            // A short page means we reached the end of the range.
+            if (kvs.len() as i64) < page_size {
+                break;
+            }
+
+            // Continue immediately after the last key we saw.
+            match kvs.last() {
+                Some(last_kv) => {
+                    next_start = last_kv.key().to_vec();
+                    next_start.push(0);
+                }
+                None => break,
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Inject resourceVersion into a JSON string by parsing, modifying, and re-serializing.
     ///
     /// This is a single parse→modify→reserialize pass (vs the old code which did
@@ -353,75 +439,7 @@ impl Storage for EtcdStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        let mut client = self.client.clone();
-
-        // Paginate list calls to avoid hitting the default 4MB gRPC message
-        // size limit.
-        //
-        // Every page is an explicit range bounded by the prefix — `[start,
-        // prefix_range_end)` — continuing at `lastKey + "\x00"`, exactly as
-        // upstream does (`etcd3/store.go`: `continueKey = string(lastKey) +
-        // "\x00"`). The previous code combined `with_prefix()` with
-        // `with_from_key()`; the latter wins in `etcd-client`, so page 2 asked
-        // for the unbounded range `[lastKey, +inf)` and relied on a manual
-        // prefix re-check to trim the overshoot. That is outside the RPC subset
-        // and, on backends that do not implement open-ended ranges, silently
-        // returned nothing — truncating long lists to their first page.
-        let page_size = self.page_size;
-        let range_end = prefix_range_end(prefix.as_bytes());
-        let mut results = Vec::new();
-        let mut next_start: Vec<u8> = prefix.as_bytes().to_vec();
-
-        loop {
-            let get_options = GetOptions::new()
-                .with_range(range_end.clone())
-                .with_limit(page_size);
-            let query_key: Vec<u8> = next_start.clone();
-
-            let resp = client
-                .get(query_key, Some(get_options))
-                .await
-                .map_err(|e| Error::Storage(format!("Failed to list resources: {}", e)))?;
-
-            let kvs = resp.kvs();
-            for kv in kvs {
-                let key_str = kv
-                    .key_str()
-                    .map_err(|e| Error::Storage(format!("Invalid UTF-8 in key: {}", e)))?;
-
-                let json = kv
-                    .value_str()
-                    .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
-                let mod_revision = kv.mod_revision();
-
-                // Inject resourceVersion and deserialize in one step
-                let json_with_rv = Self::inject_resource_version(json, mod_revision);
-                match serde_json::from_str::<T>(&json_with_rv) {
-                    Ok(value) => {
-                        results.push(value);
-                    }
-                    Err(e) => {
-                        error!("Failed to deserialize value at {}: {}", key_str, e);
-                        continue;
-                    }
-                }
-            }
-
-            // A short page means we reached the end of the range.
-            if (kvs.len() as i64) < page_size {
-                break;
-            }
-
-            // Continue immediately after the last key we saw.
-            match kvs.last() {
-                Some(last_kv) => {
-                    next_start = last_kv.key().to_vec();
-                    next_start.push(0);
-                }
-                None => break,
-            }
-        }
-
+        let results = self.list_inner(prefix, None).await?;
         debug!("Listed {} resources with prefix: {}", results.len(), prefix);
         Ok(results)
     }
@@ -430,58 +448,7 @@ impl Storage for EtcdStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        let mut client = self.client.clone();
-        let range_end = prefix_range_end(prefix.as_bytes());
-        let mut results = Vec::new();
-        let mut next_start: Vec<u8> = prefix.as_bytes().to_vec();
-
-        loop {
-            let resp = client
-                .get(
-                    next_start.clone(),
-                    Some(
-                        GetOptions::new()
-                            .with_range(range_end.clone())
-                            .with_limit(self.page_size)
-                            .with_revision(revision),
-                    ),
-                )
-                .await
-                .map_err(|e| {
-                    Error::Storage(format!("Failed to list at revision {}: {}", revision, e))
-                })?;
-
-            let kvs = resp.kvs();
-            for kv in kvs {
-                let json = kv
-                    .value_str()
-                    .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
-                let json_with_rv = Self::inject_resource_version(json, kv.mod_revision());
-                match serde_json::from_str::<T>(&json_with_rv) {
-                    Ok(value) => results.push(value),
-                    Err(e) => {
-                        error!(
-                            "Failed to deserialize value at revision {}: {}",
-                            revision, e
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            if (kvs.len() as i64) < self.page_size {
-                break;
-            }
-            match kvs.last() {
-                Some(last_kv) => {
-                    next_start = last_kv.key().to_vec();
-                    next_start.push(0);
-                }
-                None => break,
-            }
-        }
-
-        Ok(results)
+        self.list_inner(prefix, Some(revision)).await
     }
 
     async fn watch_from_revision(&self, prefix: &str, revision: i64) -> Result<WatchStream> {
