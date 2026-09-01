@@ -237,36 +237,23 @@ pub trait Storage: Send + Sync {
             return Ok((self.list(prefix).await?, None));
         }
 
-        // Default path: list everything, sort by a stable per-item key, slice.
-        // Backends with native pagination (e.g. etcd `RangeRequest.limit`) may
-        // override this for efficiency.
-        // The continue token records the revision its page sequence started at.
-        // Read at that revision so later pages cannot observe writes made after
-        // the walk began (upstream pins `withRev` for exactly this reason). A
-        // rv <= 0 means "latest": either the first page, or an inconsistent
-        // token issued after a compaction.
-        let pinned_rv = continue_token
-            .and_then(|t| decode_default_token(t).ok())
-            .and_then(|d| d.compacted_at)
-            .filter(|rv| *rv > 0);
-        let all: Vec<serde_json::Value> = match pinned_rv {
-            Some(rv) => self.list_at_revision(prefix, rv).await?,
-            None => self.list(prefix).await?,
+        // Decode the continue token and settle compaction BEFORE reading any
+        // data. Reading at a compacted revision fails at the backend, which
+        // would bury the `GoneWithContinue` path below and turn a 410 Expired
+        // (with a resumable rv = -1 token) into a 500.
+        let decoded = match continue_token {
+            Some(token) => Some(decode_default_token(token)?),
+            None => None,
         };
 
-        let mut indexed: Vec<(String, serde_json::Value)> =
-            all.into_iter().map(|v| (default_sort_key(&v), v)).collect();
-        indexed.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let start = if let Some(token) = continue_token {
-            let decoded = decode_default_token(token)?;
+        if let Some(d) = &decoded {
             // A token with rv == -1 is an "inconsistent" continue token issued
             // after a compaction: resume from the recorded key at the CURRENT
             // revision, skipping the compaction check. Mirrors upstream
             // `ValidateListOptions` (interfaces.go): continueRV < 0 means "read
             // at the latest resource version".
-            if decoded.compacted_at != Some(INCONSISTENT_CONTINUE_RV) {
-                if let Some(rv) = decoded.compacted_at {
+            if d.compacted_at != Some(INCONSISTENT_CONTINUE_RV) {
+                if let Some(rv) = d.compacted_at {
                     if rv > 0 && self.is_revision_compacted(rv).await.unwrap_or(false) {
                         // A strict (rv-pinned) token whose revision has been
                         // compacted. Rather than a dead-end 410, return a fresh
@@ -283,19 +270,43 @@ pub trait Storage: Send + Sync {
                                 rv
                             ),
                             continue_token: encode_default_token(
-                                &decoded.start_key,
+                                &d.start_key,
                                 INCONSISTENT_CONTINUE_RV,
                             ),
                         });
                     }
                 }
             }
-            indexed
+        }
+
+        // Default path: list everything, sort by a stable per-item key, slice.
+        // Backends with native pagination (e.g. etcd `RangeRequest.limit`) may
+        // override this for efficiency.
+        //
+        // The continue token records the revision its page sequence started at.
+        // Read at that revision so later pages cannot observe writes made after
+        // the walk began (upstream pins `withRev` for exactly this reason). A
+        // rv <= 0 means "latest": either the first page, or an inconsistent
+        // token issued after a compaction.
+        let pinned_rv = decoded
+            .as_ref()
+            .and_then(|d| d.compacted_at)
+            .filter(|rv| *rv > 0);
+        let all: Vec<serde_json::Value> = match pinned_rv {
+            Some(rv) => self.list_at_revision(prefix, rv).await?,
+            None => self.list(prefix).await?,
+        };
+
+        let mut indexed: Vec<(String, serde_json::Value)> =
+            all.into_iter().map(|v| (default_sort_key(&v), v)).collect();
+        indexed.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let start = match &decoded {
+            Some(d) => indexed
                 .iter()
-                .position(|(k, _)| k.as_str() >= decoded.start_key.as_str())
-                .unwrap_or(indexed.len())
-        } else {
-            0
+                .position(|(k, _)| k.as_str() >= d.start_key.as_str())
+                .unwrap_or(indexed.len()),
+            None => 0,
         };
 
         let end = (start + limit).min(indexed.len());
@@ -1166,5 +1177,167 @@ mod graceful_delete_tests {
         Storage::delete_gracefully(&backend, "/registry/pods/default/never-existed")
             .await
             .expect("deleting an absent object is not an error");
+    }
+}
+
+#[cfg(test)]
+mod continue_token_tests {
+    use super::*;
+
+    /// A backend that has compacted every revision below `compacted_below`.
+    ///
+    /// `list_at_revision` fails the way a real etcd does for a read below the
+    /// compaction point, so a `list_paginated` that reads before it checks for
+    /// compaction surfaces that error instead of the `GoneWithContinue` the
+    /// caller is owed. Everything the test does not exercise is
+    /// `unimplemented!()` on purpose — reaching it is a test bug.
+    struct CompactingStore {
+        compacted_below: i64,
+    }
+
+    #[async_trait]
+    impl Storage for CompactingStore {
+        async fn create<T>(&self, _key: &str, _value: &T) -> Result<T>
+        where
+            T: Serialize + DeserializeOwned + Send + Sync,
+        {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn get<T>(&self, _key: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send + Sync,
+        {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn update<T>(&self, _key: &str, _value: &T) -> Result<T>
+        where
+            T: Serialize + DeserializeOwned + Send + Sync,
+        {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn update_raw(&self, _key: &str, _value: &serde_json::Value) -> Result<()> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn delete(&self, _key: &str) -> Result<()> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn list<T>(&self, _prefix: &str) -> Result<Vec<T>>
+        where
+            T: Serialize + DeserializeOwned + Send + Sync,
+        {
+            Ok(Vec::new())
+        }
+
+        async fn list_at_revision<T>(&self, _prefix: &str, revision: i64) -> Result<Vec<T>>
+        where
+            T: Serialize + DeserializeOwned + Send + Sync,
+        {
+            Err(Error::Storage(format!(
+                "Failed to list at revision {}: required revision has been compacted",
+                revision
+            )))
+        }
+
+        async fn watch(&self, _prefix: &str) -> Result<WatchStream> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn watch_from_revision(&self, _prefix: &str, _revision: i64) -> Result<WatchStream> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn current_revision(&self) -> Result<i64> {
+            Ok(1000)
+        }
+
+        async fn is_revision_compacted(&self, revision: i64) -> Result<bool> {
+            Ok(revision < self.compacted_below)
+        }
+    }
+
+    /// Regression: the compaction check must run BEFORE the pinned read.
+    ///
+    /// Pinning the page sequence to the first page's revision means a strict
+    /// continue token can outlive its revision. When it does, the caller is
+    /// owed a 410 Expired carrying a fresh `rv = -1` token so the walk can
+    /// resume (inconsistently) at the current revision — upstream
+    /// `handleCompactedErrorForPaging` (etcd3/errors.go). Reading at the
+    /// compacted revision first turns that into a backend error, i.e. a 500.
+    #[tokio::test]
+    async fn a_compacted_token_returns_gone_with_a_resumable_token() {
+        let store = CompactingStore {
+            compacted_below: 100,
+        };
+        let token = encode_default_token("default/foo", 42);
+
+        let err = Storage::list_paginated::<serde_json::Value>(
+            &store,
+            "/registry/pods/",
+            2,
+            Some(&token),
+        )
+        .await
+        .expect_err("a compacted continue token must not succeed");
+
+        match err {
+            Error::GoneWithContinue { continue_token, .. } => assert_eq!(
+                continue_token,
+                encode_default_token("default/foo", INCONSISTENT_CONTINUE_RV),
+                "the 410 must carry a fresh inconsistent token at the same start key"
+            ),
+            other => panic!(
+                "expected GoneWithContinue, got {other:?} — the pinned read ran \
+                 before the compaction check and buried the 410"
+            ),
+        }
+    }
+
+    /// The `rv = -1` token issued by that 410 skips the compaction check and
+    /// reads at the current revision, so the resumed walk completes.
+    #[tokio::test]
+    async fn an_inconsistent_token_resumes_at_the_current_revision() {
+        let store = CompactingStore {
+            compacted_below: 100,
+        };
+        let token = encode_default_token("default/foo", INCONSISTENT_CONTINUE_RV);
+
+        let (items, next) = Storage::list_paginated::<serde_json::Value>(
+            &store,
+            "/registry/pods/",
+            2,
+            Some(&token),
+        )
+        .await
+        .expect("an inconsistent token must read live, not fail on compaction");
+
+        assert!(items.is_empty());
+        assert!(next.is_none());
+    }
+
+    /// And a token whose revision is still served does take the pinned read —
+    /// the reorder must not have quietly dropped the pin.
+    #[tokio::test]
+    async fn a_live_token_still_reads_at_its_pinned_revision() {
+        let store = CompactingStore { compacted_below: 5 };
+        let token = encode_default_token("default/foo", 42);
+
+        let err = Storage::list_paginated::<serde_json::Value>(
+            &store,
+            "/registry/pods/",
+            2,
+            Some(&token),
+        )
+        .await
+        .expect_err("this fixture's list_at_revision always errors");
+
+        assert!(
+            matches!(&err, Error::Storage(m) if m.contains("at revision 42")),
+            "an uncompacted pinned token must read at its own revision, got {err:?}"
+        );
     }
 }
