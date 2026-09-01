@@ -26,6 +26,9 @@ serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 etcd-client.workspace = true
+# gRPC status codes, to detect etcd's compaction error by code rather than by
+# matching on the message text. Same tonic release etcd-client links.
+tonic.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
 tracing.workspace = true
