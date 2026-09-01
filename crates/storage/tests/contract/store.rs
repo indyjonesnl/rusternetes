@@ -91,27 +91,41 @@ pub async fn run_test_create_with_key_exist<S: Storage>(storage: &S) {
 /// after the `test-ns/` prefix, so a scan whose upper bound is wrong swallows
 /// it.
 ///
-/// **Dropped upstream rows.** Four of the eight, in two groups:
+/// **Dropped upstream rows.** Six of the eight — the two that are ported below
+/// are "Recursive on resource prefix returns all objects" and "Recursive on
+/// resource prefix returns objects in the namespace". The six fall into two
+/// groups:
 ///
-/// * The three `recursive: false` rows have no target — our `list` is always
-///   recursive and there is no non-recursive variant to call.
-/// * The two RECURSIVE rows on an *object* key (`store_tests.go:2772-2782`,
-///   "Recursive on object key (prefix) doesn't return anything" and its
-///   no-prefix twin) expect an empty result, because upstream appends a `/` to
+/// * The four `recursive: false` rows (`store_tests.go:2750`, `:2762`, `:2774`
+///   and `:2786`) have no target — our `list` is always recursive and there is
+///   no non-recursive variant to call.
+/// * The two RECURSIVE rows on an *object* key (`store_tests.go:2778` and
+///   `:2790`, "Recursive on object key (prefix) doesn't return anything" and
+///   its no-prefix twin) expect an empty result, because upstream appends a `/` to
 ///   a recursive key before ranging (`etcd3/store.go`, `GetList`): the key
 ///   `/pods/test-ns/foo` becomes the prefix `/pods/test-ns/foo/`, which matches
 ///   nothing.
 ///
 ///   Our `list` is a raw prefix scan with no such normalisation, and the
-///   backends do not even agree with each other. Measured 2026-09-01 with the
-///   three objects below seeded — `list("/registry/pods/test-ns/foo")` returns
+///   backends do not agree on the result. Measured 2026-09-01 with the three
+///   objects below seeded — `list("/registry/pods/test-ns/foo")` returns
 ///   `["foo", "foobar"]` on etcd and on MemoryStorage but `[]` on kine, and
 ///   `list("/registry/pods/test-ns/foobar")` returns `["foobar"]` on etcd and
 ///   MemoryStorage but `[]` on kine. Upstream returns nothing for both.
 ///
-///   That is a real divergence between our prefix-scan `list` and upstream's
-///   key semantics, and a three-way one: kine's range handling already matches
-///   upstream while ours does not. It is unreachable from the api-server (every
+///   Kine's empty result coincides with upstream's, but the mechanism is
+///   unexplained and it should not be read as agreement on semantics. Kine's
+///   list path applies no trailing-slash normalisation: `pkg/server/list.go`
+///   passes key and range_end through unchanged, `LogStructured::List` passes
+///   them on, and `pkg/drivers/generic/generic.go` resolves them to a plain
+///   `name >= ? AND name < ?` byte range — the same shape etcd evaluates. Why
+///   kine answers `[]` where etcd answers two rows is not established. (A
+///   probe that would narrow it: seed `/registry/pods/test-ns/foo/child` as
+///   well and list `/registry/pods/test-ns/foo` — a `/`-append normalisation
+///   answers `["child"]`, anything else answers `[]`.)
+///
+///   Either way the etcd and MemoryStorage results are a real divergence from
+///   upstream's key semantics. It is unreachable from the api-server (every
 ///   caller builds its prefix with `rusternetes_storage::build_prefix`, which
 ///   always ends in `/`), so the rows are left out rather than made to pass by
 ///   weakening anything.
