@@ -13,6 +13,9 @@ pub mod store;
 ///
 /// `$setup` is an async expression yielding `Option<Fixture<S>>`; `None` means
 /// the backend is unavailable (no Docker) and every test soft-skips.
+/// `revisions:` declares whether the backend has a real resourceVersion
+/// concept (see `store::run_test_create`'s doc comment) — `false` for
+/// `MemoryStorage`.
 ///
 /// Written out explicitly rather than via a nested `macro_rules!` per test:
 /// a `macro_rules!` defined inside this macro's expansion would need to bind
@@ -21,7 +24,7 @@ pub mod store;
 /// so it doesn't compile.
 #[macro_export]
 macro_rules! contract_suite {
-    ($name:ident, $setup:expr) => {
+    ($name:ident, $setup:expr, revisions: $revisions:expr) => {
         mod $name {
             use $crate::contract::store;
 
@@ -30,7 +33,7 @@ macro_rules! contract_suite {
                 let Some(fixture) = $setup.await else {
                     return;
                 };
-                store::run_test_create(&fixture.storage).await;
+                store::run_test_create(&fixture.storage, $revisions).await;
             }
 
             #[tokio::test]
