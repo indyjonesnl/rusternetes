@@ -8,6 +8,7 @@
 
 pub mod fixtures;
 pub mod store;
+pub mod watcher;
 
 /// Instantiate the whole contract suite for one backend.
 ///
@@ -26,7 +27,7 @@ pub mod store;
 macro_rules! contract_suite {
     ($name:ident, $setup:expr, revisions: $revisions:expr) => {
         mod $name {
-            use $crate::contract::store;
+            use $crate::contract::{store, watcher};
 
             #[tokio::test]
             async fn create() {
@@ -66,6 +67,14 @@ macro_rules! contract_suite {
                     return;
                 };
                 store::run_test_list_continuation(&fixture.storage).await;
+            }
+
+            #[tokio::test]
+            async fn delete_trigger_watch() {
+                let Some(fixture) = $setup.await else {
+                    return;
+                };
+                watcher::run_test_delete_trigger_watch(&fixture.storage, $revisions).await;
             }
         }
     };
