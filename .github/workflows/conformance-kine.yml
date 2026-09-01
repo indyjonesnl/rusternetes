@@ -1,0 +1,61 @@
+# Hand-written caller — deliberately NOT generated from ci/conformance/targets.json.
+#
+# kine is not a new test target: it is a different storage substrate under an
+# existing one. The registry describes WHAT to run (a focus/skip pair); this
+# workflow varies WHERE it runs by handing the engine a different compose
+# stack. Adding a registry entry would imply a new slice of the conformance
+# suite and would earn a badge of its own, neither of which is true here.
+# scripts/tests/test-target-workflows-sync.sh skips files without the
+# GENERATED marker, so this file is safe from the generator.
+name: conformance-kine
+
+# Runs the sig-api-machinery [Conformance] slice against compose.kine.yml —
+# the same topology as the default rhino/SQLite stack with kine (the etcd v3
+# API shim k3s and k0s ship) in rhino's place.
+#
+# Why this is worth a nightly: kine implements only the RPC subset upstream
+# Kubernetes' etcd3 store emits and rejects everything else with
+# Unimplemented/InvalidArgument. That makes it an executable check that
+# crates/storage/src/etcd.rs has not drifted back outside that subset — the
+# cluster simply will not come up if it has. sig-api-machinery is the slice
+# that leans hardest on the storage layer (watch, resourceVersion, paging,
+# garbage collection), so it is the one worth spending the run on.
+#
+# crates/storage/tests/etcd_rpc_subset.rs pins the same constraint at the unit
+# level and runs on every PR; this leg catches whole-cluster interactions the
+# unit test cannot see.
+on:
+  schedule:
+    - cron: '36 3 * * *'
+  workflow_dispatch:
+    inputs:
+      focus:
+        description: "Ginkgo --focus override (narrow to one test to prove a PR). Empty = full sig-api-machinery run."
+        required: false
+        default: ''
+
+concurrency:
+  group: conformance-kine
+  cancel-in-progress: true
+
+jobs:
+  run:
+    permissions:
+      contents: write
+    secrets: inherit
+    uses: ./.github/workflows/conformance-target.yml
+    with:
+      target: sig-api-machinery
+      compose-file: compose.kine.yml
+      focus: ${{ github.event.inputs.focus || '' }}
+      # Always build this ref from source. The published GHCR tags track main,
+      # so a prebuilt image would test main's storage code rather than the code
+      # under review — and on a leg whose entire purpose is to detect storage
+      # drift, that is the one thing it must not do. ('local' is the sentinel
+      # the engine maps to the empty tag the bring-up action wants; see #1760
+      # for why it is not mapped with a `${{ }}` expression.)
+      image-tag: local
+      # The badge belongs to the target, and this is not the target's pass rate
+      # on its default stack — same rule that keeps focused runs off the badge
+      # (FR-011).
+      publish-badge: false

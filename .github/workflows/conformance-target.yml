@@ -21,6 +21,11 @@ on:
         description: "Target name (must exist in ci/conformance/targets.json)"
         required: true
         type: string
+      compose-file:
+        description: "Compose stack to bring up (default: the rhino/SQLite stack)."
+        required: false
+        type: string
+        default: compose.sqlite.yml
       focus:
         description: "Ginkgo --focus override. Empty = full target run (publishes badge)."
         required: false
@@ -42,6 +47,11 @@ on:
         description: "Target name (must exist in ci/conformance/targets.json)"
         required: true
         type: string
+      compose-file:
+        description: "Compose stack to bring up (default: the rhino/SQLite stack)."
+        required: false
+        type: string
+        default: compose.sqlite.yml
       focus:
         description: "Ginkgo --focus override. Empty = full target run (publishes badge)."
         required: false
@@ -109,6 +119,7 @@ jobs:
       - name: Bring up cluster
         uses: ./ci/actions/bring-up-cluster
         with:
+          compose-file: ${{ inputs.compose-file }}
           hydrophone-version: ${{ env.HYDROPHONE_VERSION }}
           kubectl-version: v1.35.0
           image-tag: ${{ steps.tag.outputs.value }}
@@ -118,6 +129,9 @@ jobs:
         env:
           TARGET: ${{ inputs.target }}
           FOCUS: ${{ inputs.focus }}
+          # conformance-target-run.sh reads component logs off the same stack
+          # the bring-up used.
+          COMPOSE_STACK: ${{ inputs.compose-file }}
         run: |
           set -euo pipefail
           args=(--target "$TARGET" --output-dir "target-out/$TARGET")
@@ -148,6 +162,8 @@ jobs:
 
       - name: Tear down cluster
         if: always()
+        env:
+          COMPOSE_STACK: ${{ inputs.compose-file }}
         run: |
-          docker compose -f compose.sqlite.yml logs --tail=100 || true
-          docker compose -f compose.sqlite.yml down -v || true
+          docker compose -f "${COMPOSE_STACK:-compose.sqlite.yml}" logs --tail=100 || true
+          docker compose -f "${COMPOSE_STACK:-compose.sqlite.yml}" down -v || true
