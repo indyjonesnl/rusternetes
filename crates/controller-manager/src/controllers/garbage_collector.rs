@@ -876,21 +876,39 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         Ok(())
     }
 
-    /// Returns true if any resource in storage still lists `owner_uid` in its
-    /// ownerReferences — i.e. the owner still has blocking dependents.
+    /// Returns true if `owner_uid` still has a **blocking** dependent in
+    /// storage — one whose ownerReference to it sets
+    /// `blockOwnerDeletion: true`.
     ///
     /// Used to gate foreground-deletion finalizer removal: the owner's
     /// `foregroundDeletion` finalizer must stay (and the owner must not be
-    /// deleted) until every dependent has actually been removed from storage,
-    /// not merely had a delete issued against it. Mirrors upstream GC, which
-    /// keeps the owner blocked until its dependent set is empty.
+    /// deleted) until every blocking dependent has actually been removed from
+    /// storage, not merely had a delete issued against it.
+    ///
+    /// `blockOwnerDeletion` is the whole point of the field and upstream gates
+    /// on precisely that subset — `node.blockingDependents()`
+    /// (pkg/controller/garbagecollector/graph.go:178):
+    ///
+    /// ```text
+    /// for _, owner := range dep.owners {
+    ///     if owner.UID == n.identity.UID && owner.BlockOwnerDeletion != nil && *owner.BlockOwnerDeletion {
+    ///         ret = append(ret, dep)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// with `processDeletingDependentsItem` (garbagecollector.go:654) dropping
+    /// the finalizer as soon as `len(blockingDependents) == 0`. A nil
+    /// `BlockOwnerDeletion` does not block, so `None` here does not either.
+    /// Counting every dependent instead held an owner open on dependents that
+    /// never asked to block it (#1829).
     async fn still_has_dependents(&self, owner_uid: &str) -> rusternetes_common::Result<bool> {
         let all_resources = self.get_all_resources().await?;
         Ok(all_resources.iter().any(|r| {
-            r.metadata
-                .owner_references
-                .as_ref()
-                .is_some_and(|refs| refs.iter().any(|oref| oref.uid == owner_uid))
+            r.metadata.owner_references.as_ref().is_some_and(|refs| {
+                refs.iter()
+                    .any(|oref| oref.uid == owner_uid && oref.block_owner_deletion == Some(true))
+            })
         }))
     }
 
@@ -2009,6 +2027,89 @@ mod tests {
         assert!(
             after.is_err(),
             "a pod whose grace period expired long ago must still be swept"
+        );
+    }
+
+    /// The foreground gate counts *blocking* dependents only — those whose
+    /// ownerReference to the owner sets `blockOwnerDeletion: true`.
+    ///
+    /// Upstream gates on exactly that set. `node.blockingDependents()`
+    /// (pkg/controller/garbagecollector/graph.go:178):
+    ///
+    /// ```text
+    /// for _, owner := range dep.owners {
+    ///     if owner.UID == n.identity.UID && owner.BlockOwnerDeletion != nil && *owner.BlockOwnerDeletion {
+    ///         ret = append(ret, dep)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// and `processDeletingDependentsItem` (garbagecollector.go:654) drops the
+    /// `foregroundDeletion` finalizer as soon as that set is empty. A dependent
+    /// that does not ask to block its owner must not hold the owner open.
+    #[tokio::test]
+    async fn foreground_gate_counts_blocking_dependents_only() {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let gc = GarbageCollector::new(storage.clone());
+        let owner_uid = "gate-owner-uid";
+
+        let make_pod = |name: &str, block: Option<bool>| {
+            let mut meta = ObjectMeta::new(name);
+            meta.namespace = Some("default".to_string());
+            meta.uid = format!("{name}-uid");
+            meta.owner_references = Some(vec![OwnerReference {
+                api_version: "v1".to_string(),
+                kind: "ReplicationController".to_string(),
+                name: "gate-owner".to_string(),
+                uid: owner_uid.to_string(),
+                controller: Some(true),
+                block_owner_deletion: block,
+            }]);
+            Pod {
+                type_meta: TypeMeta {
+                    kind: "Pod".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: meta,
+                spec: None,
+                status: None,
+            }
+        };
+
+        // blockOwnerDeletion explicitly false: not a blocking dependent.
+        storage
+            .create(
+                "/registry/pods/default/non-blocking",
+                &make_pod("non-blocking", Some(false)),
+            )
+            .await
+            .unwrap();
+        // Field absent: upstream treats a nil BlockOwnerDeletion as not blocking.
+        storage
+            .create("/registry/pods/default/unset", &make_pod("unset", None))
+            .await
+            .unwrap();
+
+        assert!(
+            !gc.still_has_dependents(owner_uid).await.unwrap(),
+            "dependents that do not set blockOwnerDeletion: true must not hold \
+             the owner's foregroundDeletion finalizer open"
+        );
+
+        // One blocking dependent is enough to hold the gate.
+        storage
+            .create(
+                "/registry/pods/default/blocking",
+                &make_pod("blocking", Some(true)),
+            )
+            .await
+            .unwrap();
+        assert!(
+            gc.still_has_dependents(owner_uid).await.unwrap(),
+            "a dependent with blockOwnerDeletion: true must hold the gate"
         );
     }
 }
