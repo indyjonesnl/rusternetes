@@ -1143,8 +1143,39 @@ pub async fn delete_pod(
         .unwrap_or(30);
     updated_pod.metadata.deletion_grace_period_seconds = Some(grace_period);
 
-    // If grace period is 0, delete immediately (force delete)
-    if grace_period == 0 {
+    // A zero grace period removes the pod outright ONLY when nothing is
+    // pending on it. Upstream gates immediate deletion on all three conditions
+    // (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:1174):
+    //
+    //     if graceful || pendingFinalizers || shouldUpdateFinalizers {
+    //         err, ignoreNotFound, deleteImmediately, out, lastExisting =
+    //             e.updateForGracefulDeletionAndFinalizers(...)
+    //     }
+    //     if !deleteImmediately || err != nil { return out, false, err }
+    //
+    // so a grace-0 DELETE still takes the finalizer path when the object has
+    // finalizers or the propagation policy calls for one. Checking only the
+    // grace period discarded the `foregroundDeletion` finalizer the policy had
+    // just asked for — and every pod in `newGCPod`
+    // (test/e2e/apimachinery/garbage_collector.go:181) has
+    // `TerminationGracePeriodSeconds: new(int64)`, i.e. zero. Deleting pod1
+    // with foreground propagation therefore removed it instantly with no
+    // cascade, leaving pod2 and pod3 to the orphan sweep at one GC scan each,
+    // racing the spec's 150s budget (#1804). It also let a grace-0 delete
+    // ignore a third-party finalizer outright.
+    let pending_finalizers = pod
+        .metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|f| !f.is_empty());
+    let should_update_finalizers = !crate::handlers::finalizers::gc_deletion_finalizers(
+        pod.metadata.finalizers.as_ref(),
+        propagation_policy.as_deref(),
+        orphan_dependents,
+    )
+    .is_empty();
+
+    if grace_period == 0 && !pending_finalizers && !should_update_finalizers {
         state.storage.delete(&key).await?;
         return Ok(Json(updated_pod));
     }
@@ -2258,6 +2289,103 @@ mod tests {
                 .map(String::as_str)
                 .collect();
             assert_eq!(got, expected, "finalizers for propagationPolicy {policy:?}");
+        }
+    }
+
+    /// A zero grace period must NOT bypass finalizers.
+    ///
+    /// Upstream's registry gates immediate deletion on all three conditions
+    /// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:1174):
+    ///
+    /// ```text
+    /// if graceful || pendingFinalizers || shouldUpdateFinalizers {
+    ///     err, ignoreNotFound, deleteImmediately, out, lastExisting = e.updateForGracefulDeletionAndFinalizers(...)
+    /// }
+    /// if !deleteImmediately || err != nil { return out, false, err }
+    /// ```
+    ///
+    /// So a grace-0 DELETE still goes through the finalizer path when the
+    /// object has finalizers or the propagation policy adds one; only a pod
+    /// with nothing pending is removed outright.
+    ///
+    /// Ours checked `grace_period == 0` first and hard-deleted, discarding the
+    /// `foregroundDeletion` finalizer the policy had just called for. That is
+    /// what breaks `[sig-api-machinery] Garbage collector should not be blocked
+    /// by dependency circle [Conformance]`: `newGCPod`
+    /// (test/e2e/apimachinery/garbage_collector.go:181) sets
+    /// `TerminationGracePeriodSeconds: new(int64)` — zero — so deleting pod1
+    /// with foreground propagation removed it instantly with no finalizer and
+    /// no cascade. pod2 and pod3 were then left to the orphan sweep, one GC
+    /// scan each, racing the spec's 150s budget (#1804).
+    #[tokio::test]
+    async fn grace_zero_delete_still_honours_finalizers() {
+        let cases = [
+            // (existing finalizers, propagationPolicy, still present after DELETE?)
+            (vec![], None, false),
+            (vec![], Some("Foreground"), true),
+            (vec![], Some("Orphan"), true),
+            (vec!["example.com/blocker"], None, true),
+            (vec![], Some("Background"), false),
+        ];
+
+        for (finalizers, policy, should_survive) in cases {
+            let state = create_pod_test_state().await;
+            let key = build_key("pods", Some("default"), "grace0");
+            let mut meta = serde_json::json!({
+                "name": "grace0", "namespace": "default", "uid": "grace0-uid"
+            });
+            if !finalizers.is_empty() {
+                meta["finalizers"] = serde_json::json!(finalizers);
+            }
+            let seeded = serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": meta,
+                // Exactly what newGCPod builds.
+                "spec": {
+                    "terminationGracePeriodSeconds": 0,
+                    "containers": [{"name": "c", "image": "nginx"}],
+                },
+            });
+            let _: serde_json::Value = state.storage.create(&key, &seeded).await.unwrap();
+
+            let mut params = HashMap::new();
+            if let Some(p) = policy {
+                params.insert("propagationPolicy".to_string(), p.to_string());
+            }
+
+            let _resp = delete_pod(
+                State(state.clone()),
+                Extension(AuthContext {
+                    user: rusternetes_common::auth::UserInfo::anonymous(),
+                }),
+                Path(("default".to_string(), "grace0".to_string())),
+                axum::extract::Query(params),
+                axum::body::Bytes::new(),
+            )
+            .await
+            .expect("delete must succeed");
+
+            let after: rusternetes_common::Result<Pod> = state.storage.get(&key).await;
+            assert_eq!(
+                after.is_ok(),
+                should_survive,
+                "grace-0 delete with finalizers={finalizers:?} policy={policy:?}: \
+                 expected survive={should_survive}"
+            );
+            if should_survive {
+                let pod = after.unwrap();
+                assert!(
+                    pod.metadata.deletion_timestamp.is_some(),
+                    "policy {policy:?}: a retained pod must carry a deletionTimestamp"
+                );
+                assert!(
+                    pod.metadata
+                        .finalizers
+                        .as_ref()
+                        .is_some_and(|f| !f.is_empty()),
+                    "policy {policy:?}: a retained pod must keep its finalizers"
+                );
+            }
         }
     }
 }
