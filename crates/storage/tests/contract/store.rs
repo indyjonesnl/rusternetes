@@ -162,3 +162,63 @@ pub async fn run_test_list_continuation<S: Storage>(storage: &S) {
         "continuation dropped, duplicated or reordered keys"
     );
 }
+
+/// Ported from `RunTestListPaging` (`store_tests.go`).
+///
+/// Four objects are paged one at a time; a fifth is created after the second
+/// page. On a snapshot-capable backend the walk must still take exactly four
+/// calls and return only the original four — a page sequence reflects the
+/// revision the first page was taken at, not a live view.
+///
+/// `expects_snapshot` is false for backends that keep only current state
+/// (`MemoryStorage`). Those still have to return every original object exactly
+/// once; they are just allowed to observe the mid-walk write.
+pub async fn run_test_list_paging<S: Storage>(storage: &S, expects_snapshot: bool) {
+    let prefix = "/registry/pods/paging/";
+    for i in 0..4 {
+        let name = format!("test-{i}");
+        storage
+            .create(&pod_key("paging", &name), &pod("paging", &name))
+            .await
+            .unwrap_or_else(|e| panic!("seeding {name} failed: {e}"));
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut calls = 0;
+    loop {
+        calls += 1;
+        let (items, next): (Vec<Value>, Option<String>) = storage
+            .list_paginated(prefix, 1, token.as_deref())
+            .await
+            .expect("list_paginated failed");
+        for item in &items {
+            names.push(item["metadata"]["name"].as_str().expect("name").to_string());
+        }
+        let Some(next_token) = next else { break };
+        if calls == 2 {
+            storage
+                .create(&pod_key("paging", "test-5"), &pod("paging", "test-5"))
+                .await
+                .expect("mid-pagination create failed");
+        }
+        token = Some(next_token);
+    }
+
+    // Every backend: the four originals, each exactly once, in order.
+    let originals: Vec<&String> = names.iter().filter(|n| n.as_str() != "test-5").collect();
+    assert_eq!(
+        originals,
+        vec!["test-0", "test-1", "test-2", "test-3"],
+        "continuation dropped, duplicated or reordered the original objects"
+    );
+
+    if expects_snapshot {
+        assert_eq!(calls, 4, "unexpected number of list calls");
+        assert_eq!(
+            names,
+            vec!["test-0", "test-1", "test-2", "test-3"],
+            "an object created mid-pagination leaked into the page sequence"
+        );
+    }
+}

@@ -187,6 +187,24 @@ pub trait Storage: Send + Sync {
     where
         T: Serialize + DeserializeOwned + Send + Sync;
 
+    /// List a prefix as of `revision`.
+    ///
+    /// Paged lists must behave as a snapshot: upstream's `GetList` pins the
+    /// revision of the first page and every continuation reads at that same
+    /// revision (`etcd3/store.go`, `withRev`), so an object written midway
+    /// through a walk cannot appear in a later page.
+    ///
+    /// The default implementation ignores `revision` and delegates to
+    /// [`Storage::list`] — correct for backends with no historical reads, at
+    /// the cost of snapshot semantics.
+    async fn list_at_revision<T>(&self, prefix: &str, revision: i64) -> Result<Vec<T>>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        let _ = revision;
+        self.list(prefix).await
+    }
+
     /// Paginated list — return up to `limit` items in deterministic (sorted by
     /// storage key) order and a continue token for the next page, if any.
     ///
@@ -222,7 +240,19 @@ pub trait Storage: Send + Sync {
         // Default path: list everything, sort by a stable per-item key, slice.
         // Backends with native pagination (e.g. etcd `RangeRequest.limit`) may
         // override this for efficiency.
-        let all: Vec<serde_json::Value> = self.list(prefix).await?;
+        // The continue token records the revision its page sequence started at.
+        // Read at that revision so later pages cannot observe writes made after
+        // the walk began (upstream pins `withRev` for exactly this reason). A
+        // rv <= 0 means "latest": either the first page, or an inconsistent
+        // token issued after a compaction.
+        let pinned_rv = continue_token
+            .and_then(|t| decode_default_token(t).ok())
+            .and_then(|d| d.compacted_at)
+            .filter(|rv| *rv > 0);
+        let all: Vec<serde_json::Value> = match pinned_rv {
+            Some(rv) => self.list_at_revision(prefix, rv).await?,
+            None => self.list(prefix).await?,
+        };
 
         let mut indexed: Vec<(String, serde_json::Value)> =
             all.into_iter().map(|v| (default_sort_key(&v), v)).collect();
@@ -271,7 +301,16 @@ pub trait Storage: Send + Sync {
         let end = (start + limit).min(indexed.len());
         let next_token = if end < indexed.len() {
             let next_key = &indexed[end].0;
-            let rv = self.current_revision().await.unwrap_or(0);
+            // Carry the pinned revision forward unchanged. Re-reading
+            // `current_revision()` on every page would re-pin the sequence to
+            // "now" one page at a time, which is the same live view the pin
+            // exists to prevent. Upstream threads the first page's `withRev`
+            // through every continuation (`etcd3/store.go`); only the first
+            // page establishes it.
+            let rv = match pinned_rv {
+                Some(rv) => rv,
+                None => self.current_revision().await.unwrap_or(0),
+            };
             Some(encode_default_token(next_key, rv))
         } else {
             None

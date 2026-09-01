@@ -17,6 +17,9 @@ pub mod watcher;
 /// `revisions:` declares whether the backend has a real resourceVersion
 /// concept (see `store::run_test_create`'s doc comment) — `false` for
 /// `MemoryStorage`.
+/// `snapshot_paging:` says whether the backend can serve a paged list as a
+/// snapshot at a past revision — `false` for stores that keep only current
+/// state.
 ///
 /// Written out explicitly rather than via a nested `macro_rules!` per test:
 /// a `macro_rules!` defined inside this macro's expansion would need to bind
@@ -25,7 +28,7 @@ pub mod watcher;
 /// so it doesn't compile.
 #[macro_export]
 macro_rules! contract_suite {
-    ($name:ident, $setup:expr, revisions: $revisions:expr) => {
+    ($name:ident, $setup:expr, revisions: $revisions:expr, snapshot_paging: $snapshot:expr) => {
         mod $name {
             use $crate::contract::{store, watcher};
 
@@ -75,6 +78,14 @@ macro_rules! contract_suite {
                     return;
                 };
                 watcher::run_test_delete_trigger_watch(&fixture.storage, $revisions).await;
+            }
+
+            #[tokio::test]
+            async fn list_paging() {
+                let Some(fixture) = $setup.await else {
+                    return;
+                };
+                store::run_test_list_paging(&fixture.storage, $snapshot).await;
             }
         }
     };

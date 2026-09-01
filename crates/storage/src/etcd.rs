@@ -426,6 +426,64 @@ impl Storage for EtcdStorage {
         Ok(results)
     }
 
+    async fn list_at_revision<T>(&self, prefix: &str, revision: i64) -> Result<Vec<T>>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        let mut client = self.client.clone();
+        let range_end = prefix_range_end(prefix.as_bytes());
+        let mut results = Vec::new();
+        let mut next_start: Vec<u8> = prefix.as_bytes().to_vec();
+
+        loop {
+            let resp = client
+                .get(
+                    next_start.clone(),
+                    Some(
+                        GetOptions::new()
+                            .with_range(range_end.clone())
+                            .with_limit(self.page_size)
+                            .with_revision(revision),
+                    ),
+                )
+                .await
+                .map_err(|e| {
+                    Error::Storage(format!("Failed to list at revision {}: {}", revision, e))
+                })?;
+
+            let kvs = resp.kvs();
+            for kv in kvs {
+                let json = kv
+                    .value_str()
+                    .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
+                let json_with_rv = Self::inject_resource_version(json, kv.mod_revision());
+                match serde_json::from_str::<T>(&json_with_rv) {
+                    Ok(value) => results.push(value),
+                    Err(e) => {
+                        error!(
+                            "Failed to deserialize value at revision {}: {}",
+                            revision, e
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            if (kvs.len() as i64) < self.page_size {
+                break;
+            }
+            match kvs.last() {
+                Some(last_kv) => {
+                    next_start = last_kv.key().to_vec();
+                    next_start.push(0);
+                }
+                None => break,
+            }
+        }
+
+        Ok(results)
+    }
+
     async fn watch_from_revision(&self, prefix: &str, revision: i64) -> Result<WatchStream> {
         let mut client = self.client.clone();
         let watch_options = WatchOptions::new()
