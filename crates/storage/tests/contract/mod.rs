@@ -51,6 +51,14 @@ macro_rules! contract_suite {
                 };
                 store::run_test_list_recursive_prefix(&fixture.storage).await;
             }
+
+            #[tokio::test]
+            async fn unconditional_delete() {
+                let Some(fixture) = $setup.await else {
+                    return;
+                };
+                store::run_test_unconditional_delete(&fixture.storage).await;
+            }
         }
     };
 }

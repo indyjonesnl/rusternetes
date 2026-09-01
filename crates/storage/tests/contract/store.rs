@@ -95,3 +95,33 @@ pub async fn run_test_list_recursive_prefix<S: Storage>(storage: &S) {
         "namespace prefix scan leaked into test-ns2"
     );
 }
+
+/// Ported from `RunTestUnconditionalDelete` (`store_tests.go`).
+///
+/// Upstream also asserts that the *returned* object carries a bumped
+/// resourceVersion. Our `Storage::delete` returns `Result<()>`, so that row has
+/// no target; the rest of the table ports directly.
+pub async fn run_test_unconditional_delete<S: Storage>(storage: &S) {
+    let key = pod_key("test-ns", "victim");
+    storage
+        .create(&key, &pod("test-ns", "victim"))
+        .await
+        .expect("seed failed");
+
+    storage
+        .delete(&key)
+        .await
+        .expect("delete of existing key failed");
+
+    let gone = storage.get::<Value>(&key).await;
+    assert!(
+        matches!(gone, Err(rusternetes_common::Error::NotFound(_))),
+        "object readable after delete: {gone:?}"
+    );
+
+    let missing = storage.delete(&pod_key("test-ns", "never-existed")).await;
+    assert!(
+        matches!(missing, Err(rusternetes_common::Error::NotFound(_))),
+        "delete of a non-existing key should be NotFound, got {missing:?}"
+    );
+}
