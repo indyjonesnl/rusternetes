@@ -28,6 +28,24 @@ fn is_docker_unavailable(err: &TestcontainersError) -> bool {
     )
 }
 
+/// Escape hatch for environments where Docker is mandatory. Unset (the default,
+/// i.e. a dev box) the container fixtures soft-skip; set to `1` they panic.
+///
+/// Without this, a runner with no Docker reports the whole suite green having
+/// exercised only `MemoryStorage` — the backend with the most known gaps. CI
+/// sets it on the DinD tier (`.github/workflows/storage-contract.yml`) so a
+/// broken container setup fails loudly instead of silently shrinking coverage.
+const REQUIRE_DOCKER_ENV: &str = "STORAGE_CONTRACT_REQUIRE_DOCKER";
+
+/// Report a Docker-unavailable fixture: a soft skip by default, a panic under
+/// `STORAGE_CONTRACT_REQUIRE_DOCKER=1`. `what` names the fixture in both.
+fn skip_or_require(what: &str, err: &TestcontainersError) {
+    if std::env::var(REQUIRE_DOCKER_ENV).as_deref() == Ok("1") {
+        panic!("{what}: Docker unavailable ({err}), but {REQUIRE_DOCKER_ENV}=1 requires it");
+    }
+    eprintln!("skipping {what}: Docker unavailable ({err})");
+}
+
 /// An object shaped like the `example.Pod` upstream's suite stores: enough
 /// metadata for `metadata.name` assertions and resourceVersion injection.
 pub fn pod(namespace: &str, name: &str) -> Value {
@@ -83,7 +101,7 @@ pub async fn etcd() -> Option<Fixture<EtcdStorage>> {
     match started {
         Ok(c) => Some(from_container(c).await),
         Err(e) if is_docker_unavailable(&e) => {
-            eprintln!("skipping etcd contract suite: Docker unavailable ({e})");
+            skip_or_require("etcd contract suite", &e);
             None
         }
         Err(e) => panic!("failed to start etcd container: {e}"),
@@ -105,7 +123,7 @@ pub async fn kine() -> Option<Fixture<EtcdStorage>> {
     match started {
         Ok(c) => Some(from_container(c).await),
         Err(e) if is_docker_unavailable(&e) => {
-            eprintln!("skipping kine contract suite: Docker unavailable ({e})");
+            skip_or_require("kine contract suite", &e);
             None
         }
         Err(e) => panic!("failed to start kine container: {e}"),

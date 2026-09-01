@@ -40,6 +40,20 @@ fn is_docker_unavailable(err: &TestcontainersError) -> bool {
     )
 }
 
+/// Escape hatch for environments where Docker is mandatory — same contract as
+/// the copy in `contract/fixtures.rs` (these are separate test binaries and
+/// cannot share a module). Unset: soft-skip. `1`: panic.
+const REQUIRE_DOCKER_ENV: &str = "STORAGE_CONTRACT_REQUIRE_DOCKER";
+
+/// Report a Docker-unavailable container: a soft skip by default, a panic under
+/// `STORAGE_CONTRACT_REQUIRE_DOCKER=1`.
+fn skip_or_require(what: &str, err: &TestcontainersError) {
+    if std::env::var(REQUIRE_DOCKER_ENV).as_deref() == Ok("1") {
+        panic!("{what}: Docker unavailable ({err}), but {REQUIRE_DOCKER_ENV}=1 requires it");
+    }
+    eprintln!("skipping {what}: Docker unavailable ({err})");
+}
+
 /// Connect an `EtcdStorage` to a started container's mapped 2379 port.
 ///
 /// `page_size` is deliberately tiny so `list` has to walk several pages without
@@ -78,7 +92,7 @@ async fn start_etcd() -> Option<ContainerAsync<GenericImage>> {
     match result {
         Ok(c) => Some(c),
         Err(e) if is_docker_unavailable(&e) => {
-            eprintln!("skipping etcd RPC-subset test: Docker unavailable ({e})");
+            skip_or_require("etcd RPC-subset test", &e);
             None
         }
         Err(e) => panic!("failed to start etcd test container: {e}"),
@@ -100,7 +114,7 @@ async fn start_kine() -> Option<ContainerAsync<GenericImage>> {
     match result {
         Ok(c) => Some(c),
         Err(e) if is_docker_unavailable(&e) => {
-            eprintln!("skipping kine RPC-subset test: Docker unavailable ({e})");
+            skip_or_require("kine RPC-subset test", &e);
             None
         }
         Err(e) => panic!("failed to start kine test container: {e}"),
