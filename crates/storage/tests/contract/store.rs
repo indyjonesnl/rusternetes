@@ -54,3 +54,44 @@ pub async fn run_test_create_with_key_exist<S: Storage>(storage: &S) {
         "expected AlreadyExists, got {err:?}"
     );
 }
+
+/// Ported from `RunTestGetListRecursivePrefix` (`store_tests.go`), recursive
+/// cases only — our `list` is always recursive, so upstream's
+/// `recursive: false` rows have no equivalent here.
+///
+/// The `test-ns` / `test-ns2` pair is the point: `test-ns2` sorts immediately
+/// after the `test-ns/` prefix, so a scan whose upper bound is wrong swallows
+/// it.
+pub async fn run_test_list_recursive_prefix<S: Storage>(storage: &S) {
+    for (ns, name) in [
+        ("test-ns", "foo"),
+        ("test-ns", "foobar"),
+        ("test-ns2", "baz"),
+    ] {
+        storage
+            .create(&pod_key(ns, name), &pod(ns, name))
+            .await
+            .unwrap_or_else(|e| panic!("seeding {ns}/{name} failed: {e}"));
+    }
+
+    let all: Vec<Value> = storage
+        .list("/registry/pods/")
+        .await
+        .expect("list on resource prefix failed");
+    assert_eq!(all.len(), 3, "recursive list on the resource prefix");
+
+    let ns: Vec<Value> = storage
+        .list("/registry/pods/test-ns/")
+        .await
+        .expect("list on namespace prefix failed");
+    let mut names: Vec<&str> = ns
+        .iter()
+        .map(|p| p["metadata"]["name"].as_str().expect("name"))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["foo", "foobar"],
+        "namespace prefix scan leaked into test-ns2"
+    );
+}

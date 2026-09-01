@@ -43,6 +43,14 @@ macro_rules! contract_suite {
                 };
                 store::run_test_create_with_key_exist(&fixture.storage).await;
             }
+
+            #[tokio::test]
+            async fn list_recursive_prefix() {
+                let Some(fixture) = $setup.await else {
+                    return;
+                };
+                store::run_test_list_recursive_prefix(&fixture.storage).await;
+            }
         }
     };
 }
