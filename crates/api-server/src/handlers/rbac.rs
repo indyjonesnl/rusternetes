@@ -731,6 +731,16 @@ pub async fn update_rolebinding(
     }
     let updated = state.storage.update(&key, &rolebinding).await?;
 
+    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
+    // finalizer off an object already pending deletion removes it as part of
+    // that same request (store.go:565).
+    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
+        &*state.storage,
+        &key,
+        &updated,
+    )
+    .await?;
+
     Ok(Json(updated))
 }
 
@@ -1326,6 +1336,16 @@ pub async fn update_clusterrolebinding(
         );
     }
     let updated = state.storage.update(&key, &clusterrolebinding).await?;
+
+    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
+    // finalizer off an object already pending deletion removes it as part of
+    // that same request (store.go:565).
+    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
+        &*state.storage,
+        &key,
+        &updated,
+    )
+    .await?;
 
     Ok(Json(updated))
 }

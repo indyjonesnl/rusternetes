@@ -607,6 +607,16 @@ pub async fn update_crd(
     // Notify dynamic route manager about CRD update
     info!("CRD updated: {}", name);
 
+    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
+    // finalizer off an object already pending deletion removes it as part of
+    // that same request (store.go:565).
+    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
+        &*state.storage,
+        &key,
+        &updated,
+    )
+    .await?;
+
     Ok(Json(serde_json::from_value(updated).unwrap_or(crd)))
 }
 
