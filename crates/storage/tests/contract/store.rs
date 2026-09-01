@@ -125,3 +125,40 @@ pub async fn run_test_unconditional_delete<S: Storage>(storage: &S) {
         "delete of a non-existing key should be NotFound, got {missing:?}"
     );
 }
+
+/// Ported from `RunTestListContinuation` (`store_tests.go`), reduced to the
+/// invariant our `list_paginated` can express: walking a prefix with a limit
+/// returns every key exactly once, in sort order, with no gaps or duplicates.
+pub async fn run_test_list_continuation<S: Storage>(storage: &S) {
+    let prefix = "/registry/pods/cont/";
+    for i in 0..5 {
+        let name = format!("test-{i}");
+        storage
+            .create(&pod_key("cont", &name), &pod("cont", &name))
+            .await
+            .unwrap_or_else(|e| panic!("seeding {name} failed: {e}"));
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let (items, next): (Vec<Value>, Option<String>) = storage
+            .list_paginated(prefix, 2, token.as_deref())
+            .await
+            .expect("list_paginated failed");
+        assert!(items.len() <= 2, "page exceeded the requested limit");
+        for item in &items {
+            seen.push(item["metadata"]["name"].as_str().expect("name").to_string());
+        }
+        match next {
+            Some(t) => token = Some(t),
+            None => break,
+        }
+    }
+
+    assert_eq!(
+        seen,
+        vec!["test-0", "test-1", "test-2", "test-3", "test-4"],
+        "continuation dropped, duplicated or reordered keys"
+    );
+}
