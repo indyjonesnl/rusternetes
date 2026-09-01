@@ -441,6 +441,24 @@ pub async fn update_status(
         // json-patch branch above already does this; the PUT / merge-patch path
         // previously skipped it, so e.g. a ResourceQuota /status with an
         // unparseable used/hard quantity was persisted unchecked (#1484).
+        // TEMPORARY probe for #1840: a ResourceQuota's spec.hard reverts to its
+        // pre-update value while a /status write is in flight, and every
+        // mechanism inspected so far says that is impossible. Record what this
+        // write actually read and what it is about to persist, so one
+        // occurrence in CI identifies the writer instead of another hypothesis.
+        // Scoped to resourcequotas to keep the volume negligible. Remove once
+        // #1840 is closed.
+        if resource_type == "resourcequotas" {
+            info!(
+                "#1840 probe: /status {}/{} read rv={:?} spec.hard={:?} -> writing spec.hard={:?}",
+                namespace,
+                name,
+                current_resource.pointer("/metadata/resourceVersion"),
+                current_resource.pointer("/spec/hard"),
+                updated_resource.pointer("/spec/hard"),
+            );
+        }
+
         validate_status_subresource(&resource_type, &updated_resource)?;
         match state.storage.update(&key, &updated_resource).await {
             Ok(v) => break v,

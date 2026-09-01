@@ -206,11 +206,27 @@ pub async fn update(
             &stored.metadata,
         );
     }
-    let result = match state.storage.update(&key, &quota).await {
+    // TEMPORARY probe for #1840 — see handlers/status.rs. Records the incoming
+    // resourceVersion and spec.hard against what the store returns, so a lost
+    // update can be attributed to a writer rather than guessed at.
+    let incoming_rv = quota.metadata.resource_version.clone();
+    let incoming_hard = format!("{:?}", quota.spec.hard);
+
+    let result: ResourceQuota = match state.storage.update(&key, &quota).await {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &quota).await?,
         Err(e) => return Err(e),
     };
+
+    info!(
+        "#1840 probe: update {}/{} incoming rv={:?} spec.hard={:?} -> stored rv={:?} spec.hard={:?}",
+        namespace,
+        name,
+        incoming_rv,
+        incoming_hard,
+        result.metadata.resource_version,
+        format!("{:?}", result.spec.hard),
+    );
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of
