@@ -4,7 +4,7 @@ use super::fixtures::{pod, pod_key};
 use rusternetes_storage::Storage;
 use serde_json::Value;
 
-/// Ported from `RunTestCreate` (`store_tests.go`).
+/// Ported from `RunTestCreate` (`store_tests.go:52-93`).
 ///
 /// Create must store the object and hand back a copy carrying a non-zero
 /// resourceVersion.
@@ -16,8 +16,37 @@ use serde_json::Value;
 /// revisions. Upstream's `RunTestCreate` asserts the returned object carries a
 /// valid RV, so this is a real gap in that backend, deliberately recorded here
 /// rather than asserted away.
+///
+/// **Dropped upstream row: "create with ResourceVersion set".** Upstream is a
+/// two-row table; row 2 creates a pod carrying `ResourceVersion: "1"` and
+/// requires `storage.ErrResourceVersionSetOnCreate` — "resourceVersion should
+/// not be set on objects to be created" (`storage/errors.go:29`), enforced in
+/// `etcd3/store.go:288`:
+///
+/// ```go
+/// if version, err := s.versioner.ObjectResourceVersion(obj); err == nil && version != 0 {
+///     return storage.ErrResourceVersionSetOnCreate
+/// }
+/// ```
+///
+/// No `Storage` backend here rejects it and there is no equivalent `Error`
+/// variant, so the row has no target. Measured 2026-09-01: etcd and kine both
+/// accept the create and return the real mod_revision, but persist the caller's
+/// stale `"1"` in the stored blob (masked on read, because
+/// `inject_resource_version` overwrites it). `MemoryStorage` accepts it *and*
+/// keeps `"1"` as the object's resourceVersion, so a caller can forge one. We
+/// also have no equivalent of upstream's `PrepareObjectForStorage`, which zeroes
+/// the RV before encoding. Recorded as a real gap rather than asserted away.
 pub async fn run_test_create<S: Storage>(storage: &S, expects_resource_version: bool) {
     let key = pod_key("test-ns", "foo");
+
+    // Upstream asserts the key is empty before the create (`store.Get` must be
+    // NotFound) — the create's success proves nothing if something seeded it.
+    let before = storage.get::<Value>(&key).await;
+    assert!(
+        matches!(before, Err(rusternetes_common::Error::NotFound(_))),
+        "expected an empty key before create, got {before:?}"
+    );
 
     let out: Value = storage
         .create(&key, &pod("test-ns", "foo"))
@@ -55,13 +84,44 @@ pub async fn run_test_create_with_key_exist<S: Storage>(storage: &S) {
     );
 }
 
-/// Ported from `RunTestGetListRecursivePrefix` (`store_tests.go`), recursive
-/// cases only — our `list` is always recursive, so upstream's
-/// `recursive: false` rows have no equivalent here.
+/// Ported from `RunTestGetListRecursivePrefix` (`store_tests.go:2740-2800`),
+/// the two recursive *prefix* rows only.
 ///
 /// The `test-ns` / `test-ns2` pair is the point: `test-ns2` sorts immediately
 /// after the `test-ns/` prefix, so a scan whose upper bound is wrong swallows
 /// it.
+///
+/// **Dropped upstream rows.** Four of the eight, in two groups:
+///
+/// * The three `recursive: false` rows have no target — our `list` is always
+///   recursive and there is no non-recursive variant to call.
+/// * The two RECURSIVE rows on an *object* key (`store_tests.go:2772-2782`,
+///   "Recursive on object key (prefix) doesn't return anything" and its
+///   no-prefix twin) expect an empty result, because upstream appends a `/` to
+///   a recursive key before ranging (`etcd3/store.go`, `GetList`): the key
+///   `/pods/test-ns/foo` becomes the prefix `/pods/test-ns/foo/`, which matches
+///   nothing.
+///
+///   Our `list` is a raw prefix scan with no such normalisation, and the
+///   backends do not even agree with each other. Measured 2026-09-01 with the
+///   three objects below seeded — `list("/registry/pods/test-ns/foo")` returns
+///   `["foo", "foobar"]` on etcd and on MemoryStorage but `[]` on kine, and
+///   `list("/registry/pods/test-ns/foobar")` returns `["foobar"]` on etcd and
+///   MemoryStorage but `[]` on kine. Upstream returns nothing for both.
+///
+///   That is a real divergence between our prefix-scan `list` and upstream's
+///   key semantics, and a three-way one: kine's range handling already matches
+///   upstream while ours does not. It is unreachable from the api-server (every
+///   caller builds its prefix with `rusternetes_storage::build_prefix`, which
+///   always ends in `/`), so the rows are left out rather than made to pass by
+///   weakening anything.
+///
+/// **Requires an exclusive store.** The `all.len() == 3` assertion covers the
+/// whole `/registry/pods/` prefix, and `run_test_create` writes `test-ns/foo`
+/// under it too. That is only sound because `contract_suite!` gives every test
+/// its own fixture — a fresh `MemoryStorage`, or its own etcd/kine container.
+/// A shared fixture would break this assertion and `run_test_create`'s
+/// empty-before-create one together.
 pub async fn run_test_list_recursive_prefix<S: Storage>(storage: &S) {
     for (ns, name) in [
         ("test-ns", "foo"),
