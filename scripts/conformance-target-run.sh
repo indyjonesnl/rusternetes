@@ -131,6 +131,27 @@ suite_level_failures() {
 # have settled it (the api-server's own `Watch ADDED event for key=...,
 # should_send_initial=...` line, already logged at debug) was never captured.
 #
+# Two ways this failed to deliver in practice, both fixed here:
+#
+#   * `--tail=5000` is far too small. The api-server writes ~1 MB of log in
+#     four minutes under conformance load, so 5000 lines covered only the last
+#     few minutes of a ~19-minute suite. Chasing #1804 on run 33424459852 the
+#     captured window was 18:53:52-18:58:24 while the failure was at
+#     18:45:26-18:47:56 — the artifact missed it completely. Capture the whole
+#     log; the artifact is compressed and a few MB is cheap next to a wasted
+#     nightly.
+#
+#   * `controller-manager` and `scheduler` are NOT compose services in this
+#     stack — they run as kubelet static pods (see .rusternetes/manifests/).
+#     Both `compose logs controller-manager` and `docker logs
+#     rusternetes-controller-manager` therefore fail, the file comes out empty
+#     and is deleted, and the artifact has silently never contained a
+#     controller-manager log. For a garbage-collector or namespace-controller
+#     failure that is precisely the log you need (#1836, #1804). Their stdout
+#     lands in the kubelet's per-pod log tree instead
+#     (crates/kubelet/src/cri_runtime/runtime.rs:577-621):
+#     `$KUBELET_VOLUMES_PATH/pod-logs/<ns>_<pod>_<uid>/<container>.log`.
+#
 # Best-effort throughout: a failing dump must never change the run's verdict.
 capture_component_logs() {
     local out="${1:-}"
@@ -138,17 +159,69 @@ capture_component_logs() {
     local runtime="${CONTAINER_RUNTIME:-docker}"
     command -v "$runtime" >/dev/null 2>&1 || return 0
 
+    # `all` keeps the whole log. Override only to bound a pathological run.
+    local tail="${COMPONENT_LOG_TAIL:-all}"
+
     local svc
-    for svc in api-server rhino controller-manager scheduler; do
+    for svc in api-server rhino kubelet kubelet2 kube-proxy; do
         local dest="$out/component-$svc.log"
-        if "$runtime" compose -f compose.sqlite.yml logs --no-color --tail="${COMPONENT_LOG_TAIL:-5000}" "$svc" \
+        if "$runtime" compose -f compose.sqlite.yml logs --no-color --tail="$tail" "$svc" \
              >"$dest" 2>/dev/null && [ -s "$dest" ]; then
             echo "[conformance-target-run] captured $svc log -> $dest"
-        elif "$runtime" logs --tail="${COMPONENT_LOG_TAIL:-5000}" "rusternetes-$svc" \
+        elif "$runtime" logs --tail="$tail" "rusternetes-$svc" \
              >"$dest" 2>&1 && [ -s "$dest" ]; then
             echo "[conformance-target-run] captured $svc log (direct) -> $dest"
         else
             rm -f "$dest"
+        fi
+    done
+
+    capture_static_pod_logs "$out" "$runtime"
+    return 0
+}
+
+# capture_static_pod_logs <output-dir> <container-runtime>
+# Copy the control-plane STATIC POD logs (kube-controller-manager,
+# kube-scheduler) into the results directory.
+#
+# These components are not compose services, so `compose logs` cannot see them.
+# The kubelet writes their stdout to
+# `$KUBELET_VOLUMES_PATH/pod-logs/<ns>_<pod>_<uid>/<container>.log`
+# (crates/kubelet/src/cri_runtime/runtime.rs:577-621). That tree is created by
+# the kubelet as root, so read it from inside the kubelet container — which
+# bind-mounts KUBELET_VOLUMES_PATH at the SAME path (compose.sqlite.yml) — and
+# fall back to a plain host read for a local run where the files are readable.
+#
+# Best-effort: a missing log must never change the run's verdict.
+capture_static_pod_logs() {
+    local out="$1" runtime="$2"
+    local vol="${KUBELET_VOLUMES_PATH:-}"
+    [ -n "$vol" ] || return 0
+
+    # The kubelet names a static pod's mirror after the node it runs on
+    # (`kube-controller-manager-node-1`), so glob the suffix rather than
+    # assuming it. Either kubelet may be hosting it.
+    local comp dest kubelet captured
+    for comp in kube-controller-manager kube-scheduler; do
+        dest="$out/component-$comp.log"
+        captured=""
+        for kubelet in rusternetes-kubelet rusternetes-kubelet2; do
+            if "$runtime" exec "$kubelet" sh -c \
+                   "cat $vol/pod-logs/kube-system_${comp}*/${comp}.log" \
+                   >"$dest" 2>/dev/null && [ -s "$dest" ]; then
+                echo "[conformance-target-run] captured $comp log (static pod on $kubelet) -> $dest"
+                captured=1
+                break
+            fi
+        done
+        if [ -z "$captured" ]; then
+            if cat "$vol"/pod-logs/kube-system_"${comp}"*/"${comp}".log \
+                   >"$dest" 2>/dev/null && [ -s "$dest" ]; then
+                echo "[conformance-target-run] captured $comp log (static pod, host) -> $dest"
+            else
+                rm -f "$dest"
+                echo "[conformance-target-run] no $comp log under $vol/pod-logs" >&2
+            fi
         fi
     done
     return 0
