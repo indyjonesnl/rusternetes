@@ -37,6 +37,11 @@ pub struct GarbageCollector<S: Storage> {
     /// is created between the GC listing owners and listing dependents.
     /// K8s avoids this via informer caches; we use a grace period.
     pending_orphans: std::sync::Mutex<HashSet<String>>,
+    /// Number of full-cluster list passes performed. Each pass LISTs every
+    /// resource type (28 of them), so this is the GC's dominant cost against
+    /// the api-server and the thing that starves a cascade of its own budget.
+    /// Counted so a regression is a test failure rather than a slow nightly.
+    list_passes: std::sync::atomic::AtomicUsize,
 }
 
 impl<S: Storage + 'static> GarbageCollector<S> {
@@ -49,6 +54,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             delete_batch_size: 100,
             max_retries: 3,
             pending_orphans: std::sync::Mutex::new(HashSet::new()),
+            list_passes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -68,6 +74,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             delete_batch_size,
             max_retries: 3,
             pending_orphans: std::sync::Mutex::new(HashSet::new()),
+            list_passes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -256,8 +263,17 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         Ok(found_orphans || had_being_deleted)
     }
 
+    /// Full-cluster list passes performed so far. See
+    /// [`list_passes`](Self::list_passes).
+    #[cfg(test)]
+    fn list_pass_count(&self) -> usize {
+        self.list_passes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Get all resources from storage
     async fn get_all_resources(&self) -> rusternetes_common::Result<Vec<ResourceInfo>> {
+        self.list_passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut resources = Vec::new();
 
         // List all resources across all namespaces and resource types
@@ -743,9 +759,18 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         resource: &ResourceInfo,
         dependent_map: &HashMap<String, Vec<String>>,
     ) -> rusternetes_common::Result<()> {
+        // ONE snapshot for the whole cascade. Re-listing per level made the
+        // cost of deleting an owner scale with its dependent count — see
+        // `delete_dependents_foreground_visiting`.
+        let all_resources = self.get_all_resources().await?;
         let mut visited = HashSet::new();
-        self.delete_dependents_foreground_visiting(resource, dependent_map, &mut visited)
-            .await
+        self.delete_dependents_foreground_visiting(
+            resource,
+            dependent_map,
+            &all_resources,
+            &mut visited,
+        )
+        .await
     }
 
     /// Cycle-safe body of [`Self::delete_dependents_foreground`].
@@ -760,6 +785,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         &self,
         resource: &ResourceInfo,
         _dependent_map: &HashMap<String, Vec<String>>,
+        all_resources: &[ResourceInfo],
         visited: &mut HashSet<String>,
     ) -> rusternetes_common::Result<()> {
         let resource_uid = &resource.metadata.uid;
@@ -771,8 +797,8 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             return Ok(());
         }
 
-        // Find all resources that have this resource as an owner
-        let all_resources = self.get_all_resources().await?;
+        // Find all resources that have this resource as an owner, from the
+        // snapshot the cascade opened with.
         let dependents: Vec<_> = all_resources
             .iter()
             .filter(|r| {
@@ -858,16 +884,24 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                     );
 
                     // Recursively handle foreground deletion for this dependent's dependents
-                    let (_, sub_dependent_map) = self.build_relationship_maps(&all_resources);
+                    let (_, sub_dependent_map) = self.build_relationship_maps(all_resources);
                     Box::pin(self.delete_dependents_foreground_visiting(
                         dependent,
                         &sub_dependent_map,
+                        all_resources,
                         visited,
                     ))
                     .await?;
 
-                    if let Err(e) = self.storage.delete(&dependent.key).await {
-                        error!("Failed to delete dependent {}: {}", dependent.key, e);
+                    match self.storage.delete(&dependent.key).await {
+                        Ok(_) => {}
+                        // The snapshot is from the start of the cascade, so a
+                        // dependent something else already removed is expected,
+                        // not an error.
+                        Err(rusternetes_common::Error::NotFound(_)) => {
+                            debug!("Dependent {} already gone", dependent.key);
+                        }
+                        Err(e) => error!("Failed to delete dependent {}: {}", dependent.key, e),
                     }
                 }
             }
@@ -2110,6 +2144,101 @@ mod tests {
         assert!(
             gc.still_has_dependents(owner_uid).await.unwrap(),
             "a dependent with blockOwnerDeletion: true must hold the gate"
+        );
+    }
+
+    /// The foreground cascade must not re-LIST the whole cluster once per
+    /// dependent.
+    ///
+    /// `delete_dependents_foreground` recursed into every sole-owned dependent
+    /// and each level called `get_all_resources()`, which LISTs all 28 resource
+    /// types. Deleting an rc with N pods therefore cost N + 3 full passes —
+    /// ~1484 LIST operations for the 50 sole-owned pods of
+    /// `[sig-api-machinery] Garbage collector should not delete dependents that
+    /// have both valid owner and owner that's waiting for dependents to be
+    /// deleted [Serial]`, per scan, while that same spec's 90s budget was
+    /// waiting on the cascade to finish (#1836).
+    ///
+    /// Upstream never pays this: its GC walks an in-memory dependency graph
+    /// maintained by informers (pkg/controller/garbagecollector/graph_builder.go)
+    /// and does no listing during a cascade at all. One snapshot per cascade is
+    /// the closest equivalent that keeps our scan-based design.
+    #[tokio::test]
+    async fn foreground_cascade_takes_one_list_pass_not_one_per_dependent() {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let gc = GarbageCollector::new(storage.clone());
+
+        let owner_uid = "rc-many-pods-uid";
+        let mut rc_meta = ObjectMeta::new("simpletest.rc");
+        rc_meta.namespace = Some("default".to_string());
+        rc_meta.uid = owner_uid.to_string();
+        rc_meta.deletion_timestamp = Some(chrono::Utc::now());
+        rc_meta.finalizers = Some(vec!["foregroundDeletion".to_string()]);
+        let rc = serde_json::json!({
+            "apiVersion": "v1", "kind": "ReplicationController",
+            "metadata": serde_json::to_value(&rc_meta).unwrap(),
+            "spec": {"replicas": 20},
+        });
+        storage
+            .create(
+                "/registry/replicationcontrollers/default/simpletest.rc",
+                &rc,
+            )
+            .await
+            .unwrap();
+
+        const PODS: usize = 20;
+        for i in 0..PODS {
+            let name = format!("rc-pod-{i}");
+            let mut meta = ObjectMeta::new(name.clone());
+            meta.namespace = Some("default".to_string());
+            meta.uid = format!("{name}-uid");
+            meta.owner_references = Some(vec![OwnerReference {
+                api_version: "v1".to_string(),
+                kind: "ReplicationController".to_string(),
+                name: "simpletest.rc".to_string(),
+                uid: owner_uid.to_string(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]);
+            let pod = Pod {
+                type_meta: TypeMeta {
+                    kind: "Pod".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: meta,
+                spec: None,
+                status: None,
+            };
+            storage
+                .create(&format!("/registry/pods/default/{name}"), &pod)
+                .await
+                .unwrap();
+        }
+
+        gc.scan_and_collect().await.unwrap();
+
+        // The cascade still has to work.
+        let pods: Vec<Pod> = storage
+            .list("/registry/pods/default/")
+            .await
+            .unwrap_or_default();
+        assert!(
+            pods.is_empty(),
+            "all {PODS} pods must be collected, {} left",
+            pods.len()
+        );
+
+        // One pass to open the scan, one for the cascade, one for the
+        // foreground gate's fresh re-read. Emphatically not one per pod.
+        let passes = gc.list_pass_count();
+        assert!(
+            passes <= 4,
+            "foreground cascade of {PODS} dependents took {passes} full-cluster \
+             list passes; it must not scale with the number of dependents"
         );
     }
 }
