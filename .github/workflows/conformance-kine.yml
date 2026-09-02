@@ -52,18 +52,50 @@ jobs:
     #   sig-apps           59/60   60/60
     #   sig-storage        91/91   91/91
     #
-    # Every kine-only failure is a [Serial] deletion/GC spec. The failure CLASS
-    # is ours, not kine's: our GC is a polling scan whose interval backs off
-    # 5->60s and which requires an orphan in two consecutive scans, so orphan
-    # collection can take ~65s against conformance budgets of 30-90s. rhino
-    # hits the same weakness in sig-network.
+    # The numbers above PREDATE #1845/#1848/#1849 and are kept only as the
+    # "before" column; re-measure before treating them as current.
     #
-    # Why kine crosses those budgets where rhino does not is NOT established.
-    # The obvious theory - kine churning watches and starving the control loop
-    # - was measured and refuted: on an idle cluster kine re-establishes 472
-    # watches per 300s and rhino 473, i.e. identical, and that rate is the
-    # api-server's own behaviour on both backends. Do not repeat the theory
-    # without new evidence.
+    # Every kine-only failure is a [Serial] deletion/GC spec, and the failure
+    # class is ours, not kine's. But they do NOT share one cause, and the
+    # single-cause story this comment used to tell ("our GC is a polling scan
+    # whose interval backs off 5->60s ... so orphan collection can take ~65s")
+    # was wrong. It was investigated on 2026-09-02 (#1846) and splits in two:
+    #
+    #   * The two `Namespaces [Serial]` specs were NOT a GC timing race. Both
+    #     poll for the namespace OBJECT to disappear within 60s (90s for the
+    #     pod variant) - see test/e2e/apimachinery/namespace.go:131-139 and
+    #     :188-196; despite their names neither asserts anything about orphan
+    #     collection. They failed because we accepted CREATE into a Terminating
+    #     namespace, so a ReplicationController the namespace deleter had not
+    #     reached yet kept recreating the pods it had just deleted. A namespace
+    #     holding 100 pods took 158s to go away, with the pod count RISING
+    #     mid-drain. Fixed in #1849 by porting upstream's NamespaceLifecycle
+    #     admission; 158s -> 36s.
+    #
+    #   * The two `Garbage collector` specs never reach GC code at all. They
+    #     fail in setup, waiting for `rc.Status.Replicas` to reach
+    #     `Spec.Replicas` (garbage_collector.go:1174) while all 100 pods are
+    #     demonstrably Running - i.e. the RC never publishes its status on the
+    #     kine path. Tracked in #1847, still open.
+    #
+    # "Why kine crosses those budgets where rhino does not" is now partly
+    # answered, and the answer was never about GC cadence: on rhino the same
+    # namespace teardown takes 2.7s and all four focused specs pass, against
+    # 6-8+ minutes on kine (both `main`, both built from source). Measured, not
+    # assumed - the earlier claim that "rhino fails 0 of these" had never been
+    # run.
+    #
+    # Two theories were measured and REFUTED; do not repeat either without new
+    # evidence. (1) kine churning watches and starving the control loop: on an
+    # idle cluster kine re-establishes 472 watches per 300s and rhino 473,
+    # i.e. identical, and that rate is the api-server's own behaviour on both
+    # backends. (2) `EtcdStorage::delete` silently no-opping: it is a guarded
+    # txn that returns Conflict, and the repeated GC deletes seen in the logs
+    # were api-server DELETEs correctly refused while `spec.finalizers`
+    # remained (#1848 stopped the GC from issuing them).
+    #
+    # Lesson for whoever reads this next: a spec's NAME is not its assertion.
+    # Read the spec source before attributing its failure to a mechanism.
     #
     # The engine is NON-GATING, so these show as reported numbers rather than a
     # red job. Treat a DROP from the table above as the signal.
