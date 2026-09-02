@@ -13,6 +13,34 @@ use tracing::{debug, error, info};
 /// cloning the client is cheap and allows fully concurrent access.
 pub struct EtcdStorage {
     client: Client,
+    /// Page size for prefix scans in [`Storage::list`]. Defaults to
+    /// [`DEFAULT_LIST_PAGE_SIZE`]; overridable so tests can walk several pages
+    /// without seeding hundreds of keys.
+    page_size: i64,
+}
+
+/// Keys fetched per `RangeRequest` when listing a prefix, chosen to stay well
+/// under the default 4MB gRPC message limit.
+const DEFAULT_LIST_PAGE_SIZE: i64 = 500;
+
+/// How many times an unversioned write re-reads and retries its guarded
+/// transaction before giving up, mirroring upstream's `GuaranteedUpdate` retry
+/// loop in `etcd3/store.go`.
+const GUARANTEED_UPDATE_ATTEMPTS: usize = 5;
+
+/// The exclusive upper bound of a prefix range, computed the way etcd's
+/// `WithPrefix` does: the prefix with its last non-`0xff` byte incremented. An
+/// empty or all-`0xff` prefix has no finite bound, which etcd spells as the
+/// single zero byte "scan to the end of the keyspace".
+fn prefix_range_end(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < 0xff {
+            end.push(last + 1);
+            return end;
+        }
+    }
+    vec![0]
 }
 
 impl EtcdStorage {
@@ -32,12 +60,71 @@ impl EtcdStorage {
 
         info!("Connected to etcd successfully");
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            page_size: DEFAULT_LIST_PAGE_SIZE,
+        })
+    }
+
+    /// Override the number of keys fetched per page when listing a prefix.
+    ///
+    /// Production code uses the [`DEFAULT_LIST_PAGE_SIZE`]; tests lower it to
+    /// exercise multi-page list behaviour cheaply.
+    pub fn with_page_size(mut self, page_size: i64) -> Self {
+        self.page_size = page_size;
+        self
     }
 
     /// Helper to serialize a value to JSON
     fn serialize<T: Serialize>(value: &T) -> Result<String> {
         serde_json::to_string(value).map_err(Error::Serialization)
+    }
+
+    /// Read a key's current `mod_revision`, or [`Error::NotFound`].
+    async fn read_mod_revision(client: &mut Client, key: &str) -> Result<i64> {
+        let resp = client
+            .get(key, None)
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to read resource: {}", e)))?;
+        resp.kvs()
+            .first()
+            .map(|kv| kv.mod_revision())
+            .ok_or_else(|| Error::NotFound(key.to_string()))
+    }
+
+    /// Write an existing key without a caller-supplied resourceVersion,
+    /// returning the new `mod_revision`.
+    ///
+    /// Upstream never issues a bare `Put`: a write with no expected revision
+    /// goes through `GuaranteedUpdate` (`etcd3/store.go`), which reads the
+    /// current revision, applies a `ModRevision`-guarded transaction, and
+    /// retries from the top when a concurrent writer moves the key underneath
+    /// it. Mirroring that keeps every mutation inside the upstream RPC subset
+    /// *and* closes the lost-update race a bare `Put` leaves open.
+    async fn put_guaranteed(&self, key: &str, json: &str) -> Result<i64> {
+        let mut client = self.client.clone();
+        for _ in 0..GUARANTEED_UPDATE_ATTEMPTS {
+            let expected = Self::read_mod_revision(&mut client, key).await?;
+            // The failure branch's GET is upstream's `GetOnFailure: true`,
+            // which `GuaranteedUpdate` always sets — it is part of the
+            // recognised update shape, not an optional extra.
+            let txn = etcd_client::Txn::new()
+                .when(vec![Compare::mod_revision(key, CompareOp::Equal, expected)])
+                .and_then(vec![TxnOp::put(key, json, None)])
+                .or_else(vec![TxnOp::get(key, None)]);
+            let resp = client
+                .txn(txn)
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+            if resp.succeeded() {
+                return Ok(resp.header().map(|h| h.revision()).unwrap_or(0));
+            }
+            // Lost the race — re-read and try again.
+        }
+        Err(Error::Conflict(format!(
+            "failed to update {} after {} attempts: concurrent writers keep moving the revision",
+            key, GUARANTEED_UPDATE_ATTEMPTS
+        )))
     }
 
     /// Inject resourceVersion into a JSON string by parsing, modifying, and re-serializing.
@@ -78,15 +165,19 @@ impl Storage for EtcdStorage {
             raw
         };
 
-        // Use a transaction to ensure the key doesn't already exist.
-        // Include a GET in the then branch to read back the exact mod_revision.
+        // Upstream's create is a single-op transaction guarded on the key not
+        // existing — `OptimisticPut(key, data, 0)` in
+        // `vendor/go.etcd.io/etcd/client/v3/kubernetes/client.go`:
+        //
+        //     txn.If(clientv3.Compare(clientv3.ModRevision(key), "=", 0))
+        //        .Then(clientv3.OpPut(key, value))
+        //
+        // Two details are deliberate: the guard compares `ModRevision` (not
+        // `Version`), and the success branch holds exactly one operation. Any
+        // other shape falls outside the subset etcd-API shims implement.
         let txn = etcd_client::Txn::new()
-            .when(vec![Compare::version(key, CompareOp::Equal, 0)])
-            .and_then(vec![
-                TxnOp::put(key, json.clone(), None),
-                TxnOp::get(key, None),
-            ])
-            .or_else(vec![]);
+            .when(vec![Compare::mod_revision(key, CompareOp::Equal, 0)])
+            .and_then(vec![TxnOp::put(key, json.clone(), None)]);
 
         let txn_resp = client
             .txn(txn)
@@ -99,18 +190,11 @@ impl Storage for EtcdStorage {
 
         debug!("Created resource at key: {}", key);
 
-        // Get the exact mod_revision from the GET in the then branch (2nd op)
-        let mod_revision = txn_resp
-            .op_responses()
-            .get(1)
-            .and_then(|resp| {
-                if let etcd_client::TxnOpResponse::Get(get_resp) = resp {
-                    get_resp.kvs().first().map(|kv| kv.mod_revision())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| txn_resp.header().map(|h| h.revision()).unwrap_or(0));
+        // The put is the only operation in the transaction, so the response
+        // header's revision *is* the new mod_revision. Upstream reads it the
+        // same way (`resp.Revision = txnResp.Header.Revision`), which is why
+        // the read-back GET this used to carry was always redundant.
+        let mod_revision = txn_resp.header().map(|h| h.revision()).unwrap_or(0);
 
         // Inject resourceVersion and deserialize
         let json_with_rv = Self::inject_resource_version(&json, mod_revision);
@@ -162,18 +246,17 @@ impl Storage for EtcdStorage {
             // Use a transaction to ensure atomic update with version check
             let expected_mod_revision =
                 crate::concurrency::resource_version_to_mod_revision(incoming_rv)?;
-            // Transaction: if mod_revision matches, PUT then GET (to read back mod_revision).
-            // On failure, GET to report the current version in the error.
+            // Upstream `OptimisticPut(key, data, expectedRevision,
+            // {GetOnFailure: true})`: one guarded PUT, and a GET only in the
+            // failure branch so the conflict error can name the current
+            // revision.
             let txn = etcd_client::Txn::new()
                 .when(vec![Compare::mod_revision(
                     key,
                     CompareOp::Equal,
                     expected_mod_revision,
                 )])
-                .and_then(vec![
-                    TxnOp::put(key, json.clone(), None),
-                    TxnOp::get(key, None),
-                ])
+                .and_then(vec![TxnOp::put(key, json.clone(), None)])
                 .or_else(vec![TxnOp::get(key, None)]);
 
             let txn_resp = client
@@ -206,74 +289,28 @@ impl Storage for EtcdStorage {
 
             debug!("Updated resource at key: {}", key);
 
-            // Get mod_revision from the GET in the then branch (2nd op response)
-            let mod_revision = txn_resp
-                .op_responses()
-                .get(1)
-                .and_then(|resp| {
-                    if let etcd_client::TxnOpResponse::Get(get_resp) = resp {
-                        get_resp.kvs().first().map(|kv| kv.mod_revision())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| txn_resp.header().map(|h| h.revision()).unwrap_or(0));
+            // Single-op success branch: the header revision is the new
+            // mod_revision.
+            let mod_revision = txn_resp.header().map(|h| h.revision()).unwrap_or(0);
 
             let json_with_rv = Self::inject_resource_version(&json, mod_revision);
             serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
         } else {
-            // No resourceVersion provided — check key exists, then put
-            let get_resp = client
-                .get(key, Some(GetOptions::new().with_keys_only()))
-                .await
-                .map_err(|e| Error::Storage(format!("Failed to check resource: {}", e)))?;
-
-            if get_resp.kvs().is_empty() {
-                return Err(Error::NotFound(key.to_string()));
-            }
-
-            client
-                .put(key, json.clone(), None)
-                .await
-                .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+            // No resourceVersion provided — read-modify-write under a guard
+            // rather than a bare PUT, matching upstream `GuaranteedUpdate`.
+            let mod_revision = self.put_guaranteed(key, &json).await?;
 
             debug!("Updated resource at key: {}", key);
 
-            // Read back to get exact mod_revision
-            let get_resp = client
-                .get(key, None)
-                .await
-                .map_err(|e| Error::Storage(format!("Failed to get updated resource: {}", e)))?;
-
-            if let Some(kv) = get_resp.kvs().first() {
-                let mod_revision = kv.mod_revision();
-                let json_with_rv = Self::inject_resource_version(&json, mod_revision);
-                serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
-            } else {
-                // Key was deleted between put and get — shouldn't happen
-                serde_json::from_str(&json).map_err(Error::Serialization)
-            }
+            let json_with_rv = Self::inject_resource_version(&json, mod_revision);
+            serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
         }
     }
 
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()> {
-        let mut client = self.client.clone();
         let json = serde_json::to_string(value).map_err(Error::Serialization)?;
 
-        // Check if the key exists first (keys_only to save bandwidth)
-        let get_resp = client
-            .get(key, Some(GetOptions::new().with_keys_only()))
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to check resource: {}", e)))?;
-
-        if get_resp.kvs().is_empty() {
-            return Err(Error::NotFound(key.to_string()));
-        }
-
-        client
-            .put(key, json, None)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+        self.put_guaranteed(key, &json).await?;
 
         debug!("Updated resource (raw) at key: {}", key);
         Ok(())
@@ -282,17 +319,34 @@ impl Storage for EtcdStorage {
     async fn delete(&self, key: &str) -> Result<()> {
         let mut client = self.client.clone();
 
-        let resp = client
-            .delete(key, None)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to delete resource: {}", e)))?;
-
-        if resp.deleted() == 0 {
-            return Err(Error::NotFound(key.to_string()));
+        // Upstream `OptimisticDelete` (`client/v3/kubernetes/client.go`):
+        //
+        //     txn.If(clientv3.Compare(clientv3.ModRevision(key), "=", rev))
+        //        .Then(clientv3.OpDelete(key))
+        //
+        // A bare `DeleteRange` would remove a revision we never observed, and
+        // sits outside the RPC subset besides. Read the current revision, then
+        // delete under a guard, retrying if a writer beats us to it.
+        for _ in 0..GUARANTEED_UPDATE_ATTEMPTS {
+            let expected = Self::read_mod_revision(&mut client, key).await?;
+            let txn = etcd_client::Txn::new()
+                .when(vec![Compare::mod_revision(key, CompareOp::Equal, expected)])
+                .and_then(vec![TxnOp::delete(key, None)])
+                .or_else(vec![TxnOp::get(key, None)]);
+            let resp = client
+                .txn(txn)
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to delete resource: {}", e)))?;
+            if resp.succeeded() {
+                debug!("Deleted resource at key: {}", key);
+                return Ok(());
+            }
         }
 
-        debug!("Deleted resource at key: {}", key);
-        Ok(())
+        Err(Error::Conflict(format!(
+            "failed to delete {} after {} attempts: concurrent writers keep moving the revision",
+            key, GUARANTEED_UPDATE_ATTEMPTS
+        )))
     }
 
     async fn list<T>(&self, prefix: &str) -> Result<Vec<T>>
@@ -301,31 +355,28 @@ impl Storage for EtcdStorage {
     {
         let mut client = self.client.clone();
 
-        // Paginate etcd list calls to avoid hitting the default 4MB gRPC
-        // message size limit. Fetch up to 500 keys per request.
-        const PAGE_SIZE: i64 = 500;
+        // Paginate list calls to avoid hitting the default 4MB gRPC message
+        // size limit.
+        //
+        // Every page is an explicit range bounded by the prefix — `[start,
+        // prefix_range_end)` — continuing at `lastKey + "\x00"`, exactly as
+        // upstream does (`etcd3/store.go`: `continueKey = string(lastKey) +
+        // "\x00"`). The previous code combined `with_prefix()` with
+        // `with_from_key()`; the latter wins in `etcd-client`, so page 2 asked
+        // for the unbounded range `[lastKey, +inf)` and relied on a manual
+        // prefix re-check to trim the overshoot. That is outside the RPC subset
+        // and, on backends that do not implement open-ended ranges, silently
+        // returned nothing — truncating long lists to their first page.
+        let page_size = self.page_size;
+        let range_end = prefix_range_end(prefix.as_bytes());
         let mut results = Vec::new();
-        let mut last_key: Option<Vec<u8>> = None;
+        let mut next_start: Vec<u8> = prefix.as_bytes().to_vec();
 
         loop {
-            let get_options = match &last_key {
-                None => {
-                    // First page: use prefix scan
-                    GetOptions::new().with_prefix().with_limit(PAGE_SIZE)
-                }
-                Some(_key) => {
-                    // Subsequent pages: start from last_key (exclusive) with prefix
-                    GetOptions::new()
-                        .with_prefix()
-                        .with_from_key()
-                        .with_limit(PAGE_SIZE + 1) // +1 because from_key is inclusive
-                }
-            };
-
-            let query_key: Vec<u8> = match &last_key {
-                None => prefix.as_bytes().to_vec(),
-                Some(key) => key.clone(),
-            };
+            let get_options = GetOptions::new()
+                .with_range(range_end.clone())
+                .with_limit(page_size);
+            let query_key: Vec<u8> = next_start.clone();
 
             let resp = client
                 .get(query_key, Some(get_options))
@@ -334,22 +385,9 @@ impl Storage for EtcdStorage {
 
             let kvs = resp.kvs();
             for kv in kvs {
-                // Skip the last_key itself (from_key is inclusive)
-                if let Some(ref lk) = last_key {
-                    if kv.key() == lk.as_slice() {
-                        continue;
-                    }
-                }
-
-                // Ensure key still has the prefix (from_key may go beyond prefix)
                 let key_str = kv
                     .key_str()
                     .map_err(|e| Error::Storage(format!("Invalid UTF-8 in key: {}", e)))?;
-                if !key_str.starts_with(prefix) {
-                    // We've gone past the prefix range, stop
-                    debug!("Listed {} resources with prefix: {}", results.len(), prefix);
-                    return Ok(results);
-                }
 
                 let json = kv
                     .value_str()
@@ -369,22 +407,18 @@ impl Storage for EtcdStorage {
                 }
             }
 
-            // If we got fewer results than PAGE_SIZE, we've reached the end
-            let total_kvs = kvs.len() as i64;
-            let expected = if last_key.is_some() {
-                PAGE_SIZE + 1
-            } else {
-                PAGE_SIZE
-            };
-            if total_kvs < expected {
+            // A short page means we reached the end of the range.
+            if (kvs.len() as i64) < page_size {
                 break;
             }
 
-            // Set last_key to the last key we received for the next page
-            if let Some(last_kv) = kvs.last() {
-                last_key = Some(last_kv.key().to_vec());
-            } else {
-                break;
+            // Continue immediately after the last key we saw.
+            match kvs.last() {
+                Some(last_kv) => {
+                    next_start = last_kv.key().to_vec();
+                    next_start.push(0);
+                }
+                None => break,
             }
         }
 
@@ -433,15 +467,22 @@ impl Storage for EtcdStorage {
                                     .unwrap_or_default();
                                 let mod_revision = event.kv().map(|kv| kv.mod_revision()).unwrap_or(0);
                                 let value = Self::inject_resource_version(&raw_value, mod_revision);
-                                // Use etcd key version to distinguish create vs update:
-                                // version=1 means first write (create), >1 means update.
-                                // This is more reliable than prev_kv() which may be absent
-                                // after etcd compaction.
-                                let kv_version = event.kv().map(|kv| kv.version()).unwrap_or(0);
-                                debug!("etcd watch_from_rev event: key={} mod_rev={} version={} type={}",
-                                    key, mod_revision, kv_version,
-                                    if kv_version == 1 { "ADDED" } else { "MODIFIED" });
-                                if kv_version == 1 {
+                                // Distinguish create from update the way
+                                // upstream does — `clientv3.Event.IsCreate()`
+                                // is `Type == PUT && CreateRevision ==
+                                // ModRevision` (`client/v3/watch.go`). Unlike
+                                // `prev_kv` it survives compaction of the
+                                // previous revision, and unlike the key
+                                // `Version` field every etcd-API
+                                // implementation populates it.
+                                let is_create = event
+                                    .kv()
+                                    .map(|kv| kv.create_revision() == kv.mod_revision())
+                                    .unwrap_or(false);
+                                debug!("etcd watch_from_rev event: key={} mod_rev={} type={}",
+                                    key, mod_revision,
+                                    if is_create { "ADDED" } else { "MODIFIED" });
+                                if is_create {
                                     Ok(WatchEvent::Added(key, value))
                                 } else {
                                     Ok(WatchEvent::Modified(key, value))
@@ -518,7 +559,14 @@ impl Storage for EtcdStorage {
                                     event.kv().map(|kv| kv.mod_revision()).unwrap_or(0);
                                 let value = Self::inject_resource_version(&raw_value, mod_revision);
 
-                                if event.kv().map(|kv| kv.version()).unwrap_or(0) == 1 {
+                                // See `watch_from_revision`: upstream's
+                                // `IsCreate()` is `CreateRevision ==
+                                // ModRevision`, not `Version == 1`.
+                                let is_create = event
+                                    .kv()
+                                    .map(|kv| kv.create_revision() == kv.mod_revision())
+                                    .unwrap_or(false);
+                                if is_create {
                                     Ok(WatchEvent::Added(key, value))
                                 } else {
                                     Ok(WatchEvent::Modified(key, value))
@@ -549,31 +597,37 @@ impl Storage for EtcdStorage {
 
     async fn current_revision(&self) -> Result<i64> {
         let mut client = self.client.clone();
-        // Use keys_only to minimize data transfer
+        // A single-key GET of a key that does not exist: the response carries
+        // the current revision in its header and no payload. (`keys_only`
+        // would be a hair cheaper but is outside the RPC subset — and
+        // pointless here, since this range matches at most one key.)
         let resp = client
-            .get("/", Some(GetOptions::new().with_keys_only()))
+            .get("/", None)
             .await
             .map_err(|e| Error::Storage(format!("Failed to get current revision: {}", e)))?;
-        Ok(resp.header().unwrap().revision())
+        Ok(resp.header().map(|h| h.revision()).unwrap_or(0))
     }
 
     async fn is_revision_compacted(&self, revision: i64) -> Result<bool> {
         let mut client = self.client.clone();
-        // Try to get a key at the given revision; if compacted, etcd returns an error
-        let opts = GetOptions::new().with_revision(revision).with_keys_only();
+        // Read a single key at the requested revision. etcd answers a read
+        // below its compaction point with `OutOfRange` / "required revision
+        // has been compacted"; anything else means the revision is still
+        // served.
+        //
+        // Caveat: an etcd-API shim need not report compaction at all. kine
+        // prunes rows on `Compact` and then answers historical reads with
+        // whatever survives instead of erroring, so there this always reports
+        // "not compacted" and callers fall through to a merely inconsistent
+        // list rather than a 410. That is a property of the backend, not a
+        // call outside the subset.
+        let opts = GetOptions::new().with_revision(revision);
         match client.get("/registry/", Some(opts)).await {
             Ok(_) => Ok(false), // revision still available
-            Err(e) => {
-                let err_msg = format!("{}", e);
-                if err_msg.contains("compacted")
-                    || err_msg.contains("required revision has been compacted")
-                {
-                    Ok(true) // revision has been compacted
-                } else {
-                    // Other error — not a compaction issue
-                    Ok(false)
-                }
-            }
+            Err(etcd_client::Error::GRpcStatus(status)) => Ok(status.code()
+                == tonic::Code::OutOfRange
+                || status.message().contains("has been compacted")),
+            Err(_) => Ok(false),
         }
     }
 }
