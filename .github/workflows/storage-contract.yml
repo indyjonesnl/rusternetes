@@ -1,0 +1,153 @@
+name: Storage contract suite
+
+# Runs the Docker-backed storage tests — the ones `test.yml` structurally
+# cannot run.
+#
+# `crates/storage/tests/storage_contract.rs` executes 7 contract tests against
+# 3 backends (MemoryStorage in-process, etcd and kine as real containers via
+# testcontainers), and `etcd_rpc_subset.rs` adds 2 more container-backed cases.
+# All of them soft-skip when Docker is unreachable, so on `test.yml`'s cargo
+# tier (`arc-runner-set`, no Docker-in-Docker) the 16 container cases silently
+# skipped and the suite reported green having exercised only MemoryStorage —
+# the backend with the most known gaps. A suite that cannot fail is worse than
+# no suite.
+#
+# This job therefore runs on the DinD tier and sets
+# STORAGE_CONTRACT_REQUIRE_DOCKER=1, which turns the fixtures' soft skip into a
+# panic (see crates/storage/tests/contract/fixtures.rs). A DinD pod that comes
+# up without a working daemon now fails the job instead of quietly shrinking
+# coverage back to MemoryStorage.
+#
+# WHY A SEPARATE WORKFLOW rather than a second job in test.yml:
+#   - test.yml's `checks` job is the single REQUIRED status check for Rust and
+#     is deliberately one job on the cargo tier. A DinD job alongside it would
+#     put the required gate and a scarce, slow tier in one workflow, where the
+#     required check's result reads as pending behind a queued DinD pod.
+#   - The gating differs. The required check must ALWAYS run so it can report
+#     green in seconds on docs-only PRs; that is why test.yml detects changes
+#     in a *step*. Here the scarce resource is the DinD pod itself (12 GiB /
+#     3 cpu, roughly one per node), and a step-level gate would still have to
+#     schedule one just to evaluate a git diff. Workflow-level `paths:` skips
+#     without allocating anything, so that is what this uses.
+#
+# CONSEQUENCE of the `paths:` filter: on PRs that touch none of these paths the
+# workflow reports no status at all. Do NOT add this job to branch protection
+# as a required check — a required check behind a paths filter blocks every PR
+# that skips it. It is a normal (non-required) signal.
+
+# The two `paths:` lists are duplicated on purpose: the Actions workflow parser
+# does not support YAML anchors, so `&anchor`/`*alias` would be a parse error
+# here. Keep the two lists in sync.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/storage/**"
+      # The storage crate's error mapping comes from rusternetes-common, and
+      # the contract assertions match on those variants.
+      - "crates/common/**"
+      # rhino is the storage crate's `../../rhino` path dep.
+      - "rhino"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/storage-contract.yml"
+  pull_request:
+    paths:
+      - "crates/storage/**"
+      - "crates/common/**"
+      - "rhino"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/storage-contract.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Same reason as test.yml: this workspace's test binaries dominate target/
+  # and the runner nodes evict on ephemeral-storage. Dropping debuginfo keeps
+  # the build well under the node's nodefs threshold.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  # The escape hatch. Set at workflow level so both cargo steps see it and
+  # neither can be silently downgraded to a MemoryStorage-only run.
+  STORAGE_CONTRACT_REQUIRE_DOCKER: "1"
+
+jobs:
+  contract:
+    name: storage contract (etcd + kine containers)
+    # The DinD tier: a docker:dind sidecar sharing the pod network namespace,
+    # so testcontainers' published ports are reachable at 127.0.0.1. Same tier
+    # cert-manager-smoke.yml uses. The runner image is the one all tiers share
+    # (ci/arc-runner/Dockerfile), so the Rust toolchain is present here too.
+    runs-on: arc-runner-set-dind
+    # The suite starts ~16 short-lived containers one at a time on top of a
+    # cold compile, and this tier caps cargo at CARGO_BUILD_JOBS=2.
+    timeout-minutes: 40
+    steps:
+      - name: Checkout repository
+        # rhino is an in-tree submodule (./rhino) resolving the storage crate's
+        # `../../rhino` path dep; without it `cargo metadata` fails outright.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Tool prereqs (fail fast on missing — no apt-get install)
+        # `docker info` (not just `command -v docker`) is the real check: it
+        # proves the sidecar daemon is reachable. Without it a dead daemon
+        # would surface later as an opaque testcontainers panic.
+        run: |
+          set -euo pipefail
+          for t in docker cargo; do
+              command -v "$t" >/dev/null 2>&1 || { echo "missing required tool: $t"; exit 1; }
+          done
+          docker info >/dev/null
+
+      - name: Pre-pull backend images
+        # testcontainers would pull these on first use, mid-test. Pulling them
+        # up front turns a registry hiccup into a clearly-attributed failure
+        # (and a retry) instead of a confusing container-start panic. Keep the
+        # tags in step with crates/storage/tests/contract/fixtures.rs.
+        run: |
+          set -euo pipefail
+          for image in quay.io/coreos/etcd:v3.5.17 rancher/kine:v0.13.11; do
+              for attempt in 1 2 3; do
+                  # `continue 2` skips to the next image on success, so falling
+                  # out of the inner loop means all three attempts failed.
+                  docker pull "$image" && continue 2
+                  echo "pull of $image failed (attempt $attempt); retrying"
+                  sleep 10
+              done
+              echo "giving up on $image after 3 attempts"
+              exit 1
+          done
+
+      - name: Cache cargo registry + target
+        # Same policy as test.yml: PRs restore the cache main wrote on the
+        # most recent merge and skip the multi-GB upload at job end. Its own
+        # shared-key — this job builds a different (much smaller) artifact set
+        # than the workspace-wide `checks` job and must not clobber it.
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          shared-key: "storage-contract"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo test --test storage_contract
+        # `--test-threads=1` is mandatory, not tuning: the fixtures give every
+        # test its own container, and the default thread-per-core parallelism
+        # would start a dozen etcd/kine containers at once on a 12 GiB pod.
+        run: cargo test -p rusternetes-storage --test storage_contract --locked -- --test-threads=1
+
+      - name: cargo test --test etcd_rpc_subset
+        # Runs even if the contract suite failed, so one red backend doesn't
+        # hide an unrelated RPC-subset regression. `!cancelled()` rather than
+        # `always()`: a cancelled job should stop, not start more containers.
+        if: ${{ !cancelled() }}
+        run: cargo test -p rusternetes-storage --test etcd_rpc_subset --locked -- --test-threads=1
+
+      - name: sccache stats
+        # Compilation-cache hit rate, for visibility. sccache is configured
+        # cluster-side via the runner pod env; `|| true` keeps a missing or
+        # unconfigured sccache from failing the job.
+        if: always()
+        run: sccache --show-stats || true
