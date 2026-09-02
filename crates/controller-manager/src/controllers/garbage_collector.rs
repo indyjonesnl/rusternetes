@@ -727,7 +727,9 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         match current {
             Ok(value) => {
                 if let Ok(meta) = self.extract_metadata(&value) {
-                    if !meta.has_finalizers() {
+                    if !meta.has_finalizers()
+                        && !spec_finalizers_remain(&resource.resource_type, &value)
+                    {
                         // An object still inside its deletion grace period belongs
                         // to whoever is draining it — for a pod, the kubelet, which
                         // removes it once the container actually stops. Upstream's
@@ -1437,6 +1439,44 @@ fn kind_to_plural(kind: &str) -> &str {
 /// has no dependency-graph informer to make GC fully event-driven (tracked in
 /// #1039), so a scan-based GC approximates "silent when idle" (#1040) by
 /// stretching the poll interval when there is nothing to collect.
+/// Whether an object keeps unfinished finalizers in `spec`, where
+/// [`ObjectMeta::has_finalizers`] cannot see them.
+///
+/// Only namespaces do this. Upstream gates their final removal on it in two
+/// places: `Delete` returns the object untouched while they remain —
+///
+/// ```text
+/// // prior to final deletion, we must ensure that finalizers is empty
+/// if len(namespace.Spec.Finalizers) != 0 {
+///     return namespace, false, nil
+/// }
+/// ```
+///
+/// (`pkg/registry/core/namespace/storage/storage.go:250-253`) — and the update
+/// path overrides the generic hook this sweep stands in for (#1828):
+///
+/// ```text
+/// func ShouldDeleteNamespaceDuringUpdate(ctx, key, obj, existing) bool {
+///     ...
+///     return len(ns.Spec.Finalizers) == 0 &&
+///         genericregistry.ShouldDeleteDuringUpdate(ctx, key, obj, existing)
+/// }
+/// ```
+///
+/// (same file, `:257-265`). Without the override the sweep read only
+/// `metadata.finalizers` — empty on every namespace — decided a Terminating
+/// namespace was finished, and issued a DELETE per scan that the api-server
+/// correctly refused, logging "no finalizers remaining" on a loop (#1846).
+fn spec_finalizers_remain(resource_type: &str, value: &Value) -> bool {
+    if resource_type != "namespaces" {
+        return false;
+    }
+    value
+        .pointer("/spec/finalizers")
+        .and_then(|f| f.as_array())
+        .is_some_and(|f| !f.is_empty())
+}
+
 /// Whether a storage watch event should kick a GC scan ahead of its poll.
 ///
 /// Upstream GC reacts to every event because its graph builder holds a cached
@@ -2519,6 +2559,74 @@ mod tests {
             "orphan must be collected off the owner's delete event, not after \
              the {:?} idle backoff",
             Duration::from_secs(60)
+        );
+    }
+
+    /// A Terminating namespace still holding `spec.finalizers` must NOT be
+    /// swept by the GC's no-finalizers backstop.
+    ///
+    /// `ObjectMeta::has_finalizers()` reads `metadata.finalizers`. A namespace
+    /// keeps its finalizer in **`spec.finalizers`**, so the backstop concluded
+    /// "no finalizers remaining" for every Terminating namespace and fired a
+    /// DELETE on each scan. Against an api-server those are correctly refused
+    /// (upstream `Delete` returns the object untouched while finalizers remain,
+    /// pkg/registry/core/namespace/storage/storage.go:250-252), so the sweep
+    /// just re-logged
+    /// "Deleting resource (no finalizers remaining): /registry/namespaces/..."
+    /// on a loop — observed 8 times in 93s against kine on a namespace that
+    /// took 118s to finalize (#1846).
+    ///
+    /// Upstream states the rule as a namespace-specific override of exactly the
+    /// hook this sweep stands in for (#1828):
+    ///
+    ///     func ShouldDeleteNamespaceDuringUpdate(...) bool {
+    ///         return len(ns.Spec.Finalizers) == 0 &&
+    ///             genericregistry.ShouldDeleteDuringUpdate(ctx, key, obj, existing)
+    ///     }
+    ///
+    /// (same file, :257-265)
+    #[tokio::test]
+    async fn terminating_namespace_with_spec_finalizers_is_not_swept() {
+        let storage = Arc::new(MemoryStorage::new());
+        let gc = GarbageCollector::new(storage.clone());
+
+        let key = "/registry/namespaces/ns-1846";
+        let mut meta = ObjectMeta::new("ns-1846");
+        meta.uid = "ns-1846-uid".to_string();
+        meta.deletion_timestamp = Some(chrono::Utc::now());
+        // Empty, exactly as a real namespace has it: the finalizer lives in
+        // spec, not metadata.
+        meta.finalizers = None;
+
+        let namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": serde_json::to_value(&meta).unwrap(),
+            "spec": {"finalizers": ["kubernetes"]},
+            "status": {"phase": "Terminating"},
+        });
+        storage.create(key, &namespace).await.unwrap();
+
+        gc.scan_and_collect().await.unwrap();
+
+        assert!(
+            storage.get::<Value>(key).await.is_ok(),
+            "namespace must survive the sweep while spec.finalizers is non-empty"
+        );
+
+        // Once the namespace controller has cleared spec.finalizers the
+        // backstop must still finish the job, or clearing them would leak the
+        // object. This half guards against "fixing" the bug by disabling the
+        // sweep for namespaces outright.
+        let mut finalized: Value = storage.get(key).await.unwrap();
+        finalized["spec"]["finalizers"] = serde_json::json!([]);
+        storage.update(key, &finalized).await.unwrap();
+
+        gc.scan_and_collect().await.unwrap();
+
+        assert!(
+            storage.get::<Value>(key).await.is_err(),
+            "namespace must be removed once spec.finalizers is empty"
         );
     }
 }
