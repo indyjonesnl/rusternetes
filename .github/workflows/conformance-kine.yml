@@ -9,7 +9,7 @@
 # GENERATED marker, so this file is safe from the generator.
 name: conformance-kine
 
-# Runs the sig-api-machinery [Conformance] slice against compose.kine.yml —
+# Runs storage-relevant [Conformance] slices against compose.kine.yml —
 # the same topology as the default rhino/SQLite stack with kine (the etcd v3
 # API shim k3s and k0s ship) in rhino's place.
 #
@@ -30,7 +30,11 @@ on:
   workflow_dispatch:
     inputs:
       focus:
-        description: "Ginkgo --focus override (narrow to one test to prove a PR). Empty = full sig-api-machinery run."
+        description: "Ginkgo --focus override (narrow to one test to prove a PR). Empty = the full target."
+        required: false
+        default: ''
+      target:
+        description: "Run a single target instead of the whole matrix (e.g. sig-storage)."
         required: false
         default: ''
 
@@ -40,12 +44,39 @@ concurrency:
 
 jobs:
   run:
+    # Measured against rhino on the same commit (aa6b25ac, 2026-09-02), so a
+    # reviewer can tell a real change from the known gap:
+    #
+    #   target             kine    rhino
+    #   sig-api-machinery  91/94   95/95
+    #   sig-apps           59/60   60/60
+    #   sig-storage        91/91   91/91
+    #
+    # Every kine-only failure is a [Serial] deletion/GC spec. The failure CLASS
+    # is ours, not kine's: our GC is a polling scan whose interval backs off
+    # 5->60s and which requires an orphan in two consecutive scans, so orphan
+    # collection can take ~65s against conformance budgets of 30-90s. rhino
+    # hits the same weakness in sig-network.
+    #
+    # Why kine crosses those budgets where rhino does not is NOT established.
+    # The obvious theory - kine churning watches and starving the control loop
+    # - was measured and refuted: on an idle cluster kine re-establishes 472
+    # watches per 300s and rhino 473, i.e. identical, and that rate is the
+    # api-server's own behaviour on both backends. Do not repeat the theory
+    # without new evidence.
+    #
+    # The engine is NON-GATING, so these show as reported numbers rather than a
+    # red job. Treat a DROP from the table above as the signal.
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ github.event.inputs.target != '' && fromJSON(format('["{0}"]', github.event.inputs.target)) || fromJSON('["sig-api-machinery","sig-apps","sig-storage"]') }}
     permissions:
       contents: write
     secrets: inherit
     uses: ./.github/workflows/conformance-target.yml
     with:
-      target: sig-api-machinery
+      target: ${{ matrix.target }}
       compose-file: compose.kine.yml
       focus: ${{ github.event.inputs.focus || '' }}
       # Always build this ref from source. The published GHCR tags track main,
