@@ -1,0 +1,92 @@
+# Hand-written caller — deliberately NOT generated from ci/conformance/targets.json.
+#
+# kine is not a new test target: it is a different storage substrate under an
+# existing one. The registry describes WHAT to run (a focus/skip pair); this
+# workflow varies WHERE it runs by handing the engine a different compose
+# stack. Adding a registry entry would imply a new slice of the conformance
+# suite and would earn a badge of its own, neither of which is true here.
+# scripts/tests/test-target-workflows-sync.sh skips files without the
+# GENERATED marker, so this file is safe from the generator.
+name: conformance-kine
+
+# Runs storage-relevant [Conformance] slices against compose.kine.yml —
+# the same topology as the default rhino/SQLite stack with kine (the etcd v3
+# API shim k3s and k0s ship) in rhino's place.
+#
+# Why this is worth a nightly: kine implements only the RPC subset upstream
+# Kubernetes' etcd3 store emits and rejects everything else with
+# Unimplemented/InvalidArgument. That makes it an executable check that
+# crates/storage/src/etcd.rs has not drifted back outside that subset — the
+# cluster simply will not come up if it has. sig-api-machinery is the slice
+# that leans hardest on the storage layer (watch, resourceVersion, paging,
+# garbage collection), so it is the one worth spending the run on.
+#
+# crates/storage/tests/etcd_rpc_subset.rs pins the same constraint at the unit
+# level and runs on every PR; this leg catches whole-cluster interactions the
+# unit test cannot see.
+on:
+  schedule:
+    - cron: '36 3 * * *'
+  workflow_dispatch:
+    inputs:
+      focus:
+        description: "Ginkgo --focus override (narrow to one test to prove a PR). Empty = the full target."
+        required: false
+        default: ''
+      target:
+        description: "Run a single target instead of the whole matrix (e.g. sig-storage)."
+        required: false
+        default: ''
+
+concurrency:
+  group: conformance-kine
+  cancel-in-progress: true
+
+jobs:
+  run:
+    # Measured against rhino on the same commit (aa6b25ac, 2026-09-02), so a
+    # reviewer can tell a real change from the known gap:
+    #
+    #   target             kine    rhino
+    #   sig-api-machinery  91/94   95/95
+    #   sig-apps           59/60   60/60
+    #   sig-storage        91/91   91/91
+    #
+    # Every kine-only failure is a [Serial] deletion/GC spec. The failure CLASS
+    # is ours, not kine's: our GC is a polling scan whose interval backs off
+    # 5->60s and which requires an orphan in two consecutive scans, so orphan
+    # collection can take ~65s against conformance budgets of 30-90s. rhino
+    # hits the same weakness in sig-network.
+    #
+    # Why kine crosses those budgets where rhino does not is NOT established.
+    # The obvious theory - kine churning watches and starving the control loop
+    # - was measured and refuted: on an idle cluster kine re-establishes 472
+    # watches per 300s and rhino 473, i.e. identical, and that rate is the
+    # api-server's own behaviour on both backends. Do not repeat the theory
+    # without new evidence.
+    #
+    # The engine is NON-GATING, so these show as reported numbers rather than a
+    # red job. Treat a DROP from the table above as the signal.
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ github.event.inputs.target != '' && fromJSON(format('["{0}"]', github.event.inputs.target)) || fromJSON('["sig-api-machinery","sig-apps","sig-storage"]') }}
+    permissions:
+      contents: write
+    secrets: inherit
+    uses: ./.github/workflows/conformance-target.yml
+    with:
+      target: ${{ matrix.target }}
+      compose-file: compose.kine.yml
+      focus: ${{ github.event.inputs.focus || '' }}
+      # Always build this ref from source. The published GHCR tags track main,
+      # so a prebuilt image would test main's storage code rather than the code
+      # under review — and on a leg whose entire purpose is to detect storage
+      # drift, that is the one thing it must not do. ('local' is the sentinel
+      # the engine maps to the empty tag the bring-up action wants; see #1760
+      # for why it is not mapped with a `${{ }}` expression.)
+      image-tag: local
+      # The badge belongs to the target, and this is not the target's pass rate
+      # on its default stack — same rule that keeps focused runs off the badge
+      # (FR-011).
+      publish-badge: false

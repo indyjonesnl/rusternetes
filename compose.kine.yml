@@ -1,0 +1,462 @@
+# Docker/Podman Compose — SQLite mode via Kine (no etcd, no rhino).
+#
+# Kine (https://github.com/k3s-io/kine) is the etcd v3 API shim k3s and k0s
+# ship, backed by SQLite/Postgres/MySQL/NATS. It fills exactly the role rhino
+# fills in compose.sqlite.yml: an external server speaking the etcd v3 gRPC
+# API on :2379. Components are unchanged — they use their existing
+# --etcd-servers flag, pointed at kine instead of rhino. No component is
+# compiled with a kine-specific feature; there is no such feature.
+#
+# This stack is also a compatibility check with teeth. Kine implements only
+# the RPC subset upstream Kubernetes' etcd3 store emits and rejects everything
+# else with Unimplemented/InvalidArgument, so a cluster that comes up and
+# passes conformance here proves crates/storage/src/etcd.rs stayed inside that
+# subset. The same constraint is unit-tested in
+# crates/storage/tests/etcd_rpc_subset.rs.
+#
+# Usage:
+#   export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
+#   mkdir -p .rusternetes/manifests .rusternetes/certs "$KUBELET_VOLUMES_PATH"
+#   docker compose -f compose.kine.yml up -d
+#   bash scripts/bootstrap-cluster.sh
+
+# Per-build sccache toggle for the services.Dockerfile cargo-builder stage.
+# CI (GITHUB_ACTIONS=true) -> USE_SCCACHE=1 -> sccache (prior behavior, no
+# regression). Local dev (GITHUB_ACTIONS unset) -> USE_SCCACHE="" -> cargo
+# incremental, ~10x faster leaf-crate rebuilds (4s vs 39s, measured). The
+# /sccache mount is single-machine and never reaches MinIO from this docker
+# path, so it only costs the CARGO_INCREMENTAL=0 tax locally. Force either
+# way with `USE_SCCACHE=1 docker compose ... build`.
+x-sccache-args: &sccache-args
+  USE_SCCACHE: "${USE_SCCACHE-${GITHUB_ACTIONS:+1}}"
+  # Git commit the binaries are built from, logged at startup so you can tell
+  # which build a running cluster is on. Empty -> build.rs falls back to
+  # "unknown" (.git is dockerignored). The bring-up exports it from git.
+  RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
+
+services:
+  # Kine - etcd v3 API shim backed by SQLite. Pinned: kine is the oracle for
+  # the upstream RPC subset, so an unpinned bump could change what the stack
+  # accepts without anyone noticing.
+  kine:
+    image: rancher/kine:v0.13.11
+    container_name: rusternetes-kine
+    restart: unless-stopped
+    ports:
+      - "2379:2379"
+    volumes:
+      # The image declares VOLUME /db and ships it owned by `nobody`, which is
+      # the uid kine runs as. Mounting the named volume there inherits that
+      # ownership; mounting anywhere else yields a root-owned dir that kine
+      # cannot create its database in ("unable to open database file").
+      - kine-data:/db
+    networks:
+      - rusternetes-net
+    command:
+      - "--endpoint"
+      - "sqlite:///db/state.db"
+      - "--listen-address"
+      - "0.0.0.0:2379"
+    healthcheck:
+      # A real probe, not the `true` the rhino service uses: api-server gates
+      # its start on `condition: service_healthy`, so a no-op check lets it
+      # come up against a backend that never opened its database and fail every
+      # request with "Unavailable: tcp connect error".
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 2379"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  # API Server
+  api-server:
+    build:
+      context: .
+      dockerfile: services.Dockerfile
+      additional_contexts:
+        # Required even though this stack never runs rhino:
+        # services.Dockerfile COPYs this context unconditionally so cargo can
+        # resolve the `rhino = { path = "../../rhino" }` dep in
+        # crates/storage/Cargo.toml. Removing it breaks the build.
+        rhino: ./rhino
+      args: *sccache-args
+      target: api-server
+    container_name: rusternetes-api-server
+    restart: unless-stopped
+    ports:
+      - "6443:6443"
+    # NET_ADMIN lets the entrypoint install a route to the pod CIDR
+    # (10.244.0.0/16) via the containerd container, so the pod/service proxy
+    # subresources can reach pod IPs that live in containerd's CNI netns. The
+    # DNS conformance tests read results through GET pods/<p>/proxy/...; without
+    # the route those fail with "error trying to reach backend".
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      kine:
+        condition: service_healthy
+    networks:
+      rusternetes-net:
+        aliases:
+          - api-server
+    volumes:
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      # CRI socket from the containerd service: the api-server reads container
+      # stats (metrics) and runs exec/logs over CRI, not the Docker socket.
+      - containerd-run:/run/containerd
+      # Pod container logs. containerd (the CRI runtime) writes each container's
+      # stdout/stderr under ${KUBELET_VOLUMES_PATH}/pod-logs/<ns>_<pod>_<uid>/...
+      # (the kubelet's log_root). GET pods/<p>/log?follow=true is served by the
+      # api-server reading those files off the filesystem (see
+      # api-server/handlers/pod_subresources.rs::stream_container_logs), so it
+      # must see the same host dir at the SAME absolute path the CRI
+      # ContainerStatus.log_path reports. Without this the read fails and the
+      # follow stream RST_STREAMs (INTERNAL_ERROR), which is fatal to hydrophone
+      # — every conformance pod's log fetch died there. Read-only is enough.
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:ro
+    environment:
+      - RUST_LOG=info
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
+    command:
+      - "--bind-address"
+      - "0.0.0.0:6443"
+      - "--etcd-servers"
+      - "http://kine:2379"
+      - "--tls"
+      - "--tls-cert-file"
+      - "/etc/kubernetes/pki/api-server.crt"
+      - "--tls-key-file"
+      - "/etc/kubernetes/pki/api-server.key"
+      - "--skip-auth"
+      - "--console-dir"
+      - "/app/console"
+      - "--log-level"
+      - "info"
+
+  # Scheduler — build-only. The scheduler no longer runs as its own compose
+  # service; it runs as a static pod on node-1 (manifests/control-plane/
+  # kube-scheduler.yaml), launched by the node-1 kubelet. This service exists
+  # purely so `compose --profile build build` produces the
+  # rusternetes-scheduler:latest image the static pod references. No runtime
+  # config — it never starts under `up` (gated behind the `build` profile).
+  scheduler:
+    profiles: ["build"]
+    build:
+      context: .
+      dockerfile: services.Dockerfile
+      additional_contexts:
+        # Required even though this stack never runs rhino:
+        # services.Dockerfile COPYs this context unconditionally so cargo can
+        # resolve the `rhino = { path = "../../rhino" }` dep in
+        # crates/storage/Cargo.toml. Removing it breaks the build.
+        rhino: ./rhino
+      args: *sccache-args
+      target: scheduler
+    image: rusternetes-scheduler:latest
+
+  # Controller Manager — build-only. Like the scheduler, it now runs in-cluster
+  # as a static pod on node-1 (manifests/control-plane/kube-controller-manager.yaml,
+  # API mode against the api-server via ApiStorage). This service exists only to
+  # build the rusternetes-controller-manager:latest image the static pod
+  # references; it never starts under `up` (gated behind the `build` profile).
+  controller-manager:
+    profiles: ["build"]
+    build:
+      context: .
+      dockerfile: services.Dockerfile
+      additional_contexts:
+        # Required even though this stack never runs rhino:
+        # services.Dockerfile COPYs this context unconditionally so cargo can
+        # resolve the `rhino = { path = "../../rhino" }` dep in
+        # crates/storage/Cargo.toml. Removing it breaks the build.
+        rhino: ./rhino
+      args: *sccache-args
+      target: controller-manager
+    image: rusternetes-controller-manager:latest
+
+  # Shared CRI runtime: containerd (CRI plugin) + Youki. The kubelets talk to
+  # this over CRI v1 instead of a Docker/Podman socket; pods run as containers
+  # inside this service. The CRI socket is shared with the kubelets via the
+  # `containerd-run` volume, and KUBELET_VOLUMES_PATH is bind-mounted at the same
+  # host path so the pod volumes the kubelet provisions resolve here too.
+  containerd:
+    image: rusternetes-containerd:latest
+    build:
+      context: .
+      dockerfile: containerd.Dockerfile
+    container_name: rusternetes-containerd
+    restart: unless-stopped
+    privileged: true
+    networks:
+      - rusternetes-net
+    environment:
+      # CNI config comes from kube-proxy's node-network agent (per-node podCIDR).
+      - CNI_CONF_FROM_NODE_IPAM=1
+    volumes:
+      - containerd-run:/run/containerd
+      # The node-network agent runs in kube-proxy, which shares this runtime's
+      # NETWORK namespace but not its MOUNT namespace — so the conflist it writes
+      # must land on a volume both containers see, or containerd never sees a CNI
+      # config at all and every pod stays in ContainerCreating.
+      - cni-conf:/etc/cni/net.d
+      # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
+      # filesystem, not the container's own overlay rootfs — nested overlay
+      # mounts fail with "invalid argument". A named volume is host-fs-backed.
+      - containerd-data:/var/lib/containerd
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
+      - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
+
+  # node-2's CRI runtime. Each node owns a containerd (and thus a network
+  # namespace, a cni0 bridge and an iptables table) so the two nodes are
+  # really separate nodes (#1691). Pod CIDRs come from node-ipam, and
+  # kube-proxy's node-network agent writes each node's CNI conflist +
+  # host-gw routes to the other node's pod CIDR.
+  containerd2:
+    image: rusternetes-containerd:latest
+    build:
+      context: .
+      dockerfile: containerd.Dockerfile
+    container_name: rusternetes-containerd2
+    restart: unless-stopped
+    privileged: true
+    networks:
+      - rusternetes-net
+    environment:
+      - CNI_CONF_FROM_NODE_IPAM=1
+    volumes:
+      - containerd-run2:/run/containerd
+      # Shared with kube-proxy2 — see the note on node-1's runtime.
+      - cni-conf2:/etc/cni/net.d
+      # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
+      # filesystem, not the container's own overlay rootfs — nested overlay
+      # mounts fail with "invalid argument". A named volume is host-fs-backed.
+      - containerd-data2:/var/lib/containerd
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
+      - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
+
+  # Kubelet
+  kubelet:
+    build:
+      context: .
+      dockerfile: services.Dockerfile
+      additional_contexts:
+        # Required even though this stack never runs rhino:
+        # services.Dockerfile COPYs this context unconditionally so cargo can
+        # resolve the `rhino = { path = "../../rhino" }` dep in
+        # crates/storage/Cargo.toml. Removing it breaks the build.
+        rhino: ./rhino
+      args: *sccache-args
+      target: kubelet
+    container_name: rusternetes-kubelet
+    restart: unless-stopped
+    privileged: true
+    depends_on:
+      - kine
+      - api-server
+      - containerd
+    # One netns per node (#1691): the kubelet shares its runtime's network
+    # namespace, so the InternalIP it advertises is the address pods actually
+    # see. With separate netns the node IP existed nowhere pods could bind it,
+    # and `curl --interface <nodeIP>` from a hostNetwork pod failed with
+    # "Address not available" ([sig-network] HostPort). Upstream co-locates
+    # kubelet, runtime and kube-proxy on the node for the same reason.
+    network_mode: "service:containerd"
+    volumes:
+      - containerd-run:/run/containerd
+      # rshared so tmpfs mounts the kubelet makes for Memory-medium emptyDir
+      # volumes propagate back to the host mount namespace, where the Docker
+      # daemon resolves the app-container bind mounts. Without shared
+      # propagation the tmpfs is invisible to app containers and is destroyed
+      # on container restart (breaks emptyDir data persistence — #445).
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
+      - ./.rusternetes/certs:/root/.rusternetes/certs:ro
+      # Static control-plane pod manifests (kube-scheduler). node-1 is the
+      # control-plane node; --pod-manifest-path below loads them. This mounts
+      # the TEMPLATED copy under .rusternetes/manifests/ (bootstrap-cluster.sh
+      # seds the committed manifests/control-plane/*.yaml @CERTS_PATH@ -> the
+      # host-absolute certs path here), NOT the committed source which still
+      # carries the placeholder.
+      - ./.rusternetes/manifests:/etc/rusternetes/manifests:ro
+      # The kube-scheduler static pod hostPath-mounts the certs dir. Docker
+      # resolves a pod hostPath on the HOST, and the kubelet also stat()s it
+      # inside its own container — so the certs dir must be mounted at the SAME
+      # absolute path on both sides. CERTS_PATH is the host-absolute path of
+      # .rusternetes/certs (bootstrap-cluster.sh writes it to .env; export it
+      # alongside KUBELET_VOLUMES_PATH for a manual `up`).
+      - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_MIN_STACK=8388608
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+      # The runtime's CRI streaming server (exec/attach) is reachable on
+      # loopback now that the kubelet shares its netns. The default DNS name
+      # `containerd` would send node-2's exec tokens to node-1's runtime, which
+      # answers "404 page not found" (crates/cri/src/stream.rs stream_target).
+      - CONTAINERD_STREAM_HOST=localhost
+    command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests"]
+
+  # Kubelet 2
+  kubelet2:
+    build:
+      context: .
+      dockerfile: services.Dockerfile
+      additional_contexts:
+        # Required even though this stack never runs rhino:
+        # services.Dockerfile COPYs this context unconditionally so cargo can
+        # resolve the `rhino = { path = "../../rhino" }` dep in
+        # crates/storage/Cargo.toml. Removing it breaks the build.
+        rhino: ./rhino
+      args: *sccache-args
+      target: kubelet
+    container_name: rusternetes-kubelet2
+    restart: unless-stopped
+    privileged: true
+    depends_on:
+      - kine
+      - api-server
+      - containerd2
+    # node-2's own netns, owned by its own containerd (#1691).
+    network_mode: "service:containerd2"
+    volumes:
+      - containerd-run2:/run/containerd
+      # rshared so tmpfs mounts the kubelet makes for Memory-medium emptyDir
+      # volumes propagate back to the host mount namespace, where the Docker
+      # daemon resolves the app-container bind mounts. Without shared
+      # propagation the tmpfs is invisible to app containers and is destroyed
+      # on container restart (breaks emptyDir data persistence — #445).
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
+      - ./.rusternetes/certs:/root/.rusternetes/certs:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_MIN_STACK=8388608
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+      # Loopback — see the note on node-1's kubelet.
+      - CONTAINERD_STREAM_HOST=localhost
+    command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
+
+  # Kube-proxy runs INSIDE the containerd service's network namespace
+  # (network_mode: service:containerd) so its iptables Service rules live where
+  # the pods are: pod IPs come from CNI (cni0, 10.244.0.0/16) inside containerd,
+  # which the host netns cannot reach. Sharing containerd's netns lets ClusterIP
+  # DNAT resolve to real pod IPs. It reaches the api-server over the compose
+  # network (containerd is attached to rusternetes-net) at api-server:6443.
+  kube-proxy:
+    build:
+      context: .
+      dockerfile: services.Dockerfile
+      additional_contexts:
+        # Required even though this stack never runs rhino:
+        # services.Dockerfile COPYs this context unconditionally so cargo can
+        # resolve the `rhino = { path = "../../rhino" }` dep in
+        # crates/storage/Cargo.toml. Removing it breaks the build.
+        rhino: ./rhino
+      args: *sccache-args
+      target: kube-proxy
+    container_name: rusternetes-kube-proxy
+    restart: unless-stopped
+    privileged: true
+    network_mode: "service:containerd"
+    user: "0:0"
+    depends_on:
+      - containerd
+      - api-server
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+    volumes:
+      # Kernel module tree so kube-proxy can `modprobe br_netfilter` + enable the
+      # bridge-nf-call-iptables sysctl (see crates/kube-proxy/src/iptables.rs).
+      - /lib/modules:/lib/modules:ro
+      # kube-proxy.conf (CA-only kubeconfig) for API mode — see generate-certs.sh.
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      # Same volume as this node's containerd: the node-network agent writes the
+      # per-node conflist here for the runtime to pick up.
+      - cni-conf:/etc/cni/net.d
+    environment:
+      - RUST_LOG=info
+    command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf", "--configure-node-network", "--pod-cidr", "10.244.0.0/16"]
+
+  # node-2's kube-proxy + node-network agent, in node-2's netns (#1691).
+  kube-proxy2:
+    build:
+      context: .
+      dockerfile: services.Dockerfile
+      additional_contexts:
+        # Required even though this stack never runs rhino:
+        # services.Dockerfile COPYs this context unconditionally so cargo can
+        # resolve the `rhino = { path = "../../rhino" }` dep in
+        # crates/storage/Cargo.toml. Removing it breaks the build.
+        rhino: ./rhino
+      args: *sccache-args
+      target: kube-proxy
+    container_name: rusternetes-kube-proxy2
+    restart: unless-stopped
+    privileged: true
+    network_mode: "service:containerd2"
+    user: "0:0"
+    depends_on:
+      - containerd2
+      - api-server
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+    volumes:
+      # Kernel module tree so kube-proxy can `modprobe br_netfilter` + enable the
+      # bridge-nf-call-iptables sysctl (see crates/kube-proxy/src/iptables.rs).
+      - /lib/modules:/lib/modules:ro
+      # kube-proxy.conf (CA-only kubeconfig) for API mode — see generate-certs.sh.
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      - cni-conf2:/etc/cni/net.d
+    environment:
+      - RUST_LOG=info
+    command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf", "--configure-node-network", "--pod-cidr", "10.244.0.0/16"]
+
+  # DNS image, build-only. The dns binary runs as a kube-system Deployment
+  # (bootstrap-dns.yaml, applied by bootstrap-cluster.sh) reading cluster
+  # state from the api-server — not as a compose container.
+  # Build with: docker compose --profile build build dns
+  dns:
+    profiles: ["build"]
+    image: rusternetes-dns:latest
+    build:
+      context: .
+      dockerfile: services.Dockerfile
+      target: dns
+      additional_contexts:
+        # Required even though this stack never runs rhino:
+        # services.Dockerfile COPYs this context unconditionally so cargo can
+        # resolve the `rhino = { path = "../../rhino" }` dep in
+        # crates/storage/Cargo.toml. Removing it breaks the build.
+        rhino: ./rhino
+      args: *sccache-args
+
+networks:
+  rusternetes-net:
+    driver: bridge
+    name: rusternetes-network
+
+volumes:
+  kine-data:
+    name: rusternetes-kine-data
+  # CRI socket shared from the containerd service to the kubelets.
+  containerd-run:
+    name: rusternetes-containerd-run
+  # containerd's snapshotter root on a real (host-fs-backed) volume so the
+  # overlayfs snapshotter works inside the Docker-hosted containerd.
+  containerd-data:
+    name: rusternetes-containerd-data
+  # node-2's runtime keeps its own CRI socket and snapshotter root.
+  containerd-run2:
+    name: rusternetes-containerd-run2
+  containerd-data2:
+    name: rusternetes-containerd-data2
+  # Per-node CNI conf dir, shared between a node's runtime and its kube-proxy
+  # (which writes the conflist from the node's podCIDR).
+  cni-conf:
+    name: rusternetes-cni-conf
+  cni-conf2:
+    name: rusternetes-cni-conf2

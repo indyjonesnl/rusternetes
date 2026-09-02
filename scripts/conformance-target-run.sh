@@ -38,6 +38,10 @@ export RUSTERNETES_DUMP_PAYLOADS=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 MANIFEST="${TARGETS_MANIFEST:-$REPO_ROOT/ci/conformance/targets.json}"
+# Compose stack the caller brought up. The nine sig legs use the default
+# rhino/SQLite stack; the kine leg passes compose.kine.yml. Only affects which
+# file `compose logs` reads component logs from.
+COMPOSE_STACK="${COMPOSE_STACK:-compose.sqlite.yml}"
 
 # Ginkgo's suite-level nodes, which it reports as <testcase> entries next to the
 # real specs: `[ReportBeforeSuite]`, `[SynchronizedBeforeSuite]`, … Counting them
@@ -165,7 +169,7 @@ capture_component_logs() {
     local svc
     for svc in api-server rhino kubelet kubelet2 kube-proxy; do
         local dest="$out/component-$svc.log"
-        if "$runtime" compose -f compose.sqlite.yml logs --no-color --tail="$tail" "$svc" \
+        if "$runtime" compose -f "$COMPOSE_STACK" logs --no-color --tail="$tail" "$svc" \
              >"$dest" 2>/dev/null && [ -s "$dest" ]; then
             echo "[conformance-target-run] captured $svc log -> $dest"
         elif "$runtime" logs --tail="$tail" "rusternetes-$svc" \
