@@ -15,6 +15,17 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
+/// Prefix covering every stored object; the GC watches all of it because any
+/// resource type can own a dependent, mirroring upstream GC monitoring every
+/// deletable resource (`pkg/controller/garbagecollector/garbagecollector.go`
+/// `resyncMonitors` over `GetDeletableResources`).
+const REGISTRY_PREFIX: &str = "/registry/";
+
+/// How long a watch-kicked scan waits before running, so a cascade that
+/// deletes many objects costs one scan rather than one per object. Also the
+/// floor on how fast a broken watch can drive rescans.
+const KICK_DEBOUNCE: Duration = Duration::from_millis(250);
+
 /// Garbage collector controller
 #[allow(dead_code)]
 pub struct GarbageCollector<S: Storage> {
@@ -78,6 +89,24 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         }
     }
 
+    /// Create a garbage collector with explicit scan cadence bounds.
+    ///
+    /// `scan_interval` is the base cadence used after a scan that did work;
+    /// `max_scan_interval` is the ceiling the idle backoff walks up to. See
+    /// [`next_scan_interval`].
+    #[allow(dead_code)]
+    pub fn with_scan_intervals(
+        storage: Arc<S>,
+        scan_interval: Duration,
+        max_scan_interval: Duration,
+    ) -> Self {
+        Self {
+            scan_interval,
+            max_scan_interval,
+            ..Self::new(storage)
+        }
+    }
+
     /// Start the garbage collector.
     ///
     /// The scan cadence adapts to activity: a scan that did work runs again at
@@ -92,6 +121,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         let base = self.scan_interval;
         let max = self.max_scan_interval;
         let mut interval = base;
+        let mut watch: Option<rusternetes_storage::WatchStream> = None;
         loop {
             match self.scan_and_collect_inner().await {
                 Ok(did_work) => interval = next_scan_interval(interval, did_work, base, max),
@@ -101,8 +131,66 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                     interval = base;
                 }
             }
-            sleep(interval).await;
+            if watch.is_none() {
+                match self.storage.watch(REGISTRY_PREFIX).await {
+                    Ok(w) => watch = Some(w),
+                    Err(e) => warn!(
+                        "GC registry watch unavailable ({}); polling only this cycle",
+                        e
+                    ),
+                }
+            }
+            self.wait_for_next_scan(interval, &mut watch).await;
         }
+    }
+
+    /// Wait out `interval`, but return early when a deletion event says there
+    /// is work now.
+    ///
+    /// This is the piece the idle backoff cannot supply on its own: with the
+    /// cadence stretched to `max_scan_interval`, an owner deleted right after
+    /// an idle scan is not *noticed* for up to that long, which loses the 30s
+    /// `wait.ForeverTestTimeout` budget deletion specs run on (#1839) and the
+    /// 90s `[sig-api-machinery] Namespaces [Serial]` budget. Upstream has no
+    /// such window because the delete event itself enqueues the dependents
+    /// (pkg/controller/garbagecollector/graph_builder.go `processGraphChanges`
+    /// -> `attemptToDelete`); a registry-wide watch is the closest thing we
+    /// have to that until the graph builder lands (#1039).
+    async fn wait_for_next_scan(
+        &self,
+        interval: Duration,
+        watch: &mut Option<rusternetes_storage::WatchStream>,
+    ) {
+        use futures::StreamExt;
+        let deadline = tokio::time::Instant::now() + interval;
+        while let Some(stream) = watch.as_mut() {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return,
+                event = stream.next() => match event {
+                    Some(Ok(ev)) if event_warrants_scan(&ev) => {
+                        debug!("GC scan kicked by a deletion event ahead of its poll");
+                        // Collapse a burst (a cascade deletes many objects at
+                        // once) into one scan instead of one scan per object.
+                        sleep(KICK_DEBOUNCE).await;
+                        return;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        // Lagged or broken: events were missed, so the safe
+                        // move is to relist now and reconnect next cycle.
+                        warn!("GC registry watch error ({}); rescanning and reconnecting", e);
+                        *watch = None;
+                        sleep(KICK_DEBOUNCE).await;
+                        return;
+                    }
+                    None => {
+                        warn!("GC registry watch ended; reconnecting on the next cycle");
+                        *watch = None;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep_until(deadline).await;
     }
 
     /// Scan all resources and collect orphans.
@@ -1349,6 +1437,48 @@ fn kind_to_plural(kind: &str) -> &str {
 /// has no dependency-graph informer to make GC fully event-driven (tracked in
 /// #1039), so a scan-based GC approximates "silent when idle" (#1040) by
 /// stretching the poll interval when there is nothing to collect.
+/// Whether a storage watch event should kick a GC scan ahead of its poll.
+///
+/// Upstream GC reacts to every event because its graph builder holds a cached
+/// dependency graph, so a status write costs a map update
+/// (`pkg/controller/garbagecollector/graph_builder.go` `processGraphChanges`).
+/// Ours has no graph (#1039) — a scan re-LISTs 28 resource types — so only the
+/// events that can actually create GC work are allowed to trigger one:
+///
+/// * a **delete**, which is what orphans a dependent and what
+///   `processGraphChanges` turns into `attemptToDelete` over `n.dependents`;
+/// * a **modify that stamps `deletionTimestamp`**, i.e. the start of a graceful
+///   or foreground deletion, which is the scan's `process_deletion` arm.
+///
+/// Everything else (creates, status writes) waits for the poll, preserving the
+/// idle-quiet property the backoff buys (#1040).
+fn event_warrants_scan(event: &rusternetes_storage::WatchEvent) -> bool {
+    use rusternetes_storage::WatchEvent;
+    match event {
+        WatchEvent::Deleted(..) => true,
+        WatchEvent::Modified(_, value) => value_has_deletion_timestamp(value),
+        WatchEvent::Added(..) => false,
+    }
+}
+
+/// Whether a serialised object carries a `metadata.deletionTimestamp`.
+///
+/// The substring test is a cheap gate so the common case (a status write) never
+/// pays for a parse; the parse is what actually decides, so a payload that only
+/// happens to contain the word does not kick a scan.
+fn value_has_deletion_timestamp(value: &str) -> bool {
+    if !value.contains("deletionTimestamp") {
+        return false;
+    }
+    serde_json::from_str::<Value>(value)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/metadata/deletionTimestamp")
+                .map(|t| !t.is_null())
+        })
+        .unwrap_or(false)
+}
+
 fn next_scan_interval(
     current: Duration,
     did_work: bool,
@@ -2239,6 +2369,156 @@ mod tests {
             passes <= 4,
             "foreground cascade of {PODS} dependents took {passes} full-cluster \
              list passes; it must not scale with the number of dependents"
+        );
+    }
+
+    /// Only deletion signals may kick a scan.
+    ///
+    /// Upstream's graph builder reacts to every event, but it keeps a cached
+    /// graph so a status write is cheap
+    /// (`pkg/controller/garbagecollector/graph_builder.go`
+    /// `processGraphChanges`). Our scan re-LISTs 28 resource types, so kicking
+    /// on an Added or a plain Modified would turn every pod status write into
+    /// a full-cluster pass and undo the idle-quiet property (#1040).
+    ///
+    /// A delete orphans dependents; a Modified that stamps `deletionTimestamp`
+    /// starts a graceful/foreground deletion the scan's `process_deletion` arm
+    /// owns. Everything else waits for the poll.
+    #[test]
+    fn watch_event_warrants_scan_only_for_deletion_signals() {
+        use rusternetes_storage::WatchEvent;
+
+        let live = r#"{"metadata":{"name":"p","uid":"u"}}"#.to_string();
+        let terminating =
+            r#"{"metadata":{"name":"p","uid":"u","deletionTimestamp":"2026-09-02T23:23:14Z"}}"#
+                .to_string();
+
+        assert!(event_warrants_scan(&WatchEvent::Deleted(
+            "/registry/services/default/svc".to_string(),
+            live.clone()
+        )));
+        assert!(event_warrants_scan(&WatchEvent::Modified(
+            "/registry/namespaces/ns-1842".to_string(),
+            terminating.clone()
+        )));
+
+        assert!(!event_warrants_scan(&WatchEvent::Added(
+            "/registry/pods/default/p".to_string(),
+            live.clone()
+        )));
+        assert!(!event_warrants_scan(&WatchEvent::Modified(
+            "/registry/pods/default/p".to_string(),
+            live
+        )));
+        // An Added of an already-terminating object is still not a new signal:
+        // the object was created being-deleted only in a relist, and the poll
+        // arm picks it up.
+        assert!(!event_warrants_scan(&WatchEvent::Added(
+            "/registry/pods/default/p".to_string(),
+            terminating
+        )));
+        // Unparseable payloads must not kick — a malformed value is not a
+        // deletion signal.
+        assert!(!event_warrants_scan(&WatchEvent::Modified(
+            "/registry/pods/default/p".to_string(),
+            "not json, has deletionTimestamp in it though".to_string()
+        )));
+    }
+
+    /// The deletion-latency regression.
+    ///
+    /// The scan interval backs off while idle (5 -> 10 -> 20 -> 40 -> 60s), so
+    /// an owner deleted just after an idle scan is not even *noticed* for up to
+    /// `max_scan_interval`. Measured 2026-09-02 on the kine leg: the
+    /// `[sig-api-machinery] Namespaces [Serial]` spec gave up at 23:23:14 and
+    /// the GC's first delete attempt landed at 23:23:42 — 28s late. Budgets
+    /// that lose: 30s (`wait.ForeverTestTimeout`, issue #1839) and 90s
+    /// (the Namespaces [Serial] specs).
+    ///
+    /// Upstream never has this window: it is informer-driven, and a delete
+    /// event enqueues the removed node's dependents directly
+    /// (pkg/controller/garbagecollector/graph_builder.go `processGraphChanges`
+    /// -> `attemptToDelete`). Port the reaction: a registry watch kicks the
+    /// scan instead of waiting out the backoff.
+    #[tokio::test]
+    async fn watch_kick_collects_orphan_without_waiting_out_backoff() {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(MemoryStorage::new());
+        // Base 30s / max 60s: any purely poll-driven GC needs >= 30s to look
+        // again, so collecting inside the 5s assertion below can only happen
+        // because the delete event woke it.
+        let gc = Arc::new(GarbageCollector::with_scan_intervals(
+            storage.clone(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        ));
+
+        let owner_uid = "rc-watch-kick-uid";
+        let rc_key = "/registry/replicationcontrollers/default/simpletest.rc";
+        let mut rc_meta = ObjectMeta::new("simpletest.rc");
+        rc_meta.namespace = Some("default".to_string());
+        rc_meta.uid = owner_uid.to_string();
+        let rc = serde_json::json!({
+            "apiVersion": "v1", "kind": "ReplicationController",
+            "metadata": serde_json::to_value(&rc_meta).unwrap(),
+            "spec": {"replicas": 1},
+        });
+        storage.create(rc_key, &rc).await.unwrap();
+
+        let pod_key = "/registry/pods/default/rc-pod";
+        let mut pod_meta = ObjectMeta::new("rc-pod");
+        pod_meta.namespace = Some("default".to_string());
+        pod_meta.uid = "rc-watch-kick-pod-uid".to_string();
+        pod_meta.owner_references = Some(vec![OwnerReference {
+            api_version: "v1".to_string(),
+            kind: "ReplicationController".to_string(),
+            name: "simpletest.rc".to_string(),
+            uid: owner_uid.to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }]);
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: pod_meta,
+            spec: None,
+            status: None,
+        };
+        storage.create(pod_key, &pod).await.unwrap();
+
+        let runner = Arc::clone(&gc);
+        let handle = tokio::spawn(async move { runner.run().await });
+
+        // Let the opening scan finish and settle into its (backed-off) sleep.
+        // Nothing is collectable yet: the owner still exists.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            storage.get::<Value>(pod_key).await.is_ok(),
+            "pod must survive while its owner lives"
+        );
+
+        storage.delete(rc_key).await.unwrap();
+
+        let collected = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if storage.get::<Value>(pod_key).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        handle.abort();
+
+        assert!(
+            collected.is_ok(),
+            "orphan must be collected off the owner's delete event, not after \
+             the {:?} idle backoff",
+            Duration::from_secs(60)
         );
     }
 }
