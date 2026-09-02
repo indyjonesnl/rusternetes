@@ -2439,6 +2439,171 @@ pub async fn generate_name_middleware(req: Request, next: Next) -> Response {
     next.run(Request::from_parts(parts, new_body)).await
 }
 
+// ============================================================================
+// NamespaceLifecycle admission: no CREATE into a Terminating namespace
+// ============================================================================
+// Ported from upstream's generic admission plugin,
+// `staging/src/k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle/admission.go`.
+//
+// Without this gate, tearing a namespace down is a race between two of our own
+// controllers: the namespace deleter sweeps `pods` first (matching upstream's
+// OrderedNamespaceDeletion, `pkg/controller/namespace/deletion/
+// namespaced_resources_deleter.go:533`) while a ReplicationController that has
+// not been deleted yet recreates them to hold its replica count. Measured on
+// the kine stack: a namespace holding 100 pods took 158s to go away, with the
+// pod count rising mid-drain, against the 11s the same 100 deletes take when
+// issued directly and the 60-90s the `[sig-api-machinery] Namespaces [Serial]`
+// conformance specs allow. See #1846.
+//
+// Two upstream mechanisms are deliberately NOT ported. `forceLiveLookupCache`
+// and `missingNamespaceWait` (`admission.go:128-152`) both exist to paper over
+// a stale informer cache; we read the namespace live from storage on each
+// request, so there is no stale view to correct. Their absence is a
+// consequence of not having an informer, not an oversight.
+//
+// Upstream's companion behaviour — rejecting operations against a namespace
+// that does not exist — is also out of scope here: it is a much broader change
+// than the Terminating gate #1846 needs.
+
+/// The namespace a CREATE should be gated against, or `None` when upstream's
+/// early returns say to allow the request outright.
+///
+/// Mirrors `admission.go:84-108` in order:
+///
+/// * no namespace in the path (cluster-scoped) — allow (`:84-86`);
+/// * the `Namespace` kind itself, including its subresources — allow every
+///   operation, which is what lets the namespace controller keep writing
+///   status and finalizers while terminating (`:88-98`);
+/// * access reviews — allow, so namespace state is not leaked through a
+///   rejection (`:106-108`).
+///
+/// A namespaced *content* path is `.../namespaces/{ns}/{resource}[/...]`, so a
+/// gated request is one with at least one segment after the namespace name.
+fn gated_namespace(path: &str) -> Option<&str> {
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    // Only the two API roots carry namespaced content.
+    match segments.next()? {
+        "api" | "apis" => {}
+        _ => return None,
+    }
+
+    let mut rest: Vec<&str> = segments.collect();
+    // Access reviews are answered for any namespace, terminating or not.
+    if rest.first() == Some(&"authorization.k8s.io") {
+        return None;
+    }
+
+    let idx = rest.iter().position(|s| *s == "namespaces")?;
+
+    // A create is a POST to a *collection*: `.../namespaces/{ns}/{resource}`
+    // and nothing further. Anything shorter targets the namespace object
+    // itself; anything longer names an object, so a POST there is upstream's
+    // `connect` or an update of a subresource (pods/{name}/exec,
+    // /portforward, /status), never a create of namespaced content. Gating
+    // those would break `kubectl exec` into a terminating namespace, which
+    // upstream permits.
+    if rest.len() != idx + 3 {
+        return None;
+    }
+
+    // `namespaces/{name}/status` and `.../finalize` are the Namespace kind's
+    // own subresources and share this shape. Upstream allows every operation
+    // on the Namespace kind (`admission.go:88-98`) — and must, since clearing
+    // `spec.finalizers` through `finalize` is exactly how a terminating
+    // namespace gets removed.
+    if matches!(rest[idx + 2], "status" | "finalize") {
+        return None;
+    }
+
+    Some(rest.swap_remove(idx + 1))
+}
+
+/// Whether a namespace's `status.phase` blocks creates.
+///
+/// Upstream returns nil for every phase that is not `NamespaceTerminating`
+/// (`admission.go:170-172`), so an absent or unrecognised phase must not
+/// block — a namespace whose status has not been written yet is still usable.
+fn phase_blocks_create(phase: Option<&str>) -> bool {
+    phase == Some("Terminating")
+}
+
+/// The `Status` body upstream returns for this rejection.
+///
+/// Clients match on it: `admission.NewForbidden` produces the
+/// `<resource> is forbidden: <err>` message shape, and the plugin appends a
+/// `NamespaceTerminating` cause on `metadata.namespace`
+/// (`admission.go:174-181`). `kubectl` and client-go surface the cause, so the
+/// wording is a contract, not a diagnostic.
+fn namespace_terminating_forbidden(namespace: &str, resource: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "metadata": {},
+        "status": "Failure",
+        "message": format!(
+            "{resource} is forbidden: unable to create new content in namespace \
+             {namespace} because it is being terminated"
+        ),
+        "reason": "Forbidden",
+        "details": {
+            "causes": [{
+                "reason": "NamespaceTerminating",
+                "message": format!("namespace {namespace} is being terminated"),
+                "field": "metadata.namespace",
+            }],
+        },
+        "code": 403,
+    })
+}
+
+/// Reject a CREATE whose target namespace is terminating.
+///
+/// Ported from `NamespaceLifecycle`
+/// (`staging/src/k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle/admission.go`).
+/// Layered so it runs closest to the handler — after authentication and after
+/// `generate_name_middleware` — matching upstream, where admission runs after
+/// authn/authz.
+///
+/// [`gated_namespace`] decides which requests are in scope; a namespace we
+/// cannot read is passed through, since rejecting on a missing namespace is
+/// upstream's separate behaviour and deliberately out of scope (see the module
+/// comment above).
+pub async fn namespace_lifecycle_middleware(
+    Extension(storage): Extension<Arc<StorageBackend>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.method() != axum::http::Method::POST {
+        return next.run(request).await;
+    }
+
+    let path = request.uri().path().to_string();
+    let Some(namespace) = gated_namespace(&path).map(str::to_string) else {
+        return next.run(request).await;
+    };
+    // Upstream's message names the resource being created; for a collection
+    // POST that is the final path segment.
+    let resource = path.rsplit('/').next().unwrap_or("resource").to_string();
+
+    let key = build_key("namespaces", None, &namespace);
+    if let Ok(ns) = storage.get::<serde_json::Value>(&key).await {
+        let phase = ns.pointer("/status/phase").and_then(|p| p.as_str());
+        if phase_blocks_create(phase) {
+            debug!(
+                "NamespaceLifecycle: rejecting create of {} in terminating namespace {}",
+                resource, namespace
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(namespace_terminating_forbidden(&namespace, &resource)),
+            )
+                .into_response();
+        }
+    }
+
+    next.run(request).await
+}
+
 pub async fn capture_payload(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -3043,5 +3208,116 @@ mod tests {
         // Subresource/review bodies with no metadata object — left untouched.
         assert!(synthesize_generate_name(br#"{"spec":{"x":1}}"#).is_none());
         assert!(synthesize_generate_name(b"not json").is_none());
+    }
+
+    // ========================================================================
+    // NamespaceLifecycle admission: no CREATE into a Terminating namespace
+    // ========================================================================
+
+    /// Which requests the gate applies to, ported from upstream's early
+    /// returns in `staging/src/k8s.io/apiserver/pkg/admission/plugin/namespace/
+    /// lifecycle/admission.go:84-108`.
+    #[test]
+    fn namespace_lifecycle_gate_targets_only_namespaced_content_creates() {
+        // Namespaced content under both the core and grouped API roots: gated.
+        assert_eq!(
+            gated_namespace("/api/v1/namespaces/ns-1/configmaps"),
+            Some("ns-1")
+        );
+        assert_eq!(
+            gated_namespace("/api/v1/namespaces/ns-1/pods"),
+            Some("ns-1")
+        );
+        assert_eq!(
+            gated_namespace("/apis/apps/v1/namespaces/ns-1/deployments"),
+            Some("ns-1")
+        );
+
+        // The namespace object itself: upstream allows ALL operations on
+        // namespaces (`admission.go:88-98`), so a POST to the namespace
+        // collection — or to one namespace's subresource — is never gated.
+        assert_eq!(gated_namespace("/api/v1/namespaces"), None);
+        assert_eq!(gated_namespace("/api/v1/namespaces/ns-1"), None);
+        assert_eq!(gated_namespace("/api/v1/namespaces/ns-1/finalize"), None);
+        assert_eq!(gated_namespace("/api/v1/namespaces/ns-1/status"), None);
+
+        // Cluster-scoped: upstream returns early when the request carries no
+        // namespace (`admission.go:84-86`).
+        assert_eq!(gated_namespace("/api/v1/nodes"), None);
+        assert_eq!(
+            gated_namespace("/apis/rbac.authorization.k8s.io/v1/clusterroles"),
+            None
+        );
+
+        // Access reviews are allowed through so namespace state is not leaked
+        // (`admission.go:106-108`), including the namespaced one.
+        assert_eq!(
+            gated_namespace(
+                "/apis/authorization.k8s.io/v1/namespaces/ns-1/localsubjectaccessreviews"
+            ),
+            None
+        );
+
+        // A POST to a named object's subresource is upstream's `connect` or
+        // `update` verb, not `create` — only a POST to the *collection*
+        // creates namespaced content. Gating these would break `kubectl exec`
+        // into a namespace that happens to be terminating.
+        assert_eq!(
+            gated_namespace("/api/v1/namespaces/ns-1/pods/p1/exec"),
+            None
+        );
+        assert_eq!(
+            gated_namespace("/api/v1/namespaces/ns-1/pods/p1/portforward"),
+            None
+        );
+        assert_eq!(
+            gated_namespace("/api/v1/namespaces/ns-1/pods/p1/status"),
+            None
+        );
+
+        // Not an API path at all.
+        assert_eq!(gated_namespace("/healthz"), None);
+        assert_eq!(gated_namespace("/"), None);
+    }
+
+    /// The forbidden body must carry upstream's exact wording and cause, since
+    /// clients match on it — `errors.IsForbidden` plus the
+    /// `NamespaceTerminating` cause (`admission.go:174-181`).
+    #[test]
+    fn namespace_terminating_forbidden_status_matches_upstream() {
+        let body = namespace_terminating_forbidden("ns-1", "configmaps");
+
+        assert_eq!(body["kind"], "Status");
+        assert_eq!(body["status"], "Failure");
+        assert_eq!(body["reason"], "Forbidden");
+        assert_eq!(body["code"], 403);
+        assert_eq!(
+            body["message"].as_str().unwrap(),
+            "configmaps is forbidden: unable to create new content in namespace ns-1 \
+             because it is being terminated"
+        );
+        assert_eq!(
+            body["details"]["causes"][0]["reason"].as_str().unwrap(),
+            "NamespaceTerminating"
+        );
+        assert_eq!(
+            body["details"]["causes"][0]["message"].as_str().unwrap(),
+            "namespace ns-1 is being terminated"
+        );
+        assert_eq!(
+            body["details"]["causes"][0]["field"].as_str().unwrap(),
+            "metadata.namespace"
+        );
+    }
+
+    /// Only a `Terminating` phase blocks. An Active namespace, and a namespace
+    /// with no phase recorded, must both pass — upstream returns nil for any
+    /// phase that is not `NamespaceTerminating` (`admission.go:170-172`).
+    #[test]
+    fn only_terminating_phase_blocks_creates() {
+        assert!(!phase_blocks_create(Some("Active")));
+        assert!(!phase_blocks_create(None));
+        assert!(!phase_blocks_create(Some("")));
+        assert!(phase_blocks_create(Some("Terminating")));
     }
 }

@@ -2496,6 +2496,12 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     if skip_auth {
         // In skip-auth mode, inject a default admin user context
         protected_routes = protected_routes
+            // Added first, so it runs LAST before the handler — after auth,
+            // matching upstream, where admission runs after authn/authz.
+            // Rejects creating content in a Terminating namespace (#1846).
+            .layer(axum_middleware::from_fn(
+                middleware::namespace_lifecycle_middleware,
+            ))
             // Runs after normalize_content_type (added below) so the body is
             // always JSON here: synthesise metadata.name from generateName for
             // every create handler in one place (#1052).
@@ -2506,12 +2512,21 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 middleware::normalize_content_type_middleware,
             ))
             .layer(axum_middleware::from_fn(middleware::skip_auth_middleware))
+            // namespace_lifecycle_middleware reads the namespace; the
+            // normal-auth branch below already layers this for auth.
+            .layer(Extension(state.storage.clone()))
             // The impersonation gate inside skip_auth_middleware authorizes the
             // `impersonate` verb against this authorizer.
             .layer(Extension(state.authorizer.clone()));
     } else {
         // In normal mode, apply full authentication
         protected_routes = protected_routes
+            // Added first, so it runs LAST before the handler — after auth,
+            // matching upstream, where admission runs after authn/authz.
+            // Rejects creating content in a Terminating namespace (#1846).
+            .layer(axum_middleware::from_fn(
+                middleware::namespace_lifecycle_middleware,
+            ))
             // Runs after normalize_content_type (added below) so the body is
             // always JSON here: synthesise metadata.name from generateName for
             // every create handler in one place (#1052).
