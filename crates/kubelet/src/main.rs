@@ -369,14 +369,24 @@ async fn main() -> Result<()> {
         );
         // The CA validates the server's TLS cert; client cert/key (when the
         // kubeconfig provides them) authenticate the kubelet via mTLS (#1578).
-        let client = Arc::new(ApiClient::with_tls(
-            &server,
-            insecure,
-            ca_pem,
-            client_cert.map(|p| p.into_bytes()),
-            client_key.map(|p| p.into_bytes()),
-            token,
-        )?);
+        let client = Arc::new(
+            ApiClient::with_tls(
+                &server,
+                insecure,
+                ca_pem,
+                client_cert.map(|p| p.into_bytes()),
+                client_key.map(|p| p.into_bytes()),
+                token,
+            )?
+            // Upstream kubelet's KubeAPIQPS/KubeAPIBurst
+            // (pkg/kubelet/apis/config/v1beta1/defaults.go:221, 224). Higher
+            // than the controller-manager's: a kubelet reports status for
+            // every pod it runs.
+            .with_rate_limit(
+                rusternetes_client::ratelimit::KUBELET_QPS,
+                rusternetes_client::ratelimit::KUBELET_BURST,
+            ),
+        );
         Arc::new(StorageBackend::new_api(client))
     } else {
         let storage_config = match args.storage_backend.as_str() {

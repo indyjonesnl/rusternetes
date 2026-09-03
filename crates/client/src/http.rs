@@ -1,7 +1,9 @@
+use crate::ratelimit::{RateLimiter, DEFAULT_BURST, DEFAULT_QPS};
 use anyhow::{Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// List-level metadata (`metadata` on a `*List` envelope).
 ///
@@ -40,6 +42,11 @@ pub struct ApiClient {
     /// connect-timeout + TCP keepalive so a dead connection is detected.
     stream_client: Client,
     token: Option<String>,
+    /// Throttles every request EXCEPT watches, so this component cannot starve
+    /// other api-server clients. See [`crate::ratelimit`] — client-go rate
+    /// limits by construction (`rest/config.go:374-378`) and exempts watches
+    /// (`rest/request.go:763-764`).
+    limiter: Arc<RateLimiter>,
 }
 
 #[derive(Debug)]
@@ -194,11 +201,31 @@ impl ApiClient {
             client,
             stream_client,
             token,
+            // client-go rate limits by construction: an unset QPS becomes
+            // DefaultQPS/DefaultBurst rather than "unlimited"
+            // (rest/config.go:374-378). Components raise it via
+            // `with_rate_limit`.
+            limiter: Arc::new(RateLimiter::new(DEFAULT_QPS, DEFAULT_BURST)),
         })
+    }
+
+    /// Set this client's sustained request rate and burst, as a component's
+    /// `--kube-api-qps` / `--kube-api-burst` do upstream.
+    ///
+    /// Watches are never throttled regardless of this setting
+    /// (client-go `rest/request.go:763-764`).
+    ///
+    /// Use the per-component constants in [`crate::ratelimit`] rather than
+    /// inventing numbers: upstream picked them deliberately, and a client that
+    /// is too permissive starves every other client of the api-server.
+    pub fn with_rate_limit(mut self, qps: f64, burst: f64) -> Self {
+        self.limiter = Arc::new(RateLimiter::new(qps, burst));
+        self
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, GetError> {
         let url = format!("{}{}", self.base_url, path);
+        self.limiter.acquire().await;
         let mut request = self.client.get(&url);
 
         if let Some(ref token) = self.token {
@@ -266,6 +293,7 @@ impl ApiClient {
 
     pub async fn post<T: Serialize, R: DeserializeOwned>(&self, path: &str, body: &T) -> Result<R> {
         let url = format!("{}{}", self.base_url, path);
+        self.limiter.acquire().await;
         let mut request = self.client.post(&url).json(body);
 
         if let Some(ref token) = self.token {
@@ -288,6 +316,7 @@ impl ApiClient {
 
     pub async fn put<T: Serialize, R: DeserializeOwned>(&self, path: &str, body: &T) -> Result<R> {
         let url = format!("{}{}", self.base_url, path);
+        self.limiter.acquire().await;
         let mut request = self.client.put(&url).json(body);
 
         if let Some(ref token) = self.token {
@@ -324,6 +353,7 @@ impl ApiClient {
             url.push_str(&format!("{}{}", separator, qs.join("&")));
         }
 
+        self.limiter.acquire().await;
         let mut request = self.client.delete(&url);
 
         if let Some(ref token) = self.token {
@@ -352,6 +382,7 @@ impl ApiClient {
     /// Check if a resource exists (GET returns 200). Returns false on 404.
     pub async fn resource_exists(&self, path: &str) -> Result<bool> {
         let url = format!("{}{}", self.base_url, path);
+        self.limiter.acquire().await;
         let mut request = self.client.get(&url);
 
         if let Some(ref token) = self.token {
@@ -397,6 +428,7 @@ impl ApiClient {
     /// Get a resource as plain text (for logs, etc.)
     pub async fn get_text(&self, path: &str) -> Result<String> {
         let url = format!("{}{}", self.base_url, path);
+        self.limiter.acquire().await;
         let mut request = self.client.get(&url);
 
         if let Some(ref token) = self.token {
@@ -454,6 +486,7 @@ impl ApiClient {
         accept: &str,
     ) -> anyhow::Result<serde_json::Value> {
         let url = format!("{}{}", self.base_url, path);
+        self.limiter.acquire().await;
         let mut request = self.client.get(&url).header("Accept", accept);
 
         if let Some(ref token) = self.token {
