@@ -23,10 +23,63 @@ wrong defaults, broken invariants) that only surface as failing tests later.
    via a seeded object, a reconciler, or a post-start hook, replicate *that
    mechanism* — do not fake the effect with a shortcut (e.g. an authorizer
    hard-code). Shortcuts break the invariants the real mechanism preserves.
-3. **Cite it.** In the code comment and the commit/PR, name the upstream file
+3. **Port the WHOLE mechanism, not the one function you came for.** Read the
+   caller and every gate around it before you copy anything. Upstream functions
+   sit inside systems that make them safe; lifting one out ships an accelerator
+   with no brake. Ask: what does upstream check *before* calling this? What does
+   it do with the error? What bounds it?
+4. **Read upstream's TESTS, not just its code.** They encode the edge cases you
+   will not derive — ordering constraints, partial-failure semantics, what must
+   happen on recreate. When a test exists for something that looks obvious,
+   that is usually because it is not.
+5. **A server-side change usually has a client-side counterpart.** If you add a
+   rejection, a condition, or a new error, grep for who upstream expects to
+   consume it. Shipping one half of a pair is worse than shipping neither: the
+   new behaviour becomes reachable with nothing prepared for it.
+6. **Check whether this repo already implements it** before writing your own.
+   `grep` the other controllers first — a sibling has often solved the same
+   problem, and a second copy is a future divergence.
+7. **Cite it.** In the code comment and the commit/PR, name the upstream file
    (and ideally the symbol/line) you ported from. Reviewers verify against it.
-4. **Only invent when upstream genuinely has no equivalent** (a Rust-specific
-   concern, a Rusternetes-only feature). Say so explicitly when you do.
+8. **Only invent when upstream genuinely has no equivalent** (a Rust-specific
+   concern, a Rusternetes-only feature). Say so explicitly when you do — and if
+   you deviate deliberately, say that too, with the reason.
+
+### Debugging: read upstream before reading logs
+
+When behaviour is wrong and upstream implements that behaviour, the answer is
+usually in upstream's source, not in our logs. Log-diving tells you *what*
+happened; upstream tells you what *should* happen, which is the thing you
+actually need. Reach for `../kubernetes` first and use logs to confirm, not to
+derive.
+
+### Worked example — why 3-5 above are their own rules
+
+The ReplicationController could not create 100 pods inside a conformance spec's
+120s budget. `slowStartBatch`
+(`pkg/controller/replicaset/replica_set.go:820-844`) was ported on its own in
+PR #1853, and it made things **worse**: the leg went 91/94 -> 90/94, the
+conformance suite's own client rate limiter starved, and a namespace teardown
+that had been taking 81s took 3h23m.
+
+Reading `manageReplicas` and `syncReplicaSet` properly turned up three parts
+that had been left behind, each of which exists precisely to make batched
+creation safe:
+
+- `ControllerExpectations` (`:619`, `:728`) — the brake. Without it a
+  watch-driven controller wakes on its own create events, lists a backend that
+  has not caught up, and issues the batch again.
+- `burstReplicas = 500` (`:72`, `:611`, `:653`) — the cap. Batches double
+  without limit, so nothing else bounds one object's burst.
+- `NamespaceTerminatingCause` handling (`:643-651`) — the client half of a pair
+  whose server half we had already shipped in #1849, leaving every namespace
+  teardown in a create-retry loop.
+
+Two of those came out of upstream's *tests*: `TestRSSyncExpectations` is the
+reason expectations must be read BEFORE listing pods (check after, and a pod
+arriving in between makes the record look fulfilled while your list still lacks
+it — so you duplicate it), and `TestSlowStartBatch` pins what a partially
+failing batch must report. Neither is inferable from the implementation alone.
 
 ### Reference checkouts (read these — they are on this machine)
 - **`../kubernetes`** — upstream Kubernetes (Go). The primary source of truth
