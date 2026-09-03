@@ -1,3 +1,4 @@
+use super::expectations::ControllerExpectations;
 use chrono::Utc;
 use futures::StreamExt;
 use rusternetes_common::{
@@ -12,6 +13,15 @@ use tracing::{debug, error, info, warn};
 pub struct ReplicationControllerController<S: Storage> {
     storage: Arc<S>,
     interval: Duration,
+    /// In-flight pod creates/deletes this controller has issued but not yet
+    /// observed on the pod watch, keyed "ns/name".
+    ///
+    /// Upstream gates `manageReplicas` on this
+    /// (pkg/controller/replicaset/replica_set.go:728, 756) and it is what makes
+    /// slow-start batching safe: without it a watch-driven reconcile re-enters
+    /// while a whole batch of creates is still in flight, lists pods that do
+    /// not include them yet, and issues the batch again.
+    expectations: Arc<ControllerExpectations>,
 }
 
 impl<S: Storage + 'static> ReplicationControllerController<S> {
@@ -19,6 +29,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         Self {
             storage,
             interval: Duration::from_secs(interval_secs),
+            expectations: Arc::new(ControllerExpectations::new()),
         }
     }
 
@@ -126,6 +137,29 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             Some(ns) => *ns,
             None => return,
         };
+
+        // Upstream's addPod/deletePod lower the owning controller's
+        // expectations as the pod is observed
+        // (replica_set.go:436 `CreationObserved`, :568 `DeletionObserved`).
+        // Without this the counts never come down and every sync waits out the
+        // 5-minute TTL instead of proceeding as soon as its creates land.
+        match event {
+            rusternetes_storage::WatchEvent::Added(_, value) => {
+                for owner in rc_owner_names(value) {
+                    self.expectations
+                        .creation_observed(&format!("{ns}/{owner}"));
+                }
+            }
+            // The delete event carries the previous value, so the owner is
+            // still identifiable here even though the object is gone.
+            rusternetes_storage::WatchEvent::Deleted(_, previous) => {
+                for owner in rc_owner_names(previous) {
+                    self.expectations
+                        .deletion_observed(&format!("{ns}/{owner}"));
+                }
+            }
+            rusternetes_storage::WatchEvent::Modified(..) => {}
+        }
 
         let storage_key = format!("/registry/{}", pod_key);
         match self.storage.get::<Pod>(&storage_key).await {
@@ -238,6 +272,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 
     async fn reconcile_rc(&self, rc: &ReplicationController) -> rusternetes_common::Result<()> {
         let namespace = rc.metadata.namespace.as_deref().unwrap_or("default");
+        let rc_key = format!("{}/{}", namespace, rc.metadata.name);
 
         // If RC is being deleted with Orphan policy, remove ownerReferences from pods
         // and remove the orphan finalizer, then delete the RC.
@@ -312,6 +347,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 return Ok(());
             }
             // If being deleted without orphan, skip reconciliation (let it terminate)
+            self.expectations.delete_expectations(&rc_key);
             return Ok(());
         }
 
@@ -319,6 +355,14 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             "Reconciling replicationcontroller: {}/{}",
             namespace, rc.metadata.name
         );
+
+        // Read expectations BEFORE listing pods. Upstream does the same
+        // (replica_set.go:728 precedes the pod list) and its
+        // `TestRSSyncExpectations` explains why: if the list is taken first and
+        // expectations checked second, a pod arriving in between makes the
+        // record look fulfilled while the list still lacks that pod — and the
+        // controller creates a duplicate.
+        let needs_sync = self.expectations.satisfied(&rc_key);
 
         // Get all pods in namespace
         let pods_prefix = build_prefix("pods", Some(namespace));
@@ -368,52 +412,104 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         );
 
         let mut create_failure: Option<String> = None;
-        if current_replicas < desired_replicas {
-            // Create the missing pods in upstream's slow-start batches, every
-            // pod within a batch concurrently — `slowStartBatch` spawns a
-            // goroutine per pod and waits for the batch
-            // (pkg/controller/replicaset/replica_set.go:826-835).
-            //
-            // Serially, this loop could not keep up: `create_pod` is a
-            // ServiceAccount GET, a ResourceQuota LIST and the pod CREATE, and
-            // on the kine leg those measured ~4s in total, so 100 replicas
-            // needed ~400s against the conformance specs' 120s
-            // `replicaSyncTimeout`. Three `[sig-api-machinery] Garbage
-            // collector` specs failed in setup on `rc.Status.Replicas (0)`
-            // never reaching `Spec.Replicas (100)` (#1847).
-            let to_create = (desired_replicas - current_replicas) as usize;
-            let mut created = 0usize;
-            for batch in slow_start_batches(to_create, SLOW_START_INITIAL_BATCH_SIZE) {
-                let results = futures::future::join_all(
-                    (0..batch).map(|i| self.create_pod(rc, (created + i) as i32)),
-                )
-                .await;
+        // Upstream: `if rsNeedsSync && rs.DeletionTimestamp == nil { manageReplicas }`
+        // (replica_set.go:756). The deletionTimestamp half is handled by the
+        // early return above. Status is still recalculated below either way —
+        // upstream "always updates status as pods come up or die".
+        if !needs_sync {
+            debug!(
+                "RC {}: waiting on in-flight pod creates/deletes, skipping manage",
+                rc_key
+            );
+        }
+        // Set when creates are rejected because the namespace is terminating.
+        // Deliberately NOT folded into `create_failure`: that drives the
+        // ReplicaFailure condition, and upstream does not raise one for this.
+        let mut namespace_terminating = false;
+        // Pods this reconcile successfully asked the backend to create. Only
+        // these are worth waiting to observe — a create that failed will never
+        // produce a pod.
+        let mut created = 0usize;
+        if needs_sync {
+            if current_replicas < desired_replicas {
+                // Create the missing pods in upstream's slow-start batches, every
+                // pod within a batch concurrently — `slowStartBatch` spawns a
+                // goroutine per pod and waits for the batch
+                // (pkg/controller/replicaset/replica_set.go:826-835).
+                //
+                // Serially, this loop could not keep up: `create_pod` is a
+                // ServiceAccount GET, a ResourceQuota LIST and the pod CREATE, and
+                // on the kine leg those measured ~4s in total, so 100 replicas
+                // needed ~400s against the conformance specs' 120s
+                // `replicaSyncTimeout`. Three `[sig-api-machinery] Garbage
+                // collector` specs failed in setup on `rc.Status.Replicas (0)`
+                // never reaching `Spec.Replicas (100)` (#1847).
+                let to_create =
+                    ((desired_replicas - current_replicas) as usize).min(BURST_REPLICAS);
+                // Record the creates before issuing them, so a reconcile triggered
+                // by our own pod-create watch events does not re-issue the batch
+                // (upstream `ExpectCreations`, replica_set.go:619).
+                self.expectations
+                    .expect_creations(&rc_key, to_create as i64);
+                for batch in slow_start_batches(to_create, SLOW_START_INITIAL_BATCH_SIZE) {
+                    let results = futures::future::join_all(
+                        (0..batch).map(|i| self.create_pod(rc, (created + i) as i32)),
+                    )
+                    .await;
 
-                let mut batch_failure = None;
-                for result in results {
-                    match result {
-                        Ok(()) => created += 1,
-                        Err(e) => {
-                            error!("Failed to create pod for RC {}: {}", rc.metadata.name, e);
-                            batch_failure.get_or_insert_with(|| e.to_string());
+                    let mut batch_failure = None;
+                    for result in results {
+                        match result {
+                            Ok(()) => created += 1,
+                            // The namespace is going away, so every create in this
+                            // reconcile will fail and none of them matter. Upstream
+                            // returns nil here so the create is not counted as a
+                            // replica failure (replica_set.go:643-651); stopping
+                            // now additionally spares the api-server a batch of
+                            // requests it would only reject.
+                            Err(e) if is_namespace_terminating_rejection(&e) => {
+                                debug!(
+                                    "RC {}/{}: namespace is terminating, abandoning pod creation",
+                                    namespace, rc.metadata.name
+                                );
+                                namespace_terminating = true;
+                            }
+                            Err(e) => {
+                                error!("Failed to create pod for RC {}: {}", rc.metadata.name, e);
+                                batch_failure.get_or_insert_with(|| e.to_string());
+                            }
                         }
                     }
-                }
 
-                // Upstream stops at the first failing batch and reports what
-                // succeeded (`replica_set.go:838-840`), rather than pushing
-                // the remaining rounds at an api-server that is already
-                // rejecting — the next reconcile retries from the new count.
-                if let Some(e) = batch_failure {
-                    create_failure = Some(e);
-                    break;
+                    if namespace_terminating {
+                        break;
+                    }
+
+                    // Upstream stops at the first failing batch and reports what
+                    // succeeded (`replica_set.go:838-840`), rather than pushing
+                    // the remaining rounds at an api-server that is already
+                    // rejecting — the next reconcile retries from the new count.
+                    if let Some(e) = batch_failure {
+                        create_failure = Some(e);
+                        break;
+                    }
                 }
-            }
-        } else if current_replicas > desired_replicas {
-            // Need to delete excess pods
-            let to_delete = current_replicas - desired_replicas;
-            for pod in rc_pods.iter().take(to_delete as usize) {
-                self.delete_pod(&pod.metadata.name, namespace).await?;
+                // Creates we never attempted must not be waited on: upstream
+                // decrements the expectation for each skipped pod, because no watch
+                // event will ever arrive for them (replica_set.go:645-651).
+                let skipped = to_create.saturating_sub(created);
+                for _ in 0..skipped {
+                    self.expectations.creation_observed(&rc_key);
+                }
+            } else if current_replicas > desired_replicas {
+                // Need to delete excess pods
+                let to_delete =
+                    ((current_replicas - desired_replicas) as usize).min(BURST_REPLICAS);
+                self.expectations
+                    .expect_deletions(&rc_key, to_delete as i64);
+                for pod in rc_pods.iter().take(to_delete) {
+                    self.delete_pod(&pod.metadata.name, namespace).await?;
+                }
             }
         }
 
@@ -436,6 +532,32 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 )
             })
             .collect();
+
+        // Lower expectations for the creates this re-list already shows.
+        //
+        // Upstream lowers them from informer events (replica_set.go:436
+        // `CreationObserved`) because its sync reads a cache rather than the
+        // store. Ours reads storage directly, so this re-list is an
+        // observation in its own right — and a fresher one than the watch
+        // event that will follow. The pod watch still lowers the count as
+        // well, which covers the window before this runs.
+        //
+        // Only the creates that SUCCEEDED can ever be observed; the failed
+        // ones were already settled above. Counting "pods still missing"
+        // instead would re-arm the expectation after a create that failed
+        // (a quota denial, say) and wedge the next sync until the 5-minute TTL
+        // — the opposite of what expectations are for.
+        //
+        // The guard survives where it matters: against an api-server serving a
+        // stale list the created pods are not visible yet, so they stay
+        // outstanding and the next reconcile is still gated.
+        if needs_sync && created > 0 {
+            let newly_visible =
+                (active_pods.len() as i64 - current_replicas as i64).clamp(0, created as i64);
+            for _ in 0..newly_visible {
+                self.expectations.creation_observed(&rc_key);
+            }
+        }
 
         let final_current_replicas = active_pods.len() as i32;
         let final_ready_replicas = active_pods
@@ -621,9 +743,9 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
     ) -> rusternetes_common::Result<()> {
         let namespace = rc.metadata.namespace.as_deref().unwrap_or("default");
 
-        // K8s uses <rc-name>-<5-char-random> to keep pod names under 63 chars
-        let suffix: String = uuid::Uuid::new_v4().to_string().chars().take(5).collect();
-        let pod_name = format!("{}-{}", rc.metadata.name, suffix);
+        // Name is generated per attempt below, so a collision can be retried
+        // under a new one (upstream `createWithGenerateNameRetry`).
+        let pod_name = generate_pod_name(&rc.metadata.name);
 
         let mut metadata = ObjectMeta::new(&pod_name);
         metadata.namespace = Some(namespace.to_string());
@@ -720,15 +842,45 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             .await
             .map_err(|e| rusternetes_common::Error::Forbidden(e.to_string()))?;
 
-        let key = build_key("pods", Some(namespace), &pod_name);
-        self.storage.create(&key, &pod).await?;
+        // Retry a name collision under a freshly generated name, as upstream's
+        // api-server does for `generateName` objects
+        // (registry/generic/registry/store.go:463-470). Our controllers write
+        // pods with a client-side name rather than through the generateName
+        // path, so the retry has to live here.
+        //
+        // Any other error is returned to the caller on the first attempt: only
+        // AlreadyExists is worth a new name.
+        let mut attempt_name = pod_name;
+        for attempt in 0..MAX_NAME_GENERATION_CREATE_ATTEMPTS {
+            pod.metadata.name = attempt_name.clone();
+            let key = build_key("pods", Some(namespace), &attempt_name);
+            match self.storage.create(&key, &pod).await {
+                Ok(_) => {
+                    info!(
+                        "Created pod {}/{} for replicationcontroller {}",
+                        namespace, attempt_name, rc.metadata.name
+                    );
+                    return Ok(());
+                }
+                Err(rusternetes_common::Error::AlreadyExists(_))
+                    if attempt + 1 < MAX_NAME_GENERATION_CREATE_ATTEMPTS =>
+                {
+                    debug!(
+                        "Pod name {}/{} already taken, regenerating (attempt {})",
+                        namespace,
+                        attempt_name,
+                        attempt + 1
+                    );
+                    attempt_name = generate_pod_name(&rc.metadata.name);
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
-        info!(
-            "Created pod {}/{} for replicationcontroller {}",
-            namespace, pod_name, rc.metadata.name
-        );
-
-        Ok(())
+        Err(rusternetes_common::Error::AlreadyExists(format!(
+            "could not generate a free pod name for {}/{} after {} attempts",
+            namespace, rc.metadata.name, MAX_NAME_GENERATION_CREATE_ATTEMPTS
+        )))
     }
 
     async fn delete_pod(&self, name: &str, namespace: &str) -> rusternetes_common::Result<()> {
@@ -863,6 +1015,109 @@ fn slow_start_batches(count: usize, initial_batch_size: usize) -> Vec<usize> {
     }
     batches
 }
+
+/// Names of the ReplicationControllers owning a serialised pod.
+///
+/// Used to attribute a pod watch event to the controller whose expectations it
+/// fulfils. A payload we cannot parse yields nothing, which merely means the
+/// expectation waits for its TTL rather than being wrongly lowered.
+fn rc_owner_names(serialised_pod: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(serialised_pod) else {
+        return Vec::new();
+    };
+    value
+        .pointer("/metadata/ownerReferences")
+        .and_then(|refs| refs.as_array())
+        .map(|refs| {
+            refs.iter()
+                .filter(|r| r.get("kind").and_then(|k| k.as_str()) == Some("ReplicationController"))
+                .filter_map(|r| r.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a pod-create failure is the api-server refusing to add content to a
+/// namespace that is being terminated.
+///
+/// Upstream pairs the admission rejection with a controller that expects it:
+///
+/// ```text
+/// if apierrors.HasStatusCause(err, v1.NamespaceTerminatingCause) {
+///     // if the namespace is being terminated, we don't have to do
+///     // anything because any creation will fail
+///     return nil
+/// }
+/// ```
+///
+/// (pkg/controller/replicaset/replica_set.go:643-651). It is deliberately NOT
+/// a `ReplicaFailure`: the namespace is going away, so there is nothing wrong
+/// with this ReplicaSet and nothing for an operator to act on.
+///
+/// Upstream matches the structured `StatusCause`; our storage layer renders an
+/// api-server error into a string (`map_write_err`, crates/storage/src/
+/// api_storage.rs), so we match the cause reason or the message text the
+/// api-server emits (crates/middleware/src/lib.rs, added in #1849). Both
+/// spellings are accepted so this keeps working if the cause is ever surfaced
+/// structurally.
+fn is_namespace_terminating_rejection(err: &rusternetes_common::Error) -> bool {
+    let rusternetes_common::Error::Forbidden(message) = err else {
+        return false;
+    };
+    message.contains("NamespaceTerminating") || message.contains("because it is being terminated")
+}
+
+/// How many times a create is retried under a freshly generated name when the
+/// name collides.
+///
+/// Upstream's `maxNameGenerationCreateAttempts`
+/// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:440),
+/// whose comment gives the arithmetic that makes this mandatory rather than
+/// defensive:
+///
+/// ```text
+/// Without retry, a 0.1% probability occurs at ~500
+/// generated names and a 50% probability occurs at ~4500
+/// generated names.
+/// ```
+const MAX_NAME_GENERATION_CREATE_ATTEMPTS: usize = 8;
+
+/// Alphabet for generated name suffixes.
+///
+/// Upstream's `utilrand.String` alphabet
+/// (staging/src/k8s.io/apiserver/pkg/storage/names/generate.go:53, via
+/// k8s.io/apimachinery/pkg/util/rand): 27 consonants and digits, chosen to
+/// avoid accidentally spelling words. It also matters for collisions — 27^5 is
+/// ~14.3M names against ~1M for the 5 hex characters this previously took from
+/// a UUID, i.e. a 14x larger space before the retry above is even needed.
+const NAME_SUFFIX_ALPHABET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
+
+/// Length of a generated name suffix. Upstream's `randomLength`
+/// (`generate.go:45`).
+const NAME_SUFFIX_LENGTH: usize = 5;
+
+/// A `<base>-<suffix>` name, as upstream's `simpleNameGenerator` builds it.
+fn generate_pod_name(base: &str) -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let suffix: String = (0..NAME_SUFFIX_LENGTH)
+        .map(|_| NAME_SUFFIX_ALPHABET[rng.random_range(0..NAME_SUFFIX_ALPHABET.len())] as char)
+        .collect();
+    format!("{base}-{suffix}")
+}
+
+/// Most pods one sync will create or delete for a single ReplicationController.
+///
+/// Upstream's `BurstReplicas` (pkg/controller/replicaset/replica_set.go:72),
+/// applied to the diff in both directions (`:611-612` creates, `:653-654`
+/// deletes).
+///
+/// Slow-start batching does not bound this on its own — its batches double
+/// without limit — so without the cap one large object can issue an unbounded
+/// burst at an api-server it shares with every other client. The cap is a
+/// throttle rather than a ceiling: whatever is left is created by the next
+/// sync.
+const BURST_REPLICAS: usize = 500;
 
 /// Upstream's `SlowStartInitialBatchSize` (pkg/controller/controller_utils.go).
 const SLOW_START_INITIAL_BATCH_SIZE: usize = 1;
@@ -1776,6 +2031,494 @@ mod tests {
             Some(100),
             "status.replicas must reach spec.replicas — this is what \
              garbage_collector.go:1174 waits on"
+        );
+    }
+
+    /// A create rejected because the namespace is terminating is not a replica
+    /// failure.
+    ///
+    /// Upstream treats the admission rejection and the controller's reaction as
+    /// one design. `manageReplicas` inspects the create error and swallows this
+    /// specific cause:
+    ///
+    /// ```text
+    /// if apierrors.HasStatusCause(err, v1.NamespaceTerminatingCause) {
+    ///     // if the namespace is being terminated, we don't have to do
+    ///     // anything because any creation will fail
+    ///     return nil
+    /// }
+    /// ```
+    ///
+    /// (pkg/controller/replicaset/replica_set.go:643-651)
+    ///
+    /// We shipped the api-server half of that pair in #1849 — creates into a
+    /// Terminating namespace now return 403 with the `NamespaceTerminating`
+    /// cause — without the controller half. So every namespace teardown put the
+    /// RC into a retry loop against creates that can only ever fail, and
+    /// stamped a `ReplicaFailure` condition upstream deliberately does not set.
+    #[test]
+    fn namespace_terminating_rejection_is_recognised() {
+        use rusternetes_common::Error;
+
+        // The message our api-server produces (#1849), as it reaches the
+        // controller through ApiStorage's stringified error chain.
+        assert!(is_namespace_terminating_rejection(&Error::Forbidden(
+            "POST https://api-server:6443/api/v1/namespaces/ns-1/pods failed: \
+             (Forbidden) pods is forbidden: unable to create new content in \
+             namespace ns-1 because it is being terminated"
+                .to_string()
+        )));
+
+        // The structured cause reason, if it ever reaches us intact — this is
+        // what upstream actually matches on.
+        assert!(is_namespace_terminating_rejection(&Error::Forbidden(
+            "(Forbidden) NamespaceTerminating".to_string()
+        )));
+
+        // Any other Forbidden is a real failure and must still surface: a quota
+        // denial is the case that ReplicaFailure exists for.
+        assert!(!is_namespace_terminating_rejection(&Error::Forbidden(
+            "exceeded quota: pods, requested: 1, used: 10, limited: 10".to_string()
+        )));
+
+        // Non-Forbidden errors are never this case.
+        assert!(!is_namespace_terminating_rejection(&Error::Storage(
+            "connection refused".to_string()
+        )));
+        assert!(!is_namespace_terminating_rejection(&Error::Conflict(
+            "resourceVersion mismatch".to_string()
+        )));
+    }
+
+    /// Rejects every pod create the way our api-server does for a Terminating
+    /// namespace (#1849), and counts the attempts. Everything else delegates.
+    struct TerminatingNamespaceStorage {
+        inner: Arc<MemoryStorage>,
+        pod_create_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TerminatingNamespaceStorage {
+        fn new(inner: Arc<MemoryStorage>) -> Self {
+            Self {
+                inner,
+                pod_create_attempts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.pod_create_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rusternetes_storage::Storage for TerminatingNamespaceStorage {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            if key.starts_with("/registry/pods/") {
+                self.pod_create_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(rusternetes_common::Error::Forbidden(format!(
+                    "POST {key} failed: (Forbidden) pods is forbidden: unable to create new \
+                     content in namespace ns-term because it is being terminated"
+                )));
+            }
+            self.inner.create(key, value).await
+        }
+
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update(key, value).await
+        }
+
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.inner.update_raw(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list(prefix).await
+        }
+
+        async fn watch(
+            &self,
+            prefix: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    /// When the namespace is terminating, the RC must give up quietly: no
+    /// ReplicaFailure, and no batch of creates the api-server can only reject.
+    ///
+    /// Before this, #1849's admission rejection had no consumer, so every
+    /// namespace teardown left the RC retrying creates that could never
+    /// succeed and stamping a condition upstream deliberately never sets
+    /// (pkg/controller/replicaset/replica_set.go:643-651).
+    #[tokio::test]
+    async fn rc_abandons_creates_when_namespace_is_terminating() {
+        let inner = Arc::new(MemoryStorage::new());
+        let storage = Arc::new(TerminatingNamespaceStorage::new(inner));
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "doomed".to_string());
+        let rc = make_rc("simpletest-rc", "default", 20, selector, None);
+        storage
+            .create(
+                "/registry/replicationcontrollers/default/simpletest-rc",
+                &rc,
+            )
+            .await
+            .unwrap();
+
+        // Must not surface as a reconcile error: the namespace going away is
+        // not this controller's problem to report.
+        controller
+            .reconcile_all()
+            .await
+            .expect("a terminating namespace must not fail the reconcile");
+
+        // Upstream sets ReplicaFailure only for real create failures — a quota
+        // denial, say. Not for this.
+        let observed: ReplicationController = storage
+            .get("/registry/replicationcontrollers/default/simpletest-rc")
+            .await
+            .unwrap();
+        let has_replica_failure = observed
+            .status
+            .as_ref()
+            .and_then(|st| st.conditions.as_ref())
+            .is_some_and(|cs| cs.iter().any(|c| c.condition_type == "ReplicaFailure"));
+        assert!(
+            !has_replica_failure,
+            "a terminating namespace must not raise ReplicaFailure"
+        );
+
+        // And it must stop rather than push the remaining batches at an
+        // api-server that is rejecting all of them: the first slow-start batch
+        // is 1, so exactly one attempt for a 20-replica RC.
+        assert_eq!(
+            storage.attempts(),
+            1,
+            "must abandon after the first rejected batch, not attempt all 20"
+        );
+    }
+
+    /// While creates are in flight and unobserved, a re-entrant reconcile must
+    /// not issue them again.
+    ///
+    /// This is the whole purpose of expectations, and the failure it prevents is
+    /// concrete: a watch-driven controller wakes on its OWN pod-create events,
+    /// lists pods from a backend that has not caught up, sees too few, and
+    /// creates a second batch. Upstream gates `manageReplicas` on
+    /// `SatisfiedExpectations` for exactly this
+    /// (pkg/controller/replicaset/replica_set.go:728, 756).
+    ///
+    /// Simulated by leaving an outstanding expectation and reconciling against
+    /// a storage that reports no pods at all — the worst case of a stale list.
+    /// Without the gate the controller creates the full replica count again.
+    #[tokio::test]
+    async fn rc_defers_creates_while_expectations_are_outstanding() {
+        let inner = Arc::new(MemoryStorage::new());
+        let storage = Arc::new(ConcurrencyProbeStorage::new(inner));
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "gated".to_string());
+        let rc = make_rc("simpletest-rc", "default", 10, selector, None);
+        storage
+            .create(
+                "/registry/replicationcontrollers/default/simpletest-rc",
+                &rc,
+            )
+            .await
+            .unwrap();
+
+        // Stand in for a batch this controller has just issued and not yet
+        // seen land.
+        controller
+            .expectations
+            .expect_creations("default/simpletest-rc", 10);
+
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert!(
+            pods.is_empty(),
+            "no pods may be created while 10 creates are outstanding, got {}",
+            pods.len()
+        );
+
+        // Once those creates are observed the gate opens and the controller
+        // does its job — the brake must not become a wedge.
+        for _ in 0..10 {
+            controller
+                .expectations
+                .creation_observed("default/simpletest-rc");
+        }
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(
+            pods.len(),
+            10,
+            "once expectations are satisfied the controller must create the replicas"
+        );
+    }
+
+    /// A single sync creates at most `BURST_REPLICAS` pods, and the next sync
+    /// picks up the rest.
+    ///
+    /// Upstream caps the diff in both directions before doing anything with it:
+    ///
+    /// ```text
+    /// if diff > rsc.burstReplicas {
+    ///     diff = rsc.burstReplicas
+    /// }
+    /// ```
+    ///
+    /// (pkg/controller/replicaset/replica_set.go:611-612 for creates, :653-654
+    /// for deletes; `BurstReplicas = 500` at :72.)
+    ///
+    /// The cap bounds what one object can do to the api-server in one sync.
+    /// Slow-start batching alone does not: its batches double without limit, so
+    /// a single large RC can otherwise issue an unbounded burst — and this
+    /// controller shares an api-server with every other client, including the
+    /// conformance suite whose own rate limiter starved during run
+    /// 33762395978.
+    #[tokio::test]
+    async fn rc_caps_creates_at_burst_replicas_and_finishes_next_sync() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "burst".to_string());
+        let desired = BURST_REPLICAS as i32 + 100;
+        let rc = make_rc("simpletest-rc", "default", desired, selector, None);
+        storage
+            .create(
+                "/registry/replicationcontrollers/default/simpletest-rc",
+                &rc,
+            )
+            .await
+            .unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(
+            pods.len(),
+            BURST_REPLICAS,
+            "one sync must not exceed the burst cap"
+        );
+
+        // The cap is a throttle, not a ceiling: the next sync finishes the job.
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(
+            pods.len(),
+            desired as usize,
+            "the following sync must create the remainder"
+        );
+    }
+
+    /// Fails the first `n` pod creates with AlreadyExists, then behaves. Stands
+    /// in for a generated pod name colliding with one already in the namespace.
+    struct NameCollisionStorage {
+        inner: Arc<MemoryStorage>,
+        remaining_collisions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NameCollisionStorage {
+        fn new(inner: Arc<MemoryStorage>, collisions: usize) -> Self {
+            Self {
+                inner,
+                remaining_collisions: std::sync::atomic::AtomicUsize::new(collisions),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rusternetes_storage::Storage for NameCollisionStorage {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            use std::sync::atomic::Ordering;
+            if key.starts_with("/registry/pods/")
+                && self
+                    .remaining_collisions
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                        if n > 0 {
+                            Some(n - 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .is_ok()
+            {
+                return Err(rusternetes_common::Error::AlreadyExists(format!(
+                    "pods {key} already exists"
+                )));
+            }
+            self.inner.create(key, value).await
+        }
+
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update(key, value).await
+        }
+
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.inner.update_raw(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list(prefix).await
+        }
+
+        async fn watch(
+            &self,
+            prefix: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    /// A generated pod name that collides must be retried with a new name, not
+    /// reported as a failure.
+    ///
+    /// Upstream retries the create up to `maxNameGenerationCreateAttempts` (8),
+    /// generating a fresh name each time
+    /// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:431-470).
+    /// Its comment gives the arithmetic that makes this mandatory rather than
+    /// defensive:
+    ///
+    /// ```text
+    /// Without retry, a 0.1% probability occurs at ~500
+    /// generated names and a 50% probability occurs at ~4500
+    /// generated names.
+    /// ```
+    ///
+    /// This is not hypothetical here. `rc_caps_creates_at_burst_replicas_and_
+    /// finishes_next_sync` creates 500 pods in one namespace and failed in CI
+    /// with 254 of them — a collision killed the batch — while passing locally.
+    #[tokio::test]
+    async fn rc_retries_pod_create_when_the_generated_name_collides() {
+        let inner = Arc::new(MemoryStorage::new());
+        // Three collisions in a row: within upstream's budget of 8.
+        let storage = Arc::new(NameCollisionStorage::new(inner, 3));
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "collide".to_string());
+        let rc = make_rc("simpletest-rc", "default", 1, selector, None);
+        storage
+            .create(
+                "/registry/replicationcontrollers/default/simpletest-rc",
+                &rc,
+            )
+            .await
+            .unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(
+            pods.len(),
+            1,
+            "the create must be retried under a new name, not abandoned"
+        );
+
+        // And it must not be reported as a replica failure: nothing is wrong
+        // with this RC.
+        let observed: ReplicationController = storage
+            .get("/registry/replicationcontrollers/default/simpletest-rc")
+            .await
+            .unwrap();
+        let has_replica_failure = observed
+            .status
+            .as_ref()
+            .and_then(|st| st.conditions.as_ref())
+            .is_some_and(|cs| cs.iter().any(|c| c.condition_type == "ReplicaFailure"));
+        assert!(
+            !has_replica_failure,
+            "a retried name collision is not a ReplicaFailure"
         );
     }
 }

@@ -10,6 +10,7 @@ pub mod dynamic_provisioner;
 pub mod endpoints;
 pub mod endpointslice;
 pub mod events;
+pub mod expectations;
 pub mod garbage_collector;
 pub mod hpa;
 pub mod hpa_behavior;
