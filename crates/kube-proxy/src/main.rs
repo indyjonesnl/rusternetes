@@ -141,14 +141,24 @@ async fn main() -> Result<()> {
         );
         // The CA validates the server's TLS cert; client cert/key (when the
         // kubeconfig provides them) authenticate this component via mTLS (#1578).
-        let client = Arc::new(ApiClient::with_tls(
-            &args.api_server_url,
-            insecure,
-            ca_pem,
-            client_cert.map(|p| p.into_bytes()),
-            client_key.map(|p| p.into_bytes()),
-            None,
-        )?);
+        let client = Arc::new(
+            ApiClient::with_tls(
+                &args.api_server_url,
+                insecure,
+                ca_pem,
+                client_cert.map(|p| p.into_bytes()),
+                client_key.map(|p| p.into_bytes()),
+                None,
+            )?
+            // Upstream kube-proxy's ClientConnection.QPS/.Burst
+            // (pkg/proxy/apis/config/v1alpha1/defaults.go:130, 133) — the
+            // lowest of the three: it watches Services/EndpointSlices and
+            // writes almost nothing.
+            .with_rate_limit(
+                rusternetes_client::ratelimit::KUBE_PROXY_QPS,
+                rusternetes_client::ratelimit::KUBE_PROXY_BURST,
+            ),
+        );
         return rusternetes_kube_proxy::run_with_api(client, config).await;
     }
 
