@@ -368,6 +368,10 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         );
 
         let mut create_failure: Option<String> = None;
+        // Set when creates are rejected because the namespace is terminating.
+        // Deliberately NOT folded into `create_failure`: that drives the
+        // ReplicaFailure condition, and upstream does not raise one for this.
+        let mut namespace_terminating = false;
         if current_replicas < desired_replicas {
             // Create the missing pods in upstream's slow-start batches, every
             // pod within a batch concurrently — `slowStartBatch` spawns a
@@ -393,11 +397,28 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 for result in results {
                     match result {
                         Ok(()) => created += 1,
+                        // The namespace is going away, so every create in this
+                        // reconcile will fail and none of them matter. Upstream
+                        // returns nil here so the create is not counted as a
+                        // replica failure (replica_set.go:643-651); stopping
+                        // now additionally spares the api-server a batch of
+                        // requests it would only reject.
+                        Err(e) if is_namespace_terminating_rejection(&e) => {
+                            debug!(
+                                "RC {}/{}: namespace is terminating, abandoning pod creation",
+                                namespace, rc.metadata.name
+                            );
+                            namespace_terminating = true;
+                        }
                         Err(e) => {
                             error!("Failed to create pod for RC {}: {}", rc.metadata.name, e);
                             batch_failure.get_or_insert_with(|| e.to_string());
                         }
                     }
+                }
+
+                if namespace_terminating {
+                    break;
                 }
 
                 // Upstream stops at the first failing batch and reports what
@@ -862,6 +883,36 @@ fn slow_start_batches(count: usize, initial_batch_size: usize) -> Vec<usize> {
         batch = (2 * batch).min(remaining);
     }
     batches
+}
+
+/// Whether a pod-create failure is the api-server refusing to add content to a
+/// namespace that is being terminated.
+///
+/// Upstream pairs the admission rejection with a controller that expects it:
+///
+/// ```text
+/// if apierrors.HasStatusCause(err, v1.NamespaceTerminatingCause) {
+///     // if the namespace is being terminated, we don't have to do
+///     // anything because any creation will fail
+///     return nil
+/// }
+/// ```
+///
+/// (pkg/controller/replicaset/replica_set.go:643-651). It is deliberately NOT
+/// a `ReplicaFailure`: the namespace is going away, so there is nothing wrong
+/// with this ReplicaSet and nothing for an operator to act on.
+///
+/// Upstream matches the structured `StatusCause`; our storage layer renders an
+/// api-server error into a string (`map_write_err`, crates/storage/src/
+/// api_storage.rs), so we match the cause reason or the message text the
+/// api-server emits (crates/middleware/src/lib.rs, added in #1849). Both
+/// spellings are accepted so this keeps working if the cause is ever surfaced
+/// structurally.
+fn is_namespace_terminating_rejection(err: &rusternetes_common::Error) -> bool {
+    let rusternetes_common::Error::Forbidden(message) = err else {
+        return false;
+    };
+    message.contains("NamespaceTerminating") || message.contains("because it is being terminated")
 }
 
 /// Upstream's `SlowStartInitialBatchSize` (pkg/controller/controller_utils.go).
@@ -1776,6 +1827,214 @@ mod tests {
             Some(100),
             "status.replicas must reach spec.replicas — this is what \
              garbage_collector.go:1174 waits on"
+        );
+    }
+
+    /// A create rejected because the namespace is terminating is not a replica
+    /// failure.
+    ///
+    /// Upstream treats the admission rejection and the controller's reaction as
+    /// one design. `manageReplicas` inspects the create error and swallows this
+    /// specific cause:
+    ///
+    /// ```text
+    /// if apierrors.HasStatusCause(err, v1.NamespaceTerminatingCause) {
+    ///     // if the namespace is being terminated, we don't have to do
+    ///     // anything because any creation will fail
+    ///     return nil
+    /// }
+    /// ```
+    ///
+    /// (pkg/controller/replicaset/replica_set.go:643-651)
+    ///
+    /// We shipped the api-server half of that pair in #1849 — creates into a
+    /// Terminating namespace now return 403 with the `NamespaceTerminating`
+    /// cause — without the controller half. So every namespace teardown put the
+    /// RC into a retry loop against creates that can only ever fail, and
+    /// stamped a `ReplicaFailure` condition upstream deliberately does not set.
+    #[test]
+    fn namespace_terminating_rejection_is_recognised() {
+        use rusternetes_common::Error;
+
+        // The message our api-server produces (#1849), as it reaches the
+        // controller through ApiStorage's stringified error chain.
+        assert!(is_namespace_terminating_rejection(&Error::Forbidden(
+            "POST https://api-server:6443/api/v1/namespaces/ns-1/pods failed: \
+             (Forbidden) pods is forbidden: unable to create new content in \
+             namespace ns-1 because it is being terminated"
+                .to_string()
+        )));
+
+        // The structured cause reason, if it ever reaches us intact — this is
+        // what upstream actually matches on.
+        assert!(is_namespace_terminating_rejection(&Error::Forbidden(
+            "(Forbidden) NamespaceTerminating".to_string()
+        )));
+
+        // Any other Forbidden is a real failure and must still surface: a quota
+        // denial is the case that ReplicaFailure exists for.
+        assert!(!is_namespace_terminating_rejection(&Error::Forbidden(
+            "exceeded quota: pods, requested: 1, used: 10, limited: 10".to_string()
+        )));
+
+        // Non-Forbidden errors are never this case.
+        assert!(!is_namespace_terminating_rejection(&Error::Storage(
+            "connection refused".to_string()
+        )));
+        assert!(!is_namespace_terminating_rejection(&Error::Conflict(
+            "resourceVersion mismatch".to_string()
+        )));
+    }
+
+    /// Rejects every pod create the way our api-server does for a Terminating
+    /// namespace (#1849), and counts the attempts. Everything else delegates.
+    struct TerminatingNamespaceStorage {
+        inner: Arc<MemoryStorage>,
+        pod_create_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TerminatingNamespaceStorage {
+        fn new(inner: Arc<MemoryStorage>) -> Self {
+            Self {
+                inner,
+                pod_create_attempts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.pod_create_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rusternetes_storage::Storage for TerminatingNamespaceStorage {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            if key.starts_with("/registry/pods/") {
+                self.pod_create_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(rusternetes_common::Error::Forbidden(format!(
+                    "POST {key} failed: (Forbidden) pods is forbidden: unable to create new \
+                     content in namespace ns-term because it is being terminated"
+                )));
+            }
+            self.inner.create(key, value).await
+        }
+
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update(key, value).await
+        }
+
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.inner.update_raw(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list(prefix).await
+        }
+
+        async fn watch(
+            &self,
+            prefix: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    /// When the namespace is terminating, the RC must give up quietly: no
+    /// ReplicaFailure, and no batch of creates the api-server can only reject.
+    ///
+    /// Before this, #1849's admission rejection had no consumer, so every
+    /// namespace teardown left the RC retrying creates that could never
+    /// succeed and stamping a condition upstream deliberately never sets
+    /// (pkg/controller/replicaset/replica_set.go:643-651).
+    #[tokio::test]
+    async fn rc_abandons_creates_when_namespace_is_terminating() {
+        let inner = Arc::new(MemoryStorage::new());
+        let storage = Arc::new(TerminatingNamespaceStorage::new(inner));
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "doomed".to_string());
+        let rc = make_rc("simpletest-rc", "default", 20, selector, None);
+        storage
+            .create(
+                "/registry/replicationcontrollers/default/simpletest-rc",
+                &rc,
+            )
+            .await
+            .unwrap();
+
+        // Must not surface as a reconcile error: the namespace going away is
+        // not this controller's problem to report.
+        controller
+            .reconcile_all()
+            .await
+            .expect("a terminating namespace must not fail the reconcile");
+
+        // Upstream sets ReplicaFailure only for real create failures — a quota
+        // denial, say. Not for this.
+        let observed: ReplicationController = storage
+            .get("/registry/replicationcontrollers/default/simpletest-rc")
+            .await
+            .unwrap();
+        let has_replica_failure = observed
+            .status
+            .as_ref()
+            .and_then(|st| st.conditions.as_ref())
+            .is_some_and(|cs| cs.iter().any(|c| c.condition_type == "ReplicaFailure"));
+        assert!(
+            !has_replica_failure,
+            "a terminating namespace must not raise ReplicaFailure"
+        );
+
+        // And it must stop rather than push the remaining batches at an
+        // api-server that is rejecting all of them: the first slow-start batch
+        // is 1, so exactly one attempt for a 20-replica RC.
+        assert_eq!(
+            storage.attempts(),
+            1,
+            "must abandon after the first rejected batch, not attempt all 20"
         );
     }
 }
