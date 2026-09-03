@@ -26,6 +26,35 @@ const REGISTRY_PREFIX: &str = "/registry/";
 /// floor on how fast a broken watch can drive rescans.
 const KICK_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// How many dependent operations the GC keeps in flight at once.
+///
+/// Upstream's `ConcurrentGCSyncs` default
+/// (pkg/controller/garbagecollector/config/v1alpha1/defaults.go:38), which is
+/// the number of `attemptToDelete` workers draining the dependent queue.
+///
+/// `orphanDependents` (garbagecollector.go:673-696) is in fact *unbounded* —
+/// one goroutine per dependent, then `wg.Wait()`. We use upstream's own worker
+/// count as the bound instead of copying the unbounded fan-out, because in
+/// direct-storage mode there is no client rate limiter underneath us to meter
+/// the result; 20 is the conservative choice that is still an upstream number.
+/// Either way the point stands: these operations must overlap. Serially, the
+/// 100 PATCHes the orphan conformance spec expects cost 100 round trips.
+const GC_CONCURRENT_SYNCS: usize = 20;
+
+/// One unit of dependent work discovered by the foreground walk.
+///
+/// The walk is sequential (it threads a `visited` set through an ownership
+/// graph that may contain cycles); the *I/O* is what has to overlap, so the
+/// walk records what to do and a second pass runs it concurrently. Upstream
+/// gets the same split for free: its graph builder enqueues nodes and 20
+/// `attemptToDelete` workers drain the queue in arbitrary order.
+enum DependentOp {
+    /// Delete this dependent — its only owner is going away.
+    Delete(String),
+    /// Keep the dependent, drop its reference to the owner being deleted.
+    StripOwnerRef(String, Value),
+}
+
 /// Garbage collector controller
 #[allow(dead_code)]
 pub struct GarbageCollector<S: Storage> {
@@ -53,6 +82,14 @@ pub struct GarbageCollector<S: Storage> {
     /// the api-server and the thing that starves a cascade of its own budget.
     /// Counted so a regression is a test failure rather than a slow nightly.
     list_passes: std::sync::atomic::AtomicUsize,
+    /// Dependent operations currently in flight, and the peak ever reached.
+    ///
+    /// The GC's deadline is set by how fast it can work through an owner's
+    /// dependents, so whether those operations overlap is a correctness
+    /// property, not a tuning detail — see [`GC_CONCURRENT_SYNCS`]. Counted
+    /// so a regression back to a serial loop is a test failure.
+    dependent_ops_inflight: Arc<std::sync::atomic::AtomicUsize>,
+    dependent_ops_peak: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<S: Storage + 'static> GarbageCollector<S> {
@@ -66,6 +103,8 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             max_retries: 3,
             pending_orphans: std::sync::Mutex::new(HashSet::new()),
             list_passes: std::sync::atomic::AtomicUsize::new(0),
+            dependent_ops_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            dependent_ops_peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -86,6 +125,8 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             max_retries: 3,
             pending_orphans: std::sync::Mutex::new(HashSet::new()),
             list_passes: std::sync::atomic::AtomicUsize::new(0),
+            dependent_ops_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            dependent_ops_peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -356,6 +397,13 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     #[cfg(test)]
     fn list_pass_count(&self) -> usize {
         self.list_passes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Highest number of dependent operations that were in flight at once.
+    #[cfg(test)]
+    fn peak_concurrent_dependent_ops(&self) -> usize {
+        self.dependent_ops_peak
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Get all resources from storage
@@ -854,13 +902,91 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         // `delete_dependents_foreground_visiting`.
         let all_resources = self.get_all_resources().await?;
         let mut visited = HashSet::new();
-        self.delete_dependents_foreground_visiting(
+        let mut ops = Vec::new();
+        self.collect_dependents_foreground_visiting(
             resource,
             dependent_map,
             &all_resources,
             &mut visited,
-        )
-        .await
+            &mut ops,
+        );
+
+        // Failures are logged, not propagated: the foreground finalizer is
+        // gated on `still_has_dependents` re-reading storage, so a lost write
+        // costs a scan, never correctness.
+        let _ = self.run_dependent_ops(ops).await;
+        Ok(())
+    }
+
+    /// Run collected dependent operations concurrently, returning one message
+    /// per operation that genuinely failed.
+    ///
+    /// Bounded at [`GC_CONCURRENT_SYNCS`]. `NotFound` is not a failure: every
+    /// caller works from a snapshot, so a dependent something else already
+    /// removed is expected — and either way it cannot still reference the
+    /// owner. Upstream skips it for the same reason (garbagecollector.go:691)
+    /// and collects the rest rather than returning on the first
+    /// (garbagecollector.go:697-706).
+    async fn run_dependent_ops(&self, ops: Vec<DependentOp>) -> Vec<String> {
+        use futures::future::join_all;
+        use std::sync::atomic::Ordering;
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(GC_CONCURRENT_SYNCS));
+        let mut tasks = Vec::with_capacity(ops.len());
+
+        for op in ops {
+            let sem = Arc::clone(&semaphore);
+            let storage = Arc::clone(&self.storage);
+            let inflight = Arc::clone(&self.dependent_ops_inflight);
+            let peak = Arc::clone(&self.dependent_ops_peak);
+
+            tasks.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.ok()?;
+
+                // Record the overlap. Whether these operations run at once is
+                // what decides if the GC meets its deadline, so a regression
+                // back to a serial walk should be a test failure rather than a
+                // slow nightly.
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+
+                let outcome = match &op {
+                    DependentOp::Delete(key) => match storage.delete(key).await {
+                        Ok(_) => None,
+                        Err(rusternetes_common::Error::NotFound(_)) => {
+                            debug!("Dependent {} already gone", key);
+                            None
+                        }
+                        Err(e) => {
+                            error!("Failed to delete dependent {}: {}", key, e);
+                            Some(format!("{key}: {e}"))
+                        }
+                    },
+                    DependentOp::StripOwnerRef(key, value) => {
+                        match storage.update_raw(key, value).await {
+                            Ok(()) => None,
+                            Err(rusternetes_common::Error::NotFound(_)) => {
+                                debug!("Dependent {} already gone, nothing to update", key);
+                                None
+                            }
+                            Err(e) => {
+                                error!("Failed to update dependent {}: {}", key, e);
+                                Some(format!("{key}: {e}"))
+                            }
+                        }
+                    }
+                };
+
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                outcome
+            }));
+        }
+
+        join_all(tasks)
+            .await
+            .into_iter()
+            .filter_map(|joined| joined.ok().flatten())
+            .collect()
     }
 
     /// Cycle-safe body of [`Self::delete_dependents_foreground`].
@@ -871,20 +997,21 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     /// circle" builds one deliberately — and without this the recursion never
     /// terminates: pod1 -> pod2 -> pod3 -> pod1 overflowed the stack and took
     /// the whole controller-manager process down with it.
-    async fn delete_dependents_foreground_visiting(
+    fn collect_dependents_foreground_visiting(
         &self,
         resource: &ResourceInfo,
         _dependent_map: &HashMap<String, Vec<String>>,
         all_resources: &[ResourceInfo],
         visited: &mut HashSet<String>,
-    ) -> rusternetes_common::Result<()> {
+        ops: &mut Vec<DependentOp>,
+    ) {
         let resource_uid = &resource.metadata.uid;
         if !visited.insert(resource_uid.clone()) {
             debug!(
                 "Foreground deletion: already descended into {} this pass (ownership cycle)",
                 resource.key
             );
-            return Ok(());
+            return;
         }
 
         // Find all resources that have this resource as an owner, from the
@@ -901,7 +1028,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
 
         if dependents.is_empty() {
             debug!("No dependents to delete for resource {}", resource.key);
-            return Ok(());
+            return;
         }
 
         info!(
@@ -942,13 +1069,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                             }
                         }
                     }
-                    if let Err(e) = self
-                        .storage
-                        .update_raw(&dependent.key, &dependent_value)
-                        .await
-                    {
-                        error!("Failed to update dependent {}: {}", dependent.key, e);
-                    }
+                    ops.push(DependentOp::StripOwnerRef(
+                        dependent.key.clone(),
+                        dependent_value,
+                    ));
                 } else if visited.contains(&dependent.metadata.uid) {
                     // Ownership cycle: this dependent is already on the walk, so
                     // it is the object whose own foreground deletion started it.
@@ -973,31 +1097,25 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                         dependent.key
                     );
 
-                    // Recursively handle foreground deletion for this dependent's dependents
+                    // Descend first so a dependent's own dependents are
+                    // recorded before it is. The ops themselves then run in
+                    // arbitrary order, exactly as upstream's 20 workers drain
+                    // their queue — deletion order is not what makes the
+                    // cascade correct; the finalizer gate in `process_deletion`
+                    // is.
                     let (_, sub_dependent_map) = self.build_relationship_maps(all_resources);
-                    Box::pin(self.delete_dependents_foreground_visiting(
+                    self.collect_dependents_foreground_visiting(
                         dependent,
                         &sub_dependent_map,
                         all_resources,
                         visited,
-                    ))
-                    .await?;
+                        ops,
+                    );
 
-                    match self.storage.delete(&dependent.key).await {
-                        Ok(_) => {}
-                        // The snapshot is from the start of the cascade, so a
-                        // dependent something else already removed is expected,
-                        // not an error.
-                        Err(rusternetes_common::Error::NotFound(_)) => {
-                            debug!("Dependent {} already gone", dependent.key);
-                        }
-                        Err(e) => error!("Failed to delete dependent {}: {}", dependent.key, e),
-                    }
+                    ops.push(DependentOp::Delete(dependent.key.clone()));
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Returns true if `owner_uid` still has a **blocking** dependent in
@@ -1069,51 +1187,78 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             resource.key
         );
 
-        // Remove owner references from each dependent
-        for dependent in dependents {
-            info!("Orphaning dependent {}", dependent.key);
+        // Build the patched objects first (pure, no I/O), then fan the writes
+        // out through the shared executor.
+        //
+        // Upstream starts one goroutine per dependent and waits for the lot
+        // (pkg/controller/garbagecollector/garbagecollector.go:673-696):
+        //
+        // ```text
+        // errCh := make(chan error, len(dependents))
+        // wg := sync.WaitGroup{}
+        // wg.Add(len(dependents))
+        // for i := range dependents {
+        //     go func(dependent *node) {
+        //         defer wg.Done()
+        //         ...
+        // ```
+        //
+        // That concurrency is load-bearing for the deadline, not an
+        // optimisation. The e2e spec budgets 120s to orphan 100 pods and its
+        // own comment (test/e2e/apimachinery/garbage_collector.go:410-416)
+        // explains why that is generous: 100 concurrent PATCHes metered by a
+        // 5 QPS client limiter is ~20s. One hundred *sequential* PATCHes is
+        // 100 round-trip latencies, which is what timed out `should orphan
+        // pods created by rc if delete options say so [Serial] [Conformance]`.
+        let ops: Vec<DependentOp> = dependents
+            .iter()
+            .map(|dependent| {
+                let mut dependent_value = dependent.value.clone();
 
-            // Parse the dependent's full object
-            let mut dependent_value = dependent.value.clone();
+                // Remove the owner reference to this resource
+                if let Some(metadata) = dependent_value.get_mut("metadata") {
+                    if let Some(owner_refs) = metadata.get_mut("ownerReferences") {
+                        if let Some(owner_refs_array) = owner_refs.as_array_mut() {
+                            // Filter out the owner reference matching this resource
+                            owner_refs_array.retain(|owner_ref| {
+                                owner_ref
+                                    .get("uid")
+                                    .and_then(|uid| uid.as_str())
+                                    .map(|uid| uid != resource_uid)
+                                    .unwrap_or(true)
+                            });
 
-            // Remove the owner reference to this resource
-            if let Some(metadata) = dependent_value.get_mut("metadata") {
-                if let Some(owner_refs) = metadata.get_mut("ownerReferences") {
-                    if let Some(owner_refs_array) = owner_refs.as_array_mut() {
-                        // Filter out the owner reference matching this resource
-                        owner_refs_array.retain(|owner_ref| {
-                            owner_ref
-                                .get("uid")
-                                .and_then(|uid| uid.as_str())
-                                .map(|uid| uid != resource_uid)
-                                .unwrap_or(true)
-                        });
-
-                        // If no more owner references, remove the field entirely
-                        if owner_refs_array.is_empty() {
-                            if let Some(metadata_obj) = metadata.as_object_mut() {
-                                metadata_obj.remove("ownerReferences");
+                            // If no more owner references, remove the field entirely
+                            if owner_refs_array.is_empty() {
+                                if let Some(metadata_obj) = metadata.as_object_mut() {
+                                    metadata_obj.remove("ownerReferences");
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // Update the dependent in storage
-            if let Err(e) = self
-                .storage
-                .update_raw(&dependent.key, &dependent_value)
-                .await
-            {
-                error!("Failed to orphan dependent {}: {}", dependent.key, e);
-                // Return error so the orphan finalizer is NOT removed.
-                // This prevents the race where the owner is deleted while
-                // dependents still have ownerReferences pointing to it.
-                return Err(rusternetes_common::Error::Internal(format!(
-                    "Failed to orphan dependent {}: {}",
-                    dependent.key, e
-                )));
-            }
+                DependentOp::StripOwnerRef(dependent.key.clone(), dependent_value)
+            })
+            .collect();
+
+        let failures = self.run_dependent_ops(ops).await;
+
+        // Every dependent is attempted before anything is reported, as upstream
+        // does with its buffered errCh, `wg.Wait()` and `NewAggregate`
+        // (garbagecollector.go:697-706). Returning on the first failure left
+        // the remaining dependents still pointing at an owner that was about to
+        // be deleted.
+        //
+        // A non-empty result means the orphan finalizer stays on, so the owner
+        // is not deleted while a dependent still references it.
+        if !failures.is_empty() {
+            return Err(rusternetes_common::Error::Internal(format!(
+                "failed to orphan {} dependent(s) of {}: {}",
+                failures.len(),
+                resource.key,
+                failures.join("; ")
+            )));
         }
 
         Ok(())
@@ -2627,6 +2772,245 @@ mod tests {
         assert!(
             storage.get::<Value>(key).await.is_err(),
             "namespace must be removed once spec.finalizers is empty"
+        );
+    }
+
+    /// Every dependent operation blocks for a beat, so a serial loop cannot
+    /// hide behind a fast in-memory backend.
+    struct SlowStorage {
+        inner: Arc<MemoryStorage>,
+    }
+
+    impl SlowStorage {
+        fn new(inner: Arc<MemoryStorage>) -> Self {
+            Self { inner }
+        }
+
+        async fn stall() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for SlowStorage {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.create(key, value).await
+        }
+
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update(key, value).await
+        }
+
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            Self::stall().await;
+            self.inner.update_raw(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            Self::stall().await;
+            self.inner.delete(key).await
+        }
+
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list(prefix).await
+        }
+
+        async fn watch(
+            &self,
+            prefix: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    /// Seed an owner marked for deletion under `policy`, plus `count`
+    /// dependents pointing at it. Returns the storage the GC should run on.
+    async fn seed_owner_with_dependents(
+        policy: &str,
+        count: usize,
+        block_owner_deletion: bool,
+    ) -> Arc<SlowStorage> {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(SlowStorage::new(Arc::new(MemoryStorage::new())));
+
+        let owner_uid = "fanout-rc-uid";
+        let mut rc_meta = ObjectMeta::new("simpletest.rc");
+        rc_meta.namespace = Some("default".to_string());
+        rc_meta.uid = owner_uid.to_string();
+        rc_meta.deletion_timestamp = Some(chrono::Utc::now());
+        rc_meta.finalizers = Some(vec![policy.to_string()]);
+        let rc = serde_json::json!({
+            "apiVersion": "v1", "kind": "ReplicationController",
+            "metadata": serde_json::to_value(&rc_meta).unwrap(),
+            "spec": {"replicas": count},
+        });
+        storage
+            .create(
+                "/registry/replicationcontrollers/default/simpletest.rc",
+                &rc,
+            )
+            .await
+            .unwrap();
+
+        for i in 0..count {
+            let name = format!("fanout-pod-{i}");
+            let mut meta = ObjectMeta::new(name.clone());
+            meta.namespace = Some("default".to_string());
+            meta.uid = format!("{name}-uid");
+            meta.owner_references = Some(vec![OwnerReference {
+                api_version: "v1".to_string(),
+                kind: "ReplicationController".to_string(),
+                name: "simpletest.rc".to_string(),
+                uid: owner_uid.to_string(),
+                controller: Some(true),
+                block_owner_deletion: Some(block_owner_deletion),
+            }]);
+            let pod = Pod {
+                type_meta: TypeMeta {
+                    kind: "Pod".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: meta,
+                spec: None,
+                status: None,
+            };
+            storage
+                .create(&format!("/registry/pods/default/{name}"), &pod)
+                .await
+                .unwrap();
+        }
+
+        storage
+    }
+
+    /// Orphaning an owner's dependents must fan out, not walk them one at a
+    /// time.
+    ///
+    /// Upstream starts **one goroutine per dependent** and waits for the lot
+    /// (`pkg/controller/garbagecollector/garbagecollector.go:673-696`):
+    ///
+    /// ```text
+    /// errCh := make(chan error, len(dependents))
+    /// wg := sync.WaitGroup{}
+    /// wg.Add(len(dependents))
+    /// for i := range dependents {
+    ///     go func(dependent *node) {
+    ///         defer wg.Done()
+    ///         ...
+    ///         _, err = gc.patch(dependent, p, ...)
+    /// ```
+    ///
+    /// This is load-bearing for the deadline, and the e2e test says so in as
+    /// many words (`test/e2e/apimachinery/garbage_collector.go:410-416`):
+    ///
+    /// ```text
+    /// // Orphaning the 100 pods takes 100 PATCH operations. The default qps of
+    /// // a client is 5. If the qps is saturated, it will take 20s to orphan
+    /// // the pods.
+    /// ```
+    ///
+    /// 100 PATCHes concurrently, paced by the client limiter, is ~20s against
+    /// a 180s budget. 100 PATCHes serially is 100 round-trip latencies, and
+    /// that is what timed out `should orphan pods created by rc if delete
+    /// options say so [Serial] [Conformance]` on the kine leg.
+    #[tokio::test]
+    async fn orphan_dependents_fan_out_instead_of_walking_serially() {
+        const DEPENDENTS: usize = 20;
+        let storage = seed_owner_with_dependents("orphan", DEPENDENTS, false).await;
+        let gc = GarbageCollector::new(storage.clone());
+
+        gc.scan_and_collect().await.unwrap();
+
+        // The work still has to be correct: every pod keeps living, with the
+        // owner reference stripped.
+        let pods: Vec<serde_json::Value> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(pods.len(), DEPENDENTS, "orphaned pods must survive");
+        for pod in &pods {
+            let refs = pod.get("metadata").and_then(|m| m.get("ownerReferences"));
+            assert!(
+                refs.is_none() || refs.unwrap().as_array().is_some_and(|a| a.is_empty()),
+                "owner reference must be stripped, got {refs:?}"
+            );
+        }
+
+        let peak = gc.peak_concurrent_dependent_ops();
+        assert!(
+            peak >= DEPENDENTS / 2,
+            "orphaning {DEPENDENTS} dependents peaked at {peak} concurrent operations; \
+             upstream issues one per dependent at once, and a serial walk (peak 1) is \
+             what blows the conformance deadline"
+        );
+    }
+
+    /// The foreground cascade has the same problem and the same fix: upstream
+    /// runs `ConcurrentGCSyncs` = 20 `attemptToDelete` workers
+    /// (`pkg/controller/garbagecollector/config/v1alpha1/defaults.go:38`), so
+    /// dependent deletes overlap rather than queueing behind each other.
+    ///
+    /// Guards `should keep the rc around until all its pods are deleted if the
+    /// deleteOptions says so [Serial] [Conformance]`, which fails the same way
+    /// when the cascade is serial.
+    #[tokio::test]
+    async fn foreground_cascade_deletes_dependents_concurrently() {
+        const DEPENDENTS: usize = 20;
+        let storage = seed_owner_with_dependents("foregroundDeletion", DEPENDENTS, true).await;
+        let gc = GarbageCollector::new(storage.clone());
+
+        gc.scan_and_collect().await.unwrap();
+
+        let pods: Vec<serde_json::Value> = storage
+            .list("/registry/pods/default/")
+            .await
+            .unwrap_or_default();
+        assert!(
+            pods.is_empty(),
+            "the cascade must still delete every dependent, {} left",
+            pods.len()
+        );
+
+        let peak = gc.peak_concurrent_dependent_ops();
+        assert!(
+            peak >= DEPENDENTS / 2,
+            "foreground cascade of {DEPENDENTS} dependents peaked at {peak} concurrent \
+             deletes; upstream runs 20 workers over the same queue"
         );
     }
 }
