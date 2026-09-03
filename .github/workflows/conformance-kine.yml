@@ -65,12 +65,23 @@ jobs:
     #     poll for the namespace OBJECT to disappear within 60s (90s for the
     #     pod variant) - see test/e2e/apimachinery/namespace.go:131-139 and
     #     :188-196; despite their names neither asserts anything about orphan
-    #     collection. They failed because we accepted CREATE into a Terminating
+    #     collection. One cause was that we accepted CREATE into a Terminating
     #     namespace, so a ReplicationController the namespace deleter had not
     #     reached yet kept recreating the pods it had just deleted. A namespace
     #     holding 100 pods took 158s to go away, with the pod count RISING
-    #     mid-drain. Fixed in #1849 by porting upstream's NamespaceLifecycle
-    #     admission; 158s -> 36s.
+    #     mid-drain. #1849 ported upstream's NamespaceLifecycle admission and
+    #     took that synthetic case 158s -> 36s.
+    #
+    #     It is NOT sufficient: both specs STILL FAIL on the full target
+    #     (run 33640845357, `main`, 89/94), with the same
+    #     "timed out waiting for the condition" at namespace.go:133 and :190
+    #     after 124s and 133s. They pass in a FOCUSED run on an idle cluster
+    #     and fail in the full 95-spec run, so do not verify these two with a
+    #     focused run - the cluster state and concurrent load are part of what
+    #     they measure. Hydrophone's own namespace teardown went 6-8+ min ->
+    #     81s under full load (3s focused): a real improvement, still over the
+    #     60-90s budget. #1846 is reopened; #1850 (DeleteCollection instead of
+    #     N sequential per-object deletes) is the leading remaining candidate.
     #
     #   * The two `Garbage collector` specs never reach GC code at all. They
     #     fail in setup, waiting for `rc.Status.Replicas` to reach
