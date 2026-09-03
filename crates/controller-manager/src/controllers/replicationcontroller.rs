@@ -369,12 +369,44 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 
         let mut create_failure: Option<String> = None;
         if current_replicas < desired_replicas {
-            // Need to create more pods
-            let to_create = desired_replicas - current_replicas;
-            for i in 0..to_create {
-                if let Err(e) = self.create_pod(rc, i).await {
-                    error!("Failed to create pod for RC {}: {}", rc.metadata.name, e);
-                    create_failure = Some(e.to_string());
+            // Create the missing pods in upstream's slow-start batches, every
+            // pod within a batch concurrently — `slowStartBatch` spawns a
+            // goroutine per pod and waits for the batch
+            // (pkg/controller/replicaset/replica_set.go:826-835).
+            //
+            // Serially, this loop could not keep up: `create_pod` is a
+            // ServiceAccount GET, a ResourceQuota LIST and the pod CREATE, and
+            // on the kine leg those measured ~4s in total, so 100 replicas
+            // needed ~400s against the conformance specs' 120s
+            // `replicaSyncTimeout`. Three `[sig-api-machinery] Garbage
+            // collector` specs failed in setup on `rc.Status.Replicas (0)`
+            // never reaching `Spec.Replicas (100)` (#1847).
+            let to_create = (desired_replicas - current_replicas) as usize;
+            let mut created = 0usize;
+            for batch in slow_start_batches(to_create, SLOW_START_INITIAL_BATCH_SIZE) {
+                let results = futures::future::join_all(
+                    (0..batch).map(|i| self.create_pod(rc, (created + i) as i32)),
+                )
+                .await;
+
+                let mut batch_failure = None;
+                for result in results {
+                    match result {
+                        Ok(()) => created += 1,
+                        Err(e) => {
+                            error!("Failed to create pod for RC {}: {}", rc.metadata.name, e);
+                            batch_failure.get_or_insert_with(|| e.to_string());
+                        }
+                    }
+                }
+
+                // Upstream stops at the first failing batch and reports what
+                // succeeded (`replica_set.go:838-840`), rather than pushing
+                // the remaining rounds at an api-server that is already
+                // rejecting — the next reconcile retries from the new count.
+                if let Some(e) = batch_failure {
+                    create_failure = Some(e);
+                    break;
                 }
             }
         } else if current_replicas > desired_replicas {
@@ -808,6 +840,32 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         Ok(())
     }
 }
+
+/// How many pods to create per round, following upstream's `slowStartBatch`
+/// (pkg/controller/replicaset/replica_set.go:820-844): start at
+/// `initial_batch_size`, double each round, and cap every batch at what
+/// remains.
+///
+/// Upstream states the round count as
+/// `1+floor(log_2(ceil(N/SlowStartInitialBatchSize)))`
+/// (pkg/controller/controller_utils.go:84-86) — 7 rounds for 100 pods rather
+/// than 100. The doubling is a damage bound as much as a speed-up: when
+/// creates are being rejected (quota, admission) the first failing round costs
+/// one create, not N.
+fn slow_start_batches(count: usize, initial_batch_size: usize) -> Vec<usize> {
+    let mut batches = Vec::new();
+    let mut remaining = count;
+    let mut batch = initial_batch_size.min(remaining);
+    while batch > 0 {
+        batches.push(batch);
+        remaining -= batch;
+        batch = (2 * batch).min(remaining);
+    }
+    batches
+}
+
+/// Upstream's `SlowStartInitialBatchSize` (pkg/controller/controller_utils.go).
+const SLOW_START_INITIAL_BATCH_SIZE: usize = 1;
 
 #[cfg(test)]
 mod tests {
@@ -1515,6 +1573,209 @@ mod tests {
             pods_after_second.len(),
             2,
             "Should still have 2 pods — RC must match its own pods on second reconcile"
+        );
+    }
+
+    /// Pod creates must go out in upstream's slow-start batches, not one at a
+    /// time.
+    ///
+    /// Upstream `slowStartBatch`
+    /// (pkg/controller/replicaset/replica_set.go:820-844) starts at
+    /// `SlowStartInitialBatchSize` and doubles each round, capping each batch
+    /// at what remains, and creates every pod WITHIN a batch concurrently.
+    /// The doubling is what bounds the damage when creates are being rejected
+    /// (a quota denial costs one create, not N) while still reaching a large
+    /// replica count in a logarithmic number of rounds.
+    ///
+    /// This matters because our creates are not cheap. Measured on the kine
+    /// leg (run 33750828466), `create_pod` takes ~4s — a ServiceAccount GET, a
+    /// ResourceQuota LIST and the pod CREATE, at ~1.3s per api call — so a
+    /// serial loop needs ~400s for 100 replicas. The conformance specs give
+    /// `replicaSyncTimeout` 120s (garbage_collector.go:128), which is why
+    /// three `[sig-api-machinery] Garbage collector` specs fail in setup on
+    /// `rc.Status.Replicas (0)` never reaching `Spec.Replicas (100)` (#1847).
+    /// Batched, the same 100 creates take 7 rounds instead of 100.
+    #[test]
+    fn slow_start_batches_double_and_cap_at_remaining() {
+        // Upstream's worked example: 100 pods from an initial batch of 1.
+        assert_eq!(
+            slow_start_batches(100, 1),
+            vec![1, 2, 4, 8, 16, 32, 37],
+            "batches double until the tail is capped by what remains"
+        );
+        assert_eq!(slow_start_batches(100, 1).iter().sum::<usize>(), 100);
+
+        // Round counts follow upstream's 1+floor(log2(ceil(N/initial)))
+        // (controller_utils.go:84-86): 100 pods is 7 rounds, not 100.
+        assert_eq!(slow_start_batches(100, 1).len(), 7);
+
+        assert_eq!(slow_start_batches(5, 1), vec![1, 2, 2]);
+        assert_eq!(slow_start_batches(1, 1), vec![1]);
+        assert!(slow_start_batches(0, 1).is_empty(), "nothing to create");
+
+        // A larger initial batch is still capped by the count.
+        assert_eq!(slow_start_batches(3, 8), vec![3]);
+    }
+
+    /// Wraps `MemoryStorage` and records how many pod creates are in flight at
+    /// once, so a test can tell a batched implementation from a serial one.
+    /// Every other method delegates straight through.
+    struct ConcurrencyProbeStorage {
+        inner: Arc<MemoryStorage>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak_in_flight: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ConcurrencyProbeStorage {
+        fn new(inner: Arc<MemoryStorage>) -> Self {
+            Self {
+                inner,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                peak_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn peak(&self) -> usize {
+            self.peak_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rusternetes_storage::Storage for ConcurrencyProbeStorage {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            if !key.starts_with("/registry/pods/") {
+                return self.inner.create(key, value).await;
+            }
+            use std::sync::atomic::Ordering;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_in_flight.fetch_max(now, Ordering::SeqCst);
+            // Hold the slot open across an await so overlapping creates are
+            // actually observable; a serial loop can never exceed 1.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let out = self.inner.create(key, value).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            out
+        }
+
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update(key, value).await
+        }
+
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.inner.update_raw(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list(prefix).await
+        }
+
+        async fn watch(
+            &self,
+            prefix: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    /// One reconcile must bring a 100-replica RC all the way to 100 pods AND
+    /// issue those creates concurrently.
+    ///
+    /// This is the behavioural guard for the slow-start port; the sizes are
+    /// pinned separately by
+    /// [`slow_start_batches_double_and_cap_at_remaining`]. A future change that
+    /// reverts to `for i in 0..to_create { create_pod(..).await }` still
+    /// converges and would pass an outcome-only test, but it drops the peak
+    /// in-flight count to exactly 1 — which is what actually broke the
+    /// conformance specs, because serial creates at ~1.3s per api call need
+    /// ~400s for 100 pods against a 120s `replicaSyncTimeout` (#1847).
+    #[tokio::test]
+    async fn rc_creates_all_replicas_in_one_reconcile_and_concurrently() {
+        let inner = Arc::new(MemoryStorage::new());
+        let storage = Arc::new(ConcurrencyProbeStorage::new(inner));
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "batched".to_string());
+        let rc = make_rc("simpletest-rc", "default", 100, selector, None);
+        storage
+            .create(
+                "/registry/replicationcontrollers/default/simpletest-rc",
+                &rc,
+            )
+            .await
+            .unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(
+            pods.len(),
+            100,
+            "one reconcile must create every missing replica, not one per pass"
+        );
+
+        // The load-bearing assertion: a serial loop peaks at exactly 1.
+        assert!(
+            storage.peak() > 1,
+            "pod creates must overlap; peak in-flight was {} (serial implementation?)",
+            storage.peak()
+        );
+
+        // Deliberately not asserting peak == the batch size. `create_pod`
+        // awaits a ServiceAccount GET and a ResourceQuota LIST before the
+        // create, so futures in a batch interleave at those earlier awaits and
+        // the peak *create* overlap is a lower bound on the batch width.
+
+        let observed: ReplicationController = storage
+            .get("/registry/replicationcontrollers/default/simpletest-rc")
+            .await
+            .unwrap();
+        assert_eq!(
+            observed.status.as_ref().map(|st| st.replicas),
+            Some(100),
+            "status.replicas must reach spec.replicas — this is what \
+             garbage_collector.go:1174 waits on"
         );
     }
 }
