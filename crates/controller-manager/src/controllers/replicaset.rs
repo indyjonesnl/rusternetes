@@ -1,34 +1,12 @@
+use super::expectations::ControllerExpectations;
 use futures::StreamExt;
 use rusternetes_common::{
     resources::{Pod, PodStatus, ReplicaSet, ReplicaSetStatus},
     types::{ObjectMeta, Phase},
 };
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WatchEvent, WorkQueue};
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::Instant;
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
-
-/// How long an unmet expectation is honored before it is considered stale and
-/// the controller is allowed to act again. Mirrors upstream
-/// `ExpectationsTimeout` (5 minutes) — a safety net so a create/delete event
-/// that is never observed (e.g. dropped watch) cannot wedge a ReplicaSet
-/// forever.
-const EXPECTATIONS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-
-/// Pending pod create/delete operations a ReplicaSet has issued but not yet
-/// observed via the pod watch. Mirrors upstream
-/// `ControllerExpectations` (k8s pkg/controller/controller_utils.go).
-#[derive(Debug)]
-struct Expectation {
-    /// Number of creations still expected to be observed (counts down to 0).
-    add: i64,
-    /// Number of deletions still expected to be observed.
-    del: i64,
-    /// When the expectation was last set, for staleness expiry.
-    timestamp: Instant,
-}
 
 /// ReplicaSetController reconciles ReplicaSet resources
 /// A ReplicaSet ensures that a specified number of pod replicas are running at any given time
@@ -41,7 +19,13 @@ pub struct ReplicaSetController<S: Storage> {
     /// create/delete is reflected in a `list` — the read-after-write window of
     /// the storage backend. Without this, preemption churn made a replicas=1
     /// ReplicaSet spawn ~8 pods in 400ms (#542).
-    expectations: Arc<Mutex<HashMap<String, Expectation>>>,
+    ///
+    /// Shared implementation in [`super::expectations`], ported from upstream
+    /// `ControllerExpectations` (pkg/controller/controller_utils.go:150-300).
+    /// This controller previously carried a private copy with the same
+    /// semantics; it was extracted so the ReplicationController could use the
+    /// same brake rather than the codebase growing a third copy.
+    expectations: Arc<ControllerExpectations>,
 }
 
 impl<S: Storage + 'static> ReplicaSetController<S> {
@@ -49,7 +33,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         Self {
             storage,
             interval: Duration::from_secs(interval_secs),
-            expectations: Arc::new(Mutex::new(HashMap::new())),
+            expectations: Arc::new(ControllerExpectations::new()),
         }
     }
 
@@ -67,49 +51,29 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
     /// must NOT issue further creates/deletes — it is still waiting to observe
     /// the pods from its previous action.
     fn expectations_satisfied(&self, key: &str) -> bool {
-        let map = self.expectations.lock().unwrap();
-        match map.get(key) {
-            None => true,
-            Some(exp) => {
-                (exp.add <= 0 && exp.del <= 0) || exp.timestamp.elapsed() > EXPECTATIONS_TIMEOUT
-            }
-        }
+        self.expectations.satisfied(key)
     }
 
     /// Record that the controller is about to create `adds` and delete `dels`
     /// pods; reconciliation is then gated until they are observed.
     fn set_expectations(&self, key: &str, adds: i64, dels: i64) {
-        let mut map = self.expectations.lock().unwrap();
-        map.insert(
-            key.to_string(),
-            Expectation {
-                add: adds,
-                del: dels,
-                timestamp: Instant::now(),
-            },
-        );
+        self.expectations.set_expectations(key, adds, dels);
     }
 
     /// Lower the outstanding-create count after observing a pod creation (or
     /// after a create call failed, so we don't wait on a pod that never lands).
     fn observe_creation(&self, key: &str) {
-        let mut map = self.expectations.lock().unwrap();
-        if let Some(exp) = map.get_mut(key) {
-            exp.add -= 1;
-        }
+        self.expectations.creation_observed(key);
     }
 
     /// Lower the outstanding-delete count after observing a pod deletion.
     fn observe_deletion(&self, key: &str) {
-        let mut map = self.expectations.lock().unwrap();
-        if let Some(exp) = map.get_mut(key) {
-            exp.del -= 1;
-        }
+        self.expectations.deletion_observed(key);
     }
 
     /// Drop all expectations for a ReplicaSet (e.g. when it is deleted).
     fn clear_expectations(&self, key: &str) {
-        self.expectations.lock().unwrap().remove(key);
+        self.expectations.delete_expectations(key);
     }
 
     pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
