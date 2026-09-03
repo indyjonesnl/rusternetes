@@ -444,7 +444,8 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 // `replicaSyncTimeout`. Three `[sig-api-machinery] Garbage
                 // collector` specs failed in setup on `rc.Status.Replicas (0)`
                 // never reaching `Spec.Replicas (100)` (#1847).
-                let to_create = (desired_replicas - current_replicas) as usize;
+                let to_create =
+                    ((desired_replicas - current_replicas) as usize).min(BURST_REPLICAS);
                 // Record the creates before issuing them, so a reconcile triggered
                 // by our own pod-create watch events does not re-issue the batch
                 // (upstream `ExpectCreations`, replica_set.go:619).
@@ -502,10 +503,11 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 }
             } else if current_replicas > desired_replicas {
                 // Need to delete excess pods
-                let to_delete = current_replicas - desired_replicas;
+                let to_delete =
+                    ((current_replicas - desired_replicas) as usize).min(BURST_REPLICAS);
                 self.expectations
                     .expect_deletions(&rc_key, to_delete as i64);
-                for pod in rc_pods.iter().take(to_delete as usize) {
+                for pod in rc_pods.iter().take(to_delete) {
                     self.delete_pod(&pod.metadata.name, namespace).await?;
                 }
             }
@@ -1034,6 +1036,19 @@ fn is_namespace_terminating_rejection(err: &rusternetes_common::Error) -> bool {
     };
     message.contains("NamespaceTerminating") || message.contains("because it is being terminated")
 }
+
+/// Most pods one sync will create or delete for a single ReplicationController.
+///
+/// Upstream's `BurstReplicas` (pkg/controller/replicaset/replica_set.go:72),
+/// applied to the diff in both directions (`:611-612` creates, `:653-654`
+/// deletes).
+///
+/// Slow-start batching does not bound this on its own — its batches double
+/// without limit — so without the cap one large object can issue an unbounded
+/// burst at an api-server it shares with every other client. The cap is a
+/// throttle rather than a ceiling: whatever is left is created by the next
+/// sync.
+const BURST_REPLICAS: usize = 500;
 
 /// Upstream's `SlowStartInitialBatchSize` (pkg/controller/controller_utils.go).
 const SLOW_START_INITIAL_BATCH_SIZE: usize = 1;
@@ -2217,6 +2232,63 @@ mod tests {
             pods.len(),
             10,
             "once expectations are satisfied the controller must create the replicas"
+        );
+    }
+
+    /// A single sync creates at most `BURST_REPLICAS` pods, and the next sync
+    /// picks up the rest.
+    ///
+    /// Upstream caps the diff in both directions before doing anything with it:
+    ///
+    /// ```text
+    /// if diff > rsc.burstReplicas {
+    ///     diff = rsc.burstReplicas
+    /// }
+    /// ```
+    ///
+    /// (pkg/controller/replicaset/replica_set.go:611-612 for creates, :653-654
+    /// for deletes; `BurstReplicas = 500` at :72.)
+    ///
+    /// The cap bounds what one object can do to the api-server in one sync.
+    /// Slow-start batching alone does not: its batches double without limit, so
+    /// a single large RC can otherwise issue an unbounded burst — and this
+    /// controller shares an api-server with every other client, including the
+    /// conformance suite whose own rate limiter starved during run
+    /// 33762395978.
+    #[tokio::test]
+    async fn rc_caps_creates_at_burst_replicas_and_finishes_next_sync() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "burst".to_string());
+        let desired = BURST_REPLICAS as i32 + 100;
+        let rc = make_rc("simpletest-rc", "default", desired, selector, None);
+        storage
+            .create(
+                "/registry/replicationcontrollers/default/simpletest-rc",
+                &rc,
+            )
+            .await
+            .unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(
+            pods.len(),
+            BURST_REPLICAS,
+            "one sync must not exceed the burst cap"
+        );
+
+        // The cap is a throttle, not a ceiling: the next sync finishes the job.
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(
+            pods.len(),
+            desired as usize,
+            "the following sync must create the remainder"
         );
     }
 }
