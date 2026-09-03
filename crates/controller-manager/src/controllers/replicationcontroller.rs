@@ -743,9 +743,9 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
     ) -> rusternetes_common::Result<()> {
         let namespace = rc.metadata.namespace.as_deref().unwrap_or("default");
 
-        // K8s uses <rc-name>-<5-char-random> to keep pod names under 63 chars
-        let suffix: String = uuid::Uuid::new_v4().to_string().chars().take(5).collect();
-        let pod_name = format!("{}-{}", rc.metadata.name, suffix);
+        // Name is generated per attempt below, so a collision can be retried
+        // under a new one (upstream `createWithGenerateNameRetry`).
+        let pod_name = generate_pod_name(&rc.metadata.name);
 
         let mut metadata = ObjectMeta::new(&pod_name);
         metadata.namespace = Some(namespace.to_string());
@@ -842,15 +842,45 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             .await
             .map_err(|e| rusternetes_common::Error::Forbidden(e.to_string()))?;
 
-        let key = build_key("pods", Some(namespace), &pod_name);
-        self.storage.create(&key, &pod).await?;
+        // Retry a name collision under a freshly generated name, as upstream's
+        // api-server does for `generateName` objects
+        // (registry/generic/registry/store.go:463-470). Our controllers write
+        // pods with a client-side name rather than through the generateName
+        // path, so the retry has to live here.
+        //
+        // Any other error is returned to the caller on the first attempt: only
+        // AlreadyExists is worth a new name.
+        let mut attempt_name = pod_name;
+        for attempt in 0..MAX_NAME_GENERATION_CREATE_ATTEMPTS {
+            pod.metadata.name = attempt_name.clone();
+            let key = build_key("pods", Some(namespace), &attempt_name);
+            match self.storage.create(&key, &pod).await {
+                Ok(_) => {
+                    info!(
+                        "Created pod {}/{} for replicationcontroller {}",
+                        namespace, attempt_name, rc.metadata.name
+                    );
+                    return Ok(());
+                }
+                Err(rusternetes_common::Error::AlreadyExists(_))
+                    if attempt + 1 < MAX_NAME_GENERATION_CREATE_ATTEMPTS =>
+                {
+                    debug!(
+                        "Pod name {}/{} already taken, regenerating (attempt {})",
+                        namespace,
+                        attempt_name,
+                        attempt + 1
+                    );
+                    attempt_name = generate_pod_name(&rc.metadata.name);
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
-        info!(
-            "Created pod {}/{} for replicationcontroller {}",
-            namespace, pod_name, rc.metadata.name
-        );
-
-        Ok(())
+        Err(rusternetes_common::Error::AlreadyExists(format!(
+            "could not generate a free pod name for {}/{} after {} attempts",
+            namespace, rc.metadata.name, MAX_NAME_GENERATION_CREATE_ATTEMPTS
+        )))
     }
 
     async fn delete_pod(&self, name: &str, namespace: &str) -> rusternetes_common::Result<()> {
@@ -1035,6 +1065,45 @@ fn is_namespace_terminating_rejection(err: &rusternetes_common::Error) -> bool {
         return false;
     };
     message.contains("NamespaceTerminating") || message.contains("because it is being terminated")
+}
+
+/// How many times a create is retried under a freshly generated name when the
+/// name collides.
+///
+/// Upstream's `maxNameGenerationCreateAttempts`
+/// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:440),
+/// whose comment gives the arithmetic that makes this mandatory rather than
+/// defensive:
+///
+/// ```text
+/// Without retry, a 0.1% probability occurs at ~500
+/// generated names and a 50% probability occurs at ~4500
+/// generated names.
+/// ```
+const MAX_NAME_GENERATION_CREATE_ATTEMPTS: usize = 8;
+
+/// Alphabet for generated name suffixes.
+///
+/// Upstream's `utilrand.String` alphabet
+/// (staging/src/k8s.io/apiserver/pkg/storage/names/generate.go:53, via
+/// k8s.io/apimachinery/pkg/util/rand): 27 consonants and digits, chosen to
+/// avoid accidentally spelling words. It also matters for collisions — 27^5 is
+/// ~14.3M names against ~1M for the 5 hex characters this previously took from
+/// a UUID, i.e. a 14x larger space before the retry above is even needed.
+const NAME_SUFFIX_ALPHABET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
+
+/// Length of a generated name suffix. Upstream's `randomLength`
+/// (`generate.go:45`).
+const NAME_SUFFIX_LENGTH: usize = 5;
+
+/// A `<base>-<suffix>` name, as upstream's `simpleNameGenerator` builds it.
+fn generate_pod_name(base: &str) -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let suffix: String = (0..NAME_SUFFIX_LENGTH)
+        .map(|_| NAME_SUFFIX_ALPHABET[rng.random_range(0..NAME_SUFFIX_ALPHABET.len())] as char)
+        .collect();
+    format!("{base}-{suffix}")
 }
 
 /// Most pods one sync will create or delete for a single ReplicationController.
@@ -2289,6 +2358,167 @@ mod tests {
             pods.len(),
             desired as usize,
             "the following sync must create the remainder"
+        );
+    }
+
+    /// Fails the first `n` pod creates with AlreadyExists, then behaves. Stands
+    /// in for a generated pod name colliding with one already in the namespace.
+    struct NameCollisionStorage {
+        inner: Arc<MemoryStorage>,
+        remaining_collisions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NameCollisionStorage {
+        fn new(inner: Arc<MemoryStorage>, collisions: usize) -> Self {
+            Self {
+                inner,
+                remaining_collisions: std::sync::atomic::AtomicUsize::new(collisions),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rusternetes_storage::Storage for NameCollisionStorage {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            use std::sync::atomic::Ordering;
+            if key.starts_with("/registry/pods/")
+                && self
+                    .remaining_collisions
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                        if n > 0 {
+                            Some(n - 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .is_ok()
+            {
+                return Err(rusternetes_common::Error::AlreadyExists(format!(
+                    "pods {key} already exists"
+                )));
+            }
+            self.inner.create(key, value).await
+        }
+
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update(key, value).await
+        }
+
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.inner.update_raw(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list(prefix).await
+        }
+
+        async fn watch(
+            &self,
+            prefix: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    /// A generated pod name that collides must be retried with a new name, not
+    /// reported as a failure.
+    ///
+    /// Upstream retries the create up to `maxNameGenerationCreateAttempts` (8),
+    /// generating a fresh name each time
+    /// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:431-470).
+    /// Its comment gives the arithmetic that makes this mandatory rather than
+    /// defensive:
+    ///
+    /// ```text
+    /// Without retry, a 0.1% probability occurs at ~500
+    /// generated names and a 50% probability occurs at ~4500
+    /// generated names.
+    /// ```
+    ///
+    /// This is not hypothetical here. `rc_caps_creates_at_burst_replicas_and_
+    /// finishes_next_sync` creates 500 pods in one namespace and failed in CI
+    /// with 254 of them — a collision killed the batch — while passing locally.
+    #[tokio::test]
+    async fn rc_retries_pod_create_when_the_generated_name_collides() {
+        let inner = Arc::new(MemoryStorage::new());
+        // Three collisions in a row: within upstream's budget of 8.
+        let storage = Arc::new(NameCollisionStorage::new(inner, 3));
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "collide".to_string());
+        let rc = make_rc("simpletest-rc", "default", 1, selector, None);
+        storage
+            .create(
+                "/registry/replicationcontrollers/default/simpletest-rc",
+                &rc,
+            )
+            .await
+            .unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(
+            pods.len(),
+            1,
+            "the create must be retried under a new name, not abandoned"
+        );
+
+        // And it must not be reported as a replica failure: nothing is wrong
+        // with this RC.
+        let observed: ReplicationController = storage
+            .get("/registry/replicationcontrollers/default/simpletest-rc")
+            .await
+            .unwrap();
+        let has_replica_failure = observed
+            .status
+            .as_ref()
+            .and_then(|st| st.conditions.as_ref())
+            .is_some_and(|cs| cs.iter().any(|c| c.condition_type == "ReplicaFailure"));
+        assert!(
+            !has_replica_failure,
+            "a retried name collision is not a ReplicaFailure"
         );
     }
 }
