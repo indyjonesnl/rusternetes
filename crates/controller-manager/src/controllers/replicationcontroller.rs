@@ -1616,4 +1616,166 @@ mod tests {
         // A larger initial batch is still capped by the count.
         assert_eq!(slow_start_batches(3, 8), vec![3]);
     }
+
+    /// Wraps `MemoryStorage` and records how many pod creates are in flight at
+    /// once, so a test can tell a batched implementation from a serial one.
+    /// Every other method delegates straight through.
+    struct ConcurrencyProbeStorage {
+        inner: Arc<MemoryStorage>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak_in_flight: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ConcurrencyProbeStorage {
+        fn new(inner: Arc<MemoryStorage>) -> Self {
+            Self {
+                inner,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                peak_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn peak(&self) -> usize {
+            self.peak_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rusternetes_storage::Storage for ConcurrencyProbeStorage {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            if !key.starts_with("/registry/pods/") {
+                return self.inner.create(key, value).await;
+            }
+            use std::sync::atomic::Ordering;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_in_flight.fetch_max(now, Ordering::SeqCst);
+            // Hold the slot open across an await so overlapping creates are
+            // actually observable; a serial loop can never exceed 1.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let out = self.inner.create(key, value).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            out
+        }
+
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update(key, value).await
+        }
+
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.inner.update_raw(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list(prefix).await
+        }
+
+        async fn watch(
+            &self,
+            prefix: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    /// One reconcile must bring a 100-replica RC all the way to 100 pods AND
+    /// issue those creates concurrently.
+    ///
+    /// This is the behavioural guard for the slow-start port; the sizes are
+    /// pinned separately by
+    /// [`slow_start_batches_double_and_cap_at_remaining`]. A future change that
+    /// reverts to `for i in 0..to_create { create_pod(..).await }` still
+    /// converges and would pass an outcome-only test, but it drops the peak
+    /// in-flight count to exactly 1 — which is what actually broke the
+    /// conformance specs, because serial creates at ~1.3s per api call need
+    /// ~400s for 100 pods against a 120s `replicaSyncTimeout` (#1847).
+    #[tokio::test]
+    async fn rc_creates_all_replicas_in_one_reconcile_and_concurrently() {
+        let inner = Arc::new(MemoryStorage::new());
+        let storage = Arc::new(ConcurrencyProbeStorage::new(inner));
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "batched".to_string());
+        let rc = make_rc("simpletest-rc", "default", 100, selector, None);
+        storage
+            .create(
+                "/registry/replicationcontrollers/default/simpletest-rc",
+                &rc,
+            )
+            .await
+            .unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(
+            pods.len(),
+            100,
+            "one reconcile must create every missing replica, not one per pass"
+        );
+
+        // The load-bearing assertion: a serial loop peaks at exactly 1.
+        assert!(
+            storage.peak() > 1,
+            "pod creates must overlap; peak in-flight was {} (serial implementation?)",
+            storage.peak()
+        );
+
+        // Deliberately not asserting peak == the batch size. `create_pod`
+        // awaits a ServiceAccount GET and a ResourceQuota LIST before the
+        // create, so futures in a batch interleave at those earlier awaits and
+        // the peak *create* overlap is a lower bound on the batch width.
+
+        let observed: ReplicationController = storage
+            .get("/registry/replicationcontrollers/default/simpletest-rc")
+            .await
+            .unwrap();
+        assert_eq!(
+            observed.status.as_ref().map(|st| st.replicas),
+            Some(100),
+            "status.replicas must reach spec.replicas — this is what \
+             garbage_collector.go:1174 waits on"
+        );
+    }
 }
