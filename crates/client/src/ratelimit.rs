@@ -7,14 +7,28 @@
 //! component raises it — controller-manager 20/30, kubelet 50/100,
 //! kube-proxy 5/10.
 //!
-//! This exists to stop one component starving every other client of the
-//! api-server. Upstream's `slowStartBatch` and `burstReplicas = 500` are only
-//! safe because this limiter meters the resulting requests out underneath
-//! them; without it, "at most 500 pods per sync" becomes "up to 500 concurrent
-//! requests as fast as the runtime can issue them". Observed on the kine leg:
-//! three `[sig-api-machinery] Garbage collector` specs failed with
-//! `client rate limiter Wait returned an error: context deadline exceeded` —
-//! the *test's* limiter, starved of api-server capacity by ours.
+//! This limiter is the governor that upstream's concurrent controller paths
+//! are written against, not a standalone safety net. Two examples of the
+//! pairing, both of which we port:
+//!
+//! - `slowStartBatch` with `burstReplicas = 500` (`replica_set.go`) means "at
+//!   most 500 pods per sync". Without a limiter underneath, that becomes "up
+//!   to 500 requests as fast as the runtime can issue them".
+//! - `orphanDependents` (`garbagecollector.go:673-696`) starts **one goroutine
+//!   per dependent**, unbounded, and `wg.Wait()`s. The e2e test that exercises
+//!   it says so explicitly
+//!   (`test/e2e/apimachinery/garbage_collector.go:410-416`):
+//!
+//! ```text
+//! // Orphaning the 100 pods takes 100 PATCH operations. The default qps of
+//! // a client is 5. If the qps is saturated, it will take 20s to orphan
+//! // the pods.
+//! ```
+//!
+//! That "20s" is the limiter doing its job: the fan-out is unbounded and the
+//! limiter is the only thing metering it. Port one without the other and you
+//! get either a serial controller that misses its deadline, or a burst that
+//! buries the api-server.
 //!
 //! Watches are deliberately NOT throttled, matching client-go:
 //!
