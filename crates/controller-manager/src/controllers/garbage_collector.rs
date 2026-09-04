@@ -985,7 +985,14 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         join_all(tasks)
             .await
             .into_iter()
-            .filter_map(|joined| joined.ok().flatten())
+            .filter_map(|joined| match joined {
+                Ok(outcome) => outcome,
+                // A JoinError carries no per-operation outcome, so it cannot be
+                // read as success. Swallowing it would drop the owner's
+                // finalizer while a dependent still references it — the exact
+                // race the aggregate below exists to prevent.
+                Err(e) => Some(format!("dependent task did not complete: {e}")),
+            })
             .collect()
     }
 
@@ -3011,6 +3018,105 @@ mod tests {
             peak >= DEPENDENTS / 2,
             "foreground cascade of {DEPENDENTS} dependents peaked at {peak} concurrent \
              deletes; upstream runs 20 workers over the same queue"
+        );
+    }
+
+    /// A dependent operation that panics must count as a failure, not as
+    /// success.
+    ///
+    /// `run_dependent_ops` joins spawned tasks, and a `JoinError` (panic or
+    /// cancellation) carries no per-op outcome. Treating it as "nothing went
+    /// wrong" removes the `orphan` finalizer while the dependent still
+    /// references the owner — precisely the race the aggregate-error path
+    /// exists to prevent, and the reason upstream reports every dependent's
+    /// error rather than the first (garbagecollector.go:697-706).
+    ///
+    /// The dead `delete_batch_with_retry` in this same file already gets this
+    /// right (`Task panicked: {}`), which is what makes the omission an
+    /// oversight rather than a decision.
+    #[tokio::test]
+    async fn a_panicking_dependent_op_is_reported_not_swallowed() {
+        struct PanicOnUpdate {
+            inner: Arc<MemoryStorage>,
+        }
+
+        #[async_trait::async_trait]
+        impl Storage for PanicOnUpdate {
+            async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.create(key, value).await
+            }
+            async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+            where
+                T: serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.get(key).await
+            }
+            async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.update(key, value).await
+            }
+            async fn update_raw(
+                &self,
+                _key: &str,
+                _value: &serde_json::Value,
+            ) -> rusternetes_common::Result<()> {
+                panic!("dependent write blew up");
+            }
+            async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+                self.inner.delete(key).await
+            }
+            async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.list(prefix).await
+            }
+            async fn watch(
+                &self,
+                prefix: &str,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch(prefix).await
+            }
+            async fn watch_from_revision(
+                &self,
+                prefix: &str,
+                revision: i64,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch_from_revision(prefix, revision).await
+            }
+            async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+                self.inner.current_revision().await
+            }
+            async fn is_revision_compacted(
+                &self,
+                revision: i64,
+            ) -> rusternetes_common::Result<bool> {
+                self.inner.is_revision_compacted(revision).await
+            }
+        }
+
+        let storage = Arc::new(PanicOnUpdate {
+            inner: Arc::new(MemoryStorage::new()),
+        });
+        let gc = GarbageCollector::new(storage);
+
+        let failures = gc
+            .run_dependent_ops(vec![DependentOp::StripOwnerRef(
+                "/registry/pods/default/boom".to_string(),
+                serde_json::json!({"metadata": {"name": "boom"}}),
+            )])
+            .await;
+
+        assert_eq!(
+            failures.len(),
+            1,
+            "a panicking dependent op must be reported as a failure so the \
+             orphan finalizer stays on; got {failures:?}"
         );
     }
 }
