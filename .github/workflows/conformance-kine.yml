@@ -44,57 +44,63 @@ concurrency:
 
 jobs:
   run:
-    # Measured against rhino on the same commit (aa6b25ac, 2026-09-02), so a
-    # reviewer can tell a real change from the known gap:
+    # kine sig-api-machinery on main, most recent first. Re-measure before
+    # treating any of these as current; a [Serial] failure set rotates, so a
+    # single run is a data point, not a verdict.
     #
-    #   target             kine    rhino
-    #   sig-api-machinery  91/94   95/95
-    #   sig-apps           59/60   60/60
-    #   sig-storage        91/91   91/91
+    #   ref         run           result   note
+    #   fac97fb7    33842493018   93/2     GC fan-out (#1858) + panic fix (#1861)
+    #   a2f9ed00    33816713163   87/8     REVERTED state - see the throttle note
+    #   b6401c71    33806856684   92/3     expectations brake (#1854) landed
+    #   aa6b25ac    -             91/4     the original "before" column
     #
-    # The numbers above PREDATE #1845/#1848/#1849 and are kept only as the
-    # "before" column; re-measure before treating them as current.
+    # For contrast on the same 2026-09-02 commit: rhino ran sig-api-machinery
+    # 95/95, sig-apps 60/60, sig-storage 91/91. kine ran sig-apps 59/60 and
+    # sig-storage 91/91.
     #
-    # Every kine-only failure is a [Serial] deletion/GC spec, and the failure
-    # class is ours, not kine's. But they do NOT share one cause, and the
-    # single-cause story this comment used to tell ("our GC is a polling scan
-    # whose interval backs off 5->60s ... so orphan collection can take ~65s")
-    # was wrong. It was investigated on 2026-09-02 (#1846) and splits in two:
+    # What is actually fixed, and by what:
     #
-    #   * The two `Namespaces [Serial]` specs were NOT a GC timing race. Both
-    #     poll for the namespace OBJECT to disappear within 60s (90s for the
-    #     pod variant) - see test/e2e/apimachinery/namespace.go:131-139 and
-    #     :188-196; despite their names neither asserts anything about orphan
-    #     collection. One cause was that we accepted CREATE into a Terminating
-    #     namespace, so a ReplicationController the namespace deleter had not
-    #     reached yet kept recreating the pods it had just deleted. A namespace
-    #     holding 100 pods took 158s to go away, with the pod count RISING
-    #     mid-drain. #1849 ported upstream's NamespaceLifecycle admission and
-    #     took that synthetic case 158s -> 36s.
+    #   * Both `Namespaces [Serial]` specs pass (#1846, closed on two
+    #     consecutive full runs). #1849 ported upstream's NamespaceLifecycle
+    #     admission so a CREATE into a Terminating namespace is refused; that
+    #     was necessary but NOT sufficient. #1854 finished it with upstream's
+    #     expectations brake, which stops the RC re-issuing creates it has
+    #     already issued but not yet observed - the loop that kept a draining
+    #     namespace's pod count from reaching zero.
     #
-    #     It is NOT sufficient: both specs STILL FAIL on the full target
-    #     (run 33640845357, `main`, 89/94), with the same
-    #     "timed out waiting for the condition" at namespace.go:133 and :190
-    #     after 124s and 133s. They pass in a FOCUSED run on an idle cluster
-    #     and fail in the full 95-spec run, so do not verify these two with a
-    #     focused run - the cluster state and concurrent load are part of what
-    #     they measure. Hydrophone's own namespace teardown went 6-8+ min ->
-    #     81s under full load (3s focused): a real improvement, still over the
-    #     60-90s budget. #1846 is reopened; #1850 (DeleteCollection instead of
-    #     N sequential per-object deletes) is the leading remaining candidate.
+    #   * `should orphan pods created by rc if delete options say so` and
+    #     `should keep the rc around until all its pods are deleted` pass as of
+    #     #1858. They were NOT a kine-specific timing quirk: our GC walked an
+    #     owner's dependents serially, so orphaning 100 pods cost 100 round
+    #     trips against a 120s budget. Upstream fans out one goroutine per
+    #     dependent (garbagecollector.go:673-696) and the e2e spec's own
+    #     comment (test/e2e/apimachinery/garbage_collector.go:410-416) says the
+    #     budget assumes exactly that.
     #
-    #   * The two `Garbage collector` specs never reach GC code at all. They
-    #     fail in setup, waiting for `rc.Status.Replicas` to reach
-    #     `Spec.Replicas` (garbage_collector.go:1174) while all 100 pods are
-    #     demonstrably Running - i.e. the RC never publishes its status on the
-    #     kine path. Tracked in #1847, still open.
+    #   * #1847 (rc.status.replicas stuck at 0, killing two specs in setup) no
+    #     longer reproduces: garbage_collector.go:1174 appears zero times in
+    #     the last three runs.
     #
-    # "Why kine crosses those budgets where rhino does not" is now partly
-    # answered, and the answer was never about GC cadence: on rhino the same
-    # namespace teardown takes 2.7s and all four focused specs pass, against
-    # 6-8+ minutes on kine (both `main`, both built from source). Measured, not
-    # assumed - the earlier claim that "rhino fails 0 of these" had never been
-    # run.
+    # Still failing:
+    #
+    #   * `should not delete dependents that have both valid owner and owner
+    #     that's waiting for dependents to be deleted` - the tightest budget of
+    #     the three at 90s, and the only GC spec #1858 did not clear.
+    #
+    #   * `ValidatingAdmissionPolicy ... API operations` failed once, in the
+    #     93/2 run only (1 of 6). Watch-event delivery, not admission. Not yet
+    #     classified as flake or regression - see #1865.
+    #
+    # A cautionary note, because it cost five hours of runner time: #1856 added
+    # client-side rate limiting using upstream's controller-manager value of 20
+    # QPS, and applied it to the ONE ApiClient all 31 controllers share.
+    # Upstream gives each controller its own client and therefore its own
+    # bucket (clientbuilder/client_builder.go:40-47 clones the config;
+    # rest/config.go:370-381 builds a fresh limiter per client), so that was a
+    # ~31x under-provision. It regressed this leg to 87/8 and left teardown
+    # running 3.5 hours until the 300-minute job timeout, which surfaces as
+    # `cancelled` rather than `failed`. Reverted in #1862; #1863 tracks the
+    # correct re-land.
     #
     # Two theories were measured and REFUTED; do not repeat either without new
     # evidence. (1) kine churning watches and starving the control loop: on an
@@ -105,8 +111,16 @@ jobs:
     # were api-server DELETEs correctly refused while `spec.finalizers`
     # remained (#1848 stopped the GC from issuing them).
     #
-    # Lesson for whoever reads this next: a spec's NAME is not its assertion.
-    # Read the spec source before attributing its failure to a mechanism.
+    # A third is worth adding to that list: the failures were long attributed
+    # to GC scan cadence backing off 5->60s. That was wrong too. The cost was
+    # serial dependent I/O, not poll latency.
+    #
+    # Lesson for whoever reads this next: a spec's NAME is not its assertion,
+    # and its ERROR TEXT is not its cause. These specs reported
+    # `client rate limiter Wait returned an error`, which reads like the
+    # suite being starved of api-server capacity. It was not - that is
+    # x/time/rate declining a token because the poll's own deadline was
+    # already nearly up. Read the spec source.
     #
     # The engine is NON-GATING, so these show as reported numbers rather than a
     # red job. Treat a DROP from the table above as the signal.
