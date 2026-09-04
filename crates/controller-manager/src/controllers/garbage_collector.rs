@@ -41,6 +41,18 @@ const KICK_DEBOUNCE: Duration = Duration::from_millis(250);
 /// 100 PATCHes the orphan conformance spec expects cost 100 round trips.
 const GC_CONCURRENT_SYNCS: usize = 20;
 
+/// Attempts allowed for a dependent write that loses a write race.
+///
+/// Upstream's `retry.DefaultRetry`
+/// (staging/src/k8s.io/client-go/util/retry/util.go:28-33), used with
+/// `RetryOnConflict` (`:103-105`) wherever a controller does
+/// read-modify-write against an object something else may be writing.
+const GC_CONFLICT_RETRY_ATTEMPTS: usize = 5;
+
+/// Delay between those attempts. Upstream's `DefaultRetry.Duration`, with
+/// `Factor: 1.0` — a flat 10ms, not a backoff.
+const GC_CONFLICT_RETRY_DELAY: Duration = Duration::from_millis(10);
+
 /// One unit of dependent work discovered by the foreground walk.
 ///
 /// The walk is sequential (it threads a `visited` set through an ownership
@@ -52,7 +64,13 @@ enum DependentOp {
     /// Delete this dependent — its only owner is going away.
     Delete(String),
     /// Keep the dependent, drop its reference to the owner being deleted.
-    StripOwnerRef(String, Value),
+    ///
+    /// Carries the owner's uid rather than a precomputed object: the new value
+    /// is derived from a *fresh* read at execution time. Building it from the
+    /// scan snapshot meant writing a stale object over whatever the kubelet had
+    /// written in the meantime — which the api-server rejects outright, see
+    /// [`GarbageCollector::run_dependent_ops`].
+    StripOwnerRef { key: String, owner_uid: String },
 }
 
 /// Garbage collector controller
@@ -962,18 +980,76 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                             Some(format!("{key}: {e}"))
                         }
                     },
-                    DependentOp::StripOwnerRef(key, value) => {
-                        match storage.update_raw(key, value).await {
-                            Ok(()) => None,
-                            Err(rusternetes_common::Error::NotFound(_)) => {
-                                debug!("Dependent {} already gone, nothing to update", key);
-                                None
-                            }
-                            Err(e) => {
-                                error!("Failed to update dependent {}: {}", key, e);
-                                Some(format!("{key}: {e}"))
+                    DependentOp::StripOwnerRef { key, owner_uid } => {
+                        // Read-modify-write against a FRESH read, retrying if we
+                        // lose the race.
+                        //
+                        // Upstream does not need this: it PATCHes away the one
+                        // ownerReference
+                        // (`GenerateDeleteOwnerRefStrategicMergeBytes`,
+                        // pkg/controller/controller_ref_manager.go:572-589), so a
+                        // concurrent write to an unrelated field is not a conflict
+                        // at all. Our `Storage` trait has no patch verb, so this
+                        // ports upstream's other sanctioned answer for
+                        // read-modify-write — `retry.RetryOnConflict` with
+                        // `DefaultRetry` (client-go/util/retry/util.go:28-33,
+                        // 103-105).
+                        //
+                        // Building the object from the scan snapshot instead cost
+                        // a conformance spec: the kubelet writes pod status
+                        // continuously, so the snapshot was stale by the time the
+                        // write landed and the api-server refused it. A failed
+                        // strip leaves the dependent pointing at the owner, which
+                        // keeps `still_has_dependents` true and pins the owner's
+                        // `foregroundDeletion` finalizer until a later scan.
+                        let mut outcome = None;
+                        for attempt in 0..GC_CONFLICT_RETRY_ATTEMPTS {
+                            let current: Value = match storage.get(key).await {
+                                Ok(v) => v,
+                                Err(rusternetes_common::Error::NotFound(_)) => {
+                                    debug!("Dependent {} already gone, nothing to strip", key);
+                                    break;
+                                }
+                                Err(e) => {
+                                    error!("Failed to read dependent {}: {}", key, e);
+                                    outcome = Some(format!("{key}: {e}"));
+                                    break;
+                                }
+                            };
+
+                            let stripped = without_owner_ref(current, owner_uid);
+                            match storage.update_raw(key, &stripped).await {
+                                Ok(()) => {
+                                    outcome = None;
+                                    break;
+                                }
+                                Err(rusternetes_common::Error::NotFound(_)) => {
+                                    debug!("Dependent {} already gone, nothing to strip", key);
+                                    outcome = None;
+                                    break;
+                                }
+                                Err(rusternetes_common::Error::Conflict(msg))
+                                    if attempt + 1 < GC_CONFLICT_RETRY_ATTEMPTS =>
+                                {
+                                    debug!(
+                                        "Lost a write race stripping {} from {} \
+                                         (attempt {}): {}",
+                                        owner_uid,
+                                        key,
+                                        attempt + 1,
+                                        msg
+                                    );
+                                    outcome = Some(format!("{key}: {msg}"));
+                                    tokio::time::sleep(GC_CONFLICT_RETRY_DELAY).await;
+                                }
+                                Err(e) => {
+                                    error!("Failed to update dependent {}: {}", key, e);
+                                    outcome = Some(format!("{key}: {e}"));
+                                    break;
+                                }
                             }
                         }
+                        outcome
                     }
                 };
 
@@ -1063,23 +1139,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                         "Dependent {} has other valid owners, removing reference to {}",
                         dependent.key, resource.key
                     );
-                    let mut dependent_value = dependent.value.clone();
-                    if let Some(metadata) = dependent_value.get_mut("metadata") {
-                        if let Some(owner_refs_val) = metadata.get_mut("ownerReferences") {
-                            if let Some(arr) = owner_refs_val.as_array_mut() {
-                                arr.retain(|oref| {
-                                    oref.get("uid")
-                                        .and_then(|u| u.as_str())
-                                        .map(|u| u != resource_uid)
-                                        .unwrap_or(true)
-                                });
-                            }
-                        }
-                    }
-                    ops.push(DependentOp::StripOwnerRef(
-                        dependent.key.clone(),
-                        dependent_value,
-                    ));
+                    ops.push(DependentOp::StripOwnerRef {
+                        key: dependent.key.clone(),
+                        owner_uid: resource_uid.clone(),
+                    });
                 } else if visited.contains(&dependent.metadata.uid) {
                     // Ownership cycle: this dependent is already on the walk, so
                     // it is the object whose own foreground deletion started it.
@@ -1219,33 +1282,9 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         // pods created by rc if delete options say so [Serial] [Conformance]`.
         let ops: Vec<DependentOp> = dependents
             .iter()
-            .map(|dependent| {
-                let mut dependent_value = dependent.value.clone();
-
-                // Remove the owner reference to this resource
-                if let Some(metadata) = dependent_value.get_mut("metadata") {
-                    if let Some(owner_refs) = metadata.get_mut("ownerReferences") {
-                        if let Some(owner_refs_array) = owner_refs.as_array_mut() {
-                            // Filter out the owner reference matching this resource
-                            owner_refs_array.retain(|owner_ref| {
-                                owner_ref
-                                    .get("uid")
-                                    .and_then(|uid| uid.as_str())
-                                    .map(|uid| uid != resource_uid)
-                                    .unwrap_or(true)
-                            });
-
-                            // If no more owner references, remove the field entirely
-                            if owner_refs_array.is_empty() {
-                                if let Some(metadata_obj) = metadata.as_object_mut() {
-                                    metadata_obj.remove("ownerReferences");
-                                }
-                            }
-                        }
-                    }
-                }
-
-                DependentOp::StripOwnerRef(dependent.key.clone(), dependent_value)
+            .map(|dependent| DependentOp::StripOwnerRef {
+                key: dependent.key.clone(),
+                owner_uid: resource_uid.clone(),
             })
             .collect();
 
@@ -1591,6 +1630,34 @@ fn kind_to_plural(kind: &str) -> &str {
 /// has no dependency-graph informer to make GC fully event-driven (tracked in
 /// #1039), so a scan-based GC approximates "silent when idle" (#1040) by
 /// stretching the poll interval when there is nothing to collect.
+/// The object with any ownerReference whose uid is `owner_uid` removed.
+///
+/// Drops `metadata.ownerReferences` entirely once it is empty, so a dependent
+/// that has lost its last owner reads as "no owner" rather than "owner list of
+/// length zero" — `find_orphans` treats those differently, and an object with
+/// no ownerReferences is not garbage.
+fn without_owner_ref(mut object: Value, owner_uid: &str) -> Value {
+    if let Some(metadata) = object.get_mut("metadata") {
+        if let Some(owner_refs) = metadata.get_mut("ownerReferences") {
+            if let Some(arr) = owner_refs.as_array_mut() {
+                arr.retain(|owner_ref| {
+                    owner_ref
+                        .get("uid")
+                        .and_then(|uid| uid.as_str())
+                        .map(|uid| uid != owner_uid)
+                        .unwrap_or(true)
+                });
+                if arr.is_empty() {
+                    if let Some(metadata_obj) = metadata.as_object_mut() {
+                        metadata_obj.remove("ownerReferences");
+                    }
+                }
+            }
+        }
+    }
+    object
+}
+
 /// Whether an object keeps unfinished finalizers in `spec`, where
 /// [`ObjectMeta::has_finalizers`] cannot see them.
 ///
@@ -3100,16 +3167,29 @@ mod tests {
             }
         }
 
-        let storage = Arc::new(PanicOnUpdate {
-            inner: Arc::new(MemoryStorage::new()),
-        });
+        // The object must exist: the executor reads before it writes, so a
+        // missing key would short-circuit before reaching the panicking write.
+        let inner = Arc::new(MemoryStorage::new());
+        inner
+            .create(
+                "/registry/pods/default/boom",
+                &serde_json::json!({
+                    "metadata": {
+                        "name": "boom", "uid": "boom-uid",
+                        "ownerReferences": [{"uid": "gone-uid", "name": "gone"}]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let storage = Arc::new(PanicOnUpdate { inner });
         let gc = GarbageCollector::new(storage);
 
         let failures = gc
-            .run_dependent_ops(vec![DependentOp::StripOwnerRef(
-                "/registry/pods/default/boom".to_string(),
-                serde_json::json!({"metadata": {"name": "boom"}}),
-            )])
+            .run_dependent_ops(vec![DependentOp::StripOwnerRef {
+                key: "/registry/pods/default/boom".to_string(),
+                owner_uid: "gone-uid".to_string(),
+            }])
             .await;
 
         assert_eq!(
@@ -3118,5 +3198,168 @@ mod tests {
             "a panicking dependent op must be reported as a failure so the \
              orphan finalizer stays on; got {failures:?}"
         );
+    }
+
+    /// Stripping an ownerReference must survive a concurrent write to the
+    /// dependent.
+    ///
+    /// The GC used to build the new object from the scan snapshot and write it
+    /// whole. On a live cluster the kubelet is writing pod status the entire
+    /// time, so by the time the write lands the stored resourceVersion has
+    /// moved and the api-server rejects it:
+    ///
+    /// ```text
+    /// Conflict: the object has been modified; please apply your changes to the
+    /// latest version of simpletest-rc-to-be-deleted-gnk9l
+    /// (stored resourceVersion: 7906, provided: 7830)
+    /// ```
+    ///
+    /// That is not cosmetic. A failed strip leaves the dependent pointing at
+    /// the owner, so `still_has_dependents` stays true and the owner keeps its
+    /// `foregroundDeletion` finalizer until some later scan retries. Measured
+    /// on run 33842493018: the owner was finally deleted at 06:36:39.9, and
+    /// `should not delete dependents that have both valid owner and owner
+    /// that's waiting for dependents to be deleted [Serial] [Conformance]`
+    /// gave up at 06:36:43.5 — missed by less than one poll interval.
+    ///
+    /// Upstream never hits this because it PATCHes away the single
+    /// ownerReference rather than rewriting the object
+    /// (`GenerateDeleteOwnerRefStrategicMergeBytes`,
+    /// pkg/controller/controller_ref_manager.go:572-589), so a concurrent
+    /// status write is not a conflict at all. Our `Storage` trait has no patch
+    /// verb, so this ports upstream's other sanctioned answer for
+    /// read-modify-write, `retry.RetryOnConflict` with `DefaultRetry`
+    /// (staging/src/k8s.io/client-go/util/retry/util.go:28-33, 103-105).
+    #[tokio::test]
+    async fn stripping_an_owner_ref_retries_on_conflict() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ConflictOnce {
+            inner: Arc<MemoryStorage>,
+            conflicts_left: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl Storage for ConflictOnce {
+            async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.create(key, value).await
+            }
+            async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+            where
+                T: serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.get(key).await
+            }
+            async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.update(key, value).await
+            }
+            async fn update_raw(
+                &self,
+                key: &str,
+                value: &serde_json::Value,
+            ) -> rusternetes_common::Result<()> {
+                if self
+                    .conflicts_left
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                        if n > 0 {
+                            Some(n - 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .is_ok()
+                {
+                    return Err(rusternetes_common::Error::Conflict(
+                        "the object has been modified; please apply your changes to the \
+                         latest version (stored resourceVersion: 7906, provided: 7830)"
+                            .to_string(),
+                    ));
+                }
+                self.inner.update_raw(key, value).await
+            }
+            async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+                self.inner.delete(key).await
+            }
+            async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.list(prefix).await
+            }
+            async fn watch(
+                &self,
+                prefix: &str,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch(prefix).await
+            }
+            async fn watch_from_revision(
+                &self,
+                prefix: &str,
+                revision: i64,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch_from_revision(prefix, revision).await
+            }
+            async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+                self.inner.current_revision().await
+            }
+            async fn is_revision_compacted(
+                &self,
+                revision: i64,
+            ) -> rusternetes_common::Result<bool> {
+                self.inner.is_revision_compacted(revision).await
+            }
+        }
+
+        let inner = Arc::new(MemoryStorage::new());
+        let key = "/registry/pods/default/p1";
+        inner
+            .create(
+                key,
+                &serde_json::json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": {
+                        "name": "p1", "namespace": "default", "uid": "p1-uid",
+                        "ownerReferences": [
+                            {"apiVersion": "v1", "kind": "ReplicationController",
+                             "name": "rc1", "uid": "rc1-uid", "blockOwnerDeletion": true},
+                            {"apiVersion": "v1", "kind": "ReplicationController",
+                             "name": "rc2", "uid": "rc2-uid"}
+                        ]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Two conflicts in a row, inside upstream's budget of 5 attempts.
+        let storage = Arc::new(ConflictOnce {
+            inner: inner.clone(),
+            conflicts_left: AtomicUsize::new(2),
+        });
+        let gc = GarbageCollector::new(storage);
+
+        let failures = gc
+            .run_dependent_ops(vec![DependentOp::StripOwnerRef {
+                key: key.to_string(),
+                owner_uid: "rc1-uid".to_string(),
+            }])
+            .await;
+
+        assert!(
+            failures.is_empty(),
+            "a conflict must be retried, not reported as a failure to orphan: {failures:?}"
+        );
+
+        // And the strip must actually have happened, keeping the other owner.
+        let stored: serde_json::Value = inner.get(key).await.unwrap();
+        let refs = stored["metadata"]["ownerReferences"].as_array().unwrap();
+        assert_eq!(refs.len(), 1, "only the target owner should be removed");
+        assert_eq!(refs[0]["uid"], "rc2-uid", "the surviving owner must be rc2");
     }
 }
