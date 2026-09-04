@@ -195,24 +195,14 @@ async fn run_api_mode(args: Args) -> Result<()> {
 
     // The CA validates the server's TLS cert; client cert/key (when the
     // kubeconfig provides them) authenticate this component via mTLS (#1578).
-    let client = Arc::new(
-        ApiClient::with_tls(
-            &args.api_server_url,
-            insecure,
-            ca_pem.clone(),
-            client_cert.map(|p| p.into_bytes()),
-            client_key.map(|p| p.into_bytes()),
-            None,
-        )?
-        // Upstream kube-controller-manager's defaults
-        // (pkg/controller/apis/config/v1alpha1/defaults.go:59, 62). Without a
-        // client limiter, batched pod creation saturates the api-server and
-        // starves other clients — including the conformance suite's own.
-        .with_rate_limit(
-            rusternetes_client::ratelimit::CONTROLLER_MANAGER_QPS,
-            rusternetes_client::ratelimit::CONTROLLER_MANAGER_BURST,
-        ),
-    );
+    let client = Arc::new(ApiClient::with_tls(
+        &args.api_server_url,
+        insecure,
+        ca_pem.clone(),
+        client_cert.map(|p| p.into_bytes()),
+        client_key.map(|p| p.into_bytes()),
+        None,
+    )?);
     let config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
         // Route HPA metric fetches through the same kubeconfig-derived
