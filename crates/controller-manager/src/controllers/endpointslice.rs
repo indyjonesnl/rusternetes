@@ -24,6 +24,15 @@ use tracing::{debug, error, info};
 /// This ensures that pods only appear in EndpointSlices with the ports
 /// they actually serve, fixing the conformance test failure where pods
 /// were incorrectly associated with all service ports.
+/// Services reconciled at once within a namespace.
+///
+/// Upstream's `ConcurrentServiceEndpointSyncs` default
+/// (pkg/controller/endpointslice/config/v1alpha1/defaults.go:35), the number
+/// of workers draining its service workqueue. Tunable there from 1 to 50 via
+/// `--concurrent-service-endpoint-syncs`
+/// (cmd/kube-controller-manager/app/options/endpointslicecontroller.go:28-45).
+const CONCURRENT_SERVICE_ENDPOINT_SYNCS: usize = 5;
+
 pub struct EndpointSliceController<S: Storage> {
     storage: Arc<S>,
 }
@@ -461,15 +470,53 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
         let mut service_names: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
 
+        // Group by namespace so the namespace's pods are fetched once and
+        // reused by every service in it.
+        //
+        // This used to LIST every pod in the namespace per service. Measured on
+        // a live kine cluster after a conformance run: 154 `latency-svc-*`
+        // services in one namespace, walked at ~1 service per 1.2s. The sweep
+        // could not finish inside its own 5s resync, kept the storage backend
+        // at ~1013% CPU serving the repeated LISTs, and starved the rest of the
+        // controller-manager badly enough that 335 namespaces sat in
+        // Terminating with zero drain progress over 60s.
+        //
+        // Upstream reads pods from a shared informer cache and reconciles
+        // services from a rate-limited workqueue with
+        // `ConcurrentServiceEndpointSyncs` = 5 workers
+        // (endpointslice/config/v1alpha1/defaults.go:35). We are still a sweep
+        // rather than event-driven, but we no longer pay a LIST per service and
+        // no longer walk them one at a time.
+        let mut by_namespace: std::collections::BTreeMap<&str, Vec<&Service>> =
+            std::collections::BTreeMap::new();
         for service in &services {
             let ns = service.metadata.namespace.as_deref().unwrap_or("default");
             service_names.insert((ns.to_string(), service.metadata.name.clone()));
+            by_namespace.entry(ns).or_default().push(service);
+        }
 
-            if let Err(e) = self.reconcile_service(service).await {
-                error!(
-                    "Failed to reconcile endpointslices for service {}/{}: {}",
-                    ns, service.metadata.name, e
-                );
+        for (ns, ns_services) in by_namespace {
+            let all_pods: Vec<Pod> = self
+                .storage
+                .list(&build_prefix("pods", Some(ns)))
+                .await
+                .unwrap_or_default();
+
+            for chunk in ns_services.chunks(CONCURRENT_SERVICE_ENDPOINT_SYNCS) {
+                let results = futures::future::join_all(
+                    chunk
+                        .iter()
+                        .map(|service| self.reconcile_service_with_pods(service, &all_pods)),
+                )
+                .await;
+                for (service, result) in chunk.iter().zip(results) {
+                    if let Err(e) = result {
+                        error!(
+                            "Failed to reconcile endpointslices for service {}/{}: {}",
+                            ns, service.metadata.name, e
+                        );
+                    }
+                }
             }
         }
 
@@ -614,7 +661,30 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
     }
 
     /// Reconcile EndpointSlices for a single Service
+    /// Reconcile one service, fetching the namespace's pods itself.
+    ///
+    /// Used by the watch-driven path, which reconciles one service in
+    /// response to an event and so legitimately needs its own read. The sweep
+    /// uses [`Self::reconcile_service_with_pods`] instead, so a namespace full
+    /// of services costs one pod LIST rather than one per service.
     async fn reconcile_service(&self, service: &Service) -> Result<()> {
+        let namespace = service.metadata.namespace.as_deref().unwrap_or("default");
+        let all_pods: Vec<Pod> = self
+            .storage
+            .list(&build_prefix("pods", Some(namespace)))
+            .await
+            .unwrap_or_default();
+        self.reconcile_service_with_pods(service, &all_pods).await
+    }
+
+    /// Reconcile one service against an already-fetched pod set for its
+    /// namespace.
+    ///
+    /// Upstream reads pods from a shared informer cache rather than listing
+    /// per service (pkg/controller/endpointslice/endpointslice_controller.go);
+    /// this is the same property — fetch once, reuse across every service that
+    /// shares the namespace.
+    async fn reconcile_service_with_pods(&self, service: &Service, all_pods: &[Pod]) -> Result<()> {
         let namespace = service.metadata.namespace.as_deref().unwrap_or("default");
         let service_name = &service.metadata.name;
 
@@ -640,12 +710,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             namespace, service_name
         );
 
-        // Find all pods matching the service's label selector
-        let all_pods: Vec<Pod> = self
-            .storage
-            .list(&build_prefix("pods", Some(namespace)))
-            .await
-            .unwrap_or_default();
+        // Pods come from the caller — one LIST per namespace per pass.
 
         // K8s endpointslice controller keeps terminating pods in slices with
         // terminating=true (rather than dropping them). Dropping them on the first
@@ -1571,6 +1636,161 @@ mod tests {
             conds.serving,
             Some(true),
             "publishNotReadyAddresses=true must force serving=true"
+        );
+    }
+
+    /// One pod LIST per namespace per pass, not one per service.
+    ///
+    /// `reconcile_service` used to LIST every pod in the namespace for each
+    /// service it reconciled, so a namespace holding N services cost N
+    /// identical namespace-wide LISTs every 5 seconds.
+    ///
+    /// Measured on a live kine cluster after a conformance run: 154
+    /// `latency-svc-*` services in one namespace (from the sig-network
+    /// endpoint-latency spec) were being walked at ~1 service per 1.2s. The
+    /// sweep could not finish inside its own 5s resync, it kept kine at
+    /// ~1013% CPU serving the repeated LISTs, and it starved the rest of the
+    /// controller-manager so completely that 335 namespaces sat in
+    /// Terminating with zero drain progress over 60 seconds.
+    ///
+    /// Upstream never does this: pods come from a shared informer cache, and
+    /// services are reconciled from a rate-limited workqueue by
+    /// `ConcurrentServiceEndpointSyncs` = 5 workers
+    /// (pkg/controller/endpointslice/endpointslice_controller.go:106-118,
+    /// endpointslice/config/v1alpha1/defaults.go:35).
+    #[tokio::test]
+    async fn one_pod_list_per_namespace_not_per_service() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingStorage {
+            inner: Arc<MemoryStorage>,
+            pod_lists: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl Storage for CountingStorage {
+            async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.create(key, value).await
+            }
+            async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+            where
+                T: serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.get(key).await
+            }
+            async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.update(key, value).await
+            }
+            async fn update_raw(
+                &self,
+                key: &str,
+                value: &serde_json::Value,
+            ) -> rusternetes_common::Result<()> {
+                self.inner.update_raw(key, value).await
+            }
+            async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+                self.inner.delete(key).await
+            }
+            async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                if prefix.starts_with("/registry/pods/") {
+                    self.pod_lists.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.list(prefix).await
+            }
+            async fn watch(
+                &self,
+                prefix: &str,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch(prefix).await
+            }
+            async fn watch_from_revision(
+                &self,
+                prefix: &str,
+                revision: i64,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch_from_revision(prefix, revision).await
+            }
+            async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+                self.inner.current_revision().await
+            }
+            async fn is_revision_compacted(
+                &self,
+                revision: i64,
+            ) -> rusternetes_common::Result<bool> {
+                self.inner.is_revision_compacted(revision).await
+            }
+        }
+
+        const SERVICES: usize = 12;
+        let inner = Arc::new(MemoryStorage::new());
+        let storage = Arc::new(CountingStorage {
+            inner: Arc::clone(&inner),
+            pod_lists: AtomicUsize::new(0),
+        });
+
+        // One backing pod, and SERVICES services all selecting it.
+        let mut pod_labels = HashMap::new();
+        pod_labels.insert("app".to_string(), "latency".to_string());
+        let mut pod = Pod {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("backing-pod").with_namespace("svc-latency"),
+            spec: None,
+            status: None,
+        };
+        pod.metadata.labels = Some(pod_labels.clone());
+        storage
+            .create("/registry/pods/svc-latency/backing-pod", &pod)
+            .await
+            .unwrap();
+
+        for i in 0..SERVICES {
+            let name = format!("latency-svc-{i}");
+            let service = Service {
+                type_meta: rusternetes_common::types::TypeMeta {
+                    kind: "Service".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: ObjectMeta::new(name.clone()).with_namespace("svc-latency"),
+                spec: ServiceSpec {
+                    selector: Some(pod_labels.clone()),
+                    ports: vec![ServicePort {
+                        name: None,
+                        port: 80,
+                        target_port: None,
+                        protocol: "TCP".to_string(),
+                        node_port: None,
+                        app_protocol: None,
+                    }],
+                    ..Default::default()
+                },
+                status: None,
+            };
+            storage
+                .create(&build_key("services", Some("svc-latency"), &name), &service)
+                .await
+                .unwrap();
+        }
+
+        let controller = EndpointSliceController::new(Arc::clone(&storage));
+        controller.reconcile_all().await.unwrap();
+
+        let lists = storage.pod_lists.load(Ordering::SeqCst);
+        assert!(
+            lists < SERVICES,
+            "reconcile_all issued {lists} pod LISTs for {SERVICES} services in ONE namespace; \
+             the pod set is the same for all of them and must be fetched once per namespace"
         );
     }
 }
