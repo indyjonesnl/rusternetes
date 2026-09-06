@@ -11,12 +11,48 @@ use tracing::{debug, error, info};
 /// The etcd `Client` is `Clone` and internally uses gRPC/tonic which
 /// multiplexes requests over a single HTTP/2 connection. No mutex is needed —
 /// cloning the client is cheap and allows fully concurrent access.
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+
 pub struct EtcdStorage {
     client: Client,
+    /// Highest revision the backend is known to have compacted away, or 0 when
+    /// nothing is known yet.
+    ///
+    /// Upstream keeps exactly this — an in-process integer behind a lock,
+    /// `compactor.compactRevision`, read via `CompactRevision()`
+    /// (staging/src/k8s.io/apiserver/pkg/storage/etcd3/compact.go:133-141) and
+    /// exposed on the storage interface itself
+    /// (`storage/interfaces.go:278`). It is answered from memory; upstream
+    /// never asks the backend "is this revision compacted?".
+    ///
+    /// We used to ask, once per watch reconnect. Measured on a live kine
+    /// cluster: 43 rejected `Range /registry/` calls per second, sustained,
+    /// with kine pegged at ~1468% CPU (14.7 of 24 cores) — enough to push a
+    /// 406-spec conformance phase from 27 minutes past 107, at which point
+    /// specs fail on `context deadline exceeded` and read as product defects.
+    compact_revision: Arc<AtomicI64>,
     /// Page size for prefix scans in [`Storage::list`]. Defaults to
     /// [`DEFAULT_LIST_PAGE_SIZE`]; overridable so tests can walk several pages
     /// without seeding hundreds of keys.
     page_size: i64,
+}
+
+/// Whether a cached compaction floor alone settles "is `revision` compacted?".
+///
+/// `Some(true)` means answer from memory; `None` means the floor cannot tell
+/// and the backend must be asked. A floor of 0 means "nothing observed yet".
+///
+/// Compaction is monotonic — a revision below a floor already observed can
+/// never become readable again — which is what makes the cached answer safe.
+/// Upstream relies on the same monotonicity, keeping the floor with a `max`
+/// (`UpdateCompactRevision`, etcd3/compact.go:139-146).
+fn floor_settles_compaction(floor: i64, revision: i64) -> Option<bool> {
+    if floor > 0 && revision <= floor {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// Keys fetched per `RangeRequest` when listing a prefix, chosen to stay well
@@ -63,6 +99,7 @@ impl EtcdStorage {
         Ok(Self {
             client,
             page_size: DEFAULT_LIST_PAGE_SIZE,
+            compact_revision: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -646,12 +683,35 @@ impl Storage for EtcdStorage {
         // "not compacted" and callers fall through to a merely inconsistent
         // list rather than a 410. That is a property of the backend, not a
         // call outside the subset.
+        // Answer from the cached floor when we can. Compaction only ever moves
+        // forward, so a revision at or below a floor we have already observed
+        // is compacted for good and needs no round trip.
+        let floor = self.compact_revision.load(Ordering::Relaxed);
+        if let Some(answer) = floor_settles_compaction(floor, revision) {
+            return Ok(answer);
+        }
+
         let opts = GetOptions::new().with_revision(revision);
         match client.get("/registry/", Some(opts)).await {
             Ok(_) => Ok(false), // revision still available
-            Err(etcd_client::Error::GRpcStatus(status)) => Ok(status.code()
-                == tonic::Code::OutOfRange
-                || status.message().contains("has been compacted")),
+            Err(etcd_client::Error::GRpcStatus(status)) => {
+                let compacted = status.code() == tonic::Code::OutOfRange
+                    || status.message().contains("has been compacted");
+                if compacted {
+                    // Learn the floor, so every later query at or below this
+                    // revision is answered from memory. `fetch_max` mirrors
+                    // upstream's `UpdateCompactRevision`, which is also a max:
+                    //
+                    // ```text
+                    // c.compactRevision = max(c.compactRevision, rev)
+                    // ```
+                    //
+                    // (compact.go:139-146) — the floor must never move
+                    // backwards on a stale or out-of-order observation.
+                    self.compact_revision.fetch_max(revision, Ordering::Relaxed);
+                }
+                Ok(compacted)
+            }
             Err(_) => Ok(false),
         }
     }
@@ -869,5 +929,69 @@ mod tests {
         assert_eq!(retrieved, data);
 
         storage.delete("/test/key").await.unwrap();
+    }
+
+    /// A cached compaction floor must answer without a round trip, and must
+    /// only ever answer for revisions it genuinely covers.
+    ///
+    /// This is the whole point of the cache. `is_revision_compacted` used to
+    /// ask the backend every time, and the watch-cache reconnect path calls it
+    /// on every reconnect. Measured on a live kine cluster: 43 rejected
+    /// `Range /registry/` calls per second, sustained, kine pegged at ~1468%
+    /// CPU (14.7 of 24 cores), and a 406-spec conformance phase that takes 27
+    /// minutes on a healthy cluster still unfinished at 107.
+    ///
+    /// Upstream never asks: `CompactRevision()` reads an in-process integer
+    /// (etcd3/compact.go:133-137) and it is part of the storage interface
+    /// (storage/interfaces.go:278).
+    #[test]
+    fn cached_floor_answers_only_for_revisions_it_covers() {
+        // Nothing observed yet: the floor cannot settle anything.
+        assert_eq!(floor_settles_compaction(0, 1), None);
+        assert_eq!(floor_settles_compaction(0, 9_999), None);
+
+        // At or below a known floor is compacted for good — compaction is
+        // monotonic, so this can be answered from memory forever.
+        assert_eq!(floor_settles_compaction(100, 100), Some(true));
+        assert_eq!(floor_settles_compaction(100, 99), Some(true));
+        assert_eq!(floor_settles_compaction(100, 1), Some(true));
+
+        // Above the floor the cache must NOT guess — that revision may still
+        // be served, and answering `true` would 410 a healthy watch.
+        assert_eq!(floor_settles_compaction(100, 101), None);
+        assert_eq!(floor_settles_compaction(100, i64::MAX), None);
+    }
+
+    /// The floor must never move backwards.
+    ///
+    /// Mirrors upstream's `UpdateCompactRevision`, which is a max for the same
+    /// reason (etcd3/compact.go:139-146):
+    ///
+    /// ```text
+    /// c.compactRevision = max(c.compactRevision, rev)
+    /// ```
+    ///
+    /// Concurrent probes finish out of order, so a late reply carrying an
+    /// older revision must not lower a floor a newer one already raised —
+    /// that would send us back to asking the backend for revisions we have
+    /// already proven compacted.
+    #[test]
+    fn compaction_floor_is_monotonic() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let floor = AtomicI64::new(0);
+
+        floor.fetch_max(500, Ordering::Relaxed);
+        assert_eq!(floor.load(Ordering::Relaxed), 500);
+
+        // An out-of-order observation of an older revision changes nothing.
+        floor.fetch_max(120, Ordering::Relaxed);
+        assert_eq!(
+            floor.load(Ordering::Relaxed),
+            500,
+            "a stale observation must not lower the floor"
+        );
+
+        floor.fetch_max(900, Ordering::Relaxed);
+        assert_eq!(floor.load(Ordering::Relaxed), 900);
     }
 }
