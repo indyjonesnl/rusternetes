@@ -77,6 +77,16 @@ struct GvrDeletionMetadata {
     finalizers_to_num_remaining: BTreeMap<String, usize>,
 }
 
+/// Namespaces reconciled at once.
+///
+/// Upstream's `ConcurrentNamespaceSyncs` default
+/// (pkg/controller/namespace/config/v1alpha1/defaults.go:38), tunable via
+/// `--concurrent-namespace-syncs`
+/// (cmd/kube-controller-manager/app/options/namespacecontroller.go:37), whose
+/// help text states the trade directly: "Larger number = more responsive
+/// namespace termination, but more CPU (and network) load".
+const CONCURRENT_NAMESPACE_SYNCS: usize = 10;
+
 /// NamespaceController handles namespace lifecycle and finalization.
 /// When a namespace is marked for deletion, it:
 /// 1. Discovers all resources in the namespace
@@ -222,12 +232,34 @@ impl<S: Storage + 'static> NamespaceController<S> {
         // List all namespaces
         let namespaces: Vec<Namespace> = self.storage.list("/registry/namespaces/").await?;
 
-        for namespace in namespaces {
-            if let Err(e) = self.reconcile_namespace(&namespace).await {
-                error!(
-                    "Failed to reconcile namespace {}: {}",
-                    &namespace.metadata.name, e
-                );
+        // Reconcile namespaces concurrently.
+        //
+        // Upstream runs `ConcurrentNamespaceSyncs` = 10 namespace workers
+        // (pkg/controller/namespace/config/v1alpha1/defaults.go:38). Within a
+        // single namespace it stays serial across resource types — the
+        // concurrency it buys is *across namespaces*, which is the axis that
+        // was missing here.
+        //
+        // Serially this drained roughly one namespace per 90 seconds on a live
+        // cluster, ~48s of it inside a single namespace's resource sweep. With
+        // 354 namespaces waiting that is about nine hours, and it stalled a
+        // conformance run outright: hydrophone's between-phase cleanup sat 63
+        // minutes on "Waiting for Namespace conformance to be deleted" and
+        // phase 2 never started.
+        for chunk in namespaces.chunks(CONCURRENT_NAMESPACE_SYNCS) {
+            let results = futures::future::join_all(
+                chunk
+                    .iter()
+                    .map(|namespace| self.reconcile_namespace(namespace)),
+            )
+            .await;
+            for (namespace, result) in chunk.iter().zip(results) {
+                if let Err(e) = result {
+                    error!(
+                        "Failed to reconcile namespace {}: {}",
+                        &namespace.metadata.name, e
+                    );
+                }
             }
         }
 
@@ -1620,6 +1652,150 @@ mod tests {
         assert_eq!(
             finalizers_remaining.status, "True",
             "NamespaceFinalizersRemaining should be True when pod has finalizer"
+        );
+    }
+
+    /// Namespaces must be reconciled concurrently, not one at a time.
+    ///
+    /// Measured on a live kine cluster after a conformance phase: **one
+    /// namespace drained per 90 seconds** with 354 waiting — roughly 9 hours
+    /// to clear — and a single namespace taking 48s end to end:
+    ///
+    /// ```text
+    /// 20:23:39  Finalizing namespace config...
+    /// 20:24:27  Setting deletion conditions on namespace ...
+    /// ```
+    ///
+    /// That is not a wedge; the controller is running and logging. It is
+    /// throughput. It stalled the conformance run outright: hydrophone's
+    /// between-phase cleanup waited 63 minutes on `Waiting for Namespace
+    /// conformance to be deleted` and phase 2 never started.
+    ///
+    /// Upstream runs `ConcurrentNamespaceSyncs` = 10 namespace workers
+    /// (pkg/controller/namespace/config/v1alpha1/defaults.go:38, tunable via
+    /// `--concurrent-namespace-syncs`,
+    /// cmd/kube-controller-manager/app/options/namespacecontroller.go:37).
+    /// Within one namespace it stays serial across resource types — the
+    /// concurrency upstream buys is *across namespaces*, which is exactly the
+    /// axis that was missing here.
+    #[tokio::test]
+    async fn namespaces_reconcile_concurrently_not_one_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct SlowStorage {
+            inner: Arc<MemoryStorage>,
+            inflight: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl Storage for SlowStorage {
+            async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.create(key, value).await
+            }
+            async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+            where
+                T: serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.get(key).await
+            }
+            async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.update(key, value).await
+            }
+            async fn update_raw(
+                &self,
+                key: &str,
+                value: &serde_json::Value,
+            ) -> rusternetes_common::Result<()> {
+                self.inner.update_raw(key, value).await
+            }
+            async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+                self.inner.delete(key).await
+            }
+            async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                // Stall the per-namespace resource sweep so overlap is
+                // observable; a fast in-memory backend would otherwise let a
+                // serial loop look concurrent.
+                if !prefix.starts_with("/registry/namespaces/") {
+                    let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    self.inflight.fetch_sub(1, Ordering::SeqCst);
+                }
+                self.inner.list(prefix).await
+            }
+            async fn watch(
+                &self,
+                prefix: &str,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch(prefix).await
+            }
+            async fn watch_from_revision(
+                &self,
+                prefix: &str,
+                revision: i64,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch_from_revision(prefix, revision).await
+            }
+            async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+                self.inner.current_revision().await
+            }
+            async fn is_revision_compacted(
+                &self,
+                revision: i64,
+            ) -> rusternetes_common::Result<bool> {
+                self.inner.is_revision_compacted(revision).await
+            }
+        }
+
+        const NAMESPACES: usize = 10;
+        let inner = Arc::new(MemoryStorage::new());
+        let peak = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(SlowStorage {
+            inner: Arc::clone(&inner),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+        });
+
+        for i in 0..NAMESPACES {
+            let name = format!("terminating-{i}");
+            let mut meta = rusternetes_common::types::ObjectMeta::new(name.clone());
+            meta.deletion_timestamp = Some(chrono::Utc::now());
+            meta.uid = format!("{name}-uid");
+            let ns = Namespace {
+                type_meta: rusternetes_common::types::TypeMeta {
+                    kind: "Namespace".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: meta,
+                spec: None,
+                status: None,
+            };
+            storage
+                .create(&format!("/registry/namespaces/{name}"), &ns)
+                .await
+                .unwrap();
+        }
+
+        let controller = NamespaceController::new(Arc::clone(&storage));
+        controller.reconcile_all().await.unwrap();
+
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(
+            observed > 1,
+            "reconcile_all peaked at {observed} concurrent namespace operations for \
+             {NAMESPACES} terminating namespaces; upstream runs ConcurrentNamespaceSyncs = 10 \
+             workers, and a serial loop drains ~1 namespace per 90s on a real cluster"
         );
     }
 }
