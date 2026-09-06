@@ -16,9 +16,46 @@ step for every behavioral change.** Deriving logic that already exists upstream
 wastes time and tokens and produces subtly-wrong divergences (wrong mechanism,
 wrong defaults, broken invariants) that only surface as failing tests later.
 
+### The gate (MUST — this is a precondition, not advice)
+
+**You MUST NOT write new behavioural logic in Rusternetes without first
+locating and citing the upstream implementation of that behaviour.** If you
+cannot name the upstream file and symbol, you have not finished looking — go
+look. "I could not find it" is a search result to report, not a licence to
+invent.
+
+This applies to writing code AND to deciding what code should do. It is not
+satisfied by knowing how Kubernetes works, by reasoning from a conformance
+test, or by inferring the shape from an error message.
+
+**Do not derive what you can read.** `../kubernetes` is a full checkout of the
+`release-1.35` branch on this machine — 12,294 Go files, the real
+implementation of nearly everything this project reimplements. A `grep` into it
+costs seconds. Deriving the same behaviour from first principles costs an
+implementation, a review, a CI run, and — when the derivation is subtly wrong —
+a revert and a re-measurement. That trade is never worth taking, and it is the
+single most expensive habit in this repo.
+
+Reverse the usual order of investigation:
+
+| Instead of | Do this |
+|---|---|
+| Reading our logs to work out what *should* happen | Read upstream for what should happen; use logs only to confirm what *did* |
+| Inferring semantics from a failing conformance spec | Read the spec source for the assertion, then read the upstream code that satisfies it |
+| Designing a mechanism and checking it against upstream after | Read upstream first, then write the Rust |
+| Experimenting to find the right default/threshold/ordering | Look it up — upstream has a named constant for it |
+
+The work is a **faithful, idiomatic Go→Rust rewrite**, not an independent
+re-derivation that happens to agree. Where Rust idiom differs (ownership,
+`Result`, async), change the *expression*, never the mechanism or its bounds.
+
 ### The rule
 1. **Look first.** Grep the reference checkouts for the exact concept BEFORE
    writing code. This is usually a 2-second `grep`/`rg`, not an investigation.
+   `../kubernetes` is the `release-1.35` branch (the version this project
+   targets); `git -C ../kubernetes fetch` if you need a newer 1.35.x patch. If
+   a grep for the obvious name misses, grep for the *constant*, the error
+   string, or the flag name — upstream almost always has one.
 2. **Port the mechanism, not just the outcome.** If upstream achieves an effect
    via a seeded object, a reconciler, or a post-start hook, replicate *that
    mechanism* — do not fake the effect with a shortcut (e.g. an authorizer
@@ -44,6 +81,37 @@ wrong defaults, broken invariants) that only surface as failing tests later.
 8. **Only invent when upstream genuinely has no equivalent** (a Rust-specific
    concern, a Rusternetes-only feature). Say so explicitly when you do — and if
    you deviate deliberately, say that too, with the reason.
+
+### Worked example — a value looked up, a topology not
+
+The clearest way this rule gets missed is a *partial* lookup: reading upstream
+for the number and not for the structure the number lives in.
+
+`#1856` added client-side rate limiting. Upstream's controller-manager default
+was looked up correctly — `ClientConnection.QPS = 20`
+(`pkg/controller/apis/config/v1alpha1/defaults.go:59`) — and applied to the one
+`ApiClient` all 31 of our controllers share.
+
+Upstream does not share one client. It clones the config per controller:
+
+```text
+// ClientConfig is a skeleton config to clone and use as the basis for each controller client
+clientConfig := *b.ClientConfig
+```
+
+(`staging/src/k8s.io/controller-manager/pkg/clientbuilder/client_builder.go:40-47`)
+and `RESTClientFor` builds a **fresh limiter for every client** that does not
+carry one (`staging/src/k8s.io/client-go/rest/config.go:370-381`). So "20 QPS"
+means 20 QPS *each*, not 20 QPS shared — the applied value was a ~31x
+under-provision.
+
+Cost: a conformance leg fell from 92/3 to 87/8, teardown ran 3.5 hours until the
+job's 300-minute timeout, and the change was reverted (#1862). One additional
+file read — the one that constructs the client — would have prevented all of it.
+
+The lesson is rule 3 stated precisely: **a constant is not a mechanism.** When
+you look up a value, also look up who constructs the thing that holds it, and
+how many of them exist.
 
 ### Debugging: read upstream before reading logs
 
