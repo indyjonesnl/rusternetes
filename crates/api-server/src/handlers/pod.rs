@@ -20,6 +20,52 @@ use rusternetes_storage::{build_key, build_prefix, Storage};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Whether a pod's ResourceQuota *scope* changed across an update, which is
+/// the only thing that makes an update worth re-evaluating against quota.
+///
+/// Ported from upstream's `podEvaluator.Handles`
+/// (pkg/quota/v1/evaluator/core/pods.go:179-199):
+///
+/// ```text
+/// case "":
+///     if op == admission.Update {
+///         ...
+///         // when scope changed
+///         if IsTerminating(oldPod) != IsTerminating(pod) {
+///             return true
+///         }
+///     }
+///     return op == admission.Create
+/// ```
+///
+/// So upstream evaluates pod quota on CREATE, on the `resize` subresource, and
+/// on a plain UPDATE **only** when the terminating scope flips. Everything else
+/// is skipped, because the pod is already counted and its contribution has not
+/// moved between quota scopes.
+///
+/// That gate is load-bearing here, not a micro-optimisation: our
+/// `check_resource_quota_with_old` recounts the namespace live, which is a
+/// paginated pod LIST. Running it on every update cost one namespace-wide LIST
+/// per pod write. `[sig-node] Pods Extended (pod generation) ... issue 500
+/// podspec updates` took **2754 seconds** — 46 minutes, 12% of a whole
+/// 406-spec conformance phase — and then failed with `ResourceExhausted:
+/// h2 protocol error` from exhausting streams to the storage backend.
+///
+/// `IsTerminating` is upstream's (`pods.go:417-422`): a pod is in the
+/// terminating scope when it sets a non-negative `activeDeadlineSeconds`.
+fn pod_quota_scope_changed(
+    old: &rusternetes_common::resources::Pod,
+    new: &rusternetes_common::resources::Pod,
+) -> bool {
+    fn is_terminating(pod: &rusternetes_common::resources::Pod) -> bool {
+        pod.spec
+            .as_ref()
+            .and_then(|s| s.active_deadline_seconds)
+            .is_some_and(|d| d >= 0)
+    }
+    is_terminating(old) != is_terminating(new)
+}
+
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -992,23 +1038,26 @@ pub async fn update(
     // namespace recount before the new pod's footprint is added, so an
     // UPDATE that keeps total usage at or below `.spec.hard` is admitted
     // even though the stale pod row is still in storage.
-    // K8s ref: pkg/quota/v1/evaluator/core/pods.go — PodEvaluator
-    match crate::admission::check_resource_quota_with_old(
-        &state.storage,
-        &namespace,
-        &pod,
-        Some(&old_pod),
-    )
-    .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(rusternetes_common::Error::Forbidden(
-                "exceeded quota".to_string(),
-            ));
-        }
-        Err(e) => {
-            warn!("Error checking ResourceQuota on pod update: {}", e);
+    // Only when the quota SCOPE changed — see `pod_quota_scope_changed`.
+    // K8s ref: pkg/quota/v1/evaluator/core/pods.go:179-199 (`podEvaluator.Handles`)
+    if pod_quota_scope_changed(&old_pod, &pod) {
+        match crate::admission::check_resource_quota_with_old(
+            &state.storage,
+            &namespace,
+            &pod,
+            Some(&old_pod),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(rusternetes_common::Error::Forbidden(
+                    "exceeded quota".to_string(),
+                ));
+            }
+            Err(e) => {
+                warn!("Error checking ResourceQuota on pod update: {}", e);
+            }
         }
     }
 
@@ -1763,25 +1812,29 @@ pub async fn patch(
     }
 
     // Check ResourceQuota on patch with delta-usage semantics — same as
-    // pod UPDATE. A PATCH that pushes the per-namespace total past
-    // `.spec.hard` (after subtracting the stale row) must be rejected.
-    // K8s ref: pkg/quota/v1/evaluator/core/pods.go — PodEvaluator
-    match crate::admission::check_resource_quota_with_old(
-        &state.storage,
-        &namespace,
-        &patched_pod,
-        Some(&current_pod),
-    )
-    .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(rusternetes_common::Error::Forbidden(
-                "exceeded quota".to_string(),
-            ));
-        }
-        Err(e) => {
-            warn!("Error checking ResourceQuota on pod patch: {}", e);
+    // pod UPDATE, and gated the same way. A PATCH that pushes the
+    // per-namespace total past `.spec.hard` (after subtracting the stale row)
+    // must be rejected, but only a patch that moves the pod between quota
+    // scopes can change what it contributes — see `pod_quota_scope_changed`.
+    // K8s ref: pkg/quota/v1/evaluator/core/pods.go:179-199 (`podEvaluator.Handles`)
+    if pod_quota_scope_changed(&current_pod, &patched_pod) {
+        match crate::admission::check_resource_quota_with_old(
+            &state.storage,
+            &namespace,
+            &patched_pod,
+            Some(&current_pod),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(rusternetes_common::Error::Forbidden(
+                    "exceeded quota".to_string(),
+                ));
+            }
+            Err(e) => {
+                warn!("Error checking ResourceQuota on pod patch: {}", e);
+            }
         }
     }
 
@@ -2387,5 +2440,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Pod quota is re-evaluated on update only when the quota SCOPE changed.
+    ///
+    /// Upstream's `podEvaluator.Handles`
+    /// (pkg/quota/v1/evaluator/core/pods.go:179-199) returns true for a plain
+    /// UPDATE only when `IsTerminating(oldPod) != IsTerminating(pod)`, and
+    /// otherwise falls through to `return op == admission.Create`.
+    ///
+    /// The gate is load-bearing. `check_resource_quota_with_old` recounts the
+    /// namespace live — a paginated pod LIST — so running it unconditionally
+    /// cost one namespace-wide LIST per pod write. `[sig-node] Pods Extended
+    /// (pod generation) ... issue 500 podspec updates` took 2754 seconds, 12%
+    /// of an entire 406-spec conformance phase, then failed with
+    /// `ResourceExhausted: h2 protocol error` from exhausting streams to the
+    /// storage backend.
+    ///
+    /// Quota still runs on CREATE and on the `/resize` subresource (upstream's
+    /// `case "resize": return op == admission.Update`), and a plain PUT that
+    /// changes container resources is rejected by `validate_pod_spec_update`
+    /// rather than by quota — which is upstream's mechanism too, as its own e2e
+    /// says: "a pod cannot dynamically update its resource requirements"
+    /// (test/e2e/apimachinery/resource_quota.go:304-312).
+    #[test]
+    fn pod_quota_scope_change_detection() {
+        use rusternetes_common::resources::{Pod, PodSpec};
+        use rusternetes_common::types::{ObjectMeta, TypeMeta};
+
+        fn pod_with_deadline(deadline: Option<i64>) -> Pod {
+            Pod {
+                type_meta: TypeMeta {
+                    kind: "Pod".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: ObjectMeta::new("p"),
+                spec: Some(PodSpec {
+                    active_deadline_seconds: deadline,
+                    ..Default::default()
+                }),
+                status: None,
+            }
+        }
+
+        // Neither side terminating: nothing to re-evaluate.
+        assert!(!pod_quota_scope_changed(
+            &pod_with_deadline(None),
+            &pod_with_deadline(None)
+        ));
+
+        // Entering the terminating scope, and leaving it, both count.
+        assert!(pod_quota_scope_changed(
+            &pod_with_deadline(None),
+            &pod_with_deadline(Some(30))
+        ));
+        assert!(pod_quota_scope_changed(
+            &pod_with_deadline(Some(30)),
+            &pod_with_deadline(None)
+        ));
+
+        // Already terminating and staying so — the scope did not move, even
+        // though the value did.
+        assert!(!pod_quota_scope_changed(
+            &pod_with_deadline(Some(30)),
+            &pod_with_deadline(Some(60))
+        ));
+
+        // Upstream treats any NON-NEGATIVE deadline as terminating
+        // (`*pod.Spec.ActiveDeadlineSeconds >= int64(0)`, pods.go:417-422), so
+        // zero is in scope, not out of it.
+        assert!(pod_quota_scope_changed(
+            &pod_with_deadline(None),
+            &pod_with_deadline(Some(0))
+        ));
     }
 }
