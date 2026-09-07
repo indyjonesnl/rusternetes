@@ -236,7 +236,7 @@ microVMs. The port is small and the design maps almost 1:1.
 | `providers/vm/loadbalancer.go` | `services/lb.rs` | plain TCP proxy `gateway:6443` → CP IPs |
 | `providers/vm/disk.go` | `disk.rs` | `File::create` + `set_len` + `fallocate` |
 | `providers/vm/process.go`, `state.go` | `state.rs` | state dir + pidfiles, no daemon |
-| `providers/qemu/{launch,node}.go` | `vmm/qemu.rs` + `rusternetes dev vm-launch` | re-exec self as per-VM supervisor |
+| `providers/qemu/{launch,node}.go` | `vmm/{cloud_hypervisor,qemu}.rs` + `rusternetes dev vm-launch` | re-exec self as per-VM supervisor; CH is the default backend (§5.2) |
 | `providers/qemu/arch.go` | `vmm/arch.rs` | machine type / accel / console per arch |
 
 Rust crates that cover the Go deps: `rtnetlink` (bridge/link),
@@ -271,23 +271,59 @@ Recommendation: **B1 first** (it de-risks the whole provisioner and is a real
 dev UX in a week), then **B2** reusing the same provisioner once the image
 work from #1036 lands. B1's image is throwaway; the provisioner is not.
 
-### 5.2 QEMU or a real microVM?
+### 5.2 Which VMM — and a note on "QEMU vs KVM"
 
-Talos uses full QEMU because it must emulate ISO/UEFI/TPM/NVMe to test Talos's
-own installer and disk logic. **We don't need any of that** for a dev cluster —
-we control the guest and can direct-kernel-boot.
+They are not alternatives. **KVM is the kernel accelerator; QEMU is a VMM that
+drives it.** Talos runs `-machine q35,accel=kvm` (`qemu/arch_linux.go:9`,
+`qemu/arch.go:245-248`), falling back to TCG only when `/dev/kvm` cannot be
+opened. Guest instructions execute on the host CPU through VT-x in both the
+QEMU and the cloud-hypervisor case — every option below is KVM-accelerated. The
+axis that actually costs us is the **VMM's device model and control plane**, not
+the accelerator:
 
-- **QEMU with `-machine microvm`** — same binary already on this box, minimal
-  device model, still supports `-kernel`/`-initrd`. Safest default.
-- **cloud-hypervisor** (already installed here) or **firecracker** — ~100 ms
-  boot, tiny per-VM overhead, `virtio-fs`/`virtio-blk`/`virtio-net` only, no
-  legacy emulation. `tc-redirect-tap` was in fact written for firecracker, so
-  the network path is unchanged.
+| Backend | Boot to userspace | Per-VM VMM overhead | Device model |
+|---|---|---|---|
+| QEMU `q35` (what Talos uses) | seconds — firmware, ACPI, PCI enumeration | ~100 MB+ RSS | full: UEFI/ISO/TPM/NVMe/AHCI |
+| QEMU `-machine microvm` | ~100–200 ms | tens of MB | virtio-mmio, direct kernel boot |
+| **cloud-hypervisor** (v52.0, installed here) | ~50–150 ms | ~10 MB | virtio-{net,blk,fs,console} |
+| firecracker | ~50–125 ms | ~5 MB | virtio-{net,blk,vsock} |
 
-So the VMM should be a trait (`vmm::Backend`) from day one: `Qemu` first,
-`CloudHypervisor` second. Note this is a *different* axis from **#1045**
-(microVM as a **CRI runtime**, i.e. VM-per-pod). Same tooling, different layer —
-worth keeping the low-level launch code shareable between them.
+Talos needs the q35 breadth because it tests its *own installer* — ISO boot,
+UEFI variable stores, TPM measured boot, disk selectors across
+ide/ahci/scsi/nvme/megaraid. **We need none of that for a dev cluster:** we
+control the guest and direct-kernel-boot it.
+
+**So cloud-hypervisor should be the default backend, not QEMU.** Beyond the
+footprint it fits the design better in three concrete ways:
+
+1. **It is Rust and Apache-2.0** — no MPL question (§7), and it can eventually
+   be a library rather than a subprocess.
+2. **Its `--api-socket` HTTP API replaces machinery we would otherwise port.**
+   Talos needs an in-supervisor HTTP server *plus* a QEMU monitor socket to
+   offer `vm.boot` / `vm.shutdown` / `vm.reboot` / `vm.info`; cloud-hypervisor
+   exposes exactly those as REST over a unix socket, and `--event-monitor`
+   gives a state-change stream instead of polling. Our supervisor then keeps
+   only the config-serving job.
+3. **`tc-redirect-tap` was written for firecracker**, so the CNI network path
+   (§3 step 3) is identical across all four backends — it just hands a tap
+   device name to whatever VMM.
+
+Costs of dropping QEMU, all avoidable: no cdrom, so config injection uses a
+small **vfat NoCloud seed disk** (build with `mtools`, no `mkisofs` needed)
+instead of `metal-iso`; no UEFI/TPM, which a dev cluster does not want anyway;
+and cloud-hypervisor needs an **uncompressed `vmlinux`-style kernel** — a
+distro's compressed `bzImage` will not boot it, so either run
+`extract-vmlinux` on it or ship our own kernel, which the B2 image does
+regardless.
+
+Therefore: `vmm::Backend` is a trait from day one, **`CloudHypervisor` is the
+default implementation**, and `Qemu` (microvm, `accel=kvm`) is a fallback kept
+only for what CH cannot do — UEFI, ISO boot, TPM, exotic disk buses — i.e. for
+testing the USB/installer image from #1036, not for everyday dev clusters.
+
+Note this is a *different* axis from **#1045** (microVM as a **CRI runtime**,
+i.e. VM-per-pod). Same tooling, different layer — worth keeping the low-level
+launch code shareable between them.
 
 ---
 
@@ -298,12 +334,13 @@ worth keeping the low-level launch code shareable between them.
   Deliverable: a written list of what breaks, which is the real backlog for
   node-lifecycle parity.
 - **Phase 1:** `rusternetes dev cluster create` skeleton — state dir, bridge via
-  CNI, dhcpd/dns/LB, disks, per-VM supervisor, QEMU microvm backend, B1 guest
-  image. Target: `1 CP + 2 workers` reachable via a generated kubeconfig in
-  under 60 s, `dev cluster destroy` leaving nothing behind.
-- **Phase 2:** `--vmm cloud-hypervisor`, node power/reboot API, then swap in the
-  B2 purpose-built image (#33/#1036) and publish the idle-RAM-per-node number
-  the ROADMAP wants (#35).
+  CNI, dhcpd/dns/LB, disks, per-VM supervisor, **cloud-hypervisor backend**
+  (`--api-socket` for power control), B1 guest image + vfat NoCloud seed.
+  Target: `1 CP + 2 workers` reachable via a generated kubeconfig in under
+  60 s, `dev cluster destroy` leaving nothing behind.
+- **Phase 2:** `--vmm qemu` fallback (microvm, `accel=kvm`) for the UEFI/ISO
+  cases only, then swap in the B2 purpose-built image (#33/#1036) and publish
+  the idle-RAM-per-node number the ROADMAP wants (#35).
 
 ---
 
