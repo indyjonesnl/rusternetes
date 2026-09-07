@@ -121,17 +121,42 @@ impl<S: Storage + 'static> NamespaceController<S> {
     }
 
     /// Work-queue-based run loop. Watch events enqueue resource keys;
-    /// a worker task reconciles one namespace at a time with deduplication
-    /// and exponential backoff on failures.
+    /// a pool of [`CONCURRENT_NAMESPACE_SYNCS`] workers drains the queue with
+    /// deduplication and exponential backoff on failures.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         let queue = WorkQueue::new();
 
-        // Spawn worker
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
-        });
+        // One worker per upstream `ConcurrentNamespaceSyncs`
+        // (pkg/controller/namespace/config/v1alpha1/defaults.go:38), all
+        // draining the same queue — which is upstream's shape too: N workers
+        // over one shared workqueue, not N queues.
+        //
+        // This is safe because `WorkQueue::get` moves the key into a
+        // `processing` set before returning it, so a namespace in flight is
+        // never handed to a second worker (client-go's workqueue guarantees
+        // the same, and for the same reason).
+        //
+        // A single worker meant one namespace at a time. Measured on a live
+        // kine cluster during a conformance phase: ~47 seconds per namespace,
+        // strictly sequential, with 307 namespaces waiting and ZERO draining
+        // over a 90-second window:
+        //
+        //   09:11:35  Finalizing namespace csinodes-8557
+        //   09:12:20  ... resources cleared, conditions set
+        //   09:12:20  csistoragecapacity-3787 ... starting finalization
+        //   09:13:09  ... resources cleared, conditions set
+        //
+        // The controller was not wedged — it logged throughout. It simply
+        // could not keep up, and hydrophone's between-phase cleanup waits on
+        // the `conformance` namespace, so the conformance suite stalls behind
+        // it.
+        for _ in 0..CONCURRENT_NAMESPACE_SYNCS {
+            let worker_queue = queue.clone();
+            let worker_self = Arc::clone(&self);
+            tokio::spawn(async move {
+                worker_self.worker(worker_queue).await;
+            });
+        }
 
         // Watch loop: enqueue keys from watch events
         loop {
@@ -1796,6 +1821,149 @@ mod tests {
             "reconcile_all peaked at {observed} concurrent namespace operations for \
              {NAMESPACES} terminating namespaces; upstream runs ConcurrentNamespaceSyncs = 10 \
              workers, and a serial loop drains ~1 namespace per 90s on a real cluster"
+        );
+    }
+
+    /// The LIVE path — `run()`'s worker pool — must process namespaces
+    /// concurrently.
+    ///
+    /// This test exists because #1872 made `reconcile_all` concurrent and had
+    /// no effect: `reconcile_all` is called only by tests. The production
+    /// driver is the work queue in `run()`, which spawned exactly one worker,
+    /// so namespaces drained strictly one at a time regardless. Measured on a
+    /// live cluster afterwards: ~47s per namespace, sequential, 307 waiting,
+    /// zero drained in 90 seconds.
+    ///
+    /// A test against `reconcile_all` cannot catch that, so this one drives
+    /// `run()` and watches the storage for overlap. Upstream's
+    /// `ConcurrentNamespaceSyncs` = 10 workers share one queue
+    /// (pkg/controller/namespace/config/v1alpha1/defaults.go:38).
+    #[tokio::test]
+    async fn run_processes_namespaces_with_a_worker_pool() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct SlowStorage {
+            inner: Arc<MemoryStorage>,
+            inflight: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl Storage for SlowStorage {
+            async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.create(key, value).await
+            }
+            async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+            where
+                T: serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.get(key).await
+            }
+            async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.update(key, value).await
+            }
+            async fn update_raw(
+                &self,
+                key: &str,
+                value: &serde_json::Value,
+            ) -> rusternetes_common::Result<()> {
+                self.inner.update_raw(key, value).await
+            }
+            async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+                self.inner.delete(key).await
+            }
+            async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                // Stall the per-namespace resource sweep so overlap is
+                // observable. The namespace LIST itself is left fast so the
+                // enqueue path is not what we are measuring.
+                if !prefix.starts_with("/registry/namespaces/") {
+                    let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    self.inflight.fetch_sub(1, Ordering::SeqCst);
+                }
+                self.inner.list(prefix).await
+            }
+            async fn watch(
+                &self,
+                prefix: &str,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch(prefix).await
+            }
+            async fn watch_from_revision(
+                &self,
+                prefix: &str,
+                revision: i64,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch_from_revision(prefix, revision).await
+            }
+            async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+                self.inner.current_revision().await
+            }
+            async fn is_revision_compacted(
+                &self,
+                revision: i64,
+            ) -> rusternetes_common::Result<bool> {
+                self.inner.is_revision_compacted(revision).await
+            }
+        }
+
+        const NAMESPACES: usize = 20;
+        let inner = Arc::new(MemoryStorage::new());
+        let peak = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(SlowStorage {
+            inner: Arc::clone(&inner),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+        });
+
+        for i in 0..NAMESPACES {
+            let name = format!("terminating-{i}");
+            let mut meta = rusternetes_common::types::ObjectMeta::new(name.clone());
+            meta.deletion_timestamp = Some(chrono::Utc::now());
+            meta.uid = format!("{name}-uid");
+            let ns = Namespace {
+                type_meta: rusternetes_common::types::TypeMeta {
+                    kind: "Namespace".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: meta,
+                spec: None,
+                status: None,
+            };
+            storage
+                .create(&format!("/registry/namespaces/{name}"), &ns)
+                .await
+                .unwrap();
+        }
+
+        // `run()` loops forever; give the pool a moment to work, then stop.
+        let controller = Arc::new(NamespaceController::new(Arc::clone(&storage)));
+        let handle = tokio::spawn({
+            let c = Arc::clone(&controller);
+            async move {
+                let _ = c.run().await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        handle.abort();
+
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(
+            observed > 1,
+            "run()'s worker pool peaked at {observed} concurrent namespace operations; \
+             a single worker drains ~1 namespace at a time and stalled a conformance \
+             run behind 307 terminating namespaces"
         );
     }
 }
