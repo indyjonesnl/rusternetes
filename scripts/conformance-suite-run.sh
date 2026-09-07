@@ -158,7 +158,10 @@ mkdir -p "$OUTPUT_DIR"
 SUMMARY_TSV="$OUTPUT_DIR/summary.tsv"
 : > "$SUMMARY_TSV"
 
-echo "[conformance-suite-run] ${#PARTITIONS[@]} partitions: ${PARTITIONS[*]}"
+# Join with spaces explicitly: this script sets IFS=$'\n\t', so "${a[*]}"
+# would print one partition per line and make the plan unreadable. Same trap
+# conformance-target-run.sh documents for its forwarded preflight args.
+echo "[conformance-suite-run] ${#PARTITIONS[@]} partitions: $(IFS=' '; echo "${PARTITIONS[*]}")"
 echo "[conformance-suite-run] output: $OUTPUT_DIR"
 
 SUITE_START=$(date +%s)
