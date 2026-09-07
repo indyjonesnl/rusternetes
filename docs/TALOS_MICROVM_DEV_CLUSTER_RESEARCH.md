@@ -167,13 +167,18 @@ also runs a `DEL` *before* `ADD` to clean up a previous crashed run.
 
 ---
 
-## 4. Path A — Talos as the substrate, and what it actually costs
+## 4. Rejected: run a Talos cluster and swap our images in
 
-Talos runs the Kubernetes control plane as **static pods whose images come from
-the machine config**, and the kubelet from a configurable image. Image
-validation only checks that the **tag** parses as a Kubernetes version inside
-the Talos↔K8s compatibility window — the repository name is **not** constrained
-(`pkg/machinery/compatibility/kubernetes_image.go:15-29`,
+**This section records an option that was considered and rejected.** It is kept
+because *why* it fails is useful, and because one finding (§4.1) is worth work
+on its own.
+
+The idea: skip writing a provisioner, run `talosctl cluster create qemu`, and
+point the Talos machine config at our images. It looks free — Talos runs the
+control plane as **static pods whose images come from the machine config**, and
+image validation only checks that the **tag** parses as a Kubernetes version
+inside the Talos↔K8s compatibility window; the repository name is **not**
+constrained (`pkg/machinery/compatibility/kubernetes_image.go:15-29`,
 `KubernetesVersionFromImageRef` splits on the last `:v`):
 
 ```yaml
@@ -190,7 +195,7 @@ sudo -E talosctl cluster create qemu \
   --config-patch @rusternetes-swap.yaml
 ```
 
-### 4.1 Why this is NOT free (corrects an earlier draft of this note)
+### 4.1 It is not free: Talos hard-codes the static pod's `command`
 
 **Talos hard-codes the static pod's `command`.** The generated pod is
 `Command: args` with `args[0]` a literal
@@ -214,7 +219,7 @@ the whole static-pod manifest** (`command: ["/app/api-server"]` plus only the
 seven flags we support) straight into `/etc/kubernetes/manifests/`. Under Talos
 that file is machine-generated inside `machined`; there is nothing to overwrite.
 
-Two things therefore have to exist before Path A boots:
+Two things would therefore have to exist before it boots at all:
 
 1. **The image must expose `/usr/local/bin/kube-apiserver`** (and the
    `kube-controller-manager` / `kube-scheduler` paths) — a symlink or copy in
@@ -243,7 +248,7 @@ Two things therefore have to exist before Path A boots:
 
 **A flag-compatibility layer is worth building on its own merits** — "drop-in
 replacement" means accepting upstream argv — so this is not wasted work, but it
-is *the* prerequisite for Path A rather than a footnote. Minimum viable shape:
+is a real deliverable, just not one this note depends on. Minimum viable shape:
 per component, accept the full upstream flag set, map the ones we implement,
 and **explicitly ignore-with-a-warning** the ones we do not (never silently:
 an ignored `--encryption-provider-config` is a security surprise, not a
@@ -268,17 +273,33 @@ convenience).
   VMs is nothing. **`sudo` requires a password here**, so the run is a human
   action, not an agent one.
 
-**Value:** honest multi-node testing of our control plane against a populated
-etcd, plus a flag-compat layer we want regardless. **Limit:** the *node* is
-still Talos — this is not "Rusternetes on a VM" and cannot be our shipped dev
-UX (users would need Talos). That is Path B.
+### 4.3 Why it is rejected
+
+**It answers a different question.** The reason to want VMs at all (§1) is real
+nodes: node lifecycle, per-node kernel state, honest per-node netfilter, and an
+honest idle-RAM-per-node number. In this setup the kernel, init, kubelet,
+containerd and etcd all stay Talos's — so it measures none of that. It tests
+our control plane on someone else's node, which is what the existing kind-based
+vanilla-swap legs already do more cheaply.
+
+**And it cannot ever be the dev UX**, because it requires the user to install
+and run Talos.
+
+**Cost, for completeness:** the flag-compat prerequisite in §4.1 exists only to
+satisfy *Talos's* static-pod contract. In our own provisioner (§5) we generate
+the argv, so it is not on the critical path there. It is still worth doing as
+drop-in-replacement work in its own right — tracked separately — just not as a
+gate on this note's actual goal.
+
+**Conclusion: go straight to §5.** The Talos code is the thing to learn from
+(§3), not the thing to run.
 
 ---
 
-## 5. Path B — port the provisioner: `rusternetes dev cluster create`
+## 5. The plan — port the provisioner: `rusternetes dev cluster create`
 
-The thing the user actually asked for: **our own** one-command local cluster of
-microVMs. The port is small and the design maps almost 1:1.
+**Our own** one-command local cluster of microVMs — real Rusternetes nodes, no
+Talos on the box. The port is small and the design maps almost 1:1.
 
 | Talos (Go) | Rusternetes (Rust) | Notes |
 |---|---|---|
@@ -311,13 +332,14 @@ for the launch config over stdin. Nothing exotic.
 
 ### 5.1 The one genuinely open question: what does the guest boot?
 
-Path A gets a guest OS for free. Path B needs one. Three options:
+Running Talos (§4) would have supplied a guest OS; our own provisioner needs
+one. Three options:
 
 | Option | How | Cost | Fits ROADMAP? |
 |---|---|---|---|
 | **B1. Generic cloud image + inject binaries** | Debian/Alpine cloud image, `cloud-init`/`ignition` NoCloud seed drops in `rusternetes` + a systemd unit + kubeconfig; containerd from the distro | Lowest. Days. Kernel/init are someone else's problem | Neutral — measures *our* RAM but with a distro's baseline |
 | **B2. Purpose-built minimal image** | Our own kernel + initramfs, `rusternetes` as the only service, read-only squashfs + `/var` overlay | Highest. Weeks | **Yes** — this *is* #33 / #1036's USB image, and the honest idle-RAM number |
-| **B3. Talos guest, swapped images** | = Path A | Days | No — node isn't ours |
+| **B3. Talos guest, swapped images** | see §4 | Days | No — the node isn't ours; rejected |
 
 Recommendation: **B1 first** (it de-risks the whole provisioner and is a real
 dev UX in a week), then **B2** reusing the same provisioner once the image
@@ -381,10 +403,9 @@ launch code shareable between them.
 
 ## 6. Recommended phasing
 
-- **Phase 0 (now, no code):** run Path A locally — `sudo -E talosctl cluster
-  create qemu --controlplanes 1 --workers 2` with the control-plane image swap.
-  Deliverable: a written list of what breaks, which is the real backlog for
-  node-lifecycle parity.
+- **Phase 0 (no code):** settle the MPL question (§7) — it decides whether the
+  ported files carry MPL notices or get reimplemented from the specs, and
+  retrofitting that onto a merged crate is far worse than choosing now.
 - **Phase 1:** `rusternetes dev cluster create` skeleton — state dir, bridge via
   CNI, dhcpd/dns/LB, disks, per-VM supervisor, **cloud-hypervisor backend**
   (`--api-socket` for power control), B1 guest image + vfat NoCloud seed.
@@ -410,8 +431,9 @@ either
 
 For the *architecture* (state dir, supervisor-per-VM, CNI-for-tap) there is no
 issue at all: ideas are not covered. Decide this **before** writing
-`crates/dev-cluster`, not after. Shelling out to `talosctl` (Path A) raises no
-licensing question whatsoever.
+`crates/dev-cluster`, not after. (Merely *running* the `talosctl` binary, as in
+the rejected §4, would raise no licensing question at all — but we are not
+doing that.)
 
 ---
 
