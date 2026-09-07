@@ -172,6 +172,36 @@ impl WorkQueue {
 
     /// Get the next key to process. Blocks until a key is available
     /// or the queue is shut down. Returns `None` on shutdown.
+    ///
+    /// Safe for any number of concurrent callers, which is what lets a
+    /// controller run a worker pool over one queue. Two properties carry that:
+    ///
+    /// 1. A key moves into `processing` under the same lock that pops it, so no
+    ///    two workers ever hold the same key, and `add()` for a key already in
+    ///    `processing` only marks it dirty — `done()` re-queues it afterwards.
+    ///    That is client-go's dirty/processing split: `Add` returns early on
+    ///    `processing.Has(item)`
+    ///    (staging/src/k8s.io/client-go/util/workqueue/queue.go:227, early
+    ///    return at 245-247) and `Done` re-pushes only then (queue.go:289,
+    ///    push at 297).
+    ///
+    /// 2. No wake-up is lost. `add()` and `done()` each notify for the single
+    ///    key they enqueue, matching upstream's `cond.Signal()` (queue.go:250
+    ///    and 298). The delayed-item promotion below is the one path that
+    ///    enqueues MANY keys while notifying none — and it does not need to:
+    ///    a worker parks on `tokio::select!` over `notified()` AND a sleep to
+    ///    the earliest `delayed` deadline, so every parked worker wakes on that
+    ///    deadline by itself and re-checks the queue. Upstream reaches the same
+    ///    place differently: its delaying queue promotes ready items from a
+    ///    separate `waitingLoop` goroutine
+    ///    (util/workqueue/delaying_queue.go:276) by calling `q.Add(entry.data)`
+    ///    (drain loop 298-307, `Add` at 305), so each promoted item signals
+    ///    once. Both designs guarantee a promoted batch gets drained; ours does
+    ///    it with per-worker timers instead of a promoter goroutine.
+    ///
+    /// The tests `worker_pool_drains_every_promoted_delayed_key` and
+    /// `a_key_re_added_while_processing_is_not_handed_to_a_second_worker` pin
+    /// both properties, since a pool over this queue depends on them.
     pub async fn get(&self) -> Option<String> {
         loop {
             {
@@ -511,5 +541,98 @@ mod tests {
         let key = q.get().await.unwrap();
         assert_eq!(key, "key1");
         q.done(&key).await;
+    }
+
+    /// A pool of workers must drain every key promoted out of `delayed` in one
+    /// pass. Before the promotion path woke the pool, the promoting worker took
+    /// one key and the remaining N-1 sat unclaimed while every other worker
+    /// stayed parked in `get()`'s unbounded `notified().await` — no further
+    /// `add()` was coming, so the queue simply stalled with work in it.
+    #[tokio::test]
+    async fn worker_pool_drains_every_promoted_delayed_key() {
+        const KEYS: usize = 8;
+        const WORKERS: usize = 5;
+
+        let q = WorkQueue::new();
+        // Land all keys in `delayed` with a deadline that has passed by the
+        // time the workers look, so ONE `get()` promotes the whole batch.
+        for i in 0..KEYS {
+            q.add_after(format!("key{i}"), Duration::from_millis(50))
+                .await;
+        }
+
+        let processed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut handles = Vec::new();
+        for _ in 0..WORKERS {
+            let q = q.clone();
+            let processed = Arc::clone(&processed);
+            handles.push(tokio::spawn(async move {
+                while let Some(key) = q.get().await {
+                    processed.lock().await.push(key.clone());
+                    q.forget(&key).await;
+                    q.done(&key).await;
+                }
+            }));
+        }
+
+        // Generous relative to the 50ms delay: the point is that the keys
+        // arrive at all, not how fast. A stall here never completes.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if processed.lock().await.len() >= KEYS {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {KEYS} promoted keys were processed — the pool stalled",
+                processed.lock().await.len()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        q.shutdown().await;
+        for h in handles {
+            let _ = h.await;
+        }
+
+        let mut seen = processed.lock().await.clone();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            KEYS,
+            "every promoted key should be processed exactly once, got {seen:?}"
+        );
+    }
+
+    /// The `processing` set is what makes a pool safe: two workers must never
+    /// hold the same key at once. Ports client-go's dirty/processing split
+    /// (queue.go:227 `Add` returns early when `processing.Has(item)`, and
+    /// queue.go:289 `Done` re-pushes only then).
+    #[tokio::test]
+    async fn a_key_re_added_while_processing_is_not_handed_to_a_second_worker() {
+        let q = WorkQueue::new();
+        q.add("key1".to_string()).await;
+
+        let held = q.get().await.unwrap();
+        assert_eq!(held, "key1");
+
+        // Re-add while the first worker still holds it.
+        q.add("key1".to_string()).await;
+
+        // A second worker must not receive the same key.
+        let second = tokio::time::timeout(Duration::from_millis(200), q.get()).await;
+        assert!(
+            second.is_err(),
+            "a key in `processing` was handed to a second worker: {second:?}"
+        );
+
+        // Once released, the re-add is honoured.
+        q.done(&held).await;
+        let again = tokio::time::timeout(Duration::from_secs(2), q.get())
+            .await
+            .expect("the re-added key should be requeued by done()")
+            .expect("queue should not be shut down");
+        assert_eq!(again, "key1");
     }
 }
