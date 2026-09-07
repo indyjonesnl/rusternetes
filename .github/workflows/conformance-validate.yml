@@ -20,10 +20,12 @@ on:
       # per-target conformance scaffolding
       - 'ci/conformance/targets.json'
       - 'scripts/conformance-target-run.sh'
+      - 'scripts/conformance-suite-run.sh'
       - 'scripts/conformance-targets-discover.sh'
       - 'scripts/gen-target-workflows.sh'
       - 'scripts/tests/test-targets-manifest.sh'
       - 'scripts/tests/test-conformance-target-run.sh'
+      - 'scripts/tests/test-conformance-suite-run.sh'
       - 'scripts/conformance-preflight.sh'
       - 'scripts/tests/test-conformance-preflight.sh'
       - 'scripts/tests/test-target-workflows-sync.sh'
@@ -81,6 +83,8 @@ jobs:
         run: bash scripts/tests/test-targets-manifest.sh
       - name: Runner unit tests
         run: bash scripts/tests/test-conformance-target-run.sh
+      - name: Partitioned suite driver unit tests
+        run: bash scripts/tests/test-conformance-suite-run.sh
       - name: Cluster preflight unit tests
         run: bash scripts/tests/test-conformance-preflight.sh
       - name: Per-target workflow drift
