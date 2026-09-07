@@ -24,6 +24,15 @@
 # split, so this is a local sequencer over the upstream-shaped mechanism — there
 # is no upstream Go behaviour to port here.
 #
+# SCOPE: each partition uses its manifest focus/skip, and those skip only
+# `[Flaky]` — so a partition runs its SIG's `[Serial]` and `[Slow]` specs too.
+# Running every partition is therefore the equivalent of BOTH hydrophone phases,
+# not just the parallel one, and the per-partition times include the serial
+# specs ginkgo isolates into their own single-proc phase. For a fast phase-1
+# style sweep, narrow it uniformly:
+#
+#   --skip '\[Flaky\]|\[Serial\]|\[Slow\]'
+#
 # NOT a gate. Conformance failures never fail the run; only an INFRA failure
 # (a partition that produced no junit) is reflected in the exit code.
 #
@@ -41,10 +50,12 @@
 #   bash scripts/conformance-suite-run.sh                          # all sig partitions
 #   bash scripts/conformance-suite-run.sh --skip-targets sig-cli   # omit a stable slice
 #   bash scripts/conformance-suite-run.sh --targets sig-apps,sig-storage
+#   # phase-1 style: drop the serial/slow specs from every partition
+#   bash scripts/conformance-suite-run.sh --skip '\[Flaky\]|\[Serial\]|\[Slow\]'
 #
 # Flags: --targets --skip-targets --order --reverse --output-dir
 #        --stop-on-infra-failure and the pass-throughs --kubeconfig
-#        --conformance-image --hydrophone --parallel --skip-preflight
+#        --conformance-image --hydrophone --parallel --skip --skip-preflight
 #        --preflight-arg -h|--help
 set -euo pipefail
 IFS=$'\n\t'
@@ -138,7 +149,7 @@ while [[ $# -gt 0 ]]; do
         --output-dir) [[ $# -ge 2 ]] || die "--output-dir requires a value"; OUTPUT_DIR="$2"; shift 2 ;;
         --stop-on-infra-failure) STOP_ON_INFRA=1; shift ;;
         # Pass-throughs, forwarded verbatim to every partition.
-        --kubeconfig|--conformance-image|--hydrophone|--parallel|--preflight-arg)
+        --kubeconfig|--conformance-image|--hydrophone|--parallel|--skip|--preflight-arg)
             [[ $# -ge 2 ]] || die "$1 requires a value"; PASSTHRU+=("$1" "$2"); shift 2 ;;
         --skip-preflight) PASSTHRU+=("$1"); shift ;;
         -h|--help) sed -nE '/^# /,/^$/ s/^# ?//p' "${BASH_SOURCE[0]}" | head -52; exit 0 ;;

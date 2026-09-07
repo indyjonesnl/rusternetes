@@ -106,6 +106,22 @@ check "one row per partition plus header and total" 5 "$(wc -l <<<"$OUT")"
 check "empty TSV renders header + zero total" \
     "TOTAL 0 0 0 0m" "$(: > "$TSV"; render_summary "$TSV" | awk '$1=="TOTAL"{print $1, $2, $3, $4, $5}')"
 
+echo "== pass-throughs =="
+# Every flag the driver forwards must reach conformance-target-run.sh verbatim.
+# A flag silently swallowed here would run a DIFFERENT suite than asked for
+# (e.g. --skip dropped means every partition keeps its serial/slow specs).
+DRIVER="$REPO_ROOT/scripts/conformance-suite-run.sh"
+for flag in --kubeconfig --conformance-image --hydrophone --parallel --skip --preflight-arg; do
+    if grep -qE "^\s+.*\|?$flag\|" <<<"$(grep -A1 'Pass-throughs' "$DRIVER")" \
+       || grep -qE "[|(]$flag[|)]" "$DRIVER"; then
+        ok "$flag is forwarded to the target runner"
+    else
+        bad "$flag is not in the pass-through list"
+    fi
+done
+check "--skip-preflight is forwarded as a valueless flag" \
+    1 "$(grep -c -- '--skip-preflight) PASSTHRU+=("\$1"); shift ;;' "$DRIVER")"
+
 echo
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
