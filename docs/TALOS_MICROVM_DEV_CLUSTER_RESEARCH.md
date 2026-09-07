@@ -167,7 +167,7 @@ also runs a `DEL` *before* `ADD` to clean up a previous crashed run.
 
 ---
 
-## 4. Path A — usable *today*, zero new Rusternetes code
+## 4. Path A — Talos as the substrate, and what it actually costs
 
 Talos runs the Kubernetes control plane as **static pods whose images come from
 the machine config**, and the kubelet from a configurable image. Image
@@ -177,13 +177,11 @@ the Talos↔K8s compatibility window — the repository name is **not** constrai
 `KubernetesVersionFromImageRef` splits on the last `:v`):
 
 ```yaml
-# config patch
+# rusternetes-swap.yaml
 cluster:
   apiServer:         { image: ghcr.io/indyjonesnl/rusternetes/api-server:v1.35.0 }
   controllerManager: { image: ghcr.io/indyjonesnl/rusternetes/controller-manager:v1.35.0 }
   scheduler:         { image: ghcr.io/indyjonesnl/rusternetes/scheduler:v1.35.0 }
-machine:
-  kubelet:           { image: ghcr.io/indyjonesnl/rusternetes/kubelet:v1.35.0 }
 ```
 
 ```bash
@@ -192,34 +190,88 @@ sudo -E talosctl cluster create qemu \
   --config-patch @rusternetes-swap.yaml
 ```
 
-This is **exactly the vanilla-swap program we already run in CI**, but on three
-real VMs instead of a compose stack — and it gets us the multi-node VM
-substrate before we write a line of provisioner code.
+### 4.1 Why this is NOT free (corrects an earlier draft of this note)
 
-Known frictions, all already-known work:
+**Talos hard-codes the static pod's `command`.** The generated pod is
+`Command: args` with `args[0]` a literal
+(`control_plane_static_pod.go:290,483-484` for the api-server;
+`control_plane_final.go:58,149` for controller-manager and scheduler):
 
-- **Flag surface.** Talos generates upstream `kube-apiserver` / `-scheduler` /
-  `-controller-manager` static-pod command lines. Our binaries must tolerate
-  them (the recorded vanilla-swap blocker: clap rejects the kubeadm flag set).
-  Same class of fix as the existing swap legs.
+```go
+args := []string{"/usr/local/bin/kube-apiserver"}   // then ~40 upstream flags
+...
+Container{Image: cfg.Image, Command: args}
+```
+
+Only `image`, `extraArgs`, `extraVolumes`, `resources` and `environmentVariables`
+are configurable. So a swapped image gets **exec'd at
+`/usr/local/bin/kube-apiserver` with the full upstream flag set** — there is no
+seam to pass our own argv.
+
+This is exactly the seam our existing kind-based vanilla-swap harness relies on
+and Talos does not offer: `ci/vanilla-swap/kind/apiserver-patch.yaml` **rewrites
+the whole static-pod manifest** (`command: ["/app/api-server"]` plus only the
+seven flags we support) straight into `/etc/kubernetes/manifests/`. Under Talos
+that file is machine-generated inside `machined`; there is nothing to overwrite.
+
+Two things therefore have to exist before Path A boots:
+
+1. **The image must expose `/usr/local/bin/kube-apiserver`** (and the
+   `kube-controller-manager` / `kube-scheduler` paths) — a symlink or copy in
+   the Dockerfile, since our images ship `/app/<component>`.
+2. **The binaries must tolerate the upstream flag set.** Measured against the
+   current `clap` definitions in `crates/*/src/main.rs`:
+
+   | component | flags Talos passes | we accept today | **rejected** |
+   |---|---|---|---|
+   | api-server | 41 | 4 (`bind-address`, `client-ca-file`, `etcd-servers`, `tls-cert-file`) | **37** |
+   | controller-manager | 18 | 3 (`allocate-node-cidrs`, `cluster-cidr`, `kubeconfig`) | **15** |
+   | scheduler | 8 | 0 | **8** |
+
+   Two of the rejects are pure renames — upstream `--tls-private-key-file` is
+   our `--tls-key-file`, upstream `--leader-elect` is our
+   `--enable-leader-election` — and one *accepted* flag is a semantic trap:
+   our `--bind-address` takes a full socket address (`0.0.0.0:6443`) while
+   upstream takes an IP and gets the port from `--secure-port`, which we do not
+   have. Everything else is genuinely absent: the whole
+   `requestheader-*` / `proxy-client-*` aggregation set, `etcd-{ca,cert,key}file`,
+   `service-account-{issuer,key-file,signing-key-file}`,
+   `authorization-{mode,config}`, `authentication-config`,
+   `encryption-provider-config`, the `audit-log-*` set, `enable-admission-plugins`,
+   `admission-control-config-file`, `kubelet-client-{certificate,key}`,
+   `service-cluster-ip-range`, `tls-min-version`, `profiling`.
+
+**A flag-compatibility layer is worth building on its own merits** — "drop-in
+replacement" means accepting upstream argv — so this is not wasted work, but it
+is *the* prerequisite for Path A rather than a footnote. Minimum viable shape:
+per component, accept the full upstream flag set, map the ones we implement,
+and **explicitly ignore-with-a-warning** the ones we do not (never silently:
+an ignored `--encryption-provider-config` is a security surprise, not a
+convenience).
+
+### 4.2 Other frictions
+
 - **Storage.** Talos runs **etcd** (started by `machined`, outside Kubernetes)
-  and points the api-server at it. Our etcd backend covers this; SQLite/Rhino
-  does not participate in this path.
+  and points the api-server at it via `--etcd-servers` + client certs. Our etcd
+  backend covers this; SQLite/Rhino does not participate in this path. Note the
+  kind harness dodges this by running SQLite with empty state — under Talos the
+  api-server inherits a populated etcd, which is a *better* test and a harder one.
 - **Kubelet swap is the hard one.** Talos's kubelet is a *system service* with
-  Talos-authored args, Talos's CRI containerd, and a specific mount set — a
-  drop-in `rusternetes-kubelet` image has to satisfy that contract, not just
-  boot. Do control-plane swap first, kubelet swap second.
+  Talos-authored args, Talos's own CRI containerd and a specific mount set — a
+  drop-in `rusternetes/kubelet` image has to satisfy that contract, not just
+  boot. Do the control plane first, the kubelet second.
 - **Prereqs on this box:** `/opt/cni/bin` has `bridge`, `firewall`, `static`
-  but **not `tc-redirect-tap`** — the preflight will fetch
-  `talosctl-cni-bundle` for it (`qemu/preflight_linux.go:72`). `virtiofsd`,
-  `swtpm` and `mkisofs` are absent (only needed for virtiofs disks, TPM, and
-  `metal-iso` config injection respectively). `/dev/kvm` is accessible (user is
-  in `kvm`), 24 cores / 62 GB — 3 × 2 GB VMs is nothing.
+  but **not `tc-redirect-tap`** — preflight fetches `talosctl-cni-bundle` for it
+  (`qemu/preflight_linux.go:72`). `virtiofsd`, `swtpm` and `mkisofs` are absent
+  (needed only for virtiofs disks, TPM, and `metal-iso` config injection).
+  `/dev/kvm` is accessible (user is in `kvm`), 24 cores / 62 GB — three 2 GiB
+  VMs is nothing. **`sudo` requires a password here**, so the run is a human
+  action, not an agent one.
 
-**Value:** immediate honest multi-node testing of our control plane, and it
-tells us how much of the node-lifecycle gap is ours vs the substrate's.
-**Limit:** the *node* is still Talos. It does not give us "Rusternetes on a
-VM", and it can't be our shipped dev UX (users would need Talos).
+**Value:** honest multi-node testing of our control plane against a populated
+etcd, plus a flag-compat layer we want regardless. **Limit:** the *node* is
+still Talos — this is not "Rusternetes on a VM" and cannot be our shipped dev
+UX (users would need Talos). That is Path B.
 
 ---
 
@@ -384,4 +436,7 @@ licensing question whatsoever.
 | Disk creation | `pkg/provision/providers/vm/disk.go:29` |
 | Pidfile stop | `pkg/provision/providers/vm/process.go:19` |
 | Image tag validation (repo unconstrained) | `pkg/machinery/compatibility/kubernetes_image.go:15-29` |
+| api-server static pod: hard-coded command + upstream flags | `internal/app/machined/pkg/controllers/k8s/control_plane_static_pod.go:290,483-484` |
+| controller-manager / scheduler: same | `internal/app/machined/pkg/controllers/k8s/control_plane_final.go:58,149` |
+| our kind-based swap, which rewrites `command` (Talos cannot) | `ci/vanilla-swap/kind/apiserver-patch.yaml` |
 | Cluster defaults | `cmd/talosctl/cmd/mgmt/cluster/create/clusterops/options.go:171-182` |
