@@ -707,9 +707,13 @@ VS_TEST_DIAL_FAILS=9999 VS_DIAL_CMD="$DIAL_STUB" VS_REPAIR_CMD=/bin/true \
   && bad "vs_wait_dial must fail when the ClusterIP never answers" \
   || ok "vs_wait_dial: never reachable => non-zero"
 
-# the repair hook fires exactly once, halfway through the budget -- a wedged
-# kube-proxy re-syncs its iptables on restart, which is what turns the coin
-# flip into a pass rather than just a better error message.
+# the repair hook fires exactly once, a THIRD of the way through the budget --
+# replacing kube-proxy re-syncs iptables, which is what turns the coin flip
+# into a pass rather than just a better error message. The repair must land
+# early enough that the remaining budget can actually observe it working:
+# firing at halfway left only 90s of a 180s budget, and the DaemonSet needed
+# ~50s to get replacements Running plus a few seconds to program the DNAT, so
+# the gate gave up moments before it would have passed.
 printf '0' >"$VS_TEST_DIAL_COUNT"
 REPAIR_LOG="$TMP/repair.log"; : >"$REPAIR_LOG"
 REPAIR_STUB="$TMP/repair-stub.sh"
@@ -721,6 +725,25 @@ repairs="$(wc -l <"$REPAIR_LOG" | tr -d ' ')"
 [ "$repairs" = "1" ] \
   && ok "vs_wait_dial: repair hook fires once on a wedged substrate" \
   || bad "vs_wait_dial should fire the repair hook exactly once (fired $repairs times)"
+
+# The repair must fire in the FIRST third, leaving the rest of the budget to
+# observe it. With a 30s budget and a 1s interval it must have fired by t=10s;
+# asserting on the dial count at fire time pins the timing, not just the count.
+printf '0' >"$VS_TEST_DIAL_COUNT"
+: >"$REPAIR_LOG"
+COUNT_AT_FIRE="$TMP/count-at-fire"; : >"$COUNT_AT_FIRE"
+REPAIR_TIMED="$TMP/repair-timed.sh"
+printf '#!/usr/bin/env bash\necho fired >>"%s"\ncat "%s" >"%s"\n' \
+  "$REPAIR_LOG" "$VS_TEST_DIAL_COUNT" "$COUNT_AT_FIRE" >"$REPAIR_TIMED"
+chmod +x "$REPAIR_TIMED"
+VS_TEST_DIAL_FAILS=9999 VS_DIAL_CMD="$DIAL_STUB" VS_REPAIR_CMD="$REPAIR_TIMED" \
+  vs_wait_dial node 10.96.0.1 443 30 1 >/dev/null 2>&1
+at_fire="$(tr -d ' \n' <"$COUNT_AT_FIRE" 2>/dev/null)"
+if [ -n "$at_fire" ] && [ "$at_fire" -le 12 ] 2>/dev/null; then
+  ok "vs_wait_dial: repair fires in the first third (after $at_fire polls of 30)"
+else
+  bad "repair fired too late to be observable: $at_fire polls of a 30s budget"
+fi
 
 # ...and never when the substrate was fine all along.
 printf '0' >"$VS_TEST_DIAL_COUNT"

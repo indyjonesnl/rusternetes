@@ -365,7 +365,7 @@ if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
   elif [ -z "${svc_ip:-}" ]; then
     vs_warn "could not read the default/kubernetes ClusterIP — skipping the substrate gate"
   elif ! vs_wait_dial "$probe_node" "$svc_ip" "${svc_port:-443}" \
-         "${VS_SUBSTRATE_TIMEOUT:-180}" 5; then
+         "${VS_SUBSTRATE_TIMEOUT:-360}" 5; then
     # Not the swapped module's fault: report it as its own outcome so the badge
     # and the run-result say what actually broke.
     vs_warn "substrate gate failed: the kubernetes ClusterIP is unroutable from inside the cluster"

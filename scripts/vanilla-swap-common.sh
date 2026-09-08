@@ -866,14 +866,23 @@ vs_kubernetes_clusterip() {
 }
 
 # vs_wait_dial <node> <ip> <port> <timeout-seconds> <interval-seconds>
-# Poll until <ip>:<port> answers from inside <node>. Halfway through the budget,
-# fire the repair hook ONCE (default: restart kube-proxy) and keep polling.
-# Returns 0 as soon as it connects, non-zero when the budget is spent.
+# Poll until <ip>:<port> answers from inside <node>. A third of the way through
+# the budget, fire the repair hook ONCE (default: replace kube-proxy) and keep
+# polling. Returns 0 as soon as it connects, non-zero when the budget is spent.
+#
+# The repair fires at a THIRD, not halfway, and the default budget is 360s
+# rather than 180s, because the repair needs time to take effect and the old
+# split did not give it any. Measured on a reproduced run: the repair fired at
+# t=90s of 180s, the DaemonSet took ~50s to get replacement kube-proxy pods to
+# Running, and the ClusterIP started answering ~8s after that -- i.e. just past
+# the deadline. The gate reported `substrate-not-ready` while its own failure
+# dump showed kube-proxy 1/1 Running on both nodes. Repairing and then not
+# waiting long enough to see it work is the worst of both.
 vs_wait_dial() {
   local node="$1" ip="$2" port="$3"
-  local timeout="${4:-180}" interval="${5:-5}"
+  local timeout="${4:-360}" interval="${5:-5}"
   local repair="${VS_REPAIR_CMD:-}"
-  local halfway=$(( timeout / 2 ))
+  local halfway=$(( timeout / 3 ))
   local repaired=0 i
 
   vs_log "waiting for ClusterIP ${ip}:${port} to answer from inside the cluster (≤${timeout}s)"
