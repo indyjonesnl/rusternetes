@@ -213,7 +213,7 @@ pub fn parse_delete_propagation(
     });
     let orphan = params
         .get("orphanDependents")
-        .and_then(|v| v.parse::<bool>().ok())
+        .map(|v| rusternetes_common::query::k8s_query_bool(v))
         .or_else(|| {
             body_delete_options
                 .and_then(|v| v.get("orphanDependents"))

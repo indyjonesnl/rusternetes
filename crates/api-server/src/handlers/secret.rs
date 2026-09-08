@@ -414,10 +414,10 @@ pub async fn list(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_namespaced::<Secret>(
             state,
@@ -480,10 +480,10 @@ pub async fn list_all_secrets(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_cluster_scoped::<Secret>(
             state,
@@ -616,7 +616,7 @@ async fn apply_secret_ssa(
     })?;
     let force = params
         .get("force")
-        .and_then(|v| v.parse::<bool>().ok())
+        .map(|v| rusternetes_common::query::k8s_query_bool(v))
         .unwrap_or(false);
     let opts = crate::ssa::ApplyOptions::new(field_manager).with_force(force);
 

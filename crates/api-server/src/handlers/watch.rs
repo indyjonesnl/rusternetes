@@ -191,8 +191,10 @@ where
     deserializer.deserialize_option(Outer)
 }
 
-/// Check if a query param map indicates a watch request
-
+/// Check if a query param map indicates a watch request.
+///
+/// Absence means false, matching upstream's zero-length-slice case; any present
+/// value goes through [`parse_k8s_bool`].
 pub fn is_watch_request(params: &std::collections::HashMap<String, String>) -> bool {
     params
         .get("watch")
@@ -212,10 +214,10 @@ pub fn watch_params_from_query(params: &std::collections::HashMap<String, String
         watch: Some(true),
         allow_watch_bookmarks: params
             .get("allowWatchBookmarks")
-            .and_then(|v| v.parse::<bool>().ok()),
+            .map(|v| rusternetes_common::query::k8s_query_bool(v)),
         send_initial_events: params
             .get("sendInitialEvents")
-            .and_then(|v| v.parse::<bool>().ok()),
+            .map(|v| rusternetes_common::query::k8s_query_bool(v)),
     }
 }
 
@@ -3241,6 +3243,45 @@ mod watch_bool_tests {
         for f in ["0", "false", "False", "FALSE", "fAlSe"] {
             assert_eq!(parse_k8s_bool(f), Some(false), "{f:?} must be false");
         }
+    }
+
+    /// The HashMap path (`watch_params_from_query`, used by ~50 handlers) had
+    /// the same defect as the typed path: allowWatchBookmarks and
+    /// sendInitialEvents went through a strict `parse::<bool>()`, so
+    /// `?allowWatchBookmarks=1` was silently dropped rather than honoured.
+    #[test]
+    fn watch_params_from_query_accepts_k8s_query_bools() {
+        use crate::handlers::watch::watch_params_from_query;
+        for v in ["1", "true", "t", "yes", ""] {
+            let mut p = HashMap::new();
+            p.insert("allowWatchBookmarks".to_string(), v.to_string());
+            p.insert("sendInitialEvents".to_string(), v.to_string());
+            let wp = watch_params_from_query(&p);
+            assert_eq!(
+                wp.allow_watch_bookmarks,
+                Some(true),
+                "allowWatchBookmarks={v:?}"
+            );
+            assert_eq!(
+                wp.send_initial_events,
+                Some(true),
+                "sendInitialEvents={v:?}"
+            );
+        }
+        for v in ["0", "false", "FALSE"] {
+            let mut p = HashMap::new();
+            p.insert("allowWatchBookmarks".to_string(), v.to_string());
+            let wp = watch_params_from_query(&p);
+            assert_eq!(
+                wp.allow_watch_bookmarks,
+                Some(false),
+                "allowWatchBookmarks={v:?}"
+            );
+        }
+        // Absent stays absent -- callers distinguish it from explicit false.
+        let wp = watch_params_from_query(&HashMap::new());
+        assert_eq!(wp.allow_watch_bookmarks, None);
+        assert_eq!(wp.send_initial_events, None);
     }
 
     #[test]
