@@ -962,5 +962,58 @@ unset VS_RESTORE_KC; vs_restart_kube_proxy some-cluster' >/dev/null 2>&1
   && ok "vs_restart_kube_proxy: no kubeconfig -> container bounce (unchanged behaviour)" \
   || bad "without a kubeconfig the old path must still run"
 
+# --- vs_restart_stalled_kubelets (the #1890 cause) ------------------------
+# A kubelet whose pod reflector stalled with an empty set starts nothing:
+# pods assigned, none Running, no sandboxes, no errors. Restarting it forces a
+# fresh LIST (measured: 0 -> 4/4 Running in 8s). The control-plane node must be
+# skipped -- its kubelet owns the swapped api-server static pod, whose store is
+# in the container's /tmp, so bouncing it would wipe the object store.
+SK="$TMP/sk"; mkdir -p "$SK"
+cat >"$SK/kind" <<'STUB'
+#!/usr/bin/env bash
+printf 'ctrl-cp
+node-w1
+node-w2
+'
+STUB
+cat >"$SK/kubectl" <<'STUB'
+#!/usr/bin/env bash
+node=""; for a in "$@"; do case "$a" in spec.nodeName=*) node="${a#spec.nodeName=}";; esac; done
+# node-w1: 2 assigned, none Running (stalled). node-w2: 1 assigned and Running.
+case "$node" in
+  node-w1) printf 'ns p1 0/1 Pending 0 1m
+ns p2 0/1 Pending 0 1m
+' ;;
+  node-w2) printf 'ns p3 1/1 Running 0 1m
+' ;;
+  ctrl-cp) printf 'ns p4 0/1 Pending 0 1m
+' ;;
+esac
+exit 0
+STUB
+cat >"$SK/docker" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in node-*|ctrl-*) echo "$a" >>"$SK_RESTARTED";; esac; done
+exit 0
+STUB
+chmod +x "$SK/kind" "$SK/kubectl" "$SK/docker"
+
+: >"$TMP/sk-restarted"
+got="$(SK_RESTARTED="$TMP/sk-restarted" PATH="$SK:$PATH" bash -c '
+source '"$SCRIPT_DIR"'/vanilla-swap-common.sh
+vs_control_plane_node() { echo ctrl-cp; }
+vs_restart_stalled_kubelets some-cluster /dev/null' 2>/dev/null | tail -1)"
+restarted="$(sort -u "$TMP/sk-restarted" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+
+[ "$got" = "1" ] \
+  && ok "vs_restart_stalled_kubelets: restarts exactly the stalled worker" \
+  || bad "expected 1 restart, got '$got'"
+[ "$restarted" = "node-w1" ] \
+  && ok "vs_restart_stalled_kubelets: targets node-w1 only (w2 healthy, cp skipped)" \
+  || bad "expected only node-w1 restarted, got '$restarted'"
+grep -q "ctrl-cp" <<<"$restarted" \
+  && bad "the control-plane kubelet must NEVER be restarted (it owns the api-server static pod)" \
+  || ok "vs_restart_stalled_kubelets: never touches the control-plane kubelet"
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }

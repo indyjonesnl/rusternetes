@@ -804,6 +804,46 @@ vs_recreate_stuck_addon_pods() {
   printf '%s\n' "$deleted"
 }
 
+# vs_restart_stalled_kubelets <cluster> <kubeconfig>
+# Restart the kubelet on every NON-control-plane node that has pods assigned to
+# it but none Running. Echoes how many kubelets were restarted.
+#
+# This is the actual cause of #1890, and the only remedy measured to fix it
+# deterministically. After the swap the worker kubelet is restarted to
+# re-register, so its pod reflector does its initial LIST *before* kind's
+# controllers have recreated the addon pods — it starts with an empty set. The
+# watch that should deliver the later ADDs then stalls silently (the rhino
+# backend does this; see WATCH_LIVENESS_INTERVAL and #1165), so the kubelet sits
+# with an empty desired set: node Ready, status posting fine, no errors logged,
+# and zero sandboxes. Our watches are bounded at 600s, so it self-heals in ~10
+# minutes — far longer than the substrate gate waits.
+#
+# Measured on a wedged cluster: 4 pods assigned to the worker, all Pending, 0
+# sandboxes, kubelet log silent for 7 minutes. `systemctl restart kubelet` ->
+# 4 sandboxes and 4/4 Running within 8 seconds.
+#
+# The control-plane node is deliberately EXCLUDED: its kubelet owns the swapped
+# api-server static pod, whose store lives in the container's /tmp, so bouncing
+# it would wipe the object store and reset the cluster. That is acceptable
+# because the substrate gate probes a non-control-plane node, so healing the
+# workers is sufficient for a routable ClusterIP.
+vs_restart_stalled_kubelets() {
+  local cluster="$1" kubeconfig="$2" node cp restarted=0 assigned running
+  cp="$(vs_control_plane_node "$cluster" 2>/dev/null)"
+  for node in $(kind get nodes --name "$cluster" 2>/dev/null); do
+    [ "$node" = "$cp" ] && continue
+    assigned="$( { KUBECONFIG="$kubeconfig" kubectl get pods -A \
+      --field-selector "spec.nodeName=$node" --no-headers 2>/dev/null || true; } | wc -l)"
+    running="$( { KUBECONFIG="$kubeconfig" kubectl get pods -A \
+      --field-selector "spec.nodeName=$node" --no-headers 2>/dev/null || true; } | grep -c Running || true)"
+    if [ "${assigned:-0}" -gt 0 ] && [ "${running:-0}" -eq 0 ]; then
+      vs_log "kubelet on $node has ${assigned} pod(s) assigned and none Running — restarting it (#1890)"
+      docker exec "$node" systemctl restart kubelet >/dev/null 2>&1 && restarted=$((restarted + 1))
+    fi
+  done
+  printf '%s\n' "$restarted"
+}
+
 # vs_repair_stuck_addon_pods <kubeconfig> [settle_s] [attempts]
 # Ensure at least one kube-proxy pod is actually Running, repairing stuck addon
 # pods as needed. Echoes the total number of pods deleted across attempts.
@@ -831,7 +871,7 @@ vs_recreate_stuck_addon_pods() {
 # is able to start anything.
 vs_repair_stuck_addon_pods() {
   local kubeconfig="$1" settle="${2:-60}" attempts="${3:-6}"
-  local deleted_total=0 attempt=1 waited proxy_running total notrunning n
+  local deleted_total=0 attempt=1 waited proxy_running total notrunning n k
   while [ "$attempt" -le "$attempts" ]; do
     waited=0
     while [ "$waited" -lt "$settle" ]; do
@@ -849,7 +889,24 @@ vs_repair_stuck_addon_pods() {
       --no-headers 2>/dev/null || true; } | wc -l )"
     notrunning="$( { KUBECONFIG="$kubeconfig" kubectl -n kube-system get pods \
       --no-headers 2>/dev/null || true; } | grep -vc Running || true)"
-    vs_log "addon-pod repair attempt $attempt/$attempts: no Running kube-proxy after ${settle}s (total=${total:-0} notRunning=${notrunning:-0}) — deleting stuck pods (#1890)"
+    vs_log "addon-pod repair attempt $attempt/$attempts: no Running kube-proxy after ${settle}s (total=${total:-0} notRunning=${notrunning:-0})"
+    # Address the CAUSE first: a kubelet whose pod reflector stalled with an
+    # empty set will not start ANY pod, so deleting pods just produces more
+    # Pending ones. Restarting it forces a fresh LIST and it starts them all
+    # within seconds (measured: 0 -> 4/4 Running in 8s).
+    k="$(vs_restart_stalled_kubelets "${VS_CLUSTER:-}" "$kubeconfig")"
+    if [ "${k:-0}" -gt 0 ] 2>/dev/null; then
+      vs_log "addon-pod repair: restarted ${k} stalled kubelet(s); re-checking before deleting anything"
+      sleep 10
+      proxy_running="$( { KUBECONFIG="$kubeconfig" kubectl -n kube-system get pods \
+        -l k8s-app=kube-proxy --no-headers 2>/dev/null || true; } | grep -c Running || true)"
+      if [ "${proxy_running:-0}" -ge 1 ] 2>/dev/null; then
+        vs_log "addon-pod repair: kube-proxy Running after the kubelet restart (attempt $attempt)"
+        printf '%s\n' "$deleted_total"
+        return 0
+      fi
+    fi
+    vs_log "addon-pod repair: deleting stuck pods so their controllers recreate them (#1890)"
     n="$(vs_recreate_stuck_addon_pods "$kubeconfig")"
     deleted_total=$(( deleted_total + ${n:-0} ))
     attempt=$(( attempt + 1 ))
