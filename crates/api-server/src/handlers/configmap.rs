@@ -611,10 +611,11 @@ async fn paginate_configmaps_response(
         continue_token,
     };
 
-    let resource_version = match state.storage.current_revision().await {
-        Ok(rev) => rev.to_string(),
-        Err(_) => crate::handlers::list_resource_version(&configmaps),
-    };
+    // The list RV must never fall below an item this same list returns.
+    // Upstream gets both from one etcd range response; here the store
+    // revision and the items are read separately, so take the max (#1825).
+    let resource_version =
+        crate::handlers::list_collection_resource_version(&state.storage, &configmaps).await;
 
     let paginated =
         match rusternetes_common::paginate(configmaps, pagination_params, &resource_version) {

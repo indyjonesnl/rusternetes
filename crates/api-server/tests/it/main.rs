@@ -118,6 +118,7 @@ mod limitrange_handler_test;
 mod limitrange_pdb_update_validation_test;
 mod list_empty_items_router_test;
 mod list_pagination_test;
+mod list_resource_version_floor_guard_test;
 mod list_resource_version_router_test;
 mod mtls_client_cert_authn_test;
 mod namespace_controller_api_finalize_test;
