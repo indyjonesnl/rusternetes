@@ -33,8 +33,18 @@
 #
 #   --skip '\[Flaky\]|\[Serial\]|\[Slow\]'
 #
+# TIMEOUT: each partition is capped by --partition-timeout (default 45m). A
+# wedged partition otherwise stalls the whole run indefinitely: hydrophone
+# passes ginkgo `--timeout=24h`, so nothing below this script gives up. Seen for
+# real on the first full partitioned run — one leaked e2e fake node put every
+# later spec's DeferCleanup into a permanent wait on AllNodesReady (#1887), and
+# sig-node sat dead for 90 minutes with the driver still waiting. A capped
+# partition is recorded as TIMEOUT and the run moves on, so one wedge costs one
+# partition instead of the night.
+#
 # NOT a gate. Conformance failures never fail the run; only an INFRA failure
-# (a partition that produced no junit) is reflected in the exit code.
+# (a partition that produced no junit, or one that timed out) is reflected in
+# the exit code.
 #
 # Coverage: the kind:sig partitions cover every [sig-*] label present in the
 # [Conformance] set except [sig-architecture], which has no manifest entry
@@ -55,6 +65,7 @@
 #
 # Flags: --targets --skip-targets --order --reverse --output-dir
 #        --stop-on-infra-failure and the pass-throughs --kubeconfig
+#        --partition-timeout and the pass-throughs --kubeconfig
 #        --conformance-image --hydrophone --parallel --skip --skip-preflight
 #        --preflight-arg -h|--help
 set -euo pipefail
@@ -115,6 +126,44 @@ resolve_selection() {
     if [ "$reverse" = "1" ]; then printf '%s\n' "$out" | tac; else printf '%s\n' "$out"; fi
 }
 
+# Default cap per partition. 45 minutes is comfortably above the slowest
+# healthy partition measured so far (sig-scheduling, 11 min wall, whose
+# [Serial] specs are wait-dominated by design) and well below the ~90 minutes a
+# wedged one burned before anyone noticed.
+DEFAULT_PARTITION_TIMEOUT=2700
+
+# Map a `timeout`-wrapped exit code to a partition status.
+#
+# status_for_exit <rc> <elapsed_seconds> <cap_seconds>
+#
+# target-run itself exits 0 (junit produced), 1 (infra) or 2 (usage), so the
+# codes to disambiguate are the ones `timeout` adds:
+#   124      it timed out and SIGTERM was enough
+#   128+n    the child died of signal n -- with --kill-after that is 137
+#            (SIGKILL) for a partition that ignored SIGTERM, which hydrophone
+#            and ginkgo do while shutting a suite down
+#
+# 137 alone is ambiguous: an OOM kill looks identical. Elapsed time settles it —
+# a kill at or past the cap is the cap firing, anything earlier is not, and
+# calling an OOM a TIMEOUT would send the reader looking for a wedge that is not
+# there.
+status_for_exit() {
+    local rc="$1" elapsed="${2:-0}" cap="${3:-0}"
+    case "$rc" in
+        0)   echo ok ;;
+        124) echo TIMEOUT ;;
+        1)   echo INFRA ;;
+        2)   echo USAGE ;;
+        *)
+            if [ "$rc" -gt 128 ] && [ "$cap" -gt 0 ] && [ "$elapsed" -ge "$cap" ]; then
+                echo TIMEOUT
+            else
+                echo USAGE
+            fi
+            ;;
+    esac
+}
+
 # Render the summary table from the TSV rows written per partition.
 # Row: target<TAB>status<TAB>passed<TAB>failed<TAB>total<TAB>seconds
 render_summary() {
@@ -137,7 +186,7 @@ fi
 # ---------------------------------------------------------------------- driver
 
 TARGETS=""; SKIP_TARGETS=""; ORDER="registry"; REVERSE=0
-OUTPUT_DIR=""; STOP_ON_INFRA=0
+OUTPUT_DIR=""; STOP_ON_INFRA=0; PARTITION_TIMEOUT="$DEFAULT_PARTITION_TIMEOUT"
 declare -a PASSTHRU=()
 
 while [[ $# -gt 0 ]]; do
@@ -148,6 +197,10 @@ while [[ $# -gt 0 ]]; do
         --reverse) REVERSE=1; shift ;;
         --output-dir) [[ $# -ge 2 ]] || die "--output-dir requires a value"; OUTPUT_DIR="$2"; shift 2 ;;
         --stop-on-infra-failure) STOP_ON_INFRA=1; shift ;;
+        --partition-timeout)
+            [[ $# -ge 2 ]] || die "--partition-timeout requires a value"
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--partition-timeout must be whole seconds, got '$2'"
+            PARTITION_TIMEOUT="$2"; shift 2 ;;
         # Pass-throughs, forwarded verbatim to every partition.
         --kubeconfig|--conformance-image|--hydrophone|--parallel|--skip|--preflight-arg)
             [[ $# -ge 2 ]] || die "$1 requires a value"; PASSTHRU+=("$1" "$2"); shift 2 ;;
@@ -158,6 +211,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 command -v jq >/dev/null 2>&1 || die "jq required"
+# coreutils, so present everywhere this runs — but the ARC runners have no sudo
+# to install anything, so say so plainly rather than letting the partition loop
+# fail per-partition with a bare 127.
+command -v timeout >/dev/null 2>&1 || die "timeout(1) required (coreutils)"
 [ -f "$MANIFEST" ] || die "targets manifest not found: $MANIFEST"
 
 SELECTION=$(resolve_selection "$MANIFEST" "$TARGETS" "$SKIP_TARGETS" "$ORDER" "$REVERSE") \
@@ -174,6 +231,7 @@ SUMMARY_TSV="$OUTPUT_DIR/summary.tsv"
 # conformance-target-run.sh documents for its forwarded preflight args.
 echo "[conformance-suite-run] ${#PARTITIONS[@]} partitions: $(IFS=' '; echo "${PARTITIONS[*]}")"
 echo "[conformance-suite-run] output: $OUTPUT_DIR"
+echo "[conformance-suite-run] per-partition cap: ${PARTITION_TIMEOUT}s"
 
 SUITE_START=$(date +%s)
 INFRA_FAILURES=0
@@ -189,8 +247,11 @@ for target in "${PARTITIONS[@]}"; do
     # scraping stdout, which also carries the whole hydrophone log.
     counts="$part_dir/counts.env"
     : > "$counts"
+    # --foreground so the cap applies to an interactive run too, and
+    # --kill-after so a hydrophone that ignores SIGTERM still dies.
     set +e
-    GITHUB_OUTPUT="$counts" bash "$SCRIPT_DIR/conformance-target-run.sh" \
+    GITHUB_OUTPUT="$counts" timeout --foreground --kill-after=20s "$PARTITION_TIMEOUT" \
+        bash "$SCRIPT_DIR/conformance-target-run.sh" \
         --target "$target" \
         --output-dir "$part_dir" \
         ${PASSTHRU[@]+"${PASSTHRU[@]}"}
@@ -202,11 +263,12 @@ for target in "${PARTITIONS[@]}"; do
     failed=$(sed -n 's/^failed=//p' "$counts" | tail -1); failed=${failed:-0}
     total=$(sed -n 's/^total=//p' "$counts" | tail -1); total=${total:-0}
 
-    case "$rc" in
-        0) status="ok" ;;
-        1) status="INFRA"; INFRA_FAILURES=$((INFRA_FAILURES + 1)) ;;
-        *) status="USAGE"; INFRA_FAILURES=$((INFRA_FAILURES + 1)) ;;
-    esac
+    status=$(status_for_exit "$rc" "$elapsed" "$PARTITION_TIMEOUT")
+    [ "$status" = "ok" ] || INFRA_FAILURES=$((INFRA_FAILURES + 1))
+    if [ "$status" = "TIMEOUT" ]; then
+        echo "[conformance-suite-run] partition $target exceeded ${PARTITION_TIMEOUT}s and was killed." >&2
+        echo "[conformance-suite-run] a partition that stops making progress is usually a wedged cluster, not a slow suite — check $part_dir/run.log and \`kubectl get nodes\` (#1887)." >&2
+    fi
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$target" "$status" "$passed" "$failed" "$total" "$elapsed" >> "$SUMMARY_TSV"

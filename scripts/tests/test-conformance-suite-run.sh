@@ -122,6 +122,63 @@ done
 check "--skip-preflight is forwarded as a valueless flag" \
     1 "$(grep -c -- '--skip-preflight) PASSTHRU+=("\$1"); shift ;;' "$DRIVER")"
 
+echo "== status_for_exit =="
+# 124 is `timeout`'s "I had to kill it" code and must not be read as a
+# conformance result. Getting this wrong would report a wedged partition as a
+# clean pass (exit 0) or hide it among ordinary infra failures.
+check "exit 0 is ok"                    ok      "$(status_for_exit 0 5 100)"
+check "exit 124 is TIMEOUT (SIGTERM was enough)"   TIMEOUT "$(status_for_exit 124 100 100)"
+check "exit 1 is INFRA"                 INFRA   "$(status_for_exit 1 5 100)"
+check "exit 2 is USAGE"                 USAGE   "$(status_for_exit 2 5 100)"
+# 137 at/past the cap is --kill-after finishing the job; the same code well
+# short of the cap is something else (an OOM kill) and must not be mislabelled.
+check "exit 137 at the cap is TIMEOUT"  TIMEOUT "$(status_for_exit 137 120 100)"
+check "exit 137 far below the cap is not TIMEOUT" USAGE "$(status_for_exit 137 5 100)"
+
+echo "== --partition-timeout validation =="
+DRIVER="$REPO_ROOT/scripts/conformance-suite-run.sh"
+set +e; out=$(bash "$DRIVER" --partition-timeout abc --targets sig-cli 2>&1); rc=$?; set -e
+if [ "$rc" -eq 2 ] && grep -q "whole seconds" <<<"$out"; then
+    ok "a non-numeric --partition-timeout is rejected with exit 2"
+else
+    bad "a non-numeric --partition-timeout should exit 2 with a clear message (rc=$rc)"
+fi
+set +e; out=$(bash "$DRIVER" --partition-timeout 2>&1); rc=$?; set -e
+if [ "$rc" -eq 2 ]; then ok "--partition-timeout with no value is rejected"; else bad "--partition-timeout with no value should exit 2 (rc=$rc)"; fi
+
+echo "== the cap actually fires =="
+# End-to-end: a stub target runner that hangs forever must be killed and
+# recorded as TIMEOUT, and the run must continue rather than stall. Unit-testing
+# status_for_exit alone would not have caught a missing `timeout` wrapper --
+# which is the bug this whole change exists to fix.
+STUB_DIR="$TMP/stub"; mkdir -p "$STUB_DIR/scripts/tests"
+cp "$DRIVER" "$STUB_DIR/scripts/"
+cat > "$STUB_DIR/scripts/conformance-target-run.sh" <<'STUB'
+#!/usr/bin/env bash
+# Hangs like a wedged hydrophone, and (like the real thing) ignores SIGTERM
+# so --kill-after is what finally ends it.
+trap '' TERM
+sleep 300
+STUB
+chmod +x "$STUB_DIR/scripts/conformance-target-run.sh"
+mkdir -p "$STUB_DIR/ci/conformance"; cp "$FIX" "$STUB_DIR/ci/conformance/targets.json"
+run_out="$TMP/stub-run.log"
+start=$(date +%s)
+set +e
+timeout 90 bash "$STUB_DIR/scripts/conformance-suite-run.sh" \
+    --targets sig-node,sig-apps --partition-timeout 3 \
+    --output-dir "$TMP/stub-out" --skip-preflight > "$run_out" 2>&1
+stub_rc=$?
+set -e
+took=$(( $(date +%s) - start ))
+
+if grep -q "exceeded 3s and was killed" "$run_out"; then ok "a hung partition is killed at the cap"; else bad "no kill message; log: $(tail -3 "$run_out")"; fi
+check "the killed partition is recorded TIMEOUT" 2 "$(grep -c $'\tTIMEOUT\t' "$TMP/stub-out/summary.tsv" 2>/dev/null || echo 0)"
+if [ "$stub_rc" -eq 1 ]; then ok "a timed-out run exits 1 (infra), not 0"; else bad "expected exit 1, got $stub_rc"; fi
+# 2 partitions x 3s cap: must finish in well under the 300s the stub sleeps.
+if [ "$took" -lt 120 ]; then ok "the run continued past the wedge (${took}s, stub sleeps 300s)"; else bad "run took ${took}s -- the cap did not release it"; fi
+if grep -q "#1887" "$run_out"; then ok "the operator is pointed at the wedge diagnosis"; else bad "no #1887 pointer in the timeout message"; fi
+
 echo
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
