@@ -338,20 +338,32 @@ async fn watch_extract_resource_version_from_raw_json() {
 /// [sig-api-machinery] Watch query-param parsing: ?watch=true switches list
 /// requests into watch mode.
 ///
-/// Upstream: staging/src/k8s.io/apimachinery/pkg/runtime watch routing
+/// Upstream: `runtime.Convert_Slice_string_To_bool`
+/// (staging/src/k8s.io/apimachinery/pkg/runtime/conversion.go:83-95), wired for
+/// `out.Watch` at apis/meta/v1/zz_generated.conversion.go:388. NOT
+/// `strconv.ParseBool` — query bools never go through it. Its contract:
+///
+/// > Only the absence of a value (i.e. zero-length slice), a value of "false",
+/// > or a value of "0" resolve to false.
+///
+/// So EVERY other spelling is true, including "yes" and the empty value.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn watch_query_param_recognised_for_list_endpoints() {
     assert!(is_watch_request(&qp(&[("watch", "true")])));
-    // Kubernetes parses query booleans with Go's `strconv.ParseBool`, so the
-    // value "1" (sent by Lens and other non-client-go informers) is ALSO a
-    // watch — see `parse_k8s_bool`. Treating it as a plain list made those
-    // clients relist-loop (poll) instead of watching.
+    // "1" is sent by Lens and other non-client-go informers. Treating it as a
+    // plain list made those clients relist-loop (poll) instead of watching.
     assert!(is_watch_request(&qp(&[("watch", "1")])));
     assert!(is_watch_request(&qp(&[("watch", "t")])));
+    // Unrecognised spellings are TRUE, not an error and not false: upstream's
+    // `default:` arm. `?watch=` (present but empty) is a present value too.
+    assert!(is_watch_request(&qp(&[("watch", "yes")])));
+    assert!(is_watch_request(&qp(&[("watch", "")])));
+    // The only two false spellings, "false" case-insensitively.
     assert!(!is_watch_request(&qp(&[("watch", "false")])));
+    assert!(!is_watch_request(&qp(&[("watch", "FALSE")])));
     assert!(!is_watch_request(&qp(&[("watch", "0")])));
-    assert!(!is_watch_request(&qp(&[("watch", "yes")])));
+    // Absent = upstream's zero-length-slice case.
     assert!(!is_watch_request(&qp(&[])));
 }
 

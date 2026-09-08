@@ -3196,7 +3196,9 @@ mod watch_bool_tests {
     use super::{is_watch_request, parse_k8s_bool};
     use std::collections::HashMap;
 
-    /// Kubernetes accepts Go `strconv.ParseBool` spellings on `?watch=`.
+    /// Kubernetes resolves `?watch=` via `runtime.Convert_Slice_string_To_bool`
+    /// (conversion.go:83-95), where only "0" and "false" are false — NOT
+    /// `strconv.ParseBool`.
     /// Rust's `str::parse::<bool>()` only accepts "true"/"false", so clients
     /// that send `?watch=1` (Lens and other non-client-go informers) were
     /// silently served a plain LIST instead of a watch stream — making their
