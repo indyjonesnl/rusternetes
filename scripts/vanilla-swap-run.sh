@@ -79,6 +79,11 @@ vs_version_skew_check "$VS_K8S_VERSION"
 # for the same module cannot run on one host. Side containers and volumes are all
 # named from this, so an override isolates a run completely.
 CLUSTER="${VS_CLUSTER_NAME:-vanilla-swap-${MODULE}}"
+# Exported HERE, not just before the substrate gate: the post-restore addon-pod
+# repair also needs it, and reading it from an unset VS_CLUSTER made
+# vs_restart_stalled_kubelets run `kind get nodes --name ""`, iterate zero
+# nodes, and silently do nothing while reporting 0 restarts.
+export VS_CLUSTER="$CLUSTER"
 VS_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/vanilla-swap-${MODULE}.XXXXXX")"
 export VS_WORKDIR
 vs_install_teardown_trap "$CLUSTER"
@@ -391,7 +396,7 @@ for name, st in d.items():
   #
   # ONLY the api-server leg gates here. For the kube-proxy leg an unroutable
   # ClusterIP IS the module failing, and must stay reported as such.
-  export VS_CLUSTER="$CLUSTER"
+  export VS_CLUSTER="$CLUSTER"   # already exported at definition; harmless
   # The gate's repair replaces kube-proxy PODS (not containers) so the
   # DaemonSet recreates them — a stopped container is not restarted while
   # #1890 is open, which left the cluster with no kube-proxy at all.

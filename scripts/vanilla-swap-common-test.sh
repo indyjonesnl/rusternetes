@@ -1015,5 +1015,24 @@ grep -q "ctrl-cp" <<<"$restarted" \
   && bad "the control-plane kubelet must NEVER be restarted (it owns the api-server static pod)" \
   || ok "vs_restart_stalled_kubelets: never touches the control-plane kubelet"
 
+# --- wiring: VS_CLUSTER must be exported BEFORE the repair uses it --------
+# The repair calls vs_restart_stalled_kubelets "${VS_CLUSTER:-}". When that was
+# exported only just before the substrate gate, the earlier post-restore repair
+# ran `kind get nodes --name ""`, iterated zero nodes, and silently reported 0
+# restarts -- the function was correct and the wiring was not, which a unit test
+# passing an explicit cluster name cannot catch.
+RUN_SH="$SCRIPT_DIR/vanilla-swap-run.sh"
+exp_line="$(grep -n 'export VS_CLUSTER=' "$RUN_SH" | head -1 | cut -d: -f1)"
+use_line="$(grep -n 'vs_restart_stalled_kubelets "\${VS_CLUSTER' "$RUN_SH" | head -1 | cut -d: -f1)"
+if [ -z "$use_line" ]; then
+  # the repair calls it from common.sh, so assert against the repair call site
+  use_line="$(grep -n 'vs_repair_stuck_addon_pods' "$RUN_SH" | head -1 | cut -d: -f1)"
+fi
+if [ -n "$exp_line" ] && [ -n "$use_line" ] && [ "$exp_line" -lt "$use_line" ]; then
+  ok "VS_CLUSTER is exported (line $exp_line) before the repair uses it (line $use_line)"
+else
+  bad "VS_CLUSTER must be exported before the repair call (export=$exp_line use=$use_line)"
+fi
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }
