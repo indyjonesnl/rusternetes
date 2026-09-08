@@ -369,10 +369,16 @@ pub async fn list_apiservices(
     // the cluster rather than the selected ones and could never reach zero.
     crate::handlers::filtering::apply_selectors(&mut items, &params)?;
 
+    // The list RV must never fall below an item this same list returns.
+    // Upstream gets both from one etcd range response; here the store revision
+    // and the items are read separately, so take the max (#1825).
+    let resource_version =
+        crate::handlers::list_collection_resource_version(&state.storage, &items).await;
+
     let list = serde_json::json!({
         "apiVersion": "apiregistration.k8s.io/v1",
         "kind": "APIServiceList",
-        "metadata": { "resourceVersion": match state.storage.current_revision().await { Ok(rev) => rev.to_string(), Err(_) => "1".to_string() } },
+        "metadata": { "resourceVersion": resource_version },
         "items": items
     });
     Ok(Json(list).into_response())
