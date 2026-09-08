@@ -757,5 +757,122 @@ got="$(PATH="$KC_STUB_BIN:$PATH" vs_kubernetes_clusterip /dev/null)"
   && ok "vs_kubernetes_clusterip: returns '<ip> <port>'" \
   || bad "vs_kubernetes_clusterip got '$got' (want '10.96.0.1 443')"
 
+# --- vs_recreate_stuck_addon_pods (#1890 repair) --------------------------
+# A kubectl stub that reports the pod table on `get` and records `delete`
+# targets to a file, so the function's selection logic is asserted without a
+# cluster. The jsonpath the function uses is exercised for real by the live
+# run; here we feed the already-rendered rows it would produce.
+RP_BIN="$TMP/rp-bin"; mkdir -p "$RP_BIN"
+mk_kubectl_stub() { # $1 = pod rows (name phase mirror)
+  printf '%s' "$1" >"$TMP/rows"
+  : >"$TMP/deleted"
+  cat >"$RP_BIN/kubectl" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in get) mode=get;; delete) mode=delete;; esac; done
+if [ "${mode:-}" = "get" ]; then cat "$TMP_ROWS"; exit 0; fi
+if [ "${mode:-}" = "delete" ]; then
+  # the pod name is the arg after `pod`
+  prev=""; for a in "$@"; do [ "$prev" = "pod" ] && { echo "$a" >>"$TMP_DELETED"; break; }; prev="$a"; done
+  exit 0
+fi
+exit 0
+STUB
+  chmod +x "$RP_BIN/kubectl"
+}
+
+# Rows: a Running pod, two Pending addon pods, and a Pending MIRROR (static) pod.
+mk_kubectl_stub 'kube-proxy-aaa Running
+kube-proxy-bbb Pending
+coredns-ccc Pending
+kube-apiserver-cp Pending abc123mirror
+'
+got="$(TMP_ROWS="$TMP/rows" TMP_DELETED="$TMP/deleted" PATH="$RP_BIN:$PATH" vs_recreate_stuck_addon_pods /dev/null)"
+[ "$got" = "2" ] \
+  && ok "vs_recreate_stuck_addon_pods: deletes only the non-Running, non-mirror pods (2)" \
+  || bad "vs_recreate_stuck_addon_pods returned '$got' (want 2)"
+
+deleted="$(tr '\n' ' ' <"$TMP/deleted" 2>/dev/null | sed 's/ $//')"
+[ "$deleted" = "kube-proxy-bbb coredns-ccc" ] \
+  && ok "vs_recreate_stuck_addon_pods: targets exactly the stuck addon pods" \
+  || bad "deleted '$deleted' (want 'kube-proxy-bbb coredns-ccc')"
+
+# A Running pod must never be deleted -- that would bounce a healthy addon.
+mk_kubectl_stub 'kube-proxy-aaa Running
+coredns-bbb Running
+'
+got="$(TMP_ROWS="$TMP/rows" TMP_DELETED="$TMP/deleted" PATH="$RP_BIN:$PATH" vs_recreate_stuck_addon_pods /dev/null)"
+[ "$got" = "0" ] && [ ! -s "$TMP/deleted" ] \
+  && ok "vs_recreate_stuck_addon_pods: healthy cluster is a no-op (the post-#1890 state)" \
+  || bad "healthy cluster should delete nothing, got '$got' / '$(cat "$TMP/deleted")'"
+
+# The api-server's own mirror pod must survive even when it is the only entry.
+mk_kubectl_stub 'kube-apiserver-cp Pending deadbeefmirror
+'
+got="$(TMP_ROWS="$TMP/rows" TMP_DELETED="$TMP/deleted" PATH="$RP_BIN:$PATH" vs_recreate_stuck_addon_pods /dev/null)"
+[ "$got" = "0" ] && [ ! -s "$TMP/deleted" ] \
+  && ok "vs_recreate_stuck_addon_pods: never deletes a kubelet mirror pod" \
+  || bad "mirror pod must not be deleted, got '$got' / '$(cat "$TMP/deleted")'"
+
+# Empty input (api-server unreachable) must not error or delete anything.
+mk_kubectl_stub ''
+got="$(TMP_ROWS="$TMP/rows" TMP_DELETED="$TMP/deleted" PATH="$RP_BIN:$PATH" vs_recreate_stuck_addon_pods /dev/null)"
+[ "$got" = "0" ] \
+  && ok "vs_recreate_stuck_addon_pods: no pods listed -> 0, no error" \
+  || bad "empty listing should return 0, got '$got'"
+
+# --- vs_repair_stuck_addon_pods: verify-and-retry ------------------------
+# A one-shot version of this repair shipped twice and was silently a no-op both
+# times while behaving correctly when invoked by hand. So it now verifies the
+# condition it exists for -- a Running kube-proxy, which is what programs the
+# 10.96.0.1 rule the substrate gate needs -- and retries. These pin that.
+RP2="$TMP/rp2"; mkdir -p "$RP2"
+
+# kubectl stub: `get -l k8s-app=kube-proxy` returns Running only once the
+# recorded repair count reaches $RUNNING_AFTER repairs (-1 = never).
+cat >"$RP2/kubectl" <<'STUB'
+#!/usr/bin/env bash
+args="$*"
+repairs=$(cat "$TMP_REPAIRS" 2>/dev/null || echo 0)
+case "$args" in
+  *k8s-app=kube-proxy*)
+    if [ "$RUNNING_AFTER" -ge 0 ] && [ "$repairs" -ge "$RUNNING_AFTER" ]; then
+      echo "kube-proxy-xyz 1/1 Running 0 1m"
+    fi ;;
+  *"get pods"*) echo "kube-proxy-abc 0/1 Pending 0 1m" ;;
+esac
+exit 0
+STUB
+chmod +x "$RP2/kubectl"
+
+run_repair() { # $1=RUNNING_AFTER  -> echoes "<returned>|<repairs fired>"
+  : >"$TMP/repairs0"; echo 0 >"$TMP/repairs0"
+  local out
+  out="$(RUNNING_AFTER="$1" TMP_REPAIRS="$TMP/repairs0" PATH="$RP2:$PATH" \
+    bash -c 'source '"$SCRIPT_DIR"'/vanilla-swap-common.sh
+vs_recreate_stuck_addon_pods() {
+  n=$(cat "'"$TMP"'/repairs0"); echo $((n+1)) >"'"$TMP"'/repairs0"; printf "2\n"
+}
+vs_repair_stuck_addon_pods /dev/null 5 3' 2>/dev/null)"
+  printf '%s|%s\n' "$out" "$(cat "$TMP/repairs0")"
+}
+
+# kube-proxy already Running -> return immediately, repair nothing.
+got="$(run_repair 0)"
+[ "$got" = "0|0" ] \
+  && ok "vs_repair_stuck_addon_pods: Running kube-proxy -> no repair (the post-#1890 state)" \
+  || bad "healthy kube-proxy should be a no-op, got '$got' (want '0|0')"
+
+# Never becomes Running -> repairs on every attempt, bounded by attempts=3.
+got="$(run_repair -1)"
+[ "$got" = "6|3" ] \
+  && ok "vs_repair_stuck_addon_pods: never-Running kube-proxy -> 3 bounded attempts, 6 deleted" \
+  || bad "expected 3 bounded attempts totalling 6, got '$got'"
+
+# Becomes Running after the first repair -> exactly one repair, then stop.
+got="$(run_repair 1)"
+[ "$got" = "2|1" ] \
+  && ok "vs_repair_stuck_addon_pods: stops as soon as the repair works (1 attempt)" \
+  || bad "expected a single successful repair, got '$got' (want '2|1')"
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }

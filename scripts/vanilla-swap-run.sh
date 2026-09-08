@@ -266,6 +266,23 @@ if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
       cid="$(docker exec "$cp_node" crictl ps --name "$comp" -q 2>/dev/null | head -1)"
       [ -n "$cid" ] && docker exec "$cp_node" crictl stop "$cid" >/dev/null 2>&1
     done
+    # The restore leaves the recreated addon pods unstartable (#1890): they are
+    # bound and Pending but no kubelet ever runs them. Delete them so their
+    # controllers make replacements, which DO start. Without this there is no
+    # kube-proxy (so the substrate gate below always fails with
+    # `substrate-not-ready`) and no coredns (so the convergence wait below can
+    # never see the kube-dns endpoint go ready, and always burns its 180s).
+    # A no-op once #1890 is fixed: nothing is stuck, nothing gets deleted.
+    # Waits for the controllers to recreate the pods FIRST, then gives them a
+    # settle window to start on their own: at this point in the flow the addon
+    # pods do not exist yet, so an immediate check deletes nothing.
+    stuck="$(vs_repair_stuck_addon_pods "$RESTORE_KC")"
+    if [ "${stuck:-0}" -gt 0 ] 2>/dev/null; then
+      vs_log "recreated $stuck stuck kube-system addon pod(s) so their controllers restart them (#1890)"
+    else
+      vs_log "no stuck kube-system addon pods to recreate"
+    fi
+
     vs_log "waiting for endpointslice convergence (kube-dns endpoint ready, ≤180s)"
     converged=0
     for _ in $(seq 1 36); do

@@ -724,6 +724,104 @@ vs_restart_kube_proxy() {
   return 0
 }
 
+# vs_recreate_stuck_addon_pods <kubeconfig>
+# Delete every kube-system pod that is not Running, so its owning controller
+# creates a replacement. Echoes the number deleted.
+#
+# WHY (#1890): after the api-server swap the object store is empty, so kind's
+# kube-controller-manager recreates the kube-system addon pods (kube-proxy,
+# kindnet, coredns) against the fresh store. Those pods are bound to a node and
+# look correct in the API — right spec.nodeName, right tolerations, Pending —
+# but no kubelet ever starts them: they sit Pending with zero sandboxes
+# indefinitely. Pods created LATER against the same cluster start in ~6s, so it
+# is specific to the ones created in the window around the swap.
+#
+# Measured on a reproduced run: 6 addon pods Pending / 0 Running for 7+ minutes,
+# `crictl pods` empty on the worker. Deleting ONE kube-proxy pod made the
+# DaemonSet controller create a replacement that was 1/1 Running in 6 seconds,
+# and the `kubernetes` ClusterIP went from "connection refused" to dialable
+# immediately — which is exactly the substrate gate's check.
+#
+# Consequences of not doing this, both seen in every failing nightly:
+#   * no kube-proxy anywhere -> no iptables rule for 10.96.0.1 -> the substrate
+#     gate fails with `substrate-not-ready` (9 consecutive api-server nightlies)
+#   * no coredns -> the kube-dns EndpointSlice endpoint never flips ready ->
+#     the endpointslice convergence wait always burns its full 180s
+#
+# This is a REPAIR, in the same spirit as the KCM/scheduler bounce above and
+# vs_restart_kube_proxy: it restores an invariant a real cluster has rather than
+# papering over a module bug. The underlying "kubelet never adopts these
+# particular pods" defect is tracked separately in #1890 — when that is fixed
+# this repair becomes a no-op (it deletes nothing, because nothing is stuck).
+#
+# Kubelet-owned mirror pods (kube-apiserver, etcd, KCM, scheduler) are SKIPPED:
+# they are API reflections of on-node static pods, and the swapped api-server's
+# own mirror pod must not be touched.
+vs_recreate_stuck_addon_pods() {
+  local kubeconfig="$1" deleted=0 name phase mirror
+  if [ -n "${VS_RECREATE_PODS_CMD:-}" ]; then
+    "$VS_RECREATE_PODS_CMD" "$kubeconfig"
+    return $?
+  fi
+  while read -r name phase mirror; do
+    [ -n "$name" ] || continue
+    [ "$phase" = "Running" ] && continue
+    # A non-empty config.mirror annotation means a kubelet-owned static pod.
+    [ -n "$mirror" ] && continue
+    KUBECONFIG="$kubeconfig" kubectl -n kube-system delete pod "$name" \
+      --wait=false >/dev/null 2>&1 && deleted=$((deleted + 1))
+  done < <(KUBECONFIG="$kubeconfig" kubectl -n kube-system get pods \
+      -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{" "}{.metadata.annotations.kubernetes\.io/config\.mirror}{"\n"}{end}' \
+      2>/dev/null)
+  printf '%s\n' "$deleted"
+}
+
+# vs_repair_stuck_addon_pods <kubeconfig> [settle_s] [attempts]
+# Ensure at least one kube-proxy pod is actually Running, repairing stuck addon
+# pods as needed. Echoes the total number of pods deleted across attempts.
+#
+# Why a verify-and-retry loop rather than a single check: a one-shot version of
+# this shipped twice and was silently a no-op both times, while behaving
+# correctly when invoked by hand against the same cluster. Rather than keep
+# guessing at the timing, this checks the CONDITION IT CARES ABOUT
+# (a Running kube-proxy, which is what programs the 10.96.0.1 iptables rule the
+# substrate gate needs) and retries the repair until that holds or attempts run
+# out. That is robust to whatever ordering defeats a single pass: pods not yet
+# recreated, a controller still restarting, or a replacement that is itself
+# stuck.
+#
+# Each attempt: wait up to settle_s for kube-proxy to become Running on its own;
+# if it does not, delete the non-Running addon pods (#1890) so their controllers
+# make replacements, then re-check.
+vs_repair_stuck_addon_pods() {
+  local kubeconfig="$1" settle="${2:-45}" attempts="${3:-3}"
+  local deleted_total=0 attempt=1 waited proxy_running total notrunning n
+  while [ "$attempt" -le "$attempts" ]; do
+    waited=0
+    while [ "$waited" -lt "$settle" ]; do
+      proxy_running="$( { KUBECONFIG="$kubeconfig" kubectl -n kube-system get pods \
+        -l k8s-app=kube-proxy --no-headers 2>/dev/null || true; } | grep -c Running || true)"
+      if [ "${proxy_running:-0}" -ge 1 ] 2>/dev/null; then
+        vs_log "addon-pod repair: kube-proxy Running (attempt $attempt, ${waited}s, $deleted_total pod(s) deleted)"
+        printf '%s\n' "$deleted_total"
+        return 0
+      fi
+      sleep 5
+      waited=$(( waited + 5 ))
+    done
+    total="$( { KUBECONFIG="$kubeconfig" kubectl -n kube-system get pods \
+      --no-headers 2>/dev/null || true; } | wc -l )"
+    notrunning="$( { KUBECONFIG="$kubeconfig" kubectl -n kube-system get pods \
+      --no-headers 2>/dev/null || true; } | grep -vc Running || true)"
+    vs_log "addon-pod repair attempt $attempt/$attempts: no Running kube-proxy after ${settle}s (total=${total:-0} notRunning=${notrunning:-0}) — deleting stuck pods (#1890)"
+    n="$(vs_recreate_stuck_addon_pods "$kubeconfig")"
+    deleted_total=$(( deleted_total + ${n:-0} ))
+    attempt=$(( attempt + 1 ))
+  done
+  vs_warn "addon-pod repair: no Running kube-proxy after $attempts attempt(s); deleted $deleted_total pod(s) — the substrate gate below will report the outcome"
+  printf '%s\n' "$deleted_total"
+}
+
 # vs_kubernetes_clusterip <kubeconfig> — echo "<ip> <port>" for default/kubernetes.
 vs_kubernetes_clusterip() {
   local kubeconfig="$1"
