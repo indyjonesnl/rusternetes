@@ -196,7 +196,13 @@ pub async fn update(
         return Ok(Json(limit_range));
     }
 
-    let result = match state.storage.update(&key, &limit_range).await {
+    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut limit_range,
+    )
+    .await
+    {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => {
             state.storage.create(&key, &limit_range).await?

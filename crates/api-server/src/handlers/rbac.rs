@@ -401,7 +401,12 @@ pub async fn update_role(
     }
 
     let key = build_key("roles", Some(&namespace), &name);
-    let updated = state.storage.update(&key, &role).await?;
+    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut role,
+    )
+    .await?;
 
     Ok(Json(updated))
 }
@@ -1038,7 +1043,12 @@ pub async fn update_clusterrole(
     }
 
     let key = build_key("clusterroles", None, &name);
-    let updated = state.storage.update(&key, &clusterrole).await?;
+    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut clusterrole,
+    )
+    .await?;
 
     Ok(Json(updated))
 }

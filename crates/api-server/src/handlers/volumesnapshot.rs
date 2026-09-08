@@ -201,7 +201,12 @@ pub async fn update_volumesnapshot(
     }
 
     let key = build_key("volumesnapshots", Some(&namespace), &name);
-    let updated = state.storage.update(&key, &vs).await?;
+    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut vs,
+    )
+    .await?;
 
     Ok(Json(updated))
 }

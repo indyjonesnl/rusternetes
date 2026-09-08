@@ -143,7 +143,12 @@ pub async fn update(
         return Ok(Json(cronjob));
     }
     let key = build_key("cronjobs", Some(&namespace), &name);
-    let updated = state.storage.update(&key, &cronjob).await?;
+    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut cronjob,
+    )
+    .await?;
 
     Ok(Json(updated))
 }

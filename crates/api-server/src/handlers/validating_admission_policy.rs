@@ -121,7 +121,13 @@ pub async fn update_validating_admission_policy(
 
     let key = build_key("validatingadmissionpolicies", None, &name);
 
-    let result = match state.storage.update(&key, &policy).await {
+    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut policy,
+    )
+    .await
+    {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &policy).await?,
         Err(e) => return Err(e),
@@ -347,7 +353,13 @@ pub async fn update_validating_admission_policy_binding(
 
     let key = build_key("validatingadmissionpolicybindings", None, &name);
 
-    let result = match state.storage.update(&key, &binding).await {
+    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut binding,
+    )
+    .await
+    {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &binding).await?,
         Err(e) => return Err(e),

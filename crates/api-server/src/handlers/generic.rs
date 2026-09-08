@@ -164,6 +164,17 @@ pub async fn update_apiservice(
     value["metadata"]["name"] = Value::String(name.clone());
 
     let key = build_key("apiservices", None, &name);
+
+    // Reinstate the stored object's server-owned metadata before writing.
+    // APIService is persisted as an untyped document, so this is the
+    // `serde_json::Value` form of the same rule upstream applies to every
+    // resource in registry/rest/update.go::BeforeUpdate (lines 131-146).
+    // A missing object still falls through to the create below, which is the
+    // handler's existing upsert behaviour.
+    if let Ok(stored) = state.storage.get::<Value>(&key).await {
+        crate::handlers::lifecycle::inherit_server_owned_metadata_json(&mut value, &stored);
+    }
+
     let result: Value = match state.storage.update(&key, &value).await {
         Ok(v) => v,
         Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &value).await?,

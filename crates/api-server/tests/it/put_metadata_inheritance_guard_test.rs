@@ -27,53 +27,33 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-/// Handlers that do not yet read the stored object at all, so they cannot
-/// inherit its metadata without also gaining a read (and, with it, a decision
-/// about what a PUT to a missing object should do). Tracked in #1793; each
-/// needs its own look, not a sweep.
-/// DRA resources model metadata with their OWN `resources::dra::ObjectMeta`,
-/// wrapped in an `Option`, rather than the shared `types::ObjectMeta` every
-/// other resource uses. `inherit_server_owned_metadata` does not typecheck
-/// against it. That divergence is the actual bug to fix — a second ObjectMeta
-/// type means every generic metadata rule has to be written twice — so these
-/// are held here rather than given a duplicate helper. Tracked in #1793.
+/// The DRA resources are the only handlers still persisting a PUT without
+/// reinstating the stored object's server-owned metadata.
+///
+/// They model metadata with their OWN `resources::dra::ObjectMeta`, wrapped in
+/// an `Option`, rather than the shared `types::ObjectMeta` every other resource
+/// uses, so neither `inherit_server_owned_metadata` nor the shared
+/// `HasMetadata` bound typechecks against them. That divergence is the actual
+/// bug to fix — a second ObjectMeta type means every generic metadata rule has
+/// to be written twice — so these are held here rather than given a duplicate
+/// helper, which would entrench it. Tracked in #1895.
+///
+/// Note this is FOUR handlers, not the two originally recorded here:
+/// `deviceclass` and `resourceclaimtemplate` were listed as merely needing a
+/// read, but they share the same metadata type and so share the same blocker.
 const PENDING_DRA_METADATA_TYPE: &[(&str, &str)] = &[
+    ("deviceclass.rs", "update_deviceclass"),
     ("resourceclaim.rs", "update_resourceclaim"),
+    ("resourceclaimtemplate.rs", "update_resourceclaimtemplate"),
     ("resourceslice.rs", "update_resourceslice"),
 ];
 
-const PENDING_READ: &[(&str, &str)] = &[
-    ("admission_webhook.rs", "update_validating_webhook"),
-    ("admission_webhook.rs", "update_mutating_webhook"),
-    ("cronjob.rs", "update"),
-    ("deviceclass.rs", "update_deviceclass"),
-    ("endpoints.rs", "update_endpoints"),
-    ("flowcontrol.rs", "update_flow_schema"),
-    ("generic.rs", "update_apiservice"),
-    ("ingress.rs", "update"),
-    ("ipaddress.rs", "update_ipaddress"),
-    ("lease.rs", "update"),
-    ("limitrange.rs", "update"),
-    ("networkpolicy.rs", "update"),
-    ("poddisruptionbudget.rs", "update"),
-    ("podtemplate.rs", "update_podtemplate"),
-    ("rbac.rs", "update_role"),
-    ("rbac.rs", "update_clusterrole"),
-    ("replicationcontroller.rs", "update_replicationcontroller"),
-    ("resourceclaimtemplate.rs", "update_resourceclaimtemplate"),
-    ("service_account.rs", "update"),
-    (
-        "validating_admission_policy.rs",
-        "update_validating_admission_policy",
-    ),
-    (
-        "validating_admission_policy.rs",
-        "update_validating_admission_policy_binding",
-    ),
-    ("volumesnapshot.rs", "update_volumesnapshot"),
-    ("volumesnapshotclass.rs", "update_volumesnapshotclass"),
-    ("volumesnapshotcontent.rs", "update_volumesnapshotcontent"),
-];
+/// Every other handler now reinstates the metadata, via
+/// `lifecycle::update_inheriting_server_owned_metadata` (typed) or
+/// `inherit_server_owned_metadata_json` (untyped documents). Kept as an empty
+/// list rather than deleted: a new handler that forgets belongs in a fix, not
+/// in an allowlist, and an empty constant says so louder than a missing one.
+const PENDING_READ: &[(&str, &str)] = &[];
 
 /// Blank out char literals, string literals and comments, replacing each byte
 /// with a space so byte offsets are preserved. Brace matching over the raw
@@ -242,7 +222,14 @@ fn every_put_handler_reinstates_server_owned_metadata() {
                 continue;
             }
             checked += 1;
-            if body.contains("inherit_server_owned_metadata") {
+            // Either the rule applied inline, or the read-modify-write helper
+            // that applies it (`update_inheriting_server_owned_metadata`),
+            // which is what a handler with no other need for the stored object
+            // should call. Both spellings satisfy the invariant; what matters
+            // is that the stored metadata reaches the object being written.
+            if body.contains("inherit_server_owned_metadata")
+                || body.contains("update_inheriting_server_owned_metadata")
+            {
                 continue;
             }
             let key = (file_name.clone(), name.clone());
@@ -338,9 +325,74 @@ async fn put_omitting_uid_does_not_blank_it() {
             json!({"apiVersion":"v1","kind":"ResourceQuota",
                    "metadata":{"name":"t"},"spec":{"hard":{"pods":"5"}}}),
         ),
+        // Below: the handlers drained from PENDING_READ. They persisted the
+        // client's body blind — no read of the stored object at all — so every
+        // one of these cases failed before the fix. Chosen to span both persist
+        // shapes (plain update, and update-then-create upsert) and the untyped
+        // document path.
+        (
+            "endpoints",
+            "/api/v1/namespaces/default/endpoints",
+            json!({"apiVersion":"v1","kind":"Endpoints",
+                   "metadata":{"name":"t"},"subsets":[]}),
+        ),
+        (
+            "podtemplates",
+            "/api/v1/namespaces/default/podtemplates",
+            json!({"apiVersion":"v1","kind":"PodTemplate","metadata":{"name":"t"},
+                   "template":{"metadata":{"labels":{"a":"b"}},
+                     "spec":{"containers":[{"name":"c","image":"busybox"}]}}}),
+        ),
+        (
+            "roles",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/default/roles",
+            json!({"apiVersion":"rbac.authorization.k8s.io/v1","kind":"Role",
+                   "metadata":{"name":"t"},"rules":[]}),
+        ),
+        (
+            "serviceaccounts",
+            "/api/v1/namespaces/default/serviceaccounts",
+            json!({"apiVersion":"v1","kind":"ServiceAccount","metadata":{"name":"t"}}),
+        ),
+        (
+            "leases",
+            "/apis/coordination.k8s.io/v1/namespaces/default/leases",
+            json!({"apiVersion":"coordination.k8s.io/v1","kind":"Lease",
+                   "metadata":{"name":"t"},"spec":{"holderIdentity":"h"}}),
+        ),
+        (
+            "networkpolicies",
+            "/apis/networking.k8s.io/v1/namespaces/default/networkpolicies",
+            json!({"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy",
+                   "metadata":{"name":"t"},"spec":{"podSelector":{}}}),
+        ),
+        (
+            "validatingwebhookconfigurations",
+            "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations",
+            json!({"apiVersion":"admissionregistration.k8s.io/v1",
+                   "kind":"ValidatingWebhookConfiguration",
+                   "metadata":{"name":"t"},"webhooks":[]}),
+        ),
+        // The untyped-document path: APIService is stored as a raw
+        // `serde_json::Value`, so it goes through
+        // `inherit_server_owned_metadata_json` rather than the typed helper.
+        (
+            "apiservices",
+            "/apis/apiregistration.k8s.io/v1/apiservices",
+            json!({"apiVersion":"apiregistration.k8s.io/v1","kind":"APIService",
+                   "metadata":{"name":"v1.example.com"},
+                   "spec":{"group":"example.com","version":"v1",
+                           "groupPriorityMinimum":100,"versionPriority":100}}),
+        ),
     ];
 
     for (label, collection, body) in cases {
+        // The object's own name, not a fixed "t": APIService names are
+        // structurally constrained (`version.group`) and would fail validation.
+        let name = body["metadata"]["name"]
+            .as_str()
+            .expect("case body names the object")
+            .to_string();
         let state = TestApiServer::new();
         let (status, _, created) = state
             .send_raw("POST", collection, Some("application/json"), Some(&body))
@@ -358,7 +410,7 @@ async fn put_omitting_uid_does_not_blank_it() {
         let (status, _, updated) = state
             .send_raw(
                 "PUT",
-                &format!("{collection}/t"),
+                &format!("{collection}/{name}"),
                 Some("application/json"),
                 Some(&body),
             )
@@ -372,7 +424,7 @@ async fn put_omitting_uid_does_not_blank_it() {
         // response happened to echo.
         let (_, stored) = {
             let (s, _, v) = state
-                .send_raw("GET", &format!("{collection}/t"), None, None)
+                .send_raw("GET", &format!("{collection}/{name}"), None, None)
                 .await;
             (s, v)
         };

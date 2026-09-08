@@ -145,7 +145,13 @@ pub async fn update(
         return Ok(Json(lease));
     }
 
-    let result = match state.storage.update(&key, &lease).await {
+    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut lease,
+    )
+    .await
+    {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &lease).await?,
         Err(e) => return Err(e),

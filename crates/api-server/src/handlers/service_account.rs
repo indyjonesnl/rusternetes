@@ -214,7 +214,12 @@ pub async fn update(
     }
 
     let key = build_key("serviceaccounts", Some(&namespace), &name);
-    let updated = state.storage.update(&key, &service_account).await?;
+    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut service_account,
+    )
+    .await?;
 
     Ok(Json(updated))
 }
