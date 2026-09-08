@@ -799,7 +799,7 @@ pub async fn patch_crd(
 
             let force = params
                 .get("force")
-                .and_then(|v| v.parse::<bool>().ok())
+                .map(|v| rusternetes_common::query::k8s_query_bool(v))
                 .unwrap_or(false);
 
             let apply_params = if force {

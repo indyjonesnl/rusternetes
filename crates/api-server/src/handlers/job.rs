@@ -354,10 +354,10 @@ pub async fn list(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_namespaced::<Job>(
             state,
@@ -420,10 +420,10 @@ pub async fn list_all_jobs(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_cluster_scoped::<Job>(
             state,

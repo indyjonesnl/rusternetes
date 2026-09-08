@@ -76,6 +76,47 @@ pub struct ExecQuery {
     pub tty: bool,
 }
 
+/// Decode the exec/attach query string into [`ExecQuery`].
+///
+/// Extracted from the handler so the boolean decoding is unit-testable. The
+/// stream flags go through `k8s_query_bool` because upstream decodes them with
+/// `runtime.Convert_Slice_string_To_bool`
+/// (`apimachinery/pkg/runtime/conversion.go:79-95`): only absence, `"0"` and a
+/// case-insensitive `"false"` are false, so `?stdin=t`, `?stdin=yes` and even
+/// `?stdin=` all mean true. The previous `value == "true" || value == "1"`
+/// comparison silently dropped every other spelling, which for `tty` means a
+/// client asking for a TTY quietly not getting one.
+pub(crate) fn parse_exec_query(raw_query: &str) -> ExecQuery {
+    let mut command = Vec::new();
+    let mut container = None;
+    let mut stdin = false;
+    let mut stdout = false;
+    let mut stderr = false;
+    let mut tty = false;
+    for pair in raw_query.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            let value = percent_decode_str(value);
+            match key {
+                "command" => command.push(value),
+                "container" => container = Some(value),
+                "stdin" => stdin = rusternetes_common::query::k8s_query_bool(&value),
+                "stdout" => stdout = rusternetes_common::query::k8s_query_bool(&value),
+                "stderr" => stderr = rusternetes_common::query::k8s_query_bool(&value),
+                "tty" => tty = rusternetes_common::query::k8s_query_bool(&value),
+                _ => {}
+            }
+        }
+    }
+    ExecQuery {
+        container,
+        command,
+        stdin,
+        stdout,
+        stderr,
+        tty,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AttachQuery {
     /// Container to attach to
@@ -315,36 +356,7 @@ pub async fn exec(
     let raw_query = req.uri().query().unwrap_or("").to_string();
 
     // Parse query params to build webhook admission object (command/container).
-    let query = {
-        let mut command = Vec::new();
-        let mut container = None;
-        let mut stdin = false;
-        let mut stdout = false;
-        let mut stderr = false;
-        let mut tty = false;
-        for pair in raw_query.split('&') {
-            if let Some((key, value)) = pair.split_once('=') {
-                let value = percent_decode_str(value);
-                match key {
-                    "command" => command.push(value),
-                    "container" => container = Some(value),
-                    "stdin" => stdin = value == "true" || value == "1",
-                    "stdout" => stdout = value == "true" || value == "1",
-                    "stderr" => stderr = value == "true" || value == "1",
-                    "tty" => tty = value == "true" || value == "1",
-                    _ => {}
-                }
-            }
-        }
-        ExecQuery {
-            container,
-            command,
-            stdin,
-            stdout,
-            stderr,
-            tty,
-        }
-    };
+    let query = parse_exec_query(&raw_query);
 
     info!("Exec {}/{}: cmd={:?}", namespace, name, query.command);
 
@@ -1978,5 +1990,40 @@ mod tests {
             u.to_string(),
             "http://10.0.0.6:10250/containerLogs/ns1/pod1/c1?tailLines=5&follow=false"
         );
+    }
+}
+
+#[cfg(test)]
+mod exec_query_bool_tests {
+    use super::parse_exec_query;
+
+    /// Upstream decodes stdin/stdout/stderr/tty with
+    /// `runtime.Convert_Slice_string_To_bool`
+    /// (apimachinery/pkg/runtime/conversion.go:79-95): only absence, "0" and a
+    /// case-insensitive "false" are false; every other value is true. The old
+    /// `value == "true" || value == "1"` comparison dropped "t", "T", "yes"
+    /// and "", so a client asking for a TTY quietly did not get one.
+    #[test]
+    fn stream_flags_follow_upstream_query_conversion() {
+        for v in ["true", "1", "t", "T", "TRUE", "yes", ""] {
+            let q = parse_exec_query(&format!("stdin={v}&stdout={v}&stderr={v}&tty={v}"));
+            assert!(q.stdin, "stdin={v:?} must be true");
+            assert!(q.stdout, "stdout={v:?} must be true");
+            assert!(q.stderr, "stderr={v:?} must be true");
+            assert!(q.tty, "tty={v:?} must be true");
+        }
+        for v in ["0", "false", "False", "FALSE"] {
+            let q = parse_exec_query(&format!("stdin={v}&stdout={v}&stderr={v}&tty={v}"));
+            assert!(!q.stdin, "stdin={v:?} must be false");
+            assert!(!q.tty, "tty={v:?} must be false");
+        }
+    }
+
+    #[test]
+    fn absent_stream_flags_default_to_false() {
+        let q = parse_exec_query("command=sh&container=c");
+        assert!(!q.stdin && !q.stdout && !q.stderr && !q.tty);
+        assert_eq!(q.container.as_deref(), Some("c"));
+        assert_eq!(q.command, vec!["sh".to_string()]);
     }
 }

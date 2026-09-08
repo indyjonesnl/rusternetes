@@ -21,6 +21,7 @@ pub mod pagination;
 pub mod protobuf;
 pub mod qos;
 pub mod quantity;
+pub mod query;
 pub mod quota;
 pub mod resources;
 pub mod schema_validation;

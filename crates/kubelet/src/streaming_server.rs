@@ -89,9 +89,15 @@ impl ExecParams {
     }
 }
 
+/// Decode a boolean query parameter the way Kubernetes does.
+///
+/// Delegates to the shared implementation so the pod-log parameters
+/// (`follow`, `previous`, `timestamps`, `insecureSkipTLSVerifyBackend`) follow
+/// the same rule as everything else: only `"0"` and a case-insensitive
+/// `"false"` are false. The previous `"true"`/`"1"`-only comparison dropped
+/// `?follow=t` and `?follow=yes`, which upstream treats as true.
 fn is_true(s: &str) -> bool {
-    let l = s.to_ascii_lowercase();
-    l == "true" || l == "1"
+    rusternetes_common::query::k8s_query_bool(s)
 }
 
 /// Minimal percent-decode: replace `+` with space and `%XX` hex sequences.
@@ -1058,5 +1064,25 @@ mod tests {
         let opts = log_read_options(&LogParams::from_query("tailLines=5"));
         assert!(opts.since_unix.is_none());
         assert_eq!(opts.tail_lines, Some(5));
+    }
+}
+
+#[cfg(test)]
+mod pod_log_query_bool_tests {
+    use super::is_true;
+
+    /// PodLogOptions follow/previous/timestamps/insecureSkipTLSVerifyBackend
+    /// are decoded upstream with `runtime.Convert_Slice_string_To_bool`, so
+    /// only absence, "0" and a case-insensitive "false" are false. The old
+    /// helper compared against "true"/"1" only, so `?follow=t` silently did
+    /// not follow.
+    #[test]
+    fn log_flags_follow_upstream_query_conversion() {
+        for v in ["true", "1", "t", "T", "TRUE", "yes", ""] {
+            assert!(is_true(v), "{v:?} must be true");
+        }
+        for v in ["0", "false", "False", "FALSE"] {
+            assert!(!is_true(v), "{v:?} must be false");
+        }
     }
 }

@@ -1317,11 +1317,11 @@ pub async fn list(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
 
             send_initial_events: params
                 .get("sendInitialEvents")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_namespaced::<Pod>(
             state,
@@ -1451,11 +1451,11 @@ pub async fn list_all_pods(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
 
             send_initial_events: params
                 .get("sendInitialEvents")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_cluster_scoped::<Pod>(
             state,
@@ -1621,7 +1621,7 @@ pub async fn patch(
             // Apply with server-side apply semantics
             let force = params
                 .get("force")
-                .and_then(|v| v.parse::<bool>().ok())
+                .map(|v| rusternetes_common::query::k8s_query_bool(v))
                 .unwrap_or(false);
 
             let apply_params = if force {

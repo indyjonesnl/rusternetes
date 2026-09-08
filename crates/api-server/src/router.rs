@@ -462,10 +462,10 @@ async fn custom_resource_fallback(
                     watch: Some(true),
                     allow_watch_bookmarks: query_params
                         .get("allowWatchBookmarks")
-                        .and_then(|v| v.parse::<bool>().ok()),
+                        .map(|v| rusternetes_common::query::k8s_query_bool(v)),
                     send_initial_events: query_params
                         .get("sendInitialEvents")
-                        .and_then(|v| v.parse::<bool>().ok()),
+                        .map(|v| rusternetes_common::query::k8s_query_bool(v)),
                 };
                 match handlers::custom_resource::watch_custom_resources(
                     state.clone(),

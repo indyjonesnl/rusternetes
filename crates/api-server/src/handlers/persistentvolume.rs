@@ -145,10 +145,10 @@ pub async fn list_pvs(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_cluster_scoped::<PersistentVolume>(
             state,
