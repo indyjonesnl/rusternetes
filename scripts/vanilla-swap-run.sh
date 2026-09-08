@@ -144,15 +144,27 @@ while i < len(buf):
     o,j=dec.raw_decode(buf,i); i=j
     docs += o.get("items",[o]) if o.get("kind","").endswith("List") else [o]
 out=[]
+node_status={}
 for d in docs:
     k=d.get("kind","")
     if not k or k in ("Event",): continue
     m=d.setdefault("metadata",{})
     for f in ("resourceVersion","uid","creationTimestamp","generation","managedFields","selfLink","ownerReferences"):
         m.pop(f,None)
-    d.pop("status",None)
+    st=d.pop("status",None)
+    # Keep each Node capacity/allocatable aside. The kubelet admits pods against
+    # its OWN cached copy of the Node, so a Node restored with empty status makes
+    # every pod fail admission with "no set of running pods found to reclaim
+    # resources: [(res: pods, q: 1) ...]" until its node informer sees a status
+    # update -- and that watch can stall silently, stranding the node for ~10
+    # minutes (#1890). Restoring capacity means the initial list already has it.
+    if k == "Node" and isinstance(st, dict):
+        keep={kk: st[kk] for kk in ("capacity", "allocatable") if kk in st}
+        if keep:
+            node_status[m.get("name","")]=keep
     out.append(d)
 json.dump({"apiVersion":"v1","kind":"List","items":out}, open(sys.argv[1],"w"))
+json.dump(node_status, open(sys.argv[1]+".nodestatus","w"))
 print(len(out))
 ' "$APISERVER_RESTORE" | { read n; vs_log "snapshot captured $n objects"; } || vs_warn "snapshot failed (continuing)"
 fi
@@ -221,6 +233,34 @@ if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
   vs_log "restoring substrate snapshot into the swapped api-server"
   KUBECONFIG="$RESTORE_KC" kubectl apply -f "$APISERVER_RESTORE" >"$VS_WORKDIR/restore-apply.log" 2>&1 \
     || vs_warn "some snapshot objects failed to apply (see restore-apply.log)"
+
+  # Put each Node capacity/allocatable back via the status SUBRESOURCE (a plain
+  # apply cannot carry status). Without this the restored Nodes have empty
+  # capacity, and the kubelet -- which admits pods against its own cached copy
+  # of the Node -- rejects every pod with UnexpectedAdmissionError:
+  #   "no set of running pods found to reclaim resources: [(res: pods, q: 1) ...]"
+  # The API itself looks healthy the whole time, because the kubelet posts status
+  # successfully; only its cached copy is empty, and the watch that would fix
+  # that can stall silently for ~10 minutes (#1890). Restoring capacity up front
+  # means the kubelet initial LIST already has it, so admission works whether or
+  # not the watch delivers.
+  if [ -s "${APISERVER_RESTORE}.nodestatus" ]; then
+    restored_status=0
+    while IFS=$'\t' read -r node patch; do
+      [ -n "$node" ] || continue
+      if KUBECONFIG="$RESTORE_KC" kubectl patch node "$node" --subresource=status \
+          --type=merge -p "$patch" >/dev/null 2>&1; then
+        restored_status=$((restored_status + 1))
+      fi
+    done < <(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+for name, st in d.items():
+    if name:
+        print(name + "\t" + json.dumps({"status": st}))
+' "${APISERVER_RESTORE}.nodestatus")
+    vs_log "restored capacity/allocatable on $restored_status node(s) so kubelet admission works (#1890)"
+  fi
   # Surface distinct apply errors (decode/validation gaps in the api-server).
   grep -iE "error|invalid|missing field|unable|cannot" "$VS_WORKDIR/restore-apply.log" 2>/dev/null \
     | sed -E 's/[0-9]+//g' | sort -u | head -10 | sed 's/^/[restore-err] /'
