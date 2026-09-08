@@ -296,7 +296,7 @@ gate on this note's actual goal.
 
 ---
 
-## 5. The plan — port the provisioner: `rusternetes dev cluster create`
+## 5. The plan — port the provisioner: `rusternetes cluster create`
 
 **Our own** one-command local cluster of microVMs — real Rusternetes nodes, no
 Talos on the box. The port is small and the design maps almost 1:1.
@@ -401,16 +401,96 @@ launch code shareable between them.
 
 ---
 
+### 5.3 CLI surface: talosctl grammar, `s/talosctl/rusternetes/`
+
+The target is that a `talosctl`-shaped Makefile keeps working with the binary
+name swapped. That fixes the grammar to talosctl's, **not** kind's — the two are
+different (`kind create cluster --name` vs `talosctl cluster create --name`), so
+this is a choice, and talosctl's is the one that maps onto a provisioner.
+
+```make
+CLUSTER_NAME   ?= rusternetes-dev
+PROVISIONER    ?= cloud-hypervisor      # cloud-hypervisor | qemu | docker
+CONTROL_PLANES ?= 1
+WORKERS        ?= 2
+VERSION        ?= v1.35.0
+SUBNET         ?= 10.5.0.0/24
+
+cluster-up:
+	rusternetes cluster create \
+	  --name $(CLUSTER_NAME) --provisioner $(PROVISIONER) \
+	  --controlplanes $(CONTROL_PLANES) --workers $(WORKERS) \
+	  --cidr $(SUBNET) --kubernetes-version $(VERSION) --wait
+	rusternetes cluster kubeconfig --name $(CLUSTER_NAME) --force
+
+cluster-down:
+	rusternetes cluster destroy --name $(CLUSTER_NAME)
+```
+
+**Verbs to implement** (`cluster.go`, `create/`, `destroy.go`, `show.go`):
+`create`, `destroy`, `show`, plus `kubeconfig`. Persistent flags `--name`
+(default `rusternetes-default`) and `--state`
+(`~/.rusternetes/clusters/<name>`), exactly as `cluster.go:53-54`.
+
+**Flags we adopt verbatim:** `--controlplanes`, `--workers`, `--cidr`, `--mtu`,
+`--kubernetes-version`, `--cpus-controlplanes`, `--memory-controlplanes`,
+`--cpus-workers`, `--memory-workers`, `--registry-mirror`, `--wait`,
+`--wait-timeout`, `--skip-kubeconfig`, `--disks`, `--cni-bin-path`,
+`--cni-conf-dir`, `--cni-cache-dir`, `--state`, `--name`.
+
+**Flags that must differ, and why:**
+
+| talosctl | ours | reason |
+|---|---|---|
+| `--provisioner qemu\|docker` | `cloud-hypervisor\|qemu\|docker` | our default VMM is cloud-hypervisor (§5.2); `docker` is the existing compose path |
+| `--talos-version` | *dropped* | there is no Talos in the guest; the node image version is `--node-image` |
+| `--talosconfig`, `--talosconfig-destination` | *dropped* | Talos has a second (machine) API and therefore a second config file. We have only the Kubernetes API, so `create` writes **one** artifact: a kubeconfig |
+| `--config-patch*` (Talos machine config YAML) | `--config-patch*` over **our** node config | same flag name, different schema — we are not implementing Talos's machine-config schema |
+| `--with-uefi`, `--with-tpm2`, `--iso-path`, `--usb-path`, `--uki-path` | *dropped* | those exist so Talos can test its own installer (§5.2) |
+
+**Non-obvious traps in the talosctl surface** (worth not copying):
+
+- **`--provisioner firecracker` does not exist.** Only `qemu` and `docker`
+  (`pkg/provision/providers/factory.go:15-20,39-46`); a bad value fails with
+  `unsupported provisioner "firecracker"`. Talos had a firecracker provider in
+  its early releases and removed it — the firecracker legacy that survives is
+  `tc-redirect-tap`, the CNI plugin (§3.2), which is exactly the piece we keep.
+- **`--version` is not a flag.** It is `--talos-version` (the OS) and
+  `--kubernetes-version` (the control plane) — two separate axes
+  (`create/cmd.go:29`). We only have the second, plus `--node-image`.
+- **`--provisioner` on `destroy` is deprecated** — "the provisioner is inferred
+  automatically" (`cluster/destroy.go:66`), read back from the state dir. Ours
+  should infer from the start, and never accept it on `destroy`.
+- **`talosctl kubeconfig` is not under `cluster`** and has no `--name`; its only
+  flags are `--force`, `--force-context-name`, `--merge`
+  (`cmd/talosctl/cmd/talos/kubeconfig.go:190-192`), and it reaches the node over
+  the *machine* API using the talosconfig context. Since we have no machine API,
+  ours belongs under `cluster` (`rusternetes cluster kubeconfig --name ...`),
+  reading the state dir instead.
+- **`--cpus`/`--memory` are the old names**; the user-facing flags are
+  `--cpus-controlplanes` / `--memory-controlplanes` (+ `-workers`), with the
+  short forms surviving only on the hidden `dev` command
+  (`create/cmd.go:32-35`, `create/cmd_dev.go:61-64`).
+
+**Binary placement.** `crates/rusternetes/src/main.rs` is today a flat
+`#[derive(Parser)] struct Args` with no subcommands, so `rusternetes cluster
+create` means introducing a subcommand layer. Keep the current flat invocation
+working (`#[command(subcommand)] cmd: Option<Cmd>` with the all-in-one as the
+`None` arm) or this breaks every compose file and script that runs
+`rusternetes --data-dir ...`.
+
+---
+
 ## 6. Recommended phasing
 
 - **Phase 0 (no code):** settle the MPL question (§7) — it decides whether the
   ported files carry MPL notices or get reimplemented from the specs, and
   retrofitting that onto a merged crate is far worse than choosing now.
-- **Phase 1:** `rusternetes dev cluster create` skeleton — state dir, bridge via
+- **Phase 1:** `rusternetes cluster create` skeleton — state dir, bridge via
   CNI, dhcpd/dns/LB, disks, per-VM supervisor, **cloud-hypervisor backend**
   (`--api-socket` for power control), B1 guest image + vfat NoCloud seed.
   Target: `1 CP + 2 workers` reachable via a generated kubeconfig in under
-  60 s, `dev cluster destroy` leaving nothing behind.
+  60 s, `rusternetes cluster destroy` leaving nothing behind.
 - **Phase 2:** `--vmm qemu` fallback (microvm, `accel=kvm`) for the UEFI/ISO
   cases only, then swap in the B2 purpose-built image (#33/#1036) and publish
   the idle-RAM-per-node number the ROADMAP wants (#35).
