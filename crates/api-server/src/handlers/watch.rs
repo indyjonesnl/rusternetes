@@ -66,16 +66,25 @@ pub struct WatchParams {
     pub field_selector: Option<String>,
 
     /// Watch for changes
+    #[serde(deserialize_with = "deserialize_k8s_bool", default)]
     pub watch: Option<bool>,
 
     /// Allow watch bookmarks
-    #[serde(rename = "allowWatchBookmarks")]
+    #[serde(
+        rename = "allowWatchBookmarks",
+        deserialize_with = "deserialize_k8s_bool",
+        default
+    )]
     pub allow_watch_bookmarks: Option<bool>,
 
     /// Send initial events (consistent reads from cache, K8s 1.30+)
     /// When true, send all existing resources as ADDED events followed by
     /// a BOOKMARK to signal initial list is complete.
-    #[serde(rename = "sendInitialEvents")]
+    #[serde(
+        rename = "sendInitialEvents",
+        deserialize_with = "deserialize_k8s_bool",
+        default
+    )]
     pub send_initial_events: Option<bool>,
 }
 
@@ -95,20 +104,94 @@ pub fn normalize_resource_version(rv: Option<String>) -> Option<String> {
     rv.filter(|s| !s.is_empty())
 }
 
-/// Check if a query param map indicates a watch request
-/// Parse a query-parameter boolean the way Kubernetes does — Go's
-/// `strconv.ParseBool`, which accepts `1/t/T/TRUE/true/True` as true and
-/// `0/f/F/FALSE/false/False` as false. Rust's `str::parse::<bool>()` only
-/// accepts `"true"`/`"false"`, so clients that send `?watch=1` (Lens and other
-/// non-client-go informers) were silently treated as plain LIST requests —
-/// causing their reflectors to relist-loop (poll) instead of watching.
+/// Parse a query-parameter boolean the way Kubernetes does.
+///
+/// NOT Go's `strconv.ParseBool`. For query parameters, meta/v1 ListOptions
+/// conversion uses `runtime.Convert_Slice_string_To_bool`
+/// (staging/src/k8s.io/apimachinery/pkg/runtime/conversion.go:79-95, wired for
+/// `out.Watch` at apis/meta/v1/zz_generated.conversion.go:388), whose contract
+/// is:
+///
+/// > Only the absence of a value (i.e. zero-length slice), a value of "false",
+/// > or a value of "0" resolve to false. Any other value (including empty
+/// > string) resolves to true.
+///
+/// So `?watch=1`, `?watch=t`, `?watch=yes` and even `?watch=` are all TRUE, and
+/// an unrecognised spelling is never an error. Returns `None` only for an
+/// ABSENT parameter, so `.unwrap_or(false)` at the call sites gives upstream's
+/// absence-is-false behaviour.
+///
+/// Rust's `str::parse::<bool>()` accepts only `"true"`/`"false"`, so clients
+/// sending `?watch=1` (Lens and other non-client-go informers) were treated as
+/// plain LIST requests, making their reflectors relist-loop instead of watching.
 pub fn parse_k8s_bool(v: &str) -> Option<bool> {
-    match v {
-        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
-        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
-        _ => None,
+    if v == "0" || v.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        Some(true)
     }
 }
+
+/// serde adapter for the query bools on [`WatchParams`].
+///
+/// The typed `Query<WatchParams>` path (services, endpoints, endpointslices)
+/// deserialized these as strict Rust bools, so `?watch=1` was rejected with
+/// `Failed to deserialize query string: provided string was not `true` or
+/// `false`` — a 400 on the whole request — while the HashMap-based pods path
+/// accepted it. Measured against a live api-server: a pods watch succeeded
+/// where the same request on services and endpointslices returned 400.
+///
+/// Accepts a string (the query case, via [`parse_k8s_bool`]) or a real bool
+/// (JSON/other deserialization paths).
+fn deserialize_k8s_bool<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Inner;
+    impl<'de> serde::de::Visitor<'de> for Inner {
+        type Value = bool;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a Kubernetes query boolean (anything but \"0\"/\"false\" is true)")
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, v: bool) -> std::result::Result<bool, E> {
+            Ok(v)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<bool, E> {
+            Ok(parse_k8s_bool(v).unwrap_or(false))
+        }
+    }
+
+    struct Outer;
+    impl<'de> serde::de::Visitor<'de> for Outer {
+        type Value = Option<bool>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an optional Kubernetes query boolean")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Option<bool>, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Option<bool>, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, d: D2) -> std::result::Result<Option<bool>, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            d.deserialize_any(Inner).map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(Outer)
+}
+
+/// Check if a query param map indicates a watch request
 
 pub fn is_watch_request(params: &std::collections::HashMap<String, String>) -> bool {
     params
@@ -3117,15 +3200,83 @@ mod watch_bool_tests {
     /// silently served a plain LIST instead of a watch stream — making their
     /// reflectors relist-loop (poll) instead of watching.
     #[test]
-    fn parse_k8s_bool_accepts_go_spellings() {
+    fn parse_k8s_bool_matches_upstream_query_conversion() {
         for t in ["1", "t", "T", "true", "True", "TRUE"] {
             assert_eq!(parse_k8s_bool(t), Some(true), "{t} should be true");
         }
-        for f in ["0", "f", "F", "false", "False", "FALSE"] {
+        // NOTE: "f"/"F" are TRUE here, not false. Go's strconv.ParseBool would
+        // read them as false, but query params do not go through ParseBool —
+        // only "0" and a case-insensitive "false" are false (see below), so a
+        // bare "f" falls into the default true branch. This test previously
+        // asserted the ParseBool spelling set and was wrong about these two.
+        for f in ["0", "false", "False", "FALSE"] {
             assert_eq!(parse_k8s_bool(f), Some(false), "{f} should be false");
         }
-        assert_eq!(parse_k8s_bool("yes"), None);
-        assert_eq!(parse_k8s_bool(""), None);
+        for t in ["f", "F"] {
+            assert_eq!(
+                parse_k8s_bool(t),
+                Some(true),
+                "{t:?} is true under Convert_Slice_string_To_bool, unlike ParseBool"
+            );
+        }
+        // Upstream's rule is NOT strconv.ParseBool: for query parameters,
+        // meta/v1 ListOptions conversion uses
+        // runtime.Convert_Slice_string_To_bool
+        // (staging/src/k8s.io/apimachinery/pkg/runtime/conversion.go:79-95,
+        // wired at apis/meta/v1/zz_generated.conversion.go:388 for out.Watch):
+        //
+        //   "Only the absence of a value (i.e. zero-length slice), a value of
+        //    "false", or a value of "0" resolve to false. Any other value
+        //    (including empty string) resolves to true."
+        //
+        // So an unrecognised value is TRUE, not false, and never an error.
+        for t in ["yes", "t", "T", "banana", "", "TRUE", "True", "1"] {
+            assert_eq!(
+                parse_k8s_bool(t),
+                Some(true),
+                "{t:?} resolves to true upstream (anything but 0/false does)"
+            );
+        }
+        // Only these are false, case-insensitively for "false".
+        for f in ["0", "false", "False", "FALSE", "fAlSe"] {
+            assert_eq!(parse_k8s_bool(f), Some(false), "{f:?} must be false");
+        }
+    }
+
+    #[test]
+    fn watch_params_accepts_k8s_query_bools() {
+        use crate::handlers::watch::WatchParams;
+        // The typed Query<WatchParams> path (services, endpoints,
+        // endpointslices -- 53 call sites) deserialized `watch` as a strict
+        // Rust bool, so `?watch=1` was rejected outright with
+        // "Failed to deserialize query string: provided string was not
+        // `true` or `false`" while the HashMap-based pods path accepted it.
+        // Measured against a live api-server: pods watch ok, services and
+        // endpointslices 400.
+        for (q, want) in [
+            (r#"{"watch":"1"}"#, Some(true)),
+            (r#"{"watch":"true"}"#, Some(true)),
+            (r#"{"watch":"t"}"#, Some(true)),
+            (r#"{"watch":"yes"}"#, Some(true)),
+            (r#"{"watch":""}"#, Some(true)),
+            (r#"{"watch":"0"}"#, Some(false)),
+            (r#"{"watch":"false"}"#, Some(false)),
+            (r#"{"watch":"FALSE"}"#, Some(false)),
+            (r#"{}"#, None),
+        ] {
+            let p: WatchParams =
+                serde_json::from_str(q).unwrap_or_else(|e| panic!("{q} must deserialize, got {e}"));
+            assert_eq!(p.watch, want, "watch for {q}");
+        }
+        // A real JSON bool must still work (non-query deserialization paths).
+        let p: WatchParams = serde_json::from_str(r#"{"watch":true}"#).unwrap();
+        assert_eq!(p.watch, Some(true));
+
+        // The other two query bools take the same path.
+        let p: WatchParams =
+            serde_json::from_str(r#"{"allowWatchBookmarks":"1","sendInitialEvents":"0"}"#).unwrap();
+        assert_eq!(p.allow_watch_bookmarks, Some(true));
+        assert_eq!(p.send_initial_events, Some(false));
     }
 
     #[test]
