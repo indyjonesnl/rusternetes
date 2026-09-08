@@ -1,4 +1,5 @@
 use crate::resources::pod::PodSpec;
+use crate::resources::policy::IntOrString;
 use crate::types::{LabelSelector, ObjectMeta, TypeMeta};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -328,12 +329,8 @@ pub struct RollingUpdateStatefulSetStrategy {
 
     /// The maximum number of pods that can be unavailable during the update.
     /// Value can be an absolute number (ex: 5) or a percentage (ex: 10%).
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::resources::deployment::deserialize_int_or_string_opt",
-        default
-    )]
-    pub max_unavailable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_unavailable: Option<IntOrString>,
 }
 
 /// StatefulSetPersistentVolumeClaimRetentionPolicy describes the policy for PVC lifecycle
@@ -482,20 +479,12 @@ pub struct DaemonSetUpdateStrategy {
 #[serde(rename_all = "camelCase")]
 pub struct RollingUpdateDaemonSet {
     /// The maximum number of pods that can be unavailable during the update
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::resources::deployment::deserialize_int_or_string_opt",
-        default
-    )]
-    pub max_unavailable: Option<String>, // IntOrString
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_unavailable: Option<IntOrString>,
 
     /// The maximum number of nodes with an existing available daemonset pod that can have an updated one
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::resources::deployment::deserialize_int_or_string_opt",
-        default
-    )]
-    pub max_surge: Option<String>, // IntOrString
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_surge: Option<IntOrString>,
 }
 
 /// DaemonSetStatus represents the current state of a DaemonSet

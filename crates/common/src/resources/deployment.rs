@@ -79,22 +79,6 @@ pub struct RollingUpdateDeployment {
     pub max_surge: Option<serde_json::Value>, // IntOrString: int or "25%"
 }
 
-/// Deserialize a value that can be either an integer or a string into Option<String>
-pub fn deserialize_int_or_string_opt<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
-    match value {
-        None => Ok(None),
-        Some(serde_json::Value::String(s)) => Ok(Some(s)),
-        Some(serde_json::Value::Number(n)) => Ok(Some(n.to_string())),
-        Some(other) => Ok(Some(other.to_string())),
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeploymentStatus {

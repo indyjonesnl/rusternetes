@@ -469,7 +469,7 @@ async fn daemonset_rolling_update_respects_max_unavailable() {
     ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
         strategy_type: Some("RollingUpdate".to_string()),
         rolling_update: Some(RollingUpdateDaemonSet {
-            max_unavailable: Some("2".to_string()),
+            max_unavailable: Some(rusternetes_common::resources::policy::IntOrString::Int(2)),
             max_surge: None,
         }),
     });
@@ -908,7 +908,7 @@ async fn daemonset_rolling_update_max_unavailable_one_serialises_deletions() {
     ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
         strategy_type: Some("RollingUpdate".to_string()),
         rolling_update: Some(RollingUpdateDaemonSet {
-            max_unavailable: Some("1".to_string()),
+            max_unavailable: Some(rusternetes_common::resources::policy::IntOrString::Int(1)),
             max_surge: None,
         }),
     });
@@ -1270,7 +1270,7 @@ async fn daemonset_handles_burst_template_updates() {
     ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
         strategy_type: Some("RollingUpdate".to_string()),
         rolling_update: Some(RollingUpdateDaemonSet {
-            max_unavailable: Some("2".to_string()),
+            max_unavailable: Some(rusternetes_common::resources::policy::IntOrString::Int(2)),
             max_surge: None,
         }),
     });

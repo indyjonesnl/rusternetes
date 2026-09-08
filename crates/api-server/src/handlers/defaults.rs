@@ -1,4 +1,5 @@
 use rusternetes_common::resources::deployment::{DeploymentStrategy, RollingUpdateDeployment};
+use rusternetes_common::resources::policy::IntOrString;
 use rusternetes_common::resources::workloads::{
     DaemonSetUpdateStrategy, RollingUpdateDaemonSet, RollingUpdateStatefulSetStrategy,
     StatefulSetUpdateStrategy,
@@ -265,8 +266,8 @@ pub fn apply_daemonset_defaults(ds: &mut rusternetes_common::resources::DaemonSe
         ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
             strategy_type: Some("RollingUpdate".to_string()),
             rolling_update: Some(RollingUpdateDaemonSet {
-                max_unavailable: Some("1".to_string()),
-                max_surge: Some("0".to_string()),
+                max_unavailable: Some(IntOrString::Int(1)),
+                max_surge: Some(IntOrString::Int(0)),
             }),
         });
     } else if let Some(ref mut strategy) = ds.spec.update_strategy {
@@ -276,15 +277,15 @@ pub fn apply_daemonset_defaults(ds: &mut rusternetes_common::resources::DaemonSe
         if strategy.strategy_type.as_deref() == Some("RollingUpdate") {
             if strategy.rolling_update.is_none() {
                 strategy.rolling_update = Some(RollingUpdateDaemonSet {
-                    max_unavailable: Some("1".to_string()),
-                    max_surge: Some("0".to_string()),
+                    max_unavailable: Some(IntOrString::Int(1)),
+                    max_surge: Some(IntOrString::Int(0)),
                 });
             } else if let Some(ref mut ru) = strategy.rolling_update {
                 if ru.max_unavailable.is_none() {
-                    ru.max_unavailable = Some("1".to_string());
+                    ru.max_unavailable = Some(IntOrString::Int(1));
                 }
                 if ru.max_surge.is_none() {
-                    ru.max_surge = Some("0".to_string());
+                    ru.max_surge = Some(IntOrString::Int(0));
                 }
             }
         }

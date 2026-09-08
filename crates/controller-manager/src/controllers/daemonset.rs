@@ -2,6 +2,7 @@ use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::node::Taint;
 use rusternetes_common::resources::pod::{SecretVolumeSource, Toleration, Volume, VolumeMount};
+use rusternetes_common::resources::policy::IntOrString;
 use rusternetes_common::resources::{
     ControllerRevision, DaemonSet, DaemonSetStatus, Node, Pod, PodStatus,
 };
@@ -601,8 +602,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 .and_then(|s| s.rolling_update.as_ref())
                 .and_then(|r| r.max_unavailable.as_ref());
             let desired = eligible_nodes.len() as i32;
-            let max_unavailable =
-                resolve_max_unavailable(max_unavailable_raw.map(|s| s.as_str()), desired);
+            let max_unavailable = resolve_max_unavailable(max_unavailable_raw, desired);
 
             // Re-read pods after manage phase to get accurate state
             let all_pods_now: Vec<Pod> = self.storage.list(&pod_prefix).await?;
@@ -1489,14 +1489,26 @@ impl<S: Storage + 'static> DaemonSetController<S> {
 /// Absolute values pass through, and any unparseable input defaults to 1.
 /// The result is clamped to at least 1 so the rolling update can always make
 /// progress on small clusters.
-fn resolve_max_unavailable(raw: Option<&str>, desired: i32) -> i32 {
+/// Mirrors upstream `daemon/util.UnavailableCount`
+/// (`pkg/controller/daemon/util/daemonset_util.go`), which delegates to
+/// `intstr.GetScaledValueFromIntOrPercent(..., roundUp = true)`.
+///
+/// The dispatch is on the `IntOrString` **variant**, not on the text of a
+/// stringified value: upstream decides "percentage vs absolute" from
+/// `Type`, and a value that arrives as an integer can never be read as a
+/// percentage. Flattening both variants to a `&str` first is what let the
+/// int/string distinction be lost on the wire in the first place.
+fn resolve_max_unavailable(raw: Option<&IntOrString>, desired: i32) -> i32 {
     match raw {
-        Some(s) if s.ends_with('%') => {
+        Some(IntOrString::String(s)) if s.ends_with('%') => {
             let pct = s.trim_end_matches('%').parse::<f64>().unwrap_or(0.0);
             let scaled = (pct * desired as f64 / 100.0).ceil() as i32;
             scaled.max(1)
         }
-        Some(s) => s.parse::<i32>().unwrap_or(1).max(1),
+        // A non-percent string is not valid upstream, but our validator still
+        // tolerates a bare numeric string; keep reading it as an absolute.
+        Some(IntOrString::String(s)) => s.parse::<i32>().unwrap_or(1).max(1),
+        Some(IntOrString::Int(i)) => (*i).max(1),
         None => 1,
     }
 }
@@ -2211,27 +2223,48 @@ mod tests {
         // None defaults to 1
         assert_eq!(resolve_max_unavailable(None, 3), 1);
         // Absolute integer passes through
-        assert_eq!(resolve_max_unavailable(Some("2"), 5), 2);
+        assert_eq!(resolve_max_unavailable(Some(&IntOrString::Int(2)), 5), 2);
         // Absolute clamped to at least 1
-        assert_eq!(resolve_max_unavailable(Some("0"), 5), 1);
+        assert_eq!(resolve_max_unavailable(Some(&IntOrString::Int(0)), 5), 1);
         // Unparseable falls back to 1
-        assert_eq!(resolve_max_unavailable(Some("notanumber"), 5), 1);
+        assert_eq!(
+            resolve_max_unavailable(Some(&IntOrString::String("notanumber".to_string())), 5),
+            1
+        );
     }
 
     #[test]
     fn test_resolve_max_unavailable_percentage() {
         // 25% of 4 nodes = 1 (rounded up from 1.0)
-        assert_eq!(resolve_max_unavailable(Some("25%"), 4), 1);
+        assert_eq!(
+            resolve_max_unavailable(Some(&IntOrString::String("25%".to_string())), 4),
+            1
+        );
         // 50% of 4 nodes = 2
-        assert_eq!(resolve_max_unavailable(Some("50%"), 4), 2);
+        assert_eq!(
+            resolve_max_unavailable(Some(&IntOrString::String("50%".to_string())), 4),
+            2
+        );
         // 25% of 5 nodes = 2 (rounded up from 1.25)
-        assert_eq!(resolve_max_unavailable(Some("25%"), 5), 2);
+        assert_eq!(
+            resolve_max_unavailable(Some(&IntOrString::String("25%".to_string())), 5),
+            2
+        );
         // 100% of 3 nodes = 3
-        assert_eq!(resolve_max_unavailable(Some("100%"), 3), 3);
+        assert_eq!(
+            resolve_max_unavailable(Some(&IntOrString::String("100%".to_string())), 3),
+            3
+        );
         // Tiny percentage on tiny cluster still allows at least 1
-        assert_eq!(resolve_max_unavailable(Some("1%"), 1), 1);
+        assert_eq!(
+            resolve_max_unavailable(Some(&IntOrString::String("1%".to_string())), 1),
+            1
+        );
         // Regression guard: "25%" must NOT be parsed as 25 absolute on a
         // small cluster — that previously allowed all pods to be deleted.
-        assert_eq!(resolve_max_unavailable(Some("25%"), 3), 1);
+        assert_eq!(
+            resolve_max_unavailable(Some(&IntOrString::String("25%".to_string())), 3),
+            1
+        );
     }
 }
