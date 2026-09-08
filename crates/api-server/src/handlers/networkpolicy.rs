@@ -199,7 +199,13 @@ pub async fn update(
         return Ok(Json(network_policy));
     }
 
-    let result = match state.storage.update(&key, &network_policy).await {
+    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut network_policy,
+    )
+    .await
+    {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => {
             state.storage.create(&key, &network_policy).await?

@@ -155,7 +155,13 @@ pub async fn update(
     }
 
     // Try to update first, if not found then create (upsert behavior)
-    let result = match state.storage.update(&key, &pdb).await {
+    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut pdb,
+    )
+    .await
+    {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &pdb).await?,
         Err(e) => return Err(e),

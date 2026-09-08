@@ -237,7 +237,13 @@ pub async fn update_validating_webhook(
 
     let key = build_key("validatingwebhookconfigurations", None, &name);
 
-    let result = match state.storage.update(&key, &config).await {
+    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut config,
+    )
+    .await
+    {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &config).await?,
         Err(e) => return Err(e),
@@ -556,7 +562,13 @@ pub async fn update_mutating_webhook(
 
     let key = build_key("mutatingwebhookconfigurations", None, &name);
 
-    let result = match state.storage.update(&key, &config).await {
+    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut config,
+    )
+    .await
+    {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &config).await?,
         Err(e) => return Err(e),

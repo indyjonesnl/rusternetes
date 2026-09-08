@@ -125,7 +125,12 @@ pub async fn update_ipaddress(
     }
 
     let key = build_key("ipaddresses", None, &name);
-    let updated = state.storage.update(&key, &ipaddress).await?;
+    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut ipaddress,
+    )
+    .await?;
 
     Ok(Json(updated))
 }

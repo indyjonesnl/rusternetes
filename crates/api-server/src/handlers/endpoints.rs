@@ -284,7 +284,16 @@ pub async fn update_endpoints(
         return Ok(Json(endpoints));
     }
 
-    let updated = state.storage.update(&key, &endpoints).await?;
+    // Reinstate the stored object's server-owned metadata before writing
+    // (upstream registry/rest/update.go::BeforeUpdate, lines 131-146). Without
+    // it a PUT that omits `uid` stores a blank one, orphaning every child that
+    // references it, and a PUT could clear a pending deletionTimestamp.
+    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut endpoints,
+    )
+    .await?;
 
     Ok(Json(updated))
 }

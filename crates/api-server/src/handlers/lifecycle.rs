@@ -210,6 +210,53 @@ pub fn inherit_server_owned_metadata(new_meta: &mut ObjectMeta, old_meta: &Objec
     }
 }
 
+/// Read-modify-write PUT that applies [`inherit_server_owned_metadata`] against
+/// the stored object, for the handlers that would otherwise persist the
+/// client's body blind.
+///
+/// Upstream never has this problem because there is exactly one update path:
+/// `Store.Update`
+/// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go)
+/// fetches the current object inside a `GuaranteedUpdate` and hands both to
+/// `rest.BeforeUpdate` (registry/rest/update.go:131-146) before anything is
+/// written. Every resource gets the behaviour by construction.
+///
+/// Rusternetes has one handler per resource, so the rule has to be re-applied
+/// per handler — and it repeatedly was not (#1605, #1788, #1793, #1795). This
+/// helper exists so a handler that needs the stored object *only* for its
+/// metadata does not have to open-code the read, the inherit and the write, and
+/// so the next resource added gets it by calling one function.
+///
+/// **Missing-object behaviour is deliberately unchanged.** When the object is
+/// absent the write is still attempted, so a caller that upserts on
+/// `NotFound` keeps upserting and a caller that propagates `NotFound` keeps
+/// propagating. Choosing 404-vs-create is `AllowCreateOnUpdate` upstream and is
+/// a per-resource decision, not something a shared helper may make silently.
+pub async fn update_inheriting_server_owned_metadata<S, T>(
+    storage: &S,
+    key: &str,
+    new: &mut T,
+) -> rusternetes_common::Result<T>
+where
+    S: rusternetes_storage::Storage,
+    T: crate::handlers::finalizers::HasMetadata
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + Clone
+        + Send
+        + Sync,
+{
+    match storage.get::<T>(key).await {
+        Ok(stored) => {
+            let stored_meta = stored.metadata().clone();
+            inherit_server_owned_metadata(new.metadata_mut(), &stored_meta);
+        }
+        Err(rusternetes_common::Error::NotFound(_)) => {}
+        Err(e) => return Err(e),
+    }
+    storage.update(key, new).await
+}
+
 /// `serde_json::Value` form of [`inherit_server_owned_metadata`], for the
 /// handlers that persist a raw document rather than a typed struct (CRDs, and
 /// anything else stored as an untyped object).

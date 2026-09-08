@@ -387,7 +387,13 @@ pub async fn update_flow_schema(
     }
 
     let key = build_key("flowschemas", None, &name);
-    let result = match state.storage.update(&key, &fs).await {
+    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut fs,
+    )
+    .await
+    {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &fs).await?,
         Err(e) => return Err(e),

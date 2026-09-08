@@ -262,7 +262,13 @@ pub async fn update_replicationcontroller(
     let key = build_key("replicationcontrollers", Some(&namespace), &name);
 
     // Try to update first, if not found then create (upsert behavior)
-    let result = match state.storage.update(&key, &rc).await {
+    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut rc,
+    )
+    .await
+    {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &rc).await?,
         Err(e) => return Err(e),

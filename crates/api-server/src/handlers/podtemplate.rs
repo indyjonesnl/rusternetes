@@ -143,8 +143,17 @@ pub async fn update_podtemplate(
 
     let key = build_key("podtemplates", Some(&namespace), &name);
 
-    // Try to update first, if not found then create (upsert behavior)
-    let result = match state.storage.update(&key, &podtemplate).await {
+    // Try to update first, if not found then create (upsert behavior).
+    // The update inherits the stored object's server-owned metadata first
+    // (upstream registry/rest/update.go::BeforeUpdate, lines 131-146); the
+    // create path is unchanged, since there is nothing to inherit from.
+    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &*state.storage,
+        &key,
+        &mut podtemplate,
+    )
+    .await
+    {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => {
             state.storage.create(&key, &podtemplate).await?
