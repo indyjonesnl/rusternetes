@@ -276,12 +276,11 @@ if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
     # Waits for the controllers to recreate the pods FIRST, then gives them a
     # settle window to start on their own: at this point in the flow the addon
     # pods do not exist yet, so an immediate check deletes nothing.
-    stuck="$(vs_repair_stuck_addon_pods "$RESTORE_KC")"
-    if [ "${stuck:-0}" -gt 0 ] 2>/dev/null; then
-      vs_log "recreated $stuck stuck kube-system addon pod(s) so their controllers restart them (#1890)"
-    else
-      vs_log "no stuck kube-system addon pods to recreate"
-    fi
+    # The function logs its own outcome (per attempt, plus success/give-up), so
+    # do not second-guess it here: an earlier version printed "no stuck addon
+    # pods to recreate" off the returned count even on runs where the repair had
+    # in fact run and succeeded, which read as the exact opposite of the truth.
+    vs_repair_stuck_addon_pods "$RESTORE_KC" >/dev/null || true
 
     vs_log "waiting for endpointslice convergence (kube-dns endpoint ready, ≤180s)"
     converged=0

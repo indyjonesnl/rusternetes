@@ -793,8 +793,16 @@ vs_recreate_stuck_addon_pods() {
 # Each attempt: wait up to settle_s for kube-proxy to become Running on its own;
 # if it does not, delete the non-Running addon pods (#1890) so their controllers
 # make replacements, then re-check.
+#
+# The budget (6 x 60s) is deliberately generous. Replacements created EARLY are
+# themselves stuck: measured on a reproduced run, deletes at T+45s, T+90s and
+# T+135s after the restore all produced replacements that stayed Pending, while
+# a delete at ~T+5min produced a replacement that was 1/1 Running in 6 seconds
+# and made the ClusterIP dialable. Whatever recovers in that window (see #1890)
+# takes minutes, so a short retry budget just burns attempts before the cluster
+# is able to start anything.
 vs_repair_stuck_addon_pods() {
-  local kubeconfig="$1" settle="${2:-45}" attempts="${3:-3}"
+  local kubeconfig="$1" settle="${2:-60}" attempts="${3:-6}"
   local deleted_total=0 attempt=1 waited proxy_running total notrunning n
   while [ "$attempt" -le "$attempts" ]; do
     waited=0
