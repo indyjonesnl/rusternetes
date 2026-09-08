@@ -85,16 +85,34 @@ impl WatchSource for StorageBackend {
 /// 5000 × 26 prefixes × ~3KB = ~390MB of memory.
 const HISTORY_CAPACITY: usize = 500;
 
-/// Replay-ring size retained for a prefix with **zero** live external watchers
+/// Replay-ring size retained for a prefix that is BOTH unwatched and quiet
 /// (#1089). The full ring is only needed to replay history to reconnecting
-/// watchers; at idle there are none, so we keep just a small recent tail and
-/// free the rest. The tail still covers the short replay sequences the
-/// remaining ring consumers need — notably the CRD watch path, whose
-/// Established delivery replays just the ADDED+MODIFIED pair. The primary
-/// resourceVersion replay path is storage-backed (`watch_from_revision` +
-/// `is_revision_compacted` → 410), independent of this ring, so shrinking it
-/// cannot regress replay correctness.
+/// watchers; for a prefix nothing is watching and nothing is writing, a small
+/// recent tail is enough (notably the CRD watch path, whose Established
+/// delivery replays just the ADDED+MODIFIED pair).
+///
+/// It is applied ONLY after [`QUIET_BEFORE_IDLE_TRIM`] without a write. The
+/// earlier version keyed the trim on the receiver count alone, and the note
+/// here claimed that "the primary resourceVersion replay path is
+/// storage-backed ... so shrinking it cannot regress replay correctness".
+/// That was wrong: `subscribe_from_checked` 410s off THIS ring's floor
+/// (`handlers/watch.rs`), so trimming does decide replay correctness.
+///
+/// The consequence was a livelock on a write-hot, momentarily-unwatched prefix
+/// — `/registry/nodes/`, which node status and leases push at ~38
+/// revisions/second on a live cluster. A client LISTs, opens a watch from that
+/// LIST's rv, and by then the ring has been trimmed past it, so it gets 410
+/// Expired. It relists and retries — but a failed subscribe registers no
+/// receiver, so the prefix still counts as idle, is trimmed again, and 410s
+/// again, forever. Nothing was ever compacted; the events were thrown away for
+/// memory. (Found while debugging #1890.)
 const HISTORY_IDLE_CAPACITY: usize = 16;
+
+/// How long a prefix must go without a write before the idle reclaim will trim
+/// its replay ring. A prefix still receiving writes keeps the full
+/// [`HISTORY_CAPACITY`], because that is precisely the ring an arriving
+/// watcher needs in order to subscribe at all.
+const QUIET_BEFORE_IDLE_TRIM: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How often the idle-GC sweep reclaims replay rings for prefixes that have
 /// dropped to zero watchers.
@@ -141,6 +159,13 @@ pub struct WatchCache {
     /// (floor = storage head at shared-watch start, advanced whenever the ring
     /// trims). RV-watches below the floor must 410 so the client relists.
     floors: Arc<RwLock<HashMap<String, i64>>>,
+    /// When each prefix last received an event. Absent = never written.
+    ///
+    /// The idle reclaim keys off this as well as the receiver count, because
+    /// "nobody is watching" is NOT the same as "nothing is happening" — and
+    /// gutting the ring of a prefix that is still being written is exactly
+    /// what breaks an arriving watcher (see [`HISTORY_IDLE_CAPACITY`]).
+    last_write: Arc<RwLock<HashMap<String, std::time::Instant>>>,
 }
 
 impl WatchCache {
@@ -158,6 +183,7 @@ impl WatchCache {
             revision: RwLock::new(0), // Will be populated from etcd events
             history: Arc::new(RwLock::new(HashMap::new())),
             floors: Arc::new(RwLock::new(HashMap::new())),
+            last_write: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -252,6 +278,7 @@ impl WatchCache {
         let prefix_owned = prefix.to_string();
         let tx_clone = tx.clone();
         let history_ref = self.history.clone();
+        let last_write_ref = Arc::clone(&self.last_write);
         let floors_ref = self.floors.clone();
 
         tokio::spawn(async move {
@@ -394,15 +421,24 @@ impl WatchCache {
                                     > = history_ref.write().await;
                                     let buf = hist.entry(prefix_owned.clone()).or_default();
                                     buf.push_back(cached.clone());
-                                    // Retain the full ring only while someone is
-                                    // watching; once the last watcher leaves, trim to
-                                    // the idle tail so a busy-then-idle prefix doesn't
-                                    // pin ~500 events forever (#1089).
-                                    let cap = if tx_clone.receiver_count() > 0 {
-                                        HISTORY_CAPACITY
-                                    } else {
-                                        HISTORY_IDLE_CAPACITY
-                                    };
+                                    // Stamp write activity so the idle sweep can
+                                    // tell "unwatched" from "quiet".
+                                    last_write_ref
+                                        .write()
+                                        .await
+                                        .insert(prefix_owned.clone(), std::time::Instant::now());
+                                    // Always retain the full ring on the write
+                                    // path: this event IS proof the prefix is
+                                    // active, and the ring is what an arriving
+                                    // watcher needs in order to subscribe at
+                                    // all. Trimming a write-hot prefix here
+                                    // (the old behaviour, keyed on the receiver
+                                    // count) raised the replay floor past
+                                    // clients' LIST revisions and 410'd them in
+                                    // a livelock — see HISTORY_IDLE_CAPACITY.
+                                    // Reclaim for genuinely quiet prefixes is
+                                    // the idle sweep's job (#1089).
+                                    let cap = HISTORY_CAPACITY;
                                     let mut trimmed_to: Option<i64> = None;
                                     while buf.len() > cap {
                                         if let Some(popped) = buf.pop_front() {
@@ -475,15 +511,31 @@ impl WatchCache {
         });
     }
 
-    /// Shrink the replay ring of every prefix that currently has no live
-    /// receivers down to [`HISTORY_IDLE_CAPACITY`], releasing the backing
-    /// capacity. Idempotent and cheap when nothing is idle.
+    /// Shrink the replay ring of every prefix that is BOTH unwatched and quiet
+    /// down to [`HISTORY_IDLE_CAPACITY`], releasing the backing capacity.
+    /// Idempotent and cheap when nothing is eligible.
+    ///
+    /// Quiet means no event for [`QUIET_BEFORE_IDLE_TRIM`]. A prefix that is
+    /// still being written keeps its full ring even with zero receivers,
+    /// because trimming it raises the replay floor past the revision an
+    /// arriving watcher LISTed at, which 410s that watcher in a livelock it
+    /// cannot escape (it never becomes a receiver, so the prefix stays
+    /// "idle"). See [`HISTORY_IDLE_CAPACITY`].
     async fn gc_idle_history(&self) {
         let idle_prefixes: Vec<String> = {
             let watchers = self.watchers.read().await;
+            let last_write = self.last_write.read().await;
+            let now = std::time::Instant::now();
             watchers
                 .iter()
                 .filter(|(_, tx)| tx.receiver_count() == 0)
+                .filter(|(prefix, _)| {
+                    // Absent = never written = quiet.
+                    last_write
+                        .get(*prefix)
+                        .map(|t| now.duration_since(*t) >= QUIET_BEFORE_IDLE_TRIM)
+                        .unwrap_or(true)
+                })
                 .map(|(prefix, _)| prefix.clone())
                 .collect()
         };
@@ -1011,6 +1063,66 @@ mod tests {
             event: WatchEventData::Added(format!("k{rev}"), Arc::new("{}".to_string())),
             revision: rev,
         }
+    }
+
+    #[tokio::test]
+    async fn a_write_hot_unwatched_prefix_keeps_replay_coverage() {
+        // The kubelet's node informer LISTs nodes, then WATCHes from that
+        // LIST's resourceVersion. Between the two, a write-hot prefix advances
+        // (node status + leases push ~38 revisions/second on a live cluster).
+        //
+        // Shrinking such a prefix's ring to HISTORY_IDLE_CAPACITY raises the
+        // replay floor above the client's rv, so subscribe_from_checked returns
+        // Err -> 410 Expired. The client relists and retries -- but a failed
+        // subscribe registers no receiver, so the prefix still looks idle, gets
+        // shrunk again, and 410s again: a livelock. On the vanilla-swap
+        // api-server leg that stopped the kubelet from EVER watching pods
+        // (upstream gates its pod reflector on nodeHasSynced,
+        // pkg/kubelet/config/apiserver.go), so no pod ever started (#1890).
+        //
+        // Memory reclamation must not destroy coverage a client can still
+        // legitimately ask for: "no watchers" is not the same as "quiet".
+        let storage = Arc::new(StorageBackend::new_memory());
+        let cache = WatchCache::new(storage);
+
+        // A shared watcher exists (as at boot) but nobody is subscribed, and
+        // the prefix is being written continuously.
+        let (tx, rx) = broadcast::channel(1000);
+        drop(rx);
+        {
+            let mut watchers = cache.watchers.write().await;
+            watchers.insert("/registry/nodes/".to_string(), tx);
+        }
+        {
+            let mut hist = cache.history.write().await;
+            hist.insert(
+                "/registry/nodes/".to_string(),
+                (0..200).map(make_event).collect(),
+            );
+            let mut floors = cache.floors.write().await;
+            floors.insert("/registry/nodes/".to_string(), 0);
+        }
+        // Write-hot: the prefix received an event just now (node status and
+        // leases push ~38 revisions/second on a live cluster).
+        cache
+            .last_write
+            .write()
+            .await
+            .insert("/registry/nodes/".to_string(), std::time::Instant::now());
+
+        // A write lands (the trim fires on the write path) and the periodic
+        // sweep also runs -- both while the prefix has zero receivers.
+        cache.gc_idle_history().await;
+
+        // A client whose LIST saw revision 150 must still be servable: nothing
+        // has been compacted, it is merely behind the most recent writes.
+        let res = cache.subscribe_from_checked("/registry/nodes/", 150).await;
+        assert!(
+            res.is_ok(),
+            "a watch from an uncompacted revision on a write-hot prefix must be \
+             served, not 410'd: floor rose to {:?} (see #1890)",
+            res.err()
+        );
     }
 
     #[tokio::test]
