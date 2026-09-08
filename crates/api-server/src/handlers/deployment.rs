@@ -315,9 +315,9 @@ pub async fn update(
 pub async fn delete_deployment(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    body: axum::body::Bytes,
 ) -> Result<Json<Deployment>> {
     info!("Deleting deployment: {}/{}", namespace, name);
 
@@ -367,30 +367,13 @@ pub async fn delete_deployment(
         return Ok(Json(deployment));
     }
 
-    // Extract propagation policy from query params or request body (DeleteOptions)
-    let body_propagation: Option<String> = if !body.is_empty() {
-        serde_json::from_slice::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| {
-                v.get("propagationPolicy")
-                    .and_then(|p| p.as_str())
-                    .map(|s| s.to_string())
-            })
-    } else {
-        None
-    };
-    let propagation_policy = params
-        .get("propagationPolicy")
-        .map(|s| s.as_str())
-        .or(body_propagation.as_deref());
-
     // Handle deletion with finalizers and propagation policy
     let deleted_immediately =
         !crate::handlers::finalizers::handle_delete_with_finalizers_and_propagation(
             &state.storage,
             &key,
             &deployment,
-            propagation_policy,
+            &delete_opts,
         )
         .await?;
 
@@ -572,6 +555,7 @@ crate::patch_handler_namespaced!(patch, Deployment, "deployments", "apps");
 pub async fn deletecollection_deployments(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode> {
@@ -628,15 +612,19 @@ pub async fn deletecollection_deployments(
         .await?;
 
         // Handle deletion with finalizers
-        let deleted_immediately =
-            match crate::handlers::finalizers::delete_collection_item(&state.storage, &key, &item)
-                .await?
-            {
-                Some(deleted) => deleted,
-                // Already gone — a concurrent deleter won the race; upstream
-                // DeleteCollection ignores NotFound rather than failing the request.
-                None => continue,
-            };
+        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
+            &state.storage,
+            &key,
+            &item,
+            &delete_opts,
+        )
+        .await?
+        {
+            Some(deleted) => deleted,
+            // Already gone — a concurrent deleter won the race; upstream
+            // DeleteCollection ignores NotFound rather than failing the request.
+            None => continue,
+        };
 
         if deleted_immediately {
             deleted_count += 1;

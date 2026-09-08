@@ -362,6 +362,7 @@ pub async fn update(
 pub async fn delete(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Event>> {
@@ -398,9 +399,13 @@ pub async fn delete(
     }
 
     // Handle deletion with finalizers
-    let deleted_immediately =
-        !crate::handlers::finalizers::handle_delete_with_finalizers(&state.storage, &key, &event)
-            .await?;
+    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
+        &state.storage,
+        &key,
+        &event,
+        &delete_opts,
+    )
+    .await?;
 
     if deleted_immediately {
         Ok(Json(event))
@@ -502,6 +507,7 @@ crate::patch_handler_namespaced!(patch, Event, "events", "");
 pub async fn deletecollection_events(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode> {
@@ -542,15 +548,19 @@ pub async fn deletecollection_events(
         let key = build_key("events", Some(&namespace), &item.metadata.name);
 
         // Handle deletion with finalizers
-        let deleted_immediately =
-            match crate::handlers::finalizers::delete_collection_item(&state.storage, &key, &item)
-                .await?
-            {
-                Some(deleted) => deleted,
-                // Already gone — a concurrent deleter won the race; upstream
-                // DeleteCollection ignores NotFound rather than failing the request.
-                None => continue,
-            };
+        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
+            &state.storage,
+            &key,
+            &item,
+            &delete_opts,
+        )
+        .await?
+        {
+            Some(deleted) => deleted,
+            // Already gone — a concurrent deleter won the race; upstream
+            // DeleteCollection ignores NotFound rather than failing the request.
+            None => continue,
+        };
 
         if deleted_immediately {
             deleted_count += 1;
@@ -953,6 +963,7 @@ pub async fn update_events_v1(
 pub async fn delete_events_v1(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Event>> {
@@ -978,9 +989,13 @@ pub async fn delete_events_v1(
         return Ok(Json(event));
     }
 
-    let deleted_immediately =
-        !crate::handlers::finalizers::handle_delete_with_finalizers(&state.storage, &key, &event)
-            .await?;
+    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
+        &state.storage,
+        &key,
+        &event,
+        &delete_opts,
+    )
+    .await?;
 
     if deleted_immediately {
         Ok(Json(event))

@@ -80,6 +80,8 @@ mod decoder_content_type_test;
 mod decoder_malformed_json_test;
 mod decoder_strict_fields_test;
 mod decoder_strict_parity_test;
+mod delete_propagation_guard_test;
+mod delete_propagation_lateral_test;
 mod deployment_handler_test;
 mod dra_test;
 mod e2e_inprocess_smoke_test;

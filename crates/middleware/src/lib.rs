@@ -3321,3 +3321,183 @@ mod tests {
         assert!(phase_blocks_create(Some("Terminating")));
     }
 }
+
+// ===========================================================================
+// DeleteOptions: decoded once per request, like upstream
+// ===========================================================================
+
+/// The `DeleteOptions` fields that decide garbage-collection behaviour,
+/// decoded once per DELETE request by [`delete_options_middleware`].
+///
+/// Upstream decodes `metav1.DeleteOptions` a single time in the endpoint
+/// handler, before the registry is ever called
+/// (`staging/src/k8s.io/apiserver/pkg/endpoints/handlers/delete.go:86` for
+/// DELETE, `:263` for DeleteCollection), reading the request BODY and falling
+/// back to query parameters. Every resource therefore gets identical decoding.
+///
+/// Rusternetes has one handler per resource and they did not: only the pod
+/// handler read the body, so `kubectl delete --cascade=orphan` -- which sends
+/// `propagationPolicy` in the DELETE body, not the query string -- was silently
+/// ignored on every other resource.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeleteOptionsCtx {
+    /// `deleteOptions.propagationPolicy`: "Orphan", "Background" or "Foreground".
+    pub propagation_policy: Option<String>,
+    /// The deprecated `deleteOptions.orphanDependents` bool. Upstream still
+    /// honours it, ahead of `propagationPolicy`
+    /// (registry/generic/registry/store.go:898-901).
+    pub orphan_dependents: Option<bool>,
+}
+
+/// Read the propagation fields out of a DELETE, exactly the way upstream does.
+///
+/// Upstream is **not** a per-field merge of body and query
+/// (`staging/src/k8s.io/apiserver/pkg/endpoints/handlers/delete.go:95-126`):
+///
+/// ```go
+/// if len(body) > 0 {
+///     ... Decode(body, &defaultGVK, options)
+/// } else {
+///     ... DecodeParameters(req.URL.Query(), scope.MetaGroupVersion, options)
+/// }
+/// ```
+///
+/// A present body wins **outright** and the query string is not consulted at
+/// all -- so `DELETE ?propagationPolicy=Foreground` with a body of
+/// `{"kind":"DeleteOptions"}` is Background (the default), not Foreground.
+/// Query parameters only apply to a DELETE with an empty body.
+///
+/// A non-empty body that is not JSON is treated here as absent, falling back to
+/// the query; upstream rejects it with 400 instead. That difference is out of
+/// scope for this function -- it decides precedence, not request validity.
+pub fn parse_delete_options(
+    params: &HashMap<String, String>,
+    body: Option<&serde_json::Value>,
+) -> DeleteOptionsCtx {
+    if let Some(body) = body {
+        return DeleteOptionsCtx {
+            propagation_policy: body
+                .get("propagationPolicy")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            orphan_dependents: body.get("orphanDependents").and_then(|v| v.as_bool()),
+        };
+    }
+
+    DeleteOptionsCtx {
+        propagation_policy: params.get("propagationPolicy").cloned(),
+        orphan_dependents: params
+            .get("orphanDependents")
+            .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+    }
+}
+
+/// Decode `DeleteOptions` once for every DELETE and hand it to the handler as
+/// an `Extension`, so no handler has to parse the body itself -- and none can
+/// forget to.
+///
+/// The body is buffered and put back, so a handler that also takes `body:
+/// Bytes` (the pod path reads `gracePeriodSeconds` from it) still sees it.
+pub async fn delete_options_middleware(req: Request, next: Next) -> Response {
+    use axum::body::{to_bytes, Body};
+
+    if req.method() != axum::http::Method::DELETE {
+        return next.run(req).await;
+    }
+
+    let params: HashMap<String, String> =
+        axum::extract::Query::<HashMap<String, String>>::try_from_uri(req.uri())
+            .map(|q| q.0)
+            .unwrap_or_default();
+
+    let (parts, body) = req.into_parts();
+    // A DELETE body is a small DeleteOptions document; the same cap the dump
+    // middleware uses is far above anything legitimate.
+    let bytes = to_bytes(body, MAX_DUMP_BODY).await.unwrap_or_default();
+    let parsed: Option<serde_json::Value> = if bytes.is_empty() {
+        None
+    } else {
+        serde_json::from_slice(&bytes).ok()
+    };
+
+    let opts = parse_delete_options(&params, parsed.as_ref());
+
+    let mut req = Request::from_parts(parts, Body::from(bytes));
+    req.extensions_mut().insert(opts);
+    next.run(req).await
+}
+
+#[cfg(test)]
+mod delete_options_tests {
+    use super::{parse_delete_options, DeleteOptionsCtx};
+    use std::collections::HashMap;
+
+    fn q(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// With no body, the query string decides — upstream's `else` branch
+    /// (endpoints/handlers/delete.go:121).
+    #[test]
+    fn an_empty_body_falls_back_to_query_parameters() {
+        assert_eq!(
+            parse_delete_options(&q(&[("propagationPolicy", "Foreground")]), None),
+            DeleteOptionsCtx {
+                propagation_policy: Some("Foreground".to_string()),
+                orphan_dependents: None,
+            }
+        );
+    }
+
+    /// The deprecated bool is a query bool, so it follows
+    /// `Convert_Slice_string_To_bool`: only "0"/"false" are false. Before the
+    /// query-bool sweep this was `parse::<bool>()`, so `?orphanDependents=1`
+    /// silently meant "not set".
+    #[test]
+    fn orphan_dependents_uses_upstream_query_bool_rules() {
+        for truthy in ["true", "1", "t", "yes", ""] {
+            assert_eq!(
+                parse_delete_options(&q(&[("orphanDependents", truthy)]), None).orphan_dependents,
+                Some(true),
+                "?orphanDependents={truthy} must be true"
+            );
+        }
+        for falsy in ["false", "False", "0"] {
+            assert_eq!(
+                parse_delete_options(&q(&[("orphanDependents", falsy)]), None).orphan_dependents,
+                Some(false),
+                "?orphanDependents={falsy} must be false"
+            );
+        }
+    }
+
+    /// A present body wins outright. This is the case that a per-field merge
+    /// gets wrong, and it is the one kubectl exercises: it sends DeleteOptions
+    /// in the body.
+    #[test]
+    fn a_present_body_wins_over_the_query_string() {
+        let body = serde_json::json!({"propagationPolicy": "Orphan"});
+        assert_eq!(
+            parse_delete_options(&q(&[("propagationPolicy", "Foreground")]), Some(&body))
+                .propagation_policy,
+            Some("Orphan".to_string())
+        );
+    }
+
+    /// The sharp edge: a body that does NOT name the field does not fall back
+    /// to the query, because upstream never reads the query once a body is
+    /// present. A merge implementation returns Foreground here and is wrong.
+    #[test]
+    fn a_body_without_the_field_does_not_fall_back_to_the_query() {
+        let body = serde_json::json!({"kind": "DeleteOptions"});
+        assert_eq!(
+            parse_delete_options(&q(&[("propagationPolicy", "Foreground")]), Some(&body)),
+            DeleteOptionsCtx::default(),
+            "a present body suppresses the query string entirely \
+             (endpoints/handlers/delete.go:95-126)"
+        );
+    }
+}

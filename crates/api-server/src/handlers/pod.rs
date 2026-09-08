@@ -1088,6 +1088,7 @@ pub async fn update(
 pub async fn delete_pod(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: axum::body::Bytes,
@@ -1170,11 +1171,14 @@ pub async fn delete_pod(
     // (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:976
     // `deletionFinalizersForGarbageCollection`); the pod strategy declares no
     // `DefaultGarbageCollectionPolicy`, so the generic rules apply unchanged.
-    let (propagation_policy, orphan_dependents) =
-        crate::handlers::finalizers::parse_delete_propagation(
-            &params,
-            body_delete_options.as_ref(),
-        );
+    // Decoded once for every DELETE by `delete_options_middleware`, the port of
+    // upstream's single decode in endpoints/handlers/delete.go:86. The pod
+    // handler used to parse this itself, which is how the other ~50 resources
+    // came to ignore a `propagationPolicy` sent in the request body.
+    let (propagation_policy, orphan_dependents) = (
+        delete_opts.propagation_policy.clone(),
+        delete_opts.orphan_dependents,
+    );
 
     // Parse gracePeriodSeconds from query params, request body (DeleteOptions), or pod spec
     let body_grace_period = body_delete_options
@@ -1873,6 +1877,7 @@ pub async fn patch(
 pub async fn deletecollection_pods(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode> {
@@ -1929,9 +1934,13 @@ pub async fn deletecollection_pods(
         .await?;
 
         // Handle deletion with finalizers
-        let deleted_immediately =
-            !crate::handlers::finalizers::handle_delete_with_finalizers(&state.storage, &key, &pod)
-                .await?;
+        let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
+            &state.storage,
+            &key,
+            &pod,
+            &delete_opts,
+        )
+        .await?;
 
         if deleted_immediately {
             deleted_count += 1;
@@ -2312,6 +2321,7 @@ mod tests {
             if let Some(p) = policy {
                 params.insert("propagationPolicy".to_string(), p.to_string());
             }
+            let delete_opts = rusternetes_middleware::parse_delete_options(&params, body.as_ref());
             let bytes = body
                 .map(|b| axum::body::Bytes::from(serde_json::to_vec(&b).unwrap()))
                 .unwrap_or_default();
@@ -2321,6 +2331,10 @@ mod tests {
                 Extension(AuthContext {
                     user: rusternetes_common::auth::UserInfo::anonymous(),
                 }),
+                // The handler now receives what `delete_options_middleware`
+                // decodes; these unit tests call it directly, so they build the
+                // same context the middleware would from this request.
+                Extension(delete_opts),
                 Path(("default".to_string(), "gc-pod".to_string())),
                 axum::extract::Query(params),
                 bytes,
@@ -2411,6 +2425,10 @@ mod tests {
                 Extension(AuthContext {
                     user: rusternetes_common::auth::UserInfo::anonymous(),
                 }),
+                // The handler now receives what `delete_options_middleware`
+                // decodes; these unit tests call it directly, so they build the
+                // same context the middleware would from this request.
+                Extension(rusternetes_middleware::parse_delete_options(&params, None)),
                 Path(("default".to_string(), "grace0".to_string())),
                 axum::extract::Query(params),
                 axum::body::Bytes::new(),

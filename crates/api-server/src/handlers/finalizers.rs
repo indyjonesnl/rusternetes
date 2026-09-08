@@ -1,5 +1,6 @@
 use chrono::Utc;
 use rusternetes_common::Result;
+use rusternetes_middleware::DeleteOptionsCtx;
 use rusternetes_storage::Storage;
 use serde::{de::DeserializeOwned, Serialize};
 use tracing::{debug, info};
@@ -63,12 +64,13 @@ pub async fn handle_delete_with_finalizers<S, T>(
     storage: &S,
     key: &str,
     resource: &T,
+    opts: &DeleteOptionsCtx,
 ) -> Result<bool>
 where
     S: Storage,
     T: HasMetadata + Serialize + DeserializeOwned + Clone + Send + Sync,
 {
-    handle_delete_with_finalizers_and_propagation(storage, key, resource, None).await
+    handle_delete_with_finalizers_and_propagation(storage, key, resource, opts).await
 }
 
 /// `DeleteCollection` variant: delete one item of a collection, tolerating an
@@ -105,12 +107,13 @@ pub async fn delete_collection_item<S, T>(
     storage: &S,
     key: &str,
     resource: &T,
+    opts: &DeleteOptionsCtx,
 ) -> Result<Option<bool>>
 where
     S: Storage,
     T: HasMetadata + Serialize + DeserializeOwned + Clone + Send + Sync,
 {
-    match handle_delete_with_finalizers_and_propagation(storage, key, resource, None).await {
+    match handle_delete_with_finalizers_and_propagation(storage, key, resource, opts).await {
         Ok(pending_finalizers) => Ok(Some(!pending_finalizers)),
         Err(rusternetes_common::Error::NotFound(_)) => {
             debug!("{key} already deleted concurrently; skipping it in the collection delete");
@@ -195,31 +198,6 @@ pub fn gc_deletion_finalizers(
         finalizers.push(FOREGROUND.to_string());
     }
     finalizers
-}
-
-/// Read the effective propagation policy and the deprecated `orphanDependents`
-/// bool out of a DELETE request: query parameters first, then the
-/// `DeleteOptions` body. Upstream decodes both into the same `DeleteOptions`,
-/// so either transport is valid.
-pub fn parse_delete_propagation(
-    params: &std::collections::HashMap<String, String>,
-    body_delete_options: Option<&serde_json::Value>,
-) -> (Option<String>, Option<bool>) {
-    let policy = params.get("propagationPolicy").cloned().or_else(|| {
-        body_delete_options
-            .and_then(|v| v.get("propagationPolicy"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    });
-    let orphan = params
-        .get("orphanDependents")
-        .map(|v| rusternetes_common::query::k8s_query_bool(v))
-        .or_else(|| {
-            body_delete_options
-                .and_then(|v| v.get("orphanDependents"))
-                .and_then(|v| v.as_bool())
-        });
-    (policy, orphan)
 }
 
 /// Apply upstream's `ShouldDeleteDuringUpdate` to an object that a PUT has just
@@ -307,7 +285,7 @@ pub async fn handle_delete_with_finalizers_and_propagation<S, T>(
     storage: &S,
     key: &str,
     resource: &T,
-    propagation_policy: Option<&str>,
+    opts: &DeleteOptionsCtx,
 ) -> Result<bool>
 where
     S: Storage,
@@ -329,6 +307,66 @@ where
 
         // If already marked for deletion, handle as before
         if metadata.deletion_timestamp.is_some() {
+            // A second DELETE still re-applies the GC finalizers, unless a
+            // GRACEFUL deletion is already under way. Upstream:
+            // `updateForGracefulDeletionAndFinalizers` (store.go:1062-1077)
+            // returns `errAlreadyDeleting` on `pendingGraceful` and only then
+            // skips `deletionFinalizersForGarbageCollection` --
+            //
+            //   // Note that this occurs after checking pendingGraceful, so
+            //   // finalizers cannot be updated via DeleteOptions if deletion
+            //   // has started.
+            //
+            // and `pendingGraceful` is false for any kind whose strategy is not
+            // a `RESTGracefulDeleteStrategy` (rest/delete.go:101-106) -- which
+            // is every kind except Pod. So for a ConfigMap held by a finalizer,
+            // a DELETE with a different policy REPLACES the GC finalizer.
+            // Returning early here applied the pod rule to everything.
+            let graceful_deletion_pending = metadata
+                .deletion_grace_period_seconds
+                .is_some_and(|g| g > 0);
+
+            let existing_finalizers = metadata.finalizers.clone().unwrap_or_default();
+            let recomputed = gc_deletion_finalizers(
+                metadata.finalizers.as_ref(),
+                opts.propagation_policy.as_deref(),
+                opts.orphan_dependents,
+            );
+
+            if !graceful_deletion_pending && recomputed != existing_finalizers {
+                let mut updated = current.clone();
+                let meta = updated.metadata_mut();
+                meta.finalizers = if recomputed.is_empty() {
+                    None
+                } else {
+                    Some(recomputed.clone())
+                };
+                match storage.update(key, &updated).await {
+                    Ok(_) => {
+                        info!(
+                            "Re-applied GC finalizers on already-deleting {}: {:?} -> {:?}",
+                            key, existing_finalizers, recomputed
+                        );
+                        if recomputed.is_empty() {
+                            storage.delete(key).await?;
+                            return Ok(false);
+                        }
+                        return Ok(true);
+                    }
+                    Err(rusternetes_common::Error::Conflict(msg)) if attempt + 1 < MAX_ATTEMPTS => {
+                        debug!(
+                            "Conflict re-applying GC finalizers on {} (attempt {}): {}",
+                            key,
+                            attempt + 1,
+                            msg
+                        );
+                        current = storage.get(key).await?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
             let has_finalizers = metadata.finalizers.as_ref().is_some_and(|f| !f.is_empty());
 
             if has_finalizers {
@@ -355,25 +393,23 @@ where
         let mut updated_resource = current.clone();
         let meta = updated_resource.metadata_mut();
 
-        // Add propagation policy finalizer if needed
-        match propagation_policy {
-            Some("Foreground") => {
-                let finalizers = meta.finalizers.get_or_insert_with(Vec::new);
-                if !finalizers.contains(&"foregroundDeletion".to_string()) {
-                    finalizers.push("foregroundDeletion".to_string());
-                    info!("Added foregroundDeletion finalizer to {}", key);
-                }
-            }
-            Some("Orphan") => {
-                let finalizers = meta.finalizers.get_or_insert_with(Vec::new);
-                if !finalizers.contains(&"orphan".to_string()) {
-                    finalizers.push("orphan".to_string());
-                    info!("Added orphan finalizer to {}", key);
-                }
-            }
-            _ => {
-                // Background or unspecified — no extra finalizer
-            }
+        // Recompute the GC finalizers from scratch, which is what upstream
+        // does: `deletionFinalizersForGarbageCollection`
+        // (registry/generic/registry/store.go:984-997) strips BOTH
+        // `orphan` and `foregroundDeletion` and then re-adds only the one that
+        // applies. Appending instead -- as this did -- leaves both on an object
+        // deleted first with Foreground and then with Orphan, and never honours
+        // the deprecated `orphanDependents` bool that upstream lets override
+        // everything (store.go:898-901).
+        let gc = gc_deletion_finalizers(
+            meta.finalizers.as_ref(),
+            opts.propagation_policy.as_deref(),
+            opts.orphan_dependents,
+        );
+        if gc.is_empty() {
+            meta.finalizers = None;
+        } else {
+            meta.finalizers = Some(gc);
         }
 
         // Check if the resource has finalizers (including any we just added)
@@ -1051,7 +1087,7 @@ mod tests {
 
         storage.create(key, &pod).await.unwrap();
 
-        let deleted = handle_delete_with_finalizers(&storage, key, &pod)
+        let deleted = handle_delete_with_finalizers(&storage, key, &pod, &Default::default())
             .await
             .unwrap();
 
@@ -1073,7 +1109,7 @@ mod tests {
 
         storage.create(key, &pod).await.unwrap();
 
-        let marked = handle_delete_with_finalizers(&storage, key, &pod)
+        let marked = handle_delete_with_finalizers(&storage, key, &pod, &Default::default())
             .await
             .unwrap();
         assert!(
@@ -1093,9 +1129,10 @@ mod tests {
         );
 
         // Second delete should also return marked (no-op)
-        let marked_again = handle_delete_with_finalizers(&storage, key, &updated_pod)
-            .await
-            .unwrap();
+        let marked_again =
+            handle_delete_with_finalizers(&storage, key, &updated_pod, &Default::default())
+                .await
+                .unwrap();
         assert!(marked_again, "Resource should still be marked for deletion");
 
         storage.delete(key).await.unwrap();
@@ -1124,10 +1161,17 @@ mod tests {
         // concurrent status bump by the RC controller under the etcd CAS.
         storage.inject_conflicts(1);
 
-        let marked =
-            handle_delete_with_finalizers_and_propagation(&storage, key, &rc, Some("Orphan"))
-                .await
-                .expect("orphan delete must succeed despite a concurrent-update conflict");
+        let marked = handle_delete_with_finalizers_and_propagation(
+            &storage,
+            key,
+            &rc,
+            &DeleteOptionsCtx {
+                propagation_policy: Some("Orphan".to_string()),
+                orphan_dependents: None,
+            },
+        )
+        .await
+        .expect("orphan delete must succeed despite a concurrent-update conflict");
         assert!(
             marked,
             "orphan delete must mark the resource for deletion (true)"
@@ -1154,7 +1198,7 @@ mod tests {
 
         storage.create(key, &pod).await.unwrap();
 
-        let marked = handle_delete_with_finalizers(&storage, key, &pod)
+        let marked = handle_delete_with_finalizers(&storage, key, &pod, &Default::default())
             .await
             .unwrap();
         assert!(marked);
@@ -1164,9 +1208,10 @@ mod tests {
         updated_pod.metadata.finalizers = None;
         storage.update(key, &updated_pod).await.unwrap();
 
-        let deleted = handle_delete_with_finalizers(&storage, key, &updated_pod)
-            .await
-            .unwrap();
+        let deleted =
+            handle_delete_with_finalizers(&storage, key, &updated_pod, &Default::default())
+                .await
+                .unwrap();
         assert!(!deleted, "Resource without finalizers should be deleted");
 
         let result = storage.get::<Pod>(key).await;
@@ -1188,7 +1233,7 @@ mod tests {
         let key = "pods/default/vanished";
 
         // Never stored: this is the state after a concurrent deleter won.
-        let outcome = delete_collection_item(&storage, key, &pod)
+        let outcome = delete_collection_item(&storage, key, &pod, &Default::default())
             .await
             .expect("a concurrently deleted item must not fail the collection delete");
 
@@ -1207,7 +1252,7 @@ mod tests {
         let key = "pods/default/present";
         storage.create(key, &pod).await.unwrap();
 
-        let outcome = delete_collection_item(&storage, key, &pod)
+        let outcome = delete_collection_item(&storage, key, &pod, &Default::default())
             .await
             .expect("deleting a present item succeeds");
 
@@ -1232,7 +1277,7 @@ mod tests {
         let key = "pods/default/held";
         storage.create(key, &pod).await.unwrap();
 
-        let outcome = delete_collection_item(&storage, key, &pod)
+        let outcome = delete_collection_item(&storage, key, &pod, &Default::default())
             .await
             .expect("marking for deletion succeeds");
 
@@ -1295,34 +1340,6 @@ mod tests {
         assert_eq!(
             gc_deletion_finalizers(Some(&existing), Some("Background"), None),
             vec!["example.com/keep"]
-        );
-    }
-
-    #[test]
-    fn parse_delete_propagation_reads_query_then_body() {
-        use std::collections::HashMap;
-
-        let mut params = HashMap::new();
-        params.insert("propagationPolicy".to_string(), "Foreground".to_string());
-        assert_eq!(
-            parse_delete_propagation(&params, None),
-            (Some("Foreground".to_string()), None)
-        );
-
-        // Body DeleteOptions when the query says nothing.
-        let body = serde_json::json!({
-            "propagationPolicy": "Orphan",
-            "orphanDependents": true,
-        });
-        assert_eq!(
-            parse_delete_propagation(&HashMap::new(), Some(&body)),
-            (Some("Orphan".to_string()), Some(true))
-        );
-
-        // Query wins over body.
-        assert_eq!(
-            parse_delete_propagation(&params, Some(&body)),
-            (Some("Foreground".to_string()), Some(true))
         );
     }
 }

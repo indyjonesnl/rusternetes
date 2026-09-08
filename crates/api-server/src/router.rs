@@ -115,6 +115,16 @@ async fn custom_resource_fallback(
     let path = uri.path();
     debug!("Fallback handler called for path: {}", path);
 
+    // The CRD fallback dispatches to the custom-resource handlers by direct
+    // call rather than through the router, so it has to hand them the
+    // DeleteOptions that `delete_options_middleware` decoded onto the request.
+    // Absent (any non-DELETE method) means the default: no propagation policy.
+    let delete_opts = req
+        .extensions()
+        .get::<middleware::DeleteOptionsCtx>()
+        .cloned()
+        .unwrap_or_default();
+
     // Parse URI to extract custom resource information
     // Expected formats:
     //  - /apis/{group}/{version}/{plural}  (list cluster-scoped)
@@ -377,6 +387,7 @@ async fn custom_resource_fallback(
             match handlers::custom_resource::deletecollection_custom_resources(
                 state.clone(),
                 auth_ctx.clone(),
+                delete_opts.clone(),
                 group.to_string(),
                 version.to_string(),
                 plural.to_string(),
@@ -581,6 +592,7 @@ async fn custom_resource_fallback(
             match handlers::custom_resource::delete_custom_resource(
                 State(state.clone()),
                 Extension(auth_ctx.clone()),
+                Extension(delete_opts.clone()),
                 axum::extract::Path((
                     group.to_string(),
                     version.to_string(),
@@ -2502,6 +2514,13 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             .layer(axum_middleware::from_fn(
                 middleware::namespace_lifecycle_middleware,
             ))
+            // Decodes DeleteOptions once for every DELETE, so no handler has to
+            // read the body itself and none can forget to. Upstream does this
+            // in the endpoint handler, before the registry
+            // (endpoints/handlers/delete.go:86).
+            .layer(axum_middleware::from_fn(
+                middleware::delete_options_middleware,
+            ))
             // Runs after normalize_content_type (added below) so the body is
             // always JSON here: synthesise metadata.name from generateName for
             // every create handler in one place (#1052).
@@ -2526,6 +2545,13 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             // Rejects creating content in a Terminating namespace (#1846).
             .layer(axum_middleware::from_fn(
                 middleware::namespace_lifecycle_middleware,
+            ))
+            // Decodes DeleteOptions once for every DELETE, so no handler has to
+            // read the body itself and none can forget to. Upstream does this
+            // in the endpoint handler, before the registry
+            // (endpoints/handlers/delete.go:86).
+            .layer(axum_middleware::from_fn(
+                middleware::delete_options_middleware,
             ))
             // Runs after normalize_content_type (added below) so the body is
             // always JSON here: synthesise metadata.name from generateName for

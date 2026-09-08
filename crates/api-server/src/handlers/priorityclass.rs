@@ -228,6 +228,7 @@ pub async fn update(
 pub async fn delete(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<PriorityClass>> {
@@ -267,6 +268,7 @@ pub async fn delete(
         &state.storage,
         &key,
         &priority_class,
+        &delete_opts,
     )
     .await?;
 
@@ -377,6 +379,7 @@ pub async fn patch(
 pub async fn deletecollection_priorityclasses(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode> {
     info!("DeleteCollection priorityclasses with params: {:?}", params);
@@ -412,15 +415,19 @@ pub async fn deletecollection_priorityclasses(
         let key = build_key("priorityclasses", None, &item.metadata.name);
 
         // Handle deletion with finalizers
-        let deleted_immediately =
-            match crate::handlers::finalizers::delete_collection_item(&state.storage, &key, &item)
-                .await?
-            {
-                Some(deleted) => deleted,
-                // Already gone — a concurrent deleter won the race; upstream
-                // DeleteCollection ignores NotFound rather than failing the request.
-                None => continue,
-            };
+        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
+            &state.storage,
+            &key,
+            &item,
+            &delete_opts,
+        )
+        .await?
+        {
+            Some(deleted) => deleted,
+            // Already gone — a concurrent deleter won the race; upstream
+            // DeleteCollection ignores NotFound rather than failing the request.
+            None => continue,
+        };
 
         if deleted_immediately {
             deleted_count += 1;

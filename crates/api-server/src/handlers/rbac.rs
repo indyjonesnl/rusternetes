@@ -409,6 +409,7 @@ pub async fn update_role(
 pub async fn delete_role(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Role>> {
@@ -457,9 +458,13 @@ pub async fn delete_role(
     }
 
     // Handle deletion with finalizers
-    let deleted_immediately =
-        !crate::handlers::finalizers::handle_delete_with_finalizers(&state.storage, &key, &role)
-            .await?;
+    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
+        &state.storage,
+        &key,
+        &role,
+        &delete_opts,
+    )
+    .await?;
 
     if deleted_immediately {
         Ok(Json(role))
@@ -747,6 +752,7 @@ pub async fn update_rolebinding(
 pub async fn delete_rolebinding(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<RoleBinding>> {
@@ -799,6 +805,7 @@ pub async fn delete_rolebinding(
         &state.storage,
         &key,
         &rolebinding,
+        &delete_opts,
     )
     .await?;
 
@@ -1046,6 +1053,7 @@ pub async fn update_clusterrole(
 pub async fn delete_clusterrole(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ClusterRole>> {
@@ -1097,6 +1105,7 @@ pub async fn delete_clusterrole(
         &state.storage,
         &key,
         &clusterrole,
+        &delete_opts,
     )
     .await?;
 
@@ -1353,6 +1362,7 @@ pub async fn update_clusterrolebinding(
 pub async fn delete_clusterrolebinding(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ClusterRoleBinding>> {
@@ -1404,6 +1414,7 @@ pub async fn delete_clusterrolebinding(
         &state.storage,
         &key,
         &clusterrolebinding,
+        &delete_opts,
     )
     .await?;
 
@@ -1465,6 +1476,7 @@ pub async fn list_clusterrolebindings(
 pub async fn deletecollection_roles(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<StatusCode> {
@@ -1521,15 +1533,19 @@ pub async fn deletecollection_roles(
         .await?;
 
         // Handle deletion with finalizers
-        let deleted_immediately =
-            match crate::handlers::finalizers::delete_collection_item(&state.storage, &key, &role)
-                .await?
-            {
-                Some(deleted) => deleted,
-                // Already gone — a concurrent deleter won the race; upstream
-                // DeleteCollection ignores NotFound rather than failing the request.
-                None => continue,
-            };
+        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
+            &state.storage,
+            &key,
+            &role,
+            &delete_opts,
+        )
+        .await?
+        {
+            Some(deleted) => deleted,
+            // Already gone — a concurrent deleter won the race; upstream
+            // DeleteCollection ignores NotFound rather than failing the request.
+            None => continue,
+        };
 
         if deleted_immediately {
             deleted_count += 1;
@@ -1546,6 +1562,7 @@ pub async fn deletecollection_roles(
 pub async fn deletecollection_rolebindings(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<StatusCode> {
@@ -1606,6 +1623,7 @@ pub async fn deletecollection_rolebindings(
             &state.storage,
             &key,
             &rolebinding,
+            &delete_opts,
         )
         .await?
         {
@@ -1630,6 +1648,7 @@ pub async fn deletecollection_rolebindings(
 pub async fn deletecollection_clusterroles(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<StatusCode> {
     info!("DeleteCollection clusterroles with params: {:?}", params);
@@ -1685,6 +1704,7 @@ pub async fn deletecollection_clusterroles(
             &state.storage,
             &key,
             &clusterrole,
+            &delete_opts,
         )
         .await?
         {
@@ -1709,6 +1729,7 @@ pub async fn deletecollection_clusterroles(
 pub async fn deletecollection_clusterrolebindings(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<StatusCode> {
     info!(
@@ -1771,6 +1792,7 @@ pub async fn deletecollection_clusterrolebindings(
             &state.storage,
             &key,
             &clusterrolebinding,
+            &delete_opts,
         )
         .await?
         {
