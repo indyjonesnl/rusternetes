@@ -180,6 +180,7 @@ pub async fn update_servicecidr(
 pub async fn delete_servicecidr(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ServiceCIDR>> {
@@ -214,6 +215,7 @@ pub async fn delete_servicecidr(
         &state.storage,
         &key,
         &servicecidr,
+        &delete_opts,
     )
     .await?;
 
@@ -276,6 +278,7 @@ crate::patch_handler_cluster!(
 pub async fn deletecollection_servicecidrs(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode> {
     info!("DeleteCollection servicecidrs with params: {:?}", params);
@@ -311,15 +314,19 @@ pub async fn deletecollection_servicecidrs(
         let key = build_key("servicecidrs", None, &item.metadata.name);
 
         // Handle deletion with finalizers
-        let deleted_immediately =
-            match crate::handlers::finalizers::delete_collection_item(&state.storage, &key, &item)
-                .await?
-            {
-                Some(deleted) => deleted,
-                // Already gone — a concurrent deleter won the race; upstream
-                // DeleteCollection ignores NotFound rather than failing the request.
-                None => continue,
-            };
+        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
+            &state.storage,
+            &key,
+            &item,
+            &delete_opts,
+        )
+        .await?
+        {
+            Some(deleted) => deleted,
+            // Already gone — a concurrent deleter won the race; upstream
+            // DeleteCollection ignores NotFound rather than failing the request.
+            None => continue,
+        };
 
         if deleted_immediately {
             deleted_count += 1;

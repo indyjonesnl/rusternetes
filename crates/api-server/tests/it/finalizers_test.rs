@@ -68,7 +68,7 @@ async fn test_delete_resource_with_empty_finalizers_list() {
     storage.create(key, &pod).await.unwrap();
 
     // Delete should remove immediately (empty finalizers = no finalizers)
-    let deleted = handle_delete_with_finalizers(&storage, key, &pod)
+    let deleted = handle_delete_with_finalizers(&storage, key, &pod, &Default::default())
         .await
         .unwrap();
 
@@ -101,7 +101,7 @@ async fn test_delete_resource_with_multiple_finalizers() {
     storage.create(key, &pod).await.unwrap();
 
     // First delete should mark for deletion
-    let marked = handle_delete_with_finalizers(&storage, key, &pod)
+    let marked = handle_delete_with_finalizers(&storage, key, &pod, &Default::default())
         .await
         .unwrap();
 
@@ -136,7 +136,7 @@ async fn test_delete_already_marked_logs_correctly() {
     let before: Pod = storage.get(key).await.unwrap();
 
     // Delete should return true but not modify resource
-    let marked = handle_delete_with_finalizers(&storage, key, &pod)
+    let marked = handle_delete_with_finalizers(&storage, key, &pod, &Default::default())
         .await
         .unwrap();
 
@@ -171,7 +171,7 @@ async fn test_delete_finalizer_workflow_complete() {
     storage.create(key, &pod).await.unwrap();
 
     // Step 2: First delete marks for deletion
-    let marked = handle_delete_with_finalizers(&storage, key, &pod)
+    let marked = handle_delete_with_finalizers(&storage, key, &pod, &Default::default())
         .await
         .unwrap();
     assert!(marked);
@@ -182,7 +182,7 @@ async fn test_delete_finalizer_workflow_complete() {
     storage.update(key, &updated_pod).await.unwrap();
 
     // Step 4: Another delete still returns marked (still has finalizer)
-    let marked = handle_delete_with_finalizers(&storage, key, &updated_pod)
+    let marked = handle_delete_with_finalizers(&storage, key, &updated_pod, &Default::default())
         .await
         .unwrap();
     assert!(marked);
@@ -193,7 +193,7 @@ async fn test_delete_finalizer_workflow_complete() {
     storage.update(key, &updated_pod).await.unwrap();
 
     // Step 6: Final delete removes the resource
-    let deleted = handle_delete_with_finalizers(&storage, key, &updated_pod)
+    let deleted = handle_delete_with_finalizers(&storage, key, &updated_pod, &Default::default())
         .await
         .unwrap();
     assert!(!deleted, "Resource should be deleted");
@@ -258,9 +258,10 @@ async fn test_delete_with_finalizer_race_condition() {
     storage.create(key, &pod).await.unwrap();
 
     // Simulate race condition: multiple delete calls
-    let result1 = handle_delete_with_finalizers(&storage, key, &pod).await;
+    let result1 = handle_delete_with_finalizers(&storage, key, &pod, &Default::default()).await;
     let updated_pod: Pod = storage.get(key).await.unwrap();
-    let result2 = handle_delete_with_finalizers(&storage, key, &updated_pod).await;
+    let result2 =
+        handle_delete_with_finalizers(&storage, key, &updated_pod, &Default::default()).await;
 
     // Both should succeed
     assert!(result1.is_ok());
@@ -292,7 +293,7 @@ async fn test_delete_without_finalizers_multiple_times() {
     storage.create(key, &pod).await.unwrap();
 
     // First delete should succeed and remove resource
-    let deleted = handle_delete_with_finalizers(&storage, key, &pod)
+    let deleted = handle_delete_with_finalizers(&storage, key, &pod, &Default::default())
         .await
         .unwrap();
     assert!(!deleted);
@@ -302,6 +303,6 @@ async fn test_delete_without_finalizers_multiple_times() {
     assert!(result.is_err());
 
     // Second delete should fail (resource not found)
-    let result2 = handle_delete_with_finalizers(&storage, key, &pod).await;
+    let result2 = handle_delete_with_finalizers(&storage, key, &pod, &Default::default()).await;
     assert!(result2.is_err());
 }

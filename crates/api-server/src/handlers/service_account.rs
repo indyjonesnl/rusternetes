@@ -227,6 +227,7 @@ pub async fn update(
 pub async fn delete_service_account(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ServiceAccount>> {
@@ -278,9 +279,13 @@ pub async fn delete_service_account(
         return Ok(Json(sa));
     }
 
-    let has_finalizers =
-        crate::handlers::finalizers::handle_delete_with_finalizers(&*state.storage, &key, &sa)
-            .await?;
+    let has_finalizers = crate::handlers::finalizers::handle_delete_with_finalizers(
+        &*state.storage,
+        &key,
+        &sa,
+        &delete_opts,
+    )
+    .await?;
 
     if has_finalizers {
         // Resource has finalizers, re-read to get updated version with deletionTimestamp
@@ -426,6 +431,7 @@ crate::patch_handler_namespaced!(patch, ServiceAccount, "serviceaccounts", "");
 pub async fn deletecollection_serviceaccounts(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode> {
@@ -482,15 +488,19 @@ pub async fn deletecollection_serviceaccounts(
         .await?;
 
         // Handle deletion with finalizers
-        let deleted_immediately =
-            match crate::handlers::finalizers::delete_collection_item(&state.storage, &key, &item)
-                .await?
-            {
-                Some(deleted) => deleted,
-                // Already gone — a concurrent deleter won the race; upstream
-                // DeleteCollection ignores NotFound rather than failing the request.
-                None => continue,
-            };
+        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
+            &state.storage,
+            &key,
+            &item,
+            &delete_opts,
+        )
+        .await?
+        {
+            Some(deleted) => deleted,
+            // Already gone — a concurrent deleter won the race; upstream
+            // DeleteCollection ignores NotFound rather than failing the request.
+            None => continue,
+        };
 
         if deleted_immediately {
             deleted_count += 1;

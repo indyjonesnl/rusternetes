@@ -255,6 +255,7 @@ pub async fn update_validating_webhook(
 pub async fn delete_validating_webhook(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ValidatingWebhookConfiguration>> {
@@ -289,6 +290,7 @@ pub async fn delete_validating_webhook(
         &state.storage,
         &key,
         &resource,
+        &delete_opts,
     )
     .await?;
 
@@ -580,6 +582,7 @@ pub async fn update_mutating_webhook(
 pub async fn delete_mutating_webhook(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<MutatingWebhookConfiguration>> {
@@ -614,6 +617,7 @@ pub async fn delete_mutating_webhook(
         &state.storage,
         &key,
         &resource,
+        &delete_opts,
     )
     .await?;
 
@@ -686,6 +690,7 @@ crate::patch_handler_cluster!(
 pub async fn deletecollection_validatingwebhookconfigurations(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode> {
     info!(
@@ -731,15 +736,19 @@ pub async fn deletecollection_validatingwebhookconfigurations(
         let key = build_key("validatingwebhookconfigurations", None, &item.metadata.name);
 
         // Handle deletion with finalizers
-        let deleted_immediately =
-            match crate::handlers::finalizers::delete_collection_item(&state.storage, &key, &item)
-                .await?
-            {
-                Some(deleted) => deleted,
-                // Already gone — a concurrent deleter won the race; upstream
-                // DeleteCollection ignores NotFound rather than failing the request.
-                None => continue,
-            };
+        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
+            &state.storage,
+            &key,
+            &item,
+            &delete_opts,
+        )
+        .await?
+        {
+            Some(deleted) => deleted,
+            // Already gone — a concurrent deleter won the race; upstream
+            // DeleteCollection ignores NotFound rather than failing the request.
+            None => continue,
+        };
 
         if deleted_immediately {
             deleted_count += 1;
@@ -756,6 +765,7 @@ pub async fn deletecollection_validatingwebhookconfigurations(
 pub async fn deletecollection_mutatingwebhookconfigurations(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode> {
     info!(
@@ -801,15 +811,19 @@ pub async fn deletecollection_mutatingwebhookconfigurations(
         let key = build_key("mutatingwebhookconfigurations", None, &item.metadata.name);
 
         // Handle deletion with finalizers
-        let deleted_immediately =
-            match crate::handlers::finalizers::delete_collection_item(&state.storage, &key, &item)
-                .await?
-            {
-                Some(deleted) => deleted,
-                // Already gone — a concurrent deleter won the race; upstream
-                // DeleteCollection ignores NotFound rather than failing the request.
-                None => continue,
-            };
+        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
+            &state.storage,
+            &key,
+            &item,
+            &delete_opts,
+        )
+        .await?
+        {
+            Some(deleted) => deleted,
+            // Already gone — a concurrent deleter won the race; upstream
+            // DeleteCollection ignores NotFound rather than failing the request.
+            None => continue,
+        };
 
         if deleted_immediately {
             deleted_count += 1;

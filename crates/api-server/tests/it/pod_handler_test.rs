@@ -190,7 +190,10 @@ async fn test_pod_delete_with_finalizers() {
 
     // Attempt to delete - should mark for deletion but not remove
     let marked = rusternetes_api_server::handlers::finalizers::handle_delete_with_finalizers(
-        &storage, &key, &pod,
+        &storage,
+        &key,
+        &pod,
+        &Default::default(),
     )
     .await
     .unwrap();

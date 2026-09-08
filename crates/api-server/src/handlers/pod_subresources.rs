@@ -897,18 +897,20 @@ pub async fn create_eviction(
     }
 
     // Parse deleteOptions (UID precondition, dryRun) from the body.
-    let delete_opts = eviction.get("deleteOptions");
-    let precond_uid = delete_opts
+    // The eviction request body's own DeleteOptions -- distinct from the
+    // request-level `delete_opts` decoded by the middleware.
+    let eviction_delete_opts = eviction.get("deleteOptions");
+    let precond_uid = eviction_delete_opts
         .and_then(|o| o.get("preconditions"))
         .and_then(|p| p.get("uid"))
         .and_then(|u| u.as_str())
         .map(|s| s.to_string());
-    let dry_run_all = delete_opts
+    let dry_run_all = eviction_delete_opts
         .and_then(|o| o.get("dryRun"))
         .and_then(|d| d.as_array())
         .map(|arr| arr.iter().any(|v| v.as_str() == Some("All")))
         .unwrap_or(false);
-    let grace_period_seconds = delete_opts
+    let grace_period_seconds = eviction_delete_opts
         .and_then(|opts| opts.get("gracePeriodSeconds"))
         .and_then(|gp| gp.as_i64());
 
@@ -1069,6 +1071,13 @@ pub async fn create_eviction(
             state.storage.as_ref(),
             &pod_key,
             &fresh_pod,
+            // An eviction is a POST, so the DELETE middleware did not run.
+            // Upstream reads the DeleteOptions out of the Eviction object's own
+            // `deleteOptions` field (registry/core/pod/storage/eviction.go).
+            &rusternetes_middleware::parse_delete_options(
+                &std::collections::HashMap::new(),
+                eviction_delete_opts,
+            ),
         )
         .await?;
     }

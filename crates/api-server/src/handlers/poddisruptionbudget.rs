@@ -173,6 +173,7 @@ pub async fn update(
 pub async fn delete(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<PodDisruptionBudget>> {
@@ -209,9 +210,13 @@ pub async fn delete(
     }
 
     // Handle deletion with finalizers
-    let deleted_immediately =
-        !crate::handlers::finalizers::handle_delete_with_finalizers(&state.storage, &key, &pdb)
-            .await?;
+    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
+        &state.storage,
+        &key,
+        &pdb,
+        &delete_opts,
+    )
+    .await?;
 
     if deleted_immediately {
         Ok(Json(pdb))
@@ -435,6 +440,7 @@ crate::patch_handler_namespaced!(patch, PodDisruptionBudget, "poddisruptionbudge
 pub async fn deletecollection_poddisruptionbudgets(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode> {
@@ -479,15 +485,19 @@ pub async fn deletecollection_poddisruptionbudgets(
         );
 
         // Handle deletion with finalizers
-        let deleted_immediately =
-            match crate::handlers::finalizers::delete_collection_item(&state.storage, &key, &item)
-                .await?
-            {
-                Some(deleted) => deleted,
-                // Already gone — a concurrent deleter won the race; upstream
-                // DeleteCollection ignores NotFound rather than failing the request.
-                None => continue,
-            };
+        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
+            &state.storage,
+            &key,
+            &item,
+            &delete_opts,
+        )
+        .await?
+        {
+            Some(deleted) => deleted,
+            // Already gone — a concurrent deleter won the race; upstream
+            // DeleteCollection ignores NotFound rather than failing the request.
+            None => continue,
+        };
 
         if deleted_immediately {
             deleted_count += 1;

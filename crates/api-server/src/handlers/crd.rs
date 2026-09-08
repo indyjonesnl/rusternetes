@@ -624,6 +624,7 @@ pub async fn update_crd(
 pub async fn delete_crd(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<CustomResourceDefinition>> {
@@ -656,9 +657,13 @@ pub async fn delete_crd(
     // handles cleanup of custom resources after deletionTimestamp is set.
 
     // Handle deletion with finalizers
-    let deleted_immediately =
-        !crate::handlers::finalizers::handle_delete_with_finalizers(&state.storage, &key, &crd)
-            .await?;
+    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
+        &state.storage,
+        &key,
+        &crd,
+        &delete_opts,
+    )
+    .await?;
 
     if deleted_immediately {
         info!("CRD deleted: {}", name);
@@ -1020,6 +1025,7 @@ fn enrich_updated_crd(
 pub async fn deletecollection_customresourcedefinitions(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode> {
     info!(
@@ -1065,15 +1071,19 @@ pub async fn deletecollection_customresourcedefinitions(
         let key = build_key("customresourcedefinitions", None, &item.metadata.name);
 
         // Handle deletion with finalizers
-        let deleted_immediately =
-            match crate::handlers::finalizers::delete_collection_item(&state.storage, &key, &item)
-                .await?
-            {
-                Some(deleted) => deleted,
-                // Already gone — a concurrent deleter won the race; upstream
-                // DeleteCollection ignores NotFound rather than failing the request.
-                None => continue,
-            };
+        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
+            &state.storage,
+            &key,
+            &item,
+            &delete_opts,
+        )
+        .await?
+        {
+            Some(deleted) => deleted,
+            // Already gone — a concurrent deleter won the race; upstream
+            // DeleteCollection ignores NotFound rather than failing the request.
+            None => continue,
+        };
 
         if deleted_immediately {
             deleted_count += 1;

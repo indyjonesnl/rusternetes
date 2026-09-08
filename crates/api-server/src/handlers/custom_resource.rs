@@ -463,9 +463,18 @@ pub async fn list_custom_resources(
 /// selectors -> delete each match by name (the storage key is
 /// version-independent). Honours finalizers per item like the built-in
 /// `deletecollection_*` handlers.
+// Called directly by the CRD fallback rather than routed, so the request parts
+// arrive as plain arguments instead of extractors -- adding the decoded
+// DeleteOptions takes it to eight. Grouping them into a struct would only move
+// the same fields behind one name at the single call site.
+#[allow(clippy::too_many_arguments)]
 pub async fn deletecollection_custom_resources(
     state: Arc<ApiServerState>,
     auth_ctx: AuthContext,
+    // Not an axum handler: the CRD fallback calls this directly, so the
+    // decoded DeleteOptions arrive as a plain argument rather than an
+    // `Extension` extractor.
+    delete_opts: rusternetes_middleware::DeleteOptionsCtx,
     group: String,
     version: String,
     plural: String,
@@ -537,9 +546,13 @@ pub async fn deletecollection_custom_resources(
         } else {
             build_key(&resource_type, None, &cr.metadata.name)
         };
-        let has_finalizers =
-            crate::handlers::finalizers::handle_delete_with_finalizers(&*state.storage, &key, cr)
-                .await?;
+        let has_finalizers = crate::handlers::finalizers::handle_delete_with_finalizers(
+            &*state.storage,
+            &key,
+            cr,
+            &delete_opts,
+        )
+        .await?;
         if !has_finalizers {
             deleted_count += 1;
         }
@@ -1314,6 +1327,7 @@ pub async fn patch_custom_resource_status(
 pub async fn delete_custom_resource(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((group, version, plural, namespace, name)): Path<(
         String,
         String,
@@ -1418,9 +1432,13 @@ pub async fn delete_custom_resource(
         return Ok(Json(cr));
     }
 
-    let has_finalizers =
-        crate::handlers::finalizers::handle_delete_with_finalizers(&*state.storage, &key, &cr)
-            .await?;
+    let has_finalizers = crate::handlers::finalizers::handle_delete_with_finalizers(
+        &*state.storage,
+        &key,
+        &cr,
+        &delete_opts,
+    )
+    .await?;
 
     if has_finalizers {
         // Resource has finalizers, re-read to get updated version with deletionTimestamp
