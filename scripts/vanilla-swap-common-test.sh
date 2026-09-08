@@ -874,5 +874,70 @@ got="$(run_repair 1)"
   && ok "vs_repair_stuck_addon_pods: stops as soon as the repair works (1 attempt)" \
   || bad "expected a single successful repair, got '$got' (want '2|1')"
 
+# --- vs_restart_kube_proxy: delete pods, do not strand the cluster --------
+# The gate's repair used `crictl stop`, which leaves the Pod object behind.
+# While #1890 is open the kubelet does not restart it, so the repair left the
+# cluster with NO kube-proxy and every 10.96.0.1 rule gone -- strictly worse
+# than doing nothing. It must delete the pod so the DaemonSet recreates it.
+KP="$TMP/kp"; mkdir -p "$KP"
+cat >"$KP/kubectl" <<'STUB'
+#!/usr/bin/env bash
+args="$*"
+case "$args" in
+  *"get pods"*) [ "${KP_HAS_PODS:-1}" = "1" ] && printf 'kube-proxy-aaa
+kube-proxy-bbb
+' ;;
+  *delete*) prev=""; for a in "$@"; do [ "$prev" = "pod" ] && { echo "$a" >>"$KP_DELETED"; break; }; prev="$a"; done ;;
+esac
+exit 0
+STUB
+chmod +x "$KP/kubectl"
+# `kind`/`docker` stubs record any fallback container bounce.
+cat >"$KP/kind" <<'STUB'
+#!/usr/bin/env bash
+echo node-a
+STUB
+cat >"$KP/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "CRICTL-BOUNCE $*" >>"$KP_BOUNCED"
+exit 0
+STUB
+chmod +x "$KP/kind" "$KP/docker"
+
+touch "$TMP/kc"   # a "usable kubeconfig"
+
+: >"$TMP/kp-deleted"; : >"$TMP/kp-bounced"
+out=$(KP_DELETED="$TMP/kp-deleted" KP_BOUNCED="$TMP/kp-bounced" KP_HAS_PODS=1 \
+  PATH="$KP:$PATH" bash -c 'source '"$SCRIPT_DIR"'/vanilla-swap-common.sh
+vs_restart_kube_proxy some-cluster "'"$TMP"'/kc"' 2>&1)
+got="$(tr '\n' ' ' <"$TMP/kp-deleted" | sed 's/ $//')"
+[ "$got" = "kube-proxy-aaa kube-proxy-bbb" ] \
+  && ok "vs_restart_kube_proxy: deletes every kube-proxy pod" \
+  || bad "expected both pods deleted, got '$got'"
+[ ! -s "$TMP/kp-bounced" ] \
+  && ok "vs_restart_kube_proxy: does NOT crictl-stop when pods were deleted" \
+  || bad "must not fall back to a container bounce; got '$(cat "$TMP/kp-bounced")'"
+grep -q "deleted 2 kube-proxy pod" <<<"$out" \
+  && ok "vs_restart_kube_proxy: reports what it did" \
+  || bad "expected a 'deleted N kube-proxy pod(s)' log, got '$out'"
+
+# No pods to delete -> fall back, so callers are no worse off than before.
+: >"$TMP/kp-deleted"; : >"$TMP/kp-bounced"
+KP_DELETED="$TMP/kp-deleted" KP_BOUNCED="$TMP/kp-bounced" KP_HAS_PODS=0 \
+  PATH="$KP:$PATH" bash -c 'source '"$SCRIPT_DIR"'/vanilla-swap-common.sh
+vs_restart_kube_proxy some-cluster "'"$TMP"'/kc"' >/dev/null 2>&1
+[ -s "$TMP/kp-bounced" ] \
+  && ok "vs_restart_kube_proxy: falls back to the container bounce with no pods" \
+  || bad "with no pods it should still attempt the old bounce"
+
+# No kubeconfig at all -> straight to the fallback (callers that cannot supply one).
+: >"$TMP/kp-bounced"
+KP_BOUNCED="$TMP/kp-bounced" PATH="$KP:$PATH" \
+  bash -c 'source '"$SCRIPT_DIR"'/vanilla-swap-common.sh
+unset VS_RESTORE_KC; vs_restart_kube_proxy some-cluster' >/dev/null 2>&1
+[ -s "$TMP/kp-bounced" ] \
+  && ok "vs_restart_kube_proxy: no kubeconfig -> container bounce (unchanged behaviour)" \
+  || bad "without a kubeconfig the old path must still run"
+
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }

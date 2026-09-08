@@ -352,6 +352,10 @@ if [ "$MODULE" = "api-server" ] && [ -f "$APISERVER_RESTORE" ]; then
   # ONLY the api-server leg gates here. For the kube-proxy leg an unroutable
   # ClusterIP IS the module failing, and must stay reported as such.
   export VS_CLUSTER="$CLUSTER"
+  # The gate's repair replaces kube-proxy PODS (not containers) so the
+  # DaemonSet recreates them — a stopped container is not restarted while
+  # #1890 is open, which left the cluster with no kube-proxy at all.
+  export VS_RESTORE_KC="$RESTORE_KC"
   probe_node="$(kind get nodes --name "$CLUSTER" 2>/dev/null | grep -v 'control-plane' | head -1)"
   [ -n "$probe_node" ] || probe_node="$(vs_control_plane_node "$CLUSTER")"
   read -r svc_ip svc_port <<<"$(vs_kubernetes_clusterip "$RESTORE_KC")"

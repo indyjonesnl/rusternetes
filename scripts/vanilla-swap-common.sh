@@ -710,13 +710,41 @@ vs_dial_cluster_ip() {
   docker exec "$node" bash -c "exec 3<>/dev/tcp/${ip}/${port}" >/dev/null 2>&1
 }
 
-# vs_restart_kube_proxy <cluster>
-# Bounce every kube-proxy container so it re-syncs iptables from the current
-# EndpointSlices. Same remedy, and same crictl mechanism, as the KCM bounce in
-# the driver's post-restore block. Best-effort throughout: this runs on a
-# cluster that is by definition unhealthy.
+# vs_restart_kube_proxy <cluster> [kubeconfig]
+# Replace every kube-proxy POD so a FRESH kube-proxy re-LISTs Services and
+# EndpointSlices and reprograms iptables. Best-effort throughout: this runs on
+# a cluster that is by definition unhealthy.
+#
+# Deleting the pod, not `crictl stop`-ing the container, is deliberate. Stopping
+# the container leaves the Pod object in place, and while #1890 is open the
+# kubelet will not restart it — measured on a reproduced run, the gate's own
+# repair left kube-proxy GONE (`crictl ps --name kube-proxy` empty, every
+# 10.96.0.1 rule removed) and the gate then failed with nothing running at all.
+# The remedy was strictly worse than doing nothing. Deleting the pod hands the
+# DaemonSet controller the job, and its replacement does start.
+#
+# A fresh pod is also what actually fixes the symptom: kube-proxy that started
+# before the `kubernetes` endpoints existed caches "no endpoints" and writes a
+# REJECT rule; it is the new process's initial LIST that picks the endpoints up.
+# Restarting the container in place would do that too -- if it came back.
+#
+# Falls back to the old crictl bounce when no usable kubeconfig is available,
+# so callers that cannot supply one are no worse off than before.
 vs_restart_kube_proxy() {
-  local cluster="$1" node cid
+  local cluster="$1" kubeconfig="${2:-${VS_RESTORE_KC:-}}" node cid deleted=0
+  if [ -n "$kubeconfig" ] && [ -f "$kubeconfig" ]; then
+    while read -r pod; do
+      [ -n "$pod" ] || continue
+      KUBECONFIG="$kubeconfig" kubectl -n kube-system delete pod "$pod" \
+        --wait=false >/dev/null 2>&1 && deleted=$((deleted + 1))
+    done < <(KUBECONFIG="$kubeconfig" kubectl -n kube-system get pods \
+        -l k8s-app=kube-proxy -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+    if [ "$deleted" -gt 0 ]; then
+      vs_log "deleted $deleted kube-proxy pod(s) so the DaemonSet recreates them"
+      return 0
+    fi
+    vs_warn "no kube-proxy pods to delete — falling back to a container bounce"
+  fi
   for node in $(kind get nodes --name "$cluster" 2>/dev/null); do
     cid="$(docker exec "$node" crictl ps --name kube-proxy -q 2>/dev/null | head -1)"
     [ -n "$cid" ] && docker exec "$node" crictl stop "$cid" >/dev/null 2>&1
