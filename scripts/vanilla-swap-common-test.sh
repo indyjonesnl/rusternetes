@@ -707,9 +707,13 @@ VS_TEST_DIAL_FAILS=9999 VS_DIAL_CMD="$DIAL_STUB" VS_REPAIR_CMD=/bin/true \
   && bad "vs_wait_dial must fail when the ClusterIP never answers" \
   || ok "vs_wait_dial: never reachable => non-zero"
 
-# the repair hook fires exactly once, halfway through the budget -- a wedged
-# kube-proxy re-syncs its iptables on restart, which is what turns the coin
-# flip into a pass rather than just a better error message.
+# the repair hook fires exactly once, a THIRD of the way through the budget --
+# replacing kube-proxy re-syncs iptables, which is what turns the coin flip
+# into a pass rather than just a better error message. The repair must land
+# early enough that the remaining budget can actually observe it working:
+# firing at halfway left only 90s of a 180s budget, and the DaemonSet needed
+# ~50s to get replacements Running plus a few seconds to program the DNAT, so
+# the gate gave up moments before it would have passed.
 printf '0' >"$VS_TEST_DIAL_COUNT"
 REPAIR_LOG="$TMP/repair.log"; : >"$REPAIR_LOG"
 REPAIR_STUB="$TMP/repair-stub.sh"
@@ -721,6 +725,25 @@ repairs="$(wc -l <"$REPAIR_LOG" | tr -d ' ')"
 [ "$repairs" = "1" ] \
   && ok "vs_wait_dial: repair hook fires once on a wedged substrate" \
   || bad "vs_wait_dial should fire the repair hook exactly once (fired $repairs times)"
+
+# The repair must fire in the FIRST third, leaving the rest of the budget to
+# observe it. With a 30s budget and a 1s interval it must have fired by t=10s;
+# asserting on the dial count at fire time pins the timing, not just the count.
+printf '0' >"$VS_TEST_DIAL_COUNT"
+: >"$REPAIR_LOG"
+COUNT_AT_FIRE="$TMP/count-at-fire"; : >"$COUNT_AT_FIRE"
+REPAIR_TIMED="$TMP/repair-timed.sh"
+printf '#!/usr/bin/env bash\necho fired >>"%s"\ncat "%s" >"%s"\n' \
+  "$REPAIR_LOG" "$VS_TEST_DIAL_COUNT" "$COUNT_AT_FIRE" >"$REPAIR_TIMED"
+chmod +x "$REPAIR_TIMED"
+VS_TEST_DIAL_FAILS=9999 VS_DIAL_CMD="$DIAL_STUB" VS_REPAIR_CMD="$REPAIR_TIMED" \
+  vs_wait_dial node 10.96.0.1 443 30 1 >/dev/null 2>&1
+at_fire="$(tr -d ' \n' <"$COUNT_AT_FIRE" 2>/dev/null)"
+if [ -n "$at_fire" ] && [ "$at_fire" -le 12 ] 2>/dev/null; then
+  ok "vs_wait_dial: repair fires in the first third (after $at_fire polls of 30)"
+else
+  bad "repair fired too late to be observable: $at_fire polls of a 30s budget"
+fi
 
 # ...and never when the substrate was fine all along.
 printf '0' >"$VS_TEST_DIAL_COUNT"
@@ -756,6 +779,260 @@ got="$(PATH="$KC_STUB_BIN:$PATH" vs_kubernetes_clusterip /dev/null)"
 [ "$got" = "10.96.0.1 443" ] \
   && ok "vs_kubernetes_clusterip: returns '<ip> <port>'" \
   || bad "vs_kubernetes_clusterip got '$got' (want '10.96.0.1 443')"
+
+# --- vs_recreate_stuck_addon_pods (#1890 repair) --------------------------
+# A kubectl stub that reports the pod table on `get` and records `delete`
+# targets to a file, so the function's selection logic is asserted without a
+# cluster. The jsonpath the function uses is exercised for real by the live
+# run; here we feed the already-rendered rows it would produce.
+RP_BIN="$TMP/rp-bin"; mkdir -p "$RP_BIN"
+mk_kubectl_stub() { # $1 = pod rows (name phase mirror)
+  printf '%s' "$1" >"$TMP/rows"
+  : >"$TMP/deleted"
+  cat >"$RP_BIN/kubectl" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in get) mode=get;; delete) mode=delete;; esac; done
+if [ "${mode:-}" = "get" ]; then cat "$TMP_ROWS"; exit 0; fi
+if [ "${mode:-}" = "delete" ]; then
+  # the pod name is the arg after `pod`
+  prev=""; for a in "$@"; do [ "$prev" = "pod" ] && { echo "$a" >>"$TMP_DELETED"; break; }; prev="$a"; done
+  exit 0
+fi
+exit 0
+STUB
+  chmod +x "$RP_BIN/kubectl"
+}
+
+# Rows: a Running pod, two Pending addon pods, and a Pending MIRROR (static) pod.
+mk_kubectl_stub 'kube-proxy-aaa Running
+kube-proxy-bbb Pending
+coredns-ccc Pending
+kube-apiserver-cp Pending abc123mirror
+'
+got="$(TMP_ROWS="$TMP/rows" TMP_DELETED="$TMP/deleted" PATH="$RP_BIN:$PATH" vs_recreate_stuck_addon_pods /dev/null)"
+[ "$got" = "2" ] \
+  && ok "vs_recreate_stuck_addon_pods: deletes only the non-Running, non-mirror pods (2)" \
+  || bad "vs_recreate_stuck_addon_pods returned '$got' (want 2)"
+
+deleted="$(tr '\n' ' ' <"$TMP/deleted" 2>/dev/null | sed 's/ $//')"
+[ "$deleted" = "kube-proxy-bbb coredns-ccc" ] \
+  && ok "vs_recreate_stuck_addon_pods: targets exactly the stuck addon pods" \
+  || bad "deleted '$deleted' (want 'kube-proxy-bbb coredns-ccc')"
+
+# A Running pod must never be deleted -- that would bounce a healthy addon.
+mk_kubectl_stub 'kube-proxy-aaa Running
+coredns-bbb Running
+'
+got="$(TMP_ROWS="$TMP/rows" TMP_DELETED="$TMP/deleted" PATH="$RP_BIN:$PATH" vs_recreate_stuck_addon_pods /dev/null)"
+[ "$got" = "0" ] && [ ! -s "$TMP/deleted" ] \
+  && ok "vs_recreate_stuck_addon_pods: healthy cluster is a no-op (the post-#1890 state)" \
+  || bad "healthy cluster should delete nothing, got '$got' / '$(cat "$TMP/deleted")'"
+
+# The api-server's own mirror pod must survive even when it is the only entry.
+mk_kubectl_stub 'kube-apiserver-cp Pending deadbeefmirror
+'
+got="$(TMP_ROWS="$TMP/rows" TMP_DELETED="$TMP/deleted" PATH="$RP_BIN:$PATH" vs_recreate_stuck_addon_pods /dev/null)"
+[ "$got" = "0" ] && [ ! -s "$TMP/deleted" ] \
+  && ok "vs_recreate_stuck_addon_pods: never deletes a kubelet mirror pod" \
+  || bad "mirror pod must not be deleted, got '$got' / '$(cat "$TMP/deleted")'"
+
+# Empty input (api-server unreachable) must not error or delete anything.
+mk_kubectl_stub ''
+got="$(TMP_ROWS="$TMP/rows" TMP_DELETED="$TMP/deleted" PATH="$RP_BIN:$PATH" vs_recreate_stuck_addon_pods /dev/null)"
+[ "$got" = "0" ] \
+  && ok "vs_recreate_stuck_addon_pods: no pods listed -> 0, no error" \
+  || bad "empty listing should return 0, got '$got'"
+
+# --- vs_repair_stuck_addon_pods: verify-and-retry ------------------------
+# A one-shot version of this repair shipped twice and was silently a no-op both
+# times while behaving correctly when invoked by hand. So it now verifies the
+# condition it exists for -- a Running kube-proxy, which is what programs the
+# 10.96.0.1 rule the substrate gate needs -- and retries. These pin that.
+RP2="$TMP/rp2"; mkdir -p "$RP2"
+
+# kubectl stub: `get -l k8s-app=kube-proxy` returns Running only once the
+# recorded repair count reaches $RUNNING_AFTER repairs (-1 = never).
+cat >"$RP2/kubectl" <<'STUB'
+#!/usr/bin/env bash
+args="$*"
+repairs=$(cat "$TMP_REPAIRS" 2>/dev/null || echo 0)
+case "$args" in
+  *k8s-app=kube-proxy*)
+    if [ "$RUNNING_AFTER" -ge 0 ] && [ "$repairs" -ge "$RUNNING_AFTER" ]; then
+      echo "kube-proxy-xyz 1/1 Running 0 1m"
+    fi ;;
+  *"get pods"*) echo "kube-proxy-abc 0/1 Pending 0 1m" ;;
+esac
+exit 0
+STUB
+chmod +x "$RP2/kubectl"
+
+run_repair() { # $1=RUNNING_AFTER  -> echoes "<returned>|<repairs fired>"
+  : >"$TMP/repairs0"; echo 0 >"$TMP/repairs0"
+  local out
+  out="$(RUNNING_AFTER="$1" TMP_REPAIRS="$TMP/repairs0" PATH="$RP2:$PATH" \
+    bash -c 'source '"$SCRIPT_DIR"'/vanilla-swap-common.sh
+vs_recreate_stuck_addon_pods() {
+  n=$(cat "'"$TMP"'/repairs0"); echo $((n+1)) >"'"$TMP"'/repairs0"; printf "2\n"
+}
+vs_repair_stuck_addon_pods /dev/null 5 3' 2>/dev/null)"
+  printf '%s|%s\n' "$out" "$(cat "$TMP/repairs0")"
+}
+
+# kube-proxy already Running -> return immediately, repair nothing.
+got="$(run_repair 0)"
+[ "$got" = "0|0" ] \
+  && ok "vs_repair_stuck_addon_pods: Running kube-proxy -> no repair (the post-#1890 state)" \
+  || bad "healthy kube-proxy should be a no-op, got '$got' (want '0|0')"
+
+# Never becomes Running -> repairs on every attempt, bounded by attempts=3.
+got="$(run_repair -1)"
+[ "$got" = "6|3" ] \
+  && ok "vs_repair_stuck_addon_pods: never-Running kube-proxy -> 3 bounded attempts, 6 deleted" \
+  || bad "expected 3 bounded attempts totalling 6, got '$got'"
+
+# Becomes Running after the first repair -> exactly one repair, then stop.
+got="$(run_repair 1)"
+[ "$got" = "2|1" ] \
+  && ok "vs_repair_stuck_addon_pods: stops as soon as the repair works (1 attempt)" \
+  || bad "expected a single successful repair, got '$got' (want '2|1')"
+
+# --- vs_restart_kube_proxy: delete pods, do not strand the cluster --------
+# The gate's repair used `crictl stop`, which leaves the Pod object behind.
+# While #1890 is open the kubelet does not restart it, so the repair left the
+# cluster with NO kube-proxy and every 10.96.0.1 rule gone -- strictly worse
+# than doing nothing. It must delete the pod so the DaemonSet recreates it.
+KP="$TMP/kp"; mkdir -p "$KP"
+cat >"$KP/kubectl" <<'STUB'
+#!/usr/bin/env bash
+args="$*"
+case "$args" in
+  *"get pods"*) [ "${KP_HAS_PODS:-1}" = "1" ] && printf 'kube-proxy-aaa
+kube-proxy-bbb
+' ;;
+  *delete*) prev=""; for a in "$@"; do [ "$prev" = "pod" ] && { echo "$a" >>"$KP_DELETED"; break; }; prev="$a"; done ;;
+esac
+exit 0
+STUB
+chmod +x "$KP/kubectl"
+# `kind`/`docker` stubs record any fallback container bounce.
+cat >"$KP/kind" <<'STUB'
+#!/usr/bin/env bash
+echo node-a
+STUB
+cat >"$KP/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "CRICTL-BOUNCE $*" >>"$KP_BOUNCED"
+exit 0
+STUB
+chmod +x "$KP/kind" "$KP/docker"
+
+touch "$TMP/kc"   # a "usable kubeconfig"
+
+: >"$TMP/kp-deleted"; : >"$TMP/kp-bounced"
+out=$(KP_DELETED="$TMP/kp-deleted" KP_BOUNCED="$TMP/kp-bounced" KP_HAS_PODS=1 \
+  PATH="$KP:$PATH" bash -c 'source '"$SCRIPT_DIR"'/vanilla-swap-common.sh
+vs_restart_kube_proxy some-cluster "'"$TMP"'/kc"' 2>&1)
+got="$(tr '\n' ' ' <"$TMP/kp-deleted" | sed 's/ $//')"
+[ "$got" = "kube-proxy-aaa kube-proxy-bbb" ] \
+  && ok "vs_restart_kube_proxy: deletes every kube-proxy pod" \
+  || bad "expected both pods deleted, got '$got'"
+[ ! -s "$TMP/kp-bounced" ] \
+  && ok "vs_restart_kube_proxy: does NOT crictl-stop when pods were deleted" \
+  || bad "must not fall back to a container bounce; got '$(cat "$TMP/kp-bounced")'"
+grep -q "deleted 2 kube-proxy pod" <<<"$out" \
+  && ok "vs_restart_kube_proxy: reports what it did" \
+  || bad "expected a 'deleted N kube-proxy pod(s)' log, got '$out'"
+
+# No pods to delete -> fall back, so callers are no worse off than before.
+: >"$TMP/kp-deleted"; : >"$TMP/kp-bounced"
+KP_DELETED="$TMP/kp-deleted" KP_BOUNCED="$TMP/kp-bounced" KP_HAS_PODS=0 \
+  PATH="$KP:$PATH" bash -c 'source '"$SCRIPT_DIR"'/vanilla-swap-common.sh
+vs_restart_kube_proxy some-cluster "'"$TMP"'/kc"' >/dev/null 2>&1
+[ -s "$TMP/kp-bounced" ] \
+  && ok "vs_restart_kube_proxy: falls back to the container bounce with no pods" \
+  || bad "with no pods it should still attempt the old bounce"
+
+# No kubeconfig at all -> straight to the fallback (callers that cannot supply one).
+: >"$TMP/kp-bounced"
+KP_BOUNCED="$TMP/kp-bounced" PATH="$KP:$PATH" \
+  bash -c 'source '"$SCRIPT_DIR"'/vanilla-swap-common.sh
+unset VS_RESTORE_KC; vs_restart_kube_proxy some-cluster' >/dev/null 2>&1
+[ -s "$TMP/kp-bounced" ] \
+  && ok "vs_restart_kube_proxy: no kubeconfig -> container bounce (unchanged behaviour)" \
+  || bad "without a kubeconfig the old path must still run"
+
+# --- vs_restart_stalled_kubelets (the #1890 cause) ------------------------
+# A kubelet whose pod reflector stalled with an empty set starts nothing:
+# pods assigned, none Running, no sandboxes, no errors. Restarting it forces a
+# fresh LIST (measured: 0 -> 4/4 Running in 8s). The control-plane node must be
+# skipped -- its kubelet owns the swapped api-server static pod, whose store is
+# in the container's /tmp, so bouncing it would wipe the object store.
+SK="$TMP/sk"; mkdir -p "$SK"
+cat >"$SK/kind" <<'STUB'
+#!/usr/bin/env bash
+printf 'ctrl-cp
+node-w1
+node-w2
+'
+STUB
+cat >"$SK/kubectl" <<'STUB'
+#!/usr/bin/env bash
+node=""; for a in "$@"; do case "$a" in spec.nodeName=*) node="${a#spec.nodeName=}";; esac; done
+# node-w1: 2 assigned, none Running (stalled). node-w2: 1 assigned and Running.
+case "$node" in
+  node-w1) printf 'ns p1 0/1 Pending 0 1m
+ns p2 0/1 Pending 0 1m
+' ;;
+  node-w2) printf 'ns p3 1/1 Running 0 1m
+' ;;
+  ctrl-cp) printf 'ns p4 0/1 Pending 0 1m
+' ;;
+esac
+exit 0
+STUB
+cat >"$SK/docker" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in node-*|ctrl-*) echo "$a" >>"$SK_RESTARTED";; esac; done
+exit 0
+STUB
+chmod +x "$SK/kind" "$SK/kubectl" "$SK/docker"
+
+: >"$TMP/sk-restarted"
+got="$(SK_RESTARTED="$TMP/sk-restarted" PATH="$SK:$PATH" bash -c '
+source '"$SCRIPT_DIR"'/vanilla-swap-common.sh
+vs_control_plane_node() { echo ctrl-cp; }
+vs_restart_stalled_kubelets some-cluster /dev/null' 2>/dev/null | tail -1)"
+restarted="$(sort -u "$TMP/sk-restarted" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+
+[ "$got" = "1" ] \
+  && ok "vs_restart_stalled_kubelets: restarts exactly the stalled worker" \
+  || bad "expected 1 restart, got '$got'"
+[ "$restarted" = "node-w1" ] \
+  && ok "vs_restart_stalled_kubelets: targets node-w1 only (w2 healthy, cp skipped)" \
+  || bad "expected only node-w1 restarted, got '$restarted'"
+grep -q "ctrl-cp" <<<"$restarted" \
+  && bad "the control-plane kubelet must NEVER be restarted (it owns the api-server static pod)" \
+  || ok "vs_restart_stalled_kubelets: never touches the control-plane kubelet"
+
+# --- wiring: VS_CLUSTER must be exported BEFORE the repair uses it --------
+# The repair calls vs_restart_stalled_kubelets "${VS_CLUSTER:-}". When that was
+# exported only just before the substrate gate, the earlier post-restore repair
+# ran `kind get nodes --name ""`, iterated zero nodes, and silently reported 0
+# restarts -- the function was correct and the wiring was not, which a unit test
+# passing an explicit cluster name cannot catch.
+RUN_SH="$SCRIPT_DIR/vanilla-swap-run.sh"
+exp_line="$(grep -n 'export VS_CLUSTER=' "$RUN_SH" | head -1 | cut -d: -f1)"
+use_line="$(grep -n 'vs_restart_stalled_kubelets "\${VS_CLUSTER' "$RUN_SH" | head -1 | cut -d: -f1)"
+if [ -z "$use_line" ]; then
+  # the repair calls it from common.sh, so assert against the repair call site
+  use_line="$(grep -n 'vs_repair_stuck_addon_pods' "$RUN_SH" | head -1 | cut -d: -f1)"
+fi
+if [ -n "$exp_line" ] && [ -n "$use_line" ] && [ "$exp_line" -lt "$use_line" ]; then
+  ok "VS_CLUSTER is exported (line $exp_line) before the repair uses it (line $use_line)"
+else
+  bad "VS_CLUSTER must be exported before the repair call (export=$exp_line use=$use_line)"
+fi
 
 echo "---"
 [ "$fails" -eq 0 ] && { echo "PASS: all registry-parser tests"; exit 0; } || { echo "FAIL: $fails test(s)"; exit 1; }
