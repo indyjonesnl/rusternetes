@@ -296,10 +296,18 @@ gate on this note's actual goal.
 
 ---
 
-## 5. The plan — port the provisioner: `rusternetes cluster create`
+## 5. The plan — `rusternetes cluster create`
 
 **Our own** one-command local cluster of microVMs — real Rusternetes nodes, no
-Talos on the box. The port is small and the design maps almost 1:1.
+Talos on the box.
+
+> **Read §5.4 first if you are implementing this.** The table below is what
+> *Talos* has and was the original plan; since writing it, `~/Projects/vmcompose`
+> turned out to already provide the substrate (CH launch, images, NoCloud seed,
+> bridge/tap, state dir) as our own code. §5.4 is what actually gets built, and
+> it deletes four rows of this table. The table stays because it is the map of
+> where each behaviour lives in Talos, which is still the reference for
+> mechanism.
 
 | Talos (Go) | Rusternetes (Rust) | Notes |
 |---|---|---|
@@ -330,20 +338,41 @@ for the launch config over stdin. Nothing exotic.
    power on/off/reboot without any hypervisor management layer.
 5. **Config over kernel cmdline URL**, served by that same supervisor.
 
-### 5.1 The one genuinely open question: what does the guest boot?
+### 5.1 What does the guest boot? — answered, and already working on this box
 
 Running Talos (§4) would have supplied a guest OS; our own provisioner needs
 one. Three options:
 
 | Option | How | Cost | Fits ROADMAP? |
 |---|---|---|---|
-| **B1. Generic cloud image + inject binaries** | Debian/Alpine cloud image, `cloud-init`/`ignition` NoCloud seed drops in `rusternetes` + a systemd unit + kubeconfig; containerd from the distro | Lowest. Days. Kernel/init are someone else's problem | Neutral — measures *our* RAM but with a distro's baseline |
+| **B1. Generic cloud image + inject binaries** | Debian/Alpine cloud image, a NoCloud seed drops in `rusternetes` + a systemd unit + kubeconfig; containerd from the distro | Lowest. Days. Kernel/init are someone else's problem | Neutral — measures *our* RAM but with a distro's baseline |
 | **B2. Purpose-built minimal image** | Our own kernel + initramfs, `rusternetes` as the only service, read-only squashfs + `/var` overlay | Highest. Weeks | **Yes** — this *is* #33 / #1036's USB image, and the honest idle-RAM number |
 | **B3. Talos guest, swapped images** | see §4 | Days | No — the node isn't ours; rejected |
 
-Recommendation: **B1 first** (it de-risks the whole provisioner and is a real
-dev UX in a week), then **B2** reusing the same provisioner once the image
-work from #1036 lands. B1's image is throwaway; the provisioner is not.
+**B1 first**, then B2 reusing the same provisioner once #1036's image lands.
+B1's image is throwaway; the provisioner is not.
+
+And B1 is not a guess: `vmcompose` (§5.4) already boots Debian 13 cloud images
+under cloud-hypervisor on this machine, with three findings that are not
+obvious and cost real time to discover:
+
+1. **`--firmware`, not `--kernel`.** CH v52's `--kernel` takes "a kernel or
+   firmware that supports a PVH entry point (e.g. vmlinux)" — an uncompressed
+   ELF, which a distro's `bzImage` is not (and `/boot/vmlinuz-*` is `0600 root`
+   here anyway). A distro cloud image boots through its own bootloader behind a
+   firmware image instead, loaded via `--firmware`.
+2. **edk2 `CLOUDHV.fd`, not `rust-hypervisor-firmware`.** `hypervisor-fw` is
+   the obvious choice — smaller, faster, Rust — and it **hangs**: Debian 13's
+   `shim` calls UEFI security-protocol / MOK / TPM-log APIs it does not
+   implement, and unlike older shims treats the failure as fatal rather than
+   skippable. edk2's CloudHV build implements enough to get through shim into
+   GRUB and the kernel.
+3. **`backing_files=on` is mandatory for a qcow2 overlay.** CH ≥ v50 defaults
+   qcow2 backing files *off* (a guest could otherwise point its own qcow2
+   header at an arbitrary host path) and then refuses **any** backing file, not
+   only unsafe ones. Every overlay the tool creates has exactly one backing
+   file — a checksummed base image that is never guest-writable — so enabling
+   it is opening a door only the host tool controls.
 
 ### 5.2 Which VMM — and a note on "QEMU vs KVM"
 
@@ -481,39 +510,113 @@ working (`#[command(subcommand)] cmd: Option<Cmd>` with the all-in-one as the
 
 ---
 
-## 6. Recommended phasing
+### 5.4 Build on `vmcompose`, not on a Talos port
 
-- **Phase 0 (no code):** settle the MPL question (§7) — it decides whether the
-  ported files carry MPL notices or get reimplemented from the specs, and
-  retrofitting that onto a merged crate is far worse than choosing now.
-- **Phase 1:** `rusternetes cluster create` skeleton — state dir, bridge via
-  CNI, dhcpd/dns/LB, disks, per-VM supervisor, **cloud-hypervisor backend**
-  (`--api-socket` for power control), B1 guest image + vfat NoCloud seed.
-  Target: `1 CP + 2 workers` reachable via a generated kubeconfig in under
-  60 s, `rusternetes cluster destroy` leaving nothing behind.
-- **Phase 2:** `--vmm qemu` fallback (microvm, `accel=kvm`) for the UEFI/ISO
-  cases only, then swap in the B2 purpose-built image (#33/#1036) and publish
-  the idle-RAM-per-node number the ROADMAP wants (#35).
+There is already a working cloud-hypervisor microVM orchestrator on this
+machine: **`~/Projects/vmcompose`** (`crates/{vmc,backend,imagestore,netplumb,state,vm-spec,compose-model}`,
+~2.7k LOC, own code, its own test suite). It is Docker-Compose-shaped — one
+microVM per `services.*` entry — but the *substrate* is exactly what §5 needs,
+and it is already debugged against this host.
+
+| what #1878 needs | `vmcompose` crate | state |
+|---|---|---|
+| CH launch args, boot-timeout, force-stop, pid identity | `backend` (`ch/{args,api,mod}.rs`) | done, tested, all three §5.1 findings baked in |
+| base-image fetch + checksum, qcow2 overlay, firmware download | `imagestore` (`fetch.rs`, `disk.rs`, `firmware.rs`) | done |
+| vfat **NoCloud** seed (meta-data / user-data / network-config) | `imagestore/seed.rs` | done — built as typed structs through `serde_yaml`, so quoting/indentation is the serializer's problem, not ours |
+| bridge + tap + NAT/forwarding, with rollback | `netplumb` | done — typed `Cmd` + `Runner` trait, `inverse()` for rollback, nft ruleset on stdin |
+| daemonless state dir + reconcile | `state` | done |
+| per-VM spec type | `vm-spec` | done |
+
+**What that deletes from the §5 plan.** Four of the Talos modules in the table
+above stop being necessary:
+
+- **`dhcpd` + the IPAM-record file** — the NoCloud seed's `network-config`
+  assigns a static address per VM (matched on MAC), so nothing needs to answer
+  DHCP. Talos needs a DHCP server because Talos's own guest asks for DHCP.
+- **`dnsd`** — the seed writes `/etc/hosts` entries directly.
+- **`tc-redirect-tap` + netns + the CNI file mutex** — `netplumb` creates the
+  bridge and taps with `ip` under `sudo`. **This is a deliberate divergence
+  from Talos and from §5's point 2.** The CNI-is-a-hard-contract rule in
+  `CLAUDE.local.md` governs **pod** networking inside the guest; a host-side
+  bridge for VM taps has no CNI obligation, and `tc-redirect-tap` buys plugin
+  interchangeability we would never use here. Revisit only if we want a
+  Calico/Flannel-shaped *host* network, which we do not.
+- **The supervisor's HTTP power API and the QEMU monitor socket** — CH's
+  `--api-socket` is that API (§5.2).
+
+**Privilege model, also better than Talos's.** Talos demands the whole run be
+root (`qemu/preflight.go:43`). `vmcompose` needs passwordless `sudo` for
+exactly four binaries — `ip`, `sysctl`, `nft`, `iptables` — because a
+daemonless CLI has nowhere to prompt for a password during a background
+readiness poll. Copy that: a `sudoers.d` drop-in for four tools, not
+`sudo -E rusternetes`.
+
+**The actual delta to build**, then, is small and Rusternetes-specific:
+
+1. **Cluster shape** — `--controlplanes` / `--workers` instead of compose
+   services: N VMs from one spec, roles, and a deterministic address plan.
+2. **Node provisioning** — the seed drops in the `rusternetes` binary (or its
+   per-component binaries), a systemd unit, containerd, and the CA/kubeconfig
+   the node needs to join. This is the piece with no equivalent in either
+   project.
+3. **Join + readiness** — generate PKI, bootstrap the CP, hand workers a join
+   credential, then `--wait` on `Nodes Ready` rather than on SSH.
+4. **The `cluster` CLI grammar** from §5.3.
+
+**Open question for the user (not for me):** reuse `vmcompose` by *vendoring
+the crates* into `crates/dev-cluster/`, by *depending on it as a path/git
+dependency*, or by *extracting the substrate into its own published crate* that
+both tools use. The third is the cleanest and the most work; the first is the
+fastest and forks the code.
 
 ---
 
-## 7. Licensing constraint (MPL-2.0)
+## 6. Recommended phasing
+
+- **Phase 0 (decision, no code):** pick the `vmcompose` reuse strategy (§5.4) —
+  vendor, depend, or extract. Everything else forks off that choice.
+- **Phase 1:** `rusternetes cluster create` over the `vmcompose` substrate —
+  the §5.3 CLI grammar, cluster shape (1 CP + 2 workers), a node seed that
+  installs the `rusternetes` binary + containerd, PKI generation, and `--wait`
+  on `Nodes Ready`. Target: reachable via a generated kubeconfig in under 60 s,
+  `rusternetes cluster destroy` leaving nothing behind (`netplumb`'s
+  `inverse()` already does the network half).
+- **Phase 2:** swap the B1 distro image for the B2 purpose-built image
+  (#33/#1036) behind the same `--node-image` flag, and publish the
+  idle-RAM-per-node number the ROADMAP wants (#35). Optional `--provisioner
+  qemu` only if a UEFI/ISO case ever needs it.
+
+**What is left of the Talos port after §5.4:** the *architecture* (state dir,
+no daemon, one supervisor per VM, reflect-to-reattach) — which `vmcompose`
+independently arrived at — plus one module we would still want if we ever run
+multiple control planes: `providers/vm/loadbalancer.go`, the TCP proxy on
+`gateway:6443`. For 1 CP that is a single address and not needed.
+
+---
+
+## 7. Licensing constraint (MPL-2.0) — now nearly moot
 
 Talos is **MPL-2.0**; Rusternetes is **Apache-2.0**. MPL is *file-level*
-copyleft: a Rust translation of an MPL file is a derivative of that file, so
-either
+copyleft, so a Rust translation of an MPL file is a derivative of that file.
 
-- **keep the ported files under MPL-2.0** with the original notice (MPL-2.0
-  §3.3 explicitly permits shipping a Larger Work under other terms as long as
-  the MPL-covered files stay MPL) and note it in `NOTICE`, or
-- **reimplement from the specs** — CNI spec, DHCP RFCs, the QEMU/CH command-line
-  contracts — and cite Talos only as prior art in prose.
+**§5.4 removes almost all of the exposure.** The substrate now comes from
+`vmcompose` (own code, no third-party copyleft) rather than from a translation
+of `pkg/provision/`. What remains is:
 
-For the *architecture* (state dir, supervisor-per-VM, CNI-for-tap) there is no
-issue at all: ideas are not covered. Decide this **before** writing
-`crates/dev-cluster`, not after. (Merely *running* the `talosctl` binary, as in
-the rejected §4, would raise no licensing question at all — but we are not
-doing that.)
+- **Architecture and mechanism** — state dir, no daemon, supervisor-per-VM,
+  reflect-to-reattach, config-over-seed. Ideas are not covered by copyright,
+  and `vmcompose` reached the same shape independently. **No issue.**
+- **One module we might still port** — `providers/vm/loadbalancer.go` (TCP
+  proxy on `gateway:6443`), and only for multi-control-plane. If we write it,
+  either keep that file MPL-2.0 with its notice (MPL-2.0 §3.3 explicitly
+  permits distributing a Larger Work under other terms provided the
+  MPL-covered files stay MPL) and record it in `NOTICE`, or write a plain
+  `tokio` TCP proxy from scratch — which is a genuinely small job and the
+  obvious choice for something this simple.
+
+So: **do not port files.** Cite Talos as prior art in prose, take the
+mechanism, and write the code. That is the position regardless of which
+`vmcompose` reuse strategy Phase 0 picks.
 
 ---
 
