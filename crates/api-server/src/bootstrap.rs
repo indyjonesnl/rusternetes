@@ -387,6 +387,32 @@ pub async fn reconcile_kubernetes_service<S: Storage + ?Sized>(
             service_type: Some(ServiceType::ClusterIP),
             // No selector: the api-server maintains the Endpoints itself.
             selector: None,
+            // kube-proxy resolves a Service to its EndpointSlices BY IP FAMILY.
+            // Without ipFamilies it matches no slice, decides the Service has
+            // no endpoints, and installs a REJECT for the ClusterIP:
+            //
+            //   -A KUBE-SERVICES -d 10.96.0.1/32 -p tcp \
+            //      --comment "default/kubernetes:https has no endpoints" -j REJECT
+            //
+            // so 10.96.0.1 is unroutable even with a present, ready
+            // EndpointSlice. Observed live during the api-server swap:
+            // kube-system/kube-dns had ipFamilies/ipFamilyPolicy/clusterIPs and
+            // programmed 6 working DNAT rules; this Service had none of them
+            // and got the REJECT above.
+            //
+            // Upstream sets ipFamilyPolicy and sessionAffinity explicitly when
+            // it creates this Service
+            // (pkg/controlplane/controller/kubernetesservice/controller.go:225-239)
+            // and its registry allocator fills clusterIPs/ipFamilies on the way
+            // in (pkg/registry/core/service/storage/alloc.go:239). We write
+            // straight to storage, bypassing that allocator, so they have to be
+            // set here or nothing sets them at all.
+            cluster_ips: Some(vec![KUBERNETES_SERVICE_IP.to_string()]),
+            ip_families: Some(vec![rusternetes_common::resources::service::IPFamily::IPv4]),
+            ip_family_policy: Some(
+                rusternetes_common::resources::service::IPFamilyPolicy::SingleStack,
+            ),
+            session_affinity: Some("None".to_string()),
             ..Default::default()
         },
         status: None,
@@ -927,6 +953,53 @@ mod tests {
         assert_eq!(
             labels.get("provider").map(String::as_str),
             Some("kubernetes")
+        );
+    }
+
+    /// kube-proxy resolves a Service to its EndpointSlices BY IP FAMILY, so a
+    /// `kubernetes` Service without `ipFamilies` yields no usable endpoints and
+    /// kube-proxy installs a REJECT rule for 10.96.0.1 with the comment
+    /// "default/kubernetes:https has no endpoints" — the ClusterIP is then
+    /// unroutable even though the EndpointSlice is present and ready.
+    ///
+    /// Upstream sets `IPFamilyPolicy: SingleStack` and `SessionAffinity: None`
+    /// explicitly when it creates this Service
+    /// (`pkg/controlplane/controller/kubernetesservice/controller.go:225-239`),
+    /// and the registry allocator fills `ClusterIPs`/`IPFamilies` on the way in
+    /// (`pkg/registry/core/service/storage/alloc.go:239`). We write straight to
+    /// storage and so bypass that allocator, which is why they must be set
+    /// here. Observed live: `kube-dns` had all three and worked; this Service
+    /// had none of them and did not.
+    #[tokio::test]
+    async fn kubernetes_service_carries_the_ip_family_fields_kube_proxy_needs() {
+        use rusternetes_common::resources::service::{IPFamily, IPFamilyPolicy};
+
+        let storage = MemoryStorage::new();
+        reconcile_kubernetes_service(&storage, 6443).await.unwrap();
+        let svc: rusternetes_common::resources::Service =
+            storage.get(SERVICE_KEY).await.expect("kubernetes Service");
+
+        assert_eq!(
+            svc.spec.cluster_ips.as_deref(),
+            Some([KUBERNETES_SERVICE_IP.to_string()].as_slice()),
+            "clusterIPs must mirror clusterIP — the registry allocator would have \
+             set it, and kube-proxy reads it"
+        );
+        assert_eq!(
+            svc.spec.ip_families.as_deref(),
+            Some([IPFamily::IPv4].as_slice()),
+            "ipFamilies must be [IPv4]; without it kube-proxy matches no \
+             EndpointSlice and REJECTs the ClusterIP"
+        );
+        assert_eq!(
+            svc.spec.ip_family_policy,
+            Some(IPFamilyPolicy::SingleStack),
+            "upstream sets IPFamilyPolicy: SingleStack explicitly"
+        );
+        assert_eq!(
+            svc.spec.session_affinity.as_deref(),
+            Some("None"),
+            "upstream sets SessionAffinity: None explicitly"
         );
     }
 
