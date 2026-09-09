@@ -549,14 +549,18 @@ const NODE_RULES: &[(&str, &str, &[&str])] = &[
     ("", "nodes/status", &["update", "patch"]),
     ("", "events", &["create", "update", "patch"]),
     ("events.k8s.io", "events", &["create", "update", "patch"]),
-    // Upstream also grants nodes "create" and "delete" on pods, and "create" on
-    // pods/eviction (policy.go:217-219). Those are DELIBERATELY omitted here:
-    // upstream makes them safe with NodeRestriction admission, which limits a node
-    // to pods bound to it, and rusternetes has no equivalent yet — so granting them
-    // would let any node delete any pod. Read access is what a kubelet needs to run
-    // its own workloads, and it is what was missing. Tracked for alignment once
-    // NodeRestriction exists (#1721).
-    ("", "pods", &["get", "list", "watch"]),
+    // "Needed for the node to create/delete mirror pods. Use the NodeRestriction
+    // admission plugin to limit a node to creating/deleting mirror pods bound to
+    // itself." (policy.go:215-217). The grant is deliberately unconditional here,
+    // as it is upstream: the narrowing lives in the admission plugin, ported in
+    // api-server `handlers::node_restriction` — a node may only create a mirror
+    // pod owned by and bound to itself, and only delete a pod bound to itself
+    // (#1721, #1906). Read access is separate (policy.go:213).
+    //
+    // "create" on pods/eviction (policy.go:223) is still omitted: the eviction
+    // path has no NodeRestriction equivalent yet, so granting it would let a node
+    // evict any pod.
+    ("", "pods", &["get", "list", "watch", "create", "delete"]),
     ("", "pods/status", &["update", "patch"]),
     ("", "secrets", &["get", "list", "watch"]),
     ("", "configmaps", &["get", "list", "watch"]),
@@ -1120,15 +1124,34 @@ mod tests {
         ));
     }
 
-    /// Upstream NodeRules grants pods create/delete, but we deliberately do not:
-    /// upstream constrains them with NodeRestriction admission (a node may only
-    /// touch pods bound to it) and we have no equivalent, so allowing them would let
-    /// any node delete any pod. See the note on NODE_RULES and #1721.
+    /// Upstream NodeRules grants pods create/delete outright and constrains them
+    /// in NodeRestriction admission instead (policy.go:215-217). This asserted
+    /// the opposite while rusternetes had no such plugin (#1721); it does now
+    /// (api-server `handlers::node_restriction`), which is what lets a kubelet
+    /// delete the mirror pod of a static pod (#1906).
     #[tokio::test]
-    async fn node_may_not_delete_pods_without_noderestriction() {
-        let attrs = RequestAttributes::new(node_user(), "delete", "pods")
+    async fn node_may_create_and_delete_pods() {
+        for verb in ["create", "delete"] {
+            let attrs = RequestAttributes::new(node_user(), verb, "pods")
+                .with_namespace("kube-system")
+                .with_api_group("");
+            assert_eq!(
+                NodeAuthorizer.authorize(&attrs).await.unwrap(),
+                Decision::Allow,
+                "node should be authorized to {verb} pods; NodeRestriction narrows it"
+            );
+        }
+    }
+
+    /// `pods/eviction` (policy.go:223) stays denied: there is no NodeRestriction
+    /// equivalent for the eviction path yet, so the grant would let a node evict
+    /// any pod in the cluster.
+    #[tokio::test]
+    async fn node_may_not_create_pod_evictions() {
+        let attrs = RequestAttributes::new(node_user(), "create", "pods")
             .with_namespace("kube-system")
-            .with_api_group("");
+            .with_api_group("")
+            .with_subresource("eviction");
         assert!(matches!(
             NodeAuthorizer.authorize(&attrs).await.unwrap(),
             Decision::Deny(_)

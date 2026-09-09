@@ -47,6 +47,7 @@ pub mod namespace;
 pub mod networkpolicy;
 pub mod node;
 pub mod node_conn;
+pub mod node_restriction;
 pub mod openapi;
 pub mod persistentvolume;
 pub mod persistentvolumeclaim;

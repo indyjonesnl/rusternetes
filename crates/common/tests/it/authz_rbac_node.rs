@@ -1114,12 +1114,43 @@ async fn node_authorizer_allows_node_to_create_events() {
 }
 
 #[tokio::test]
-async fn node_authorizer_denies_node_from_deleting_pods() {
+async fn node_authorizer_allows_node_pod_create_and_delete() {
     let az = rusternetes_common::authz::NodeAuthorizer;
 
-    let attrs = RequestAttributes::new(node_user("worker-1"), "delete", "pods")
+    // "Needed for the node to create/delete mirror pods. Use the
+    // NodeRestriction admission plugin to limit a node to creating/deleting
+    // mirror pods bound to itself."
+    // (plugin/pkg/auth/authorizer/rbac/bootstrappolicy/policy.go:215-217)
+    //
+    // This test used to assert the opposite. The deny was deliberate while
+    // rusternetes had no NodeRestriction admission (#1721) -- granting the verb
+    // alone would have let any node delete any pod. The plugin now exists
+    // (api-server `handlers::node_restriction`), so the grant is restored to
+    // upstream's shape and the narrowing happens there, which is what lets a
+    // kubelet clean up the mirror pod of a static pod (#1906).
+    for verb in ["create", "delete"] {
+        let attrs = RequestAttributes::new(node_user("worker-1"), verb, "pods")
+            .with_api_group("")
+            .with_namespace("default");
+        assert_eq!(
+            az.authorize(&attrs).await.unwrap(),
+            Decision::Allow,
+            "node should be authorized to {verb} pods; NodeRestriction narrows it"
+        );
+    }
+}
+
+/// Still denied: `pods/eviction` has no NodeRestriction equivalent yet, so the
+/// grant at policy.go:223 stays omitted rather than letting a node evict any
+/// pod in the cluster.
+#[tokio::test]
+async fn node_authorizer_denies_node_pod_eviction() {
+    let az = rusternetes_common::authz::NodeAuthorizer;
+
+    let attrs = RequestAttributes::new(node_user("worker-1"), "create", "pods")
         .with_api_group("")
-        .with_namespace("default");
+        .with_namespace("default")
+        .with_subresource("eviction");
     assert!(matches!(
         az.authorize(&attrs).await.unwrap(),
         Decision::Deny(_)
