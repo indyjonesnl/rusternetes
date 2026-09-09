@@ -246,6 +246,27 @@ where
 {
     let stored_json =
         serde_json::to_value(stored).map_err(rusternetes_common::Error::Serialization)?;
+    finish_deletion_if_write_drained_finalizers(storage, key, &stored_json, &stored_json).await
+}
+
+/// Upstream's `ShouldDeleteDuringUpdate`, plus the one registry that overrides
+/// it. **The single decision point for every write path** — PUT, PATCH and
+/// apply all reach storage through `Store.Update` upstream
+/// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:565),
+/// so the rule cannot differ between verbs.
+///
+/// It differed here. There were three copies: this module's (PUT), one in
+/// `patch_cluster_resource` that omitted the namespace override, and one
+/// hand-inlined in `patch_namespaced_resource` that omitted the grace-period
+/// clause as well — plus six PATCH handlers with no check at all (#1919).
+///
+/// `new_json` supplies the finalizers, `existing_json` the pre-write
+/// `deletionTimestamp` / `deletionGracePeriodSeconds`, exactly as upstream's
+/// predicate reads them.
+pub(crate) fn should_finish_deletion(
+    new_json: &serde_json::Value,
+    existing_json: &serde_json::Value,
+) -> bool {
     // Namespaces are the one resource whose registry overrides the predicate:
     // `ShouldDeleteNamespaceDuringUpdate`
     // (pkg/registry/core/namespace/storage/storage.go:258) is
@@ -255,24 +276,44 @@ where
     // A Terminating namespace normally has an EMPTY `metadata.finalizers` and a
     // `spec.finalizers` of ["kubernetes"], which the namespace controller clears
     // through /finalize only once the namespace is drained. Without this the
-    // generic predicate would delete the namespace on the first PUT it received,
-    // while its contents were still being removed. `spec.finalizers` exists on
-    // no other resource, so the check is safe to apply unconditionally.
-    let spec_finalizers_remain = stored_json
+    // generic predicate would delete the namespace on the first write it
+    // received, while its contents were still being removed. `spec.finalizers`
+    // exists on no other resource, so the check is safe to apply
+    // unconditionally.
+    let spec_finalizers_remain = new_json
         .get("spec")
         .and_then(|sp| sp.get("finalizers"))
         .and_then(|f| f.as_array())
         .is_some_and(|a| !a.is_empty());
     if spec_finalizers_remain {
-        return Ok(false);
+        return false;
     }
 
-    if !crate::handlers::generic_patch::should_delete_during_update(&stored_json, &stored_json) {
+    crate::handlers::generic_patch::should_delete_during_update(new_json, existing_json)
+}
+
+/// Remove the object when [`should_finish_deletion`] says the write that just
+/// landed completed its deletion.
+///
+/// Returns `true` when the object is gone. Call it from every write path that
+/// persists a client-supplied body: a PUT passes the stored object as both
+/// arguments (see [`finish_deletion_if_finalizers_drained`]), a PATCH passes
+/// the patched object and the object it read.
+pub async fn finish_deletion_if_write_drained_finalizers<S>(
+    storage: &S,
+    key: &str,
+    new_json: &serde_json::Value,
+    existing_json: &serde_json::Value,
+) -> Result<bool>
+where
+    S: Storage,
+{
+    if !should_finish_deletion(new_json, existing_json) {
         return Ok(false);
     }
     match storage.delete(key).await {
         Ok(_) => {
-            info!("{key} deleted (finalizers drained during update)");
+            info!("{key} deleted (finalizers drained during write)");
             Ok(true)
         }
         // Something else finished it first; the outcome the caller wanted holds.
