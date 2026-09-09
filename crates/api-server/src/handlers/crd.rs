@@ -89,13 +89,15 @@ pub async fn create_crd(
                         val["metadata"] = serde_json::json!({});
                     }
                     serde_json::from_value(val).map_err(|e2| {
-                        rusternetes_common::Error::InvalidResource(format!(
+                        rusternetes_common::Error::BadRequest(format!(
                             "failed to decode CRD: {}",
                             e2
                         ))
                     })?
                 } else {
-                    return Err(rusternetes_common::Error::InvalidResource(format!(
+                    // 400/BadRequest for a body that will not decode, matching
+                    // upstream transformDecodeError (#1915).
+                    return Err(rusternetes_common::Error::BadRequest(format!(
                         "failed to decode CRD: {}",
                         e
                     )));

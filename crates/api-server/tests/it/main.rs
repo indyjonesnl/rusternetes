@@ -213,6 +213,7 @@ mod strategy_workloads_test;
 mod strict_decoding_client_go_pod_test;
 mod strict_decoding_empty_object_test;
 mod tokenrequest_expiration_test;
+mod undecodable_body_status_test;
 mod unverified_fixes_test;
 mod volume_integration_test;
 mod volumeattachment_handler_test;

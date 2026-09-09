@@ -54,6 +54,12 @@ pub async fn create_apiservice(
         .to_string();
     info!("Creating APIService: {}", name);
 
+    // This handler keeps the body untyped (#1911), so nothing has rejected a
+    // shape a typed decode would refuse. Upstream types APIService and answers
+    // `{"metadata": "not-an-object"}` with 400/BadRequest before the handler
+    // ever runs (#1915).
+    rusternetes_common::dump::require_object_shape(&value, "APIService")?;
+
     // Reject create with neither name nor generateName (#1065). This handler is
     // JSON-Value based, so it can't share `require_object_name`; emit the same
     // upstream 422 inline.

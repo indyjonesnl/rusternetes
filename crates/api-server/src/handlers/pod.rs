@@ -720,9 +720,7 @@ pub async fn update(
     // Parse the body manually for better error handling — axum's Json extractor
     // returns 422 Unprocessable Entity on failure, but Kubernetes expects a proper
     // Status object. Manual parsing also tolerates unknown fields gracefully.
-    let mut pod: Pod = serde_json::from_slice(&body).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
-    })?;
+    let mut pod: Pod = rusternetes_common::dump::decode_request_body(&body)?;
 
     info!("Updating pod: {}/{}", namespace, name);
 
