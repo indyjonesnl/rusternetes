@@ -401,6 +401,15 @@ pub async fn update_flow_schema(
         Err(e) => return Err(e),
     };
 
+    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
+    // finalizer off an object already pending deletion removes it as part of
+    // that same request (store.go:565).
+    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
+        &*state.storage,
+        &key,
+        &result,
+    )
+    .await?;
     Ok(Json(result))
 }
 
@@ -576,6 +585,7 @@ pub async fn deletecollection_prioritylevelconfigurations(
 pub async fn deletecollection_flowschemas(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode> {
     info!("DeleteCollection flowschemas");
@@ -592,7 +602,22 @@ pub async fn deletecollection_flowschemas(
     let items: Vec<FlowSchema> = state.storage.list(&prefix).await?;
     for item in items {
         let key = build_key("flowschemas", None, &item.metadata.name);
-        let _ = state.storage.delete(&key).await;
+        // Route through the shared helper like every other collection delete:
+        // it honours finalizers and propagationPolicy, and tolerates an item
+        // deleted concurrently. The previous `let _ = ...delete()` both skipped
+        // finalizers and discarded the error (#1895).
+        match crate::handlers::finalizers::delete_collection_item(
+            &state.storage,
+            &key,
+            &item,
+            &delete_opts,
+        )
+        .await?
+        {
+            Some(_) => {}
+            // Already gone; upstream DeleteCollection ignores NotFound.
+            None => continue,
+        }
     }
     Ok(StatusCode::OK)
 }

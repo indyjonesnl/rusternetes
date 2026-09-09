@@ -7,6 +7,13 @@
 //! for every resource, with no kind check. Rusternetes has one delete handler
 //! per resource, and only 8 of ~50 passed a policy before this guard existed.
 //!
+//! The scope rule matters as much as the check. This guard originally examined
+//! only handlers that *already* called the shared helper, so a handler which
+//! bypassed finalizers entirely — `storage.delete(&key)` and nothing else — was
+//! skipped rather than flagged. That is an allowlist wearing a `continue`, and
+//! it hid eight DRA delete paths (#1895). Anything that deletes an object is in
+//! scope now.
+//!
 //! **This guard has no allowlist, deliberately.** The PUT-metadata rule shipped
 //! with an allowlist of known-broken handlers, and the test then sat green for
 //! 21 handlers across three "fixes" (#1788, #1793, #1795) until #1896 drained
@@ -65,16 +72,60 @@ fn every_delete_handler_passes_the_request_delete_options() {
         let src = src.split("\n#[cfg(test)]").next().unwrap_or("").to_string();
 
         for (fname, body) in delete_fn_bodies(&src) {
-            // Only handlers that actually route through the shared helper are
-            // in scope; a handler with bespoke deletion (namespaces) is not.
-            if !body.contains("handle_delete_with_finalizers")
-                && !body.contains("delete_collection_item")
-            {
+            let uses_helper = body.contains("handle_delete_with_finalizers")
+                || body.contains("delete_collection_item");
+            // A raw `storage.delete(...)` is the bypass shape: it removes the
+            // object outright, so finalizers never run and propagationPolicy
+            // is meaningless.
+            let deletes_directly = body.contains("storage.delete(");
+
+            // Anything that deletes an object is in scope. This used to
+            // `continue` unless the handler already called the helper, which
+            // made the guard's scope depend on the very property it checks: a
+            // handler that bypassed finalizers altogether was skipped, not
+            // flagged. Eight DRA delete paths sat green that way until #1895.
+            if !uses_helper && !deletes_directly {
                 continue;
             }
             checked += 1;
+
+            // Two structural reasons a handler may delete without the shared
+            // helper. Both are keyed on a *mechanism visible in the code*, not
+            // on a handler name — a name list is the allowlist this guard
+            // exists to avoid.
+            //
+            // 1. It implements the finalizing/graceful path itself, which it
+            //    proves by assigning `metadata.deletion_timestamp`. Upstream
+            //    has exactly these: Pod is its only
+            //    `RESTGracefulDeleteStrategy`, and namespaces finalize through
+            //    `spec.finalizers`.
+            let handles_deletion_itself = body.contains("deletion_timestamp = Some(");
+            // 2. It stores the object as an untyped `serde_json::Value`, which
+            //    cannot implement `HasMetadata`, so the typed helper does not
+            //    apply. This is a real gap, not an exemption — tracked in
+            //    #1911, which will add the JSON twin and delete this branch.
+            // Both spellings: the turbofish (`list::<Value>`) and the
+            // annotated binding (`let items: Vec<Value> = ...list(...)`).
+            // Matching only the first missed `deletecollection_apiservices`.
+            let untyped_document = body.contains(": Value = state.storage.get(")
+                || body.contains("list::<Value>")
+                || body.contains(": Vec<Value> = state.storage.list(");
+
+            if deletes_directly && !uses_helper && !handles_deletion_itself && !untyped_document {
+                offenders.push(format!(
+                    "{name}::{fname} (deletes via storage.delete() without the \
+                     shared finalizer helper)"
+                ));
+                continue;
+            }
+            if deletes_directly && !uses_helper {
+                // In scope and accounted for; nothing further to check.
+                continue;
+            }
             if !body.contains("&delete_opts") && !body.contains("delete_opts,") {
-                offenders.push(format!("{name}::{fname}"));
+                offenders.push(format!(
+                    "{name}::{fname} (helper called without &delete_opts)"
+                ));
             }
         }
     }

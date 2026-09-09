@@ -847,10 +847,52 @@ impl HasMetadata for rusternetes_common::resources::PriorityLevelConfiguration {
     }
 }
 
-// NOTE: DRA resources (ResourceClaim, ResourceClaimTemplate, DeviceClass, ResourceSlice)
-// use a different ObjectMeta type (rusternetes_common::resources::dra::ObjectMeta)
-// which is incompatible with rusternetes_common::types::ObjectMeta.
-// Therefore, we cannot implement HasMetadata for DRA resources, and they do not support finalizers.
+// DRA resources. These used to be excluded here — they declared their own
+// `dra::ObjectMeta`, so neither `HasMetadata` nor the shared finalizer and
+// metadata-inheritance helpers typechecked against them, and DRA silently had
+// no finalizer support and no server-owned-field reinstatement (#1895). They
+// now use `types::ObjectMeta` like every other resource, so the generic rules
+// reach them by construction rather than by a per-resource copy.
+
+impl HasMetadata for rusternetes_common::resources::dra::ResourceClaim {
+    fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+        &mut self.metadata
+    }
+}
+
+impl HasMetadata for rusternetes_common::resources::dra::ResourceClaimTemplate {
+    fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+        &mut self.metadata
+    }
+}
+
+impl HasMetadata for rusternetes_common::resources::dra::DeviceClass {
+    fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+        &mut self.metadata
+    }
+}
+
+impl HasMetadata for rusternetes_common::resources::dra::ResourceSlice {
+    fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+        &mut self.metadata
+    }
+}
 
 impl HasMetadata for rusternetes_common::resources::Role {
     fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
