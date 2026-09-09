@@ -147,6 +147,151 @@ pub struct PortForwardQuery {
 /// Mirrors `pkg/registry/core/pod/rest/log.go` (LogREST) + upstream's
 /// `streamLocation` — the kubelet exposes `/containerLogs/{ns}/{pod}/{ctr}?<params>`
 /// and handles all follow/tailLines/limitBytes logic server-side.
+/// Maximum bytes read from a kubelet error response body — upstream
+/// `maxReadLength` (staging/src/k8s.io/apiserver/pkg/registry/generic/rest/response_checker.go:37).
+const KUBELET_ERROR_MAX_READ: usize = 50_000;
+
+/// Upstream `GenericHttpResponseChecker.Check`
+/// (staging/src/k8s.io/apiserver/pkg/registry/generic/rest/response_checker.go:46-67),
+/// installed on `pods/log` by `pkg/registry/core/pod/rest/log.go:111` as
+/// `NewGenericHttpResponseChecker(api.Resource("pods/log"), name)`.
+///
+/// The api-server never streams a kubelet error response through to the
+/// client: `LocationStreamer` runs this check before it hands over the body
+/// (`generic/rest/streamer.go:100-105`) and converts anything outside
+/// `200..=206` into a typed API error, so the client always gets a `Status`.
+///
+/// We used to proxy the kubelet's response verbatim, which meant a plain-text
+/// `400` body. client-go cannot decode that as a `Status`, falls back to
+/// `NewGenericServerResponse`, and prints its canned 400 wording — so the
+/// kubelet's actual explanation was lost:
+///
+/// ```text
+/// Unable to fetch gc-1009/pod1/nginx logs: the server rejected our request
+/// for an unknown reason (get pods pod1)
+/// ```
+///
+/// That cost the e2e framework its container logs on exactly the runs where a
+/// spec had failed (#1920).
+async fn check_kubelet_log_response(resp: Response, pod_name: &str) -> Response {
+    let code = resp.status();
+    // Upstream: `resp.StatusCode < http.StatusOK || resp.StatusCode > http.StatusPartialContent`.
+    if (StatusCode::OK..=StatusCode::PARTIAL_CONTENT).contains(&code) {
+        return resp;
+    }
+
+    let (_parts, body) = resp.into_parts();
+    let text = read_limited(body, KUBELET_ERROR_MAX_READ).await;
+
+    // The three arms of the checker, then `NewGenericServerResponse` for
+    // everything else.
+    match code {
+        StatusCode::BAD_REQUEST => Error::BadRequest(text).into_response(),
+        // `errors.NewInternalError(fmt.Errorf("%s", bodyText))`, whose message
+        // is `fmt.Sprintf("Internal error occurred: %v", err)`
+        // (apimachinery/pkg/api/errors/errors.go:387-397).
+        StatusCode::INTERNAL_SERVER_ERROR => {
+            Error::Internal(format!("Internal error occurred: {text}")).into_response()
+        }
+        _ => generic_server_response(code, pod_name),
+    }
+}
+
+/// `errors.NewGenericServerResponse(code, "", api.Resource("pods/log"), name, bodyText, 0, false)`
+/// (apimachinery/pkg/api/errors/errors.go:437-524).
+///
+/// Note what upstream does **not** do here: with `isUnexpectedResponse: false`
+/// the kubelet's `bodyText` is dropped entirely for these codes, and the
+/// message is the canned one for the status code with the qualified resource
+/// appended. The empty verb is what leaves a double space after the `(` —
+/// `fmt.Sprintf("%s (%s %s %s)", message, strings.ToLower(verb), ...)` with
+/// `verb == ""`. Reproduced exactly rather than tidied: the wording is what
+/// clients match on.
+fn generic_server_response(code: StatusCode, pod_name: &str) -> Response {
+    let (reason, message) = match code {
+        StatusCode::CONFLICT => ("Conflict", "the server reported a conflict".to_string()),
+        StatusCode::NOT_FOUND => (
+            "NotFound",
+            "the server could not find the requested resource".to_string(),
+        ),
+        StatusCode::UNAUTHORIZED => (
+            "Unauthorized",
+            "the server has asked for the client to provide credentials".to_string(),
+        ),
+        StatusCode::FORBIDDEN => ("Forbidden", String::new()),
+        StatusCode::METHOD_NOT_ALLOWED => (
+            "MethodNotAllowed",
+            "the server does not allow this method on the requested resource".to_string(),
+        ),
+        StatusCode::UNPROCESSABLE_ENTITY => (
+            "Invalid",
+            "the server rejected our request due to an error in our request".to_string(),
+        ),
+        StatusCode::SERVICE_UNAVAILABLE => (
+            "ServiceUnavailable",
+            "the server is currently unable to handle the request".to_string(),
+        ),
+        StatusCode::GATEWAY_TIMEOUT => (
+            "Timeout",
+            "the server was unable to return a response in the time allotted, but may still be processing the request".to_string(),
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (
+            "TooManyRequests",
+            "the server has received too many requests and has asked us to try again later"
+                .to_string(),
+        ),
+        _ => (
+            "Unknown",
+            format!(
+                "the server responded with the status code {} but did not return more information",
+                code.as_u16()
+            ),
+        ),
+    };
+
+    let message = format!("{message} ( pods/log {pod_name})");
+    let details = rusternetes_common::types::StatusDetails {
+        name: Some(pod_name.to_string()),
+        group: None,
+        kind: Some("pods/log".to_string()),
+        uid: None,
+        causes: None,
+        retry_after_seconds: None,
+    };
+    (
+        code,
+        axum::Json(rusternetes_common::types::Status::failure_with_details(
+            message,
+            reason,
+            code.as_u16(),
+            details,
+        )),
+    )
+        .into_response()
+}
+
+/// `io.ReadAll(io.LimitReader(resp.Body, maxReadLength))` — truncate rather
+/// than fail, which is what `LimitReader` does. `axum::body::to_bytes` errors
+/// out on an oversized body instead, and an error here would replace the
+/// kubelet's explanation with a message about the explanation.
+async fn read_limited(body: Body, limit: usize) -> String {
+    use http_body_util::BodyExt;
+    let mut body = body;
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < limit {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    let take = (limit - buf.len()).min(data.len());
+                    buf.extend_from_slice(&data[..take]);
+                }
+            }
+            Some(Err(_)) | None => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 pub async fn get_logs(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -257,7 +402,10 @@ pub async fn get_logs(
 
     // Plain HTTP proxy (non-upgrade) — handles both follow and non-follow since
     // the kubelet log endpoint is plain HTTP (no WebSocket / SPDY upgrade).
-    Ok(rusternetes_streamproxy::proxy_stream(target_url, req).await)
+    // A kubelet error is converted to a Status before anything is streamed,
+    // exactly as upstream's ResponseChecker does (#1920).
+    let proxied = rusternetes_streamproxy::proxy_stream(target_url, req).await;
+    Ok(check_kubelet_log_response(proxied, &name).await)
 }
 
 /// Fetch the kubelet `containerLogs` stream over plain HTTP and expose it as a
