@@ -403,7 +403,13 @@ for name, st in d.items():
   export VS_RESTORE_KC="$RESTORE_KC"
   probe_node="$(kind get nodes --name "$CLUSTER" 2>/dev/null | grep -v 'control-plane' | head -1)"
   [ -n "$probe_node" ] || probe_node="$(vs_control_plane_node "$CLUSTER")"
-  read -r svc_ip svc_port <<<"$(vs_kubernetes_clusterip "$RESTORE_KC")"
+  # Not `read -r svc_ip svc_port`: this script runs with IFS=$'\n\t' (line 27),
+  # which has no space, so that silently put "<ip> <port>" in svc_ip and left
+  # svc_port empty — breaking both the dial and the failure dump on every run
+  # since #1820. vs_clusterip_fields splits without consulting IFS.
+  vs_clusterip_fields "$RESTORE_KC"
+  svc_ip="$VS_SVC_IP"
+  svc_port="$VS_SVC_PORT"
   if [ -z "$probe_node" ]; then
     # --env cloud has no kind nodes to exec into; the gate is kind-specific.
     vs_warn "no cluster node container to probe from — skipping the substrate gate"
