@@ -25,12 +25,7 @@ pub async fn create_resourceclaimtemplate(
 ) -> Result<(StatusCode, Json<ResourceClaimTemplate>)> {
     info!(
         "Creating ResourceClaimTemplate: {}/{}",
-        namespace,
-        template
-            .metadata
-            .as_ref()
-            .map(|m| m.name.as_deref().unwrap_or(""))
-            .unwrap_or("")
+        namespace, template.metadata.name
     );
 
     // Check authorization
@@ -61,18 +56,19 @@ pub async fn create_resourceclaimtemplate(
     }
 
     // Ensure metadata exists and set defaults
-    let metadata = template.metadata.get_or_insert_with(Default::default);
+    let metadata = &mut template.metadata;
     metadata.namespace = Some(namespace.clone());
 
     // Generate UID and timestamp if not present
-    if metadata.uid.is_none() {
-        metadata.uid = Some(uuid::Uuid::new_v4().to_string());
+    if metadata.uid.is_empty() {
+        metadata.uid = uuid::Uuid::new_v4().to_string();
     }
     if metadata.creation_timestamp.is_none() {
         metadata.creation_timestamp = Some(chrono::Utc::now());
     }
 
-    let name = crate::handlers::validation::require_optional_object_name(metadata.name.as_deref())?;
+    let name =
+        crate::handlers::validation::require_optional_object_name(Some(metadata.name.as_str()))?;
 
     // Check for dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
@@ -271,9 +267,9 @@ pub async fn update_resourceclaimtemplate(
 
     // Ensure metadata and set namespace/name
     {
-        let metadata = template.metadata.get_or_insert_with(Default::default);
+        let metadata = &mut template.metadata;
         metadata.namespace = Some(namespace.clone());
-        metadata.name = Some(name.clone());
+        metadata.name = name.clone();
     }
 
     // Field validation on update (upstream ValidateResourceClaimTemplateUpdate
@@ -295,7 +291,22 @@ pub async fn update_resourceclaimtemplate(
     }
 
     let key = build_key("resourceclaimtemplates", Some(&namespace), &name);
-    let updated = state.storage.update(&key, &template).await?;
+    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+        &state.storage,
+        &key,
+        &mut template,
+    )
+    .await?;
+
+    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
+    // finalizer off an object already pending deletion removes it as part of
+    // that same request (store.go:565).
+    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
+        &*state.storage,
+        &key,
+        &updated,
+    )
+    .await?;
 
     Ok(Json(updated))
 }
@@ -303,6 +314,7 @@ pub async fn update_resourceclaimtemplate(
 pub async fn delete_resourceclaimtemplate(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ResourceClaimTemplate>> {
@@ -332,9 +344,20 @@ pub async fn delete_resourceclaimtemplate(
         return Ok(Json(resource));
     }
 
-    // NOTE: DRA resources use dra::ObjectMeta which is incompatible with finalizers.
-    // We perform a simple delete without finalizer support.
-    state.storage.delete(&key).await?;
+    // Finalizers now apply: the shared helper stamps deletionTimestamp and
+    // honours propagationPolicy instead of deleting outright (#1895).
+    let has_finalizers = crate::handlers::finalizers::handle_delete_with_finalizers(
+        &*state.storage,
+        &key,
+        &resource,
+        &delete_opts,
+    )
+    .await?;
+
+    if has_finalizers {
+        let updated: ResourceClaimTemplate = state.storage.get(&key).await?;
+        return Ok(Json(updated));
+    }
 
     Ok(Json(resource))
 }
@@ -350,6 +373,7 @@ crate::patch_handler_namespaced!(
 pub async fn deletecollection_resourceclaimtemplates(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode> {
@@ -388,14 +412,33 @@ pub async fn deletecollection_resourceclaimtemplates(
     let mut deleted_count = 0;
     for item in items {
         // Extract name from metadata (handle Option)
-        if let Some(metadata) = &item.metadata {
-            if let Some(name) = &metadata.name {
+        {
+            let metadata = &item.metadata;
+            {
+                let name = &metadata.name;
                 let key = build_key("resourceclaimtemplates", Some(&namespace), name);
 
-                // NOTE: DRA resources use dra::ObjectMeta which is incompatible with finalizers.
-                // We perform a simple delete without finalizer support.
-                state.storage.delete(&key).await?;
-                deleted_count += 1;
+                // Same shared helper every other collection delete uses: it
+                // stamps deletionTimestamp when finalizers remain, honours
+                // propagationPolicy, and tolerates an item that vanished
+                // between the list and the delete (#1895).
+                let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
+                    &state.storage,
+                    &key,
+                    &item,
+                    &delete_opts,
+                )
+                .await?
+                {
+                    Some(deleted) => deleted,
+                    // Already gone — a concurrent deleter won the race;
+                    // upstream DeleteCollection ignores NotFound rather
+                    // than failing the request.
+                    None => continue,
+                };
+                if deleted_immediately {
+                    deleted_count += 1;
+                }
             }
         }
     }

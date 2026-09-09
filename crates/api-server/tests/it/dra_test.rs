@@ -19,13 +19,13 @@ fn test_resourceclaim_serialization() {
     let claim = ResourceClaim {
         api_version: "resource.k8s.io/v1".to_string(),
         kind: "ResourceClaim".to_string(),
-        metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-            name: Some("test-claim".to_string()),
+        metadata: rusternetes_common::resources::dra::ObjectMeta {
+            name: "test-claim".to_string(),
             namespace: Some("default".to_string()),
-            uid: Some("test-uid-123".to_string()),
+            uid: "test-uid-123".to_string(),
             creation_timestamp: Some(chrono::Utc::now()),
             ..Default::default()
-        }),
+        },
         spec: ResourceClaimSpec {
             devices: DeviceClaim {
                 requests: vec![DeviceRequest {
@@ -56,16 +56,7 @@ fn test_resourceclaim_serialization() {
     // Test deserialization
     let deserialized: ResourceClaim =
         serde_json::from_str(&json).expect("Failed to deserialize ResourceClaim");
-    assert_eq!(
-        deserialized
-            .metadata
-            .as_ref()
-            .unwrap()
-            .name
-            .as_ref()
-            .unwrap(),
-        "test-claim"
-    );
+    assert_eq!(deserialized.metadata.name, "test-claim");
     assert_eq!(deserialized.spec.devices.requests.len(), 1);
     assert_eq!(deserialized.spec.devices.requests[0].name, "gpu-req");
 }
@@ -75,11 +66,11 @@ fn test_resourceclaim_with_allocation_modes() {
     let claim = ResourceClaim {
         api_version: "resource.k8s.io/v1".to_string(),
         kind: "ResourceClaim".to_string(),
-        metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-            name: Some("multi-gpu-claim".to_string()),
+        metadata: rusternetes_common::resources::dra::ObjectMeta {
+            name: "multi-gpu-claim".to_string(),
             namespace: Some("default".to_string()),
             ..Default::default()
-        }),
+        },
         spec: ResourceClaimSpec {
             devices: DeviceClaim {
                 requests: vec![DeviceRequest {
@@ -123,11 +114,11 @@ fn test_resourceclaim_status() {
     let claim = ResourceClaim {
         api_version: "resource.k8s.io/v1".to_string(),
         kind: "ResourceClaim".to_string(),
-        metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-            name: Some("test-claim-status".to_string()),
+        metadata: rusternetes_common::resources::dra::ObjectMeta {
+            name: "test-claim-status".to_string(),
             namespace: Some("default".to_string()),
             ..Default::default()
-        }),
+        },
         spec: ResourceClaimSpec {
             devices: DeviceClaim::default(),
         },
@@ -172,14 +163,14 @@ fn test_resourceclaimtemplate_serialization() {
     let template = ResourceClaimTemplate {
         api_version: "resource.k8s.io/v1".to_string(),
         kind: "ResourceClaimTemplate".to_string(),
-        metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-            name: Some("test-template".to_string()),
+        metadata: rusternetes_common::resources::dra::ObjectMeta {
+            name: "test-template".to_string(),
             namespace: Some("default".to_string()),
-            uid: Some("template-uid-456".to_string()),
+            uid: "template-uid-456".to_string(),
             ..Default::default()
-        }),
+        },
         spec: ResourceClaimTemplateSpec {
-            metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
+            metadata: rusternetes_common::resources::dra::ObjectMeta {
                 labels: Some(
                     vec![
                         ("app".to_string(), "ml-workload".to_string()),
@@ -189,7 +180,7 @@ fn test_resourceclaimtemplate_serialization() {
                     .collect(),
                 ),
                 ..Default::default()
-            }),
+            },
             spec: ResourceClaimSpec {
                 devices: DeviceClaim {
                     requests: vec![DeviceRequest {
@@ -221,29 +212,13 @@ fn test_resourceclaimtemplate_serialization() {
     // Test deserialization
     let deserialized: ResourceClaimTemplate =
         serde_json::from_str(&json).expect("Failed to deserialize ResourceClaimTemplate");
-    assert_eq!(
-        deserialized
-            .metadata
-            .as_ref()
-            .unwrap()
-            .name
-            .as_ref()
-            .unwrap(),
-        "test-template"
-    );
+    assert_eq!(deserialized.metadata.name, "test-template");
     assert_eq!(
         deserialized.spec.spec.devices.requests[0].name,
         "ml-gpu-req"
     );
 
-    let labels = deserialized
-        .spec
-        .metadata
-        .as_ref()
-        .unwrap()
-        .labels
-        .as_ref()
-        .unwrap();
+    let labels = deserialized.spec.metadata.labels.as_ref().unwrap();
     assert_eq!(labels.get("app").unwrap(), "ml-workload");
     assert_eq!(labels.get("tier").unwrap(), "gpu");
 }
@@ -253,11 +228,11 @@ fn test_deviceclass_serialization() {
     let device_class = DeviceClass {
         api_version: "resource.k8s.io/v1".to_string(),
         kind: "DeviceClass".to_string(),
-        metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-            name: Some("nvidia-gpu-a100".to_string()),
-            uid: Some("deviceclass-uid-789".to_string()),
+        metadata: rusternetes_common::resources::dra::ObjectMeta {
+            name: "nvidia-gpu-a100".to_string(),
+            uid: "deviceclass-uid-789".to_string(),
             ..Default::default()
-        }),
+        },
         spec: DeviceClassSpec {
             selectors: vec![
                 DeviceSelector {
@@ -285,16 +260,7 @@ fn test_deviceclass_serialization() {
     // Test deserialization
     let deserialized: DeviceClass =
         serde_json::from_str(&json).expect("Failed to deserialize DeviceClass");
-    assert_eq!(
-        deserialized
-            .metadata
-            .as_ref()
-            .unwrap()
-            .name
-            .as_ref()
-            .unwrap(),
-        "nvidia-gpu-a100"
-    );
+    assert_eq!(deserialized.metadata.name, "nvidia-gpu-a100");
     assert_eq!(deserialized.spec.selectors.len(), 2);
 
     let first_selector = &deserialized.spec.selectors[0];
@@ -312,10 +278,10 @@ fn test_deviceclass_with_suitable_nodes() {
     let device_class = DeviceClass {
         api_version: "resource.k8s.io/v1".to_string(),
         kind: "DeviceClass".to_string(),
-        metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-            name: Some("high-memory-gpu".to_string()),
+        metadata: rusternetes_common::resources::dra::ObjectMeta {
+            name: "high-memory-gpu".to_string(),
             ..Default::default()
-        }),
+        },
         spec: DeviceClassSpec {
             selectors: vec![DeviceSelector {
                 cel: Some(CELDeviceSelector {
@@ -353,11 +319,11 @@ fn test_resourceslice_serialization() {
     let resource_slice = ResourceSlice {
         api_version: "resource.k8s.io/v1".to_string(),
         kind: "ResourceSlice".to_string(),
-        metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-            name: Some("node-1-gpu-resources".to_string()),
-            uid: Some("slice-uid-101".to_string()),
+        metadata: rusternetes_common::resources::dra::ObjectMeta {
+            name: "node-1-gpu-resources".to_string(),
+            uid: "slice-uid-101".to_string(),
             ..Default::default()
-        }),
+        },
         spec: ResourceSliceSpec {
             driver: "gpu-driver.example.com".to_string(),
             pool: ResourcePool {
@@ -430,16 +396,7 @@ fn test_resourceslice_serialization() {
     // Test deserialization
     let deserialized: ResourceSlice =
         serde_json::from_str(&json).expect("Failed to deserialize ResourceSlice");
-    assert_eq!(
-        deserialized
-            .metadata
-            .as_ref()
-            .unwrap()
-            .name
-            .as_ref()
-            .unwrap(),
-        "node-1-gpu-resources"
-    );
+    assert_eq!(deserialized.metadata.name, "node-1-gpu-resources");
     assert_eq!(deserialized.spec.driver, "gpu-driver.example.com");
     assert_eq!(deserialized.spec.node_name.as_ref().unwrap(), "node-1");
 
@@ -464,10 +421,10 @@ fn test_resourceslice_pool_info() {
     let resource_slice = ResourceSlice {
         api_version: "resource.k8s.io/v1".to_string(),
         kind: "ResourceSlice".to_string(),
-        metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-            name: Some("pool-test-slice".to_string()),
+        metadata: rusternetes_common::resources::dra::ObjectMeta {
+            name: "pool-test-slice".to_string(),
             ..Default::default()
-        }),
+        },
         spec: ResourceSliceSpec {
             driver: "pool-driver.example.com".to_string(),
             pool: ResourcePool {
@@ -500,10 +457,10 @@ fn test_deviceclass_empty_selectors() {
     let device_class = DeviceClass {
         api_version: "resource.k8s.io/v1".to_string(),
         kind: "DeviceClass".to_string(),
-        metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-            name: Some("no-selector-class".to_string()),
+        metadata: rusternetes_common::resources::dra::ObjectMeta {
+            name: "no-selector-class".to_string(),
             ..Default::default()
-        }),
+        },
         spec: DeviceClassSpec {
             selectors: vec![],
             config: vec![],
@@ -521,10 +478,10 @@ fn test_deviceclass_with_config() {
     let device_class = DeviceClass {
         api_version: "resource.k8s.io/v1".to_string(),
         kind: "DeviceClass".to_string(),
-        metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-            name: Some("configured-class".to_string()),
+        metadata: rusternetes_common::resources::dra::ObjectMeta {
+            name: "configured-class".to_string(),
             ..Default::default()
-        }),
+        },
         spec: DeviceClassSpec {
             selectors: vec![],
             config: vec![DeviceClassConfiguration {
@@ -558,11 +515,11 @@ fn test_resourceclaim_all_allocation_mode() {
     let claim = ResourceClaim {
         api_version: "resource.k8s.io/v1".to_string(),
         kind: "ResourceClaim".to_string(),
-        metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-            name: Some("all-mode-claim".to_string()),
+        metadata: rusternetes_common::resources::dra::ObjectMeta {
+            name: "all-mode-claim".to_string(),
             namespace: Some("default".to_string()),
             ..Default::default()
-        }),
+        },
         spec: ResourceClaimSpec {
             devices: DeviceClaim {
                 requests: vec![DeviceRequest {
@@ -607,10 +564,10 @@ fn test_resourceslice_with_all_nodes() {
     let resource_slice = ResourceSlice {
         api_version: "resource.k8s.io/v1".to_string(),
         kind: "ResourceSlice".to_string(),
-        metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-            name: Some("all-nodes-slice".to_string()),
+        metadata: rusternetes_common::resources::dra::ObjectMeta {
+            name: "all-nodes-slice".to_string(),
             ..Default::default()
-        }),
+        },
         spec: ResourceSliceSpec {
             driver: "cluster-wide-driver.example.com".to_string(),
             pool: ResourcePool {

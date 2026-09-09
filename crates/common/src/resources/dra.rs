@@ -28,8 +28,8 @@ pub struct ResourceClaim {
     #[serde(rename = "kind", default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<ObjectMeta>,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
 
     pub spec: ResourceClaimSpec,
 
@@ -385,8 +385,8 @@ pub struct ResourceClaimTemplate {
     #[serde(rename = "kind", default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<ObjectMeta>,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
 
     pub spec: ResourceClaimTemplateSpec,
 }
@@ -395,8 +395,8 @@ pub struct ResourceClaimTemplate {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceClaimTemplateSpec {
     /// Metadata to be applied to ResourceClaims created from this template
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<ObjectMeta>,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
 
     /// Spec for the ResourceClaim created from this template
     pub spec: ResourceClaimSpec,
@@ -419,8 +419,8 @@ pub struct DeviceClass {
     #[serde(rename = "kind", default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<ObjectMeta>,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
 
     pub spec: DeviceClassSpec,
 }
@@ -469,8 +469,8 @@ pub struct ResourceSlice {
     #[serde(rename = "kind", default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<ObjectMeta>,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
 
     pub spec: ResourceSliceSpec,
 }
@@ -739,74 +739,22 @@ pub struct Counter {
 pub type FullyQualifiedName = String;
 pub type QualifiedName = String;
 
-// Re-export ObjectMeta from parent
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ObjectMeta {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespace: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uid: Option<String>,
-
-    #[serde(
-        rename = "resourceVersion",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub resource_version: Option<String>,
-
-    #[serde(
-        rename = "creationTimestamp",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub creation_timestamp: Option<DateTime<Utc>>,
-
-    #[serde(
-        rename = "deletionTimestamp",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub deletion_timestamp: Option<DateTime<Utc>>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub labels: Option<BTreeMap<String, String>>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<BTreeMap<String, String>>,
-
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub finalizers: Vec<String>,
-
-    #[serde(
-        rename = "ownerReferences",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub owner_references: Vec<OwnerReference>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct OwnerReference {
-    #[serde(rename = "apiVersion")]
-    pub api_version: String,
-    pub kind: String,
-    pub name: String,
-    pub uid: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub controller: Option<bool>,
-    #[serde(
-        rename = "blockOwnerDeletion",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub block_owner_deletion: Option<bool>,
-}
+// The DRA resources use the SHARED metadata types, not their own.
+//
+// They used to declare a private `ObjectMeta` (and a private
+// `OwnerReference`) here. Upstream has exactly one `metav1.ObjectMeta`, and
+// applies its server-owned-field rules to every resource in one place
+// (`registry/rest/update.go::BeforeUpdate`). A second Rust copy meant every
+// generic metadata rule either had to be written twice or silently skipped
+// DRA — which is what happened: four PUT handlers could not reach the shared
+// `inherit_server_owned_metadata` because it did not typecheck against the
+// local type (#1895).
+//
+// The copy had drifted, too: it serialized timestamps with chrono's default
+// (nanosecond) format instead of `k8s_time`'s RFC3339 seconds, and used
+// non-`Option` `Vec`/`BTreeMap` collections, so DRA objects did not round-trip
+// the way every other resource does.
+pub use crate::types::{ObjectMeta, OwnerReference};
 
 // List types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -915,11 +863,11 @@ mod tests {
         let claim = ResourceClaim {
             api_version: "resource.k8s.io/v1".to_string(),
             kind: "ResourceClaim".to_string(),
-            metadata: Some(ObjectMeta {
-                name: Some("test-claim".to_string()),
+            metadata: ObjectMeta {
+                name: "test-claim".to_string(),
                 namespace: Some("default".to_string()),
                 ..Default::default()
-            }),
+            },
             spec: ResourceClaimSpec {
                 devices: DeviceClaim {
                     requests: vec![DeviceRequest {
@@ -952,10 +900,10 @@ mod tests {
         let device_class = DeviceClass {
             api_version: "resource.k8s.io/v1".to_string(),
             kind: "DeviceClass".to_string(),
-            metadata: Some(ObjectMeta {
-                name: Some("gpu-class".to_string()),
+            metadata: ObjectMeta {
+                name: "gpu-class".to_string(),
                 ..Default::default()
-            }),
+            },
             spec: DeviceClassSpec {
                 selectors: vec![],
                 config: vec![],
@@ -973,10 +921,10 @@ mod tests {
         let slice = ResourceSlice {
             api_version: "resource.k8s.io/v1".to_string(),
             kind: "ResourceSlice".to_string(),
-            metadata: Some(ObjectMeta {
-                name: Some("test-slice".to_string()),
+            metadata: ObjectMeta {
+                name: "test-slice".to_string(),
                 ..Default::default()
-            }),
+            },
             spec: ResourceSliceSpec {
                 driver: "test.driver".to_string(),
                 pool: ResourcePool {

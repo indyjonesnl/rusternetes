@@ -119,12 +119,10 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
         {
             Ok(items) => {
                 for item in &items {
-                    if let Some(ref meta) = item.metadata {
-                        let ns = meta.namespace.as_deref().unwrap_or("");
-                        let name = meta.name.as_deref().unwrap_or("");
-                        let key = format!("resourceclaims/{}/{}", ns, name);
-                        queue.add(key).await;
-                    }
+                    let meta = &item.metadata;
+                    let ns = meta.namespace.as_deref().unwrap_or("");
+                    let key = format!("resourceclaims/{}/{}", ns, meta.name);
+                    queue.add(key).await;
                 }
             }
             Err(e) => {
@@ -141,16 +139,8 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
             if let Err(e) = self.reconcile_claim(&mut claim).await {
                 error!(
                     "Failed to reconcile ResourceClaim {}/{}: {}",
-                    claim
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.namespace.as_ref())
-                        .unwrap_or(&"".to_string()),
-                    claim
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.name.as_ref())
-                        .unwrap_or(&"".to_string()),
+                    claim.metadata.namespace.as_deref().unwrap_or(""),
+                    claim.metadata.name,
                     e
                 );
             }
@@ -160,19 +150,18 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
     }
 
     async fn reconcile_claim(&self, claim: &mut ResourceClaim) -> Result<()> {
-        let metadata = claim
-            .metadata
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("ResourceClaim missing metadata"))?;
+        let metadata = &claim.metadata;
 
-        let name = metadata
-            .name
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("ResourceClaim missing name"))?;
+        // `name` is a plain String on the shared ObjectMeta, so an unnamed
+        // object is an empty string rather than a `None`.
+        if metadata.name.is_empty() {
+            return Err(anyhow::anyhow!("ResourceClaim missing name"));
+        }
+        let name = metadata.name.clone();
 
         let namespace = metadata
             .namespace
-            .as_ref()
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("ResourceClaim missing namespace"))?;
 
         // Skip if already allocated
@@ -264,7 +253,7 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
         claim.status = Some(status);
 
         // Save updated ResourceClaim
-        let key = build_key("resourceclaims", Some(namespace), name);
+        let key = build_key("resourceclaims", Some(&namespace), &name);
         // Status subresource write: a full-object PUT strips `.status` (#1723).
         self.storage.update_status(&key, claim).await?;
 
@@ -370,10 +359,10 @@ mod tests {
         let device_class = DeviceClass {
             api_version: "resource.k8s.io/v1".to_string(),
             kind: "DeviceClass".to_string(),
-            metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-                name: Some("test-class".to_string()),
+            metadata: rusternetes_common::resources::dra::ObjectMeta {
+                name: "test-class".to_string(),
                 ..Default::default()
-            }),
+            },
             spec: DeviceClassSpec {
                 selectors: vec![],
                 config: vec![],
@@ -394,11 +383,11 @@ mod tests {
         let mut claim = ResourceClaim {
             api_version: "resource.k8s.io/v1".to_string(),
             kind: "ResourceClaim".to_string(),
-            metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-                name: Some("test-claim".to_string()),
+            metadata: rusternetes_common::resources::dra::ObjectMeta {
+                name: "test-claim".to_string(),
                 namespace: Some("default".to_string()),
                 ..Default::default()
-            }),
+            },
             spec: ResourceClaimSpec {
                 devices: DeviceClaim::default(),
             },
@@ -429,10 +418,10 @@ mod tests {
         let device_class = DeviceClass {
             api_version: "resource.k8s.io/v1".to_string(),
             kind: "DeviceClass".to_string(),
-            metadata: Some(rusternetes_common::resources::dra::ObjectMeta {
-                name: Some("test-class".to_string()),
+            metadata: rusternetes_common::resources::dra::ObjectMeta {
+                name: "test-class".to_string(),
                 ..Default::default()
-            }),
+            },
             spec: DeviceClassSpec::default(),
         };
 

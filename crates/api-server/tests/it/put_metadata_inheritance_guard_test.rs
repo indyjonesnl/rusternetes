@@ -41,12 +41,12 @@ use std::path::PathBuf;
 /// Note this is FOUR handlers, not the two originally recorded here:
 /// `deviceclass` and `resourceclaimtemplate` were listed as merely needing a
 /// read, but they share the same metadata type and so share the same blocker.
-const PENDING_DRA_METADATA_TYPE: &[(&str, &str)] = &[
-    ("deviceclass.rs", "update_deviceclass"),
-    ("resourceclaim.rs", "update_resourceclaim"),
-    ("resourceclaimtemplate.rs", "update_resourceclaimtemplate"),
-    ("resourceslice.rs", "update_resourceslice"),
-];
+/// Empty, like `PENDING_READ`. The DRA resources used to define their own
+/// `ObjectMeta`, so neither the shared `inherit_server_owned_metadata` nor the
+/// `HasMetadata` bound typechecked against them and the generic rule could not
+/// reach four handlers. They now use `types::ObjectMeta` like every other
+/// resource, which removes the exception rather than recording it.
+const PENDING_DRA_METADATA_TYPE: &[(&str, &str)] = &[];
 
 /// Every other handler now reinstates the metadata, via
 /// `lifecycle::update_inheriting_server_owned_metadata` (typed) or
@@ -372,6 +372,38 @@ async fn put_omitting_uid_does_not_blank_it() {
             json!({"apiVersion":"admissionregistration.k8s.io/v1",
                    "kind":"ValidatingWebhookConfiguration",
                    "metadata":{"name":"t"},"webhooks":[]}),
+        ),
+        // The DRA resources, drained from PENDING_DRA_METADATA_TYPE. They were
+        // unreachable by the generic rule until they shared one ObjectMeta.
+        (
+            "deviceclasses",
+            "/apis/resource.k8s.io/v1/deviceclasses",
+            json!({"apiVersion":"resource.k8s.io/v1","kind":"DeviceClass",
+                   "metadata":{"name":"t"},"spec":{}}),
+        ),
+        (
+            "resourceclaims",
+            "/apis/resource.k8s.io/v1/namespaces/default/resourceclaims",
+            json!({"apiVersion":"resource.k8s.io/v1","kind":"ResourceClaim",
+                   "metadata":{"name":"t"},"spec":{}}),
+        ),
+        (
+            "resourceclaimtemplates",
+            "/apis/resource.k8s.io/v1/namespaces/default/resourceclaimtemplates",
+            json!({"apiVersion":"resource.k8s.io/v1","kind":"ResourceClaimTemplate",
+                   "metadata":{"name":"t"},"spec":{"spec":{}}}),
+        ),
+        (
+            "resourceslices",
+            "/apis/resource.k8s.io/v1/resourceslices",
+            json!({"apiVersion":"resource.k8s.io/v1","kind":"ResourceSlice",
+                   "metadata":{"name":"t"},
+                   // driver must be an RFC-1123 subdomain, and exactly one of
+                   // nodeName/nodeSelector/allNodes/perDeviceNodeSelection is
+                   // required — both enforced by validate_resource_slice.
+                   "spec":{"driver":"example.com","allNodes":true,
+                           "pool":{"name":"p","resourceSliceCount":1,
+                                   "generation":1}}}),
         ),
         // The untyped-document path: APIService is stored as a raw
         // `serde_json::Value`, so it goes through
