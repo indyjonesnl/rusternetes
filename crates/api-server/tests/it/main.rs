@@ -12,6 +12,7 @@
 mod admission_test;
 mod admission_webhook_e2e_test;
 mod aggregator_test;
+mod apiservice_delete_finalizers_test;
 mod apiservices_routing_test;
 mod apps_update_spec_validation_test;
 mod auth_integration_test;

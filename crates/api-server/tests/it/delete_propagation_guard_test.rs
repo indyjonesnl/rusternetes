@@ -72,6 +72,8 @@ fn every_delete_handler_passes_the_request_delete_options() {
         let src = src.split("\n#[cfg(test)]").next().unwrap_or("").to_string();
 
         for (fname, body) in delete_fn_bodies(&src) {
+            // Matches the `_json` variants too — they are thin wrappers over
+            // the same helper (see `JsonResource`).
             let uses_helper = body.contains("handle_delete_with_finalizers")
                 || body.contains("delete_collection_item");
             // A raw `storage.delete(...)` is the bypass shape: it removes the
@@ -100,18 +102,17 @@ fn every_delete_handler_passes_the_request_delete_options() {
             //    `RESTGracefulDeleteStrategy`, and namespaces finalize through
             //    `spec.finalizers`.
             let handles_deletion_itself = body.contains("deletion_timestamp = Some(");
-            // 2. It stores the object as an untyped `serde_json::Value`, which
-            //    cannot implement `HasMetadata`, so the typed helper does not
-            //    apply. This is a real gap, not an exemption — tracked in
-            //    #1911, which will add the JSON twin and delete this branch.
-            // Both spellings: the turbofish (`list::<Value>`) and the
-            // annotated binding (`let items: Vec<Value> = ...list(...)`).
-            // Matching only the first missed `deletecollection_apiservices`.
-            let untyped_document = body.contains(": Value = state.storage.get(")
-                || body.contains("list::<Value>")
-                || body.contains(": Vec<Value> = state.storage.list(");
+            //
+            // There used to be a second reason here: a resource stored as an
+            // untyped `serde_json::Value` could not implement `HasMetadata`, so
+            // the typed helper did not apply. That was a real gap, not an
+            // exemption, and #1911 closed it — `JsonResource` adapts a document
+            // to `HasMetadata` and `handle_delete_with_finalizers_json` /
+            // `delete_collection_item_json` run the same propagation logic. An
+            // untyped handler that deletes directly is now an offender like any
+            // other.
 
-            if deletes_directly && !uses_helper && !handles_deletion_itself && !untyped_document {
+            if deletes_directly && !uses_helper && !handles_deletion_itself {
                 offenders.push(format!(
                     "{name}::{fname} (deletes via storage.delete() without the \
                      shared finalizer helper)"
