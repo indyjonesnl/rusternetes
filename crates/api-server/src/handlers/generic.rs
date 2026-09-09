@@ -281,6 +281,7 @@ pub async fn patch_apiservice(
 pub async fn delete_apiservice(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
 ) -> rusternetes_common::Result<Json<Value>> {
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "apiservices")
@@ -293,7 +294,25 @@ pub async fn delete_apiservice(
 
     let key = build_key("apiservices", None, &name);
     let deleted: Value = state.storage.get(&key).await?;
-    state.storage.delete(&key).await?;
+
+    // An APIService is stored untyped, but upstream's delete path has no kind
+    // or representation check: `Store.Delete` calls
+    // `deletionFinalizersForGarbageCollection` (store.go:976) for everything.
+    // This used to `storage.delete()` outright, so a finalizer was ignored and
+    // `propagationPolicy`/`orphanDependents` were silently dropped (#1911).
+    let pending = crate::handlers::finalizers::handle_delete_with_finalizers_json(
+        &*state.storage,
+        &key,
+        &deleted,
+        &delete_opts,
+    )
+    .await?;
+
+    if pending {
+        // Answer with the marked object, as the typed handlers do.
+        let marked: Value = state.storage.get(&key).await?;
+        return Ok(Json(marked));
+    }
     Ok(Json(deleted))
 }
 
@@ -303,6 +322,7 @@ pub async fn delete_apiservice(
 pub async fn deletecollection_apiservices(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Query(params): Query<HashMap<String, String>>,
 ) -> rusternetes_common::Result<Json<Value>> {
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "apiservices")
@@ -327,7 +347,15 @@ pub async fn deletecollection_apiservices(
         }
         if let Some(name) = item.pointer("/metadata/name").and_then(|v| v.as_str()) {
             let key = build_key("apiservices", None, name);
-            let _ = state.storage.delete(&key).await;
+            // Same rule as the single-object delete: a finalizer holds the
+            // item and the request's propagation policy applies (#1911).
+            let _ = crate::handlers::finalizers::delete_collection_item_json(
+                &*state.storage,
+                &key,
+                item,
+                &delete_opts,
+            )
+            .await;
         }
     }
 

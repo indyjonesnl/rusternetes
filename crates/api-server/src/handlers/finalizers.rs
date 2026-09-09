@@ -1431,3 +1431,176 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Untyped (serde_json::Value) resources
+// ---------------------------------------------------------------------------
+
+/// A resource stored as a raw `serde_json::Value`, viewed through
+/// [`HasMetadata`] so it can go through the *same* delete path as a typed one.
+///
+/// Upstream has no untyped path: `Store.Delete` calls
+/// `deletionFinalizersForGarbageCollection`
+/// (`registry/generic/registry/store.go:976`) for every resource, with no kind
+/// or representation check. Handlers here that keep the document untyped —
+/// APIService — could not satisfy the `HasMetadata + Serialize +
+/// DeserializeOwned` bound and so deleted outright, ignoring finalizers and
+/// silently dropping `propagationPolicy`/`orphanDependents` (#1911).
+///
+/// This is an adapter, not a second implementation: the ~150 lines of
+/// propagation and conflict-retry logic in
+/// [`handle_delete_with_finalizers_and_propagation`] are shared verbatim. A
+/// parallel JSON copy of that logic is exactly how the four drifted copies of
+/// the finalizer-drain predicate happened.
+///
+/// Fields outside `metadata`, and metadata fields `ObjectMeta` does not model,
+/// are preserved: serialization overlays the (possibly mutated) `ObjectMeta`
+/// onto the original document rather than replacing it.
+#[derive(Debug, Clone)]
+pub struct JsonResource {
+    doc: serde_json::Value,
+    meta: rusternetes_common::types::ObjectMeta,
+    /// The metadata keys `ObjectMeta` emitted for the document as read. A key
+    /// here that `ObjectMeta` no longer emits was cleared (e.g. the last
+    /// finalizer removed) and must be dropped from the document, not left
+    /// behind by the overlay.
+    known_keys: Vec<String>,
+}
+
+impl JsonResource {
+    /// View a stored document as a finalizer-aware resource.
+    pub fn new(doc: serde_json::Value) -> Result<Self> {
+        let meta: rusternetes_common::types::ObjectMeta = match doc.get("metadata") {
+            Some(m) => serde_json::from_value(m.clone())
+                .map_err(rusternetes_common::Error::Serialization)?,
+            None => Default::default(),
+        };
+        let known_keys = metadata_keys(&meta)?;
+        Ok(Self {
+            doc,
+            meta,
+            known_keys,
+        })
+    }
+
+    /// The document with the current metadata overlaid — what a response body
+    /// should carry after a delete marked the object.
+    pub fn to_document(&self) -> Result<serde_json::Value> {
+        let mut doc = self.doc.clone();
+        overlay_metadata(&mut doc, &self.meta, &self.known_keys)?;
+        Ok(doc)
+    }
+}
+
+/// The metadata keys a serialized `ObjectMeta` carries. `ObjectMeta` skips its
+/// `None` fields, so this is exactly the set of keys it currently owns.
+fn metadata_keys(meta: &rusternetes_common::types::ObjectMeta) -> Result<Vec<String>> {
+    let value = serde_json::to_value(meta).map_err(rusternetes_common::Error::Serialization)?;
+    Ok(value
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default())
+}
+
+/// Write `meta` back into `doc["metadata"]` without disturbing anything else.
+///
+/// Same key-level merge as `inherit_server_owned_metadata_json`
+/// (`handlers/lifecycle.rs:272`): keys the typed `ObjectMeta` does not model
+/// (`managedFields`, an unknown extension) survive untouched.
+fn overlay_metadata(
+    doc: &mut serde_json::Value,
+    meta: &rusternetes_common::types::ObjectMeta,
+    previously_known: &[String],
+) -> Result<()> {
+    let serialized =
+        serde_json::to_value(meta).map_err(rusternetes_common::Error::Serialization)?;
+    let serialized = serialized.as_object().cloned().unwrap_or_default();
+
+    if !doc.is_object() {
+        return Err(rusternetes_common::Error::BadRequest(
+            "resource document is not a JSON object".to_string(),
+        ));
+    }
+    let obj = doc.as_object_mut().expect("checked above");
+    let target = obj
+        .entry("metadata")
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if !target.is_object() {
+        *target = serde_json::Value::Object(Default::default());
+    }
+    let target = target.as_object_mut().expect("set above");
+
+    // A key `ObjectMeta` owned when the document was read but no longer emits
+    // was cleared — `finalizers = None` after the last one is removed. Drop it
+    // rather than leaving the stale value the overlay would not overwrite.
+    for key in previously_known {
+        if !serialized.contains_key(key) {
+            target.remove(key);
+        }
+    }
+    for (key, value) in serialized {
+        target.insert(key, value);
+    }
+    Ok(())
+}
+
+impl Serialize for JsonResource {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let doc = self.to_document().map_err(serde::ser::Error::custom)?;
+        doc.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for JsonResource {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let doc = serde_json::Value::deserialize(deserializer)?;
+        JsonResource::new(doc).map_err(serde::de::Error::custom)
+    }
+}
+
+impl HasMetadata for JsonResource {
+    fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
+        &self.meta
+    }
+
+    fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+        &mut self.meta
+    }
+}
+
+/// Delete an untyped document, honouring finalizers and propagation policy.
+///
+/// The untyped counterpart of [`handle_delete_with_finalizers`], and a thin one
+/// on purpose — see [`JsonResource`].
+pub async fn handle_delete_with_finalizers_json<S>(
+    storage: &S,
+    key: &str,
+    doc: &serde_json::Value,
+    opts: &DeleteOptionsCtx,
+) -> Result<bool>
+where
+    S: Storage,
+{
+    let resource = JsonResource::new(doc.clone())?;
+    handle_delete_with_finalizers_and_propagation(storage, key, &resource, opts).await
+}
+
+/// Collection-delete counterpart of [`delete_collection_item`] for untyped
+/// documents. `Ok(None)` means a concurrent deleter won the race.
+pub async fn delete_collection_item_json<S>(
+    storage: &S,
+    key: &str,
+    doc: &serde_json::Value,
+    opts: &DeleteOptionsCtx,
+) -> Result<Option<bool>>
+where
+    S: Storage,
+{
+    let resource = JsonResource::new(doc.clone())?;
+    delete_collection_item(storage, key, &resource, opts).await
+}
