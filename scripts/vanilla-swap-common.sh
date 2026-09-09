@@ -188,23 +188,78 @@ vs_teardown() {
   docker volume rm "vanilla-swap-${cluster}-kubelet-vols" >/dev/null 2>&1 || true
 }
 
+# The exact kindest/node tag used for each supported BARE minor version.
+#
+# There is deliberately no fallback to kind's bundled default. That default
+# tracks the KIND RELEASE, not the Kubernetes version asked for, so the same
+# command built different clusters on different machines:
+#
+#   kind v0.31.0 (CI)     --k8s-version v1.35  ->  kindest/node:v1.35.0
+#   kind v0.33.0 (local)  --k8s-version v1.35  ->  kindest/node:v1.37.0
+#
+# and BOTH logged "k8s=v1.35" and stamped v1.35 into run-result.json. A local
+# reproduction of a CI failure ran two minor versions ahead of the cluster it
+# was reproducing, and the published result named a baseline it had not tested
+# (#1889). An unknown minor is a hard error: pass a full vX.Y.Z instead.
+VS_NODE_IMAGE_v1_35="kindest/node:v1.35.0"
+
+# vs_resolve_node_image <k8s-version>
+# Always resolves to a CONCRETE kindest/node tag. A full vX.Y.Z is used
+# verbatim; a bare vX.Y maps through the table above.
+vs_resolve_node_image() {
+  local version="$1"
+  if [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    printf 'kindest/node:%s\n' "$version"
+    return 0
+  fi
+  local key="VS_NODE_IMAGE_${version//./_}"
+  local image="${!key:-}"
+  if [ -z "$image" ]; then
+    vs_warn "no pinned node image for baseline '$version'; pass a full vX.Y.Z (e.g. ${version}.0)"
+    return 1
+  fi
+  printf '%s\n' "$image"
+}
+
 # vs_create_baseline <cluster> <k8s-version>
-# A bare minor version (vX.Y) uses kind's bundled default node image (whose
-# patch version tracks the kind release); a full vX.Y.Z pins kindest/node:vX.Y.Z.
+# Creates the vanilla baseline cluster on an EXPLICITLY pinned node image, then
+# asserts the cluster really is the version that was asked for -- the harness
+# stamps that version into the published result, so it must not be a guess.
 vs_create_baseline() {
   local cluster="$1" version="$2" root; root="$(vs_repo_root)"
-  local image_args=()
-  if [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-    image_args=(--image "kindest/node:${version}")
-    vs_log "creating vanilla baseline cluster '$cluster' (node image kindest/node:${version})"
-  else
-    vs_log "creating vanilla baseline cluster '$cluster' (kind default node image for $version)"
-  fi
-  kind create cluster --name "$cluster" \
-    "${image_args[@]}" \
+  local image; image="$(vs_resolve_node_image "$version")" || return 1
+
+  vs_log "creating vanilla baseline cluster '$cluster' (node image ${image})"
+  "${VS_KIND_CMD:-kind}" create cluster --name "$cluster" \
+    --image "$image" \
     --config "$root/ci/vanilla-swap/kind/base-cluster.yaml" \
     --kubeconfig "$(vs_kubeconfig_path "$cluster")" \
-    --wait 120s
+    --wait 120s || return 1
+
+  [ -n "${VS_SKIP_BASELINE_ASSERT:-}" ] && return 0
+  vs_assert_baseline_version "$cluster" "$version"
+}
+
+# vs_assert_baseline_version <cluster> <requested-version>
+# Fail loudly when the cluster that came up is not the minor that was asked
+# for. Without this the drift above is invisible: every log line and the run
+# result report the REQUESTED version, never the one running.
+vs_assert_baseline_version() {
+  local cluster="$1" requested="$2"
+  local want; want="$(printf '%s\n' "$requested" | cut -d. -f1,2)"
+  local got
+  got="$(KUBECONFIG="$(vs_kubeconfig_path "$cluster")" kubectl get nodes \
+    -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null || true)"
+  if [ -z "$got" ]; then
+    vs_warn "could not read the baseline node version to verify it is ${want}"
+    return 0
+  fi
+  local got_minor; got_minor="$(printf '%s\n' "$got" | cut -d. -f1,2)"
+  if [ "$got_minor" != "$want" ]; then
+    vs_die "baseline is ${got}, not ${want}: the run would report a version it did not test (#1889)" \
+      "${VS_EX_USAGE:-2}"
+  fi
+  vs_log "baseline verified at ${got}"
 }
 
 # vs_control_plane_node <cluster>
