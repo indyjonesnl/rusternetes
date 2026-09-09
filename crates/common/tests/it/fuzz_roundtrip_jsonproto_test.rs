@@ -577,6 +577,13 @@ fn event_strategy() -> impl Strategy<Value = Event> {
                 reporting_instance: None,
                 note: None,
                 regarding: None,
+                // The events.k8s.io/v1 aliases are drained by
+                // `convert_from_events_v1` before storage, so a round-tripped
+                // Event never carries them.
+                deprecated_source: None,
+                deprecated_first_timestamp: None,
+                deprecated_last_timestamp: None,
+                deprecated_count: None,
                 // The Event struct has a `#[serde(flatten)] extra` field that
                 // would round-trip *into* itself if non-empty (any unknown key
                 // would land here on decode, then re-emit at the top level on
