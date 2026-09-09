@@ -389,6 +389,19 @@ pub async fn update_role(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("roles", Some(&namespace), &name),
+        "rbac.authorization.k8s.io",
+        "roles",
+        &name,
+    )
+    .await?;
 
     role.metadata.name = name.clone();
     role.metadata.namespace = Some(namespace.clone());
@@ -401,12 +414,20 @@ pub async fn update_role(
     }
 
     let key = build_key("roles", Some(&namespace), &name);
-    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+    // AllowCreateOnUpdate is true for Role (pkg/registry/rbac/role/strategy.go), so a PUT to a
+    // name that does not exist creates the object rather than answering
+    // NotFound (store.go:646-650).
+    let updated = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
         &*state.storage,
         &key,
         &mut role,
     )
-    .await?;
+    .await
+    {
+        Ok(updated) => updated,
+        Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &role).await?,
+        Err(e) => return Err(e),
+    };
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of
@@ -705,6 +726,19 @@ pub async fn update_rolebinding(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("rolebindings", Some(&namespace), &name),
+        "rbac.authorization.k8s.io",
+        "rolebindings",
+        &name,
+    )
+    .await?;
 
     rolebinding.metadata.name = name.clone();
     rolebinding.metadata.namespace = Some(namespace.clone());
@@ -748,7 +782,16 @@ pub async fn update_rolebinding(
             &stored.metadata,
         );
     }
-    let updated = state.storage.update(&key, &rolebinding).await?;
+    // AllowCreateOnUpdate is true for RoleBinding (pkg/registry/rbac/rolebinding/strategy.go), so a PUT to a
+    // name that does not exist creates the object rather than answering
+    // NotFound (store.go:646-650).
+    let updated = match state.storage.update(&key, &rolebinding).await {
+        Ok(updated) => updated,
+        Err(rusternetes_common::Error::NotFound(_)) => {
+            state.storage.create(&key, &rolebinding).await?
+        }
+        Err(e) => return Err(e),
+    };
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of
@@ -1044,6 +1087,19 @@ pub async fn update_clusterrole(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("clusterroles", None, &name),
+        "rbac.authorization.k8s.io",
+        "clusterroles",
+        &name,
+    )
+    .await?;
 
     clusterrole.metadata.name = name.clone();
 
@@ -1059,12 +1115,22 @@ pub async fn update_clusterrole(
     }
 
     let key = build_key("clusterroles", None, &name);
-    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+    // AllowCreateOnUpdate is true for ClusterRole (pkg/registry/rbac/clusterrole/strategy.go), so a PUT to a
+    // name that does not exist creates the object rather than answering
+    // NotFound (store.go:646-650).
+    let updated = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
         &*state.storage,
         &key,
         &mut clusterrole,
     )
-    .await?;
+    .await
+    {
+        Ok(updated) => updated,
+        Err(rusternetes_common::Error::NotFound(_)) => {
+            state.storage.create(&key, &clusterrole).await?
+        }
+        Err(e) => return Err(e),
+    };
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of
@@ -1331,6 +1397,19 @@ pub async fn update_clusterrolebinding(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("clusterrolebindings", None, &name),
+        "rbac.authorization.k8s.io",
+        "clusterrolebindings",
+        &name,
+    )
+    .await?;
 
     clusterrolebinding.metadata.name = name.clone();
 
@@ -1372,7 +1451,16 @@ pub async fn update_clusterrolebinding(
             &stored.metadata,
         );
     }
-    let updated = state.storage.update(&key, &clusterrolebinding).await?;
+    // AllowCreateOnUpdate is true for ClusterRoleBinding (pkg/registry/rbac/clusterrolebinding/strategy.go), so a PUT to a
+    // name that does not exist creates the object rather than answering
+    // NotFound (store.go:646-650).
+    let updated = match state.storage.update(&key, &clusterrolebinding).await {
+        Ok(updated) => updated,
+        Err(rusternetes_common::Error::NotFound(_)) => {
+            state.storage.create(&key, &clusterrolebinding).await?
+        }
+        Err(e) => return Err(e),
+    };
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of

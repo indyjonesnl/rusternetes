@@ -210,6 +210,19 @@ pub async fn update(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("deployments", Some(&namespace), &name),
+        "apps",
+        "deployments",
+        &name,
+    )
+    .await?;
 
     deployment.metadata.name = name.clone();
     deployment.metadata.namespace = Some(namespace.clone());
@@ -290,14 +303,7 @@ pub async fn update(
         return Ok(Json(deployment));
     }
 
-    // Try to update first, if not found then create (upsert behavior)
-    let result = match state.storage.update(&key, &deployment).await {
-        Ok(updated) => updated,
-        Err(rusternetes_common::Error::NotFound(_)) => {
-            state.storage.create(&key, &deployment).await?
-        }
-        Err(e) => return Err(e),
-    };
+    let result = state.storage.update(&key, &deployment).await?;
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of

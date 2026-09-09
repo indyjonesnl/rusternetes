@@ -343,7 +343,14 @@ pub async fn update(
             &stored.metadata,
         );
     }
-    let updated = state.storage.update(&key, &event).await?;
+    // Event is one of the nine strategies whose `AllowCreateOnUpdate()` is
+    // true (pkg/registry/core/event/strategy.go:74), so a PUT to a name that
+    // does not exist creates it rather than answering NotFound (#1905).
+    let updated = match state.storage.update(&key, &event).await {
+        Ok(updated) => updated,
+        Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &event).await?,
+        Err(e) => return Err(e),
+    };
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of
@@ -916,7 +923,13 @@ pub async fn update_events_v1(
             &stored.metadata,
         );
     }
-    let mut updated: Event = state.storage.update(&key, &event).await?;
+    // AllowCreateOnUpdate, as on the core endpoint above — both reach the same
+    // registry upstream (pkg/registry/core/event/strategy.go:74).
+    let mut updated: Event = match state.storage.update(&key, &event).await {
+        Ok(updated) => updated,
+        Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &event).await?,
+        Err(e) => return Err(e),
+    };
     updated.api_version = "events.k8s.io/v1".to_string();
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last

@@ -104,6 +104,19 @@ pub async fn update_priority_level_configuration(
         Decision::Allow => {}
         Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("prioritylevelconfigurations", None, &name),
+        "flowcontrol.apiserver.k8s.io",
+        "prioritylevelconfigurations",
+        &name,
+    )
+    .await?;
 
     plc.metadata.name = name.clone();
     plc.kind = "PriorityLevelConfiguration".to_string();
@@ -161,11 +174,7 @@ pub async fn update_priority_level_configuration(
             &stored.metadata,
         );
     }
-    let result = match state.storage.update(&key, &plc).await {
-        Ok(updated) => updated,
-        Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &plc).await?,
-        Err(e) => return Err(e),
-    };
+    let result = state.storage.update(&key, &plc).await?;
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of
@@ -369,6 +378,19 @@ pub async fn update_flow_schema(
         Decision::Allow => {}
         Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("flowschemas", None, &name),
+        "flowcontrol.apiserver.k8s.io",
+        "flowschemas",
+        &name,
+    )
+    .await?;
 
     fs.metadata.name = name.clone();
 
@@ -389,17 +411,12 @@ pub async fn update_flow_schema(
     }
 
     let key = build_key("flowschemas", None, &name);
-    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+    let result = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
         &*state.storage,
         &key,
         &mut fs,
     )
-    .await
-    {
-        Ok(updated) => updated,
-        Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &fs).await?,
-        Err(e) => return Err(e),
-    };
+    .await?;
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of
