@@ -990,6 +990,65 @@ vs_kubernetes_clusterip() {
 # the deadline. The gate reported `substrate-not-ready` while its own failure
 # dump showed kube-proxy 1/1 Running on both nodes. Repairing and then not
 # waiting long enough to see it work is the worst of both.
+# Dump everything needed to explain an unroutable ClusterIP, to stderr.
+#
+# The gate used to print only the EndpointSlice list and the kube-system pod
+# list. That says *that* kube-proxy is Running but nothing about why it has not
+# programmed the service, so three consecutive investigations of the api-server
+# leg each had to guess. The decisive artefacts are kube-proxy's own log and the
+# node's iptables state for the ClusterIP.
+#
+# Every command is best-effort: this runs only when something is already broken,
+# and a failing probe must never replace the real failure with its own.
+#
+# Usage: vs_dump_clusterip_diagnostics <kubeconfig> <probe-node> <ip> <port>
+vs_dump_clusterip_diagnostics() {
+  local kc="${1:-}" node="${2:-}" ip="${3:-}" port="${4:-443}"
+
+  echo "=== ClusterIP diagnostics: ${ip}:${port} ===" >&2
+
+  echo "--- default/kubernetes Service ---" >&2
+  KUBECONFIG="$kc" kubectl -n default get service kubernetes -o yaml >&2 2>&1 || true
+
+  echo "--- EndpointSlices for default/kubernetes ---" >&2
+  KUBECONFIG="$kc" kubectl -n default get endpointslice \
+    -l kubernetes.io/service-name=kubernetes -o yaml >&2 2>&1 || true
+
+  echo "--- kube-system pods ---" >&2
+  KUBECONFIG="$kc" kubectl -n kube-system get pods -o wide >&2 2>&1 || true
+
+  # Logs for EVERY kube-proxy pod, current and previous. A pod left in Failed
+  # holds its explanation in --previous, and the run that motivated this had two
+  # Failed pods alongside two Running ones.
+  local pods pod
+  pods="$(KUBECONFIG="$kc" kubectl -n kube-system get pods \
+    -l k8s-app=kube-proxy -o name 2>/dev/null || true)"
+  if [ -z "$pods" ]; then
+    # Fall back to a name match: the swap restores upstream's labels, but a
+    # partially restored substrate may not carry them.
+    pods="$(KUBECONFIG="$kc" kubectl -n kube-system get pods -o name 2>/dev/null \
+      | grep kube-proxy || true)"
+  fi
+  for pod in $pods; do
+    echo "--- logs: ${pod} (current) ---" >&2
+    KUBECONFIG="$kc" kubectl -n kube-system logs "${pod#pod/}" --tail=200 >&2 2>&1 || true
+    echo "--- logs: ${pod} (--previous) ---" >&2
+    KUBECONFIG="$kc" kubectl -n kube-system logs "${pod#pod/}" --previous --tail=200 >&2 2>&1 || true
+  done
+
+  # The actual assertion the gate makes, shown directly: are there any rules for
+  # this ClusterIP on the node we dialled from?
+  if [ -n "$node" ]; then
+    echo "--- iptables rules mentioning ${ip} on ${node} ---" >&2
+    docker exec "$node" sh -c "iptables-save 2>/dev/null | grep -F '${ip}' || echo 'NO iptables rules reference ${ip}'" >&2 2>&1 || true
+    echo "--- ipvs (if the proxier is in ipvs mode) ---" >&2
+    docker exec "$node" sh -c "ipvsadm -Ln 2>/dev/null | grep -F '${ip}' || echo 'no ipvs entries for ${ip}'" >&2 2>&1 || true
+  fi
+
+  echo "=== end ClusterIP diagnostics ===" >&2
+  return 0
+}
+
 vs_wait_dial() {
   local node="$1" ip="$2" port="$3"
   local timeout="${4:-360}" interval="${5:-5}"

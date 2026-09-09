@@ -414,9 +414,10 @@ for name, st in d.items():
     # Not the swapped module's fault: report it as its own outcome so the badge
     # and the run-result say what actually broke.
     vs_warn "substrate gate failed: the kubernetes ClusterIP is unroutable from inside the cluster"
-    KUBECONFIG="$RESTORE_KC" kubectl -n default get endpointslices \
-      -l kubernetes.io/service-name=kubernetes -o wide >&2 2>&1 || true
-    KUBECONFIG="$RESTORE_KC" kubectl -n kube-system get pods -o wide >&2 2>&1 || true
+    # Capture kube-proxy's log and the node's iptables state, not just the
+    # object lists: a Running kube-proxy that has programmed nothing looks
+    # identical to a healthy one from `get pods` alone (#1889 follow-up).
+    vs_dump_clusterip_diagnostics "$RESTORE_KC" "$probe_node" "$svc_ip" "${svc_port:-443}"
     set -e
     vs_emit_result "substrate-not-ready" 0 0 "$VS_K8S_VERSION"
     exit "$VS_EX_NOTUP"
