@@ -248,3 +248,101 @@ fn bare_numeric_string_still_counts_as_non_zero() {
          'cannot be 0 when maxSurge is 0' rule: {errs:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The rendered `error_body()` — pinned against upstream's own output
+// ---------------------------------------------------------------------------
+//
+// #1903 rendered an IntOrString bad value **unquoted**, on the strength of this
+// switch:
+//
+// ```go
+// switch t := e.BadValue.(type) {
+// case int64, int32, float64, float32, bool:
+//     s += fmt.Sprintf("%v", value)
+// case fmt.Stringer:
+//     s += fmt.Sprintf("%s", t.String())
+// ...
+// ```
+//
+// That is the **kustomize fork** of `field.Error`
+// (`vendor/sigs.k8s.io/kustomize/kyaml/yaml/internal/k8sgen/pkg/util/validation/field/errors.go:49-73`),
+// not apimachinery's. The real one
+// (`staging/src/k8s.io/apimachinery/pkg/util/validation/field/errors.go:84-107`)
+// has no `case fmt.Stringer:` at all — its `default:` arm marshals to JSON
+// first and only falls back to `fmt.Stringer` when marshalling *errors*:
+//
+// ```go
+// jb, err := json.Marshal(e.BadValue)
+// if err == nil {
+//     valstr = string(jb)
+// } else if stringer, ok := e.BadValue.(fmt.Stringer); ok {
+//     valstr = stringer.String()
+// }
+// ```
+//
+// `intstr.IntOrString` and `resource.Quantity` both have a `MarshalJSON`, so
+// neither ever reaches the Stringer path. Running upstream's `ErrorBody()`
+// directly on the pinned checkout:
+//
+// ```text
+// intstr.FromString("abc")     => Invalid value: "abc": some detail
+// intstr.FromString("50%")     => Invalid value: "50%": some detail
+// intstr.FromInt32(5)          => Invalid value: 5: some detail
+// resource.MustParse("2Gi")    => Invalid value: "2Gi": some detail
+// resource.MustParse("-1")     => Invalid value: "-1": some detail
+// ```
+//
+// So a String-typed IntOrString is **quoted**, an Int-typed one is a bare
+// number, and a Quantity is **quoted** — which also answers #1907: Quantity
+// already renders correctly through `BadValue::String`, and switching it to
+// the Stringer form would have broken it.
+//
+// None of the #1903 tests caught the regression because they all asserted
+// `e.detail` and never the rendered body. These assert the body.
+
+/// A `Type: String` IntOrString renders quoted, because `json.Marshal` of an
+/// `intstr.IntOrString` with `Type: String` emits a JSON string.
+#[test]
+fn string_typed_max_unavailable_renders_quoted_in_the_error_body() {
+    let errs = validate_daemonset(&with_max_unavailable(json!("abc")));
+    let e = errs
+        .iter()
+        .find(|e| e.field == "spec.updateStrategy.rollingUpdate.maxUnavailable")
+        .unwrap_or_else(|| panic!("expected a maxUnavailable error, got: {errs:?}"));
+    assert_eq!(
+        e.error_body(),
+        format!("Invalid value: \"abc\": {PERCENT_MSG}"),
+        "upstream: `intstr.FromString(\"abc\")` => `Invalid value: \"abc\"`"
+    );
+}
+
+/// Same for a percent-shaped string that fails the format check — the quoting
+/// is a property of the type, not of the content.
+#[test]
+fn percent_shaped_string_max_unavailable_renders_quoted() {
+    let errs = validate_daemonset(&with_max_unavailable(json!("50 %")));
+    let e = errs
+        .iter()
+        .find(|e| e.field == "spec.updateStrategy.rollingUpdate.maxUnavailable")
+        .unwrap_or_else(|| panic!("expected a maxUnavailable error, got: {errs:?}"));
+    assert_eq!(
+        e.error_body(),
+        format!("Invalid value: \"50 %\": {PERCENT_MSG}")
+    );
+}
+
+/// An `Type: Int` IntOrString renders as a bare number, never `"-1"`.
+#[test]
+fn int_typed_max_unavailable_renders_unquoted_in_the_error_body() {
+    let errs = validate_daemonset(&with_max_unavailable(json!(-1)));
+    let e = errs
+        .iter()
+        .find(|e| e.field == "spec.updateStrategy.rollingUpdate.maxUnavailable")
+        .unwrap_or_else(|| panic!("expected a maxUnavailable error, got: {errs:?}"));
+    assert_eq!(
+        e.error_body(),
+        "Invalid value: -1: must be greater than or equal to 0",
+        "upstream: `intstr.FromInt32(-1)` => `Invalid value: -1`"
+    );
+}

@@ -155,11 +155,40 @@ fn int_or_percent_value(v: &IntOrString) -> i64 {
     }
 }
 
-/// Render an int-or-string the way upstream's `IntOrString.String()` does, for
-/// the `bad_value` of an error.
+/// Render an int-or-string as the `bad_value` of an error, the way upstream's
+/// `field.Error.ErrorBody()` does.
+///
+/// `ErrorBody`'s `default:` arm marshals the value to JSON **first**
+/// (`staging/src/k8s.io/apimachinery/pkg/util/validation/field/errors.go:92-97`)
+/// and only reaches `fmt.Stringer` if that marshalling *errors*:
+///
+/// ```go
+/// valstr := ""
+/// jb, err := json.Marshal(e.BadValue)
+/// if err == nil {
+///     valstr = string(jb)
+/// } else if stringer, ok := e.BadValue.(fmt.Stringer); ok {
+///     valstr = stringer.String()
+/// }
+/// ```
+///
+/// `intstr.IntOrString` has a `MarshalJSON`, so it never takes the Stringer
+/// path: a `Type: String` value renders **quoted** and a `Type: Int` value as a
+/// bare number. Verified against the pinned checkout:
+///
+/// ```text
+/// intstr.FromString("abc") => Invalid value: "abc"
+/// intstr.FromInt32(5)      => Invalid value: 5
+/// ```
+///
+/// So this is `BadValue::Json`, not `BadValue::Stringer`. The `fmt.Stringer`
+/// switch that #1903 ported — with a `case fmt.Stringer:` sitting right after
+/// the simple types, which *would* have made this unquoted — is the **kustomize
+/// fork** of `field.Error`
+/// (`vendor/sigs.k8s.io/kustomize/kyaml/yaml/internal/k8sgen/pkg/util/validation/field/errors.go:49-73`),
+/// not apimachinery's. Same file path, different package, opposite behaviour.
 fn int_or_percent_display(v: &IntOrString) -> BadValue {
-    // `IntOrString::Display` is already upstream's `String()`.
-    BadValue::Stringer(v.to_string())
+    BadValue::Json(v.to_json())
 }
 
 /// Mirrors upstream `ValidatePositiveIntOrPercent`
