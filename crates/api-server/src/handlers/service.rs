@@ -103,17 +103,18 @@ pub async fn create(
         Err(e) => {
             let msg = e.to_string();
             if is_strict && msg.contains("duplicate field") {
-                let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e2| {
-                    rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e2))
-                })?;
+                let value: serde_json::Value =
+                    rusternetes_common::dump::decode_request_body(&body)?;
                 serde_json::from_value(value).map_err(|e2| {
-                    rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e2))
+                    rusternetes_common::Error::BadRequest(format!("failed to decode: {}", e2))
                 })?
             } else {
-                return Err(rusternetes_common::Error::InvalidResource(format!(
-                    "failed to decode: {}",
-                    msg
-                )));
+                // Upstream's transformDecodeError: a body that will not decode
+                // is 400/BadRequest, never 422/Invalid (#1915).
+                return Err(
+                    rusternetes_common::dump::decode_request_body::<Service>(&body)
+                        .expect_err("the decode that just failed cannot now succeed"),
+                );
             }
         }
     };

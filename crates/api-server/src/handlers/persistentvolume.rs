@@ -23,9 +23,7 @@ pub async fn create_pv(
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<PersistentVolume>)> {
-    let mut pv: PersistentVolume = serde_json::from_slice(&body).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
-    })?;
+    let mut pv: PersistentVolume = rusternetes_common::dump::decode_request_body(&body)?;
     info!("Creating PersistentVolume: {}", pv.metadata.name);
 
     // Check if this is a dry-run request

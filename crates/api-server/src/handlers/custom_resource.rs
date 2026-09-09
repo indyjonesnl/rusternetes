@@ -32,9 +32,7 @@ pub async fn create_custom_resource(
     body: Bytes,
 ) -> Result<(StatusCode, Json<CustomResource>)> {
     // Parse the body manually so we can do strict field validation against the raw bytes
-    let mut cr: CustomResource = serde_json::from_slice(&body).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
-    })?;
+    let mut cr: CustomResource = rusternetes_common::dump::decode_request_body(&body)?;
 
     // Server-side name generation (metadata.generateName) is applied centrally
     // by generate_name_middleware before this handler runs (#1052).
@@ -725,9 +723,7 @@ pub async fn update_custom_resource(
     body: Bytes,
 ) -> Result<Json<CustomResource>> {
     // Parse the body manually so we can do strict field validation against the raw bytes
-    let mut cr: CustomResource = serde_json::from_slice(&body).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
-    })?;
+    let mut cr: CustomResource = rusternetes_common::dump::decode_request_body(&body)?;
 
     info!(
         "Updating custom resource {}/{}/{}: {}",

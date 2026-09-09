@@ -23,9 +23,7 @@ pub async fn create(
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<DaemonSet>)> {
-    let mut daemonset: DaemonSet = serde_json::from_slice(&body).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
-    })?;
+    let mut daemonset: DaemonSet = rusternetes_common::dump::decode_request_body(&body)?;
     info!(
         "Creating daemonset: {}/{}",
         namespace, daemonset.metadata.name
@@ -118,9 +116,7 @@ pub async fn update(
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Json<DaemonSet>> {
-    let mut daemonset: DaemonSet = serde_json::from_slice(&body).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
-    })?;
+    let mut daemonset: DaemonSet = rusternetes_common::dump::decode_request_body(&body)?;
     info!("Updating daemonset: {}/{}", namespace, name);
 
     // Check if this is a dry-run request

@@ -22,9 +22,7 @@ pub async fn create_csinode(
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<CSINode>)> {
-    let mut node: CSINode = serde_json::from_slice(&body).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
-    })?;
+    let mut node: CSINode = rusternetes_common::dump::decode_request_body(&body)?;
     info!("Creating CSINode: {}", node.metadata.name);
 
     // Reject create with neither name nor generateName (#1065).

@@ -150,8 +150,7 @@ where
 #[cfg(feature = "axum-support")]
 use axum::{
     body::{Body, Bytes as AxumBytes},
-    extract::{rejection::JsonRejection, FromRequest, Request},
-    http::{header, StatusCode},
+    extract::{FromRequest, Request},
     response::{IntoResponse, Response},
     Json,
 };
@@ -173,59 +172,202 @@ where
     type Rejection = DumpingJsonRejection;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        if !dumps_enabled() {
-            // Fast path: just delegate to axum::Json.
-            let Json(t) = Json::<T>::from_request(req, state)
-                .await
-                .map_err(DumpingJsonRejection::Json)?;
-            return Ok(DumpingJson(t));
-        }
-
-        // Slow path: buffer body, store, then re-create a request for Json.
+        // The body is buffered unconditionally. `axum::Json` buffers it anyway
+        // (`Bytes::from_request`), and `Bytes` clones are refcount bumps, so
+        // the only cost is cloning the header map — while the gain is that the
+        // rejection path still HAS the body, which is what upstream's
+        // `transformDecodeError` needs to name the kind and version the client
+        // sent (endpoints/handlers/rest.go:245-256).
         let (parts, body) = req.into_parts();
         let bytes = AxumBytes::from_request(Request::from_parts(parts.clone(), body), state)
             .await
             .map_err(|_| DumpingJsonRejection::BodyRead)?;
 
         // Stash in task-local for the panic-hook path.
-        let _ = CURRENT_PAYLOAD.try_with(|cell| {
-            *cell.borrow_mut() = Some(bytes.clone());
-        });
+        if dumps_enabled() {
+            let _ = CURRENT_PAYLOAD.try_with(|cell| {
+                *cell.borrow_mut() = Some(bytes.clone());
+            });
+        }
 
         let rebuilt = Request::from_parts(parts, Body::from(bytes.clone()));
         match Json::<T>::from_request(rebuilt, state).await {
             Ok(Json(t)) => Ok(DumpingJson(t)),
             Err(rej) => {
-                let redacted = redact_secret_like(&bytes);
-                tracing::error!(
-                    rejection = %rej,
-                    payload = %String::from_utf8_lossy(&redacted),
-                    "JSON body decode failed"
-                );
-                Err(DumpingJsonRejection::Json(rej))
+                if dumps_enabled() {
+                    let redacted = redact_secret_like(&bytes);
+                    tracing::error!(
+                        rejection = %rej,
+                        payload = %String::from_utf8_lossy(&redacted),
+                        "JSON body decode failed"
+                    );
+                }
+                Err(DumpingJsonRejection::Decode(transform_decode_error::<T>(
+                    &rej.body_text(),
+                    &bytes,
+                )))
             }
         }
+    }
+}
+
+/// Decode a client-supplied request body, answering a failure the way upstream
+/// does: `transformDecodeError` → `errors.NewBadRequest`, i.e. a `Status` with
+/// `reason: BadRequest` and HTTP 400
+/// (staging/src/k8s.io/apiserver/pkg/endpoints/handlers/rest.go:245-256).
+///
+/// **Use this for every request body decoded by hand.** Handlers that take a
+/// raw `Bytes` body and call `serde_json::from_slice` themselves used to map
+/// the failure to `Error::InvalidResource`, which renders as 422/Invalid — the
+/// code reserved for an object that decoded and then failed validation. Eight
+/// create handlers did that while the rest of the server answered 400, so the
+/// response shape depended on which handler you happened to hit (#1915).
+pub fn decode_request_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> crate::Result<T> {
+    serde_json::from_slice(body)
+        .map_err(|e| crate::Error::BadRequest(transform_decode_error::<T>(&e.to_string(), body)))
+}
+
+/// The structural check a typed decode would have performed, for a handler that
+/// keeps its body as an untyped `serde_json::Value`.
+///
+/// Upstream types every resource, so `{"metadata": "not-an-object"}` never
+/// reaches a handler — the decoder rejects it with `transformDecodeError` →
+/// 400/BadRequest. A handler that decodes into `Value` has no such step, so a
+/// malformed body sails past and surfaces later as a confusing validation error
+/// about a missing name (#1915; the untyped handlers themselves are #1911).
+///
+/// Checks only what every Kubernetes object declares as an object: `metadata`,
+/// `spec` and `status`. `kind` and `apiVersion` are strings and are checked
+/// where they are read.
+pub fn require_object_shape(value: &serde_json::Value, kind: &str) -> crate::Result<()> {
+    for field in ["metadata", "spec", "status"] {
+        match value.get(field) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(v) if v.is_object() => {}
+            Some(v) => {
+                let got = match v {
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Array(_) => "array",
+                    _ => "value",
+                };
+                return Err(crate::Error::BadRequest(format!(
+                    "{kind} in version \"v1\" cannot be handled as a {kind}: \
+                     json: cannot unmarshal {got} into Go struct field {kind}.{field} \
+                     of type v1.{field}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Port of upstream `transformDecodeError`
+/// (staging/src/k8s.io/apiserver/pkg/endpoints/handlers/rest.go:245-256).
+///
+/// Every decode failure becomes `errors.NewBadRequest(...)` — a `Status` with
+/// `reason: BadRequest` and HTTP 400. Which of the two messages you get depends
+/// on whether the body named a `kind`:
+///
+/// ```go
+/// if gvk != nil && len(gvk.Kind) > 0 {
+///     return errors.NewBadRequest(fmt.Sprintf("%s in version %q cannot be handled as a %s: %v", gvk.Kind, gvk.Version, objGVK.Kind, baseErr))
+/// }
+/// summary := summarizeData(body, 30)
+/// return errors.NewBadRequest(fmt.Sprintf("the object provided is unrecognized (must be of type %s): %v (%s)", objGVK.Kind, baseErr, summary))
+/// ```
+///
+/// `objGVK.Kind` is the type the handler is decoding INTO, which is `T` here.
+fn transform_decode_error<T>(base_err: &str, body: &[u8]) -> String {
+    let target = target_kind::<T>();
+
+    // `gvk` upstream comes from the body's own apiVersion/kind, not the path.
+    let parsed: Option<serde_json::Value> = serde_json::from_slice(body).ok();
+    let kind = parsed
+        .as_ref()
+        .and_then(|v| v.get("kind"))
+        .and_then(|k| k.as_str())
+        .filter(|k| !k.is_empty());
+
+    match kind {
+        Some(kind) => {
+            // `gvk.Version` is the version alone: "apps/v1" contributes "v1".
+            let api_version = parsed
+                .as_ref()
+                .and_then(|v| v.get("apiVersion"))
+                .and_then(|a| a.as_str())
+                .unwrap_or("");
+            let version = api_version.rsplit('/').next().unwrap_or("");
+            format!("{kind} in version {version:?} cannot be handled as a {target}: {base_err}")
+        }
+        None => format!(
+            "the object provided is unrecognized (must be of type {target}): {base_err} ({})",
+            summarize_data(body, 30)
+        ),
+    }
+}
+
+/// The bare kind name for `T`, standing in for upstream's
+/// `typer.ObjectKinds(into)`. `std::any::type_name` yields a fully qualified
+/// path, and the last segment is the struct name — which is exactly the
+/// Kubernetes kind for every resource struct in `crate::resources`.
+fn target_kind<T>() -> String {
+    std::any::type_name::<T>()
+        .rsplit("::")
+        .next()
+        .unwrap_or("Object")
+        .to_string()
+}
+
+/// Upstream `summarizeData` (endpoints/handlers/rest.go:355-370): JSON-looking
+/// data is shown as text and truncated with a trailing " ...", anything else is
+/// hex-encoded so a binary body cannot smuggle control characters into an error
+/// message.
+fn summarize_data(data: &[u8], max_length: usize) -> String {
+    if data.is_empty() {
+        return "<empty>".to_string();
+    }
+    if data[0] == b'{' {
+        if data.len() > max_length {
+            return format!("{} ...", String::from_utf8_lossy(&data[..max_length]));
+        }
+        return String::from_utf8_lossy(data).into_owned();
+    }
+    let hex = |d: &[u8]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    if data.len() > max_length {
+        format!("{} ...", hex(&data[..max_length]))
+    } else {
+        hex(data)
     }
 }
 
 #[cfg(feature = "axum-support")]
 #[derive(Debug)]
 pub enum DumpingJsonRejection {
-    Json(JsonRejection),
+    /// A body the decoder could not turn into `T`, already rendered into
+    /// upstream's `transformDecodeError` wording.
+    Decode(String),
     BodyRead,
 }
 
 #[cfg(feature = "axum-support")]
 impl IntoResponse for DumpingJsonRejection {
+    /// Both arms answer with a `Status`, through the same `Error` rendering
+    /// every other failure in the server uses.
+    ///
+    /// Axum's own `JsonRejection` used to be returned verbatim: `text/plain`,
+    /// no `kind`, no `reason`, no `code`, and HTTP **422**. A client-go client
+    /// cannot classify that, `kubectl` prints the raw string, and the status
+    /// code was wrong besides — 422/Invalid is for an object that decoded and
+    /// then failed validation, while a body that never decoded is
+    /// 400/BadRequest (#1915).
     fn into_response(self) -> Response {
         match self {
-            Self::Json(r) => r.into_response(),
-            Self::BodyRead => (
-                StatusCode::BAD_REQUEST,
-                [(header::CONTENT_TYPE, "text/plain")],
-                "failed to read request body",
-            )
-                .into_response(),
+            Self::Decode(message) => crate::Error::BadRequest(message).into_response(),
+            Self::BodyRead => {
+                crate::Error::BadRequest("failed to read request body".to_string()).into_response()
+            }
         }
     }
 }
@@ -234,7 +376,7 @@ impl IntoResponse for DumpingJsonRejection {
 impl std::fmt::Display for DumpingJsonRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Json(r) => write!(f, "{r}"),
+            Self::Decode(m) => write!(f, "{m}"),
             Self::BodyRead => write!(f, "failed to read request body"),
         }
     }

@@ -23,9 +23,7 @@ pub async fn create(
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<ReplicaSet>)> {
-    let mut replicaset: ReplicaSet = serde_json::from_slice(&body).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
-    })?;
+    let mut replicaset: ReplicaSet = rusternetes_common::dump::decode_request_body(&body)?;
     info!(
         "Creating replicaset: {}/{}",
         namespace, replicaset.metadata.name
@@ -130,9 +128,7 @@ pub async fn update(
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Json<ReplicaSet>> {
-    let mut replicaset: ReplicaSet = serde_json::from_slice(&body).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
-    })?;
+    let mut replicaset: ReplicaSet = rusternetes_common::dump::decode_request_body(&body)?;
     info!("Updating replicaset: {}/{}", namespace, name);
 
     // Check if this is a dry-run request
