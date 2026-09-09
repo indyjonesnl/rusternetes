@@ -139,25 +139,12 @@ impl axum::response::IntoResponse for Error {
         // Extract resource name from error message for StatusDetails
         let (status, message, reason, details) = match self {
             Error::NotFound(msg) => {
-                // Sanitize internal storage paths from error messages
-                let clean_msg = if msg.starts_with("/registry/") {
-                    // Convert /registry/resources/namespace/name to "resources \"name\" not found"
-                    let parts: Vec<&str> =
-                        msg.trim_start_matches("/registry/").split('/').collect();
-                    match parts.len() {
-                        3 => format!("{} \"{}\" not found", parts[0], parts[2]),
-                        2 => format!("{} \"{}\" not found", parts[0], parts[1]),
-                        _ => format!("resource not found: {}", parts.last().unwrap_or(&"")),
-                    }
-                } else {
-                    msg.clone()
-                };
-                let details = extract_resource_details(&clean_msg);
-                (StatusCode::NOT_FOUND, clean_msg, "NotFound", details)
+                let (message, details) = resource_error_status(&msg, "not found");
+                (StatusCode::NOT_FOUND, message, "NotFound", details)
             }
             Error::AlreadyExists(msg) => {
-                let details = extract_resource_details(&msg);
-                (StatusCode::CONFLICT, msg, "AlreadyExists", details)
+                let (message, details) = resource_error_status(&msg, "already exists");
+                (StatusCode::CONFLICT, message, "AlreadyExists", details)
             }
             Error::InvalidResource(msg) => {
                 let details = extract_resource_details_for_invalid(&msg);
@@ -262,7 +249,73 @@ impl axum::response::IntoResponse for Error {
     }
 }
 
+/// Recover the `(resource, name)` identity that upstream's error constructors
+/// take as arguments, from whatever a caller happened to put in the error.
+///
+/// Upstream never builds these messages from a storage path — it is handed a
+/// `schema.GroupResource` and a name (`NewNotFound(qualifiedResource, name)`),
+/// so both the message and `Status.details` are derived from the same
+/// structured identity. Rusternetes' storage layer raises `NotFound(key)` /
+/// `AlreadyExists(key)` with the raw `/registry/...` key instead, so the
+/// boundary has to parse it back.
+///
+/// Two accepted inputs:
+/// - a storage key, `/registry/{resource}[/{namespace}]/{name}`;
+/// - a message a handler already rendered, `{resource} "{name}" <suffix>`,
+///   which is re-parsed rather than scraped so `details` stays consistent with
+///   whichever path produced the error.
+#[cfg(feature = "axum-support")]
+fn resource_identity(msg: &str) -> Option<(String, String)> {
+    if let Some(rest) = msg.strip_prefix("/registry/") {
+        let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
+        // The first segment is the resource, the last is the object name; a
+        // namespace may sit between them. Names never contain a slash, so the
+        // last segment is the whole name — including dots, as in
+        // `kube-root-ca.crt`.
+        if parts.len() >= 2 {
+            return Some((parts[0].to_string(), parts[parts.len() - 1].to_string()));
+        }
+        return None;
+    }
+
+    // `configmaps "kube-root-ca.crt" not found`
+    let (resource, rest) = msg.split_once(" \"")?;
+    let name = rest.split('"').next()?;
+    if resource.is_empty() || name.is_empty() || resource.contains(' ') {
+        return None;
+    }
+    Some((resource.to_string(), name.to_string()))
+}
+
+/// Build the `(message, details)` pair for a resource-scoped error, mirroring
+/// `NewNotFound` / `NewAlreadyExists`: the message is
+/// `{resource} "{name}" {suffix}` and `details` carries the resource as `kind`
+/// and the bare object name as `name`.
+///
+/// Falls back to the caller's text when the identity cannot be recovered, so a
+/// free-form message still produces a valid Status rather than a 500.
+#[cfg(feature = "axum-support")]
+fn resource_error_status(msg: &str, suffix: &str) -> (String, Option<crate::types::StatusDetails>) {
+    match resource_identity(msg) {
+        Some((resource, name)) => {
+            let message = format!("{resource} \"{name}\" {suffix}");
+            let details = crate::types::StatusDetails {
+                name: Some(name),
+                group: None,
+                kind: Some(resource),
+                uid: None,
+                causes: None,
+                retry_after_seconds: None,
+            };
+            (message, Some(details))
+        }
+        None => (msg.to_string(), extract_resource_details(msg)),
+    }
+}
+
 /// Extract resource name from error messages and return StatusDetails.
+///
+/// Fallback for messages `resource_identity` cannot parse.
 #[cfg(feature = "axum-support")]
 fn extract_resource_details(msg: &str) -> Option<crate::types::StatusDetails> {
     let name = if let Some(path) = msg.split(": ").last() {
