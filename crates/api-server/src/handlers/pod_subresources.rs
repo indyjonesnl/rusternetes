@@ -182,9 +182,14 @@ async fn check_kubelet_log_response(resp: Response, pod_name: &str) -> Response 
 
     let (_parts, body) = resp.into_parts();
     let text = read_limited(body, KUBELET_ERROR_MAX_READ).await;
+    kubelet_error_response(code, text, pod_name)
+}
 
-    // The three arms of the checker, then `NewGenericServerResponse` for
-    // everything else.
+/// The checker's three arms, then `NewGenericServerResponse` for everything
+/// else. Shared by both log paths: the plain proxy and the websocket fetch
+/// below, which upstream also covers because its websocket reader consumes the
+/// very stream `InputStream` returns — after the checker has run.
+fn kubelet_error_response(code: StatusCode, text: String, pod_name: &str) -> Response {
     match code {
         StatusCode::BAD_REQUEST => Error::BadRequest(text).into_response(),
         // `errors.NewInternalError(fmt.Errorf("%s", bodyText))`, whose message
@@ -392,7 +397,12 @@ pub async fn get_logs(
         // Fetch the kubelet log stream over plain HTTP (same target URL the
         // non-upgrade path proxies). We build a fresh GET so the websocket
         // upgrade headers are not forwarded to the kubelet.
-        let stream = fetch_kubelet_log_stream(&target_url).await?;
+        let stream = match fetch_kubelet_log_stream(&target_url, &name).await? {
+            Ok(stream) => stream,
+            // The kubelet refused: answer the HTTP request with a Status
+            // instead of upgrading and framing the error text as log output.
+            Err(resp) => return Ok(resp),
+        };
 
         return Ok(ws
             .protocols(streaming::LOG_WS_PROTOCOLS)
@@ -442,7 +452,17 @@ fn load_kubelet_client_identity() -> Option<reqwest::Identity> {
     }
 }
 
-async fn fetch_kubelet_log_stream(target_url: &Uri) -> Result<LogByteStream> {
+/// Fetch the kubelet log stream, or the `Response` that must be returned
+/// instead when the kubelet refused.
+///
+/// The websocket path needs the same check as the plain proxy: without it the
+/// kubelet's error text is framed into the websocket as if it were log output,
+/// which is worse than the plain path's bad content type — the client cannot
+/// tell an error from a log line at all.
+async fn fetch_kubelet_log_stream(
+    target_url: &Uri,
+    pod_name: &str,
+) -> Result<std::result::Result<LogByteStream, Response>> {
     // `danger_accept_invalid_certs` mirrors the api-server->kubelet trust model
     // used by the streaming proxy (the kubelet serves a self-signed cert).
     let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(true);
@@ -457,13 +477,31 @@ async fn fetch_kubelet_log_stream(target_url: &Uri) -> Result<LogByteStream> {
         .build()
         .map_err(|e| Error::Internal(format!("failed to build kubelet log client: {e}")))?;
 
-    let resp = client
+    let mut resp = client
         .get(target_url.to_string())
         .send()
         .await
         .map_err(|e| Error::Internal(format!("kubelet log request failed: {e}")))?;
 
-    Ok(Box::pin(resp.bytes_stream()))
+    let code = resp.status();
+    if !(StatusCode::OK..=StatusCode::PARTIAL_CONTENT).contains(&code) {
+        // `io.ReadAll(io.LimitReader(resp.Body, maxReadLength))`, chunk by
+        // chunk so an oversized body is truncated rather than rejected.
+        let mut buf: Vec<u8> = Vec::new();
+        while buf.len() < KUBELET_ERROR_MAX_READ {
+            match resp.chunk().await {
+                Ok(Some(data)) => {
+                    let take = (KUBELET_ERROR_MAX_READ - buf.len()).min(data.len());
+                    buf.extend_from_slice(&data[..take]);
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        return Ok(Err(kubelet_error_response(code, text, pod_name)));
+    }
+
+    Ok(Ok(Box::pin(resp.bytes_stream())))
 }
 
 /// Build the kubelet stream URL for an exec or attach subresource.
