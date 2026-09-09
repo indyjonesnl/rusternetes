@@ -141,6 +141,7 @@ pub async fn create(
     };
 
     // Check authorization
+    let node_auth_ctx = auth_ctx.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "pods")
         .with_namespace(&namespace)
         .with_api_group("");
@@ -151,6 +152,13 @@ pub async fn create(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+
+    // NodeRestriction admission: a node's RBAC rules grant `create` on pods
+    // outright, and this narrows it to a mirror pod bound to itself
+    // (plugin/pkg/admission/noderestriction/admission.go:277-340). A non-node
+    // request passes straight through.
+    crate::handlers::node_restriction::admit_pod_create(&*state.storage, &node_auth_ctx, &pod)
+        .await?;
 
     // Apply SetDefaults_PodSpec / SetDefaults_Container / SetDefaults_Probe
     // BEFORE validation. Upstream defaults the object in the decode/admission
@@ -1111,6 +1119,7 @@ pub async fn delete_pod(
 
     // Check authorization
     let user_for_webhook = auth_ctx.user.clone();
+    let node_auth_ctx = auth_ctx.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "pods")
         .with_namespace(&namespace)
         .with_api_group("")
@@ -1127,6 +1136,12 @@ pub async fn delete_pod(
 
     // Get the pod to check for finalizers
     let pod: Pod = state.storage.get(&key).await?;
+
+    // NodeRestriction admission: a node may delete only a pod bound to itself
+    // (plugin/pkg/admission/noderestriction/admission.go:257-270). It is the
+    // stored pod that decides, so this runs after the read. A non-node request
+    // passes straight through.
+    crate::handlers::node_restriction::admit_pod_delete(&node_auth_ctx, &pod)?;
 
     // Enforce deleteOptions.preconditions.{resourceVersion,uid} before mutating
     // anything. Upstream: pkg/registry/generic/registry/store.go::Delete calls

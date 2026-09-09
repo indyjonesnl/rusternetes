@@ -136,6 +136,7 @@ mod networkpolicy_default_policytypes_test;
 mod networkpolicy_handler_test;
 mod networkpolicy_update_validation_test;
 mod node_handler_test;
+mod node_restriction_test;
 mod openapi_discovery_test;
 mod openapi_v3_proto_test;
 mod patch_cas_retry_test;
