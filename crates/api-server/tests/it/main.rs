@@ -93,6 +93,7 @@ mod endpoints_handler_test;
 mod endpoints_lease_update_validation_test;
 mod endpointslice_handler_test;
 mod event_handler_test;
+mod events_v1_deprecated_fields_test;
 mod eviction_grace_period_test;
 mod finalizer_drain_guard_test;
 mod finalizers_test;

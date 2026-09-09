@@ -39,6 +39,10 @@ fn base_event() -> Event {
         reporting_instance: None,
         note: None,
         regarding: None,
+        deprecated_source: None,
+        deprecated_first_timestamp: None,
+        deprecated_last_timestamp: None,
+        deprecated_count: None,
         extra: None,
     }
 }

@@ -764,28 +764,15 @@ pub async fn create_events_v1(
     event.metadata.ensure_uid();
     event.api_version = "events.k8s.io/v1".to_string();
 
-    // Map the events.k8s.io/v1 `regarding`/`note` aliases onto the core
-    // `involvedObject`/`message` fields BEFORE validation: the strict
-    // validator reads `involvedObject.namespace` and `message`/`note` length.
-    // Crucially we do NOT yet copy `reportingController` into `source` — strict
+    // Convert the events.k8s.io/v1 body onto the core field names BEFORE
+    // validation: the strict validator reads `involvedObject.namespace`,
+    // `message`/`note` length, and requires `source`, `firstTimestamp`,
+    // `lastTimestamp` and `count` — which arrive as `deprecated*` on this
+    // version — to be unset (#1914).
+    // Crucially we do NOT yet copy `reportingController` into `source`: strict
     // validation requires `source` to be unset, and the client legitimately
     // leaves it empty.
-    if event.message.is_empty() {
-        if let Some(ref note) = event.note {
-            event.message = note.clone();
-        }
-    }
-    if event
-        .involved_object
-        .name
-        .as_deref()
-        .unwrap_or("")
-        .is_empty()
-    {
-        if let Some(ref regarding) = event.regarding {
-            event.involved_object = regarding.clone();
-        }
-    }
+    event.convert_from_events_v1();
 
     if event.metadata.name.is_empty() {
         let name = Event::generate_name(&event.involved_object, &event.reason);
@@ -883,29 +870,15 @@ pub async fn update_events_v1(
         }
     }
 
-    // Map events.k8s.io/v1 fields to core/v1 equivalents. On the update path
-    // we back-fill `source.component` from `reportingController` to mirror how
+    // Convert the events.k8s.io/v1 body onto the core field names, then
+    // back-fill `source.component` from `reportingController` to mirror how
     // the stored event was normalised at create time, so the strict update
-    // immutability check on `source` compares like with like.
+    // immutability check on `source` compares like with like. The back-fill
+    // runs second so an explicit `deprecatedSource` still wins.
+    event.convert_from_events_v1();
     if event.source.component.is_empty() {
         if let Some(ref rc) = event.reporting_component {
             event.source.component = rc.clone();
-        }
-    }
-    if event.message.is_empty() {
-        if let Some(ref note) = event.note {
-            event.message = note.clone();
-        }
-    }
-    if event
-        .involved_object
-        .name
-        .as_deref()
-        .unwrap_or("")
-        .is_empty()
-    {
-        if let Some(ref regarding) = event.regarding {
-            event.involved_object = regarding.clone();
         }
     }
 

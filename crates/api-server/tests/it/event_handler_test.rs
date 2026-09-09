@@ -45,6 +45,10 @@ fn create_test_event(name: &str, namespace: &str) -> Event {
         reporting_instance: None,
         note: None,
         regarding: None,
+        deprecated_source: None,
+        deprecated_first_timestamp: None,
+        deprecated_last_timestamp: None,
+        deprecated_count: None,
         extra: None,
     }
 }
