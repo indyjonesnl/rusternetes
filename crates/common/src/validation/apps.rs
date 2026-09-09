@@ -15,6 +15,7 @@
 //! <https://github.com/kubernetes/kubernetes/blob/release-1.35/pkg/apis/apps/validation/validation.go>
 
 use crate::resources::deployment::{Deployment, DeploymentStrategy, RollingUpdateDeployment};
+use crate::resources::policy::IntOrString;
 use crate::resources::workloads::{
     DaemonSet, DaemonSetSpec, ReplicaSet, ReplicaSetSpec, StatefulSet, StatefulSetSpec,
 };
@@ -127,8 +128,8 @@ fn percent_format_error() -> String {
 
 /// Upstream `getPercentValue` (`pkg/apis/apps/validation/validation.go:562-571`):
 /// only a String that passes `IsValidPercent` yields a percentage.
-fn percent_value(v: &serde_json::Value) -> Option<i64> {
-    let serde_json::Value::String(s) = v else {
+fn percent_value(v: &IntOrString) -> Option<i64> {
+    let IntOrString::String(s) = v else {
         return None;
     };
     if !is_valid_percent(s) {
@@ -144,25 +145,21 @@ fn percent_value(v: &serde_json::Value) -> Option<i64> {
 /// so a malformed `"2"` still reports 2 here even though
 /// `ValidatePositiveIntOrPercent` rejects its format. Both behaviours are
 /// upstream's, and the zero/non-zero switch depends on this leniency.
-fn int_or_percent_value(v: &serde_json::Value) -> i64 {
+fn int_or_percent_value(v: &IntOrString) -> i64 {
     if let Some(pct) = percent_value(v) {
         return pct;
     }
     match v {
-        serde_json::Value::Number(n) => n.as_i64().unwrap_or(0),
-        serde_json::Value::String(s) => s.parse::<i64>().unwrap_or(0),
-        _ => 0,
+        IntOrString::Int(i) => *i as i64,
+        IntOrString::String(s) => s.parse::<i64>().unwrap_or(0),
     }
 }
 
 /// Render an int-or-string the way upstream's `IntOrString.String()` does, for
 /// the `bad_value` of an error.
-fn int_or_percent_display(v: &serde_json::Value) -> BadValue {
-    match v {
-        serde_json::Value::String(s) => BadValue::Stringer(s.clone()),
-        serde_json::Value::Number(n) => BadValue::Stringer(n.to_string()),
-        other => BadValue::Stringer(other.to_string()),
-    }
+fn int_or_percent_display(v: &IntOrString) -> BadValue {
+    // `IntOrString::Display` is already upstream's `String()`.
+    BadValue::Stringer(v.to_string())
 }
 
 /// Mirrors upstream `ValidatePositiveIntOrPercent`
@@ -179,10 +176,10 @@ fn int_or_percent_display(v: &serde_json::Value) -> BadValue {
 /// Returns `(is_zero, errors)`, where `is_zero` comes from
 /// `int_or_percent_value` so it matches upstream's `getIntOrPercentValue` even
 /// for a value whose format was just rejected.
-fn validate_positive_int_or_percent(v: &serde_json::Value, fld_path: &Path) -> (bool, ErrorList) {
+fn validate_positive_int_or_percent(v: &IntOrString, fld_path: &Path) -> (bool, ErrorList) {
     let mut errs: ErrorList = Vec::new();
     match v {
-        serde_json::Value::String(s) => {
+        IntOrString::String(s) => {
             if !is_valid_percent(s) {
                 errs.push(Error::invalid(
                     fld_path,
@@ -191,21 +188,15 @@ fn validate_positive_int_or_percent(v: &serde_json::Value, fld_path: &Path) -> (
                 ));
             }
         }
-        serde_json::Value::Number(n) => {
-            let i = n.as_i64().unwrap_or(0);
-            if i < 0 {
+        IntOrString::Int(i) => {
+            if *i < 0 {
                 errs.push(Error::invalid(
                     fld_path,
-                    i,
+                    *i,
                     "must be greater than or equal to 0",
                 ));
             }
         }
-        other => errs.push(Error::invalid(
-            fld_path,
-            int_or_percent_display(other),
-            "must be an integer or percentage (e.g '5%')",
-        )),
     }
     (int_or_percent_value(v) == 0, errs)
 }
@@ -214,7 +205,7 @@ fn validate_positive_int_or_percent(v: &serde_json::Value, fld_path: &Path) -> (
 /// (`pkg/apis/apps/validation/validation.go:583-591`): only a *valid* percent
 /// string is bounded, and only above 100. Integers and malformed strings are
 /// left to `ValidatePositiveIntOrPercent`.
-fn is_not_more_than_100_percent(v: &serde_json::Value, fld_path: &Path) -> ErrorList {
+fn is_not_more_than_100_percent(v: &IntOrString, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if let Some(val) = percent_value(v) {
         if val > 100 {
@@ -787,25 +778,20 @@ fn validate_daemonset_spec(spec: &DaemonSetSpec, fld_path: &Path) -> ErrorList {
 
                     let mut max_unavailable_zero = true;
                     if let Some(mu) = &ru.max_unavailable {
-                        let v = mu.to_json();
-                        let (is_zero, sub) =
-                            validate_positive_int_or_percent(&v, &ru_path.child("maxUnavailable"));
+                        let path = ru_path.child("maxUnavailable");
+                        let (is_zero, sub) = validate_positive_int_or_percent(mu, &path);
                         max_unavailable_zero = is_zero;
                         errs.extend(sub);
-                        errs.extend(is_not_more_than_100_percent(
-                            &v,
-                            &ru_path.child("maxUnavailable"),
-                        ));
+                        errs.extend(is_not_more_than_100_percent(mu, &path));
                     }
 
                     let mut max_surge_zero = true;
                     if let Some(ms) = &ru.max_surge {
-                        let v = ms.to_json();
-                        let (is_zero, sub) =
-                            validate_positive_int_or_percent(&v, &ru_path.child("maxSurge"));
+                        let path = ru_path.child("maxSurge");
+                        let (is_zero, sub) = validate_positive_int_or_percent(ms, &path);
                         max_surge_zero = is_zero;
                         errs.extend(sub);
-                        errs.extend(is_not_more_than_100_percent(&v, &ru_path.child("maxSurge")));
+                        errs.extend(is_not_more_than_100_percent(ms, &path));
                     }
 
                     // Exactly one of maxSurge / maxUnavailable must be non-zero.

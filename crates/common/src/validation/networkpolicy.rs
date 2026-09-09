@@ -12,6 +12,7 @@ use std::str::FromStr;
 use crate::resources::networking::{
     IPBlock, NetworkPolicy, NetworkPolicyPeer, NetworkPolicyPort, NetworkPolicySpec,
 };
+use crate::resources::policy::IntOrString;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
     is_dns1123_label, validate_label_selector, LabelSelectorValidationOptions,
@@ -102,8 +103,8 @@ fn validate_port(port: &NetworkPolicyPort, fld_path: &Path) -> ErrorList {
                 ));
             }
         }
-        Some(serde_json::Value::Number(n)) => {
-            let p = n.as_i64().unwrap_or(0);
+        Some(IntOrString::Int(n)) => {
+            let p = *n as i64;
             if !(MIN_PORT..=MAX_PORT).contains(&p) {
                 errs.push(Error::invalid(
                     &fld_path.child("port"),
@@ -128,7 +129,7 @@ fn validate_port(port: &NetworkPolicyPort, fld_path: &Path) -> ErrorList {
                 }
             }
         }
-        Some(serde_json::Value::String(s)) => {
+        Some(IntOrString::String(s)) => {
             if let Some(ep) = port.end_port {
                 errs.push(Error::invalid(
                     &fld_path.child("endPort"),
@@ -143,12 +144,11 @@ fn validate_port(port: &NetworkPolicyPort, fld_path: &Path) -> ErrorList {
                     "must be an IANA_SVC_NAME (at most 15 characters, matching regex [a-z0-9]([a-z0-9-]*[a-z0-9])* and it must contain at least one letter [a-z])",
                 ));
             }
-        }
-        Some(_) => errs.push(Error::invalid(
-            &fld_path.child("port"),
-            "<non-port>".to_string(),
-            "must be an integer or string",
-        )),
+        } // No catch-all arm: `IntOrString` has exactly the two variants
+          // upstream's `intstr.IntOrString` can hold, so "must be an integer or
+          // string" is now unrepresentable rather than a runtime check. The old
+          // `serde_json::Value` type could carry `true`, `[]`, `{}` or a float
+          // this far.
     }
 
     errs

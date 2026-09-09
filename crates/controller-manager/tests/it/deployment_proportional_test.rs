@@ -33,8 +33,10 @@ fn rolling_update_strategy(max_surge: i64, max_unavailable: i64) -> deployment::
     deployment::DeploymentStrategy {
         strategy_type: "RollingUpdate".to_string(),
         rolling_update: Some(deployment::RollingUpdateDeployment {
-            max_surge: Some(serde_json::Value::from(max_surge)),
-            max_unavailable: Some(serde_json::Value::from(max_unavailable)),
+            // Integers, so the Int variant — the old `Value::from(i64)` also
+            // encoded a JSON number here.
+            max_surge: Some(IntOrString::Int(max_surge as i32)),
+            max_unavailable: Some(IntOrString::Int(max_unavailable as i32)),
         }),
     }
 }

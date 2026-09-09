@@ -306,8 +306,8 @@ pub fn apply_deployment_defaults(deploy: &mut rusternetes_common::resources::Dep
         deploy.spec.strategy = Some(DeploymentStrategy {
             strategy_type: "RollingUpdate".to_string(),
             rolling_update: Some(RollingUpdateDeployment {
-                max_unavailable: Some(serde_json::json!("25%")),
-                max_surge: Some(serde_json::json!("25%")),
+                max_unavailable: Some(IntOrString::String("25%".to_string())),
+                max_surge: Some(IntOrString::String("25%".to_string())),
             }),
         });
     } else if let Some(ref mut strategy) = deploy.spec.strategy {
@@ -317,15 +317,15 @@ pub fn apply_deployment_defaults(deploy: &mut rusternetes_common::resources::Dep
         if strategy.strategy_type == "RollingUpdate" {
             if strategy.rolling_update.is_none() {
                 strategy.rolling_update = Some(RollingUpdateDeployment {
-                    max_unavailable: Some(serde_json::json!("25%")),
-                    max_surge: Some(serde_json::json!("25%")),
+                    max_unavailable: Some(IntOrString::String("25%".to_string())),
+                    max_surge: Some(IntOrString::String("25%".to_string())),
                 });
             } else if let Some(ref mut ru) = strategy.rolling_update {
                 if ru.max_unavailable.is_none() {
-                    ru.max_unavailable = Some(serde_json::json!("25%"));
+                    ru.max_unavailable = Some(IntOrString::String("25%".to_string()));
                 }
                 if ru.max_surge.is_none() {
-                    ru.max_surge = Some(serde_json::json!("25%"));
+                    ru.max_surge = Some(IntOrString::String("25%".to_string()));
                 }
             }
         }
