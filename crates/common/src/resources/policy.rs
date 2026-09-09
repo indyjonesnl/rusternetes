@@ -310,6 +310,21 @@ pub enum IntOrString {
     String(String),
 }
 
+impl IntOrString {
+    /// Encode the way upstream `intstr.MarshalJSON`
+    /// (`apimachinery/pkg/util/intstr/intstr.go`) does: an `Int` becomes a JSON
+    /// **number**, a `String` a JSON **string**. Callers that need to inspect
+    /// the value (validation, defaulting) must go through this rather than
+    /// stringifying, so the int-vs-string discriminator Go clients depend on is
+    /// never flattened away.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            IntOrString::Int(i) => serde_json::Value::Number((*i).into()),
+            IntOrString::String(s) => serde_json::Value::String(s.clone()),
+        }
+    }
+}
+
 impl std::fmt::Display for IntOrString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

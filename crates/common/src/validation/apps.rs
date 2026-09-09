@@ -739,7 +739,7 @@ fn validate_daemonset_spec(spec: &DaemonSetSpec, fld_path: &Path) -> ErrorList {
 
                     let mut max_unavailable_zero = true;
                     if let Some(mu) = &ru.max_unavailable {
-                        let v = serde_json::Value::String(mu.clone());
+                        let v = mu.to_json();
                         let (is_zero, sub) =
                             validate_positive_int_or_percent(&v, &ru_path.child("maxUnavailable"));
                         max_unavailable_zero = is_zero;
@@ -752,7 +752,7 @@ fn validate_daemonset_spec(spec: &DaemonSetSpec, fld_path: &Path) -> ErrorList {
 
                     let mut max_surge_zero = true;
                     if let Some(ms) = &ru.max_surge {
-                        let v = serde_json::Value::String(ms.clone());
+                        let v = ms.to_json();
                         let (is_zero, sub) =
                             validate_positive_int_or_percent(&v, &ru_path.child("maxSurge"));
                         max_surge_zero = is_zero;
@@ -764,7 +764,10 @@ fn validate_daemonset_spec(spec: &DaemonSetSpec, fld_path: &Path) -> ErrorList {
                     if !max_unavailable_zero && !max_surge_zero {
                         errs.push(Error::invalid(
                             &ru_path.child("maxSurge"),
-                            ru.max_surge.clone().unwrap_or_default(),
+                            ru.max_surge
+                                .as_ref()
+                                .map(|ms| ms.to_string())
+                                .unwrap_or_default(),
                             "may not be set when maxUnavailable is non-zero",
                         ));
                     } else if max_unavailable_zero && max_surge_zero {

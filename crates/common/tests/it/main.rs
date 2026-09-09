@@ -13,6 +13,7 @@ mod authz_rbac_node;
 mod crd_jsonschemaprops_roundtrip_test;
 mod decode_parity;
 mod fuzz_roundtrip_jsonproto_test;
+mod intorstring_lossy_type_guard;
 mod ipaddress_test;
 mod k8s_openapi_parity;
 mod list_empty_items_invariant_test;

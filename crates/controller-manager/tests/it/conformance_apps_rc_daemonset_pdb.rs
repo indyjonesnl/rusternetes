@@ -469,7 +469,7 @@ async fn daemonset_rolling_update_replaces_pods_on_template_change() {
     ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
         strategy_type: Some("RollingUpdate".to_string()),
         rolling_update: Some(RollingUpdateDaemonSet {
-            max_unavailable: Some("1".to_string()),
+            max_unavailable: Some(rusternetes_common::resources::policy::IntOrString::Int(1)),
             max_surge: None,
         }),
     });
@@ -539,7 +539,7 @@ async fn daemonset_should_rollback_without_unnecessary_restarts() {
     ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
         strategy_type: Some("RollingUpdate".to_string()),
         rolling_update: Some(RollingUpdateDaemonSet {
-            max_unavailable: Some("1".to_string()),
+            max_unavailable: Some(rusternetes_common::resources::policy::IntOrString::Int(1)),
             max_surge: None,
         }),
     });

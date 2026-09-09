@@ -113,6 +113,7 @@ mod integration_pods_topology_labels;
 mod integration_secrets_lifecycle;
 mod integration_serviceaccount_token;
 mod integration_watch_rv_test;
+mod intorstring_roundtrip_test;
 mod job_defaults_test;
 mod job_handler_test;
 mod lease_handler_test;
