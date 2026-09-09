@@ -41,6 +41,40 @@ fn negative_hard_quantity_rejected() {
     );
 }
 
+/// #1907 proposed switching every Quantity bad value to the "render unquoted"
+/// form that #1903 introduced for `IntOrString`. That would have been wrong in
+/// both directions, and this pins why.
+///
+/// `resource.Quantity` has a `MarshalJSON`, so upstream's `ErrorBody()` renders
+/// it through the `default:` arm's `json.Marshal`
+/// (`staging/src/k8s.io/apimachinery/pkg/util/validation/field/errors.go:92-97`)
+/// and never reaches the `fmt.Stringer` fallback — which is only taken when
+/// marshalling *errors*. Running upstream's own `ErrorBody()` on the pinned
+/// checkout:
+///
+/// ```text
+/// resource.MustParse("-1")  => Invalid value: "-1": some detail
+/// resource.MustParse("2Gi") => Invalid value: "2Gi": some detail
+/// ```
+///
+/// Quoted. Our quantity validators pass the raw string through
+/// `BadValue::String`, which quotes, so they were already correct and #1907's
+/// change would have broken them. The unquoted form the issue cites comes from
+/// the kustomize fork of `field.Error`, not apimachinery.
+#[test]
+fn a_quantity_bad_value_renders_quoted_in_the_error_body() {
+    let errs = validate_resource_quota(&rq(json!({"hard": {"cpu": "-1"}})));
+    let e = errs
+        .iter()
+        .find(|e| e.field == "spec.hard[cpu]")
+        .unwrap_or_else(|| panic!("expected a spec.hard[cpu] error, got: {errs:?}"));
+    assert_eq!(
+        e.error_body(),
+        "Invalid value: \"-1\": must be greater than or equal to 0",
+        "upstream: `resource.MustParse(\"-1\")` => `Invalid value: \"-1\"`"
+    );
+}
+
 // Note: a syntactically-invalid hard quantity (e.g. "lots") is rejected at
 // deserialization, before this validator runs — so the `Quantity::parse` Err
 // arm is a backstop the API path can't reach (not unit-tested via `from_value`).
