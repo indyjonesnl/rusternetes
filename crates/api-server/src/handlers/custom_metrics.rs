@@ -6,14 +6,22 @@ use axum::{
 use chrono::Utc;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
-    resources::custom_metrics::{
-        ListMetadata, MetricSelector, MetricValue, MetricValueList, ObjectReference,
-    },
+    resources::custom_metrics::{MetricSelector, MetricValue, MetricValueList, ObjectReference},
     Result,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+/// TypeMeta for the custom-metrics group. Flattened into the value/list structs
+/// since #1916, so a response still names its type while a body that omits
+/// apiVersion/kind still decodes.
+fn metric_value_type_meta(kind: &str) -> rusternetes_common::types::TypeMeta {
+    rusternetes_common::types::TypeMeta {
+        api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
+        kind: kind.to_string(),
+    }
+}
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Deserialize)]
@@ -76,8 +84,7 @@ pub async fn get_custom_metric(
     };
 
     let metric_value = MetricValue {
-        api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
-        kind: "MetricValue".to_string(),
+        type_meta: metric_value_type_meta("MetricValue"),
         described_object: ObjectReference {
             kind: capitalize(&resource_type),
             namespace: Some(namespace),
@@ -155,8 +162,7 @@ pub async fn list_custom_metrics(
                 let values: Vec<MetricValue> = metric_map
                     .into_iter()
                     .map(|(resource_name, value)| MetricValue {
-                        api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
-                        kind: "MetricValue".to_string(),
+                        type_meta: metric_value_type_meta("MetricValue"),
                         described_object: ObjectReference {
                             kind: capitalize(&resource_type),
                             namespace: Some(namespace.clone()),
@@ -185,8 +191,7 @@ pub async fn list_custom_metrics(
         // Fallback mock values when Prometheus is not configured
         vec![
             MetricValue {
-                api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
-                kind: "MetricValue".to_string(),
+                type_meta: metric_value_type_meta("MetricValue"),
                 described_object: ObjectReference {
                     kind: capitalize(&resource_type),
                     namespace: Some(namespace.clone()),
@@ -200,8 +205,7 @@ pub async fn list_custom_metrics(
                 selector: selector.clone(),
             },
             MetricValue {
-                api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
-                kind: "MetricValue".to_string(),
+                type_meta: metric_value_type_meta("MetricValue"),
                 described_object: ObjectReference {
                     kind: capitalize(&resource_type),
                     namespace: Some(namespace.clone()),
@@ -218,14 +222,10 @@ pub async fn list_custom_metrics(
     };
 
     let metric_list = MetricValueList {
-        api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
-        kind: "MetricValueList".to_string(),
-        metadata: ListMetadata {
-            self_link: Some(format!(
-                "/apis/custom.metrics.k8s.io/v1beta2/namespaces/{}/{}/*/{}",
-                namespace, resource_type, metric_name
-            )),
-        },
+        type_meta: metric_value_type_meta("MetricValueList"),
+        // `metav1.ListMeta`. The bespoke predecessor carried only `selfLink`,
+        // which upstream stopped populating on every object in 1.20 (#1916).
+        metadata: rusternetes_common::types::ListMeta::default(),
         items,
     };
 
@@ -271,8 +271,7 @@ pub async fn get_namespace_metric(
     };
 
     let metric_value = MetricValue {
-        api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
-        kind: "MetricValue".to_string(),
+        type_meta: metric_value_type_meta("MetricValue"),
         described_object: ObjectReference {
             kind: "Namespace".to_string(),
             namespace: None,
@@ -336,8 +335,7 @@ pub async fn get_cluster_metric(
     };
 
     let metric_value = MetricValue {
-        api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
-        kind: "MetricValue".to_string(),
+        type_meta: metric_value_type_meta("MetricValue"),
         described_object: ObjectReference {
             kind: capitalize(&resource_type),
             namespace: None,

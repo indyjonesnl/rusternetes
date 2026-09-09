@@ -3,6 +3,7 @@
 // Mirrors k8s.io/metrics/pkg/apis/external_metrics/v1beta1. The HPA controller
 // reads these for the `External` metric type — values not associated with any
 // Kubernetes object (e.g. a cloud queue depth).
+use crate::types::{ListMeta, TypeMeta};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -11,8 +12,10 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalMetricValue {
-    pub api_version: String,
-    pub kind: String,
+    /// `metav1.TypeMeta` (`metrics/pkg/apis/external_metrics/types.go:40-41`);
+    /// no ObjectMeta upstream. Required-at-decode before #1916.
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
     /// The name of the metric.
     pub metric_name: String,
     /// The labels for the metric.
@@ -34,9 +37,13 @@ pub struct ExternalMetricValue {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalMetricValueList {
-    pub api_version: String,
-    pub kind: String,
-    pub metadata: super::custom_metrics::ListMetadata,
+    /// `metav1.TypeMeta` + `metav1.ListMeta`, as the custom-metrics list
+    /// (`metrics/pkg/apis/external_metrics/types.go:62-69`).
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+
+    #[serde(default)]
+    pub metadata: ListMeta,
     pub items: Vec<ExternalMetricValue>,
 }
 
@@ -59,12 +66,16 @@ mod tests {
     #[test]
     fn external_metric_value_list_round_trips() {
         let list = ExternalMetricValueList {
-            api_version: "external.metrics.k8s.io/v1beta1".to_string(),
-            kind: "ExternalMetricValueList".to_string(),
-            metadata: super::super::custom_metrics::ListMetadata { self_link: None },
-            items: vec![ExternalMetricValue {
+            type_meta: TypeMeta {
                 api_version: "external.metrics.k8s.io/v1beta1".to_string(),
-                kind: "ExternalMetricValue".to_string(),
+                kind: "ExternalMetricValueList".to_string(),
+            },
+            metadata: ListMeta::default(),
+            items: vec![ExternalMetricValue {
+                type_meta: TypeMeta {
+                    api_version: "external.metrics.k8s.io/v1beta1".to_string(),
+                    kind: "ExternalMetricValue".to_string(),
+                },
                 metric_name: "queue_depth".to_string(),
                 metric_labels: Some(BTreeMap::from([(
                     "queue".to_string(),

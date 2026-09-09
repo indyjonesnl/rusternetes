@@ -6,12 +6,28 @@ use axum::{
 use chrono::Utc;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
-    resources::{
-        ContainerMetrics, NodeMetrics, NodeMetricsMetadata, PodMetrics, PodMetricsMetadata,
-    },
+    resources::{ContainerMetrics, NodeMetrics, PodMetrics},
     List, Result,
 };
 use rusternetes_storage::{build_key, build_prefix, Storage};
+
+/// `metrics.k8s.io/v1beta1` NodeMetrics TypeMeta. Flattened into the struct
+/// since #1916, so responses still name their type while a body that omits it
+/// still decodes.
+fn node_metrics_type_meta() -> rusternetes_common::types::TypeMeta {
+    rusternetes_common::types::TypeMeta {
+        api_version: "metrics.k8s.io/v1beta1".to_string(),
+        kind: "NodeMetrics".to_string(),
+    }
+}
+
+/// As [`node_metrics_type_meta`], for PodMetrics.
+fn pod_metrics_type_meta() -> rusternetes_common::types::TypeMeta {
+    rusternetes_common::types::TypeMeta {
+        api_version: "metrics.k8s.io/v1beta1".to_string(),
+        kind: "PodMetrics".to_string(),
+    }
+}
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -79,12 +95,10 @@ async fn pod_metrics_or_fallback<S: Storage>(
         return metrics;
     }
     PodMetrics {
-        api_version: "metrics.k8s.io/v1beta1".to_string(),
-        kind: "PodMetrics".to_string(),
-        metadata: PodMetricsMetadata {
-            name: name.clone(),
-            namespace: namespace.to_string(),
+        type_meta: pod_metrics_type_meta(),
+        metadata: rusternetes_common::types::ObjectMeta {
             creation_timestamp: Some(Utc::now()),
+            ..rusternetes_common::types::ObjectMeta::new(name.clone()).with_namespace(namespace)
         },
         timestamp: Utc::now(),
         window: "30s".to_string(),
@@ -129,11 +143,10 @@ pub async fn get_node_metrics(
             usage.insert("cpu".to_string(), "0m".to_string());
             usage.insert("memory".to_string(), "0Mi".to_string());
             Ok(Json(NodeMetrics {
-                api_version: "metrics.k8s.io/v1beta1".to_string(),
-                kind: "NodeMetrics".to_string(),
-                metadata: NodeMetricsMetadata {
-                    name,
+                type_meta: node_metrics_type_meta(),
+                metadata: rusternetes_common::types::ObjectMeta {
                     creation_timestamp: Some(Utc::now()),
+                    ..rusternetes_common::types::ObjectMeta::new(name)
                 },
                 timestamp: Utc::now(),
                 window: "30s".to_string(),
@@ -178,11 +191,10 @@ pub async fn list_node_metrics(
             usage.insert("cpu".to_string(), "0m".to_string());
             usage.insert("memory".to_string(), "0Mi".to_string());
             metrics_list.push(NodeMetrics {
-                api_version: "metrics.k8s.io/v1beta1".to_string(),
-                kind: "NodeMetrics".to_string(),
-                metadata: NodeMetricsMetadata {
-                    name: node.metadata.name.clone(),
+                type_meta: node_metrics_type_meta(),
+                metadata: rusternetes_common::types::ObjectMeta {
                     creation_timestamp: Some(Utc::now()),
+                    ..rusternetes_common::types::ObjectMeta::new(node.metadata.name.clone())
                 },
                 timestamp: Utc::now(),
                 window: "30s".to_string(),

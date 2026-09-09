@@ -1,4 +1,5 @@
 // Metrics API Resources (metrics.k8s.io/v1beta1)
+use crate::types::{ObjectMeta, TypeMeta};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -7,9 +8,16 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeMetrics {
-    pub api_version: String,
-    pub kind: String,
-    pub metadata: NodeMetricsMetadata,
+    /// `metav1.TypeMeta` + `metav1.ObjectMeta`, as upstream
+    /// (`staging/src/k8s.io/metrics/pkg/apis/metrics/types.go:31-45`). Both were
+    /// bespoke here: `apiVersion`/`kind` were required at decode time, and
+    /// `metadata` was a three-field struct that dropped labels, annotations,
+    /// uid and resourceVersion (#1916).
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+
+    #[serde(default)]
+    pub metadata: ObjectMeta,
     #[serde(
         serialize_with = "crate::types::k8s_time_required::serialize",
         deserialize_with = "crate::types::k8s_time_required::deserialize"
@@ -19,26 +27,17 @@ pub struct NodeMetrics {
     pub usage: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeMetricsMetadata {
-    pub name: String,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "crate::types::k8s_time::serialize",
-        deserialize_with = "crate::types::k8s_time::deserialize"
-    )]
-    pub creation_timestamp: Option<DateTime<Utc>>,
-}
-
 /// PodMetrics contains resource usage metrics for a pod
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PodMetrics {
-    pub api_version: String,
-    pub kind: String,
-    pub metadata: PodMetricsMetadata,
+    /// See [`NodeMetrics`] — same upstream shape
+    /// (`metrics/pkg/apis/metrics/types.go:60-77`).
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+
+    #[serde(default)]
+    pub metadata: ObjectMeta,
     #[serde(
         serialize_with = "crate::types::k8s_time_required::serialize",
         deserialize_with = "crate::types::k8s_time_required::deserialize"
@@ -46,20 +45,6 @@ pub struct PodMetrics {
     pub timestamp: DateTime<Utc>,
     pub window: String,
     pub containers: Vec<ContainerMetrics>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct PodMetricsMetadata {
-    pub name: String,
-    pub namespace: String,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "crate::types::k8s_time::serialize",
-        deserialize_with = "crate::types::k8s_time::deserialize"
-    )]
-    pub creation_timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -88,11 +73,13 @@ mod tests {
     #[test]
     fn test_node_metrics_serialization() {
         let node_metrics = NodeMetrics {
-            api_version: "metrics.k8s.io/v1beta1".to_string(),
-            kind: "NodeMetrics".to_string(),
-            metadata: NodeMetricsMetadata {
-                name: "node-1".to_string(),
+            type_meta: TypeMeta {
+                api_version: "metrics.k8s.io/v1beta1".to_string(),
+                kind: "NodeMetrics".to_string(),
+            },
+            metadata: ObjectMeta {
                 creation_timestamp: Some(fixed_time()),
+                ..ObjectMeta::new("node-1")
             },
             timestamp: fixed_time(),
             window: "30s".to_string(),
@@ -110,12 +97,13 @@ mod tests {
     #[test]
     fn test_pod_metrics_serialization() {
         let pod_metrics = PodMetrics {
-            api_version: "metrics.k8s.io/v1beta1".to_string(),
-            kind: "PodMetrics".to_string(),
-            metadata: PodMetricsMetadata {
-                name: "test-pod".to_string(),
-                namespace: "default".to_string(),
+            type_meta: TypeMeta {
+                api_version: "metrics.k8s.io/v1beta1".to_string(),
+                kind: "PodMetrics".to_string(),
+            },
+            metadata: ObjectMeta {
                 creation_timestamp: Some(fixed_time()),
+                ..ObjectMeta::new("test-pod").with_namespace("default")
             },
             timestamp: fixed_time(),
             window: "30s".to_string(),
@@ -136,40 +124,37 @@ mod tests {
     #[test]
     fn test_node_metrics_fields() {
         let node_metrics = NodeMetrics {
-            api_version: "metrics.k8s.io/v1beta1".to_string(),
-            kind: "NodeMetrics".to_string(),
-            metadata: NodeMetricsMetadata {
-                name: "node-1".to_string(),
-                creation_timestamp: None,
+            type_meta: TypeMeta {
+                api_version: "metrics.k8s.io/v1beta1".to_string(),
+                kind: "NodeMetrics".to_string(),
             },
+            metadata: ObjectMeta::new("node-1"),
             timestamp: fixed_time(),
             window: "30s".to_string(),
             usage: BTreeMap::new(),
         };
 
-        assert_eq!(node_metrics.api_version, "metrics.k8s.io/v1beta1");
-        assert_eq!(node_metrics.kind, "NodeMetrics");
+        assert_eq!(node_metrics.type_meta.api_version, "metrics.k8s.io/v1beta1");
+        assert_eq!(node_metrics.type_meta.kind, "NodeMetrics");
         assert_eq!(node_metrics.metadata.name, "node-1");
     }
 
     #[test]
     fn test_pod_metrics_fields() {
         let pod_metrics = PodMetrics {
-            api_version: "metrics.k8s.io/v1beta1".to_string(),
-            kind: "PodMetrics".to_string(),
-            metadata: PodMetricsMetadata {
-                name: "test-pod".to_string(),
-                namespace: "default".to_string(),
-                creation_timestamp: None,
+            type_meta: TypeMeta {
+                api_version: "metrics.k8s.io/v1beta1".to_string(),
+                kind: "PodMetrics".to_string(),
             },
+            metadata: ObjectMeta::new("test-pod").with_namespace("default"),
             timestamp: fixed_time(),
             window: "30s".to_string(),
             containers: vec![],
         };
 
-        assert_eq!(pod_metrics.api_version, "metrics.k8s.io/v1beta1");
-        assert_eq!(pod_metrics.kind, "PodMetrics");
+        assert_eq!(pod_metrics.type_meta.api_version, "metrics.k8s.io/v1beta1");
+        assert_eq!(pod_metrics.type_meta.kind, "PodMetrics");
         assert_eq!(pod_metrics.metadata.name, "test-pod");
-        assert_eq!(pod_metrics.metadata.namespace, "default");
+        assert_eq!(pod_metrics.metadata.namespace.as_deref(), Some("default"));
     }
 }
