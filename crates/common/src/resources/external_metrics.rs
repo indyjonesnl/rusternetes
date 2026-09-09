@@ -18,6 +18,10 @@ pub struct ExternalMetricValue {
     /// The labels for the metric.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metric_labels: Option<BTreeMap<String, String>>,
+    #[serde(
+        serialize_with = "crate::types::k8s_time_required::serialize",
+        deserialize_with = "crate::types::k8s_time_required::deserialize"
+    )]
     pub timestamp: DateTime<Utc>,
     /// Window over which the value was produced, e.g. "60s".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,6 +44,18 @@ pub struct ExternalMetricValueList {
 mod tests {
     use super::*;
 
+    /// A whole-second timestamp. `Utc::now()` carries nanoseconds, which these
+    /// fields no longer round-trip: they are `metav1.Time` upstream and now
+    /// serialize with `time.RFC3339` (second precision), so a nanosecond input
+    /// legitimately comes back truncated. Using a second-precision value keeps
+    /// the round-trip assertion about the round trip rather than about the
+    /// precision loss.
+    fn fixed_time() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-08T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     #[test]
     fn external_metric_value_list_round_trips() {
         let list = ExternalMetricValueList {
@@ -54,7 +70,7 @@ mod tests {
                     "queue".to_string(),
                     "worker".to_string(),
                 )])),
-                timestamp: Utc::now(),
+                timestamp: fixed_time(),
                 window: Some("60s".to_string()),
                 value: "42".to_string(),
             }],

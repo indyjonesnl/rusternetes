@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct Endpoints {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub subsets: Vec<EndpointSubset>,
 }

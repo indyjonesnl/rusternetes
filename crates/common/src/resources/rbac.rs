@@ -8,6 +8,7 @@ pub struct Role {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Rules holds all the PolicyRules for this Role
@@ -39,6 +40,7 @@ pub struct ClusterRole {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Rules holds all the PolicyRules for this ClusterRole
@@ -129,6 +131,7 @@ pub struct RoleBinding {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Subjects holds references to the objects the role applies to.
@@ -178,6 +181,7 @@ pub struct ClusterRoleBinding {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Subjects holds references to the objects the role applies to.

@@ -10,6 +10,7 @@ pub struct ResourceQuota {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     pub spec: ResourceQuotaSpec,
@@ -108,6 +109,7 @@ pub struct LimitRange {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     pub spec: LimitRangeSpec,
@@ -195,6 +197,7 @@ pub struct PriorityClass {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// The value of this priority class
@@ -255,6 +258,7 @@ pub struct PodDisruptionBudget {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     pub spec: PodDisruptionBudgetSpec,

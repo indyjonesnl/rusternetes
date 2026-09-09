@@ -60,6 +60,7 @@ mod conformance_secret_data_proto_test;
 mod conformance_status_conditions_proto_test;
 mod conformance_status_proto_test;
 mod conformance_volume_localobjectref_proto_test;
+mod conformance_wide_serialization_sweep_test;
 mod crd_discovery_after_create_test;
 mod crd_items_schema_unwrap_test;
 mod crd_openapi_publish_test;

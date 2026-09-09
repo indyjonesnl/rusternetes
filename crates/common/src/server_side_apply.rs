@@ -22,6 +22,12 @@ pub struct ManagedFieldsEntry {
     pub api_version: String,
 
     /// Timestamp of last modification
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub time: Option<DateTime<Utc>>,
 
     /// Fields owned by this manager (JSON representation)

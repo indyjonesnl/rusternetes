@@ -10,6 +10,7 @@ use std::collections::HashMap;
 pub struct Service {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     #[serde(default)]
     pub spec: ServiceSpec,

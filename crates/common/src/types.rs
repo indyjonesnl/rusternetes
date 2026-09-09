@@ -93,6 +93,147 @@ pub mod k8s_time_str {
 /// Upstream `metav1.Time` normally marshals to an RFC3339 string, but apply
 /// configurations and some clients emit a *zero* `metav1.Time` as an empty JSON
 /// object `{}` (and a zero time marshals to `null`). chrono's `DateTime`
+/// `k8s_time` for a field that is not an `Option` — upstream's `metav1.Time` is
+/// a value type, so `job.status.startTime`-style fields on the Go side are
+/// non-pointer and always present on the wire. Same output format as
+/// [`k8s_time`]; separate module only because serde's `with` must match the
+/// field's exact type.
+pub mod k8s_time_required {
+    use chrono::{DateTime, Utc};
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(date: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&date.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
+            return Ok(dt.with_timezone(&Utc));
+        }
+        s.parse::<DateTime<Utc>>().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Serde for `metav1.MicroTime` fields.
+///
+/// Upstream `MicroTime.MarshalJSON` formats with `RFC3339Micro`
+/// (`staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/micro_time.go:26,181`:
+/// `"2006-01-02T15:04:05.000000Z07:00"`), i.e. **exactly six** fractional
+/// digits — not chrono's variable-width default, and not the second precision
+/// a `metav1.Time` gets. Deserialize is lenient and accepts a timestamp with
+/// or without a fractional part, mirroring `MicroTime.UnmarshalJSON`.
+pub mod k8s_micro_time {
+    use chrono::{DateTime, Utc};
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(date: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match date {
+            Some(dt) => serializer.serialize_str(&dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        match opt {
+            Some(s) => {
+                if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
+                    return Ok(Some(dt.with_timezone(&Utc)));
+                }
+                s.parse::<DateTime<Utc>>()
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// [`k8s_micro_time`] for a non-`Option` field (audit's
+/// `requestReceivedTimestamp` / `stageTimestamp`, both `metav1.MicroTime` in
+/// `staging/src/k8s.io/apiserver/pkg/apis/audit/types.go:140,142`).
+pub mod k8s_micro_time_required {
+    use chrono::{DateTime, Utc};
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(date: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&date.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
+            return Ok(dt.with_timezone(&Utc));
+        }
+        s.parse::<DateTime<Utc>>().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Serde for the `float64` fields of an OpenAPI schema (`maximum`, `minimum`,
+/// `multipleOf`), matching how Go writes them.
+///
+/// Upstream declares these as `*float64`
+/// (`staging/src/k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1/types_jsonschema.go`),
+/// and Go's `encoding/json` writes a float with
+/// `strconv.AppendFloat(b, f, fmt, -1, 64)` — the *shortest* representation
+/// that round-trips (`encoding/json/encode.go`, `floatEncoder.encode`). For an
+/// integral value that is `10`, not `10.0`.
+///
+/// serde_json always writes an `f64` with a fractional part, so a CRD created
+/// with `maximum: 10` read back as `maximum: 10.0`: a different JSON token for
+/// the same schema, which shows up in `kubectl get crd -o yaml` and makes a
+/// re-apply diff against itself. Emitting the integral case as an integer
+/// restores Go's output. Found by the wide serialization sweep
+/// (`crates/api-server/tests/it/conformance_wide_serialization_sweep_test.rs`).
+pub mod k8s_float {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    /// The largest magnitude for which every integer is exactly representable
+    /// in an `f64` (2^53). Above it `fract() == 0` no longer implies the value
+    /// is the integer it looks like, so defer to the float form — which is
+    /// also what Go's shortest-round-trip encoder produces there.
+    const MAX_EXACT_INT: f64 = 9_007_199_254_740_992.0;
+
+    pub fn serialize<S>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(f) if f.is_finite() && f.fract() == 0.0 && f.abs() <= MAX_EXACT_INT => {
+                serializer.serialize_i64(*f as i64)
+            }
+            Some(f) => serializer.serialize_f64(*f),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::deserialize(deserializer)
+    }
+}
+
 /// deserializer rejects both the object form and `null`, which made the
 /// PodDisruptionBudget `UpdateStatus` path reject otherwise-valid requests with
 /// a 422. This module accepts a string, an object, or null per value, mirroring
@@ -794,7 +935,12 @@ pub struct Condition {
     pub observed_generation: Option<i64>,
 
     /// LastTransitionTime is the last time the condition transitioned from one status to another
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<DateTime<Utc>>,
 
     /// Reason contains a programmatic identifier indicating the reason for the condition's last transition
@@ -968,7 +1114,12 @@ pub struct ManagedFieldsEntry {
     pub api_version: Option<String>,
 
     /// Time is the timestamp of when the ManagedFields entry was added
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub time: Option<DateTime<Utc>>,
 
     /// FieldsType is the discriminator for the different fields format

@@ -12,8 +12,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidatingWebhookConfiguration {
+    #[serde(default)]
     pub api_version: String,
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhooks: Option<Vec<ValidatingWebhook>>,
@@ -86,8 +89,11 @@ pub struct ValidatingWebhook {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MutatingWebhookConfiguration {
+    #[serde(default)]
     pub api_version: String,
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhooks: Option<Vec<MutatingWebhook>>,

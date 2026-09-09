@@ -276,6 +276,7 @@ pub struct SelfSubjectRulesReview {
     pub api_version: String,
     #[serde(default = "default_kind_self_subject_rules_review")]
     pub kind: String,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: SelfSubjectRulesReviewSpec,
     #[serde(skip_serializing_if = "Option::is_none")]

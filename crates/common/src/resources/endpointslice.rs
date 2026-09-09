@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct EndpointSlice {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// addressType specifies the type of address carried by this EndpointSlice.

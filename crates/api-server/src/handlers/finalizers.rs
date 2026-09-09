@@ -37,6 +37,7 @@ use tracing::{debug, info};
 /// use rusternetes_api_server::handlers::finalizers::handle_delete_with_finalizers;
 /// use rusternetes_common::resources::Pod;
 /// use rusternetes_common::Result;
+/// use rusternetes_middleware::DeleteOptionsCtx;
 /// use rusternetes_storage::Storage;
 /// use tracing::info;
 ///
@@ -44,11 +45,15 @@ use tracing::{debug, info};
 ///     // Get the resource
 ///     let pod: Pod = storage.get(key).await?;
 ///
-///     // Handle deletion with finalizers
+///     // Handle deletion with finalizers. In a handler `opts` comes from the
+///     // `Extension<DeleteOptionsCtx>` the middleware decodes off the request;
+///     // the default is upstream's default propagation.
+///     let opts = DeleteOptionsCtx::default();
 ///     let marked_for_deletion = handle_delete_with_finalizers(
 ///         storage,
 ///         key,
 ///         &pod,
+///         &opts,
 ///     ).await?;
 ///
 ///     if marked_for_deletion {

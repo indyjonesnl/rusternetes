@@ -11,6 +11,7 @@ use std::collections::HashMap;
 pub struct PersistentVolume {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: PersistentVolumeSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -252,7 +253,12 @@ pub struct PersistentVolumeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// lastPhaseTransitionTime is the time the phase transitioned from one to another
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub last_phase_transition_time: Option<DateTime<Utc>>,
 }
 
@@ -272,6 +278,7 @@ pub enum PersistentVolumePhase {
 pub struct PersistentVolumeClaim {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: PersistentVolumeClaimSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -476,6 +483,7 @@ pub enum PersistentVolumeClaimResizeStatus {
 pub struct StorageClass {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Provisioner name
@@ -541,6 +549,7 @@ pub struct TopologySelectorLabelRequirement {
 pub struct VolumeSnapshot {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: VolumeSnapshotSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -608,6 +617,7 @@ pub struct VolumeSnapshotError {
 pub struct VolumeSnapshotClass {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Driver name (snapshotter)
@@ -633,6 +643,7 @@ pub enum DeletionPolicy {
 pub struct VolumeSnapshotContent {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: VolumeSnapshotContentSpec,
     #[serde(skip_serializing_if = "Option::is_none")]

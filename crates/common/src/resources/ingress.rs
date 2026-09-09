@@ -8,6 +8,7 @@ pub struct Ingress {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     #[serde(skip_serializing_if = "Option::is_none")]

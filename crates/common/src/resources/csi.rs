@@ -11,6 +11,7 @@ use std::collections::HashMap;
 pub struct CSIDriver {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: CSIDriverSpec,
 }
@@ -93,6 +94,7 @@ pub struct TokenRequest {
 pub struct CSINode {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: CSINodeSpec,
 }
@@ -139,6 +141,7 @@ pub struct VolumeNodeResources {
 pub struct VolumeAttachment {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: VolumeAttachmentSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,6 +247,7 @@ pub struct VolumeError {
 pub struct CSIStorageCapacity {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// storageClassName represents the name of the StorageClass
@@ -268,6 +272,7 @@ pub struct CSIStorageCapacity {
 pub struct VolumeAttributesClass {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// driverName is the name of the CSI driver that this class applies to
