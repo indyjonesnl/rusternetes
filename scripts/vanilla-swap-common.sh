@@ -977,6 +977,39 @@ vs_kubernetes_clusterip() {
     -o jsonpath='{.spec.clusterIP} {.spec.ports[0].port}' 2>/dev/null
 }
 
+# vs_clusterip_fields <kubeconfig>
+# Set VS_SVC_IP / VS_SVC_PORT from default/kubernetes, independent of IFS.
+#
+# `vs_kubernetes_clusterip` returns both fields from one jsonpath, separated by
+# a SPACE, and the driver runs under strict mode:
+#
+#     IFS=$'\n\t'      # scripts/vanilla-swap-run.sh:27 -- no space
+#     read -r svc_ip svc_port <<<"$(vs_kubernetes_clusterip "$kc")"
+#
+# so `read` did not split and the whole string landed in `svc_ip`. That is why
+# the substrate gate reported `substrate-not-ready` on every api-server-leg run
+# since #1820 added it: `vs_dial_cluster_ip` was asked for
+# `/dev/tcp/"10.96.0.1 443"/443`, a path that can never connect, so the gate
+# never actually tested the ClusterIP — and the failure dump greped
+# `iptables-save` for the literal `10.96.0.1 443`, which no rule can contain, so
+# it always printed `NO iptables rules reference ...`. Both failures pointed at
+# kube-proxy, and neither was about kube-proxy.
+#
+# Splitting here with parameter expansion — not with a fourth `IFS=' '` at a
+# call site — removes the dependency instead of restating it. Covered by
+# scripts/tests/test-vanilla-swap-clusterip-fields.sh.
+vs_clusterip_fields() {
+  local out rest
+  out="$(vs_kubernetes_clusterip "${1:-}")"
+  # Trim surrounding whitespace (space, tab, newline) without consulting IFS.
+  out="${out#"${out%%[![:space:]]*}"}"
+  out="${out%"${out##*[![:space:]]}"}"
+  VS_SVC_IP="${out%%[[:space:]]*}"
+  rest="${out#"$VS_SVC_IP"}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  VS_SVC_PORT="$rest"
+}
+
 # vs_wait_dial <node> <ip> <port> <timeout-seconds> <interval-seconds>
 # Poll until <ip>:<port> answers from inside <node>. A third of the way through
 # the budget, fire the repair hook ONCE (default: replace kube-proxy) and keep
@@ -1039,10 +1072,30 @@ vs_dump_clusterip_diagnostics() {
   # The actual assertion the gate makes, shown directly: are there any rules for
   # this ClusterIP on the node we dialled from?
   if [ -n "$node" ]; then
-    echo "--- iptables rules mentioning ${ip} on ${node} ---" >&2
-    docker exec "$node" sh -c "iptables-save 2>/dev/null | grep -F '${ip}' || echo 'NO iptables rules reference ${ip}'" >&2 2>&1 || true
+    # Grep for the IP ALONE. iptables renders it as `-d 10.96.0.1/32 ...
+    # --dport 443`, so a combined "<ip> <port>" needle matches nothing and the
+    # "NO rules" branch fires unconditionally — which is exactly what happened
+    # while `$ip` still carried the port (see vs_clusterip_fields).
+    #
+    # And keep stderr: `iptables-save` failing (missing binary, no nat table,
+    # wrong legacy/nft backend) produces no stdout, so discarding its error made
+    # a broken probe read as a clean negative result.
+    echo "--- iptables rules mentioning ${ip} on ${node} (port ${port}) ---" >&2
+    docker exec "$node" sh -c "
+      if ! out=\$(iptables-save); then
+        echo \"iptables-save FAILED — the absence of rules below is NOT evidence\"
+        exit 0
+      fi
+      printf '%s' \"\$out\" | grep -F '${ip}' || echo 'NO iptables rules reference ${ip}'
+    " >&2 2>&1 || true
     echo "--- ipvs (if the proxier is in ipvs mode) ---" >&2
-    docker exec "$node" sh -c "ipvsadm -Ln 2>/dev/null | grep -F '${ip}' || echo 'no ipvs entries for ${ip}'" >&2 2>&1 || true
+    docker exec "$node" sh -c "
+      if ! out=\$(ipvsadm -Ln 2>&1); then
+        echo \"ipvsadm unavailable (\$out) — expected when the proxier is in iptables mode\"
+        exit 0
+      fi
+      printf '%s' \"\$out\" | grep -F '${ip}' || echo 'no ipvs entries for ${ip}'
+    " >&2 2>&1 || true
   fi
 
   echo "=== end ClusterIP diagnostics ===" >&2
