@@ -150,6 +150,12 @@ pub enum BadValue {
     /// Renders as JSON via `serde_json::to_string`. Used for slice/struct
     /// values such as `[]string{"All", "False"}`.
     Json(serde_json::Value),
+    /// Renders **unquoted**, mirroring upstream `ErrorBody`'s `fmt.Stringer`
+    /// arm (`s += fmt.Sprintf("%s", t.String())`). Types that implement
+    /// `String()` upstream — `intstr.IntOrString`, `resource.Quantity` — take
+    /// this path, so `maxUnavailable: "abc"` reports `Invalid value: abc` and
+    /// not `Invalid value: "abc"`.
+    Stringer(String),
     /// Sentinel for "omit the value entirely". Mirrors upstream `omitValue`.
     Omit,
 }
@@ -338,6 +344,7 @@ impl Error {
                     let rendered = serde_json::to_string(v).unwrap_or_else(|_| format!("{v:?}"));
                     format!("{}: {}", self.error_type.as_str(), rendered)
                 }
+                BadValue::Stringer(v) => format!("{}: {}", self.error_type.as_str(), v),
             },
         };
         if !self.detail.is_empty() {

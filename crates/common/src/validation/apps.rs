@@ -19,7 +19,7 @@ use crate::resources::workloads::{
     DaemonSet, DaemonSetSpec, ReplicaSet, ReplicaSetSpec, StatefulSet, StatefulSetSpec,
 };
 use crate::types::LabelSelector;
-use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::field::{BadValue, Error, ErrorList, Path};
 use crate::validation::metav1::{
     is_dns1123_label, validate_label_selector, LabelSelectorValidationOptions,
 };
@@ -104,75 +104,123 @@ fn validate_workload_pod_template_restart_policy(
     errs
 }
 
-/// Parse an IntOrString value (serde_json::Value that is either a number or a
-/// percent string like "25%"). Returns `(is_percent, value)` or an error
-/// message.
-fn parse_int_or_string(v: &serde_json::Value) -> Result<(bool, i64), String> {
-    match v {
-        serde_json::Value::Number(n) => {
-            let i = n
-                .as_i64()
-                .ok_or_else(|| "must be an integer or percent string".to_string())?;
-            Ok((false, i))
-        }
-        serde_json::Value::String(s) => {
-            if let Some(pct) = s.strip_suffix('%') {
-                let val: i64 = pct.parse().map_err(|_| format!("invalid percent: {s}"))?;
-                Ok((true, val))
-            } else {
-                // bare string number
-                s.parse::<i64>()
-                    .map(|n| (false, n))
-                    .map_err(|_| format!("must be an integer or percent string, got: {s}"))
-            }
-        }
-        _ => Err("must be an integer or percent string".to_string()),
+/// Upstream `validation.IsValidPercent`
+/// (`apimachinery/pkg/util/validation/validation.go:341-352`): the value must
+/// match the anchored regex `^[0-9]+%$`. Note this rejects a bare `"1"` — a
+/// String IntOrString is *only* ever a percentage upstream.
+fn is_valid_percent(s: &str) -> bool {
+    match s.strip_suffix('%') {
+        Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
     }
 }
 
-/// Validate that an IntOrString value is a non-negative int or a valid percent
-/// string. Mirrors upstream `ValidatePositiveIntOrPercent`
-/// (`pkg/apis/apps/validation/validation.go` lines 545-559): integers must be
-/// `>= 0`; percent strings must parse, but their magnitude (e.g. `200%`) is
-/// **not** bounded here — the upstream `IsNotMoreThan100Percent` check is
-/// applied separately, and only to the fields upstream actually bounds.
+/// The message upstream emits for a malformed percentage, via
+/// `RegexError(percentErrMsg, percentFmt, "1%", "93%")`.
+fn percent_format_error() -> String {
+    crate::validation::metav1::regex_error(
+        "a valid percent string must be a numeric string followed by an ending '%'",
+        "[0-9]+%",
+        &["1%", "93%"],
+    )
+}
+
+/// Upstream `getPercentValue` (`pkg/apis/apps/validation/validation.go:562-571`):
+/// only a String that passes `IsValidPercent` yields a percentage.
+fn percent_value(v: &serde_json::Value) -> Option<i64> {
+    let serde_json::Value::String(s) = v else {
+        return None;
+    };
+    if !is_valid_percent(s) {
+        return None;
+    }
+    s[..s.len() - 1].parse::<i64>().ok()
+}
+
+/// Upstream `getIntOrPercentValue` (lines 573-579): the percentage if there is
+/// one, otherwise `IntValue()`.
 ///
-/// Returns `(is_zero, errors)`, where `is_zero` reflects the int/percent value
-/// being `0` (used for the "both maxSurge and maxUnavailable are 0" rule).
+/// `IntValue()` on a String does `strconv.Atoi(StrVal)` and swallows the error,
+/// so a malformed `"2"` still reports 2 here even though
+/// `ValidatePositiveIntOrPercent` rejects its format. Both behaviours are
+/// upstream's, and the zero/non-zero switch depends on this leniency.
+fn int_or_percent_value(v: &serde_json::Value) -> i64 {
+    if let Some(pct) = percent_value(v) {
+        return pct;
+    }
+    match v {
+        serde_json::Value::Number(n) => n.as_i64().unwrap_or(0),
+        serde_json::Value::String(s) => s.parse::<i64>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Render an int-or-string the way upstream's `IntOrString.String()` does, for
+/// the `bad_value` of an error.
+fn int_or_percent_display(v: &serde_json::Value) -> BadValue {
+    match v {
+        serde_json::Value::String(s) => BadValue::Stringer(s.clone()),
+        serde_json::Value::Number(n) => BadValue::Stringer(n.to_string()),
+        other => BadValue::Stringer(other.to_string()),
+    }
+}
+
+/// Mirrors upstream `ValidatePositiveIntOrPercent`
+/// (`pkg/apis/apps/validation/validation.go:547-560`), which dispatches on the
+/// IntOrString **`Type`**, not on the text of a stringified value:
+///
+/// - `String` → must satisfy `IsValidPercent`;
+/// - `Int` → must satisfy `ValidateNonnegativeField`;
+/// - anything else → "must be an integer or percentage".
+///
+/// Percent magnitude is deliberately not bounded here; upstream applies
+/// `IsNotMoreThan100Percent` separately, and only to the fields it bounds.
+///
+/// Returns `(is_zero, errors)`, where `is_zero` comes from
+/// `int_or_percent_value` so it matches upstream's `getIntOrPercentValue` even
+/// for a value whose format was just rejected.
 fn validate_positive_int_or_percent(v: &serde_json::Value, fld_path: &Path) -> (bool, ErrorList) {
     let mut errs: ErrorList = Vec::new();
-    match parse_int_or_string(v) {
-        Err(msg) => {
-            errs.push(Error::invalid(fld_path, format!("{v}"), msg));
-            (false, errs)
-        }
-        Ok((_is_pct, val)) => {
-            // Only integers are bounded below; percent strings of any size are
-            // accepted here (upstream defers the upper bound to
-            // IsNotMoreThan100Percent, applied per-field by the caller).
-            if !_is_pct && val < 0 {
+    match v {
+        serde_json::Value::String(s) => {
+            if !is_valid_percent(s) {
                 errs.push(Error::invalid(
                     fld_path,
-                    val,
+                    int_or_percent_display(v),
+                    percent_format_error(),
+                ));
+            }
+        }
+        serde_json::Value::Number(n) => {
+            let i = n.as_i64().unwrap_or(0);
+            if i < 0 {
+                errs.push(Error::invalid(
+                    fld_path,
+                    i,
                     "must be greater than or equal to 0",
                 ));
-                return (false, errs);
             }
-            (val == 0, errs)
         }
+        other => errs.push(Error::invalid(
+            fld_path,
+            int_or_percent_display(other),
+            "must be an integer or percentage (e.g '5%')",
+        )),
     }
+    (int_or_percent_value(v) == 0, errs)
 }
 
-/// Mirrors upstream `IsNotMoreThan100Percent` (lines 581-591): if the value is
-/// a percent string greater than 100%, emit `Invalid(... "must not be greater
-/// than 100%")`. Integers and percents `<= 100` are accepted.
+/// Mirrors upstream `IsNotMoreThan100Percent`
+/// (`pkg/apis/apps/validation/validation.go:583-591`): only a *valid* percent
+/// string is bounded, and only above 100. Integers and malformed strings are
+/// left to `ValidatePositiveIntOrPercent`.
 fn is_not_more_than_100_percent(v: &serde_json::Value, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
-    if let Ok((true, val)) = parse_int_or_string(v) {
+    if let Some(val) = percent_value(v) {
         if val > 100 {
             errs.push(Error::invalid(
                 fld_path,
-                format!("{v}"),
+                int_or_percent_display(v),
                 "must not be greater than 100%",
             ));
         }
@@ -1187,7 +1235,7 @@ mod workload_parity_tests {
     fn daemonset_restart_policy_never_rejected_ads_forbidden() {
         let ds = daemonset(daemonset_with(
             template(Some("Never"), Some(5)),
-            serde_json::json!({"maxUnavailable": "1", "maxSurge": "0"}),
+            serde_json::json!({"maxUnavailable": 1, "maxSurge": 0}),
         ));
         let a = agg(&validate_daemonset(&ds));
         assert!(a.contains("template.spec.restartPolicy"), "got: {a}");
@@ -1201,7 +1249,7 @@ mod workload_parity_tests {
     fn daemonset_rolling_update_both_nonzero_rejected() {
         let ds = daemonset(daemonset_with(
             template(Some("Always"), None),
-            serde_json::json!({"maxUnavailable": "1", "maxSurge": "1"}),
+            serde_json::json!({"maxUnavailable": 1, "maxSurge": 1}),
         ));
         let a = agg(&validate_daemonset(&ds));
         assert!(
@@ -1214,7 +1262,7 @@ mod workload_parity_tests {
     fn daemonset_rolling_update_both_zero_rejected() {
         let ds = daemonset(daemonset_with(
             template(Some("Always"), None),
-            serde_json::json!({"maxUnavailable": "0", "maxSurge": "0"}),
+            serde_json::json!({"maxUnavailable": 0, "maxSurge": 0}),
         ));
         let a = agg(&validate_daemonset(&ds));
         assert!(
@@ -1227,7 +1275,7 @@ mod workload_parity_tests {
     fn daemonset_rolling_update_surge_only_ok() {
         let ds = daemonset(daemonset_with(
             template(Some("Always"), None),
-            serde_json::json!({"maxUnavailable": "0", "maxSurge": "1"}),
+            serde_json::json!({"maxUnavailable": 0, "maxSurge": 1}),
         ));
         assert!(
             validate_daemonset(&ds).is_empty(),
@@ -1241,7 +1289,7 @@ mod workload_parity_tests {
         // unlike Deployment, DaemonSet bounds BOTH fields to 100% (upstream 483)
         let ds = daemonset(daemonset_with(
             template(Some("Always"), None),
-            serde_json::json!({"maxUnavailable": "0", "maxSurge": "200%"}),
+            serde_json::json!({"maxUnavailable": 0, "maxSurge": "200%"}),
         ));
         let a = agg(&validate_daemonset(&ds));
         assert!(

@@ -86,7 +86,7 @@ const MAX_MESSAGE_LEN: usize = 32 * 1024;
 
 /// Upstream `validation.RegexError(msg, fmt, examples...)` — formats the
 /// canonical "regex used for validation" tail.
-fn regex_error(msg: &str, fmt: &str, examples: &[&str]) -> String {
+pub(crate) fn regex_error(msg: &str, fmt: &str, examples: &[&str]) -> String {
     if examples.is_empty() {
         return format!("{msg} (regex used for validation is '{fmt}')");
     }
