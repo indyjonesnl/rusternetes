@@ -507,5 +507,13 @@ fi
 # the module and must not read as a pass (vs_verdict).
 IFS=' ' read -r VS_OUTCOME VS_EXIT <<<"$(vs_verdict "${TOTAL:-0}" "${FAILED:-0}" "$runner_rc" "$VS_COMPLETENESS")"
 [ "${TOTAL:-0}" -gt 0 ] || vs_warn "no spec executed (runner rc=$runner_rc) — reporting '$VS_OUTCOME'"
+
+# A red subset without the cluster's own logs is what #1919 cost a day to
+# diagnose: ginkgo's timeline says which spec failed, never why the server
+# behaved that way. Dump before teardown (the EXIT trap destroys the cluster),
+# and only when something went wrong — a green run needs no forensics.
+if [ "$VS_OUTCOME" != "test-passed" ]; then
+  vs_dump_test_failure_diagnostics "$CLUSTER" "$KUBECONFIG_FILE" || true
+fi
 vs_emit_result "$VS_OUTCOME" "$PASSED" "$TOTAL" "$VS_K8S_VERSION"
 exit "$VS_EXIT"

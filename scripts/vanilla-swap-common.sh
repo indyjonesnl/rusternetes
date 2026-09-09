@@ -1161,29 +1161,83 @@ vs_dump_readiness_diagnostics() {
       KUBECONFIG="$kubeconfig" kubectl get deployments -A >&2 2>&1 || true ;;
   esac
 
-  # The swapped module's own logs. A join-worker module runs as its own docker
-  # container beside the kind nodes (named vanilla-swap-<cluster>-<node>, see
-  # vs_start_node); a static-pod / daemonset module runs inside the cluster, so
-  # its logs come from the node's container runtime.
-  #
-  # The container list is ENUMERATED, not guessed: the first version of this dump
-  # probed fixed names ("rusternetes-node", …), matched nothing, and printed an
-  # empty section for the one failure it existed to explain (run 30439140932).
+  vs_dump_module_logs "$cluster" "$kubeconfig" 60
+}
+
+# vs_dump_module_logs <cluster> <kubeconfig> [tail]
+# The swapped module's own logs. A join-worker module runs as its own docker
+# container beside the kind nodes (named vanilla-swap-<cluster>-<node>, see
+# vs_start_node); a static-pod / daemonset module runs inside the cluster, so
+# its logs come from the node's container runtime.
+#
+# The container list is ENUMERATED, not guessed: the first version of this dump
+# probed fixed names ("rusternetes-node", …), matched nothing, and printed an
+# empty section for the one failure it existed to explain (run 30439140932).
+#
+# Shared by the readiness-timeout dump and the test-failure dump — the module's
+# log is the first thing you want in both cases, and one copy cannot drift from
+# the other.
+vs_dump_module_logs() {
+  local cluster="$1" kubeconfig="$2" tail="${3:-60}"
+
   echo "--- harness containers ---" >&2
   docker ps -a --filter "name=vanilla-swap-${cluster}" \
     --format '{{.Names}}\t{{.Status}}\t{{.Image}}' >&2 2>&1 || true
 
-  echo "--- swapped module logs (last 60 lines) ---" >&2
+  echo "--- swapped module logs (last ${tail} lines) ---" >&2
   local c
   while IFS= read -r c; do
     [ -n "$c" ] || continue
     echo "[container $c]" >&2
-    docker logs --tail 60 "$c" >&2 2>&1 || true
+    docker logs --tail "$tail" "$c" >&2 2>&1 || true
   done < <(docker ps -a --filter "name=vanilla-swap-${cluster}" --format '{{.Names}}' 2>/dev/null)
-  KUBECONFIG="$kubeconfig" kubectl -n kube-system logs --tail=60 \
+  KUBECONFIG="$kubeconfig" kubectl -n kube-system logs --tail="$tail" \
     "-l=component=kube-${VS_MODULE}" >&2 2>&1 || true
-  KUBECONFIG="$kubeconfig" kubectl -n kube-system logs --tail=60 \
+  KUBECONFIG="$kubeconfig" kubectl -n kube-system logs --tail="$tail" \
     "-l=app=rusternetes-${VS_MODULE}" >&2 2>&1 || true
+}
+
+# vs_dump_test_failure_diagnostics <cluster> <kubeconfig>
+# What the cluster looked like when the conformance subset came back red.
+#
+# The harness dumped diagnostics for a readiness timeout and for the ClusterIP
+# gate, but the path after the subset ran went straight from the spec counts to
+# vs_emit_result. So `outcome=test-failed` produced ginkgo's timeline and
+# nothing else: run 34361805618 left one failing GC spec (#1919) with no
+# api-server log and no kube-controller-manager log — the two things that would
+# have said whether the GC ever issued the missing delete (#1921).
+#
+# A failing spec is usually an interaction between the swapped module and the
+# vanilla peers that drive it, so dump both sides. Every command is best-effort
+# and bounded by --tail: a dump must never replace the verdict, and a chatty
+# component must not bury it.
+vs_dump_test_failure_diagnostics() {
+  local cluster="$1" kubeconfig="$2"
+  echo "=== post-test diagnostics (outcome=${VS_OUTCOME:-unknown}) ===" >&2
+
+  vs_dump_module_logs "$cluster" "$kubeconfig" 200
+
+  # The vanilla control-plane peers. For every module except api-server one of
+  # these IS the component under test's counterpart; for api-server they are the
+  # clients whose requests it answered.
+  local component
+  for component in kube-apiserver kube-controller-manager kube-scheduler kube-proxy; do
+    echo "--- logs: ${component} (last 200 lines) ---" >&2
+    KUBECONFIG="$kubeconfig" kubectl -n kube-system logs --tail=200 \
+      "-l=component=${component}" >&2 2>&1 \
+      || KUBECONFIG="$kubeconfig" kubectl -n kube-system logs --tail=200 \
+           "-l=k8s-app=${component}" >&2 2>&1 \
+      || true
+  done
+
+  echo "--- pods (all namespaces) ---" >&2
+  KUBECONFIG="$kubeconfig" kubectl get pods -A -o wide >&2 2>&1 || true
+
+  # Sorted by time so the tail is what happened last, which is what a failing
+  # spec's window looks like.
+  echo "--- events (last 200, all namespaces) ---" >&2
+  KUBECONFIG="$kubeconfig" kubectl get events -A --sort-by=.lastTimestamp >&2 2>&1 \
+    | tail -n 200 >&2 || true
 }
 
 vs_readiness_probe() {

@@ -46,6 +46,11 @@ on:
       - 'scripts/vanilla-swap-common-test.sh'
       - 'scripts/vanilla-swap-guard-test.sh'
       - 'scripts/vanilla-swap-run.sh'
+      # Diagnostics dumps: what the harness captures when a leg goes red. These
+      # tests existed (and one shipped in #1918) but ran in no workflow at all.
+      - 'scripts/tests/test-vanilla-swap-clusterip-diagnostics.sh'
+      - 'scripts/tests/test-vanilla-swap-clusterip-fields.sh'
+      - 'scripts/tests/test-vanilla-swap-test-failure-diagnostics.sh'
       - 'scripts/conformance-target-run.sh'
       # rehomed guards (compose overlays + image Dockerfiles)
       - 'scripts/tests/test-ghcr-overlays.sh'
@@ -117,3 +122,12 @@ jobs:
         run: bash scripts/vanilla-swap-common-test.sh
       - name: Vanilla-swap single-module guard tests
         run: bash scripts/vanilla-swap-guard-test.sh
+      # The diagnostics dumps decide whether a red leg is diagnosable at all.
+      # They had no workflow, so the ClusterIP-field split test added in #1918
+      # had never run in CI.
+      - name: Vanilla-swap ClusterIP gate field-split tests
+        run: bash scripts/tests/test-vanilla-swap-clusterip-fields.sh
+      - name: Vanilla-swap ClusterIP diagnostics tests
+        run: bash scripts/tests/test-vanilla-swap-clusterip-diagnostics.sh
+      - name: Vanilla-swap post-test diagnostics tests
+        run: bash scripts/tests/test-vanilla-swap-test-failure-diagnostics.sh
