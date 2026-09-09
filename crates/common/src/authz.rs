@@ -528,7 +528,7 @@ impl Authorizer for AlwaysDenyAuthorizer {
 ///
 /// ```text
 /// Failed to watch: failed to list *v1.Pod: Node <name> is not authorized to list
-/// pods in namespace None; User does not have permission to perform this action
+/// pods in namespace ; User does not have permission to perform this action
 /// ```
 ///
 /// Entries are `(apiGroup, resource[/subresource], verbs)`.
@@ -751,10 +751,24 @@ impl Authorizer for NodeAuthorizer {
             return Ok(Decision::Allow);
         }
 
-        // Deny everything else
+        // Deny everything else.
+        //
+        // The namespace is rendered as a plain string, empty for a
+        // cluster-scoped request, the way upstream's node authorizer prints it
+        // (`node '%s' cannot get %s %s/%s`,
+        // plugin/pkg/auth/authorizer/node/node_authorizer.go:506-551). Using
+        // `{:?}` on the `Option` leaked Rust's `Debug` form into an API error
+        // message a real kubelet then logged verbatim:
+        //
+        //   Node ... is not authorized to delete pods in namespace Some("kube-system")
+        //   Failed to watch: failed to list *v1.Pod: Node <name> is not
+        //   authorized to list pods in namespace None
         Ok(Decision::Deny(format!(
-            "Node {} is not authorized to {} {} in namespace {:?}",
-            node_name, attrs.verb, attrs.resource, attrs.namespace
+            "Node {} is not authorized to {} {} in namespace {}",
+            node_name,
+            attrs.verb,
+            attrs.resource,
+            attrs.namespace.as_deref().unwrap_or("")
         )))
     }
 
