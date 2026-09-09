@@ -20,9 +20,11 @@
 //! field that cannot use `IntOrString` is a reason to change the field, not to
 //! record an exception here.
 //!
-//! `serde_json::Value` is *not* flagged: it round-trips a number as a number,
-//! so it is imprecise (it also accepts `true`, `[]`, `{}`) but not lossy.
-//! Tightening those onto `IntOrString` is tracked separately.
+//! `serde_json::Value` is flagged too. It round-trips a number as a number, so
+//! it is not *lossy* the way `String` is — but it accepts `true`, `[]`, `{}`
+//! and `1.5`, none of which upstream's `IntOrString` can hold, so a body a
+//! conformant api-server rejects at decode time gets through. Both parallel
+//! representations of one upstream type are now gone.
 
 use std::path::{Path, PathBuf};
 
@@ -47,20 +49,30 @@ const INTORSTRING_FIELDS: &[&str] = &[
     "target_port",
 ];
 
-/// The lossy shapes: a bare `String`, or an `Option<String>`.
+/// The shapes that are not `IntOrString`: a `String` (lossy — quotes an
+/// integer) or a `serde_json::Value` (imprecise — admits values the upstream
+/// type cannot represent).
 ///
 /// A trailing `// ...` comment is stripped first. The lossy fields this guard
 /// exists for were all annotated `// IntOrString`, so leaving the comment in
 /// the parsed type made the scan miss precisely the declarations it was
 /// written to catch.
-fn is_string_typed(ty: &str) -> bool {
+fn is_wrong_typed(ty: &str) -> bool {
     let ty = ty
         .split("//")
         .next()
         .unwrap_or("")
         .trim()
         .trim_end_matches(',');
-    ty == "String" || ty == "Option<String>"
+    matches!(
+        ty,
+        "String"
+            | "Option<String>"
+            | "serde_json::Value"
+            | "Option<serde_json::Value>"
+            | "Value"
+            | "Option<Value>"
+    )
 }
 
 /// Whether a field declaration refers to an upstream `IntOrString` value.
@@ -100,7 +112,7 @@ fn field_decl(line: &str) -> Option<(&str, &str)> {
 }
 
 #[test]
-fn no_intorstring_field_is_string_typed() {
+fn no_intorstring_field_uses_a_substitute_type() {
     let mut offenders = Vec::new();
 
     for path in resource_files() {
@@ -111,14 +123,15 @@ fn no_intorstring_field_is_string_typed() {
             let Some((field, ty)) = field_decl(line) else {
                 continue;
             };
-            if !is_string_typed(ty) {
+            if !is_wrong_typed(ty) {
                 continue;
             }
 
             if is_intorstring_field(field, line) {
                 offenders.push(format!(
-                    "{name}:{} — `{field}: {ty}` is an IntOrString field held as a String; \
-                     use `IntOrString` so an integer serializes as a JSON number",
+                    "{name}:{} — `{field}: {ty}` is an IntOrString field with the wrong \
+                     type; use `IntOrString` so an integer serializes as a JSON number \
+                     and nothing else is representable",
                     n + 1
                 ));
             }
@@ -127,8 +140,9 @@ fn no_intorstring_field_is_string_typed() {
 
     assert!(
         offenders.is_empty(),
-        "IntOrString fields must not be String-typed — a quoted integer breaks \
-         every Go client that calls GetScaledValueFromIntOrPercent:\n  {}",
+        "IntOrString fields must use `IntOrString` — a quoted integer breaks every \
+         Go client that calls GetScaledValueFromIntOrPercent, and a raw Value \
+         admits input upstream cannot decode:\n  {}",
         offenders.join("\n  ")
     );
 }
@@ -169,7 +183,7 @@ fn the_lossy_int_or_string_deserializer_is_not_reintroduced() {
 fn the_detector_flags_the_lossy_shape_and_only_that() {
     let flagged = |line: &str| {
         let (field, ty) = field_decl(line).expect("parses as a field");
-        is_string_typed(ty) && is_intorstring_field(field, line)
+        is_wrong_typed(ty) && is_intorstring_field(field, line)
     };
 
     // The exact shape this change removed — caught by name.
@@ -186,10 +200,12 @@ fn the_detector_flags_the_lossy_shape_and_only_that() {
     // Legitimately numeric ports.
     assert!(!flagged("    pub port: i32,"));
     assert!(!flagged("    pub container_port: i32,"));
-    // Lossless, deliberately out of scope.
-    assert!(!flagged(
+    // Lossless but imprecise — flagged too, so one upstream type has one
+    // Rust representation.
+    assert!(flagged(
         "    pub max_surge: Option<serde_json::Value>, // IntOrString"
     ));
+    assert!(flagged("    pub port: Option<Value>, // IntOrString"));
     // An ordinary string field must never be flagged.
     assert!(!flagged("    pub name: Option<String>,"));
     assert!(!flagged("    pub service_name: String,"));

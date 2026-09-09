@@ -11,6 +11,7 @@ use rusternetes_common::resources::deployment::{
     Deployment, DeploymentSpec, DeploymentStrategy, RollingUpdateDeployment,
 };
 use rusternetes_common::resources::pod::PodSpec;
+use rusternetes_common::resources::policy::IntOrString;
 use rusternetes_common::resources::workloads::PodTemplateSpec;
 use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
 use rusternetes_common::validation::apps::{validate_deployment, validate_deployment_update};
@@ -80,8 +81,8 @@ fn make_deployment(
 }
 
 fn rolling_update(
-    max_unavailable: Option<serde_json::Value>,
-    max_surge: Option<serde_json::Value>,
+    max_unavailable: Option<IntOrString>,
+    max_surge: Option<IntOrString>,
 ) -> DeploymentStrategy {
     DeploymentStrategy {
         strategy_type: "RollingUpdate".to_string(),
@@ -92,12 +93,12 @@ fn rolling_update(
     }
 }
 
-fn int_val(n: i64) -> serde_json::Value {
-    serde_json::Value::Number(n.into())
+fn int_val(n: i64) -> IntOrString {
+    IntOrString::Int(n as i32)
 }
 
-fn pct_val(s: &str) -> serde_json::Value {
-    serde_json::Value::String(s.to_string())
+fn pct_val(s: &str) -> IntOrString {
+    IntOrString::String(s.to_string())
 }
 
 fn aggregate(errs: &[rusternetes_common::validation::field::Error]) -> String {

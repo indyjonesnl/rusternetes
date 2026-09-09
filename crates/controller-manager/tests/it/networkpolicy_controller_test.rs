@@ -18,6 +18,7 @@
 //! namespaceSelector, port ranges, policyTypes, and default-deny.
 
 use rusternetes_common::resources::pod::{Container, Pod, PodSpec, PodStatus};
+use rusternetes_common::resources::policy::IntOrString;
 use rusternetes_common::resources::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
     NetworkPolicyPort, NetworkPolicySpec,
@@ -168,7 +169,7 @@ async fn test_networkpolicy_ingress_rules_reconcile() {
         ingress: Some(vec![NetworkPolicyIngressRule {
             ports: Some(vec![NetworkPolicyPort {
                 protocol: "TCP".to_string(),
-                port: Some(serde_json::json!(80)),
+                port: Some(IntOrString::Int(80)),
                 end_port: None,
             }]),
             from: Some(vec![NetworkPolicyPeer {
@@ -214,7 +215,7 @@ async fn test_networkpolicy_egress_rules_reconcile() {
         egress: Some(vec![NetworkPolicyEgressRule {
             ports: Some(vec![NetworkPolicyPort {
                 protocol: "UDP".to_string(),
-                port: Some(serde_json::json!(53)),
+                port: Some(IntOrString::Int(53)),
                 end_port: None,
             }]),
             to: Some(vec![NetworkPolicyPeer {
@@ -341,7 +342,7 @@ async fn test_networkpolicy_port_ranges_accept_end_port() {
         ingress: Some(vec![NetworkPolicyIngressRule {
             ports: Some(vec![NetworkPolicyPort {
                 protocol: "TCP".to_string(),
-                port: Some(serde_json::json!(8000)),
+                port: Some(IntOrString::Int(8000)),
                 end_port: Some(8100),
             }]),
             from: None,

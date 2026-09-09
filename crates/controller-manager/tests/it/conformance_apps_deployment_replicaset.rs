@@ -23,6 +23,7 @@
 
 use rusternetes_common::resources::deployment::{DeploymentStrategy, RollingUpdateDeployment};
 use rusternetes_common::resources::pod::{PodCondition, PodStatus};
+use rusternetes_common::resources::policy::IntOrString;
 use rusternetes_common::resources::{
     Container, Deployment, DeploymentSpec, Pod, PodSpec, PodTemplateSpec, ReplicaSet,
     ReplicaSetSpec, ReplicationController, ReplicationControllerSpec,
@@ -174,8 +175,8 @@ fn rolling_update_strategy(max_surge: &str, max_unavailable: &str) -> Deployment
     DeploymentStrategy {
         strategy_type: "RollingUpdate".to_string(),
         rolling_update: Some(RollingUpdateDeployment {
-            max_surge: Some(serde_json::Value::String(max_surge.to_string())),
-            max_unavailable: Some(serde_json::Value::String(max_unavailable.to_string())),
+            max_surge: Some(IntOrString::String(max_surge.to_string())),
+            max_unavailable: Some(IntOrString::String(max_unavailable.to_string())),
         }),
     }
 }

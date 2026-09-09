@@ -1,3 +1,4 @@
+use crate::resources::policy::IntOrString;
 use crate::types::{LabelSelector, ObjectMeta, TypeMeta};
 use serde::{Deserialize, Serialize};
 
@@ -90,7 +91,7 @@ pub struct NetworkPolicyPort {
 
     /// The port on the given protocol
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub port: Option<serde_json::Value>, // IntOrString
+    pub port: Option<IntOrString>,
 
     /// The end port range
     #[serde(skip_serializing_if = "Option::is_none", rename = "endPort")]

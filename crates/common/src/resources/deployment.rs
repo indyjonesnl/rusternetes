@@ -1,3 +1,4 @@
+use crate::resources::policy::IntOrString;
 use crate::resources::workloads::PodTemplateSpec;
 use crate::types::{LabelSelector, ObjectMeta, TypeMeta};
 use chrono::{DateTime, Utc};
@@ -73,10 +74,10 @@ fn default_rolling_update_strategy() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct RollingUpdateDeployment {
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub max_unavailable: Option<serde_json::Value>, // IntOrString: int or "25%"
+    pub max_unavailable: Option<IntOrString>,
 
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub max_surge: Option<serde_json::Value>, // IntOrString: int or "25%"
+    pub max_surge: Option<IntOrString>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

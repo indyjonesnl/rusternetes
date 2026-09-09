@@ -3,13 +3,13 @@
 //! Tests all CRUD operations, edge cases, and error handling for networkpolicies.
 //! NetworkPolicy describes what network traffic is allowed for a set of Pods.
 
+use rusternetes_common::resources::policy::IntOrString;
 use rusternetes_common::resources::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
     NetworkPolicyPort, NetworkPolicySpec,
 };
 use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
 use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
-use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -182,7 +182,7 @@ async fn test_networkpolicy_with_ingress_rules() {
     np.spec.ingress = Some(vec![NetworkPolicyIngressRule {
         ports: Some(vec![NetworkPolicyPort {
             protocol: "TCP".to_string(),
-            port: Some(json!(80)),
+            port: Some(IntOrString::Int(80)),
             end_port: None,
         }]),
         from: Some(vec![NetworkPolicyPeer {
@@ -224,7 +224,7 @@ async fn test_networkpolicy_with_egress_rules() {
     np.spec.egress = Some(vec![NetworkPolicyEgressRule {
         ports: Some(vec![NetworkPolicyPort {
             protocol: "TCP".to_string(),
-            port: Some(json!(443)),
+            port: Some(IntOrString::Int(443)),
             end_port: None,
         }]),
         to: Some(vec![NetworkPolicyPeer {
@@ -462,7 +462,7 @@ async fn test_networkpolicy_port_range() {
     np.spec.ingress = Some(vec![NetworkPolicyIngressRule {
         ports: Some(vec![NetworkPolicyPort {
             protocol: "TCP".to_string(),
-            port: Some(json!(8000)),
+            port: Some(IntOrString::Int(8000)),
             end_port: Some(9000),
         }]),
         from: None,
@@ -474,7 +474,7 @@ async fn test_networkpolicy_port_range() {
     let created: NetworkPolicy = storage.create(&key, &np).await.unwrap();
     let ingress_rules = created.spec.ingress.unwrap();
     let ports = ingress_rules[0].ports.as_ref().unwrap();
-    assert_eq!(ports[0].port, Some(json!(8000)));
+    assert_eq!(ports[0].port, Some(IntOrString::Int(8000)));
     assert_eq!(ports[0].end_port, Some(9000));
 
     // Clean up
@@ -532,7 +532,7 @@ async fn test_networkpolicy_multiple_policy_types() {
     np.spec.ingress = Some(vec![NetworkPolicyIngressRule {
         ports: Some(vec![NetworkPolicyPort {
             protocol: "TCP".to_string(),
-            port: Some(json!(80)),
+            port: Some(IntOrString::Int(80)),
             end_port: None,
         }]),
         from: None,
@@ -541,7 +541,7 @@ async fn test_networkpolicy_multiple_policy_types() {
     np.spec.egress = Some(vec![NetworkPolicyEgressRule {
         ports: Some(vec![NetworkPolicyPort {
             protocol: "TCP".to_string(),
-            port: Some(json!(443)),
+            port: Some(IntOrString::Int(443)),
             end_port: None,
         }]),
         to: None,

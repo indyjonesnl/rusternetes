@@ -74,8 +74,8 @@ fn build_deployment(name: &str, namespace: &str, replicas: i32, image: &str) -> 
             strategy: Some(deployment::DeploymentStrategy {
                 strategy_type: "RollingUpdate".to_string(),
                 rolling_update: Some(deployment::RollingUpdateDeployment {
-                    max_surge: Some(serde_json::json!("25%")),
-                    max_unavailable: Some(serde_json::json!("25%")),
+                    max_surge: Some(IntOrString::String("25%".to_string())),
+                    max_unavailable: Some(IntOrString::String("25%".to_string())),
                 }),
             }),
             paused: None,
@@ -426,8 +426,8 @@ async fn test_deployment_annotation_refresh_skipped_when_values_match() {
     deployment.spec.strategy = Some(deployment::DeploymentStrategy {
         strategy_type: "RollingUpdate".to_string(),
         rolling_update: Some(deployment::RollingUpdateDeployment {
-            max_surge: Some(serde_json::json!("0")),
-            max_unavailable: Some(serde_json::json!("0")),
+            max_surge: Some(IntOrString::Int(0)),
+            max_unavailable: Some(IntOrString::Int(0)),
         }),
     });
     deployment

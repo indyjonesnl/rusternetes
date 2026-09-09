@@ -498,20 +498,14 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 let surge = ru
                     .max_surge
                     .as_ref()
-                    .and_then(|v| {
-                        v.as_str()
-                            .map(|s| s.to_string())
-                            .or_else(|| v.as_i64().map(|n| n.to_string()))
-                    })
+                    // `IntOrString: Display` is upstream's `String()`.
+                    .map(|v| v.to_string())
                     .unwrap_or_else(|| "25%".to_string());
                 let unavail = ru
                     .max_unavailable
                     .as_ref()
-                    .and_then(|v| {
-                        v.as_str()
-                            .map(|s| s.to_string())
-                            .or_else(|| v.as_i64().map(|n| n.to_string()))
-                    })
+                    // `IntOrString: Display` is upstream's `String()`.
+                    .map(|v| v.to_string())
                     .unwrap_or_else(|| "25%".to_string());
                 (surge, unavail)
             })
@@ -1234,13 +1228,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 .strategy
                 .as_ref()
                 .and_then(|s| s.rolling_update.as_ref())
-                .and_then(|ru| {
-                    ru.max_surge.as_ref().and_then(|v| {
-                        v.as_str()
-                            .map(|s| s.to_string())
-                            .or_else(|| v.as_i64().map(|n| n.to_string()))
-                    })
-                })
+                .and_then(|ru| ru.max_surge.as_ref().map(|v| v.to_string()))
                 .unwrap_or_else(|| "25%".to_string());
             let surge = parse_int_or_percent(&local_max_surge, desired);
             annotations.insert(
