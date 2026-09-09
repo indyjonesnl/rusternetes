@@ -168,6 +168,19 @@ pub async fn update(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("limitranges", Some(&namespace), &name),
+        "",
+        "limitranges",
+        &name,
+    )
+    .await?;
 
     limit_range.metadata.name = name.clone();
     limit_range.metadata.namespace = Some(namespace.clone());

@@ -108,6 +108,19 @@ pub async fn update_certificate_signing_request(
         Decision::Allow => {}
         Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("certificatesigningrequests", None, &name),
+        "certificates.k8s.io",
+        "certificatesigningrequests",
+        &name,
+    )
+    .await?;
 
     csr.metadata.name = name.clone();
     csr.kind = "CertificateSigningRequest".to_string();
@@ -157,11 +170,7 @@ pub async fn update_certificate_signing_request(
             &stored.metadata,
         );
     }
-    let result = match state.storage.update(&key, &csr).await {
-        Ok(updated) => updated,
-        Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &csr).await?,
-        Err(e) => return Err(e),
-    };
+    let result = state.storage.update(&key, &csr).await?;
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of

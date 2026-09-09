@@ -730,6 +730,28 @@ pub async fn update_custom_resource(
         group, version, plural, name
     );
 
+    // A PUT to a custom resource that does not exist is a 404, not a create:
+    // "AllowCreateOnUpdate is false for CustomResources; this means a POST is
+    // needed to create one"
+    // (apiextensions-apiserver/pkg/registry/customresource/strategy.go:262-266).
+    // The key is rebuilt below, where the write happens; this early copy keeps
+    // the check ahead of validation, as upstream's is (#1905).
+    {
+        let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
+        let key = match namespace.as_deref() {
+            Some(ns) => build_key(&resource_type, Some(ns), &name),
+            None => build_key(&resource_type, None, &name),
+        };
+        crate::handlers::lifecycle::reject_create_on_update(
+            &*state.storage,
+            &key,
+            &group,
+            &plural,
+            &name,
+        )
+        .await?;
+    }
+
     // Strict field validation: reject unknown top-level fields for CRDs
     let is_strict = params.get("fieldValidation").map(|v| v.as_str()) == Some("Strict");
     if is_strict && !cr.extra.is_empty() {

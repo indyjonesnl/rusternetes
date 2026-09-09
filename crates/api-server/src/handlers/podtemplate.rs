@@ -120,6 +120,19 @@ pub async fn update_podtemplate(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("podtemplates", Some(&namespace), &name),
+        "",
+        "podtemplates",
+        &name,
+    )
+    .await?;
 
     podtemplate.metadata.name = name.clone();
     podtemplate.metadata.namespace = Some(namespace.clone());
@@ -147,19 +160,12 @@ pub async fn update_podtemplate(
     // The update inherits the stored object's server-owned metadata first
     // (upstream registry/rest/update.go::BeforeUpdate, lines 131-146); the
     // create path is unchanged, since there is nothing to inherit from.
-    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+    let result = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
         &*state.storage,
         &key,
         &mut podtemplate,
     )
-    .await
-    {
-        Ok(updated) => updated,
-        Err(rusternetes_common::Error::NotFound(_)) => {
-            state.storage.create(&key, &podtemplate).await?
-        }
-        Err(e) => return Err(e),
-    };
+    .await?;
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of

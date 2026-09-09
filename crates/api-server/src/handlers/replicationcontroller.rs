@@ -225,6 +225,19 @@ pub async fn update_replicationcontroller(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("replicationcontrollers", Some(&namespace), &name),
+        "",
+        "replicationcontrollers",
+        &name,
+    )
+    .await?;
 
     rc.metadata.name = name.clone();
     rc.metadata.namespace = Some(namespace.clone());
@@ -261,18 +274,12 @@ pub async fn update_replicationcontroller(
 
     let key = build_key("replicationcontrollers", Some(&namespace), &name);
 
-    // Try to update first, if not found then create (upsert behavior)
-    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+    let result = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
         &*state.storage,
         &key,
         &mut rc,
     )
-    .await
-    {
-        Ok(updated) => updated,
-        Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &rc).await?,
-        Err(e) => return Err(e),
-    };
+    .await?;
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of

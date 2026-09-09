@@ -164,6 +164,19 @@ pub async fn update_apiservice(
         Decision::Allow => {}
         Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("apiservices", None, &name),
+        "apiregistration.k8s.io",
+        "apiservices",
+        &name,
+    )
+    .await?;
 
     value["kind"] = Value::String("APIService".to_string());
     value["apiVersion"] = Value::String("apiregistration.k8s.io/v1".to_string());
@@ -181,11 +194,7 @@ pub async fn update_apiservice(
         crate::handlers::lifecycle::inherit_server_owned_metadata_json(&mut value, &stored);
     }
 
-    let result: Value = match state.storage.update(&key, &value).await {
-        Ok(v) => v,
-        Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &value).await?,
-        Err(e) => return Err(e),
-    };
+    let result: Value = state.storage.update(&key, &value).await?;
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of
     // that same request (store.go:565).
@@ -211,16 +220,25 @@ pub async fn update_apiservice_status(
         Decision::Allow => {}
         Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("apiservices", None, &name),
+        "apiregistration.k8s.io",
+        "apiservices",
+        &name,
+    )
+    .await?;
 
     value["kind"] = Value::String("APIService".to_string());
     value["apiVersion"] = Value::String("apiregistration.k8s.io/v1".to_string());
 
     let key = build_key("apiservices", None, &name);
-    let result: Value = match state.storage.update(&key, &value).await {
-        Ok(v) => v,
-        Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &value).await?,
-        Err(e) => return Err(e),
-    };
+    let result: Value = state.storage.update(&key, &value).await?;
     Ok(Json(result))
 }
 

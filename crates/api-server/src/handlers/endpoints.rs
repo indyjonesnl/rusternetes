@@ -244,6 +244,19 @@ pub async fn update_endpoints(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("endpoints", Some(&namespace), &name),
+        "",
+        "endpoints",
+        &name,
+    )
+    .await?;
 
     endpoints.metadata.name = name.clone();
     endpoints.metadata.namespace = Some(namespace.clone());
@@ -288,12 +301,22 @@ pub async fn update_endpoints(
     // (upstream registry/rest/update.go::BeforeUpdate, lines 131-146). Without
     // it a PUT that omits `uid` stores a blank one, orphaning every child that
     // references it, and a PUT could clear a pending deletionTimestamp.
-    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
+    // AllowCreateOnUpdate is true for Endpoints (pkg/registry/core/endpoint/strategy.go:70), so a PUT to a
+    // name that does not exist creates the object rather than answering
+    // NotFound (store.go:646-650).
+    let updated = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
         &*state.storage,
         &key,
         &mut endpoints,
     )
-    .await?;
+    .await
+    {
+        Ok(updated) => updated,
+        Err(rusternetes_common::Error::NotFound(_)) => {
+            state.storage.create(&key, &endpoints).await?
+        }
+        Err(e) => return Err(e),
+    };
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of

@@ -120,6 +120,19 @@ pub async fn update_runtimeclass(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+    // A PUT to an object that does not exist is a 404, not a create: upstream
+    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
+    // (registry/generic/registry/store.go:646-650) and only nine resources opt
+    // in. The check sits ahead of every validator there, so it runs here before
+    // validation too (#1905).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key("runtimeclasses", None, &name),
+        "node.k8s.io",
+        "runtimeclasses",
+        &name,
+    )
+    .await?;
 
     runtime_class.metadata.name = name.clone();
 
@@ -164,14 +177,7 @@ pub async fn update_runtimeclass(
         );
     }
 
-    // Try to update first, if not found then create (upsert behavior)
-    let result = match state.storage.update(&key, &runtime_class).await {
-        Ok(updated) => updated,
-        Err(rusternetes_common::Error::NotFound(_)) => {
-            state.storage.create(&key, &runtime_class).await?
-        }
-        Err(e) => return Err(e),
-    };
+    let result = state.storage.update(&key, &runtime_class).await?;
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of
