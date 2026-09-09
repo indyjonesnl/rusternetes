@@ -12,8 +12,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidatingAdmissionPolicy {
+    #[serde(default)]
     pub api_version: String,
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<ValidatingAdmissionPolicySpec>,
@@ -321,8 +324,11 @@ pub struct PolicyCondition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidatingAdmissionPolicyBinding {
+    #[serde(default)]
     pub api_version: String,
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<ValidatingAdmissionPolicyBindingSpec>,

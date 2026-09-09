@@ -13,6 +13,7 @@ pub struct RuntimeClass {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Handler specifies the underlying runtime and configuration that the CRI

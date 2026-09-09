@@ -2,48 +2,8 @@ use crate::types::{ObjectMeta, TypeMeta};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Module for serializing/deserializing MicroTime format (with microsecond precision).
-/// Kubernetes MicroTime requires the format: "2006-01-02T15:04:05.000000Z"
-mod micro_time {
-    use chrono::{DateTime, Utc};
-    use serde::{self, Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(date: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match date {
-            Some(dt) => {
-                let s = dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
-                serializer.serialize_str(&s)
-            }
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let opt: Option<String> = Option::deserialize(deserializer)?;
-        match opt {
-            Some(s) => {
-                // Try parsing with microseconds first, then without
-                if let Ok(dt) = DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.6fZ") {
-                    return Ok(Some(dt.with_timezone(&Utc)));
-                }
-                if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
-                    return Ok(Some(dt.with_timezone(&Utc)));
-                }
-                // Try chrono's default parsing
-                s.parse::<DateTime<Utc>>()
-                    .map(Some)
-                    .map_err(serde::de::Error::custom)
-            }
-            None => Ok(None),
-        }
-    }
-}
+// The RFC3339Micro (`metav1.MicroTime`) serde module used below lives in
+// `crate::types` — this file used to carry a third private copy of it.
 
 /// Lease defines a lease concept
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +12,7 @@ pub struct Lease {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,8 +53,8 @@ pub struct LeaseSpec {
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
-        serialize_with = "micro_time::serialize",
-        deserialize_with = "micro_time::deserialize"
+        serialize_with = "crate::types::k8s_micro_time::serialize",
+        deserialize_with = "crate::types::k8s_micro_time::deserialize"
     )]
     pub acquire_time: Option<DateTime<Utc>>,
 
@@ -101,8 +62,8 @@ pub struct LeaseSpec {
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
-        serialize_with = "micro_time::serialize",
-        deserialize_with = "micro_time::deserialize"
+        serialize_with = "crate::types::k8s_micro_time::serialize",
+        deserialize_with = "crate::types::k8s_micro_time::deserialize"
     )]
     pub renew_time: Option<DateTime<Utc>>,
 

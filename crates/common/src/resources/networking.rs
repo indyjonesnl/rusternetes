@@ -9,6 +9,7 @@ pub struct NetworkPolicy {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     pub spec: NetworkPolicySpec,

@@ -83,3 +83,4 @@ mod validation_vac_update;
 mod validation_volumeattachment;
 mod validation_volumeattributesclass;
 mod validation_webhookconfiguration;
+mod wire_field_shape_guard;

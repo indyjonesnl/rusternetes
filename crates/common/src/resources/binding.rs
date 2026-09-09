@@ -8,6 +8,7 @@ pub struct Binding {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Target is the object to bind to

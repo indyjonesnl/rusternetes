@@ -9,6 +9,7 @@ pub struct HorizontalPodAutoscaler {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     pub spec: HorizontalPodAutoscalerSpec,
@@ -252,7 +253,12 @@ pub struct HorizontalPodAutoscalerStatus {
     pub observed_generation: Option<i64>,
 
     /// Last time the autoscaler scaled the number of pods
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub last_scale_time: Option<DateTime<Utc>>,
 
     /// Current number of replicas
@@ -389,7 +395,12 @@ pub struct HorizontalPodAutoscalerCondition {
     pub status: String,
 
     /// Last time the condition transitioned
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<DateTime<Utc>>,
 
     /// Reason for the condition's last transition
@@ -408,6 +419,7 @@ pub struct VerticalPodAutoscaler {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     pub spec: VerticalPodAutoscalerSpec,
@@ -562,7 +574,12 @@ pub struct VerticalPodAutoscalerCondition {
     pub status: String,
 
     /// Last time the condition transitioned
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<DateTime<Utc>>,
 
     /// Reason for the condition's last transition

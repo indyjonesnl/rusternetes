@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct Deployment {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: DeploymentSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,9 +126,19 @@ pub struct DeploymentCondition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub last_update_time: Option<DateTime<Utc>>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<DateTime<Utc>>,
 }

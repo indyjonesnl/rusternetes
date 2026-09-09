@@ -11,6 +11,10 @@ pub struct MetricValue {
     pub kind: String,
     pub described_object: ObjectReference,
     pub metric_name: String,
+    #[serde(
+        serialize_with = "crate::types::k8s_time_required::serialize",
+        deserialize_with = "crate::types::k8s_time_required::deserialize"
+    )]
     pub timestamp: DateTime<Utc>,
     pub window: Option<String>,
     pub value: String,
@@ -56,6 +60,18 @@ pub struct ListMetadata {
 mod tests {
     use super::*;
 
+    /// A whole-second timestamp. `Utc::now()` carries nanoseconds, which these
+    /// fields no longer round-trip: they are `metav1.Time` upstream and now
+    /// serialize with `time.RFC3339` (second precision), so a nanosecond input
+    /// legitimately comes back truncated. Using a second-precision value keeps
+    /// the round-trip assertion about the round trip rather than about the
+    /// precision loss.
+    fn fixed_time() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-08T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     #[test]
     fn test_metric_value_serialization() {
         let metric_value = MetricValue {
@@ -68,7 +84,7 @@ mod tests {
                 api_version: Some("v1".to_string()),
             },
             metric_name: "http_requests_per_second".to_string(),
-            timestamp: Utc::now(),
+            timestamp: fixed_time(),
             window: Some("60s".to_string()),
             value: "100".to_string(),
             selector: Some(MetricSelector {
@@ -100,7 +116,7 @@ mod tests {
                         api_version: Some("v1".to_string()),
                     },
                     metric_name: "http_requests_per_second".to_string(),
-                    timestamp: Utc::now(),
+                    timestamp: fixed_time(),
                     window: Some("60s".to_string()),
                     value: "100".to_string(),
                     selector: None,
@@ -125,7 +141,7 @@ mod tests {
                 api_version: None,
             },
             metric_name: "http_requests".to_string(),
-            timestamp: Utc::now(),
+            timestamp: fixed_time(),
             window: None,
             value: "50".to_string(),
             selector: None,

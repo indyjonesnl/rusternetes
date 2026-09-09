@@ -13,7 +13,7 @@
 //! `#[ignore = "RED-state: ..."]`; lifting the ignore marker is the unit of
 //! work to GREEN them.
 
-use chrono::{Duration, Utc};
+use chrono::{Duration, Timelike, Utc};
 use rusternetes_common::resources::node::Taint;
 use rusternetes_common::resources::{Lease, LeaseSpec, Node, NodeCondition, NodeSpec, NodeStatus};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
@@ -443,7 +443,13 @@ async fn test_node_ready_condition_last_transition_time_preserved_on_no_flip() {
     // staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go:
     // "lastTransitionTime ... is updated each time the condition transitions
     // from one status to another").
-    let pinned = Utc::now() - Duration::seconds(3_600);
+    // Whole seconds: `metav1.Time` serializes with `time.RFC3339` and carries
+    // no fractional part (apimachinery .../meta/v1/time.go:167-170), so a
+    // nanosecond value pinned here would come back truncated and the equality
+    // below would be testing the precision loss rather than the controller.
+    let pinned = (Utc::now() - Duration::seconds(3_600))
+        .with_nanosecond(0)
+        .expect("nanosecond 0 is always in range");
     let node = make_node(
         "test-node-ready-stable",
         Some(vec![NodeCondition {
@@ -486,6 +492,13 @@ async fn test_node_pressure_condition_transitions_observed() {
     let controller = NodeController::new(storage.clone());
 
     let now = Utc::now();
+    // The pressure conditions start out an hour stale so the flip assertion at
+    // the end of this test can use a strict ordering: `metav1.Time` is second
+    // precision on the wire, so a `lastTransitionTime` set to `now` and one
+    // the controller refreshes in the same second compare equal.
+    let stale = (now - Duration::seconds(3_600))
+        .with_nanosecond(0)
+        .expect("nanosecond 0 is always in range");
     // A node carrying every pressure condition the upstream API ships with,
     // each in its "good" state. A future controller surface must keep them
     // observable (i.e. preserve them across reconciles).
@@ -504,7 +517,7 @@ async fn test_node_pressure_condition_transitions_observed() {
                 condition_type: "MemoryPressure".to_string(),
                 status: "False".to_string(),
                 last_heartbeat_time: Some(now),
-                last_transition_time: Some(now),
+                last_transition_time: Some(stale),
                 reason: Some("KubeletHasSufficientMemory".to_string()),
                 message: Some("kubelet has sufficient memory available".to_string()),
             },
@@ -512,7 +525,7 @@ async fn test_node_pressure_condition_transitions_observed() {
                 condition_type: "DiskPressure".to_string(),
                 status: "False".to_string(),
                 last_heartbeat_time: Some(now),
-                last_transition_time: Some(now),
+                last_transition_time: Some(stale),
                 reason: Some("KubeletHasNoDiskPressure".to_string()),
                 message: Some("kubelet has no disk pressure".to_string()),
             },
@@ -520,7 +533,7 @@ async fn test_node_pressure_condition_transitions_observed() {
                 condition_type: "PIDPressure".to_string(),
                 status: "False".to_string(),
                 last_heartbeat_time: Some(now),
-                last_transition_time: Some(now),
+                last_transition_time: Some(stale),
                 reason: Some("KubeletHasSufficientPID".to_string()),
                 message: Some("kubelet has sufficient PID available".to_string()),
             },
@@ -528,7 +541,7 @@ async fn test_node_pressure_condition_transitions_observed() {
                 condition_type: "NetworkUnavailable".to_string(),
                 status: "False".to_string(),
                 last_heartbeat_time: Some(now),
-                last_transition_time: Some(now),
+                last_transition_time: Some(stale),
                 reason: Some("RouteCreated".to_string()),
                 message: Some("RouteController created a route".to_string()),
             },
@@ -597,17 +610,19 @@ async fn test_node_pressure_condition_transitions_observed() {
         .cloned()
         .expect("MemoryPressure condition expected");
     assert_eq!(mp_after.status, "True");
-    // The pre-flip lastTransitionTime was `now` (set when the node was
-    // created). A correct controller bumps it past `now` when it observes the
-    // False -> True flip. Use a strict ordering rather than a fuzzy window
-    // so the assertion is robust against clock jitter.
+    // The pre-flip lastTransitionTime is an hour old (see `stale` above). A
+    // correct controller bumps it when it observes the False -> True flip.
+    // Strict ordering against a timestamp that far back stays expressible at
+    // the second precision `metav1.Time` has on the wire — comparing against
+    // `Utc::now()` would not, since the reconcile lands inside the same
+    // second and truncation makes the two equal.
     let updated_ltt = mp_after
         .last_transition_time
         .expect("MemoryPressure lastTransitionTime must be set");
     assert!(
-        updated_ltt > now,
+        updated_ltt > stale,
         "lastTransitionTime must be refreshed on MemoryPressure flip: pre={:?}, post={:?}",
-        now,
+        stale,
         updated_ltt
     );
 

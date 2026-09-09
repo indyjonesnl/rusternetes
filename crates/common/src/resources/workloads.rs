@@ -13,6 +13,7 @@ pub struct ReplicationController {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     pub spec: ReplicationControllerSpec,
@@ -121,6 +122,7 @@ pub struct ReplicaSet {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     pub spec: ReplicaSetSpec,
@@ -234,6 +236,7 @@ pub struct StatefulSet {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     pub spec: StatefulSetSpec,
@@ -406,7 +409,12 @@ pub struct StatefulSetCondition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<DateTime<Utc>>,
 }
 
@@ -417,6 +425,7 @@ pub struct DaemonSet {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     pub spec: DaemonSetSpec,
@@ -546,7 +555,12 @@ pub struct DaemonSetCondition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<DateTime<Utc>>,
 }
 
@@ -557,6 +571,7 @@ pub struct Job {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     pub spec: JobSpec,
@@ -758,11 +773,21 @@ pub struct JobStatus {
     pub conditions: Option<Vec<JobCondition>>,
 
     /// When the job started
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub start_time: Option<DateTime<Utc>>,
 
     /// When the job completed
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub completion_time: Option<DateTime<Utc>>,
 
     /// Number of pods which have a ready condition
@@ -817,6 +842,7 @@ pub struct CronJob {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     pub spec: CronJobSpec,
@@ -908,6 +934,7 @@ pub struct PodTemplate {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Template defines the pods that will be created from this pod template

@@ -3,115 +3,11 @@ use crate::types::ObjectMeta;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Module for serializing/deserializing Kubernetes Time format (without fractional seconds).
-/// Kubernetes Time uses the format: "2006-01-02T15:04:05Z"
-/// but must also accept timestamps with fractional seconds.
-mod k8s_time {
-    use chrono::{DateTime, Utc};
-    use serde::{self, Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(date: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match date {
-            Some(dt) => {
-                // Kubernetes Time format: WITHOUT microseconds (RFC3339 basic)
-                let s = dt.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-                serializer.serialize_str(&s)
-            }
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let opt: Option<String> = Option::deserialize(deserializer)?;
-        match opt {
-            Some(s) => {
-                // Accept RFC3339 with or without fractional seconds
-                if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
-                    return Ok(Some(dt.with_timezone(&Utc)));
-                }
-                s.parse::<DateTime<Utc>>()
-                    .map(Some)
-                    .map_err(serde::de::Error::custom)
-            }
-            None => Ok(None),
-        }
-    }
-}
-
-/// Module for serializing/deserializing MicroTime format (with microsecond precision).
-/// Kubernetes MicroTime requires the format: "2006-01-02T15:04:05.000000Z"
-/// but must also accept plain RFC3339 timestamps without fractional seconds.
-mod micro_time {
-    use chrono::{DateTime, Utc};
-    use serde::{self, Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(date: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match date {
-            Some(dt) => {
-                // Always include microseconds for MicroTime — K8s Events v1 client
-                // uses time.Parse("2006-01-02T15:04:05.000000Z07:00") which requires .000000
-                let s = dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
-                serializer.serialize_str(&s)
-            }
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let opt: Option<String> = Option::deserialize(deserializer)?;
-        match opt {
-            Some(s) => {
-                // Try parsing with microseconds first, then plain RFC3339
-                if let Ok(dt) = DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.6fZ") {
-                    return Ok(Some(dt.with_timezone(&Utc)));
-                }
-                if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
-                    return Ok(Some(dt.with_timezone(&Utc)));
-                }
-                s.parse::<DateTime<Utc>>()
-                    .map(Some)
-                    .map_err(serde::de::Error::custom)
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Serialize a required DateTime in MicroTime format (non-Option)
-    pub fn serialize_required<S>(date: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let s = date.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
-        serializer.serialize_str(&s)
-    }
-
-    /// Deserialize a required DateTime from MicroTime format (non-Option)
-    pub fn deserialize_required<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: String = String::deserialize(deserializer)?;
-        if let Ok(dt) = DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.6fZ") {
-            return Ok(dt.with_timezone(&Utc));
-        }
-        if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
-            return Ok(dt.with_timezone(&Utc));
-        }
-        s.parse::<DateTime<Utc>>().map_err(serde::de::Error::custom)
-    }
-}
+// The RFC3339-second (`metav1.Time`) and RFC3339Micro (`metav1.MicroTime`)
+// serde modules used below live in `crate::types` — this file used to carry
+// its own private copies. A second copy of a shared serialization rule is how
+// #1895 happened: the duplicate drifted to chrono's nanosecond default while
+// nobody was looking. One definition, used everywhere.
 
 /// Event represents a single event in the system
 ///
@@ -126,6 +22,7 @@ pub struct Event {
     #[serde(default = "default_kind")]
     pub kind: String,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// InvolvedObject is the object this event is about
@@ -152,8 +49,8 @@ pub struct Event {
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
-        serialize_with = "k8s_time::serialize",
-        deserialize_with = "k8s_time::deserialize"
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
     )]
     pub first_timestamp: Option<DateTime<Utc>>,
 
@@ -161,8 +58,8 @@ pub struct Event {
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
-        serialize_with = "k8s_time::serialize",
-        deserialize_with = "k8s_time::deserialize"
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
     )]
     pub last_timestamp: Option<DateTime<Utc>>,
 
@@ -186,8 +83,8 @@ pub struct Event {
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
-        serialize_with = "micro_time::serialize",
-        deserialize_with = "micro_time::deserialize"
+        serialize_with = "crate::types::k8s_micro_time::serialize",
+        deserialize_with = "crate::types::k8s_micro_time::deserialize"
     )]
     pub event_time: Option<DateTime<Utc>>,
 
@@ -300,8 +197,8 @@ pub struct EventSeries {
 
     /// Time of the last occurrence observed (MicroTime format for K8s compatibility)
     #[serde(
-        serialize_with = "micro_time::serialize_required",
-        deserialize_with = "micro_time::deserialize_required"
+        serialize_with = "crate::types::k8s_micro_time_required::serialize",
+        deserialize_with = "crate::types::k8s_micro_time_required::deserialize"
     )]
     pub last_observed_time: DateTime<Utc>,
 }

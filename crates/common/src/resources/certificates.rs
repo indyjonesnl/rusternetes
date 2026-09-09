@@ -10,6 +10,7 @@ pub struct CertificateSigningRequest {
     pub api_version: String,
     #[serde(default = "default_kind")]
     pub kind: String,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     /// CSR spec — optional to allow status-only patches/applies to deserialize
     #[serde(default)]

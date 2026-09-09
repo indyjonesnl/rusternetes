@@ -34,8 +34,11 @@ fn skip_empty_map<K, V>(v: &Option<std::collections::HashMap<K, V>>) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomResourceDefinition {
+    #[serde(default)]
     pub api_version: String,
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: CustomResourceDefinitionSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -229,10 +232,18 @@ pub struct JSONSchemaProps {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<serde_json::Value>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::types::k8s_float"
+    )]
     pub maximum: Option<f64>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::types::k8s_float"
+    )]
     pub minimum: Option<f64>,
 
     #[serde(skip_serializing_if = "skip_false_or_none")]
@@ -259,7 +270,11 @@ pub struct JSONSchemaProps {
     #[serde(skip_serializing_if = "skip_false_or_none")]
     pub unique_items: Option<bool>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::types::k8s_float"
+    )]
     pub multiple_of: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -674,8 +689,11 @@ pub struct CustomResourceDefinitionCondition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomResource {
+    #[serde(default)]
     pub api_version: String,
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Spec is the custom resource's specification (schema-validated)

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct Namespace {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub metadata: ObjectMeta,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<NamespaceSpec>,
@@ -63,7 +64,12 @@ pub struct NamespaceCondition {
     /// Status of the condition (True, False, Unknown)
     pub status: String,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<DateTime<Utc>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]

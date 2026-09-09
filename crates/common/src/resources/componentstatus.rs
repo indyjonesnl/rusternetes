@@ -8,6 +8,7 @@ pub struct ComponentStatus {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Conditions holds the status of the component

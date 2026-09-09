@@ -9,6 +9,7 @@ pub struct ConfigMap {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Data contains the configuration data
@@ -164,6 +165,7 @@ pub struct Secret {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Type of secret (Opaque, kubernetes.io/service-account-token, etc.)
