@@ -254,6 +254,21 @@ pub async fn patch_apiservice(
     patched["apiVersion"] = Value::String("apiregistration.k8s.io/v1".to_string());
 
     let result: Value = state.storage.update(&key, &patched).await?;
+
+    // Upstream's ShouldDeleteDuringUpdate: a patch that drains the last
+    // finalizer off an object already pending deletion finishes that deletion
+    // in the same request. PUT and PATCH share the rule because upstream has a
+    // single `Store.Update`, and the garbage collector relies on the PATCH side
+    // of it — `removeFinalizer` sends a merge patch
+    // (pkg/controller/garbagecollector/operations.go:141) (#1919).
+    crate::handlers::finalizers::finish_deletion_if_write_drained_finalizers(
+        &state.storage,
+        &key,
+        &result,
+        &original,
+    )
+    .await?;
+
     Ok(Json(result))
 }
 

@@ -1190,7 +1190,7 @@ pub async fn patch_custom_resource(
     patched.kind = crd.spec.names.kind.clone();
 
     // Update or create the resource in storage
-    let updated = if current_result.is_ok() {
+    let updated: CustomResource = if current_result.is_ok() {
         state.storage.update(&key, &patched).await?
     } else {
         // Server-side apply creates new resource
@@ -1198,6 +1198,28 @@ pub async fn patch_custom_resource(
         patched.metadata.ensure_creation_timestamp();
         state.storage.create(&key, &patched).await?
     };
+
+    // Upstream's ShouldDeleteDuringUpdate: a patch that drains the last
+    // finalizer off an object already pending deletion finishes that deletion
+    // in the same request. PUT and PATCH share the rule because upstream has a
+    // single `Store.Update`, and the garbage collector relies on the PATCH side
+    // of it — `removeFinalizer` sends a merge patch
+    // (pkg/controller/garbagecollector/operations.go:141) (#1919).
+    // Only on the update branch: an object this request just created was never
+    // pending deletion.
+    if let Ok(ref current) = current_result {
+        let updated_json =
+            serde_json::to_value(&updated).map_err(rusternetes_common::Error::Serialization)?;
+        let current_json =
+            serde_json::to_value(current).map_err(rusternetes_common::Error::Serialization)?;
+        crate::handlers::finalizers::finish_deletion_if_write_drained_finalizers(
+            &state.storage,
+            &key,
+            &updated_json,
+            &current_json,
+        )
+        .await?;
+    }
 
     Ok(Json(updated))
 }

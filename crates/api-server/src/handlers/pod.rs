@@ -1871,7 +1871,24 @@ pub async fn patch(
     patched_pod.metadata.resource_version = None;
 
     // Update in storage
-    let updated = state.storage.update(&key, &patched_pod).await?;
+    let updated: Pod = state.storage.update(&key, &patched_pod).await?;
+
+    // A patch that drained the last finalizer off a pod already pending
+    // deletion finishes that deletion in this request — upstream's
+    // ShouldDeleteDuringUpdate, which PUT and PATCH share because upstream has
+    // one `Store.Update`. This is how the garbage collector completes a
+    // foreground/orphan delete: `removeFinalizer` sends a merge patch
+    // (pkg/controller/garbagecollector/operations.go:141), so without this the
+    // pod keeps its deletionTimestamp with nothing left to remove it (#1919).
+    let updated_json =
+        serde_json::to_value(&updated).map_err(rusternetes_common::Error::Serialization)?;
+    crate::handlers::finalizers::finish_deletion_if_write_drained_finalizers(
+        &state.storage,
+        &key,
+        &updated_json,
+        &current_json,
+    )
+    .await?;
 
     Ok(Json(updated))
 }

@@ -283,15 +283,14 @@ where
         }
     }
 
-    // Whether the existing object was already pending deletion. Combined with
-    // "the patched object has no finalizers left", this triggers removal from
-    // storage — upstream ShouldDeleteDuringUpdate. Captured here because
-    // current_json is consumed by the admission webhook calls below.
-    let existing_terminating = current_json
-        .get("metadata")
-        .and_then(|m| m.get("deletionTimestamp"))
-        .map(|v| !v.is_null())
-        .unwrap_or(false);
+    // The pre-write metadata, kept for `should_finish_deletion`: upstream's
+    // predicate reads `deletionTimestamp` and `deletionGracePeriodSeconds` off
+    // the *existing* object, and `current_json` itself is consumed by the
+    // admission webhook calls below. Metadata is all the predicate looks at on
+    // that side, so this carries the whole of it rather than one flag.
+    let pre_write = serde_json::json!({
+        "metadata": current_json.get("metadata").cloned().unwrap_or(serde_json::Value::Null)
+    });
 
     // Convert back to resource type — use lenient deserialization
     let mut patched_resource: T = serde_json::from_value(patched_json.clone()).map_err(|e| {
@@ -439,27 +438,24 @@ where
     // Upstream ShouldDeleteDuringUpdate: if the patch drained the last finalizer
     // of an object already pending deletion, remove it now. The garbage
     // collector finishes orphan/foreground deletion this way — it PATCHes away
-    // the last finalizer and the owner must then disappear.
-    if existing_terminating {
-        let updated_json = serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null);
-        let new_finalizers_empty = updated_json
-            .get("metadata")
-            .and_then(|m| m.get("finalizers"))
-            .map(|f| f.as_array().is_none_or(|a| a.is_empty()))
-            .unwrap_or(true);
-        if new_finalizers_empty {
-            match state.storage.delete(&key).await {
-                Ok(_) => info!(
-                    "{} {}/{} deleted (finalizers drained during patch)",
-                    resource_type, namespace, name
-                ),
-                Err(rusternetes_common::Error::NotFound(_)) => {}
-                Err(e) => warn!(
-                    "failed to remove finalized {} {}/{}: {}",
-                    resource_type, namespace, name, e
-                ),
-            }
-        }
+    // the last finalizer and the owner must then disappear
+    // (pkg/controller/garbagecollector/operations.go:141). One shared decision
+    // point, because this rule is upstream's `Store.Update` and cannot differ
+    // between verbs; the copy that used to sit here omitted the grace-period
+    // clause and the namespace override (#1919).
+    let updated_json = serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null);
+    if let Err(e) = crate::handlers::finalizers::finish_deletion_if_write_drained_finalizers(
+        &state.storage,
+        &key,
+        &updated_json,
+        &pre_write,
+    )
+    .await
+    {
+        warn!(
+            "failed to remove finalized {} {}/{}: {}",
+            resource_type, namespace, name, e
+        );
     }
 
     Ok(Json(updated))
@@ -672,10 +668,6 @@ where
         }
     }
 
-    // Decide (before consuming patched_json) whether this patch finalizes a
-    // pending deletion — upstream ShouldDeleteDuringUpdate.
-    let finalizes_deletion = should_delete_during_update(&patched_json, &current_json);
-
     // Convert back to resource type
     let patched_resource: T = serde_json::from_value(patched_json).map_err(|e| {
         rusternetes_common::Error::InvalidResource(format!("Invalid result: {}", e))
@@ -750,19 +742,23 @@ where
 
     // If the patch drained the last finalizer of an object already pending
     // deletion, remove it now (upstream ShouldDeleteDuringUpdate). The GC drives
-    // orphan/foreground deletion this way.
-    if finalizes_deletion {
-        match state.storage.delete(&key).await {
-            Ok(_) => info!(
-                "{} {} deleted (finalizers drained during patch)",
-                resource_type, name
-            ),
-            Err(rusternetes_common::Error::NotFound(_)) => {}
-            Err(e) => warn!(
-                "failed to remove finalized {} {}: {}",
-                resource_type, name, e
-            ),
-        }
+    // orphan/foreground deletion this way. Shared with every other write path:
+    // the copy that used to sit here skipped the namespace override, so a PATCH
+    // could delete a Terminating namespace whose `spec.finalizers` still held
+    // ["kubernetes"] and whose contents were still being removed (#1919).
+    let updated_json = serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null);
+    if let Err(e) = crate::handlers::finalizers::finish_deletion_if_write_drained_finalizers(
+        &state.storage,
+        &key,
+        &updated_json,
+        &current_json,
+    )
+    .await
+    {
+        warn!(
+            "failed to remove finalized {} {}: {}",
+            resource_type, name, e
+        );
     }
 
     Ok(Json(updated))
