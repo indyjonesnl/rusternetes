@@ -63,14 +63,21 @@ pub struct LimitedPriorityLevelConfiguration {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LimitResponse {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub type_: LimitResponseType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queuing: Option<QueuingConfiguration>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum LimitResponseType {
+    /// Go's zero value: `type` was absent. Upstream's is a bare string and
+    /// `ValidateLimitResponse`'s `default` arm answers `NotSupported`
+    /// (`pkg/apis/flowcontrol/validation/validation.go:478`). Neither `Queue`
+    /// nor `Reject` may be assumed — they are opposite behaviours under load.
+    #[default]
+    #[serde(rename = "")]
+    Unspecified,
     Queue,
     Reject,
 }
@@ -169,12 +176,18 @@ pub struct PriorityLevelConfigurationReference {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowDistinguisherMethod {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub type_: FlowDistinguisherMethodType,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum FlowDistinguisherMethodType {
+    /// Go's zero value: `distinguisherMethod.type` was absent. Upstream checks
+    /// it against `supportedDistinguisherMethods` and answers `NotSupported`
+    /// (`validation.go:117-119`).
+    #[default]
+    #[serde(rename = "")]
+    Unspecified,
     ByUser,
     ByNamespace,
 }
@@ -194,6 +207,7 @@ pub struct PolicyRulesWithSubjects {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowSchemaSubject {
+    #[serde(default)]
     pub kind: SubjectKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<UserSubject>,
@@ -203,8 +217,15 @@ pub struct FlowSchemaSubject {
     pub service_account: Option<ServiceAccountSubject>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum SubjectKind {
+    /// Go's zero value: `kind` was absent. `ValidateFlowSchemaSubject`'s
+    /// `default` arm answers `NotSupported` (`validation.go:185-187`), which is
+    /// also what makes the `user`/`group`/`serviceAccount` triple unambiguous —
+    /// guessing a kind here would validate the wrong one of the three.
+    #[default]
+    #[serde(rename = "")]
+    Unspecified,
     User,
     Group,
     ServiceAccount,
@@ -213,19 +234,23 @@ pub enum SubjectKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserSubject {
+    #[serde(default)]
     pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupSubject {
+    #[serde(default)]
     pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceAccountSubject {
+    #[serde(default)]
     pub namespace: String,
+    #[serde(default)]
     pub name: String,
 }
 

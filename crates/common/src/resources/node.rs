@@ -281,7 +281,9 @@ pub struct NodeConfigSource {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigMapNodeConfigSource {
+    #[serde(default)]
     pub namespace: String,
+    #[serde(default)]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,

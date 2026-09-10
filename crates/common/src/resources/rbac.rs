@@ -78,6 +78,7 @@ impl ClusterRole {
 pub struct PolicyRule {
     /// Verbs is a list of Verbs that apply to ALL the ResourceKinds and AttributeRestrictions contained in this rule
     /// Examples: get, list, watch, create, update, patch, delete
+    #[serde(default)]
     pub verbs: Vec<String>,
 
     /// APIGroups is the name of the APIGroup that contains the resources
@@ -234,9 +235,11 @@ impl ClusterRoleBinding {
 #[serde(rename_all = "camelCase")]
 pub struct Subject {
     /// Kind of object being referenced. Values defined by this API group are "User", "Group", and "ServiceAccount"
+    #[serde(default)]
     pub kind: String,
 
     /// Name of the object being referenced
+    #[serde(default)]
     pub name: String,
 
     /// Namespace of the referenced object. If the object kind is non-namespace, such as "User" or "Group", this field should be empty

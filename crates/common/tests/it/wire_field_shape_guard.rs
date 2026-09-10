@@ -483,7 +483,16 @@ fn every_field_of_an_audited_module_decodes_when_absent() {
 
 /// Modules of `crates/common/src/resources/` whose whole field surface has been
 /// audited for #1939. Grows one slice at a time; see rule 5.
-const AUDITED_MODULES: &[&str] = &["admission_webhook.rs"];
+const AUDITED_MODULES: &[&str] = &[
+    "admission_webhook.rs",
+    "endpointslice.rs",
+    "flowcontrol.rs",
+    "ipaddress.rs",
+    "networking.rs",
+    "node.rs",
+    "rbac.rs",
+    "service.rs",
+];
 
 /// `(first, last)` line of every struct body shaped like a status condition:
 /// it declares a field serialized as `type` and one serialized as `status`.

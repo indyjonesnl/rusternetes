@@ -4,16 +4,19 @@
 //! Covers `matchingPrecedence` bounds + the `exempt`-name rule,
 //! `priorityLevelConfiguration.name`, each rule's subjects +
 //! resourceRules/nonResourceRules, and `status.conditions`. ObjectMeta is
-//! validated separately (#1087 / #1277). `kind` / `distinguisherMethod.type`
-//! are typed enums, so those upstream `NotSupported` checks are enforced by the
-//! type system. `ValidateNonResourceURLPath` is a full port of upstream
+//! validated separately (#1087 / #1277). `kind` and
+//! `distinguisherMethod.type` are typed enums, so an *unrecognized* string is
+//! rejected at decode time; their Go zero value (an absent field) decodes to
+//! `Unspecified` and is answered here with the same `NotSupported` upstream
+//! gives (#1939). `ValidateNonResourceURLPath` is a full port of upstream
 //! (empty / leading-slash / whitespace / double-slash / suffix-only wildcard).
 
 use std::collections::HashSet;
 
 use crate::resources::flowcontrol::{
-    FlowSchema, FlowSchemaCondition, FlowSchemaStatus, FlowSchemaSubject, NonResourcePolicyRule,
-    PolicyRulesWithSubjects, ResourcePolicyRule, SubjectKind,
+    FlowDistinguisherMethodType, FlowSchema, FlowSchemaCondition, FlowSchemaStatus,
+    FlowSchemaSubject, NonResourcePolicyRule, PolicyRulesWithSubjects, ResourcePolicyRule,
+    SubjectKind,
 };
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
@@ -66,6 +69,15 @@ fn validate_subject(subject: &FlowSchemaSubject, fld_path: &Path) -> ErrorList {
         }
     };
     match subject.kind {
+        // Go's zero value, i.e. an absent `kind`. Upstream's `default` arm
+        // (`pkg/apis/flowcontrol/validation/validation.go:185-187`): the kind
+        // decides which of `user`/`group`/`serviceAccount` is even looked at,
+        // so there is nothing else to check here.
+        SubjectKind::Unspecified => errs.push(Error::not_supported(
+            &fld_path.child("kind"),
+            String::new(),
+            &["Group", "ServiceAccount", "User"],
+        )),
         SubjectKind::ServiceAccount => {
             let sp = fld_path.child("serviceAccount");
             match &subject.service_account {
@@ -396,6 +408,19 @@ pub fn validate_flow_schema(fs: &FlowSchema) -> ErrorList {
     } else {
         for msg in is_dns1123_subdomain(plc_name) {
             errs.push(Error::invalid(&plc_name_path, plc_name.clone(), msg));
+        }
+    }
+
+    // Upstream `ValidateFlowSchemaSpec` (validation.go:115-120): when
+    // `distinguisherMethod` is present its `type` must be one of the supported
+    // methods. An absent `type` is Go's `""`, which fails that check.
+    if let Some(dm) = &spec.distinguisher_method {
+        if matches!(dm.type_, FlowDistinguisherMethodType::Unspecified) {
+            errs.push(Error::not_supported(
+                &spec_path.child("distinguisherMethod").child("type"),
+                String::new(),
+                &["ByNamespace", "ByUser"],
+            ));
         }
     }
 
