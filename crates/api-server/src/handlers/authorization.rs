@@ -33,18 +33,20 @@ pub async fn create_subject_access_review(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
-    // Build the authorization request from the spec
-    // Exactly one of resourceAttributes / nonResourceAttributes may be set
-    // (upstream ValidateSubjectAccessReviewSpec rejects both being present).
-    if sar.spec.resource_attributes.is_some() && sar.spec.non_resource_attributes.is_some() {
-        return Err(rusternetes_common::Error::Invalid(vec![
-            rusternetes_common::validation::field::Error::invalid(
-                &rusternetes_common::validation::field::Path::new("spec")
-                    .child("nonResourceAttributes"),
-                "<set>".to_string(),
-                "cannot be specified in combination with resourceAttributes",
-            ),
-        ]));
+    // The whole spec, validated in one place. Upstream runs
+    // `ValidateSubjectAccessReview` in the registry and answers `NewInvalid`
+    // (`pkg/registry/authorization/subjectaccessreview/rest.go:75-77`); this
+    // handler used to hand-roll only the "both set" clause and raise
+    // `Error::Internal` -- a 500 -- for the "neither set" one (#1938).
+    {
+        let errs =
+            rusternetes_common::validation::authorization::validate_subject_access_review_spec(
+                &sar.spec,
+                &rusternetes_common::validation::field::Path::new("spec"),
+            );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
     }
 
     let check_attrs = if let Some(ref resource_attrs) = sar.spec.resource_attributes {
@@ -82,9 +84,8 @@ pub async fn create_subject_access_review(
             non_resource_attrs.path.as_deref().unwrap_or(""),
         )
     } else {
-        return Err(rusternetes_common::Error::Internal(
-            "Either resourceAttributes or nonResourceAttributes must be specified".to_string(),
-        ));
+        // Unreachable: validation above rejected a spec with neither set.
+        unreachable!("validate_subject_access_review_spec accepted an empty spec")
     };
 
     // Perform the authorization check
@@ -137,18 +138,18 @@ pub async fn create_self_subject_access_review(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
-    // Build the authorization request from the spec using the current user
-    // Exactly one of resourceAttributes / nonResourceAttributes may be set
-    // (upstream ValidateSubjectAccessReviewSpec rejects both being present).
-    if ssar.spec.resource_attributes.is_some() && ssar.spec.non_resource_attributes.is_some() {
-        return Err(rusternetes_common::Error::Invalid(vec![
-            rusternetes_common::validation::field::Error::invalid(
-                &rusternetes_common::validation::field::Path::new("spec")
-                    .child("nonResourceAttributes"),
-                "<set>".to_string(),
-                "cannot be specified in combination with resourceAttributes",
-            ),
-        ]));
+    // `ValidateSelfSubjectAccessReviewSpec` (`validation.go:49-60`): the two
+    // attribute rules, and no user/groups rule -- this review authorizes the
+    // caller, so there is no subject to name (#1938).
+    {
+        let errs =
+            rusternetes_common::validation::authorization::validate_self_subject_access_review_spec(
+                &ssar.spec,
+                &rusternetes_common::validation::field::Path::new("spec"),
+            );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
     }
 
     let check_attrs = if let Some(ref resource_attrs) = ssar.spec.resource_attributes {
@@ -176,9 +177,8 @@ pub async fn create_self_subject_access_review(
             non_resource_attrs.path.as_deref().unwrap_or(""),
         )
     } else {
-        return Err(rusternetes_common::Error::Internal(
-            "Either resourceAttributes or nonResourceAttributes must be specified".to_string(),
-        ));
+        // Unreachable: validation above rejected a spec with neither set.
+        unreachable!("validate_self_subject_access_review_spec accepted an empty spec")
     };
 
     // Perform the authorization check
@@ -222,17 +222,21 @@ pub async fn create_local_subject_access_review(
 
     // Build the authorization request from the spec
     // LocalSubjectAccessReview is namespace-scoped
-    // Exactly one of resourceAttributes / nonResourceAttributes may be set
-    // (upstream ValidateSubjectAccessReviewSpec rejects both being present).
-    if lsar.spec.resource_attributes.is_some() && lsar.spec.non_resource_attributes.is_some() {
-        return Err(rusternetes_common::Error::Invalid(vec![
-            rusternetes_common::validation::field::Error::invalid(
-                &rusternetes_common::validation::field::Path::new("spec")
-                    .child("nonResourceAttributes"),
-                "<set>".to_string(),
-                "cannot be specified in combination with resourceAttributes",
-            ),
-        ]));
+    // `ValidateLocalSubjectAccessReview` (`validation.go:88-106`) adds two rules
+    // to the shared spec ones: `spec.resourceAttributes.namespace` must match
+    // the namespace the review was posted to, and `nonResourceAttributes` is
+    // disallowed outright. The namespace rule is what keeps a local review
+    // scoped: without it this handler answered a question about a *different*
+    // namespace than the path, silently rewriting it to the path namespace and
+    // reporting `allowed` for a check the client never asked for (#1938).
+    {
+        let errs =
+            rusternetes_common::validation::authorization::validate_local_subject_access_review(
+                &lsar.spec, &namespace,
+            );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
     }
 
     let check_attrs = if let Some(ref resource_attrs) = lsar.spec.resource_attributes {
@@ -258,9 +262,10 @@ pub async fn create_local_subject_access_review(
 
         attrs
     } else {
-        return Err(rusternetes_common::Error::Internal(
-            "resourceAttributes must be specified for LocalSubjectAccessReview".to_string(),
-        ));
+        // Unreachable: validation above rejected a spec without
+        // resourceAttributes (nonResourceAttributes is disallowed here, and a
+        // spec with neither is rejected by the shared rule).
+        unreachable!("validate_local_subject_access_review accepted an empty spec")
     };
 
     // Perform the authorization check

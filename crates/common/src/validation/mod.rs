@@ -6,6 +6,7 @@
 //! [`metav1`] for the metav1 validators.
 
 pub mod apps;
+pub mod authorization;
 pub mod certificatesigningrequest;
 pub mod configmap;
 pub mod controllerrevision;
