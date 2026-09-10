@@ -80,6 +80,26 @@ async fn seed(state: &TestApiServer, pod: &Pod) {
     state.storage.create(&key, pod).await.expect("seed pod");
 }
 
+/// Serialize `pod` for a PUT, carrying the resourceVersion the store actually
+/// holds.
+///
+/// A real client PUTs the object it just read. The store stamps a
+/// resourceVersion on every write (#1942), and the update path enforces it, so
+/// a body holding the `"1"` from `baseline_pod` is a 409 Conflict *before* any
+/// immutability check runs — which would make every rejection assertion below
+/// pass for the wrong reason, and every acceptance assertion fail.
+async fn body_with_stored_rv(state: &TestApiServer, pod: &Pod) -> Value {
+    let key = build_key(
+        "pods",
+        pod.metadata.namespace.as_deref(),
+        &pod.metadata.name,
+    );
+    let mut body = serde_json::to_value(pod).unwrap();
+    let stored: Value = state.storage.get(&key).await.expect("stored pod");
+    body["metadata"]["resourceVersion"] = stored["metadata"]["resourceVersion"].clone();
+    body
+}
+
 /// Send PUT for the regular update path. Returns (status, body json).
 async fn put_pod(state: TestApiServer, pod: &Pod) -> (u16, Value) {
     let uri = format!(
@@ -87,7 +107,7 @@ async fn put_pod(state: TestApiServer, pod: &Pod) -> (u16, Value) {
         pod.metadata.namespace.as_deref().unwrap_or("default"),
         pod.metadata.name
     );
-    let body = serde_json::to_value(pod).unwrap();
+    let body = body_with_stored_rv(&state, pod).await;
     let (status, value) = state
         .send("PUT", &uri, Some("application/json"), Some(&body))
         .await;
@@ -101,7 +121,7 @@ async fn put_ephemeralcontainers(state: TestApiServer, pod: &Pod) -> (u16, Value
         pod.metadata.namespace.as_deref().unwrap_or("default"),
         pod.metadata.name
     );
-    let body = serde_json::to_value(pod).unwrap();
+    let body = body_with_stored_rv(&state, pod).await;
     let (status, value) = state
         .send("PUT", &uri, Some("application/json"), Some(&body))
         .await;

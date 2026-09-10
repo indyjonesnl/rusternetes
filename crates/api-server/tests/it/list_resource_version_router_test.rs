@@ -174,11 +174,18 @@ async fn list_empty_configmaps_has_valid_resource_version() {
 }
 
 /// Secrets list goes through the `List::new`-only path (no explicit
-/// `current_revision()` stamp historically). The list RV must equal the store
-/// revision, not the small max-item resourceVersion. With `MemoryStorage` the
-/// store revision is a unix timestamp (> 1e9), whereas freshly created object
-/// RVs are tiny — so a list RV below the threshold proves the handler ignored
-/// `current_revision()`.
+/// `current_revision()` stamp historically). The list RV must be the store
+/// revision, not the max resourceVersion among the returned items — an
+/// informer watches from the list RV, and a max-item RV silently drops every
+/// change made to any *other* resource in between.
+///
+/// The discriminator is a write that does not appear in this list: a ConfigMap
+/// created after the Secret advances the store revision past every Secret's
+/// RV, so `list.metadata.resourceVersion` must come out strictly greater than
+/// the largest item RV. (It used to be "> 1e9", which worked only because
+/// `MemoryStorage::current_revision` returned a unix timestamp; it now returns
+/// a real write counter, #1942, and that threshold would pass vacuously for
+/// either implementation.)
 #[tokio::test]
 async fn list_secrets_uses_store_revision_not_item_rv() {
     let state = TestApiServer::new();
@@ -199,6 +206,23 @@ async fn list_secrets_uses_store_revision_not_item_rv() {
         "secret create returned {status}",
     );
 
+    // A write that this list will not return, so the store revision moves past
+    // every Secret's own resourceVersion.
+    let (status, _b) = state
+        .post(
+            &format!("/api/v1/namespaces/{ns}/configmaps"),
+            &json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": { "name": "rv-bump", "namespace": ns },
+            }),
+        )
+        .await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::OK,
+        "configmap create returned {status}",
+    );
+
     let uri = format!("/api/v1/namespaces/{ns}/secrets");
     let (status, raw, body) = state.send_raw("GET", &uri, None, None).await;
     assert_eq!(
@@ -214,10 +238,20 @@ async fn list_secrets_uses_store_revision_not_item_rv() {
         .unwrap()
         .parse()
         .unwrap();
+    let max_item_rv = body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|i| i["metadata"]["resourceVersion"].as_str())
+        .filter_map(|s| s.parse::<i64>().ok())
+        .max()
+        .expect("at least one item with a resourceVersion");
     assert!(
-        rv > 1_000_000_000,
-        "SecretList resourceVersion={rv} looks like a max-item RV, not the store \
-         revision from current_revision(); informers watch from the store revision: {}",
+        rv > max_item_rv,
+        "SecretList resourceVersion={rv} is not above the largest item RV \
+         ({max_item_rv}), so it is a max-item RV rather than the store revision \
+         from current_revision(); an informer watching from it would miss every \
+         write to another resource: {}",
         std::str::from_utf8(&raw).unwrap(),
     );
 }

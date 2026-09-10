@@ -29,51 +29,51 @@ use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, WatchStream
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
 // ---------------------------------------------------------------------------
-// RvEnforcingStorage — stamps objects with auto-incrementing resource_version
-// and rejects updates with stale versions (simulates etcd CAS behavior).
+// RvEnforcingStorage — rejects updates carrying a stale resourceVersion
+// (simulates etcd's compare-and-swap).
+//
+// The resourceVersion itself comes from the wrapped `MemoryStorage`, which
+// stamps one on every write like the etcd backend does (#1942). This wrapper
+// used to run its own counter on top and write through `update_raw`, so both
+// layers stamped and the value a `get` returned was the inner one while the
+// wrapper's CAS map held its own — two sources of truth for the same field.
+// It now records whatever the inner store assigned, and adds only the CAS
+// check that `MemoryStorage` still lacks.
 // ---------------------------------------------------------------------------
 
 struct RvEnforcingStorage {
     inner: MemoryStorage,
-    rv_counter: Arc<AtomicU64>,
-    current_rvs: Arc<Mutex<HashMap<String, u64>>>,
+    current_rvs: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl RvEnforcingStorage {
     fn new() -> Self {
         Self {
             inner: MemoryStorage::new(),
-            rv_counter: Arc::new(AtomicU64::new(1)),
             current_rvs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    fn next_rv(&self) -> u64 {
-        self.rv_counter.fetch_add(1, Ordering::SeqCst)
-    }
-
-    fn stamp_rv(value: &mut serde_json::Value, rv: u64) {
-        if let Some(metadata) = value.get_mut("metadata") {
-            if let Some(obj) = metadata.as_object_mut() {
-                obj.insert(
-                    "resourceVersion".to_string(),
-                    serde_json::Value::String(rv.to_string()),
-                );
-            }
-        }
-    }
-
-    fn extract_rv(value: &serde_json::Value) -> Option<u64> {
+    fn extract_rv(value: &serde_json::Value) -> Option<String> {
         value
             .get("metadata")
             .and_then(|m| m.get("resourceVersion"))
             .and_then(|rv| rv.as_str())
-            .and_then(|s| s.parse::<u64>().ok())
+            .map(str::to_string)
+    }
+
+    /// Record the resourceVersion the inner store stamped on `stored`.
+    fn remember_rv<T: Serialize>(&self, key: &str, stored: &T) -> rusternetes_common::Result<()> {
+        let json = serde_json::to_value(stored)?;
+        if let Some(rv) = Self::extract_rv(&json) {
+            self.current_rvs.lock().unwrap().insert(key.to_string(), rv);
+        }
+        Ok(())
     }
 }
 
@@ -83,20 +83,9 @@ impl Storage for RvEnforcingStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        let mut json = serde_json::to_value(value)?;
-        let rv = self.next_rv();
-        Self::stamp_rv(&mut json, rv);
-        self.current_rvs.lock().unwrap().insert(key.to_string(), rv);
-        let serialized = serde_json::to_string(&json)?;
-        // Store directly in inner without going through inner.create (which adds its own UID/RV)
-        // We bypass inner by using update_raw after creating a placeholder
-        self.inner
-            .create(
-                key,
-                &serde_json::from_str::<serde_json::Value>(&serialized)?,
-            )
-            .await?;
-        Ok(serde_json::from_value(json)?)
+        let stored: T = self.inner.create(key, value).await?;
+        self.remember_rv(key, &stored)?;
+        Ok(stored)
     }
 
     async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
@@ -113,7 +102,7 @@ impl Storage for RvEnforcingStorage {
         let json = serde_json::to_value(value)?;
         // Check the resource_version in the submitted value matches current
         let submitted_rv = Self::extract_rv(&json);
-        let current_rv = self.current_rvs.lock().unwrap().get(key).copied();
+        let current_rv = self.current_rvs.lock().unwrap().get(key).cloned();
 
         if let (Some(submitted), Some(current)) = (submitted_rv, current_rv) {
             if submitted != current {
@@ -124,17 +113,10 @@ impl Storage for RvEnforcingStorage {
             }
         }
 
-        // Stamp new RV
-        let mut new_json = json;
-        let new_rv = self.next_rv();
-        Self::stamp_rv(&mut new_json, new_rv);
-        self.current_rvs
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), new_rv);
-
-        self.inner.update_raw(key, &new_json).await?;
-        Ok(serde_json::from_value(new_json)?)
+        // The inner store assigns the new resourceVersion.
+        let stored: T = self.inner.update(key, value).await?;
+        self.remember_rv(key, &stored)?;
+        Ok(stored)
     }
 
     async fn update_raw(

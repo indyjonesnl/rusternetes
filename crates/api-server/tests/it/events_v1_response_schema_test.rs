@@ -206,7 +206,6 @@ async fn a_v1_read_modify_write_preserves_every_field() {
         "count": 2,
         "lastObservedTime": "2026-09-08T10:06:00.000000Z",
     });
-    put["metadata"]["resourceVersion"] = json!("1");
     let (status, updated) = api
         .send(
             "PUT",
