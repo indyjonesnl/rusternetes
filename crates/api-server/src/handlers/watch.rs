@@ -1937,6 +1937,7 @@ impl_has_metadata!(
     rusternetes_common::resources::Job,
     rusternetes_common::resources::CronJob,
     rusternetes_common::resources::Event,
+    rusternetes_common::resources::EventV1,
     rusternetes_common::resources::ServiceAccount,
     rusternetes_common::resources::PersistentVolume,
     rusternetes_common::resources::PersistentVolumeClaim,

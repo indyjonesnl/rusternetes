@@ -8,7 +8,7 @@ use axum::{
 use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
-    resources::{Event, EventList},
+    resources::{Event, EventList, EventV1, EventV1List},
     Result,
 };
 use rusternetes_storage::{build_key, build_prefix, Storage};
@@ -614,13 +614,24 @@ pub async fn list_events_v1(
                 .get("sendInitialEvents")
                 .map(|v| rusternetes_common::query::k8s_query_bool(v)),
         };
-        return crate::handlers::watch::watch_namespaced::<Event>(
+        // The stored object is the core Event; the client asked for
+        // `events.k8s.io/v1`. Convert every streamed object the way upstream's
+        // codec does on the way out (`Convert_core_Event_To_v1_Event`,
+        // `pkg/apis/events/v1/conversion.go:46-60`) and stream the v1 wire
+        // type, so a watch answers with the same schema as a GET (#1926).
+        let converter: crate::handlers::watch::WatchObjectConverter =
+            std::sync::Arc::new(|value: serde_json::Value| {
+                Box::pin(async move { core_event_json_to_events_v1(value) })
+            });
+        return crate::handlers::watch::watch_namespaced_converted::<EventV1>(
             state,
             auth_ctx,
             namespace,
             "events",
             "events.k8s.io",
             watch_params,
+            converter,
+            Some(("Event".to_string(), "events.k8s.io/v1".to_string())),
         )
         .await;
     }
@@ -640,16 +651,13 @@ pub async fn list_events_v1(
     let mut events: Vec<Event> = state.storage.list(&prefix).await?;
     crate::handlers::filtering::apply_selectors(&mut events, &params)?;
 
-    // Set apiVersion to events.k8s.io/v1 for each event
-    for event in &mut events {
-        event.api_version = "events.k8s.io/v1".to_string();
-    }
-
-    Ok(Json(EventList {
+    // Answer in the events.k8s.io/v1 schema, not the stored core one with a
+    // rewritten `apiVersion` (#1926).
+    Ok(Json(EventV1List {
         api_version: "events.k8s.io/v1".to_string(),
         kind: "EventList".to_string(),
         metadata: rusternetes_common::types::ListMeta::default(),
-        items: events,
+        items: events.iter().map(Event::to_events_v1).collect(),
     })
     .into_response())
 }
@@ -708,15 +716,11 @@ pub async fn list_all_events_v1(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut events, &params)?;
 
-    for event in &mut events {
-        event.api_version = "events.k8s.io/v1".to_string();
-    }
-
-    Ok(Json(EventList {
+    Ok(Json(EventV1List {
         api_version: "events.k8s.io/v1".to_string(),
         kind: "EventList".to_string(),
         metadata: rusternetes_common::types::ListMeta::default(),
-        items: events,
+        items: events.iter().map(Event::to_events_v1).collect(),
     })
     .into_response())
 }
@@ -726,7 +730,7 @@ pub async fn get_events_v1(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<Event>> {
+) -> Result<Json<EventV1>> {
     let attrs = RequestAttributes::new(auth_ctx.user, "get", "events")
         .with_namespace(&namespace)
         .with_api_group("events.k8s.io")
@@ -740,10 +744,9 @@ pub async fn get_events_v1(
     }
 
     let key = build_key("events", Some(&namespace), &name);
-    let mut event: Event = state.storage.get(&key).await?;
-    event.api_version = "events.k8s.io/v1".to_string();
+    let event: Event = state.storage.get(&key).await?;
 
-    Ok(Json(event))
+    Ok(Json(event.to_events_v1()))
 }
 
 /// Create an event via events.k8s.io/v1
@@ -752,8 +755,8 @@ pub async fn create_events_v1(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut event): DumpingJson<Event>,
-) -> Result<(StatusCode, Json<Event>)> {
+    DumpingJson(body): DumpingJson<EventV1>,
+) -> Result<(StatusCode, Json<EventV1>)> {
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "events")
@@ -767,19 +770,16 @@ pub async fn create_events_v1(
         }
     }
 
-    event.metadata.namespace = Some(namespace.clone());
-    event.metadata.ensure_uid();
-    event.api_version = "events.k8s.io/v1".to_string();
-
-    // Convert the events.k8s.io/v1 body onto the core field names BEFORE
-    // validation: the strict validator reads `involvedObject.namespace`,
-    // `message`/`note` length, and requires `source`, `firstTimestamp`,
-    // `lastTimestamp` and `count` — which arrive as `deprecated*` on this
-    // version — to be unset (#1914).
+    // Convert the request onto the core object BEFORE validation: the strict
+    // validator reads `involvedObject.namespace`, `message`/`note` length, and
+    // requires `source`, `firstTimestamp`, `lastTimestamp` and `count` — which
+    // arrive as `deprecated*` on this version — to be unset (#1914).
     // Crucially we do NOT yet copy `reportingController` into `source`: strict
     // validation requires `source` to be unset, and the client legitimately
     // leaves it empty.
-    event.convert_from_events_v1();
+    let mut event = body.into_core();
+    event.metadata.namespace = Some(namespace.clone());
+    event.metadata.ensure_uid();
 
     if event.metadata.name.is_empty() {
         let name = Event::generate_name(&event.involved_object, &event.reason);
@@ -813,13 +813,12 @@ pub async fn create_events_v1(
     let key = build_key("events", Some(&namespace), &event.metadata.name);
 
     if is_dry_run {
-        return Ok((StatusCode::CREATED, Json(event)));
+        return Ok((StatusCode::CREATED, Json(event.to_events_v1())));
     }
 
-    let mut created: Event = state.storage.create(&key, &event).await?;
-    created.api_version = "events.k8s.io/v1".to_string();
+    let created: Event = state.storage.create(&key, &event).await?;
 
-    Ok((StatusCode::CREATED, Json(created)))
+    Ok((StatusCode::CREATED, Json(created.to_events_v1())))
 }
 
 /// Update an event via events.k8s.io/v1
@@ -828,8 +827,8 @@ pub async fn update_events_v1(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut event): DumpingJson<Event>,
-) -> Result<Json<Event>> {
+    DumpingJson(body): DumpingJson<EventV1>,
+) -> Result<Json<EventV1>> {
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     let attrs = RequestAttributes::new(auth_ctx.user, "update", "events")
@@ -844,9 +843,14 @@ pub async fn update_events_v1(
         }
     }
 
+    // The v1 body converts onto the core object unconditionally, as upstream's
+    // `Convert_v1_Event_To_core_Event` does: this version has no `count`,
+    // `message`, `source` or `involvedObject` field for the conversion to
+    // clobber, and reads now answer in the same schema, so a
+    // read-modify-write client round-trips the `deprecated*` names (#1926).
+    let mut event = body.into_core();
     event.metadata.namespace = Some(namespace.clone());
     event.metadata.name = name.clone();
-    event.api_version = "events.k8s.io/v1".to_string();
 
     let key = build_key("events", Some(&namespace), &name);
 
@@ -877,12 +881,11 @@ pub async fn update_events_v1(
         }
     }
 
-    // Convert the events.k8s.io/v1 body onto the core field names, then
-    // back-fill `source.component` from `reportingController` to mirror how
-    // the stored event was normalised at create time, so the strict update
-    // immutability check on `source` compares like with like. The back-fill
-    // runs second so an explicit `deprecatedSource` still wins.
-    event.convert_from_events_v1();
+    // Back-fill `source.component` from `reportingController` to mirror how the
+    // stored event was normalised at create time, so the strict update
+    // immutability check on `source` compares like with like. An explicit
+    // `deprecatedSource` already landed on `source` in the conversion above and
+    // still wins.
     if event.source.component.is_empty() {
         if let Some(ref rc) = event.reporting_component {
             event.source.component = rc.clone();
@@ -904,7 +907,7 @@ pub async fn update_events_v1(
     }
 
     if is_dry_run {
-        return Ok(Json(event));
+        return Ok(Json(event.to_events_v1()));
     }
 
     // Reinstate the server-owned metadata a PUT body may omit: uid,
@@ -925,12 +928,11 @@ pub async fn update_events_v1(
     }
     // AllowCreateOnUpdate, as on the core endpoint above — both reach the same
     // registry upstream (pkg/registry/core/event/strategy.go:74).
-    let mut updated: Event = match state.storage.update(&key, &event).await {
+    let updated: Event = match state.storage.update(&key, &event).await {
         Ok(updated) => updated,
         Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &event).await?,
         Err(e) => return Err(e),
     };
-    updated.api_version = "events.k8s.io/v1".to_string();
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of
@@ -942,7 +944,7 @@ pub async fn update_events_v1(
     )
     .await?;
 
-    Ok(Json(updated))
+    Ok(Json(updated.to_events_v1()))
 }
 
 /// Delete an event via events.k8s.io/v1
@@ -952,7 +954,7 @@ pub async fn delete_events_v1(
     Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Event>> {
+) -> Result<Json<EventV1>> {
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "events")
@@ -968,11 +970,10 @@ pub async fn delete_events_v1(
     }
 
     let key = build_key("events", Some(&namespace), &name);
-    let mut event: Event = state.storage.get(&key).await?;
-    event.api_version = "events.k8s.io/v1".to_string();
+    let event: Event = state.storage.get(&key).await?;
 
     if is_dry_run {
-        return Ok(Json(event));
+        return Ok(Json(event.to_events_v1()));
     }
 
     let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
@@ -984,13 +985,49 @@ pub async fn delete_events_v1(
     .await?;
 
     if deleted_immediately {
-        Ok(Json(event))
+        Ok(Json(event.to_events_v1()))
     } else {
-        let mut updated: Event = state.storage.get(&key).await?;
-        updated.api_version = "events.k8s.io/v1".to_string();
-        Ok(Json(updated))
+        let updated: Event = state.storage.get(&key).await?;
+        Ok(Json(updated.to_events_v1()))
     }
 }
 
-// PATCH handler for events.k8s.io/v1
-crate::patch_handler_namespaced!(patch_events_v1, Event, "events", "events.k8s.io");
+/// PATCH an event via events.k8s.io/v1.
+///
+/// The patch itself is applied to the stored core object; only the response is
+/// converted. Upstream converts both ways around the patch, so a patch that
+/// names an `events.k8s.io/v1` field (`note`, `regarding`, `deprecatedCount`)
+/// lands on the core counterpart — that half is tracked separately in #1940.
+pub async fn patch_events_v1(
+    state: State<Arc<ApiServerState>>,
+    auth_ctx: Extension<AuthContext>,
+    path: Path<(String, String)>,
+    query: Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<EventV1>> {
+    let Json(patched) = crate::handlers::generic_patch::patch_namespaced_resource::<Event>(
+        state,
+        auth_ctx,
+        path,
+        query,
+        headers,
+        body,
+        "events",
+        "events.k8s.io",
+    )
+    .await?;
+    Ok(Json(patched.to_events_v1()))
+}
+
+/// Convert one stored core-Event JSON object into the `events.k8s.io/v1` shape.
+///
+/// Used by the watch path, which hands the converter raw JSON rather than a
+/// typed object. Best-effort like every other watch converter: an object that
+/// will not decode is passed through unchanged, exactly as before.
+fn core_event_json_to_events_v1(value: serde_json::Value) -> serde_json::Value {
+    match serde_json::from_value::<Event>(value.clone()) {
+        Ok(event) => serde_json::to_value(event.to_events_v1()).unwrap_or(value),
+        Err(_) => value,
+    }
+}
