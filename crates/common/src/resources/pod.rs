@@ -243,6 +243,7 @@ pub struct PodSpec {
 #[serde(rename_all = "camelCase")]
 pub struct PodResourceClaim {
     /// Name uniquely identifies this resource claim inside the pod
+    #[serde(default)]
     pub name: String,
 
     /// ResourceClaimName is the name of a ResourceClaim object in the same namespace
@@ -268,6 +269,7 @@ pub struct HostAlias {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PodOS {
+    #[serde(default)]
     pub name: String,
 }
 
@@ -275,6 +277,7 @@ pub struct PodOS {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PodSchedulingGate {
+    #[serde(default)]
     pub name: String,
 }
 
@@ -293,6 +296,7 @@ pub struct PodDNSConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PodDNSConfigOption {
+    #[serde(default)]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
@@ -333,7 +337,9 @@ pub struct PodSecurityContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Sysctl {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub value: String,
 }
 
@@ -376,6 +382,7 @@ pub struct WindowsSecurityContextOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalObjectReference {
+    #[serde(default)]
     pub name: String,
 }
 
@@ -383,6 +390,7 @@ pub struct LocalObjectReference {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PodReadinessGate {
+    #[serde(default)]
     pub condition_type: String,
 }
 
@@ -390,7 +398,9 @@ pub struct PodReadinessGate {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkloadReference {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub pod_group: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pod_group_replica_key: Option<String>,
@@ -566,13 +576,16 @@ pub struct EphemeralContainer {
 #[serde(rename_all = "camelCase")]
 pub struct TopologySpreadConstraint {
     /// MaxSkew describes the degree to which pods may be unevenly distributed
+    #[serde(default)]
     pub max_skew: i32,
 
     /// TopologyKey is the key of node labels
+    #[serde(default)]
     pub topology_key: String,
 
     /// WhenUnsatisfiable indicates how to deal with a pod if it doesn't satisfy the spread constraint
     /// Possible values: DoNotSchedule, ScheduleAnyway
+    #[serde(default)]
     pub when_unsatisfiable: String,
 
     /// LabelSelector is used to find matching pods
@@ -1017,6 +1030,7 @@ pub struct VolumeMount {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Volume {
+    #[serde(default)]
     pub name: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
