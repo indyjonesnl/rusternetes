@@ -482,25 +482,46 @@ async fn test_watch_resource_version_tracking() {
     let prefix = build_prefix("configmaps", Some(namespace));
     let mut watch_stream = storage.watch(&prefix).await.unwrap();
 
-    // Update multiple times and track resource versions
+    // Update multiple times and track resource versions.
+    //
+    // The store stamps the resourceVersion itself (#1942), so the contract to
+    // assert is that the watch frame carries the RV the write produced and
+    // that it strictly increases — not that it echoes a value the caller put
+    // in the body, which the store overwrites the way etcd does.
+    let mut previous_rv: i64 = 0;
     for i in 2..=5 {
-        cm.metadata.resource_version = Some(i.to_string());
         cm.data
             .as_mut()
             .unwrap()
             .insert(format!("key{}", i), format!("value{}", i));
-        storage.update(&key, &cm).await.unwrap();
+        let updated: ConfigMap = storage.update(&key, &cm).await.unwrap();
+        let written_rv = updated
+            .metadata
+            .resource_version
+            .clone()
+            .expect("update must stamp a resourceVersion");
 
         // Verify event has updated resource version
         if let Some(Ok(event)) = watch_stream.next().await {
             match event {
                 rusternetes_storage::WatchEvent::Modified(_, v) => {
                     let received_cm: ConfigMap = serde_json::from_str(&v).unwrap();
-                    assert_eq!(received_cm.metadata.resource_version, Some(i.to_string()));
+                    assert_eq!(
+                        received_cm.metadata.resource_version,
+                        Some(written_rv.clone()),
+                        "the watch frame must carry the resourceVersion the write produced"
+                    );
                 }
                 _ => panic!("Expected Modified event"),
             }
         }
+
+        let rv: i64 = written_rv.parse().expect("numeric resourceVersion");
+        assert!(
+            rv > previous_rv,
+            "resourceVersion must strictly increase across writes ({previous_rv} -> {rv})"
+        );
+        previous_rv = rv;
     }
 
     // Cleanup

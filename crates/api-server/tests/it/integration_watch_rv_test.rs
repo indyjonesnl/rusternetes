@@ -150,13 +150,19 @@ async fn collect_watch_events(
 async fn test_resource_version_present_after_create() {
     let (mem, router) = spawn_router();
 
-    // Pre-seed via storage with an explicit RV — memory backend does not
-    // auto-stamp, so we mirror what etcd would do on the way in. This isolates
-    // the *handler contract*: a GET must echo back the stored RV.
+    // The store stamps the resourceVersion itself now, on every backend
+    // (#1942) — a create body carrying one is overwritten, which is what etcd
+    // does (and upstream goes further and rejects it outright:
+    // `ErrResourceVersionSetOnCreate`, `etcd3/store.go:288`). So take the RV
+    // from the create result rather than forging one. This still isolates the
+    // *handler contract*: a GET must echo back the stored RV.
     let key = build_key("configmaps", Some(TEST_NS), "rv-echo");
-    let mut stored = cm_stub("rv-echo");
-    stored["metadata"]["resourceVersion"] = json!("42");
-    mem.create(&key, &stored).await.unwrap();
+    let created: Value = mem.create(&key, &cm_stub("rv-echo")).await.unwrap();
+    let stamped = created["metadata"]["resourceVersion"]
+        .as_str()
+        .expect("create must stamp a resourceVersion")
+        .to_string();
+    assert_ne!(stamped, "0", "a stamped resourceVersion is never zero");
 
     let (status, body) = send_json(
         router,
@@ -168,7 +174,7 @@ async fn test_resource_version_present_after_create() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["metadata"]["resourceVersion"].as_str(),
-        Some("42"),
+        Some(stamped.as_str()),
         "GET must echo the stored resourceVersion"
     );
 }
@@ -226,12 +232,12 @@ async fn test_resource_version_matching_update_succeeds() {
 
     let key = build_key("pods", Some(TEST_NS), "matchpod");
     let mut stored = pod_stub("matchpod");
-    stored["metadata"]["resourceVersion"] = json!("7");
     stored["metadata"]["uid"] = json!("u-match");
-    mem.create(&key, &stored).await.unwrap();
+    let created: Value = mem.create(&key, &stored).await.unwrap();
 
-    // Client sends the same rv — must succeed.
-    let put_body = stored.clone();
+    // Client sends back the rv the store stamped — must succeed.
+    let mut put_body = created.clone();
+    put_body["metadata"]["resourceVersion"] = created["metadata"]["resourceVersion"].clone();
 
     let (status, body) = send_json(
         router,
@@ -251,11 +257,13 @@ async fn test_resource_version_matching_update_succeeds() {
 }
 
 /// `Storage::current_revision` is monotonically non-decreasing across writes
-/// — the property every list/watch RV bookmark depends on. Memory backend
-/// derives it from the Unix timestamp; etcd/rhino from the mod_revision.
-/// For higher backends the contract is strictly increasing; the memory
-/// backend can only guarantee non-decreasing because it uses wall-clock
-/// seconds, so this test pins the weaker contract that holds everywhere.
+/// — the property every list/watch RV bookmark depends on. Every backend now
+/// derives it from a real write counter: etcd/rhino from the mod_revision, the
+/// memory backend from its own monotonic revision (#1942, which replaced a
+/// wall-clock timestamp that could report the same value for two writes in the
+/// same second). The assertion stays at non-decreasing, the contract that has
+/// to hold everywhere, with the strictly-increasing case pinned by the storage
+/// contract suite.
 #[tokio::test]
 async fn test_resource_version_current_revision_monotonic() {
     let mem = Arc::new(MemoryStorage::new());

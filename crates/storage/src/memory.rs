@@ -19,6 +19,17 @@ pub struct MemoryStorage {
     /// rejected with `Error::Gone`. Used by chunking tests to simulate the
     /// etcd compaction window.
     compacted_revision: Arc<std::sync::atomic::AtomicI64>,
+    /// Monotonic write counter, standing in for etcd's cluster revision.
+    ///
+    /// Every write bumps it and stamps the result on the object's
+    /// `metadata.resourceVersion`, mirroring what the etcd backend derives
+    /// from `mod_revision` (`etcd.rs::inject_resource_version`). Without it a
+    /// create answered with no resourceVersion at all, so an
+    /// `Update()`-after-create -- ordinary read-modify-write, and what
+    /// `client-go` does with the object it just got back -- had none to send,
+    /// and every test running on this backend was blind to that whole class of
+    /// bug (#1942).
+    revision: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl MemoryStorage {
@@ -28,7 +39,36 @@ impl MemoryStorage {
             bus: crate::EventBus::new(crate::event_bus::DEFAULT_CAPACITY),
             conflict_update_count: Arc::new(AtomicUsize::new(0)),
             compacted_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            // etcd's first revision is 1; 0 means "unset" on the wire.
+            revision: Arc::new(std::sync::atomic::AtomicI64::new(1)),
         }
+    }
+
+    /// Bump the write counter and stamp the new revision on
+    /// `metadata.resourceVersion`, returning the serialized object.
+    ///
+    /// The etcd backend stores the blob without a resourceVersion and injects
+    /// one on every read from the key's `mod_revision`
+    /// (`etcd.rs:253-266`). Here the revision is stamped at write time
+    /// instead, which reaches the same place -- reads, lists and watch frames
+    /// all carry it -- and additionally overwrites a resourceVersion a caller
+    /// put in a create body, which this backend used to persist verbatim so
+    /// that a client could forge one.
+    fn stamp_revision(&self, value: &mut serde_json::Value) -> Result<String> {
+        let rv = self
+            .revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let rv = crate::concurrency::mod_revision_to_resource_version(rv);
+        if let Some(metadata) = value.get_mut("metadata") {
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert(
+                    "resourceVersion".to_string(),
+                    serde_json::Value::String(rv.clone()),
+                );
+            }
+        }
+        Ok(rv)
     }
 
     /// Simulate an etcd-style compaction: any continue token referencing a
@@ -105,6 +145,17 @@ impl Storage for MemoryStorage {
             }
         }
 
+        // Check for the conflict before consuming a revision, so a rejected
+        // create does not advance the counter (an etcd txn that fails its
+        // compare does not bump the cluster revision either).
+        {
+            let data = self.data.read().unwrap();
+            if data.contains_key(key) {
+                return Err(Error::AlreadyExists(key.to_string()));
+            }
+        }
+
+        self.stamp_revision(&mut value_json)?;
         let serialized = serde_json::to_string(&value_json)?;
 
         let mut data = self.data.write().unwrap();
@@ -154,7 +205,16 @@ impl Storage for MemoryStorage {
             }
         }
 
-        let serialized = serde_json::to_string(value)?;
+        {
+            let data = self.data.read().unwrap();
+            if !data.contains_key(key) {
+                return Err(Error::NotFound(key.to_string()));
+            }
+        }
+
+        let mut value_json: serde_json::Value = serde_json::to_value(value)?;
+        self.stamp_revision(&mut value_json)?;
+        let serialized = serde_json::to_string(&value_json)?;
 
         let mut data = self.data.write().unwrap();
         if !data.contains_key(key) {
@@ -172,7 +232,16 @@ impl Storage for MemoryStorage {
     }
 
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()> {
-        let serialized = serde_json::to_string(value)?;
+        {
+            let data = self.data.read().unwrap();
+            if !data.contains_key(key) {
+                return Err(Error::NotFound(key.to_string()));
+            }
+        }
+
+        let mut value = value.clone();
+        self.stamp_revision(&mut value)?;
+        let serialized = serde_json::to_string(&value)?;
 
         let mut data = self.data.write().unwrap();
         if !data.contains_key(key) {
@@ -194,6 +263,10 @@ impl Storage for MemoryStorage {
         let previous_value = data
             .remove(key)
             .ok_or_else(|| Error::NotFound(key.to_string()))?;
+        // A delete advances the cluster revision in etcd; a watcher replaying
+        // from the revision the delete produced must not see it again.
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         drop(data); // Release lock before sending event
 
         // Emit watch event with previous value
@@ -238,7 +311,7 @@ impl Storage for MemoryStorage {
     }
 
     async fn current_revision(&self) -> Result<i64> {
-        Ok(chrono::Utc::now().timestamp())
+        Ok(self.revision.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     async fn is_revision_compacted(&self, revision: i64) -> Result<bool> {
