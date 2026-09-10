@@ -434,6 +434,18 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// checks is already ported in
 /// `crates/common/src/validation/webhookconfiguration.rs` and in
 /// `handlers/admission_webhook.rs`, so the fields only had to become reachable.
+///
+/// `workloads.rs` / `deployment.rs`: the `spec.template` of every workload, and
+/// `PodSpec.containers` under it, are required upstream by
+/// `ValidatePodTemplateSpec` (`pkg/apis/core/validation/validation.go:7066-7073`),
+/// which every workload spec validator calls — `ValidateStatefulSetSpec`
+/// (`pkg/apis/apps/validation/validation.go:214`), `ValidateDaemonSetSpec`
+/// (`:454`), `ValidatePodTemplateSpecForReplicaSet` (`:656`) and
+/// `ValidateJobSpec` (`pkg/apis/batch/validation/validation.go:276`). Rusternetes
+/// called that predicate from the standalone `PodTemplate` handler only, so this
+/// slice had to wire it into all five validators *first*: defaulting the fields
+/// without it would have turned serde's 400 into a silent accept rather than
+/// into the 422 upstream answers.
 #[test]
 fn every_field_of_an_audited_module_decodes_when_absent() {
     let mut offenders: Vec<String> = Vec::new();
@@ -485,6 +497,7 @@ fn every_field_of_an_audited_module_decodes_when_absent() {
 /// audited for #1939. Grows one slice at a time; see rule 5.
 const AUDITED_MODULES: &[&str] = &[
     "admission_webhook.rs",
+    "deployment.rs",
     "endpointslice.rs",
     "flowcontrol.rs",
     "ipaddress.rs",
@@ -492,6 +505,7 @@ const AUDITED_MODULES: &[&str] = &[
     "node.rs",
     "rbac.rs",
     "service.rs",
+    "workloads.rs",
 ];
 
 /// `(first, last)` line of every struct body shaped like a status condition:
