@@ -196,6 +196,7 @@ impl EndpointSlice {
 pub struct Endpoint {
     /// addresses of this endpoint. The contents of this field are interpreted according to
     /// the corresponding EndpointSlice addressType field.
+    #[serde(default)]
     pub addresses: Vec<String>,
 
     /// conditions contains information about the current status of the endpoint.
@@ -324,6 +325,7 @@ pub struct EndpointHints {
 #[serde(rename_all = "camelCase")]
 pub struct ForZone {
     /// name represents the name of the zone.
+    #[serde(default)]
     pub name: String,
 }
 
@@ -331,6 +333,7 @@ pub struct ForZone {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ForNode {
+    #[serde(default)]
     pub name: String,
 }
 

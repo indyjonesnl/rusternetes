@@ -67,6 +67,13 @@ fn validate_queuing(q: &QueuingConfiguration, fld_path: &Path) -> ErrorList {
 fn validate_limit_response(lr: &LimitResponse, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     match lr.type_ {
+        // Go's zero value, i.e. an absent `type`; upstream's `default` arm
+        // (`pkg/apis/flowcontrol/validation/validation.go:477-479`).
+        LimitResponseType::Unspecified => errs.push(Error::not_supported(
+            &fld_path.child("type"),
+            String::new(),
+            &["Queue", "Reject"],
+        )),
         LimitResponseType::Reject => {
             if lr.queuing.is_some() {
                 errs.push(Error::forbidden(

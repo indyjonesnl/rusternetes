@@ -38,6 +38,7 @@ impl NetworkPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicySpec {
     /// Selects the pods to which this NetworkPolicy applies
+    #[serde(default)]
     pub pod_selector: LabelSelector,
 
     /// List of ingress rules to be applied
@@ -122,6 +123,7 @@ pub struct NetworkPolicyPeer {
 #[serde(rename_all = "camelCase")]
 pub struct IPBlock {
     /// CIDR is a string representing the IP Block
+    #[serde(default)]
     pub cidr: String,
 
     /// Except is a slice of CIDRs that should not be included within an IP Block

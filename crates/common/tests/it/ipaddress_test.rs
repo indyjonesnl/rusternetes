@@ -16,7 +16,9 @@ fn create_ipaddress(name: &str, parent_ref: ParentReference) -> IPAddress {
             api_version: "networking.k8s.io/v1".to_string(),
         },
         metadata: ObjectMeta::new(name),
-        spec: Some(IPAddressSpec { parent_ref }),
+        spec: Some(IPAddressSpec {
+            parent_ref: Some(parent_ref),
+        }),
     }
 }
 
@@ -42,9 +44,12 @@ fn test_ipaddress_creation() {
     assert_eq!(ip.metadata.name, "10-96-0-10");
 
     let spec = ip.spec.unwrap();
-    assert_eq!(spec.parent_ref.resource, "services");
-    assert_eq!(spec.parent_ref.name, "my-service");
-    assert_eq!(spec.parent_ref.namespace, Some("default".to_string()));
+    assert_eq!(spec.parent_ref.as_ref().unwrap().resource, "services");
+    assert_eq!(spec.parent_ref.as_ref().unwrap().name, "my-service");
+    assert_eq!(
+        spec.parent_ref.as_ref().unwrap().namespace,
+        Some("default".to_string())
+    );
 }
 
 #[test]
@@ -61,10 +66,16 @@ fn test_ipaddress_with_service_parent() {
 
     assert!(ip.spec.is_some());
     let spec = ip.spec.unwrap();
-    assert_eq!(spec.parent_ref.resource, "services");
-    assert_eq!(spec.parent_ref.name, "kubernetes");
-    assert_eq!(spec.parent_ref.namespace, Some("kube-system".to_string()));
-    assert_eq!(spec.parent_ref.uid, Some("service-uid-123".to_string()));
+    assert_eq!(spec.parent_ref.as_ref().unwrap().resource, "services");
+    assert_eq!(spec.parent_ref.as_ref().unwrap().name, "kubernetes");
+    assert_eq!(
+        spec.parent_ref.as_ref().unwrap().namespace,
+        Some("kube-system".to_string())
+    );
+    assert_eq!(
+        spec.parent_ref.as_ref().unwrap().uid,
+        Some("service-uid-123".to_string())
+    );
 }
 
 #[test]
@@ -80,8 +91,8 @@ fn test_ipaddress_with_pod_parent() {
     let ip = create_ipaddress("pod-ip-10-244-1-5", parent_ref);
 
     let spec = ip.spec.unwrap();
-    assert_eq!(spec.parent_ref.resource, "pods");
-    assert_eq!(spec.parent_ref.name, "my-pod");
+    assert_eq!(spec.parent_ref.as_ref().unwrap().resource, "pods");
+    assert_eq!(spec.parent_ref.as_ref().unwrap().name, "my-pod");
 }
 
 // ===== ParentReference Tests =====
@@ -152,8 +163,8 @@ fn test_ipaddress_serialization() {
     assert_eq!(deserialized.type_meta.kind, "IPAddress");
     assert_eq!(deserialized.metadata.name, "test-ip");
     let spec = deserialized.spec.unwrap();
-    assert_eq!(spec.parent_ref.resource, "services");
-    assert_eq!(spec.parent_ref.name, "test-service");
+    assert_eq!(spec.parent_ref.as_ref().unwrap().resource, "services");
+    assert_eq!(spec.parent_ref.as_ref().unwrap().name, "test-service");
 }
 
 #[test]
@@ -283,11 +294,11 @@ fn test_ipaddress_minimal_parent_ref() {
     let ip = create_ipaddress("minimal-ip", parent_ref);
 
     let spec = ip.spec.unwrap();
-    assert!(spec.parent_ref.group.is_none());
-    assert!(spec.parent_ref.namespace.is_none());
-    assert!(spec.parent_ref.uid.is_none());
-    assert_eq!(spec.parent_ref.resource, "services");
-    assert_eq!(spec.parent_ref.name, "minimal-service");
+    assert!(spec.parent_ref.as_ref().unwrap().group.is_none());
+    assert!(spec.parent_ref.as_ref().unwrap().namespace.is_none());
+    assert!(spec.parent_ref.as_ref().unwrap().uid.is_none());
+    assert_eq!(spec.parent_ref.as_ref().unwrap().resource, "services");
+    assert_eq!(spec.parent_ref.as_ref().unwrap().name, "minimal-service");
 }
 
 #[test]
@@ -305,7 +316,11 @@ fn test_ipaddress_spec_optional() {
 
     // Can add spec later
     ip.spec = Some(IPAddressSpec {
-        parent_ref: create_parent_ref("services", "test-service", Some("default")),
+        parent_ref: Some(create_parent_ref(
+            "services",
+            "test-service",
+            Some("default"),
+        )),
     });
 
     assert!(ip.spec.is_some());
@@ -334,8 +349,11 @@ fn test_ipaddress_various_parent_types() {
         let ip = create_ipaddress(&format!("ip-{}", resource), parent_ref);
 
         let spec = ip.spec.unwrap();
-        assert_eq!(spec.parent_ref.resource, resource);
-        assert_eq!(spec.parent_ref.namespace, namespace.map(|s| s.to_string()));
+        assert_eq!(spec.parent_ref.as_ref().unwrap().resource, resource);
+        assert_eq!(
+            spec.parent_ref.as_ref().unwrap().namespace,
+            namespace.map(|s| s.to_string())
+        );
     }
 }
 
@@ -353,8 +371,14 @@ fn test_ipaddress_with_custom_resource_parent() {
     let ip = create_ipaddress("custom-resource-ip", parent_ref);
 
     let spec = ip.spec.unwrap();
-    assert_eq!(spec.parent_ref.group, Some("example.com".to_string()));
-    assert_eq!(spec.parent_ref.resource, "customresources");
+    assert_eq!(
+        spec.parent_ref.as_ref().unwrap().group,
+        Some("example.com".to_string())
+    );
+    assert_eq!(
+        spec.parent_ref.as_ref().unwrap().resource,
+        "customresources"
+    );
 }
 
 // ===== JSON Field Naming Tests =====

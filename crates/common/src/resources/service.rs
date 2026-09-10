@@ -144,6 +144,7 @@ pub struct ServicePort {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
+    #[serde(default)]
     pub port: u16,
 
     /// Number or name of the port to access on the pods targeted by the service.
@@ -208,6 +209,7 @@ pub struct LoadBalancerIngress {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortStatus {
+    #[serde(default)]
     pub port: i32,
     #[serde(default = "default_protocol")]
     pub protocol: String,

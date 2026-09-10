@@ -22,7 +22,9 @@ impl IPAddress {
                 api_version: "networking.k8s.io/v1".to_string(),
             },
             metadata: ObjectMeta::new(name),
-            spec: Some(IPAddressSpec { parent_ref }),
+            spec: Some(IPAddressSpec {
+                parent_ref: Some(parent_ref),
+            }),
         }
     }
 }
@@ -33,7 +35,15 @@ impl IPAddress {
 pub struct IPAddressSpec {
     /// ParentRef references the resource that an IPAddress is attached to. An IPAddress must
     /// reference a parent object.
-    pub parent_ref: ParentReference,
+    ///
+    /// Upstream's field is a pointer (`ParentRef *ParentReference`,
+    /// `staging/src/k8s.io/api/networking/v1/types.go:669`) and an absent one is
+    /// `field.Required(fldPath.Child("parentRef"))`
+    /// (`pkg/apis/networking/validation/validation.go:772`), so `Option` is the
+    /// faithful shape: defaulting to an empty `ParentReference` would answer
+    /// with `resource`/`name` required instead of naming `parentRef` (#1939).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_ref: Option<ParentReference>,
 }
 
 /// ParentReference describes a reference to a parent object
@@ -45,6 +55,7 @@ pub struct ParentReference {
     pub group: Option<String>,
 
     /// Resource is the resource of the object being referenced.
+    #[serde(default)]
     pub resource: String,
 
     /// Namespace is the namespace of the object being referenced.
@@ -52,6 +63,7 @@ pub struct ParentReference {
     pub namespace: Option<String>,
 
     /// Name is the name of the object being referenced.
+    #[serde(default)]
     pub name: String,
 
     /// UID is the UID of the object being referenced.

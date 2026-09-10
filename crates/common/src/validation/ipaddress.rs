@@ -15,10 +15,11 @@ use crate::validation::objectmeta::name_is_path_segment;
 /// name check, which the handler does via `NameKind::Ip`).
 pub fn validate_ip_address(ip: &IPAddress) -> ErrorList {
     let spec_path = Path::new("spec");
-    match &ip.spec {
-        // A missing spec is a missing parentRef (which is required).
+    match ip.spec.as_ref().and_then(|spec| spec.parent_ref.as_ref()) {
+        // A missing spec, or a spec with no parentRef, is a missing parentRef —
+        // which upstream requires (`validation.go:771-773`).
         None => vec![Error::required(&spec_path.child("parentRef"), "")],
-        Some(spec) => validate_parent_reference(&spec.parent_ref, &spec_path),
+        Some(parent_ref) => validate_parent_reference(parent_ref, &spec_path),
     }
 }
 
