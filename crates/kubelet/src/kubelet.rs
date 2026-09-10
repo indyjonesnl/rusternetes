@@ -1520,7 +1520,8 @@ impl Kubelet {
     /// Collect container metrics from the runtime and write NodeMetrics to storage.
     /// The api-server reads these to serve the metrics.k8s.io API.
     async fn publish_node_metrics(&self) {
-        use rusternetes_common::resources::{NodeMetrics, NodeMetricsMetadata};
+        use rusternetes_common::resources::NodeMetrics;
+        use rusternetes_common::types::{ObjectMeta, TypeMeta};
         use std::collections::BTreeMap;
 
         // Get pods assigned to this node
@@ -1549,11 +1550,13 @@ impl Kubelet {
         usage.insert("memory".to_string(), format!("{}Mi", memory_mi));
 
         let metrics = NodeMetrics {
-            api_version: "metrics.k8s.io/v1beta1".to_string(),
-            kind: "NodeMetrics".to_string(),
-            metadata: NodeMetricsMetadata {
-                name: self.node_name.clone(),
+            type_meta: TypeMeta {
+                api_version: "metrics.k8s.io/v1beta1".to_string(),
+                kind: "NodeMetrics".to_string(),
+            },
+            metadata: ObjectMeta {
                 creation_timestamp: Some(chrono::Utc::now()),
+                ..ObjectMeta::new(self.node_name.clone())
             },
             timestamp: chrono::Utc::now(),
             window: "30s".to_string(),
@@ -1580,7 +1583,8 @@ impl Kubelet {
     /// `metrics.k8s.io` pod metrics (replacing synthetic usage=requests), which
     /// in turn lets the HPA controller compute true resource utilization.
     async fn publish_pod_metrics(&self) {
-        use rusternetes_common::resources::{ContainerMetrics, PodMetrics, PodMetricsMetadata};
+        use rusternetes_common::resources::{ContainerMetrics, PodMetrics};
+        use rusternetes_common::types::{ObjectMeta, TypeMeta};
         use std::collections::BTreeMap;
 
         let all_pods: Vec<Pod> = self
@@ -1630,12 +1634,13 @@ impl Kubelet {
                 .collect();
 
             let metrics = PodMetrics {
-                api_version: "metrics.k8s.io/v1beta1".to_string(),
-                kind: "PodMetrics".to_string(),
-                metadata: PodMetricsMetadata {
-                    name: name.clone(),
-                    namespace: namespace.to_string(),
+                type_meta: TypeMeta {
+                    api_version: "metrics.k8s.io/v1beta1".to_string(),
+                    kind: "PodMetrics".to_string(),
+                },
+                metadata: ObjectMeta {
                     creation_timestamp: Some(chrono::Utc::now()),
+                    ..ObjectMeta::new(name.clone()).with_namespace(namespace)
                 },
                 timestamp: chrono::Utc::now(),
                 window: "30s".to_string(),

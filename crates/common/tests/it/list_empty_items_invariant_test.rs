@@ -450,9 +450,11 @@ fn empty_resource_slice_list_struct() {
 #[test]
 fn empty_metric_value_list_struct() {
     let list = MetricValueList {
-        api_version: "custom.metrics.k8s.io/v1beta1".to_string(),
-        kind: "MetricValueList".to_string(),
-        metadata: rusternetes_common::resources::ListMetadata { self_link: None },
+        type_meta: rusternetes_common::types::TypeMeta {
+            api_version: "custom.metrics.k8s.io/v1beta1".to_string(),
+            kind: "MetricValueList".to_string(),
+        },
+        metadata: rusternetes_common::types::ListMeta::default(),
         items: Vec::<MetricValue>::new(),
     };
     assert_value_items_is_empty_array("MetricValueList", &list);

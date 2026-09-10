@@ -6,12 +6,20 @@ use axum::{
 use chrono::Utc;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
-    resources::{custom_metrics::ListMetadata, ExternalMetricValue, ExternalMetricValueList},
+    resources::{ExternalMetricValue, ExternalMetricValueList},
     Result,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+/// TypeMeta for the external-metrics group; see the custom-metrics twin (#1916).
+fn external_metric_type_meta(kind: &str) -> rusternetes_common::types::TypeMeta {
+    rusternetes_common::types::TypeMeta {
+        api_version: "external.metrics.k8s.io/v1beta1".to_string(),
+        kind: kind.to_string(),
+    }
+}
 use tracing::{info, warn};
 
 #[derive(Debug, Deserialize)]
@@ -83,8 +91,7 @@ pub async fn list_external_metrics(
     };
 
     let items = vec![ExternalMetricValue {
-        api_version: "external.metrics.k8s.io/v1beta1".to_string(),
-        kind: "ExternalMetricValue".to_string(),
+        type_meta: external_metric_type_meta("ExternalMetricValue"),
         metric_name: metric_name.clone(),
         metric_labels,
         timestamp: Utc::now(),
@@ -93,14 +100,10 @@ pub async fn list_external_metrics(
     }];
 
     let list = ExternalMetricValueList {
-        api_version: "external.metrics.k8s.io/v1beta1".to_string(),
-        kind: "ExternalMetricValueList".to_string(),
-        metadata: ListMetadata {
-            self_link: Some(format!(
-                "/apis/external.metrics.k8s.io/v1beta1/namespaces/{}/{}",
-                namespace, metric_name
-            )),
-        },
+        type_meta: external_metric_type_meta("ExternalMetricValueList"),
+        // `metav1.ListMeta`; the bespoke predecessor carried only the
+        // long-deprecated `selfLink` (#1916).
+        metadata: rusternetes_common::types::ListMeta::default(),
         items,
     };
 

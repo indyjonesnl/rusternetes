@@ -113,8 +113,7 @@ pub use csi::{
     VolumeError, VolumeLifecycleMode, VolumeNodeResources,
 };
 pub use custom_metrics::{
-    ListMetadata, MetricSelector, MetricValue, MetricValueList,
-    ObjectReference as MetricsObjectReference,
+    MetricSelector, MetricValue, MetricValueList, ObjectReference as MetricsObjectReference,
 };
 pub use deployment::{Deployment, DeploymentCondition, DeploymentSpec, DeploymentStatus};
 pub use dra::{
@@ -149,9 +148,7 @@ pub use ingress::{
 };
 pub use ingressclass::{IngressClass, IngressClassParametersReference, IngressClassSpec};
 pub use ipaddress::{IPAddress, IPAddressSpec, ParentReference};
-pub use metrics::{
-    ContainerMetrics, NodeMetrics, NodeMetricsMetadata, PodMetrics, PodMetricsMetadata,
-};
+pub use metrics::{ContainerMetrics, NodeMetrics, PodMetrics};
 pub use namespace::{Namespace, NamespaceCondition, NamespaceSpec, NamespaceStatus};
 pub use networking::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,

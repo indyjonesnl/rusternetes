@@ -18,6 +18,7 @@ mod ipaddress_test;
 mod k8s_openapi_parity;
 mod list_empty_items_invariant_test;
 mod managed_fields_roundtrip_test;
+mod metrics_wire_shape_test;
 mod null_field_deserialization_test;
 mod qos_pod_class;
 mod quantity_decode_test;

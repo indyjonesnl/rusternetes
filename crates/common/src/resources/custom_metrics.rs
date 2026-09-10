@@ -1,4 +1,5 @@
 // Custom Metrics API Resources (custom.metrics.k8s.io/v1beta2)
+use crate::types::{ListMeta, TypeMeta};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -7,8 +8,13 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricValue {
-    pub api_version: String,
-    pub kind: String,
+    /// `metav1.TypeMeta` (`metrics/pkg/apis/custom_metrics/types.go:49-50`).
+    /// These were required at decode time, so a body that omitted them -- what
+    /// every client sends inside a list -- failed to decode (#1916). Upstream
+    /// gives MetricValue no ObjectMeta; the object it describes is
+    /// `describedObject`.
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
     pub described_object: ObjectReference,
     pub metric_name: String,
     #[serde(
@@ -43,17 +49,16 @@ pub struct MetricSelector {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricValueList {
-    pub api_version: String,
-    pub kind: String,
-    pub metadata: ListMetadata,
-    pub items: Vec<MetricValue>,
-}
+    /// `metav1.TypeMeta` + `metav1.ListMeta`
+    /// (`metrics/pkg/apis/custom_metrics/types.go:38-44`). `metadata` used to be
+    /// a bespoke one-field struct carrying only the long-deprecated `selfLink`,
+    /// which upstream stopped populating in 1.20 (#1916).
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ListMetadata {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub self_link: Option<String>,
+    #[serde(default)]
+    pub metadata: ListMeta,
+    pub items: Vec<MetricValue>,
 }
 
 #[cfg(test)]
@@ -75,8 +80,10 @@ mod tests {
     #[test]
     fn test_metric_value_serialization() {
         let metric_value = MetricValue {
-            api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
-            kind: "MetricValue".to_string(),
+            type_meta: TypeMeta {
+                api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
+                kind: "MetricValue".to_string(),
+            },
             described_object: ObjectReference {
                 kind: "Pod".to_string(),
                 namespace: Some("default".to_string()),
@@ -100,28 +107,28 @@ mod tests {
     #[test]
     fn test_metric_value_list_serialization() {
         let metric_value_list = MetricValueList {
-            api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
-            kind: "MetricValueList".to_string(),
-            metadata: ListMetadata {
-                self_link: Some("/apis/custom.metrics.k8s.io/v1beta2/namespaces/default/pods/*/http_requests_per_second".to_string()),
+            type_meta: TypeMeta {
+                api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
+                kind: "MetricValueList".to_string(),
             },
-            items: vec![
-                MetricValue {
+            metadata: ListMeta::default(),
+            items: vec![MetricValue {
+                type_meta: TypeMeta {
                     api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
                     kind: "MetricValue".to_string(),
-                    described_object: ObjectReference {
-                        kind: "Pod".to_string(),
-                        namespace: Some("default".to_string()),
-                        name: "test-pod-1".to_string(),
-                        api_version: Some("v1".to_string()),
-                    },
-                    metric_name: "http_requests_per_second".to_string(),
-                    timestamp: fixed_time(),
-                    window: Some("60s".to_string()),
-                    value: "100".to_string(),
-                    selector: None,
                 },
-            ],
+                described_object: ObjectReference {
+                    kind: "Pod".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "test-pod-1".to_string(),
+                    api_version: Some("v1".to_string()),
+                },
+                metric_name: "http_requests_per_second".to_string(),
+                timestamp: fixed_time(),
+                window: Some("60s".to_string()),
+                value: "100".to_string(),
+                selector: None,
+            }],
         };
 
         let json = serde_json::to_string(&metric_value_list).unwrap();
@@ -132,8 +139,10 @@ mod tests {
     #[test]
     fn test_metric_value_fields() {
         let metric_value = MetricValue {
-            api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
-            kind: "MetricValue".to_string(),
+            type_meta: TypeMeta {
+                api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
+                kind: "MetricValue".to_string(),
+            },
             described_object: ObjectReference {
                 kind: "Pod".to_string(),
                 namespace: Some("default".to_string()),
@@ -147,8 +156,11 @@ mod tests {
             selector: None,
         };
 
-        assert_eq!(metric_value.api_version, "custom.metrics.k8s.io/v1beta2");
-        assert_eq!(metric_value.kind, "MetricValue");
+        assert_eq!(
+            metric_value.type_meta.api_version,
+            "custom.metrics.k8s.io/v1beta2"
+        );
+        assert_eq!(metric_value.type_meta.kind, "MetricValue");
         assert_eq!(metric_value.described_object.name, "test-pod");
         assert_eq!(
             metric_value.described_object.namespace,
