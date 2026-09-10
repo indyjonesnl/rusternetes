@@ -56,10 +56,11 @@ pub struct ServiceCIDRStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ServiceCIDRCondition {
     /// Type is the type of the condition. Known values are "Ready"
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
     /// Status is the status of the condition. Can be True, False, Unknown.
+    #[serde(default)]
     pub status: String,
 
     /// ObservedGeneration represents the .metadata.generation that the condition was set based upon.
@@ -71,8 +72,10 @@ pub struct ServiceCIDRCondition {
     pub last_transition_time: Option<String>,
 
     /// Reason contains a programmatic identifier indicating the reason for the condition's last transition.
+    #[serde(default)]
     pub reason: String,
 
     /// Message is a human readable message indicating details about the transition.
+    #[serde(default)]
     pub message: String,
 }

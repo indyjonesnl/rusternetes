@@ -57,10 +57,11 @@ impl ComponentStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ComponentCondition {
     /// Type of condition (e.g., "Healthy")
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
     /// Status of the condition (True, False, Unknown)
+    #[serde(default)]
     pub status: String,
 
     /// Human-readable message indicating details about the condition

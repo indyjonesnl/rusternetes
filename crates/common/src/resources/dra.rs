@@ -337,9 +337,10 @@ pub struct AllocatedDeviceStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceCondition {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
+    #[serde(default)]
     pub status: String,
 
     #[serde(
