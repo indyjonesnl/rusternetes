@@ -12,6 +12,7 @@ pub struct Role {
     pub metadata: ObjectMeta,
 
     /// Rules holds all the PolicyRules for this Role
+    #[serde(default)]
     pub rules: Vec<PolicyRule>,
 }
 
@@ -44,6 +45,7 @@ pub struct ClusterRole {
     pub metadata: ObjectMeta,
 
     /// Rules holds all the PolicyRules for this ClusterRole
+    #[serde(default)]
     pub rules: Vec<PolicyRule>,
 
     /// AggregationRule is an optional field that describes how to build the Rules for this ClusterRole
@@ -143,6 +145,7 @@ pub struct RoleBinding {
 
     /// RoleRef can reference a Role in the current namespace or a ClusterRole in the global namespace
     #[serde(alias = "roleRef")]
+    #[serde(default)]
     pub role_ref: RoleRef,
 }
 
@@ -194,6 +197,7 @@ pub struct ClusterRoleBinding {
 
     /// RoleRef can only reference a ClusterRole in the global namespace
     #[serde(alias = "roleRef")]
+    #[serde(default)]
     pub role_ref: RoleRef,
 }
 
@@ -274,7 +278,7 @@ impl Subject {
 }
 
 /// RoleRef contains information that points to the role being used
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RoleRef {
     /// APIGroup is the group for the resource being referenced.

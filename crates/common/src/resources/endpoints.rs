@@ -10,6 +10,7 @@ pub struct Endpoints {
     pub type_meta: TypeMeta,
     #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub subsets: Vec<EndpointSubset>,
 }
 

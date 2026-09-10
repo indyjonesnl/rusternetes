@@ -12,6 +12,7 @@ pub struct Deployment {
     pub type_meta: TypeMeta,
     #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub spec: DeploymentSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<DeploymentStatus>,

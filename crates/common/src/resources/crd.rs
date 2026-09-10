@@ -40,6 +40,7 @@ pub struct CustomResourceDefinition {
     pub kind: String,
     #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub spec: CustomResourceDefinitionSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<CustomResourceDefinitionStatus>,
@@ -73,7 +74,7 @@ impl CustomResourceDefinition {
 }
 
 /// CustomResourceDefinitionSpec describes the desired state of a CRD
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomResourceDefinitionSpec {
     /// Group is the API group of the custom resource
@@ -83,6 +84,10 @@ pub struct CustomResourceDefinitionSpec {
     pub names: CustomResourceDefinitionNames,
 
     /// Scope indicates whether the resource is cluster-scoped or namespace-scoped
+    ///
+    /// Decodes to `Unspecified` when the body omits it, as upstream's `""`
+    /// does; `validate_crd` is what rejects that (#1931).
+    #[serde(default)]
     pub scope: ResourceScope,
 
     /// Versions is the list of versions for this custom resource
@@ -98,7 +103,7 @@ pub struct CustomResourceDefinitionSpec {
 }
 
 /// CustomResourceDefinitionNames indicates the names to use for this resource
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomResourceDefinitionNames {
     /// Plural is the plural name of the resource (used in URLs: /apis/<group>/<version>/<plural>)
@@ -133,8 +138,19 @@ pub struct CustomResourceDefinitionNames {
 }
 
 /// ResourceScope indicates whether a resource is cluster-scoped or namespace-scoped
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// `Unspecified` is the Go zero value: upstream's `ResourceScope` is a string
+/// type, so an absent `spec.scope` decodes to `""` and
+/// `validateCustomResourceDefinitionSpec` is what rejects it
+/// (`apiextensions-apiserver/pkg/apis/apiextensions/validation/validation.go:364`
+/// -> `validateEnumStrings(..., required=true)` -> `field.Required`). Without a
+/// variant for it the field could not decode from an absent key at all, and
+/// defaulting to `Namespaced` would invent a scope the client never sent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum ResourceScope {
+    #[default]
+    #[serde(rename = "")]
+    Unspecified,
     Namespaced,
     Cluster,
 }

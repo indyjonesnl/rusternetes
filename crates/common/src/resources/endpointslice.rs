@@ -18,6 +18,7 @@ pub struct EndpointSlice {
     /// * IPv6: Represents an IPv6 Address.
     /// * FQDN: Represents a Fully Qualified Domain Name.
     #[serde(rename = "addressType")]
+    #[serde(default)]
     pub address_type: String,
 
     /// endpoints is a list of unique endpoints in this slice.

@@ -12,6 +12,7 @@ pub struct NetworkPolicy {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: NetworkPolicySpec,
 }
 
@@ -33,7 +34,7 @@ impl NetworkPolicy {
 }
 
 /// NetworkPolicySpec provides the specification of a NetworkPolicy
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicySpec {
     /// Selects the pods to which this NetworkPolicy applies

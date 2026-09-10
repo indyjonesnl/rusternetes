@@ -12,6 +12,7 @@ pub struct HorizontalPodAutoscaler {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: HorizontalPodAutoscalerSpec,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,7 +38,7 @@ impl HorizontalPodAutoscaler {
 }
 
 /// HorizontalPodAutoscalerSpec describes the desired behavior of the autoscaler
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct HorizontalPodAutoscalerSpec {
     /// Reference to the scaled resource (Deployment, ReplicaSet, StatefulSet, etc.)
@@ -59,7 +60,7 @@ pub struct HorizontalPodAutoscalerSpec {
 }
 
 /// CrossVersionObjectReference contains information to identify the referenced resource
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CrossVersionObjectReference {
     /// Kind of the referent (e.g., Deployment)
@@ -422,6 +423,7 @@ pub struct VerticalPodAutoscaler {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: VerticalPodAutoscalerSpec,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -447,7 +449,7 @@ impl VerticalPodAutoscaler {
 }
 
 /// VerticalPodAutoscalerSpec describes the desired behavior of the VPA
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct VerticalPodAutoscalerSpec {
     /// TargetRef points to the controller managing the set of pods

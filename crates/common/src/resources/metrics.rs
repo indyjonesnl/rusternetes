@@ -22,8 +22,11 @@ pub struct NodeMetrics {
         serialize_with = "crate::types::k8s_time_required::serialize",
         deserialize_with = "crate::types::k8s_time_required::deserialize"
     )]
+    #[serde(default)]
     pub timestamp: DateTime<Utc>,
+    #[serde(default)]
     pub window: String,
+    #[serde(default)]
     pub usage: BTreeMap<String, String>,
 }
 
@@ -42,8 +45,11 @@ pub struct PodMetrics {
         serialize_with = "crate::types::k8s_time_required::serialize",
         deserialize_with = "crate::types::k8s_time_required::deserialize"
     )]
+    #[serde(default)]
     pub timestamp: DateTime<Utc>,
+    #[serde(default)]
     pub window: String,
+    #[serde(default)]
     pub containers: Vec<ContainerMetrics>,
 }
 
@@ -51,6 +57,7 @@ pub struct PodMetrics {
 #[serde(rename_all = "camelCase")]
 pub struct ContainerMetrics {
     pub name: String,
+    #[serde(default)]
     pub usage: BTreeMap<String, String>,
 }
 

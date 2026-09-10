@@ -13,6 +13,7 @@ pub struct PersistentVolume {
     pub type_meta: TypeMeta,
     #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub spec: PersistentVolumeSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<PersistentVolumeStatus>,
@@ -280,12 +281,13 @@ pub struct PersistentVolumeClaim {
     pub type_meta: TypeMeta,
     #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub spec: PersistentVolumeClaimSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<PersistentVolumeClaimStatus>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistentVolumeClaimSpec {
     /// Access modes
@@ -487,6 +489,7 @@ pub struct StorageClass {
     pub metadata: ObjectMeta,
 
     /// Provisioner name
+    #[serde(default)]
     pub provisioner: String,
 
     /// Parameters for the provisioner
@@ -551,12 +554,13 @@ pub struct VolumeSnapshot {
     pub type_meta: TypeMeta,
     #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub spec: VolumeSnapshotSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<VolumeSnapshotStatus>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeSnapshotSpec {
     /// Source of the snapshot
@@ -566,7 +570,7 @@ pub struct VolumeSnapshotSpec {
     pub volume_snapshot_class_name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeSnapshotSource {
     /// Reference to PVC to snapshot
@@ -621,6 +625,7 @@ pub struct VolumeSnapshotClass {
     pub metadata: ObjectMeta,
 
     /// Driver name (snapshotter)
+    #[serde(default)]
     pub driver: String,
 
     /// Parameters for the driver
@@ -628,11 +633,20 @@ pub struct VolumeSnapshotClass {
     pub parameters: Option<HashMap<String, String>>,
 
     /// Deletion policy
+    #[serde(default)]
     pub deletion_policy: DeletionPolicy,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// `Unspecified` is the Go zero value, as for [`ResourceScope`]: the
+/// external-snapshotter CRD declares `deletionPolicy` as a required string
+/// enum, so an absent key decodes to `""` and validation rejects it. Defaulting
+/// to a real policy would pick `Delete` -- which deletes the backing snapshot
+/// -- or `Retain`, neither of which the client asked for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum DeletionPolicy {
+    #[default]
+    #[serde(rename = "")]
+    Unspecified,
     Delete,
     Retain,
 }
@@ -645,12 +659,13 @@ pub struct VolumeSnapshotContent {
     pub type_meta: TypeMeta,
     #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub spec: VolumeSnapshotContentSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<VolumeSnapshotContentStatus>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeSnapshotContentSpec {
     /// Source of the snapshot
@@ -669,7 +684,7 @@ pub struct VolumeSnapshotContentSpec {
     pub driver: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeSnapshotContentSource {
     /// Snapshot handle (CSI snapshot ID)

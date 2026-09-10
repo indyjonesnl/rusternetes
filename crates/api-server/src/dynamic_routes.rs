@@ -52,7 +52,12 @@ impl DynamicRouteManager {
 
         for version in served_versions {
             let routes = match scope {
-                ResourceScope::Namespaced => {
+                // `Unspecified` is the decoded Go zero value; a stored CRD never
+                // carries it, because `validate_crd` rejects an unset
+                // `spec.scope` the way upstream's `validateEnumStrings(...,
+                // required=true)` does. Routing it as namespaced keeps this
+                // unreachable arm from silently exposing a cluster-wide path.
+                ResourceScope::Namespaced | ResourceScope::Unspecified => {
                     // Namespaced resources have both namespaced and cluster-wide list endpoints
                     let ns_path = format!(
                         "/apis/{}/{}/namespaces/:namespace/{}",
@@ -152,7 +157,9 @@ impl DynamicRouteManager {
         scope: &ResourceScope,
     ) -> Router<Arc<ApiServerState>> {
         match scope {
-            ResourceScope::Namespaced => {
+            // See the note in `build_routes_for_crd`: unreachable for a stored
+            // CRD, routed as namespaced rather than cluster-wide.
+            ResourceScope::Namespaced | ResourceScope::Unspecified => {
                 let status_name_path = format!(
                     "/apis/{}/{}/namespaces/:namespace/{}/:name/status",
                     group, version, plural
@@ -186,7 +193,9 @@ impl DynamicRouteManager {
         scope: &ResourceScope,
     ) -> Router<Arc<ApiServerState>> {
         match scope {
-            ResourceScope::Namespaced => {
+            // See the note in `build_routes_for_crd`: unreachable for a stored
+            // CRD, routed as namespaced rather than cluster-wide.
+            ResourceScope::Namespaced | ResourceScope::Unspecified => {
                 let scale_path = format!(
                     "/apis/{}/{}/namespaces/:namespace/{}/:name/scale",
                     group, version, plural

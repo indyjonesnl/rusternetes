@@ -263,6 +263,132 @@ fn metadata_and_typemeta_decode_when_the_body_omits_them() {
     );
 }
 
+/// # Rule 3 — every field of an object struct must decode when absent
+///
+/// Rule 2 is the two-field case of a rule that holds for the whole body. Go has
+/// no required JSON fields: `spec`, `rules`, `roleRef`, `subsets` and the rest
+/// are plain struct fields, so an absent key decodes to the zero value and the
+/// object reaches validation, which answers 422 with a field path. A bare
+/// non-`Option` Rust field answers 400 instead, before any validator, with no
+/// `details.causes` — and for a strategy that allows create-on-update it also
+/// changes the outcome (#1931).
+///
+/// The obligation `#[serde(default)]` carries is that *some validator rejects
+/// the zero value*. A field that defaults and then passes validation silently
+/// accepts an invalid object, which is worse than the 400. The wire-side sweep
+/// `crates/api-server/tests/it/minimal_body_decodes_test.rs` is what checks
+/// that half.
+#[test]
+fn every_field_of_an_object_struct_decodes_when_absent() {
+    let mut files = Vec::new();
+    rust_sources(&common_src().join("resources"), &mut files);
+    files.sort();
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    for path in &files {
+        let src = std::fs::read_to_string(path).expect("read source");
+        let lines: Vec<&str> = src.lines().collect();
+
+        for (start, end) in object_struct_ranges(&lines) {
+            for i in (start + 1)..end {
+                let Some((name, ty)) = field_decl_generic(lines[i]) else {
+                    continue;
+                };
+                // `Option` decodes from an absent key on its own; `metadata`
+                // and the TypeMeta pair are rule 2's business.
+                if ty.starts_with("Option<") || matches!(name, "metadata" | "api_version" | "kind")
+                {
+                    continue;
+                }
+                checked += 1;
+                let attrs = attributes_above(&lines, i);
+                if attrs.contains("default") || attrs.contains("flatten") {
+                    continue;
+                }
+                offenders.push(format!(
+                    "{}:{} `{name}: {ty}` on {} is required at decode time",
+                    path.display(),
+                    i + 1,
+                    lines[start].trim(),
+                ));
+            }
+        }
+    }
+
+    assert!(
+        checked > 90,
+        "only {checked} object-struct fields were examined — the scan broke and \
+         an empty guard passes vacuously"
+    );
+    assert!(
+        offenders.is_empty(),
+        "{} field(s) of a top-level API object are required at decode time, so \
+         a body upstream decodes answers 400 BadRequest here instead of the 422 \
+         Invalid a client can act on. Add `#[serde(default)]` (and `Default` \
+         down the field's type tree) — and confirm a validator rejects the zero \
+         value, or the object is silently accepted:\n  {}",
+        offenders.len(),
+        offenders.join("\n  "),
+    );
+}
+
+/// `(first, last)` line of every struct body that declares `metadata:
+/// ObjectMeta` — i.e. every top-level API object.
+fn object_struct_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !line.starts_with("pub struct ") || !line.trim_end().ends_with('{') {
+            continue;
+        }
+        let mut depth = 0i32;
+        for (j, l) in lines.iter().enumerate().skip(i) {
+            depth += l.matches('{').count() as i32 - l.matches('}').count() as i32;
+            if depth == 0 {
+                if lines[i..=j]
+                    .iter()
+                    .any(|f| f.trim() == "pub metadata: ObjectMeta,")
+                {
+                    out.push((i, j));
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Like [`field_decl`], but keeps a generic type whose arguments contain a
+/// comma — `BTreeMap<String, String>` was invisible to the simpler parser, and
+/// an invisible field is an unguarded one.
+fn field_decl_generic(line: &str) -> Option<(&str, &str)> {
+    let t = line.trim();
+    let rest = t.strip_prefix("pub ")?;
+    let (name, ty) = rest.split_once(": ")?;
+    let ty = ty.strip_suffix(',')?;
+    if name.contains(' ') || name.contains('(') {
+        return None;
+    }
+    // A type is one token or a generic application; anything with a space
+    // outside angle brackets is not a field declaration.
+    let outside_space = {
+        let mut depth = 0i32;
+        ty.chars().any(|c| {
+            match c {
+                '<' => depth += 1,
+                '>' => depth -= 1,
+                _ => {}
+            }
+            c == ' ' && depth == 0
+        })
+    };
+    if outside_space {
+        return None;
+    }
+    Some((name, ty))
+}
+
 /// Neither scan above can be trusted on its own: each one is a text search
 /// whose *scope* is the thing under test, and a scope bug reads as a pass.
 /// Pin both detectors against hand-written sources, including the shapes they
@@ -326,4 +452,29 @@ fn the_scans_flag_exactly_the_wrong_declarations() {
     );
     assert_eq!(field_decl("    pub fn name(&self) -> &str {"), None);
     assert_eq!(field_decl("    metadata: ObjectMeta,"), None);
+
+    // field_decl_generic must see through a comma inside a generic — the
+    // omission that hid `usage: BTreeMap<String, String>` from rule 3.
+    assert_eq!(
+        field_decl_generic("    pub usage: BTreeMap<String, String>,"),
+        Some(("usage", "BTreeMap<String, String>"))
+    );
+    assert_eq!(
+        field_decl_generic("    pub spec: DeploymentSpec,"),
+        Some(("spec", "DeploymentSpec"))
+    );
+    assert_eq!(field_decl_generic("    pub fn name(&self) -> &str {"), None);
+    assert_eq!(field_decl_generic("    metadata: ObjectMeta,"), None);
+
+    // And object_struct_ranges must pick the object struct, not its spec.
+    let two = vec![
+        "pub struct Widget {",
+        "    pub metadata: ObjectMeta,",
+        "    pub spec: WidgetSpec,",
+        "}",
+        "pub struct WidgetSpec {",
+        "    pub replicas: i32,",
+        "}",
+    ];
+    assert_eq!(object_struct_ranges(&two), vec![(0, 3)]);
 }

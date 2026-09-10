@@ -30,6 +30,21 @@ pub async fn create_volumesnapshotclass(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // `deletionPolicy` is required and must be one of Delete/Retain -- the
+    // external-snapshotter CRD declares it `enum: [Delete, Retain]` with
+    // `required: [driver, deletionPolicy]`
+    // (`client/config/crd/snapshot.storage.k8s.io_volumesnapshotclasses.yaml`).
+    // `Unspecified` is the value an absent key decodes to (#1931); without this
+    // check defaulting the field would silently accept the object.
+    if vsc.deletion_policy == rusternetes_common::resources::DeletionPolicy::Unspecified {
+        return Err(rusternetes_common::Error::Invalid(vec![
+            rusternetes_common::validation::field::Error::required(
+                &rusternetes_common::validation::field::Path::new("deletionPolicy"),
+                "",
+            ),
+        ]));
+    }
+
     // Check authorization (cluster-scoped)
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "volumesnapshotclasses")
         .with_api_group("snapshot.storage.k8s.io");

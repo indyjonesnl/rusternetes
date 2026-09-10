@@ -4,9 +4,12 @@
 //! deserialization error and caused the entire watch request to return HTTP 400.
 //!
 //! Harness: in-process Axum router over `MemoryStorage`. We bypass the
-//! normal POST path and inject a partial Deployment (no `spec`) directly into
-//! storage using `storage.create::<serde_json::Value>` so the raw JSON is
-//! stored verbatim, but `list::<Deployment>` would fail on it. A second, valid
+//! normal POST path and inject a Deployment whose `spec.replicas` is a string
+//! directly into storage using `storage.create::<serde_json::Value>` so the raw
+//! JSON is stored verbatim, but `list::<Deployment>` would fail on it. A
+//! mistyped value is used rather than an absent `spec`: absent keys decode to
+//! the zero value now, as upstream's do (#1931), so only a type error is still
+//! a decode error. A second, valid
 //! Deployment is also seeded. We then open
 //! `GET /apis/apps/v1/namespaces/<ns>/deployments?watch=true&resourceVersion=0`
 //! and assert:
@@ -78,13 +81,13 @@ async fn collect_watch_events(
     (status, events)
 }
 
-/// Seed a valid Deployment and a partial/malformed Deployment (no `spec`) into
-/// raw storage, bypassing the router.
+/// Seed a valid Deployment and a malformed one into raw storage, bypassing the
+/// router.
 ///
-/// The partial Deployment has only `apiVersion`, `kind`, and `metadata` — no
-/// `spec` field. When `list::<Deployment>` tries to deserialize it, serde will
-/// return an error ("missing field `spec`"). The watch handler must skip it
-/// rather than propagating the error.
+/// The malformed Deployment carries `spec.replicas: "three"`, so
+/// `list::<Deployment>` fails on it with `invalid type: string "three",
+/// expected i32`. The watch handler must skip it rather than propagating the
+/// error.
 async fn seed_deployments(mem: &MemoryStorage) {
     // Seed the namespace so that namespaced resources don't get rejected.
     let _ = mem
@@ -118,17 +121,17 @@ async fn seed_deployments(mem: &MemoryStorage) {
         )
         .await;
 
-    // Partial/malformed Deployment — only apiVersion, kind, metadata, NO spec.
+    // Malformed Deployment — `replicas` is a string where the type is `i32`.
     // This is stored as serde_json::Value so the MemoryStorage accepts it.
-    // Deserializing this into Deployment will fail ("missing field `spec`").
+    // Deserializing this into Deployment fails ("invalid type: string").
     let _ = mem
         .create(
             &build_key("deployments", Some(NS), "partial-deploy"),
             &json!({
                 "apiVersion": "apps/v1",
                 "kind": "Deployment",
-                "metadata": {"name": "partial-deploy", "namespace": NS}
-                // Intentionally omitted: "spec"
+                "metadata": {"name": "partial-deploy", "namespace": NS},
+                "spec": { "replicas": "three" }
             }),
         )
         .await;
@@ -146,7 +149,7 @@ async fn watch_skips_undeserializable_object_and_delivers_valid_objects() {
     let uri = format!("/apis/apps/v1/namespaces/{NS}/deployments?watch=true&resourceVersion=0");
 
     // Collect 1 non-bookmark event (the ADDED for "valid-deploy") with a 3-second
-    // deadline. The partial Deployment must be skipped; if it caused a 400 the
+    // deadline. The malformed Deployment must be skipped; if it caused a 400 the
     // test fails on the status check before even reading events.
     let (status, events) = collect_watch_events(&api, uri, 1, Duration::from_secs(3)).await;
 
