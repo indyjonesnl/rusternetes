@@ -355,6 +355,20 @@ pub async fn update_resourceclaim_status(
 
     let key = build_key("resourceclaims", Some(&namespace), &name);
 
+    // Upstream serves a subresource from the same `genericregistry.Store` as
+    // its parent, with only the strategy swapped, so `Store.Update`'s
+    // create-on-update gate applies to a status write exactly as it does to a
+    // spec write (`registry/generic/registry/store.go:646-650`): the object has
+    // to exist first, and the check runs before any validator (#1932).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &key,
+        "resource.k8s.io",
+        "resourceclaims",
+        &name,
+    )
+    .await?;
+
     // Get existing claim to preserve spec
     let mut existing: ResourceClaim = state.storage.get(&key).await?;
 

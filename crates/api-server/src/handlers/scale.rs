@@ -170,6 +170,20 @@ pub async fn update_scale(
         }
     }
 
+    // Upstream serves a subresource from the same `genericregistry.Store` as
+    // its parent, with only the strategy swapped, so `Store.Update`'s
+    // create-on-update gate applies to a scale write exactly as it does to a
+    // spec write (`registry/generic/registry/store.go:646-650`): the object has
+    // to exist first, and the check runs before any validator (#1932).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key(&resource, Some(&namespace), &name),
+        &group,
+        &resource,
+        &name,
+    )
+    .await?;
+
     // Scale.spec.replicas must be non-negative (upstream ValidateScale).
     if scale.spec.replicas < 0 {
         return Err(Error::Invalid(vec![

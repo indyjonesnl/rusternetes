@@ -309,15 +309,10 @@ async fn every_update_handler_consults_the_create_on_update_table() {
             if !writes {
                 continue;
             }
-            // Subresource writes (`status`, `scale`, `approval`, …) go through
-            // the same store upstream and so answer NotFound too, but they are
-            // not part of this change; tracked in #1932.
-            if ["status", "scale", "subresource", "approval", "finalize"]
-                .iter()
-                .any(|k| fname.contains(k))
-            {
-                continue;
-            }
+            // Subresource writes (`status`, `scale`, `approval`, …) are in
+            // scope too: upstream reaches them through the same `Store.Update`,
+            // so the gate applies to a status write exactly as to a spec write
+            // (#1932).
             checked += 1;
 
             let consults_table = body.contains("reject_create_on_update")
@@ -334,7 +329,7 @@ async fn every_update_handler_consults_the_create_on_update_table() {
     }
 
     assert!(
-        checked >= 55,
+        checked >= 64,
         "guard scanned only {checked} update handlers that can create -- the \
          parser stopped matching, which would make this test vacuously green"
     );
@@ -383,4 +378,240 @@ fn update_fn_bodies(src: &str) -> Vec<(String, String)> {
         rest = &after[end..];
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Subresources (#1932)
+// ---------------------------------------------------------------------------
+
+/// Every `<resource>/<subresource>` discovery reports an `update` verb for,
+/// with the parent's scope and kind.
+///
+/// Upstream serves `/status`, `/scale`, `/approval` and `/finalize` from a
+/// second `*REST` built on the same `genericregistry.Store` as the parent, with
+/// only the strategy swapped (`registry/apps/deployment/storage/storage.go`
+/// wires `statusStore.UpdateStrategy = deployment.StatusStrategy`, and
+/// `StatusStrategy` embeds `deploymentStrategy`). So `AllowCreateOnUpdate()`
+/// answers the same for the subresource as for the parent, and the
+/// `store.go:646-650` NotFound applies unchanged.
+async fn updatable_subresources(s: &TestApiServer) -> BTreeMap<Gvr, (bool, String)> {
+    let mut gvs: Vec<(String, String)> = vec![(String::new(), "v1".to_string())];
+    let (st, apis) = s.get("/apis").await;
+    assert!(st.is_success(), "GET /apis: {st} {apis}");
+    for g in apis["groups"].as_array().cloned().unwrap_or_default() {
+        let name = g["name"].as_str().unwrap_or_default().to_string();
+        for v in g["versions"].as_array().cloned().unwrap_or_default() {
+            gvs.push((
+                name.clone(),
+                v["version"].as_str().unwrap_or_default().to_string(),
+            ));
+        }
+    }
+
+    let mut out = BTreeMap::new();
+    for (group, version) in gvs {
+        let uri = if group.is_empty() {
+            format!("/api/{version}")
+        } else {
+            format!("/apis/{group}/{version}")
+        };
+        let (st, list) = s.get(&uri).await;
+        assert!(st.is_success(), "GET {uri}: {st} {list}");
+        for r in list["resources"].as_array().cloned().unwrap_or_default() {
+            let name = r["name"].as_str().unwrap_or_default();
+            if !name.contains('/') {
+                continue;
+            }
+            let verbs: BTreeSet<&str> = r["verbs"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            if !verbs.contains("update") {
+                continue;
+            }
+            out.insert(
+                (group.clone(), version.clone(), name.to_string()),
+                (
+                    r["namespaced"].as_bool().unwrap_or(false),
+                    r["kind"].as_str().unwrap_or_default().to_string(),
+                ),
+            );
+        }
+    }
+    out
+}
+
+/// A PUT to `<resource>/<subresource>` of a name that does not exist is a 404.
+///
+/// None of the nine `AllowCreateOnUpdate()` strategies has a writable
+/// subresource, so this direction has no opt-in half: every entry must answer
+/// NotFound.
+#[tokio::test]
+async fn a_put_to_a_missing_objects_subresource_is_not_a_create() {
+    let api = TestApiServer::new();
+    let subresources = updatable_subresources(&api).await;
+    assert!(
+        subresources.len() > 15,
+        "discovery returned only {} updatable subresources -- the sweep would \
+         be nearly vacuous",
+        subresources.len()
+    );
+
+    let mut created: Vec<String> = Vec::new();
+    let mut missing_404 = 0usize;
+    let mut undecodable: Vec<String> = Vec::new();
+    let mut other: Vec<String> = Vec::new();
+
+    for ((group, version, path), (namespaced, kind)) in &subresources {
+        let (resource, subresource) = path.split_once('/').expect("name contains '/'");
+        let root = if group.is_empty() {
+            format!("/api/{version}")
+        } else {
+            format!("/apis/{group}/{version}")
+        };
+        let base = if *namespaced {
+            format!("{root}/namespaces/default/{resource}")
+        } else {
+            format!("{root}/{resource}")
+        };
+        let name = format!(
+            "put-sub-probe-{}",
+            if group.is_empty() { "core" } else { group }
+        );
+        let api_version = if group.is_empty() {
+            version.clone()
+        } else {
+            format!("{group}/{version}")
+        };
+        // `scale` is its own kind on the wire; everything else takes the
+        // parent's kind with only `.status` read off it.
+        // `Scale` still decodes through a bespoke `ScaleMetadata` whose
+        // `namespace`, and whose `status`, are required fields (#1931), so the
+        // probe spells them out to reach the gate at all.
+        let body = if subresource == "scale" {
+            json!({
+                "apiVersion": "autoscaling/v1",
+                "kind": "Scale",
+                "metadata": { "name": name, "namespace": "default" },
+                "spec": { "replicas": 1 },
+                "status": { "replicas": 0 },
+            })
+        } else {
+            json!({
+                "apiVersion": api_version,
+                "kind": kind,
+                "metadata": { "name": name },
+                "status": {},
+            })
+        };
+
+        let (status, answer) = api
+            .send(
+                "PUT",
+                &format!("{base}/{name}/{subresource}"),
+                Some("application/json"),
+                Some(&body),
+            )
+            .await;
+        let code = status.as_u16();
+        let id = format!("{api_version} {path}");
+        match code {
+            404 => missing_404 += 1,
+            200..=299 => created.push(format!("{id} -> {code}")),
+            400 | 422 if is_decode_failure(&answer) => undecodable.push(id),
+            _ => other.push(format!("{id} -> {code}: {}", answer["message"])),
+        }
+    }
+
+    assert!(
+        created.is_empty(),
+        "{} subresource(s) accepted a PUT to a name that does not exist. \
+         Upstream serves the subresource from the same Store, so the \
+         AllowCreateOnUpdate() gate (store.go:646-650) answers NotFound \
+         first.\n\nOffenders:\n  {}",
+        created.len(),
+        created.join("\n  ")
+    );
+    assert!(
+        other.is_empty(),
+        "{} subresource(s) answered a PUT to a missing object with neither 404 \
+         nor a decode failure. The existence check runs before any validator \
+         upstream, so a validation error here means the gate is in the wrong \
+         place.\n\n  {}",
+        other.len(),
+        other.join("\n  ")
+    );
+    assert!(
+        missing_404 >= 10,
+        "only {missing_404} subresources reached the existence check ({} could \
+         not decode the probe body) -- too few for this sweep to mean anything",
+        undecodable.len()
+    );
+}
+
+/// The gate runs before validation, so an invalid body against a missing object
+/// is still a 404 -- the ordering `Store.Update` fixes by checking existence
+/// before `BeforeUpdate` and the strategy's `ValidateUpdate`.
+///
+/// `update_scale` validated `spec.replicas >= 0` before reading the object, so
+/// this exact request used to answer 422 Invalid for an object that was never
+/// there.
+#[tokio::test]
+async fn an_invalid_scale_on_a_missing_deployment_is_a_notfound() {
+    let api = TestApiServer::new();
+    let (status, answer) = api
+        .send(
+            "PUT",
+            "/apis/apps/v1/namespaces/default/deployments/nope/scale",
+            Some("application/json"),
+            Some(&json!({
+                "apiVersion": "autoscaling/v1",
+                "kind": "Scale",
+                "metadata": { "name": "nope", "namespace": "default" },
+                "spec": { "replicas": -3 },
+                "status": { "replicas": 0 },
+            })),
+        )
+        .await;
+
+    assert_eq!(status.as_u16(), 404, "{answer}");
+    assert_eq!(answer["reason"], json!("NotFound"));
+    assert_eq!(answer["message"], json!("deployments \"nope\" not found"));
+}
+
+/// The status subresource of a resource that does exist still writes, so the
+/// gate above cannot be satisfied by rejecting everything.
+#[tokio::test]
+async fn a_status_put_on_an_existing_object_still_writes() {
+    let api = TestApiServer::new();
+    let (status, answer) = api
+        .send(
+            "POST",
+            "/api/v1/namespaces/default/pods",
+            Some("application/json"),
+            Some(&json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": "status-writes" },
+                "spec": { "containers": [ { "name": "c", "image": "busybox" } ] },
+            })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {answer}");
+
+    let (status, answer) = api
+        .send(
+            "PUT",
+            "/api/v1/namespaces/default/pods/status-writes/status",
+            Some("application/json"),
+            Some(&json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": "status-writes" },
+                "status": { "phase": "Running" },
+            })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {answer}");
+    assert_eq!(answer["status"]["phase"], json!("Running"));
 }

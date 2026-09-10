@@ -1918,6 +1918,22 @@ pub async fn update_custom_resource_status(
         build_key(&resource_type, None, &name)
     };
 
+    // Upstream serves a subresource from the same `genericregistry.Store` as
+    // its parent, with only the strategy swapped, so `Store.Update`'s
+    // create-on-update gate applies to a status write exactly as it does to a
+    // spec write (`registry/generic/registry/store.go:646-650`). Custom
+    // resources never opt in -- `apiextensions-apiserver/pkg/registry/
+    // customresource/strategy.go:262-266` returns false unconditionally --
+    // so this is always a NotFound (#1932).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &key,
+        &group,
+        &plural,
+        &name,
+    )
+    .await?;
+
     let mut cr: CustomResource = state.storage.get(&key).await?;
 
     // K8s status subresource semantics: the request body is the FULL object;
@@ -2127,6 +2143,22 @@ pub async fn update_custom_resource_scale(
     } else {
         build_key(&resource_type, None, &name)
     };
+
+    // Upstream serves a subresource from the same `genericregistry.Store` as
+    // its parent, with only the strategy swapped, so `Store.Update`'s
+    // create-on-update gate applies to a scale write exactly as it does to a
+    // spec write (`registry/generic/registry/store.go:646-650`). Custom
+    // resources never opt in -- `apiextensions-apiserver/pkg/registry/
+    // customresource/strategy.go:262-266` returns false unconditionally --
+    // so this is always a NotFound (#1932).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &key,
+        &group,
+        &plural,
+        &name,
+    )
+    .await?;
 
     let mut cr: CustomResource = state.storage.get(&key).await?;
 

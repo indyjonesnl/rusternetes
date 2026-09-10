@@ -328,6 +328,20 @@ pub async fn update_status(
         }
     }
 
+    // Upstream serves a subresource from the same `genericregistry.Store` as
+    // its parent, with only the strategy swapped, so `Store.Update`'s
+    // create-on-update gate applies to a status write exactly as it does to a
+    // spec write (`registry/generic/registry/store.go:646-650`): the object has
+    // to exist first, and the check runs before any validator (#1932).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key(&resource_type, Some(&namespace), &name),
+        &api_group,
+        &resource_type,
+        &name,
+    )
+    .await?;
+
     // Handle JSON Patch (RFC 6902) — body is an array of patch operations
     if content_type.contains("json-patch") {
         let key = build_key(&resource_type, Some(&namespace), &name);
@@ -502,6 +516,20 @@ pub async fn update_cluster_status(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+
+    // Upstream serves a subresource from the same `genericregistry.Store` as
+    // its parent, with only the strategy swapped, so `Store.Update`'s
+    // create-on-update gate applies to a status write exactly as it does to a
+    // spec write (`registry/generic/registry/store.go:646-650`): the object has
+    // to exist first, and the check runs before any validator (#1932).
+    crate::handlers::lifecycle::reject_create_on_update(
+        &*state.storage,
+        &build_key(&resource_type, None, &name),
+        &api_group,
+        &resource_type,
+        &name,
+    )
+    .await?;
 
     // Handle JSON Patch (RFC 6902) — body is an array of patch operations
     if content_type.contains("json-patch") {
