@@ -281,6 +281,17 @@ fn validate_job_spec_core(spec: &JobSpec, fld_path: &Path) -> ErrorList {
         }
     }
 
+    // The template is held to the same rules as a standalone pod: upstream's
+    // `ValidateJobSpec` calls `ValidatePodTemplateSpec` on it
+    // (`pkg/apis/batch/validation/validation.go:276`), so a Job with no
+    // containers answers `spec.template.spec.containers: Required value`
+    // rather than a decoder error (#1939).
+    errs.extend(crate::validation::podtemplate::validate_pod_template_spec(
+        &spec.template,
+        &fld_path.child("template"),
+        false,
+    ));
+
     // template.spec.restartPolicy must be OnFailure or Never (upstream rejects
     // the SetDefaults_PodSpec-defaulted "Always"/empty for Jobs). With a
     // podFailurePolicy, only "Never" is permitted (upstream validation.go:287).
@@ -909,6 +920,9 @@ mod parity_tests {
     fn container() -> Container {
         Container {
             name: "main".to_string(),
+            // `image` is required upstream (`ValidateContainers`), and the job
+            // validator now reaches it through `ValidatePodTemplateSpec`.
+            image: "nginx".to_string(),
             ..Default::default()
         }
     }

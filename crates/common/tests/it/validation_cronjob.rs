@@ -7,6 +7,12 @@ use rusternetes_common::validation::cronjob::validate_cron_job;
 fn job_template() -> JobTemplateSpec {
     let mut t = PodTemplateSpec::default();
     t.spec.restart_policy = Some("OnFailure".to_string());
+    // The jobTemplate's pod template is validated like a standalone pod now.
+    t.spec.containers = vec![rusternetes_common::resources::Container {
+        name: "c".to_string(),
+        image: "nginx".to_string(),
+        ..Default::default()
+    }];
     JobTemplateSpec {
         metadata: None,
         spec: JobSpec {

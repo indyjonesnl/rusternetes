@@ -165,6 +165,7 @@ pub struct ReplicaSetSpec {
     pub selector: LabelSelector,
 
     /// Template for pod creation
+    #[serde(default)]
     pub template: PodTemplateSpec,
 
     /// Minimum number of seconds for which a newly created pod should be ready
@@ -285,6 +286,7 @@ pub struct StatefulSetSpec {
     pub service_name: String,
 
     /// Template for pod creation
+    #[serde(default)]
     pub template: PodTemplateSpec,
 
     /// Update strategy
@@ -464,6 +466,7 @@ pub struct DaemonSetSpec {
     pub selector: LabelSelector,
 
     /// Template for pod creation
+    #[serde(default)]
     pub template: PodTemplateSpec,
 
     /// Update strategy
@@ -608,6 +611,7 @@ impl Job {
 #[serde(rename_all = "camelCase")]
 pub struct JobSpec {
     /// Template for pod creation
+    #[serde(default)]
     pub template: PodTemplateSpec,
 
     /// Number of successful completions required
@@ -683,6 +687,7 @@ pub struct PodFailurePolicy {
 pub struct PodFailurePolicyRule {
     /// Action taken on a pod failure when the requirements are satisfied.
     /// Possible values: `FailJob`, `FailIndex`, `Ignore`, `Count`.
+    #[serde(default)]
     pub action: String,
 
     /// Requirement on the container exit codes.
@@ -708,10 +713,12 @@ pub struct PodFailurePolicyOnExitCodesRequirement {
 
     /// Relationship between the container exit code(s) and the specified
     /// values. Possible values: `In`, `NotIn`.
+    #[serde(default)]
     pub operator: String,
 
     /// Set of values. At least one element is required; at most 255 allowed.
     /// `0` cannot be used with the `In` operator.
+    #[serde(default)]
     pub values: Vec<i32>,
 }
 
@@ -881,10 +888,11 @@ impl CronJob {
 #[serde(rename_all = "camelCase")]
 pub struct CronJobSpec {
     /// Cron schedule (e.g., "0 * * * *")
+    #[serde(default)]
     pub schedule: String,
 
     /// Job template
-    #[serde(alias = "jobTemplate")]
+    #[serde(alias = "jobTemplate", default)]
     pub job_template: JobTemplateSpec,
 
     /// Concurrency policy: Allow, Forbid, or Replace
@@ -918,6 +926,7 @@ pub struct JobTemplateSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ObjectMeta>,
 
+    #[serde(default)]
     pub spec: JobSpec,
 }
 
@@ -977,6 +986,7 @@ pub struct PodTemplateSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ObjectMeta>,
 
+    #[serde(default)]
     pub spec: PodSpec,
 }
 

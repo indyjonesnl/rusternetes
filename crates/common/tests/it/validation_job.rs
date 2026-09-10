@@ -15,6 +15,12 @@ fn template_with_labels(restart_policy: &str, labels: &[(&str, &str)]) -> PodTem
         l.insert(k.to_string(), v.to_string());
     }
     t.spec.restart_policy = Some(restart_policy.to_string());
+    // The job's template is validated like a standalone pod now.
+    t.spec.containers = vec![rusternetes_common::resources::Container {
+        name: "c".to_string(),
+        image: "nginx".to_string(),
+        ..Default::default()
+    }];
     t
 }
 
