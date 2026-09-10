@@ -334,6 +334,120 @@ fn every_field_of_an_object_struct_decodes_when_absent() {
     );
 }
 
+/// # Rule 4 — every field of a status condition must decode when absent
+///
+/// Rule 3 stops at the fields of the object struct, so it cannot see a field
+/// *inside* a status. Conditions are the first slice of that nested surface
+/// (#1939) and the one clients hit: a condition list is what a controller
+/// writes and what a client sends back when it PUTs an object it read.
+///
+/// Upstream decodes a condition like everything else — an absent `status`,
+/// `reason` or `message` becomes `""` — and then either
+///
+/// * validates it, for the `[]metav1.Condition` lists:
+///   `metav1validation.ValidateCondition` requires `type`, `status`, `reason`
+///   and `lastTransitionTime`
+///   (`staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/validation/validation.go:315-350`),
+///   called from `pkg/apis/policy/validation/validation.go:82`,
+///   `certificates/validation/validation.go:764`,
+///   `resource/validation/validation.go:1288,1494` and
+///   `admissionregistration/validation/validation.go:1259`; or
+/// * accepts it, for the older typed conditions (`DeploymentCondition`,
+///   `PodCondition`, `JobCondition`, …) that upstream validates nowhere.
+///
+/// Either way the answer is a `Status` a client can act on, or a write. A bare
+/// non-`Option` Rust field answers serde's 400 before any of that. The wire
+/// half is `crates/api-server/tests/it/condition_decodes_when_absent_test.rs`.
+#[test]
+fn every_field_of_a_status_condition_decodes_when_absent() {
+    let mut files = Vec::new();
+    rust_sources(&common_src().join("resources"), &mut files);
+    files.sort();
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    for path in &files {
+        let src = std::fs::read_to_string(path).expect("read source");
+        let lines: Vec<&str> = src.lines().collect();
+
+        for (start, end) in condition_struct_ranges(&lines) {
+            for i in (start + 1)..end {
+                let Some((name, ty)) = field_decl_generic(lines[i]) else {
+                    continue;
+                };
+                if ty.starts_with("Option<") {
+                    continue;
+                }
+                checked += 1;
+                let attrs = attributes_above(&lines, i);
+                if attrs.contains("default") || attrs.contains("flatten") {
+                    continue;
+                }
+                offenders.push(format!(
+                    "{}:{} `{name}: {ty}` on {} is required at decode time",
+                    path.display(),
+                    i + 1,
+                    lines[start].trim(),
+                ));
+            }
+        }
+    }
+
+    assert!(
+        checked > 40,
+        "only {checked} condition fields were examined — the scan broke and an \
+         empty guard passes vacuously"
+    );
+    assert!(
+        offenders.is_empty(),
+        "{} condition field(s) are required at decode time, so a status a \
+         controller or a client sends answers 400 BadRequest from serde instead \
+         of the 422 Invalid (or the write) upstream answers. Add \
+         `#[serde(default)]`:\n  {}",
+        offenders.len(),
+        offenders.join("\n  "),
+    );
+}
+
+/// `(first, last)` line of every struct body shaped like a status condition:
+/// it declares a field serialized as `type` and one serialized as `status`.
+///
+/// Keyed on the shape rather than on the name ending in `Condition`, so a
+/// struct that merely borrows the word — `MatchCondition`, which is a CEL
+/// name/expression pair — is not swept in, and one that does not borrow it is
+/// not missed.
+fn condition_struct_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !line.starts_with("pub struct ") || !line.trim_end().ends_with('{') {
+            continue;
+        }
+        let mut depth = 0i32;
+        for (j, l) in lines.iter().enumerate().skip(i) {
+            depth += l.matches('{').count() as i32 - l.matches('}').count() as i32;
+            if depth == 0 {
+                let mut has_type = false;
+                let mut has_status = false;
+                for k in (i + 1)..j {
+                    let Some((name, _)) = field_decl_generic(lines[k]) else {
+                        continue;
+                    };
+                    let serde_name_is_type = matches!(name, "condition_type" | "type_" | "r#type")
+                        || attributes_above(lines, k).contains("rename = \"type\"");
+                    has_type |= serde_name_is_type;
+                    has_status |= name == "status";
+                }
+                if has_type && has_status {
+                    out.push((i, j));
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// `(first, last)` line of every struct body that declares `metadata:
 /// ObjectMeta` — i.e. every top-level API object.
 fn object_struct_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
@@ -465,6 +579,25 @@ fn the_scans_flag_exactly_the_wrong_declarations() {
     );
     assert_eq!(field_decl_generic("    pub fn name(&self) -> &str {"), None);
     assert_eq!(field_decl_generic("    metadata: ObjectMeta,"), None);
+
+    // condition_struct_ranges must key on the shape, not the name: a type +
+    // status pair is a condition, a name + expression pair is not, however it
+    // is called.
+    let conditions = vec![
+        "pub struct ThingCondition {",
+        "    #[serde(rename = \"type\")]",
+        "    pub condition_type: String,",
+        "    pub status: String,",
+        "}",
+        "pub struct MatchCondition {",
+        "    pub name: String,",
+        "    pub expression: String,",
+        "}",
+        "pub struct ThingSpec {",
+        "    pub status: String,",
+        "}",
+    ];
+    assert_eq!(condition_struct_ranges(&conditions), vec![(0, 4)]);
 
     // And object_struct_ranges must pick the object struct, not its spec.
     let two = vec![

@@ -1315,10 +1315,11 @@ pub struct PodIP {
 #[serde(rename_all = "camelCase")]
 pub struct PodCondition {
     /// Type of pod condition (e.g. Ready, ContainersReady, Initialized, PodScheduled)
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
     /// Status of the condition (True, False, or Unknown)
+    #[serde(default)]
     pub status: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]

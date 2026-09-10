@@ -130,10 +130,11 @@ pub struct CertificateSigningRequestStatus {
 #[serde(rename_all = "camelCase")]
 pub struct CertificateSigningRequestCondition {
     /// type of the condition
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub type_: String,
 
     /// status of the condition
+    #[serde(default)]
     pub status: String,
 
     /// reason indicates a brief reason for the request state

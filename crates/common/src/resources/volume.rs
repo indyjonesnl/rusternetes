@@ -449,7 +449,9 @@ pub enum PersistentVolumeClaimPhase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistentVolumeClaimCondition {
+    #[serde(default)]
     pub r#type: String,
+    #[serde(default)]
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_probe_time: Option<String>,

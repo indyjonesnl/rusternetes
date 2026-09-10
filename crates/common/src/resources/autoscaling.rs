@@ -389,10 +389,11 @@ pub struct MetricValueStatus {
 #[serde(rename_all = "camelCase")]
 pub struct HorizontalPodAutoscalerCondition {
     /// Type of condition (ScalingActive, AbleToScale, ScalingLimited)
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
     /// Status of the condition (True, False, Unknown)
+    #[serde(default)]
     pub status: String,
 
     /// Last time the condition transitioned
@@ -569,10 +570,11 @@ pub struct RecommendedContainerResources {
 #[serde(rename_all = "camelCase")]
 pub struct VerticalPodAutoscalerCondition {
     /// Type of condition (RecommendationProvided, LowConfidence, NoPodsMatched, etc.)
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
     /// Status of the condition (True, False, Unknown)
+    #[serde(default)]
     pub status: String,
 
     /// Last time the condition transitioned

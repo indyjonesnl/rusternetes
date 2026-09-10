@@ -301,10 +301,11 @@ pub struct ExpressionWarning {
 #[serde(rename_all = "camelCase")]
 pub struct PolicyCondition {
     /// Type is the type of the condition
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
     /// Status is the status of the condition (True, False, or Unknown)
+    #[serde(default)]
     pub status: String,
 
     /// LastTransitionTime is the last time the condition transitioned

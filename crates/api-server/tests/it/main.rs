@@ -20,6 +20,7 @@ mod cel_matchcondition_eval_test;
 mod cel_vap_end_to_end_test;
 mod chunking_podtemplate_ordering_test;
 mod cluster_startup_test;
+mod condition_decodes_when_absent_test;
 mod configmap_consumption_test;
 mod configmap_handler_test;
 mod conformance_affinity_proto_test;

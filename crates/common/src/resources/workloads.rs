@@ -97,10 +97,11 @@ pub struct ReplicationControllerStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ReplicationControllerCondition {
     /// Type of replication controller condition
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
     /// Status of the condition: True, False, Unknown
+    #[serde(default)]
     pub status: String,
 
     /// Last time the condition transitioned
@@ -212,10 +213,11 @@ pub struct ReplicaSetStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ReplicaSetCondition {
     /// Type of replica set condition
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
     /// Status of the condition: True, False, Unknown
+    #[serde(default)]
     pub status: String,
 
     /// Last time the condition transitioned
@@ -401,9 +403,10 @@ pub struct StatefulSetStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct StatefulSetCondition {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
+    #[serde(default)]
     pub status: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -548,9 +551,10 @@ pub struct DaemonSetStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonSetCondition {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
+    #[serde(default)]
     pub status: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -717,7 +721,7 @@ pub struct PodFailurePolicyOnExitCodesRequirement {
 #[serde(rename_all = "camelCase")]
 pub struct PodFailurePolicyOnPodConditionsPattern {
     /// Required Pod condition type.
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
     /// Required Pod condition status. Defaults to `True` when unspecified.
@@ -819,10 +823,11 @@ pub struct JobStatus {
 #[serde(rename_all = "camelCase")]
 pub struct JobCondition {
     /// Type of condition: Complete or Failed
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
     /// Status of the condition: True, False, Unknown
+    #[serde(default)]
     pub status: String,
 
     /// Last time the condition was probed

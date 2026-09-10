@@ -391,10 +391,11 @@ pub struct PodDisruptionBudgetStatus {
 #[serde(rename_all = "camelCase")]
 pub struct PodDisruptionBudgetCondition {
     /// Type of PDB condition
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
     /// Status of the condition (True, False, Unknown)
+    #[serde(default)]
     pub status: String,
 
     /// Last time the condition transitioned

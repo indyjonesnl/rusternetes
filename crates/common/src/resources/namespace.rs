@@ -58,10 +58,11 @@ pub struct NamespaceStatus {
 #[serde(rename_all = "camelCase")]
 pub struct NamespaceCondition {
     /// Type of namespace condition (NamespaceDeletionDiscoveryFailure, NamespaceDeletionGroupVersionParsingFailure, etc.)
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub condition_type: String,
 
     /// Status of the condition (True, False, Unknown)
+    #[serde(default)]
     pub status: String,
 
     #[serde(
