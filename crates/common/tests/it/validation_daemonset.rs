@@ -23,7 +23,7 @@ fn valid_spec() -> serde_json::Value {
     json!({
         "selector": {"matchLabels": {"app": "agent"}},
         "updateStrategy": {"type": "RollingUpdate", "rollingUpdate": {"maxUnavailable": 1}},
-        "template": {"metadata": {"labels": {"app": "agent"}}, "spec": {"containers": []}}
+        "template": {"metadata": {"labels": {"app": "agent"}}, "spec": {"containers": [{"name": "c", "image": "nginx"}]}}
     })
 }
 

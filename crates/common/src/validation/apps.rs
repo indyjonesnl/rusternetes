@@ -24,6 +24,7 @@ use crate::validation::field::{BadValue, Error, ErrorList, Path};
 use crate::validation::metav1::{
     is_dns1123_label, validate_label_selector, LabelSelectorValidationOptions,
 };
+use crate::validation::podtemplate::validate_pod_template_spec;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -461,6 +462,16 @@ fn validate_deployment_spec(
         }
     }
 
+    // The template is held to the same rules as a standalone pod: upstream's
+    // `ValidateDeploymentSpec` calls `ValidatePodTemplateSpec` on it
+    // (`pkg/apis/apps/validation/validation.go:656 via ValidatePodTemplateSpecForReplicaSet`), which is what makes
+    // `spec.template.spec.containers: Required value` — not a decoder error —
+    // the answer to a workload with no containers (#1939).
+    errs.extend(validate_pod_template_spec(
+        &spec.template,
+        &fld_path.child("template"),
+        false,
+    ));
     errs
 }
 
@@ -550,6 +561,16 @@ fn validate_replicaset_spec(spec: &ReplicaSetSpec, fld_path: &Path) -> ErrorList
         "ReplicaSet",
     ));
 
+    // The template is held to the same rules as a standalone pod: upstream's
+    // `ValidateReplicaSetSpec` calls `ValidatePodTemplateSpec` on it
+    // (`pkg/apis/apps/validation/validation.go:847 via ValidatePodTemplateSpecForReplicaSet`), which is what makes
+    // `spec.template.spec.containers: Required value` — not a decoder error —
+    // the answer to a workload with no containers (#1939).
+    errs.extend(validate_pod_template_spec(
+        &spec.template,
+        &fld_path.child("template"),
+        false,
+    ));
     errs
 }
 
@@ -700,6 +721,16 @@ fn validate_statefulset_spec(spec: &StatefulSetSpec, fld_path: &Path) -> ErrorLi
         "StatefulSet",
     ));
 
+    // The template is held to the same rules as a standalone pod: upstream's
+    // `ValidateStatefulSetSpec` calls `ValidatePodTemplateSpec` on it
+    // (`pkg/apis/apps/validation/validation.go:214 via ValidatePodTemplateSpecForStatefulSet`), which is what makes
+    // `spec.template.spec.containers: Required value` — not a decoder error —
+    // the answer to a workload with no containers (#1939).
+    errs.extend(validate_pod_template_spec(
+        &spec.template,
+        &fld_path.child("template"),
+        false,
+    ));
     errs
 }
 
@@ -850,6 +881,16 @@ fn validate_daemonset_spec(spec: &DaemonSetSpec, fld_path: &Path) -> ErrorList {
         )),
     }
 
+    // The template is held to the same rules as a standalone pod: upstream's
+    // `ValidateDaemonSetSpec` calls `ValidatePodTemplateSpec` on it
+    // (`pkg/apis/apps/validation/validation.go:454`), which is what makes
+    // `spec.template.spec.containers: Required value` — not a decoder error —
+    // the answer to a workload with no containers (#1939).
+    errs.extend(validate_pod_template_spec(
+        &spec.template,
+        &fld_path.child("template"),
+        false,
+    ));
     errs
 }
 

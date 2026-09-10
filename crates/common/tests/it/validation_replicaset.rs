@@ -25,7 +25,7 @@ fn matching_spec() -> serde_json::Value {
         "selector": {"matchLabels": {"app": "web"}},
         "template": {
             "metadata": {"labels": {"app": "web"}},
-            "spec": {"containers": []}
+            "spec": {"containers": [{"name": "c", "image": "nginx"}]}
         }
     })
 }
@@ -65,7 +65,7 @@ fn empty_selector_rejected() {
     let spec = json!({
         "replicas": 1,
         "selector": {},
-        "template": {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": []}}
+        "template": {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": [{"name": "c", "image": "nginx"}]}}
     });
     let errs = validate_replicaset(&rs(spec));
     // Upstream emits Invalid("empty selector is invalid for deployment") — ReplicaSet
@@ -85,7 +85,7 @@ fn template_labels_must_match_selector() {
         "replicas": 1,
         "selector": {"matchLabels": {"app": "web"}},
         // template labels do not satisfy the selector
-        "template": {"metadata": {"labels": {"app": "other"}}, "spec": {"containers": []}}
+        "template": {"metadata": {"labels": {"app": "other"}}, "spec": {"containers": [{"name": "c", "image": "nginx"}]}}
     });
     let errs = validate_replicaset(&rs(spec));
     assert!(

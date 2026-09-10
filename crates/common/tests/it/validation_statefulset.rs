@@ -28,7 +28,7 @@ fn valid_spec() -> serde_json::Value {
         "podManagementPolicy": "OrderedReady",
         "updateStrategy": {"type": "RollingUpdate", "rollingUpdate": {"partition": 0}},
         "selector": {"matchLabels": {"app": "web"}},
-        "template": {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": []}}
+        "template": {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": [{"name": "c", "image": "nginx"}]}}
     })
 }
 

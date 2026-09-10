@@ -10,7 +10,7 @@
 use rusternetes_common::resources::deployment::{
     Deployment, DeploymentSpec, DeploymentStrategy, RollingUpdateDeployment,
 };
-use rusternetes_common::resources::pod::PodSpec;
+use rusternetes_common::resources::pod::{Container, PodSpec};
 use rusternetes_common::resources::policy::IntOrString;
 use rusternetes_common::resources::workloads::PodTemplateSpec;
 use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
@@ -49,7 +49,16 @@ fn make_template(labels: &[(&str, &str)]) -> PodTemplateSpec {
             },
             ..ObjectMeta::default()
         }),
-        spec: PodSpec::default(),
+        // A pod template is validated like a standalone pod now, so the
+        // fixture needs the one container upstream requires.
+        spec: PodSpec {
+            containers: vec![Container {
+                name: "c".to_string(),
+                image: "nginx".to_string(),
+                ..Default::default()
+            }],
+            ..PodSpec::default()
+        },
     }
 }
 
