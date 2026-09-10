@@ -131,7 +131,7 @@ pub use dra::{
 };
 pub use endpoints::{EndpointAddress, EndpointPort, EndpointReference, EndpointSubset, Endpoints};
 pub use endpointslice::{Endpoint, EndpointConditions, EndpointHints, EndpointSlice, ForZone};
-pub use event::{Event, EventList, EventSeries, EventSource, EventType};
+pub use event::{Event, EventList, EventSeries, EventSource, EventType, EventV1, EventV1List};
 pub use external_metrics::{ExternalMetricValue, ExternalMetricValueList};
 pub use flowcontrol::{
     ExemptPriorityLevelConfiguration, FlowDistinguisherMethod, FlowDistinguisherMethodType,

@@ -109,46 +109,6 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub regarding: Option<ObjectReference>,
 
-    // -----------------------------------------------------------------------
-    // events.k8s.io/v1 `deprecated*` aliases.
-    //
-    // The new API version carries the four core Event fields below under
-    // `deprecated*` names and converts them onto the internal object
-    // (`Convert_v1_Event_To_core_Event`, pkg/apis/events/v1/conversion.go:29-43).
-    // Rusternetes models both versions with this one struct, so the aliases
-    // need somewhere to land before `convert_from_events_v1` moves them onto
-    // the core fields. Without them they fell into `extra` and every strict
-    // "needs to be unset" rule read a zero value (#1914).
-    //
-    // They are never serialized: the conversion drains them, so a stored
-    // Event only ever holds the core shape.
-    // -----------------------------------------------------------------------
-    /// events.k8s.io/v1 alias for `source`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deprecated_source: Option<EventSource>,
-
-    /// events.k8s.io/v1 alias for `firstTimestamp`.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        serialize_with = "crate::types::k8s_time::serialize",
-        deserialize_with = "crate::types::k8s_time::deserialize"
-    )]
-    pub deprecated_first_timestamp: Option<DateTime<Utc>>,
-
-    /// events.k8s.io/v1 alias for `lastTimestamp`.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        serialize_with = "crate::types::k8s_time::serialize",
-        deserialize_with = "crate::types::k8s_time::deserialize"
-    )]
-    pub deprecated_last_timestamp: Option<DateTime<Utc>>,
-
-    /// events.k8s.io/v1 alias for `count`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deprecated_count: Option<i32>,
-
     /// Catch-all for any additional fields not explicitly defined
     #[serde(flatten)]
     pub extra: Option<std::collections::HashMap<String, serde_json::Value>>,
@@ -188,68 +148,7 @@ impl Event {
             reporting_instance: None,
             note: None,
             regarding: None,
-            deprecated_source: None,
-            deprecated_first_timestamp: None,
-            deprecated_last_timestamp: None,
-            deprecated_count: None,
             extra: None,
-        }
-    }
-
-    /// Convert an `events.k8s.io/v1` request body onto the core field names.
-    ///
-    /// Port of `Convert_v1_Event_To_core_Event`
-    /// (`../kubernetes/pkg/apis/events/v1/conversion.go:29-43`):
-    ///
-    /// ```text
-    /// Convert_v1_EventSource_To_core_EventSource(&in.DeprecatedSource, &out.Source, s)
-    /// out.InvolvedObject  = in.Regarding
-    /// out.Message         = in.Note
-    /// out.FirstTimestamp  = in.DeprecatedFirstTimestamp
-    /// out.LastTimestamp   = in.DeprecatedLastTimestamp
-    /// out.Count           = in.DeprecatedCount
-    /// ```
-    ///
-    /// Upstream assigns unconditionally because the two versions are separate
-    /// Go types: an `events.k8s.io/v1` body simply has no `count`, `message`,
-    /// `source` or `involvedObject` field to lose. Here one struct serves both
-    /// versions and reads of `events.k8s.io/v1` still answer with the core
-    /// names, so a read-modify-write client legitimately sends those back.
-    /// Each alias is therefore applied only when the client actually set it,
-    /// which yields upstream's result for every body upstream can express.
-    /// (Converting the *response* too is tracked in #1926.)
-    ///
-    /// Runs before validation: the strict branch of `ValidateEventCreate`
-    /// requires `source`, `firstTimestamp`, `lastTimestamp` and `count` to be
-    /// unset, and can only see them once the aliases have been moved (#1914).
-    pub fn convert_from_events_v1(&mut self) {
-        if let Some(source) = self.deprecated_source.take() {
-            self.source = source;
-        }
-        if let Some(first) = self.deprecated_first_timestamp.take() {
-            self.first_timestamp = Some(first);
-        }
-        if let Some(last) = self.deprecated_last_timestamp.take() {
-            self.last_timestamp = Some(last);
-        }
-        if let Some(count) = self.deprecated_count.take() {
-            self.count = count;
-        }
-        if self.message.is_empty() {
-            if let Some(note) = &self.note {
-                self.message = note.clone();
-            }
-        }
-        if self
-            .involved_object
-            .name
-            .as_deref()
-            .unwrap_or("")
-            .is_empty()
-        {
-            if let Some(regarding) = &self.regarding {
-                self.involved_object = regarding.clone();
-            }
         }
     }
 
@@ -340,6 +239,224 @@ fn default_kind() -> String {
 
 fn default_kind_list() -> String {
     "EventList".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// events.k8s.io/v1
+// ---------------------------------------------------------------------------
+
+/// `events.k8s.io/v1` Event — the wire type, distinct from the core one.
+///
+/// Port of `staging/src/k8s.io/api/events/v1/types.go:34-100`. Upstream models
+/// the two API versions as two Go types and converts between them
+/// (`pkg/apis/events/v1/conversion.go:29-60`); this is that second type, so a
+/// `events.k8s.io/v1` response carries the `events.k8s.io/v1` schema and
+/// nothing else. Before it existed the handlers answered with the stored core
+/// shape and only rewrote `apiVersion`, so the body carried `count`,
+/// `message`, `source` and `involvedObject` — fields this schema does not have
+/// — and omitted every `deprecated*` field (#1926).
+///
+/// Field presence follows upstream's json tags: `encoding/json`'s `omitempty`
+/// is a no-op on a struct, so `regarding` and `deprecatedSource` are always
+/// emitted, as are the two `metav1.Time` fields (`null` when unset, from
+/// `Time.MarshalJSON`). `deprecatedCount` is an `int32` with `omitempty`, so it
+/// is omitted at zero.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EventV1 {
+    #[serde(default = "default_events_v1_api_version")]
+    pub api_version: String,
+
+    #[serde(default = "default_kind")]
+    pub kind: String,
+
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+
+    /// `eventTime` is required and carries no `omitempty`.
+    #[serde(
+        default,
+        serialize_with = "crate::types::k8s_micro_time::serialize",
+        deserialize_with = "crate::types::k8s_micro_time::deserialize"
+    )]
+    pub event_time: Option<DateTime<Utc>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series: Option<EventSeries>,
+
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reporting_controller: String,
+
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reporting_instance: String,
+
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub action: String,
+
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+
+    #[serde(default)]
+    pub regarding: ObjectReference,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related: Option<ObjectReference>,
+
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+
+    /// Typed like the core field rather than upstream's bare `string`: the
+    /// core endpoint already rejects an unknown value at decode time, and
+    /// coercing one to `Normal` here would silently accept it instead.
+    #[serde(rename = "type", default)]
+    pub event_type: EventType,
+
+    #[serde(default)]
+    pub deprecated_source: EventSource,
+
+    #[serde(
+        default,
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
+    pub deprecated_first_timestamp: Option<DateTime<Utc>>,
+
+    #[serde(
+        default,
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
+    pub deprecated_last_timestamp: Option<DateTime<Utc>>,
+
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub deprecated_count: i32,
+}
+
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
+}
+
+fn default_events_v1_api_version() -> String {
+    "events.k8s.io/v1".to_string()
+}
+
+impl EventV1 {
+    /// Convert an `events.k8s.io/v1` body onto the core Event.
+    ///
+    /// Port of `Convert_v1_Event_To_core_Event`
+    /// (`pkg/apis/events/v1/conversion.go:29-43`):
+    ///
+    /// ```text
+    /// Convert_v1_ObjectReference_To_core_ObjectReference(&in.Regarding, &out.InvolvedObject, s)
+    /// Convert_v1_EventSource_To_core_EventSource(&in.DeprecatedSource, &out.Source, s)
+    /// out.Message        = in.Note
+    /// out.FirstTimestamp = in.DeprecatedFirstTimestamp
+    /// out.LastTimestamp  = in.DeprecatedLastTimestamp
+    /// out.Count          = in.DeprecatedCount
+    /// ```
+    ///
+    /// Unconditional, as upstream is: the v1 body has no `count`, `message`,
+    /// `source` or `involvedObject` field to lose. The earlier
+    /// `Event::convert_from_events_v1` had to guard each assignment because
+    /// reads still answered with the core names, so a read-modify-write client
+    /// legitimately sent them back; with responses converted too (this type is
+    /// what the handlers now answer with) that carve-out is gone.
+    pub fn into_core(self) -> Event {
+        Event {
+            // The stored object is the core one.
+            api_version: "v1".to_string(),
+            kind: self.kind,
+            metadata: self.metadata,
+            involved_object: self.regarding.clone(),
+            reason: self.reason,
+            message: self.note.clone(),
+            source: self.deprecated_source,
+            event_type: self.event_type,
+            first_timestamp: self.deprecated_first_timestamp,
+            last_timestamp: self.deprecated_last_timestamp,
+            count: self.deprecated_count,
+            action: if self.action.is_empty() {
+                None
+            } else {
+                Some(self.action)
+            },
+            related: self.related,
+            series: self.series,
+            event_time: self.event_time,
+            reporting_component: if self.reporting_controller.is_empty() {
+                None
+            } else {
+                Some(self.reporting_controller)
+            },
+            reporting_instance: if self.reporting_instance.is_empty() {
+                None
+            } else {
+                Some(self.reporting_instance)
+            },
+            // `note` and `regarding` have no core counterpart; they are kept on
+            // the core struct only so the fields the v1 wire type owns survive
+            // a round trip through storage byte-for-byte.
+            note: if self.note.is_empty() {
+                None
+            } else {
+                Some(self.note)
+            },
+            regarding: Some(self.regarding),
+            extra: None,
+        }
+    }
+}
+
+impl Event {
+    /// Convert the stored core Event into the `events.k8s.io/v1` wire type.
+    ///
+    /// Port of `Convert_core_Event_To_v1_Event`
+    /// (`pkg/apis/events/v1/conversion.go:46-60`):
+    ///
+    /// ```text
+    /// Convert_core_ObjectReference_To_v1_ObjectReference(&in.InvolvedObject, &out.Regarding, s)
+    /// Convert_core_EventSource_To_v1_EventSource(&in.Source, &out.DeprecatedSource, s)
+    /// out.Note                     = in.Message
+    /// out.DeprecatedFirstTimestamp = in.FirstTimestamp
+    /// out.DeprecatedLastTimestamp  = in.LastTimestamp
+    /// out.DeprecatedCount          = in.Count
+    /// ```
+    pub fn to_events_v1(&self) -> EventV1 {
+        EventV1 {
+            api_version: "events.k8s.io/v1".to_string(),
+            kind: "Event".to_string(),
+            metadata: self.metadata.clone(),
+            event_time: self.event_time,
+            series: self.series.clone(),
+            reporting_controller: self.reporting_component.clone().unwrap_or_default(),
+            reporting_instance: self.reporting_instance.clone().unwrap_or_default(),
+            action: self.action.clone().unwrap_or_default(),
+            reason: self.reason.clone(),
+            regarding: self.involved_object.clone(),
+            related: self.related.clone(),
+            note: self.message.clone(),
+            event_type: self.event_type.clone(),
+            deprecated_source: self.source.clone(),
+            deprecated_first_timestamp: self.first_timestamp,
+            deprecated_last_timestamp: self.last_timestamp,
+            deprecated_count: self.count,
+        }
+    }
+}
+
+/// EventList in the `events.k8s.io/v1` schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventV1List {
+    #[serde(default = "default_events_v1_api_version")]
+    pub api_version: String,
+
+    #[serde(default = "default_kind_list")]
+    pub kind: String,
+
+    pub metadata: crate::types::ListMeta,
+
+    pub items: Vec<EventV1>,
 }
 
 #[cfg(test)]
@@ -488,11 +605,12 @@ mod tests {
         );
     }
 
-    /// `Convert_v1_Event_To_core_Event` moves the four `deprecated*` aliases
-    /// onto the core fields and leaves nothing behind, so the stored object
-    /// only ever holds the core shape (#1914).
+    /// `Convert_v1_Event_To_core_Event` (`conversion.go:29-43`) maps the four
+    /// `deprecated*` fields plus `note` and `regarding` onto the core names.
+    /// Unconditional, as upstream is: the v1 wire type has no core field to
+    /// lose (#1914, #1926).
     #[test]
-    fn convert_from_events_v1_drains_the_deprecated_aliases() {
+    fn events_v1_into_core_maps_every_deprecated_field() {
         let body = serde_json::json!({
             "apiVersion": "events.k8s.io/v1",
             "kind": "Event",
@@ -506,71 +624,108 @@ mod tests {
             "deprecatedLastTimestamp": "2026-09-08T10:05:00Z",
             "deprecatedCount": 2,
         });
-        let mut event: Event = serde_json::from_value(body).expect("decode");
+        let v1: EventV1 = serde_json::from_value(body).expect("decode");
+        let core = v1.into_core();
 
-        // Pre-condition: the aliases decode into their own fields, not `extra`,
-        // and the core fields are still unset.
-        assert_eq!(event.deprecated_count, Some(2));
-        assert_eq!(event.count, 0);
-
-        event.convert_from_events_v1();
-
-        assert_eq!(event.count, 2);
-        assert_eq!(event.source.component, "probe");
-        assert_eq!(event.source.host.as_deref(), Some("node-1"));
+        assert_eq!(core.count, 2);
+        assert_eq!(core.source.component, "probe");
+        assert_eq!(core.source.host.as_deref(), Some("node-1"));
         assert_eq!(
-            event.first_timestamp.map(|t| t.to_rfc3339()),
+            core.first_timestamp.map(|t| t.to_rfc3339()),
             Some("2026-09-08T10:00:00+00:00".to_string())
         );
         assert_eq!(
-            event.last_timestamp.map(|t| t.to_rfc3339()),
+            core.last_timestamp.map(|t| t.to_rfc3339()),
             Some("2026-09-08T10:05:00+00:00".to_string())
         );
-        assert_eq!(event.message, "a note");
-        assert_eq!(event.involved_object.name.as_deref(), Some("p"));
-
-        assert!(event.deprecated_count.is_none());
-        assert!(event.deprecated_source.is_none());
-        assert!(event.deprecated_first_timestamp.is_none());
-        assert!(event.deprecated_last_timestamp.is_none());
-
-        // Nothing deprecated survives serialization either.
-        let round_tripped = serde_json::to_value(&event).expect("encode");
-        for key in [
-            "deprecatedCount",
-            "deprecatedSource",
-            "deprecatedFirstTimestamp",
-            "deprecatedLastTimestamp",
-        ] {
-            assert!(
-                round_tripped.get(key).is_none(),
-                "{key} survived: {round_tripped}"
-            );
-        }
+        assert_eq!(core.message, "a note");
+        assert_eq!(core.involved_object.name.as_deref(), Some("p"));
+        // Stored as the core version, whatever the request version was.
+        assert_eq!(core.api_version, "v1");
     }
 
-    /// Each alias is applied only when the client set it: reads of
-    /// `events.k8s.io/v1` still answer with the core names, so a
-    /// read-modify-write PUT carries `count`/`message` and no alias, and must
-    /// not have them cleared.
+    /// `Convert_core_Event_To_v1_Event` (`conversion.go:46-60`) is the inverse,
+    /// and the response it produces carries the `events.k8s.io/v1` schema only:
+    /// no `count`, `message`, `source` or `involvedObject`, which that schema
+    /// does not have (#1926).
     #[test]
-    fn convert_from_events_v1_leaves_core_fields_alone_when_no_alias_is_set() {
+    fn core_to_events_v1_answers_with_the_v1_schema_only() {
+        let obj_ref = ObjectReference {
+            kind: Some("Pod".to_string()),
+            namespace: Some("default".to_string()),
+            name: Some("p".to_string()),
+            uid: Some("abc".to_string()),
+            api_version: Some("v1".to_string()),
+            resource_version: None,
+            field_path: None,
+        };
+        let mut core = Event::new(
+            "e".to_string(),
+            "default".to_string(),
+            obj_ref,
+            "Probe".to_string(),
+            "a note".to_string(),
+            EventType::Warning,
+        );
+        core.count = 3;
+        core.source = EventSource {
+            component: "probe".to_string(),
+            host: Some("node-1".to_string()),
+        };
+        core.reporting_component = Some("kubernetes.io/kubelet".to_string());
+
+        let v1 = core.to_events_v1();
+        assert_eq!(v1.note, "a note");
+        assert_eq!(v1.deprecated_count, 3);
+        assert_eq!(v1.deprecated_source.component, "probe");
+        assert_eq!(v1.regarding.name.as_deref(), Some("p"));
+        assert_eq!(v1.event_type, EventType::Warning);
+        assert_eq!(v1.reporting_controller, "kubernetes.io/kubelet");
+
+        let wire = serde_json::to_value(&v1).expect("encode");
+        for absent in [
+            "count",
+            "message",
+            "source",
+            "involvedObject",
+            "firstTimestamp",
+        ] {
+            assert!(
+                wire.get(absent).is_none(),
+                "{absent} is not an events.k8s.io/v1 field: {wire}"
+            );
+        }
+        // `omitempty` is a no-op on a struct upstream, so these are always sent.
+        for present in ["regarding", "deprecatedSource", "eventTime"] {
+            assert!(wire.get(present).is_some(), "{present} missing: {wire}");
+        }
+        assert_eq!(wire["apiVersion"], serde_json::json!("events.k8s.io/v1"));
+    }
+
+    /// Round trip: a v1 body that goes to storage as core and comes back out as
+    /// v1 must be unchanged. This is the property the two-type split buys, and
+    /// what the single-struct version could not provide.
+    #[test]
+    fn a_v1_event_round_trips_through_the_core_shape() {
         let body = serde_json::json!({
             "apiVersion": "events.k8s.io/v1",
             "kind": "Event",
-            "metadata": { "name": "e" },
-            "involvedObject": { "kind": "Pod", "name": "p", "namespace": "default" },
-            "message": "kept",
-            "source": { "component": "kubelet" },
-            "count": 7,
-            "firstTimestamp": "2026-09-08T10:00:00Z",
+            "metadata": { "name": "e", "namespace": "default" },
+            "eventTime": "2026-09-08T10:00:00.000000Z",
+            "reason": "Probe",
+            "action": "Restart",
+            "type": "Warning",
+            "note": "a note",
+            "reportingController": "kubernetes.io/kubelet",
+            "reportingInstance": "kubelet-xyz",
+            "regarding": { "kind": "Pod", "name": "p", "namespace": "default" },
+            "deprecatedSource": { "component": "probe" },
+            "deprecatedFirstTimestamp": "2026-09-08T10:00:00Z",
+            "deprecatedLastTimestamp": "2026-09-08T10:05:00Z",
+            "deprecatedCount": 2,
         });
-        let mut event: Event = serde_json::from_value(body).expect("decode");
-        event.convert_from_events_v1();
-
-        assert_eq!(event.count, 7);
-        assert_eq!(event.message, "kept");
-        assert_eq!(event.source.component, "kubelet");
-        assert!(event.first_timestamp.is_some());
+        let sent: EventV1 = serde_json::from_value(body).expect("decode");
+        let round_tripped = sent.clone().into_core().to_events_v1();
+        assert_eq!(sent, round_tripped);
     }
 }

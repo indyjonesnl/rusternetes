@@ -150,6 +150,10 @@ async fn deprecated_source_is_rejected() {
 /// name for the message on this API version — so a note must still land in the
 /// stored object. Guards the conversion refactor against dropping the mapping
 /// the handler used to do inline.
+///
+/// The `events.k8s.io/v1` response carries the v1 names (#1926), so the core
+/// landing is read back through the core endpoint — where `message` and
+/// `involvedObject` are the schema.
 #[tokio::test]
 async fn note_and_regarding_still_convert_onto_the_core_fields() {
     let state = TestApiServer::new();
@@ -165,8 +169,15 @@ async fn note_and_regarding_still_convert_onto_the_core_fields() {
         )
         .await;
     assert_eq!(code, StatusCode::CREATED, "{created}");
-    assert_eq!(created["message"], json!("something happened"));
-    assert_eq!(created["involvedObject"]["name"], json!("p"));
+    assert_eq!(created["note"], json!("something happened"));
+    assert_eq!(created["regarding"]["name"], json!("p"));
+
+    let (code, core) = state
+        .get(&format!("/api/v1/namespaces/{NS}/events/note-probe"))
+        .await;
+    assert!(code.is_success(), "{code} {core}");
+    assert_eq!(core["message"], json!("something happened"));
+    assert_eq!(core["involvedObject"]["name"], json!("p"));
 }
 
 /// The core `/api/v1` endpoint is legacy-only (`ValidateEventCreate` returns
