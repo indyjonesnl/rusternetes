@@ -994,10 +994,18 @@ pub async fn delete_events_v1(
 
 /// PATCH an event via events.k8s.io/v1.
 ///
-/// The patch itself is applied to the stored core object; only the response is
-/// converted. Upstream converts both ways around the patch, so a patch that
-/// names an `events.k8s.io/v1` field (`note`, `regarding`, `deprecatedCount`)
-/// lands on the core counterpart — that half is tracked separately in #1940.
+/// The patch is applied to the object in the version it was written against —
+/// this one — and the result converted back before validation and storage, as
+/// upstream does for every patch
+/// (`staging/src/k8s.io/apiserver/pkg/endpoints/handlers/patch.go:323-338,:449-462`).
+/// Applied to the stored core object instead, a patch naming `note`,
+/// `regarding` or a `deprecated*` field would land on a key the core schema does
+/// not own and leave the real field alone (#1940).
+///
+/// The generic path then runs `validate_event_update` on the result, because
+/// upstream's patch and PUT paths share one `Store.Update` and therefore one
+/// `ValidateUpdate`: on this version everything but `series` and metadata is
+/// immutable, so a patch of `note` is a 422, not a write.
 pub async fn patch_events_v1(
     state: State<Arc<ApiServerState>>,
     auth_ctx: Extension<AuthContext>,
@@ -1006,18 +1014,80 @@ pub async fn patch_events_v1(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<EventV1>> {
-    let Json(patched) = crate::handlers::generic_patch::patch_namespaced_resource::<Event>(
-        state,
-        auth_ctx,
-        path,
-        query,
-        headers,
-        body,
-        "events",
-        "events.k8s.io",
-    )
-    .await?;
+    let hooks = crate::handlers::generic_patch::PatchHooks::<Event> {
+        conversion: Some(crate::handlers::generic_patch::RequestVersionConversion {
+            to_request_version: core_event_json_to_events_v1_ref,
+            from_request_version: events_v1_json_onto_core_event,
+        }),
+        validate_update: Some(validate_events_v1_update),
+    };
+    let Json(patched) =
+        crate::handlers::generic_patch::patch_namespaced_resource_with_hooks::<Event>(
+            state,
+            auth_ctx,
+            path,
+            query,
+            headers,
+            body,
+            "events",
+            "events.k8s.io",
+            hooks,
+        )
+        .await?;
     Ok(Json(patched.to_events_v1()))
+}
+
+/// `ValidateEventUpdate` on the events.k8s.io/v1 path, as a plain function so
+/// the generic PATCH path can hold it (`PatchHooks::validate_update`). Same call
+/// the PUT handler above makes.
+fn validate_events_v1_update(
+    new_event: &Event,
+    old_event: &Event,
+) -> rusternetes_common::validation::field::ErrorList {
+    rusternetes_common::validation::events::validate_event_update(
+        new_event,
+        old_event,
+        rusternetes_common::validation::events::RequestVersion::EventsV1,
+    )
+}
+
+/// `to_request_version` for the pair above: the stored core JSON in the
+/// `events.k8s.io/v1` shape.
+fn core_event_json_to_events_v1_ref(value: &serde_json::Value) -> serde_json::Value {
+    core_event_json_to_events_v1(value.clone())
+}
+
+/// `from_request_version` for the pair above: a patched `events.k8s.io/v1`
+/// document back onto the stored core shape, via
+/// `EventV1::into_core` — the same conversion the create and update handlers
+/// use, so PATCH cannot drift from them.
+fn events_v1_json_onto_core_event(
+    stored: &serde_json::Value,
+    patched: serde_json::Value,
+) -> serde_json::Value {
+    let Ok(v1) = serde_json::from_value::<EventV1>(patched.clone()) else {
+        // Best-effort, like the watch converter: hand back a document that will
+        // not decode as the v1 type so the caller's own decode produces the
+        // error message rather than this conversion swallowing it.
+        return patched;
+    };
+    let Ok(mut core) = serde_json::to_value(v1.into_core()) else {
+        return patched;
+    };
+    // Carry over whatever `Event::extra` was holding — keys neither schema
+    // names, kept only so a stored object survives a round trip unchanged. The
+    // patch was written against the v1 shape, so it cannot have named them.
+    if let Some(extra) = serde_json::from_value::<Event>(stored.clone())
+        .ok()
+        .and_then(|event| event.extra)
+    {
+        if let Some(obj) = core.as_object_mut() {
+            for (key, value) in extra {
+                obj.entry(key).or_insert(value);
+            }
+        }
+    }
+    core
 }
 
 /// Convert one stored core-Event JSON object into the `events.k8s.io/v1` shape.
