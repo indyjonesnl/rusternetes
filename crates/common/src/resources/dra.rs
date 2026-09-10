@@ -31,13 +31,14 @@ pub struct ResourceClaim {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: ResourceClaimSpec,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ResourceClaimStatus>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceClaimSpec {
     #[serde(default)]
@@ -390,10 +391,11 @@ pub struct ResourceClaimTemplate {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: ResourceClaimTemplateSpec,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceClaimTemplateSpec {
     /// Metadata to be applied to ResourceClaims created from this template
@@ -401,6 +403,7 @@ pub struct ResourceClaimTemplateSpec {
     pub metadata: ObjectMeta,
 
     /// Spec for the ResourceClaim created from this template
+    #[serde(default)]
     pub spec: ResourceClaimSpec,
 }
 
@@ -424,6 +427,7 @@ pub struct DeviceClass {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: DeviceClassSpec,
 }
 
@@ -474,10 +478,11 @@ pub struct ResourceSlice {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: ResourceSliceSpec,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceSliceSpec {
     /// Driver identifies the DRA driver providing the capacity information
@@ -523,7 +528,7 @@ pub struct ResourceSliceSpec {
     pub shared_counters: Vec<CounterSet>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourcePool {
     /// Name is used to identify the pool

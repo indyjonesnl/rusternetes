@@ -13,6 +13,7 @@ pub struct ResourceQuota {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: ResourceQuotaSpec,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -38,7 +39,7 @@ impl ResourceQuota {
 }
 
 /// ResourceQuotaSpec defines the desired hard limits to enforce for Quota
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceQuotaSpec {
     /// Hard is the set of desired hard limits for each named resource
@@ -112,6 +113,7 @@ pub struct LimitRange {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: LimitRangeSpec,
 }
 
@@ -133,7 +135,7 @@ impl LimitRange {
 }
 
 /// LimitRangeSpec defines a min/max usage limit for resources that match on kind
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LimitRangeSpec {
     /// Limits is a list of LimitRangeItem objects
@@ -204,6 +206,7 @@ pub struct PriorityClass {
     /// Higher values indicate higher priority
     /// Typical range: -2147483648 to 1000000000
     /// Values above 1000000000 are reserved for system use
+    #[serde(default)]
     pub value: i32,
 
     /// GlobalDefault specifies whether this PriorityClass should be considered as the default
@@ -261,6 +264,7 @@ pub struct PodDisruptionBudget {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: PodDisruptionBudgetSpec,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -286,7 +290,7 @@ impl PodDisruptionBudget {
 }
 
 /// PodDisruptionBudgetSpec describes what disruptions are allowed
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PodDisruptionBudgetSpec {
     /// Minimum number of pods that must be available

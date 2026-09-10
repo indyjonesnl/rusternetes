@@ -16,6 +16,7 @@ pub struct ReplicationController {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: ReplicationControllerSpec,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,7 +42,7 @@ impl ReplicationController {
 }
 
 /// ReplicationControllerSpec defines the desired state of a ReplicationController
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplicationControllerSpec {
     /// Number of desired pods (defaults to 1)
@@ -125,6 +126,7 @@ pub struct ReplicaSet {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: ReplicaSetSpec,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,7 +152,7 @@ impl ReplicaSet {
 }
 
 /// ReplicaSetSpec defines the desired state of a ReplicaSet
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplicaSetSpec {
     /// Number of desired pods
@@ -239,6 +241,7 @@ pub struct StatefulSet {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: StatefulSetSpec,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -264,7 +267,7 @@ impl StatefulSet {
 }
 
 /// StatefulSetSpec defines the desired state of a StatefulSet
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct StatefulSetSpec {
     /// Number of desired pods (defaults to 1)
@@ -428,6 +431,7 @@ pub struct DaemonSet {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: DaemonSetSpec,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -449,7 +453,7 @@ impl DaemonSet {
 }
 
 /// DaemonSetSpec defines the desired state of a DaemonSet
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonSetSpec {
     /// Selector for pods
@@ -574,6 +578,7 @@ pub struct Job {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: JobSpec,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -595,7 +600,7 @@ impl Job {
 }
 
 /// JobSpec defines the desired state of a Job
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct JobSpec {
     /// Template for pod creation
@@ -845,6 +850,7 @@ pub struct CronJob {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
+    #[serde(default)]
     pub spec: CronJobSpec,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -866,7 +872,7 @@ impl CronJob {
 }
 
 /// CronJobSpec defines the desired state of a CronJob
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CronJobSpec {
     /// Cron schedule (e.g., "0 * * * *")
@@ -901,7 +907,7 @@ pub struct CronJobSpec {
     pub time_zone: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct JobTemplateSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -938,6 +944,7 @@ pub struct PodTemplate {
     pub metadata: ObjectMeta,
 
     /// Template defines the pods that will be created from this pod template
+    #[serde(default)]
     pub template: PodTemplateSpec,
 }
 

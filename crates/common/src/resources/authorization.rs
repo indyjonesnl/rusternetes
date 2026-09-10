@@ -278,6 +278,7 @@ pub struct SelfSubjectRulesReview {
     pub kind: String,
     #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub spec: SelfSubjectRulesReviewSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<SubjectRulesReviewStatus>,
@@ -292,7 +293,7 @@ fn default_kind_self_subject_rules_review() -> String {
 }
 
 /// SelfSubjectRulesReviewSpec defines the specification for SelfSubjectRulesReview.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SelfSubjectRulesReviewSpec {
     /// Namespace to evaluate rules for. Required.

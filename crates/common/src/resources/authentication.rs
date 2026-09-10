@@ -17,6 +17,7 @@ pub struct TokenReview {
     pub kind: String,
     #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub spec: TokenReviewSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<TokenReviewStatus>,
@@ -31,7 +32,7 @@ fn default_kind_token_review() -> String {
 }
 
 /// TokenReviewSpec is a description of the token authentication request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenReviewSpec {
     /// Audiences is a list of the identifiers that the resource server presented

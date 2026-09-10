@@ -13,6 +13,7 @@ pub struct CSIDriver {
     pub type_meta: TypeMeta,
     #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub spec: CSIDriverSpec,
 }
 
@@ -96,10 +97,11 @@ pub struct CSINode {
     pub type_meta: TypeMeta,
     #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub spec: CSINodeSpec,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CSINodeSpec {
     /// drivers is a list of information of all CSI Drivers existing on a node
@@ -143,12 +145,13 @@ pub struct VolumeAttachment {
     pub type_meta: TypeMeta,
     #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub spec: VolumeAttachmentSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<VolumeAttachmentStatus>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeAttachmentSpec {
     /// attacher indicates the name of the volume driver that MUST handle this request
@@ -161,7 +164,7 @@ pub struct VolumeAttachmentSpec {
     pub source: VolumeAttachmentSource,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeAttachmentSource {
     /// persistentVolumeName represents the name of the persistent volume to attach
@@ -251,6 +254,7 @@ pub struct CSIStorageCapacity {
     pub metadata: ObjectMeta,
 
     /// storageClassName represents the name of the StorageClass
+    #[serde(default)]
     pub storage_class_name: String,
 
     /// capacity is the value reported by the CSI driver in its GetCapacityResponse
@@ -276,6 +280,7 @@ pub struct VolumeAttributesClass {
     pub metadata: ObjectMeta,
 
     /// driverName is the name of the CSI driver that this class applies to
+    #[serde(default)]
     pub driver_name: String,
 
     /// parameters hold volume attributes defined by the CSI driver

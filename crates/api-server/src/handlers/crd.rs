@@ -744,6 +744,25 @@ fn validate_crd(crd: &CustomResourceDefinition) -> Result<()> {
         ));
     }
 
+    // `spec.scope` is required. Upstream:
+    // `apiextensions-apiserver/pkg/apis/apiextensions/validation/validation.go:364`
+    //
+    //     allErrs = append(allErrs, validateEnumStrings(fldPath.Child("scope"),
+    //         string(spec.Scope), []string{string(apiextensions.ClusterScoped),
+    //         string(apiextensions.NamespaceScoped)}, true)...)
+    //
+    // and `validateEnumStrings` (`:502-515`) answers `field.Required` for the
+    // empty string. `ResourceScope::Unspecified` is that empty string, which is
+    // what an absent `spec.scope` decodes to (#1931).
+    if crd.spec.scope == rusternetes_common::resources::ResourceScope::Unspecified {
+        return Err(rusternetes_common::Error::Invalid(vec![
+            rusternetes_common::validation::field::Error::required(
+                &rusternetes_common::validation::field::Path::new("spec").child("scope"),
+                "",
+            ),
+        ]));
+    }
+
     // Validate that the CRD name follows the convention: <plural>.<group>
     let expected_name = format!("{}.{}", crd.spec.names.plural, crd.spec.group);
     if crd.metadata.name != expected_name {

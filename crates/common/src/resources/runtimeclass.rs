@@ -24,6 +24,7 @@ pub struct RuntimeClass {
     /// that the runc OCI runtime (using native Linux containers) will be used to
     /// run the containers in a pod. The Handler must be lowercase, conform to the
     /// DNS Label (RFC 1123) requirements, and is immutable.
+    #[serde(default)]
     pub handler: String,
 
     /// Overhead represents the resource overhead associated with running a pod for a

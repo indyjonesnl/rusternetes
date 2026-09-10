@@ -12,6 +12,7 @@ pub struct Binding {
     pub metadata: ObjectMeta,
 
     /// Target is the object to bind to
+    #[serde(default)]
     pub target: ObjectReference,
 }
 
@@ -33,7 +34,7 @@ impl Binding {
 }
 
 /// ObjectReference contains enough information to locate the referenced object
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectReference {
     /// API version of the referent

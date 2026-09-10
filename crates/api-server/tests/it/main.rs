@@ -128,6 +128,7 @@ mod list_empty_items_router_test;
 mod list_pagination_test;
 mod list_resource_version_floor_guard_test;
 mod list_resource_version_router_test;
+mod minimal_body_decodes_test;
 mod mtls_client_cert_authn_test;
 mod namespace_controller_api_finalize_test;
 mod namespace_finalize_removal_test;
