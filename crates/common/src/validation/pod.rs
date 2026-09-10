@@ -23,10 +23,11 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::resources::pod::{
-    Container, ContainerPort, EnvVar, ExecAction, GRPCAction, HTTPGetAction, Lifecycle,
-    LifecycleHandler, NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodOS, PodSchedulingGate,
-    PodSecurityContext, PodSpec, Probe, SleepAction, TCPSocketAction, Toleration,
-    TopologySpreadConstraint, Volume, VolumeMount,
+    AppArmorProfile, Container, ContainerPort, ContainerResizePolicy, ContainerRestartRule,
+    EnvFromSource, EnvVar, ExecAction, GRPCAction, HTTPGetAction, Lifecycle, LifecycleHandler,
+    NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodOS, PodSchedulingGate,
+    PodSecurityContext, PodSpec, Probe, SeccompProfile, SleepAction, TCPSocketAction, Toleration,
+    TopologySpreadConstraint, Volume, VolumeDevice, VolumeMount,
 };
 use crate::resources::policy::IntOrString;
 use crate::validation::field::{Error, ErrorList, Path};
@@ -200,6 +201,7 @@ pub fn validate_pod_spec(
             &volume_names,
             grace_period,
             os,
+            spec.restart_policy.as_deref(),
             &containers_path.index(i),
         ));
         if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
@@ -220,6 +222,7 @@ pub fn validate_pod_spec(
                 &volume_names,
                 grace_period,
                 os,
+                spec.restart_policy.as_deref(),
                 &init_path.index(i),
             ));
             if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
@@ -361,12 +364,24 @@ pub fn validate_pod_spec(
         &fld_path.child("dnsConfig"),
     ));
 
-    // securityContext.sysctls name format / uniqueness.
+    // securityContext.sysctls name format / uniqueness, plus the pod-level
+    // seccomp/AppArmor profiles (upstream `validatePodSecurityContext`,
+    // `pkg/apis/core/validation/validation.go:5563` and `:5565`).
     if let Some(ref sc) = spec.security_context {
-        errs.extend(validate_sysctls(
-            sc,
-            &fld_path.child("securityContext").child("sysctls"),
-        ));
+        let sc_path = fld_path.child("securityContext");
+        errs.extend(validate_sysctls(sc, &sc_path.child("sysctls")));
+        if let Some(ref sp) = sc.seccomp_profile {
+            errs.extend(validate_seccomp_profile(
+                sp,
+                &sc_path.child("seccompProfile"),
+            ));
+        }
+        if let Some(ref ap) = sc.app_armor_profile {
+            errs.extend(validate_app_armor_profile(
+                ap,
+                &sc_path.child("appArmorProfile"),
+            ));
+        }
     }
 
     errs
@@ -443,6 +458,7 @@ fn validate_container(
     volume_names: &HashSet<&str>,
     grace_period: Option<i64>,
     os: Option<&PodOS>,
+    pod_restart_policy: Option<&str>,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -542,6 +558,54 @@ fn validate_container(
         errs.extend(validate_env(env, &fld_path.child("env")));
     }
 
+    // envFrom (upstream `validateContainerCommon`,
+    // `pkg/apis/core/validation/validation.go:3909`).
+    if let Some(ref env_from) = c.env_from {
+        errs.extend(validate_env_from(env_from, &fld_path.child("envFrom")));
+    }
+
+    // volumeDevices (upstream `validateContainerCommon`, `:3911`).
+    if let Some(ref devices) = c.volume_devices {
+        errs.extend(validate_volume_devices(
+            devices,
+            volume_names,
+            &fld_path.child("volumeDevices"),
+        ));
+    }
+
+    // resizePolicy (upstream `validateContainerCommon`, `:3914`).
+    if let Some(ref policies) = c.resize_policy {
+        errs.extend(validate_resize_policy(
+            policies,
+            pod_restart_policy,
+            &fld_path.child("resizePolicy"),
+        ));
+    }
+
+    // restartPolicyRules (upstream `validateContainerRestartPolicy`, called
+    // from `validateContainers` at `:4060`).
+    if let Some(ref rules) = c.restart_policy_rules {
+        errs.extend(validate_container_restart_rules(rules, fld_path));
+    }
+
+    // securityContext.seccompProfile / .appArmorProfile (upstream
+    // `validateSecurityContext`, `:8392` and `:8408`).
+    if let Some(ref sc) = c.security_context {
+        let sc_path = fld_path.child("securityContext");
+        if let Some(ref sp) = sc.seccomp_profile {
+            errs.extend(validate_seccomp_profile(
+                sp,
+                &sc_path.child("seccompProfile"),
+            ));
+        }
+        if let Some(ref ap) = sc.app_armor_profile {
+            errs.extend(validate_app_armor_profile(
+                ap,
+                &sc_path.child("appArmorProfile"),
+            ));
+        }
+    }
+
     // imagePullPolicy enum (upstream validatePullPolicy). Unset/empty is
     // defaulted at runtime, so only an explicit unsupported value is rejected.
     if let Some(policy) = c.image_pull_policy.as_deref().filter(|p| !p.is_empty()) {
@@ -574,6 +638,333 @@ fn validate_container(
 
 const PULL_POLICIES: &[&str] = &["Always", "Never", "IfNotPresent"];
 const TERMINATION_MESSAGE_POLICIES: &[&str] = &["File", "FallbackToLogsOnError"];
+
+/// Upstream `supportedResizeResources` (`validateResizePolicy`,
+/// `pkg/apis/core/validation/validation.go:3630-3660`).
+const RESIZE_RESOURCES: &[&str] = &["cpu", "memory"];
+/// Upstream `supportedResizePolicies` (same function).
+const RESIZE_POLICIES: &[&str] = &["NotRequired", "RestartContainer"];
+/// Upstream `supportedContainerRestartRuleActions`
+/// (`pkg/apis/core/validation/validation.go:3661-3667`). `RestartAllContainers`
+/// is gated behind `AllowRestartAllContainers`, which is off here, and upstream
+/// lists only `Restart` in the error either way.
+const CONTAINER_RESTART_RULE_ACTIONS: &[&str] = &["Restart"];
+/// Upstream `supportedContainerRestartPolicyOperators` (same block).
+const CONTAINER_RESTART_RULE_OPERATORS: &[&str] = &["In", "NotIn"];
+/// Upstream `validateSeccompProfileType`
+/// (`pkg/apis/core/validation/validation.go:5296-5305`).
+const SECCOMP_PROFILE_TYPES: &[&str] = &["Localhost", "RuntimeDefault", "Unconfined"];
+/// Upstream `ValidateAppArmorProfileField`
+/// (`pkg/apis/core/validation/validation.go:5307-5346`).
+const APP_ARMOR_PROFILE_TYPES: &[&str] = &["Localhost", "RuntimeDefault", "Unconfined"];
+
+/// Port of upstream `ValidateEnvFrom`
+/// (`pkg/apis/core/validation/validation.go:2919-2951`) together with
+/// `validateConfigMapEnvSource` (`:2953-2963`) and `validateSecretEnvSource`
+/// (`:2965-2975`): a prefix that is a valid env var name, exactly one of
+/// `configMapRef` / `secretRef`, and a non-empty DNS-subdomain name on
+/// whichever one is set.
+fn validate_env_from(sources: &[EnvFromSource], fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    for (i, ev) in sources.iter().enumerate() {
+        let idx = fld_path.index(i);
+
+        if let Some(prefix) = ev.prefix.as_deref().filter(|p| !p.is_empty()) {
+            for msg in is_env_var_name(prefix) {
+                errs.push(Error::invalid(
+                    &idx.child("prefix"),
+                    prefix.to_string(),
+                    msg,
+                ));
+            }
+        }
+
+        let mut num_sources = 0;
+        if let Some(cm) = ev.config_map_ref.as_ref() {
+            num_sources += 1;
+            let name_path = idx.child("configMapRef").child("name");
+            if cm.name.is_empty() {
+                errs.push(Error::required(&name_path, ""));
+            } else {
+                for msg in is_dns1123_subdomain(&cm.name) {
+                    errs.push(Error::invalid(&name_path, cm.name.clone(), msg));
+                }
+            }
+        }
+        if let Some(sec) = ev.secret_ref.as_ref() {
+            num_sources += 1;
+            let name_path = idx.child("secretRef").child("name");
+            if sec.name.is_empty() {
+                errs.push(Error::required(&name_path, ""));
+            } else {
+                for msg in is_dns1123_subdomain(&sec.name) {
+                    errs.push(Error::invalid(&name_path, sec.name.clone(), msg));
+                }
+            }
+        }
+
+        // Upstream reports both of these on the *list* path, not the index.
+        if num_sources == 0 {
+            errs.push(Error::invalid(
+                fld_path,
+                String::new(),
+                "must specify one of: `configMapRef` or `secretRef`",
+            ));
+        } else if num_sources > 1 {
+            errs.push(Error::invalid(
+                fld_path,
+                String::new(),
+                "may not have more than one field specified at a time",
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `ValidateVolumeDevices`
+/// (`pkg/apis/core/validation/validation.go:3153-3197`): a non-empty unique
+/// name that names a declared volume, and a non-empty unique `devicePath` with
+/// no backsteps. The volume-source *mode* check (block mode requires a PVC or
+/// a generic ephemeral volume) needs the volume sources, which this caller does
+/// not thread through yet; the name/path requireds and the uniqueness rules —
+/// the ones the decoder was answering for — are ported here.
+fn validate_volume_devices(
+    devices: &[VolumeDevice],
+    volume_names: &HashSet<&str>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let mut seen_names: HashSet<&str> = HashSet::new();
+    let mut seen_paths: HashSet<&str> = HashSet::new();
+
+    for (i, dev) in devices.iter().enumerate() {
+        let idx = fld_path.index(i);
+
+        if dev.name.is_empty() {
+            errs.push(Error::required(&idx.child("name"), ""));
+        } else if !seen_names.insert(dev.name.as_str()) {
+            errs.push(Error::invalid(
+                &idx.child("name"),
+                dev.name.clone(),
+                "must be unique",
+            ));
+        } else if !volume_names.contains(dev.name.as_str()) {
+            errs.push(Error::not_found(&idx.child("name"), dev.name.clone()));
+        }
+
+        if dev.device_path.is_empty() {
+            errs.push(Error::required(&idx.child("devicePath"), ""));
+        } else if !seen_paths.insert(dev.device_path.as_str()) {
+            errs.push(Error::invalid(
+                &idx.child("devicePath"),
+                dev.device_path.clone(),
+                "must be unique",
+            ));
+        } else if dev.device_path.split('/').any(|seg| seg == "..") {
+            errs.push(Error::invalid(
+                &idx.child("devicePath"),
+                dev.device_path.clone(),
+                "can not contain backsteps ('..')",
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateResizePolicy`
+/// (`pkg/apis/core/validation/validation.go:3630-3660`). Note the field paths:
+/// upstream reports the enum errors on the **list** path, not on the index, so
+/// this does too — the error string is the contract.
+fn validate_resize_policy(
+    policies: &[ContainerResizePolicy],
+    pod_restart_policy: Option<&str>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    for (i, p) in policies.iter().enumerate() {
+        if !seen.insert(p.resource_name.as_str()) {
+            errs.push(Error::duplicate(
+                &fld_path.index(i),
+                p.resource_name.clone(),
+            ));
+        }
+
+        if p.resource_name.is_empty() {
+            errs.push(Error::required(fld_path, ""));
+        } else if !RESIZE_RESOURCES.contains(&p.resource_name.as_str()) {
+            errs.push(Error::not_supported(
+                fld_path,
+                p.resource_name.clone(),
+                RESIZE_RESOURCES,
+            ));
+        }
+
+        if p.restart_policy.is_empty() {
+            errs.push(Error::required(fld_path, ""));
+        } else if !RESIZE_POLICIES.contains(&p.restart_policy.as_str()) {
+            errs.push(Error::not_supported(
+                fld_path,
+                p.restart_policy.clone(),
+                RESIZE_POLICIES,
+            ));
+        }
+
+        if pod_restart_policy == Some("Never") && p.restart_policy != "NotRequired" {
+            errs.push(Error::invalid(
+                fld_path,
+                p.restart_policy.clone(),
+                "must be 'NotRequired' when `restartPolicy` is 'Never'",
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of the rules half of upstream `validateContainerRestartPolicy`
+/// (`pkg/apis/core/validation/validation.go:3683-3722`): at most 20 rules, a
+/// supported `action`, a required `exitCodes` with a supported `operator`, and
+/// at most 255 exit-code values.
+fn validate_container_restart_rules(rules: &[ContainerRestartRule], fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let rules_path = fld_path.child("restartPolicyRules");
+
+    if rules.len() > 20 {
+        errs.push(Error::too_long(&rules_path, 20));
+    }
+
+    for (i, rule) in rules.iter().enumerate() {
+        let idx = rules_path.index(i);
+
+        if !CONTAINER_RESTART_RULE_ACTIONS.contains(&rule.action.as_str()) {
+            errs.push(Error::not_supported(
+                &idx.child("action"),
+                rule.action.clone(),
+                CONTAINER_RESTART_RULE_ACTIONS,
+            ));
+        }
+
+        match rule.exit_codes.as_ref() {
+            None => errs.push(Error::required(
+                &idx.child("exitCodes"),
+                "must be specified",
+            )),
+            Some(ec) => {
+                let ec_path = idx.child("exitCodes");
+                if !CONTAINER_RESTART_RULE_OPERATORS.contains(&ec.operator.as_str()) {
+                    errs.push(Error::not_supported(
+                        &ec_path.child("operator"),
+                        ec.operator.clone(),
+                        CONTAINER_RESTART_RULE_OPERATORS,
+                    ));
+                }
+                if ec.values.as_deref().unwrap_or(&[]).len() > 255 {
+                    errs.push(Error::too_long(&ec_path.child("values"), 255));
+                }
+            }
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateSeccompProfileField`
+/// (`pkg/apis/core/validation/validation.go:5243-5266`) and
+/// `validateSeccompProfileType` (`:5296-5305`): `type` is required when the
+/// profile is set, and `localhostProfile` is required exactly for
+/// `type: Localhost`.
+fn validate_seccomp_profile(sp: &SeccompProfile, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let type_path = fld_path.child("type");
+
+    if sp.r#type.is_empty() {
+        errs.push(Error::required(
+            &type_path,
+            "type is required when seccompProfile is set",
+        ));
+    } else if !SECCOMP_PROFILE_TYPES.contains(&sp.r#type.as_str()) {
+        errs.push(Error::not_supported(
+            &type_path,
+            sp.r#type.clone(),
+            SECCOMP_PROFILE_TYPES,
+        ));
+    }
+
+    let localhost_path = fld_path.child("localhostProfile");
+    if sp.r#type == "Localhost" {
+        match sp.localhost_profile.as_deref() {
+            None => errs.push(Error::required(
+                &localhost_path,
+                "must be set when seccomp type is Localhost",
+            )),
+            Some(profile) => {
+                errs.extend(validate_local_descending_path(profile, &localhost_path));
+            }
+        }
+    } else if sp.localhost_profile.is_some() {
+        errs.push(Error::invalid(
+            &localhost_path,
+            sp.localhost_profile.clone().unwrap_or_default(),
+            "can only be set when seccomp type is Localhost",
+        ));
+    }
+
+    errs
+}
+
+/// Port of upstream `ValidateAppArmorProfileField`
+/// (`pkg/apis/core/validation/validation.go:5307-5346`).
+fn validate_app_armor_profile(profile: &AppArmorProfile, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let localhost_path = fld_path.child("localhostProfile");
+
+    match profile.type_.as_str() {
+        "Localhost" => match profile.localhost_profile.as_deref() {
+            None => errs.push(Error::required(
+                &localhost_path,
+                "must be set when AppArmor type is Localhost",
+            )),
+            Some(p) => {
+                if p.trim() != p {
+                    errs.push(Error::invalid(
+                        &localhost_path,
+                        p.to_string(),
+                        "must not be padded with whitespace",
+                    ));
+                } else if p.is_empty() {
+                    errs.push(Error::required(
+                        &localhost_path,
+                        "must be set when AppArmor type is Localhost",
+                    ));
+                }
+                // Upstream `maxLocalhostProfileLength` = PATH_MAX - 1.
+                if p.len() > 4095 {
+                    errs.push(Error::too_long(&localhost_path, 4095));
+                }
+            }
+        },
+        "RuntimeDefault" | "Unconfined" => {
+            if profile.localhost_profile.is_some() {
+                errs.push(Error::invalid(
+                    &localhost_path,
+                    profile.localhost_profile.clone().unwrap_or_default(),
+                    "can only be set when AppArmor type is Localhost",
+                ));
+            }
+        }
+        "" => errs.push(Error::required(
+            &fld_path.child("type"),
+            "type is required when appArmorProfile is set",
+        )),
+        other => errs.push(Error::not_supported(
+            &fld_path.child("type"),
+            other.to_string(),
+            APP_ARMOR_PROFILE_TYPES,
+        )),
+    }
+
+    errs
+}
 
 /// Port of upstream `validateLocalDescendingPath`: a `subPath`/`subPathExpr`
 /// must be relative and contain no `..` component.
@@ -3243,6 +3634,7 @@ mod tests {
             &vols,
             Some(30),
             None,
+            None,
             &Path::new("spec").child("containers").index(0),
         )
         .into_iter()
@@ -3819,6 +4211,191 @@ mod tests {
         assert!(
             e.iter()
                 .any(|m| m.contains("postStart.httpGet.path") && m.contains("Required")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn env_from_requires_exactly_one_source() {
+        let none = cerrs(serde_json::json!({
+            "name": "c", "image": "i", "envFrom": [{}]
+        }));
+        assert!(
+            none.iter()
+                .any(|m| m.contains("must specify one of: `configMapRef` or `secretRef`")),
+            "{none:?}"
+        );
+
+        let both = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "envFrom": [{"configMapRef": {"name": "cm"}, "secretRef": {"name": "s"}}]
+        }));
+        assert!(
+            both.iter()
+                .any(|m| m.contains("may not have more than one field specified at a time")),
+            "{both:?}"
+        );
+    }
+
+    #[test]
+    fn volume_devices_names_and_paths_are_unique() {
+        let vols: HashSet<&str> = ["v", "w"].into_iter().collect();
+        let c = container_from(serde_json::json!({
+            "name": "c", "image": "i",
+            "volumeDevices": [
+                {"name": "v", "devicePath": "/dev/a"},
+                {"name": "v", "devicePath": "/dev/a"},
+            ]
+        }));
+        let e: Vec<String> = validate_container(
+            &c,
+            false,
+            &vols,
+            Some(30),
+            None,
+            None,
+            &Path::new("spec").child("containers").index(0),
+        )
+        .into_iter()
+        .map(|x| x.to_string())
+        .collect();
+        assert!(
+            e.iter()
+                .any(|m| m.contains("volumeDevices[1].name") && m.contains("must be unique")),
+            "{e:?}"
+        );
+        assert!(
+            e.iter()
+                .any(|m| m.contains("volumeDevices[1].devicePath") && m.contains("must be unique")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn volume_device_must_name_a_declared_volume() {
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "volumeDevices": [{"name": "nope", "devicePath": "/dev/a"}]
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("volumeDevices[0].name") && m.contains("Not found")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn resize_policy_enums_are_not_supported_rather_than_ignored() {
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "resizePolicy": [{"resourceName": "storage", "restartPolicy": "Reboot"}]
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("resizePolicy") && m.contains("\"storage\"")),
+            "{e:?}"
+        );
+        assert!(
+            e.iter()
+                .any(|m| m.contains("resizePolicy") && m.contains("\"Reboot\"")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn resize_policy_must_be_not_required_when_the_pod_never_restarts() {
+        let vols: HashSet<&str> = HashSet::new();
+        let c = container_from(serde_json::json!({
+            "name": "c", "image": "i",
+            "resizePolicy": [{"resourceName": "cpu", "restartPolicy": "RestartContainer"}]
+        }));
+        let e: Vec<String> = validate_container(
+            &c,
+            false,
+            &vols,
+            Some(30),
+            None,
+            Some("Never"),
+            &Path::new("spec").child("containers").index(0),
+        )
+        .into_iter()
+        .map(|x| x.to_string())
+        .collect();
+        assert!(
+            e.iter()
+                .any(|m| m.contains("must be 'NotRequired' when `restartPolicy` is 'Never'")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn a_restart_rule_requires_exit_codes() {
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "restartPolicyRules": [{"action": "Restart"}]
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("restartPolicyRules[0].exitCodes")
+                    && m.contains("must be specified")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn seccomp_localhost_requires_a_localhost_profile() {
+        let missing = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "securityContext": {"seccompProfile": {"type": "Localhost"}}
+        }));
+        assert!(
+            missing
+                .iter()
+                .any(|m| m.contains("seccompProfile.localhostProfile")
+                    && m.contains("must be set when seccomp type is Localhost")),
+            "{missing:?}"
+        );
+
+        let stray = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "securityContext": {
+                "seccompProfile": {"type": "RuntimeDefault", "localhostProfile": "p"}
+            }
+        }));
+        assert!(
+            stray
+                .iter()
+                .any(|m| m.contains("seccompProfile.localhostProfile")
+                    && m.contains("can only be set when seccomp type is Localhost")),
+            "{stray:?}"
+        );
+    }
+
+    #[test]
+    fn app_armor_profile_type_must_be_supported() {
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "securityContext": {"appArmorProfile": {"type": "Enforce"}}
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("appArmorProfile.type") && m.contains("Unsupported value")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn app_armor_localhost_profile_must_not_be_padded() {
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "securityContext": {
+                "appArmorProfile": {"type": "Localhost", "localhostProfile": " p "}
+            }
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("appArmorProfile.localhostProfile")
+                    && m.contains("must not be padded with whitespace")),
             "{e:?}"
         );
     }

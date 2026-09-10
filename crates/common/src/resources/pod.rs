@@ -340,7 +340,7 @@ pub struct Sysctl {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppArmorProfile {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub type_: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub localhost_profile: Option<String>,
@@ -402,6 +402,7 @@ pub struct WorkloadReference {
 #[serde(rename_all = "camelCase")]
 pub struct ContainerRestartRule {
     /// Action taken when the rule matches. Currently only "Restart".
+    #[serde(default)]
     pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_codes: Option<ContainerRestartRuleOnExitCodes>,
@@ -412,6 +413,7 @@ pub struct ContainerRestartRule {
 #[serde(rename_all = "camelCase")]
 pub struct ContainerRestartRuleOnExitCodes {
     /// Operator relating the container exit code(s) to `values` (In / NotIn).
+    #[serde(default)]
     pub operator: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<i32>>,
@@ -464,7 +466,9 @@ pub struct PodCertificateProjection {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EphemeralContainer {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub image: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -596,7 +600,9 @@ pub struct TopologySpreadConstraint {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Container {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub image: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -717,6 +723,7 @@ pub struct LifecycleHandler {
 #[serde(rename_all = "camelCase")]
 pub struct SleepAction {
     /// Seconds is the number of seconds to sleep
+    #[serde(default)]
     pub seconds: i64,
 }
 
@@ -725,8 +732,10 @@ pub struct SleepAction {
 #[serde(rename_all = "camelCase")]
 pub struct ContainerResizePolicy {
     /// Name of the resource to which this resource resize policy applies (cpu, memory)
+    #[serde(default)]
     pub resource_name: String,
     /// Restart policy to apply when the specified resource is resized (NotRequired or RestartContainer)
+    #[serde(default)]
     pub restart_policy: String,
 }
 
@@ -783,6 +792,7 @@ pub struct Capabilities {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SeccompProfile {
+    #[serde(default)]
     pub r#type: String, // RuntimeDefault, Unconfined, Localhost
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -796,6 +806,7 @@ fn default_protocol() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerPort {
+    #[serde(default)]
     pub container_port: u16,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -859,6 +870,7 @@ skip_if_empty!(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvVar {
+    #[serde(default)]
     pub name: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -893,8 +905,10 @@ pub struct EnvVarSource {
 #[serde(rename_all = "camelCase")]
 pub struct FileKeySelector {
     /// The name of the volume containing the file
+    #[serde(default)]
     pub volume_name: String,
     /// The relative path of the file to map the key to
+    #[serde(default)]
     pub path: String,
     /// The key to select
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -922,6 +936,7 @@ pub struct EnvFromSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigMapEnvSource {
+    #[serde(default)]
     pub name: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -932,6 +947,7 @@ pub struct ConfigMapEnvSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretEnvSource {
+    #[serde(default)]
     pub name: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -942,14 +958,18 @@ pub struct SecretEnvSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeDevice {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub device_path: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigMapKeySelector {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub key: String,
 
     /// Specify whether the ConfigMap or its key must be defined
@@ -960,7 +980,9 @@ pub struct ConfigMapKeySelector {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretKeySelector {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub key: String,
 
     /// Specify whether the Secret or its key must be defined
@@ -971,7 +993,9 @@ pub struct SecretKeySelector {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeMount {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub mount_path: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1785,6 +1809,7 @@ pub struct Probe {
 pub struct GRPCAction {
     /// Port number of the gRPC service.
     /// K8s API: IntOrString — int port or named port from container.ports[].name.
+    #[serde(default)]
     pub port: IntOrString,
 
     /// Service is the name of the service to place in the gRPC HealthCheckRequest
@@ -1828,6 +1853,7 @@ pub struct HTTPGetAction {
 
     /// Port to access on the container.
     /// K8s API: IntOrString — int port or named port from container.ports[].name.
+    #[serde(default)]
     pub port: IntOrString,
 
     /// Host name to connect to
@@ -1847,7 +1873,9 @@ pub struct HTTPGetAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HTTPHeader {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub value: String,
 }
 
@@ -1857,6 +1885,7 @@ pub struct HTTPHeader {
 pub struct TCPSocketAction {
     /// Port to connect to on the container.
     /// K8s API: IntOrString — int port or named port from container.ports[].name.
+    #[serde(default)]
     pub port: IntOrString,
 
     /// Host name to connect to
@@ -1869,6 +1898,7 @@ pub struct TCPSocketAction {
 #[serde(rename_all = "camelCase")]
 pub struct ExecAction {
     /// Command to execute
+    #[serde(default)]
     pub command: Vec<String>,
 }
 
@@ -1884,7 +1914,9 @@ pub struct ContainerUser {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LinuxContainerUser {
+    #[serde(default)]
     pub uid: i64,
+    #[serde(default)]
     pub gid: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supplemental_groups: Option<Vec<i64>>,

@@ -314,8 +314,19 @@ pub struct PodDisruptionBudgetSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum IntOrString {
+    /// Upstream's zero value is `{Type: Int, IntVal: 0}` — `Type` is an
+    /// `iota`-based enum whose first constant is `Int`
+    /// (`apimachinery/pkg/util/intstr/intstr.go:50-54`), so a field of this
+    /// type decodes to the integer `0` when the body omits it, and validation
+    /// (not the decoder) answers for the missing port.
     Int(i32),
     String(String),
+}
+
+impl Default for IntOrString {
+    fn default() -> Self {
+        IntOrString::Int(0)
+    }
 }
 
 impl IntOrString {
