@@ -25,9 +25,10 @@ use std::collections::{HashMap, HashSet};
 use crate::resources::pod::{
     AppArmorProfile, Container, ContainerPort, ContainerResizePolicy, ContainerRestartRule,
     EnvFromSource, EnvVar, ExecAction, GRPCAction, HTTPGetAction, Lifecycle, LifecycleHandler,
-    NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodOS, PodSchedulingGate,
-    PodSecurityContext, PodSpec, Probe, SeccompProfile, SleepAction, TCPSocketAction, Toleration,
-    TopologySpreadConstraint, Volume, VolumeDevice, VolumeMount,
+    NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodOS, PodReadinessGate, PodResourceClaim,
+    PodSchedulingGate, PodSecurityContext, PodSpec, Probe, SeccompProfile, SleepAction,
+    TCPSocketAction, Toleration, TopologySpreadConstraint, Volume, VolumeDevice, VolumeMount,
+    WorkloadReference,
 };
 use crate::resources::policy::IntOrString;
 use crate::validation::field::{Error, ErrorList, Path};
@@ -384,6 +385,169 @@ pub fn validate_pod_spec(
         }
     }
 
+    // resourceClaims (upstream `validatePodSpec`,
+    // `pkg/apis/core/validation/validation.go:4640`).
+    if let Some(ref claims) = spec.resource_claims {
+        errs.extend(validate_pod_resource_claims(
+            claims,
+            &fld_path.child("resourceClaims"),
+        ));
+    }
+
+    // readinessGates / schedulingGates (upstream `:4657` and `:4658`).
+    if let Some(ref gates) = spec.readiness_gates {
+        errs.extend(validate_readiness_gates(
+            gates,
+            &fld_path.child("readinessGates"),
+        ));
+    }
+    if let Some(ref gates) = spec.scheduling_gates {
+        errs.extend(validate_scheduling_gates(
+            gates,
+            &fld_path.child("schedulingGates"),
+        ));
+    }
+
+    // os (upstream `:4717`).
+    if let Some(pod_os) = spec.os.as_ref() {
+        errs.extend(validate_os(pod_os, &fld_path.child("os")));
+    }
+
+    // workloadRef (upstream `:4728`).
+    if let Some(workload_ref) = spec.workload_ref.as_ref() {
+        errs.extend(validate_workload_reference(
+            workload_ref,
+            &fld_path.child("workloadRef"),
+        ));
+    }
+
+    errs
+}
+
+/// Upstream `validOS` (`pkg/apis/core/validation/validation.go:122`).
+const VALID_OS: &[&str] = &["linux", "windows"];
+
+/// Port of upstream `validateOS`
+/// (`pkg/apis/core/validation/validation.go:8594-8607`): `name` is required
+/// once `os` is set, and must be one of the two supported values. Note the
+/// path — upstream reports the `NotSupported` on `os`, not on `os.name`.
+fn validate_os(pod_os: &PodOS, fld_path: &Path) -> ErrorList {
+    if pod_os.name.is_empty() {
+        return vec![Error::required(&fld_path.child("name"), "")];
+    }
+    if !VALID_OS.contains(&pod_os.name.as_str()) {
+        return vec![Error::not_supported(
+            fld_path,
+            pod_os.name.clone(),
+            VALID_OS,
+        )];
+    }
+    Vec::new()
+}
+
+/// Port of upstream `validatePodResourceClaims` / `validatePodResourceClaim`
+/// (`pkg/apis/core/validation/validation.go:3201-3245`): a required, unique,
+/// DNS-1123-label `name`, and at most one of `resourceClaimName` /
+/// `resourceClaimTemplateName`.
+fn validate_pod_resource_claims(claims: &[PodResourceClaim], fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    for (i, claim) in claims.iter().enumerate() {
+        let idx = fld_path.index(i);
+        let name_path = idx.child("name");
+
+        if claim.name.is_empty() {
+            errs.push(Error::required(&name_path, ""));
+        } else if !seen.insert(claim.name.as_str()) {
+            errs.push(Error::duplicate(&name_path, claim.name.clone()));
+        } else {
+            for msg in is_dns1123_label(&claim.name) {
+                errs.push(Error::invalid(&name_path, claim.name.clone(), msg));
+            }
+        }
+
+        if claim.resource_claim_name.is_some() && claim.resource_claim_template_name.is_some() {
+            errs.push(Error::invalid(
+                &idx,
+                claim.name.clone(),
+                "at most one of `resourceClaimName` or `resourceClaimTemplateName` may be specified",
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateReadinessGates`
+/// (`pkg/apis/core/validation/validation.go:4134-4141`): `conditionType` is a
+/// qualified name. An empty one fails `ValidateQualifiedName`, which is how
+/// upstream answers for an omitted field here rather than with `Required`.
+fn validate_readiness_gates(gates: &[PodReadinessGate], fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    for (i, gate) in gates.iter().enumerate() {
+        let path = fld_path.index(i).child("conditionType");
+        for msg in is_qualified_name(&gate.condition_type) {
+            errs.push(Error::invalid(&path, gate.condition_type.clone(), msg));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateSchedulingGates`
+/// (`pkg/apis/core/validation/validation.go:4142-4154`): each `name` is a
+/// qualified name and no two gates repeat. Upstream reports both on the index
+/// path, not on `index.name`.
+fn validate_scheduling_gates(gates: &[PodSchedulingGate], fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (i, gate) in gates.iter().enumerate() {
+        let idx = fld_path.index(i);
+        for msg in is_qualified_name(&gate.name) {
+            errs.push(Error::invalid(&idx, gate.name.clone(), msg));
+        }
+        if !seen.insert(gate.name.as_str()) {
+            errs.push(Error::duplicate(&idx, gate.name.clone()));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateWorkloadReference`
+/// (`pkg/apis/core/validation/validation.go:9586-9600`): `name` is a DNS
+/// subdomain (`ValidateWorkloadName`, `:347`), `podGroup` a DNS label
+/// (`ValidatePodGroupName`, `:351`), and `podGroupReplicaKey` a DNS label when
+/// set. Upstream reports an empty value as `Invalid` from the name check, not
+/// as `Required`.
+fn validate_workload_reference(workload_ref: &WorkloadReference, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    for msg in is_dns1123_subdomain(&workload_ref.name) {
+        errs.push(Error::invalid(
+            &fld_path.child("name"),
+            workload_ref.name.clone(),
+            msg,
+        ));
+    }
+    for msg in is_dns1123_label(&workload_ref.pod_group) {
+        errs.push(Error::invalid(
+            &fld_path.child("podGroup"),
+            workload_ref.pod_group.clone(),
+            msg,
+        ));
+    }
+    if let Some(key) = workload_ref
+        .pod_group_replica_key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+    {
+        for msg in is_dns1123_label(key) {
+            errs.push(Error::invalid(
+                &fld_path.child("podGroupReplicaKey"),
+                key.to_string(),
+                msg,
+            ));
+        }
+    }
     errs
 }
 

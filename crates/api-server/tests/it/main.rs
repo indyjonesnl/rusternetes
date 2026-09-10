@@ -163,6 +163,7 @@ mod pod_qos_class_parity_test;
 mod pod_requests_from_limits_default_test;
 mod pod_resize_cas_test;
 mod pod_security_admission_test;
+mod pod_spec_decodes_when_absent_test;
 mod pod_update_immutability_test;
 mod poddisruptionbudget_handler_test;
 mod podstatus_lifecycle_test;
