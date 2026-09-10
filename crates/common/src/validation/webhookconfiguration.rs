@@ -174,6 +174,9 @@ fn validate_rule_with_operations(rule: &RuleWithOperations, path: &Path) -> Erro
 
 fn side_effect_str(s: &SideEffectClass) -> &'static str {
     match s {
+        // Go's zero value for the field, i.e. an absent `sideEffects`; upstream
+        // renders it in the error as the empty string it is.
+        SideEffectClass::Unspecified => "",
         SideEffectClass::Unknown => "Unknown",
         SideEffectClass::None => "None",
         SideEffectClass::Some => "Some",
@@ -355,6 +358,9 @@ fn to_metav1_selector(s: &WebhookLabelSelector) -> crate::types::LabelSelector {
                 .map(|r| crate::types::LabelSelectorRequirement {
                     key: r.key.clone(),
                     operator: match r.operator {
+                        // An absent `operator`; the shared validator rejects it
+                        // as upstream does, rather than this mapping guessing.
+                        Op::Unspecified => "",
                         Op::In => "In",
                         Op::NotIn => "NotIn",
                         Op::Exists => "Exists",

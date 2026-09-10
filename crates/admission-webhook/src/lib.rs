@@ -712,6 +712,20 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                                     .unwrap_or(true),
                                                 LabelSelectorOperator::Exists => val.is_some(),
                                                 LabelSelectorOperator::DoesNotExist => val.is_none(),
+                                                // An absent `operator`.
+                                                // `LabelSelectorAsSelector`
+                                                // fails on it upstream
+                                                // ("%q is not a valid label
+                                                // selector operator",
+                                                // apimachinery/pkg/apis/meta/v1/helpers.go:63),
+                                                // so the selector matches
+                                                // nothing rather than
+                                                // everything. Validation
+                                                // rejects such a webhook at
+                                                // create, so this is
+                                                // unreachable for an object
+                                                // written through the API.
+                                                LabelSelectorOperator::Unspecified => false,
                                             }
                                         }
                                     })
@@ -1113,6 +1127,20 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                                 LabelSelectorOperator::NotIn => expr.values.as_ref().map(|vs| val.map(|v| !vs.contains(v)).unwrap_or(true)).unwrap_or(true),
                                                 LabelSelectorOperator::Exists => val.is_some(),
                                                 LabelSelectorOperator::DoesNotExist => val.is_none(),
+                                                // An absent `operator`.
+                                                // `LabelSelectorAsSelector`
+                                                // fails on it upstream
+                                                // ("%q is not a valid label
+                                                // selector operator",
+                                                // apimachinery/pkg/apis/meta/v1/helpers.go:63),
+                                                // so the selector matches
+                                                // nothing rather than
+                                                // everything. Validation
+                                                // rejects such a webhook at
+                                                // create, so this is
+                                                // unreachable for an object
+                                                // written through the API.
+                                                LabelSelectorOperator::Unspecified => false,
                                             }
                                         }
                                     })

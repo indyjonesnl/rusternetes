@@ -38,12 +38,15 @@ impl ValidatingWebhookConfiguration {
 #[serde(rename_all = "camelCase")]
 pub struct ValidatingWebhook {
     /// Name is the full-qualified name of the webhook
+    #[serde(default)]
     pub name: String,
 
     /// ClientConfig defines how to communicate with the webhook
+    #[serde(default)]
     pub client_config: WebhookClientConfig,
 
     /// Rules describes what operations on what resources the webhook cares about
+    #[serde(default)]
     pub rules: Vec<RuleWithOperations>,
 
     /// FailurePolicy defines how unrecognized errors are handled
@@ -71,6 +74,7 @@ pub struct ValidatingWebhook {
     pub object_selector: Option<LabelSelector>,
 
     /// SideEffects states whether this webhook has side effects
+    #[serde(default)]
     pub side_effects: SideEffectClass,
 
     /// TimeoutSeconds specifies the timeout for this webhook (1-30 seconds)
@@ -78,6 +82,7 @@ pub struct ValidatingWebhook {
     pub timeout_seconds: Option<i32>,
 
     /// AdmissionReviewVersions is an ordered list of AdmissionReview versions the webhook accepts
+    #[serde(default)]
     pub admission_review_versions: Vec<String>,
 
     /// MatchConditions are CEL expressions that must be true for the webhook to be called
@@ -115,12 +120,15 @@ impl MutatingWebhookConfiguration {
 #[serde(rename_all = "camelCase")]
 pub struct MutatingWebhook {
     /// Name is the full-qualified name of the webhook
+    #[serde(default)]
     pub name: String,
 
     /// ClientConfig defines how to communicate with the webhook
+    #[serde(default)]
     pub client_config: WebhookClientConfig,
 
     /// Rules describes what operations on what resources the webhook cares about
+    #[serde(default)]
     pub rules: Vec<RuleWithOperations>,
 
     /// FailurePolicy defines how unrecognized errors are handled
@@ -148,6 +156,7 @@ pub struct MutatingWebhook {
     pub object_selector: Option<LabelSelector>,
 
     /// SideEffects states whether this webhook has side effects
+    #[serde(default)]
     pub side_effects: SideEffectClass,
 
     /// TimeoutSeconds specifies the timeout for this webhook (1-30 seconds)
@@ -155,6 +164,7 @@ pub struct MutatingWebhook {
     pub timeout_seconds: Option<i32>,
 
     /// AdmissionReviewVersions is an ordered list of AdmissionReview versions the webhook accepts
+    #[serde(default)]
     pub admission_review_versions: Vec<String>,
 
     /// MatchConditions are CEL expressions that must be true for the webhook to be called
@@ -242,8 +252,18 @@ pub enum MatchPolicy {
 }
 
 /// SideEffectClass denotes the level of side effects a webhook may have
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum SideEffectClass {
+    /// Go's zero value: the field was absent from the body. Upstream's
+    /// `SideEffectClass` is a bare string, so an omitted `sideEffects` decodes
+    /// to `""` and `validateValidatingWebhook`
+    /// (`pkg/apis/admissionregistration/validation/validation.go`) answers
+    /// `field.NotSupported` — v1 accepts only `None` and `NoneOnDryRun`. There
+    /// is no safe value to invent here: every named variant claims something
+    /// about the webhook's behaviour that the client never said.
+    #[default]
+    #[serde(rename = "")]
+    Unspecified,
     /// Unknown means the webhook may have unknown side effects
     Unknown,
     /// None means the webhook has no side effects on dryRun
@@ -281,9 +301,11 @@ pub struct LabelSelector {
 #[serde(rename_all = "camelCase")]
 pub struct LabelSelectorRequirement {
     /// Key is the label key that the selector applies to
+    #[serde(default)]
     pub key: String,
 
     /// Operator represents a key's relationship to a set of values
+    #[serde(default)]
     pub operator: LabelSelectorOperator,
 
     /// Values is an array of string values
@@ -292,8 +314,16 @@ pub struct LabelSelectorRequirement {
 }
 
 /// LabelSelectorOperator is the set of operators for label selector requirements
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum LabelSelectorOperator {
+    /// Go's zero value: `operator` was absent. Upstream's is a bare string, so
+    /// the requirement reaches `ValidateLabelSelectorRequirement`
+    /// (`apimachinery/pkg/apis/meta/v1/validation/validation.go`), which answers
+    /// `Invalid: not a valid selector operator`. Defaulting to any real operator
+    /// would instead select pods the client never asked for.
+    #[default]
+    #[serde(rename = "")]
+    Unspecified,
     In,
     NotIn,
     Exists,
@@ -305,9 +335,11 @@ pub enum LabelSelectorOperator {
 #[serde(rename_all = "camelCase")]
 pub struct MatchCondition {
     /// Name is an identifier for this match condition
+    #[serde(default)]
     pub name: String,
 
     /// Expression is a CEL expression that must evaluate to true
+    #[serde(default)]
     pub expression: String,
 }
 

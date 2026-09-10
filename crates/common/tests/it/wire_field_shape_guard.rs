@@ -410,6 +410,81 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
     );
 }
 
+/// # Rule 5 — every field of an audited module must decode when absent
+///
+/// Rules 2-4 pick out a shape (`metadata`, an object struct, a condition). The
+/// end state of #1939 is simpler than any of them: **no** field of **any** wire
+/// struct in `resources/` may be required at decode time, because Go has no
+/// required JSON fields anywhere. The measurement on #1939 found 309 such
+/// fields across 186 nested structs, and each one carries an obligation the
+/// guard cannot check — some validator must reject the zero value, or the
+/// object is silently accepted. So the surface is being taken module by module,
+/// and this rule holds the modules already audited.
+///
+/// [`AUDITED_MODULES`] therefore only ever **grows**. It is not an exclusion
+/// list: a module in it is fully covered, and a new required field there fails
+/// this test. When the last module lands, the list goes and the scan runs
+/// unconditionally over `resources/`.
+///
+/// `admission_webhook.rs`: `name`, `clientConfig`, `sideEffects` and
+/// `admissionReviewVersions` are required upstream by *validation*
+/// (`validateValidatingWebhook` / `validateMutatingWebhook`,
+/// `pkg/apis/admissionregistration/validation/validation.go:250-330`), and
+/// `matchConditions[].name`/`.expression` at `:987,:992`. Every one of those
+/// checks is already ported in
+/// `crates/common/src/validation/webhookconfiguration.rs` and in
+/// `handlers/admission_webhook.rs`, so the fields only had to become reachable.
+#[test]
+fn every_field_of_an_audited_module_decodes_when_absent() {
+    let mut offenders: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    for module in AUDITED_MODULES {
+        let path = common_src().join("resources").join(module);
+        let src =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let lines: Vec<&str> = src.lines().collect();
+
+        for (i, line) in lines.iter().enumerate() {
+            let Some((name, ty)) = field_decl_generic(line) else {
+                continue;
+            };
+            if ty.starts_with("Option<") || !in_serde_struct(&lines, i) {
+                continue;
+            }
+            checked += 1;
+            let attrs = attributes_above(&lines, i);
+            if attrs.contains("default") || attrs.contains("flatten") {
+                continue;
+            }
+            offenders.push(format!(
+                "{}:{} `{name}: {ty}` is required at decode time",
+                path.display(),
+                i + 1,
+            ));
+        }
+    }
+
+    assert!(
+        checked > 10,
+        "only {checked} fields were examined across {} audited module(s) — the \
+         scan broke and an empty guard passes vacuously",
+        AUDITED_MODULES.len()
+    );
+    assert!(
+        offenders.is_empty(),
+        "{} field(s) in an audited module are required at decode time, so a body \
+         upstream decodes answers 400 BadRequest from serde instead of the 422 \
+         Invalid its validator would give. Add `#[serde(default)]`:\n  {}",
+        offenders.len(),
+        offenders.join("\n  "),
+    );
+}
+
+/// Modules of `crates/common/src/resources/` whose whole field surface has been
+/// audited for #1939. Grows one slice at a time; see rule 5.
+const AUDITED_MODULES: &[&str] = &["admission_webhook.rs"];
+
 /// `(first, last)` line of every struct body shaped like a status condition:
 /// it declares a field serialized as `type` and one serialized as `status`.
 ///

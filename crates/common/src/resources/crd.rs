@@ -631,7 +631,7 @@ pub struct WebhookConversion {
 }
 
 /// WebhookClientConfig contains information for connecting to a webhook
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WebhookClientConfig {
     /// URL is the webhook URL
