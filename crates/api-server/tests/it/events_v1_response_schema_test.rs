@@ -275,3 +275,210 @@ async fn the_watch_stream_answers_in_the_v1_schema() {
     assert_v1_shape(&frame["object"], "the watch frame object");
     assert_eq!(frame["object"]["note"], json!("the note"));
 }
+
+/// A PATCH is applied to the object in the version the patch was written
+/// against, not to the stored one.
+///
+/// Upstream converts around the patch: `jsonPatcher.applyPatchToCurrentObject`
+/// encodes the current object through the request codec before applying the
+/// patch ("Input and output objects must both have the external version, since
+/// that is what the patch must have been constructed against",
+/// `staging/src/k8s.io/apiserver/pkg/endpoints/handlers/patch.go:323-338,:388`)
+/// and `smpPatcher.applyPatchToCurrentObject` converts to
+/// `p.kind.GroupVersion()` and back to `p.hubGroupVersion` (:449-462).
+///
+/// So `{"note": ...}` on the v1 endpoint reaches the core object's `message`,
+/// which `ValidateEventUpdate` makes immutable on this version
+/// (`pkg/apis/core/validation/events.go:89`) — the patch is rejected. Applied
+/// to the *stored* shape instead it would set a `note` key the core schema does
+/// not own, leave `message` untouched, pass the immutability check trivially and
+/// answer 200 with the old note (#1940).
+#[tokio::test]
+async fn a_patch_of_note_reaches_the_immutable_core_message() {
+    let api = TestApiServer::new();
+
+    let (status, _) = api
+        .send(
+            "POST",
+            &v1_path(),
+            Some("application/json"),
+            Some(&body("patch-note")),
+        )
+        .await;
+    assert!(status.is_success());
+
+    let (status, answer) = api
+        .send(
+            "PATCH",
+            &format!("{}/patch-note", v1_path()),
+            Some("application/merge-patch+json"),
+            Some(&json!({ "note": "edited" })),
+        )
+        .await;
+    assert_eq!(
+        status.as_u16(),
+        422,
+        "a merge patch of `note` must reach the immutable core `message`: {status} {answer}"
+    );
+    assert!(
+        answer.to_string().contains("message"),
+        "the rejection names the core field the conversion landed on: {answer}"
+    );
+
+    // Nothing was written.
+    let (status, got) = api.get(&format!("{}/patch-note", v1_path())).await;
+    assert!(status.is_success(), "{status} {got}");
+    assert_eq!(got["note"], json!("the note"));
+}
+
+/// Same for a JSON patch: upstream applies both patch flavours to the versioned
+/// JSON (`applyJSPatch`, `patch.go:388-432`).
+#[tokio::test]
+async fn a_json_patch_of_note_is_rejected_the_same_way() {
+    let api = TestApiServer::new();
+
+    let (status, _) = api
+        .send(
+            "POST",
+            &v1_path(),
+            Some("application/json"),
+            Some(&body("json-patch-note")),
+        )
+        .await;
+    assert!(status.is_success());
+
+    let (status, answer) = api
+        .send(
+            "PATCH",
+            &format!("{}/json-patch-note", v1_path()),
+            Some("application/json-patch+json"),
+            Some(&json!([{ "op": "replace", "path": "/note", "value": "edited" }])),
+        )
+        .await;
+    assert_eq!(
+        status.as_u16(),
+        422,
+        "a json patch of `/note` must reach the immutable core `message`: {status} {answer}"
+    );
+}
+
+/// `deprecatedCount` is the v1 name for the core `count`. Applied to the stored
+/// shape the key lands nowhere (the core struct has no such field, so it falls
+/// into the catch-all) and `count` keeps its value; applied to the v1 shape it
+/// reaches `count`, which this version makes immutable
+/// (`events.go:95`).
+#[tokio::test]
+async fn a_patch_of_a_deprecated_name_reaches_its_core_counterpart() {
+    let api = TestApiServer::new();
+
+    let (status, _) = api
+        .send(
+            "POST",
+            &v1_path(),
+            Some("application/json"),
+            Some(&body("patch-deprecated")),
+        )
+        .await;
+    assert!(status.is_success());
+
+    let (status, answer) = api
+        .send(
+            "PATCH",
+            &format!("{}/patch-deprecated", v1_path()),
+            Some("application/merge-patch+json"),
+            Some(&json!({ "deprecatedCount": 7 })),
+        )
+        .await;
+    assert_eq!(
+        status.as_u16(),
+        422,
+        "`deprecatedCount` must reach the immutable core `count`: {status} {answer}"
+    );
+
+    // And the stored object did not grow a stray `deprecatedCount` key.
+    let (status, core) = api
+        .get(&format!("/api/v1/namespaces/{NS}/events/patch-deprecated"))
+        .await;
+    assert!(status.is_success(), "{status} {core}");
+    assert!(
+        core.get("deprecatedCount").is_none(),
+        "the core object kept a v1-only key: {core}"
+    );
+    assert_eq!(core["count"], json!(0));
+}
+
+/// `series` is the one field an `events.k8s.io/v1` update may change
+/// (`ValidateEventUpdate`, `events.go:86-88` — everything else goes through
+/// `ValidateImmutableField`). The patch lands, the answer is in the v1 schema,
+/// and the core view of the same object follows along.
+#[tokio::test]
+async fn a_patch_of_series_applies_and_answers_in_the_v1_schema() {
+    let api = TestApiServer::new();
+
+    let (status, _) = api
+        .send(
+            "POST",
+            &v1_path(),
+            Some("application/json"),
+            Some(&body("patch-series")),
+        )
+        .await;
+    assert!(status.is_success());
+
+    let (status, patched) = api
+        .send(
+            "PATCH",
+            &format!("{}/patch-series", v1_path()),
+            Some("application/merge-patch+json"),
+            Some(&json!({
+                "series": { "count": 3, "lastObservedTime": "2026-09-08T10:07:00.000000Z" },
+            })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {patched}");
+    assert_v1_shape(&patched, "the patch response");
+    assert_eq!(patched["series"]["count"], json!(3));
+    // The round trip through the v1 shape preserved every other field.
+    assert_eq!(patched["note"], json!("the note"));
+    assert_eq!(patched["regarding"]["name"], json!("p"));
+    assert_eq!(patched["reportingController"], json!("probe"));
+    assert_eq!(patched["action"], json!("Probe"));
+
+    let (status, core) = api
+        .get(&format!("/api/v1/namespaces/{NS}/events/patch-series"))
+        .await;
+    assert!(status.is_success(), "{status} {core}");
+    assert_eq!(core["series"]["count"], json!(3));
+    assert_eq!(core["message"], json!("the note"));
+    assert_eq!(core["involvedObject"]["name"], json!("p"));
+}
+
+/// A metadata-only patch — what `kubectl label` sends — still works, and still
+/// answers in the v1 schema. Metadata is mutable on both versions.
+#[tokio::test]
+async fn a_metadata_patch_applies_and_answers_in_the_v1_schema() {
+    let api = TestApiServer::new();
+
+    let (status, _) = api
+        .send(
+            "POST",
+            &v1_path(),
+            Some("application/json"),
+            Some(&body("patch-labels")),
+        )
+        .await;
+    assert!(status.is_success());
+
+    let (status, patched) = api
+        .send(
+            "PATCH",
+            &format!("{}/patch-labels", v1_path()),
+            Some("application/merge-patch+json"),
+            Some(&json!({ "metadata": { "labels": { "k": "v" } } })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {patched}");
+    assert_v1_shape(&patched, "the patch response");
+    assert_eq!(patched["metadata"]["labels"]["k"], json!("v"));
+    assert_eq!(patched["note"], json!("the note"));
+}

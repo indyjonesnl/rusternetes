@@ -460,16 +460,22 @@ async fn events_api_get_events_k8s_io_v1() {
     assert_eq!(body["reason"].as_str(), Some("ConformanceReason"));
 }
 
-/// PATCH (merge-patch) via `events.k8s.io/v1` updates a field.
+/// PATCH (strategic-merge-patch) via `events.k8s.io/v1` updates `series`.
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/instrumentation/events.go:100 — the patch step
-///   at events.go:138-154. Upstream patches `series`, not `reason`, and
-///   verifies it with a whole-object `apiequality.Semantic.DeepEqual`
-///   (events.go:155-168) rather than by reading back the patched field.
-///   That DeepEqual is mirrored in `conformance_events_api_test.rs`.
+///   at events.go:138-154. Upstream patches `series`, and verifies it with a
+///   whole-object `apiequality.Semantic.DeepEqual` (events.go:155-168) rather
+///   than by reading back the patched field. That DeepEqual is mirrored in
+///   `conformance_events_api_test.rs`.
 ///
 /// Mirror audit (#1749, 2026-08-27): re-cited; `:178-191` is the post-update
 /// get, and the old citation described a field upstream never patches.
+///
+/// #1940: this test used to patch `reason` and assert a 200. `series` is the
+/// only field an `events.k8s.io/v1` update may change — `reason` goes through
+/// `ValidateImmutableField` (`pkg/apis/core/validation/events.go:90`) — so the
+/// old assertion held only while the patch path skipped validation and applied
+/// the patch to the stored core shape. It now patches what upstream patches.
 #[tokio::test]
 async fn events_api_patch_events_k8s_io_v1() {
     let (_, router) = spawn_router();
@@ -485,12 +491,15 @@ async fn events_api_patch_events_k8s_io_v1() {
     .await;
     assert_eq!(s, 201);
 
-    let patch_body = json!({"reason": "PatchedReason"});
+    // events.go:141-147 — `Count: 2, LastObservedTime: time.Unix(1505828951, 0)`.
+    let patch_body = json!({
+        "series": { "count": 2, "lastObservedTime": "2017-09-19T14:29:11.000000Z" },
+    });
     let (status, body) = send(
         router,
         Method::PATCH,
         &format!("/apis/events.k8s.io/v1/namespaces/{ns}/events/api-ev-patch"),
-        Some("application/merge-patch+json"),
+        Some("application/strategic-merge-patch+json"),
         Some(patch_body),
     )
     .await;
@@ -499,10 +508,13 @@ async fn events_api_patch_events_k8s_io_v1() {
         "expected 200/201 after patch; got {status}: {body}",
     );
     assert_eq!(
-        body["reason"].as_str(),
-        Some("PatchedReason"),
-        "reason must be updated; got {body}",
+        body["series"]["count"].as_i64(),
+        Some(2),
+        "series must be updated; got {body}",
     );
+    // The answer is in the v1 schema, and the rest of the object came through
+    // the version round trip intact.
+    assert_eq!(body["reason"].as_str(), Some("ConformanceReason"), "{body}");
 }
 
 /// DELETE via `events.k8s.io/v1`; subsequent GET returns 404.

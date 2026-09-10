@@ -71,6 +71,90 @@ pub(crate) fn should_delete_during_update(
         .is_none_or(|secs| secs == 0)
 }
 
+/// How to move a stored object into the version a patch was written against,
+/// and back again.
+///
+/// Upstream applies every patch to the object in the **request's** version, not
+/// the stored (hub) one. `jsonPatcher.applyPatchToCurrentObject` encodes the
+/// current object through the request codec before applying the patch
+/// (staging/src/k8s.io/apiserver/pkg/endpoints/handlers/patch.go:323-338) —
+/// "Input and output objects must both have the external version, since that is
+/// what the patch must have been constructed against" (:386-388) — and
+/// `smpPatcher.applyPatchToCurrentObject` calls
+/// `ConvertToVersion(currentObject, p.kind.GroupVersion())` before the merge,
+/// then `ConvertToVersion(versionedObjToUpdate, p.hubGroupVersion)` after it
+/// (:449-462). Server-side apply converts in the same place, inside the field
+/// manager (`apimachinery/pkg/util/managedfields/internal/structuredmerge.go:139`).
+///
+/// Nearly every resource here stores exactly what it serves, so the pair is
+/// `None` and the patch applies to the stored JSON directly. `events.k8s.io/v1`
+/// is the one endpoint whose wire schema differs from the stored (core) one:
+/// without the conversion a patch naming `note`, `regarding` or `deprecatedCount`
+/// lands on a key the core schema does not own, while `message`,
+/// `involvedObject` and `count` keep their old values (#1940).
+#[derive(Clone, Copy)]
+pub struct RequestVersionConversion {
+    /// Stored (hub) JSON -> the shape the patch was written against.
+    pub to_request_version: fn(&serde_json::Value) -> serde_json::Value,
+
+    /// Patched request-version JSON (second argument) -> stored (hub) JSON,
+    /// given the pre-patch stored object (first argument).
+    ///
+    /// Upstream needs no equivalent of that first argument: a Go object has no
+    /// unknown-field catch-all, so converting back writes every field there is.
+    /// Our stored types keep one (`Event::extra`), and what it holds survives
+    /// the round trip only if the reverse conversion can see the object it came
+    /// off.
+    pub from_request_version: fn(&serde_json::Value, serde_json::Value) -> serde_json::Value,
+}
+
+/// Per-resource hooks for the generic PATCH path.
+///
+/// Upstream reaches both of these through the one `rest.Patch` -> `rest.Update`
+/// chain: the patch is applied in the request's version (see
+/// [`RequestVersionConversion`]) and the result then goes through the resource
+/// strategy's `ValidateUpdate`, called by `rest.BeforeUpdate` inside
+/// `Store.Update` (registry/generic/registry/store.go). PATCH and PUT therefore
+/// validate identically upstream — a resource whose PUT handler validates and
+/// whose PATCH does not is diverging, and on `events.k8s.io/v1` that divergence
+/// is the whole of the immutability contract.
+pub struct PatchHooks<T> {
+    /// Version conversion around the patch, for a resource served in a version
+    /// other than the one it is stored in.
+    pub conversion: Option<RequestVersionConversion>,
+
+    /// `(new, old) -> errors`: the resource strategy's `ValidateUpdate`.
+    pub validate_update: Option<fn(&T, &T) -> rusternetes_common::validation::field::ErrorList>,
+}
+
+impl<T> Default for PatchHooks<T> {
+    fn default() -> Self {
+        Self {
+            conversion: None,
+            validate_update: None,
+        }
+    }
+}
+
+/// Apply `patch_json` in the version the patch was written against, per
+/// [`RequestVersionConversion`]. With no conversion this is `apply_patch` on the
+/// stored JSON, which is what every same-version resource wants.
+fn apply_patch_in_request_version(
+    current_json: &serde_json::Value,
+    patch_json: &serde_json::Value,
+    patch_type: PatchType,
+    conversion: Option<&RequestVersionConversion>,
+) -> Result<serde_json::Value> {
+    let Some(conversion) = conversion else {
+        return apply_patch(current_json, patch_json, patch_type)
+            .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()));
+    };
+    let versioned = (conversion.to_request_version)(current_json);
+    let patched = apply_patch(&versioned, patch_json, patch_type)
+        .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
+    Ok((conversion.from_request_version)(current_json, patched))
+}
+
 /// Generic PATCH handler for namespaced resources
 ///
 /// # Type Parameters
@@ -90,6 +174,36 @@ pub(crate) fn should_delete_during_update(
 /// Updated resource after applying patch
 #[allow(clippy::too_many_arguments)]
 pub async fn patch_namespaced_resource<T>(
+    state: State<Arc<ApiServerState>>,
+    auth_ctx: Extension<AuthContext>,
+    path: Path<(String, String)>,
+    params: Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+    resource_type: &str,
+    api_group: &str,
+) -> Result<Json<T>>
+where
+    T: Serialize + DeserializeOwned + Send + Sync,
+{
+    patch_namespaced_resource_with_hooks(
+        state,
+        auth_ctx,
+        path,
+        params,
+        headers,
+        body,
+        resource_type,
+        api_group,
+        PatchHooks::default(),
+    )
+    .await
+}
+
+/// [`patch_namespaced_resource`] with the per-resource hooks spelled out. See
+/// [`PatchHooks`].
+#[allow(clippy::too_many_arguments)]
+pub async fn patch_namespaced_resource_with_hooks<T>(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
@@ -98,6 +212,7 @@ pub async fn patch_namespaced_resource<T>(
     body: Bytes,
     resource_type: &str,
     api_group: &str,
+    hooks: PatchHooks<T>,
 ) -> Result<Json<T>>
 where
     T: Serialize + DeserializeOwned + Send + Sync,
@@ -165,7 +280,18 @@ where
                 ApplyParams::new(field_manager.clone())
             };
 
-            let result = server_side_apply(current_json.as_ref(), &desired_json, &apply_params)
+            // The apply document is written against the request's version, so
+            // the live object is merged in that version too: upstream's field
+            // manager converts it first (`toVersioned`,
+            // apimachinery/pkg/util/managedfields/internal/structuredmerge.go:139).
+            let apply_base = match hooks.conversion.as_ref() {
+                Some(conversion) => current_json
+                    .as_ref()
+                    .map(|current| (conversion.to_request_version)(current)),
+                None => current_json.clone(),
+            };
+
+            let result = server_side_apply(apply_base.as_ref(), &desired_json, &apply_params)
                 .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
 
             match result {
@@ -187,6 +313,14 @@ where
                         }
                     }
 
+                    // Back to the version this object is stored in.
+                    if let Some(conversion) = hooks.conversion.as_ref() {
+                        applied_json = (conversion.from_request_version)(
+                            current_json.as_ref().unwrap_or(&serde_json::Value::Null),
+                            applied_json,
+                        );
+                    }
+
                     // Convert to resource type
                     let applied_resource: T =
                         serde_json::from_value(applied_json).map_err(|e| {
@@ -195,6 +329,21 @@ where
                                 e
                             ))
                         })?;
+
+                    // The strategy's `ValidateUpdate`, which upstream runs on
+                    // this path too — apply reaches `Store.Update` like every
+                    // other write.
+                    if let Some(validate) = hooks.validate_update {
+                        if let Some(old) = current_json
+                            .as_ref()
+                            .and_then(|current| serde_json::from_value::<T>(current.clone()).ok())
+                        {
+                            let errs = validate(&applied_resource, &old);
+                            if !errs.is_empty() {
+                                return Err(rusternetes_common::Error::Invalid(errs));
+                            }
+                        }
+                    }
 
                     // Save to storage (create or update)
                     let saved = if current_json.is_some() {
@@ -253,8 +402,12 @@ where
 
     // Apply patch (clone patch_type for potential retry on rv conflict)
     let patch_type_for_retry = patch_type.clone();
-    let mut patched_json = apply_patch(&current_json, &patch_json, patch_type)
-        .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
+    let mut patched_json = apply_patch_in_request_version(
+        &current_json,
+        &patch_json,
+        patch_type,
+        hooks.conversion.as_ref(),
+    )?;
 
     // Increment metadata.generation only when spec changes.
     // K8s only tracks generation for resources WITH a spec field
@@ -371,6 +524,18 @@ where
         }
     }
 
+    // The resource strategy's `ValidateUpdate`. Upstream reaches it from the
+    // patch path exactly as from the PUT path — `rest.BeforeUpdate` inside
+    // `Store.Update` — so a rule a PUT enforces a PATCH cannot skip. On
+    // `events.k8s.io/v1` every field but `series` and metadata is immutable, so
+    // a patch of `note` must be rejected rather than applied (#1940).
+    if let Some(validate) = hooks.validate_update {
+        let errs = validate(&patched_resource, &current_resource);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
@@ -397,6 +562,8 @@ where
         let state = &state;
         let key = key.clone();
         let patch_json = patch_json.clone();
+        let conversion = hooks.conversion;
+        let validate_update = hooks.validate_update;
         let first = std::cell::RefCell::new(Some(patched_resource));
         crate::handlers::conflict_retry::with_conflict_retry(
             &format!("patching {} {}/{}", resource_type, namespace, name),
@@ -416,16 +583,27 @@ where
                             let fresh: T = state.storage.get(&key).await?;
                             let fresh_json = serde_json::to_value(&fresh)
                                 .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
-                            let re_patched = apply_patch(&fresh_json, &patch_json, patch_type)
-                                .map_err(|e| {
-                                    rusternetes_common::Error::InvalidResource(e.to_string())
-                                })?;
-                            serde_json::from_value(re_patched).map_err(|e| {
+                            let re_patched = apply_patch_in_request_version(
+                                &fresh_json,
+                                &patch_json,
+                                patch_type,
+                                conversion.as_ref(),
+                            )?;
+                            let candidate: T = serde_json::from_value(re_patched).map_err(|e| {
                                 rusternetes_common::Error::InvalidResource(format!(
                                     "Invalid result: {}",
                                     e
                                 ))
-                            })?
+                            })?;
+                            // Re-validate: this attempt merged onto an object
+                            // the check above never saw.
+                            if let Some(validate) = validate_update {
+                                let errs = validate(&candidate, &fresh);
+                                if !errs.is_empty() {
+                                    return Err(rusternetes_common::Error::Invalid(errs));
+                                }
+                            }
+                            candidate
                         }
                     };
                     state.storage.update(&key, &candidate).await
