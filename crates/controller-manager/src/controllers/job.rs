@@ -27,6 +27,16 @@ pub struct JobController<S: Storage> {
     finalizer_expectations: FinalizerExpectations,
 }
 
+/// Cap on how many UIDs one pass may park in `.status.uncountedTerminatedPods`.
+///
+/// Upstream `MaxUncountedPods = 500` (`pkg/controller/job/job_controller.go:76`),
+/// which stops at the cap with the reasoning: "1. Ensure that the UIDs
+/// representation are under 20 KB. 2. Cap the number of finalizer removals so
+/// that syncing of big Jobs doesn't starve smaller ones." The remaining pods
+/// are picked up on the next pass — the status write and the pod updates
+/// re-enqueue the Job anyway.
+const MAX_UNCOUNTED_PODS: usize = 500;
+
 /// What one pass of the tracking protocol concluded.
 ///
 /// The two pairs of counters are deliberately distinct, and conflating them
@@ -323,6 +333,13 @@ impl<S: Storage + 'static> JobController<S> {
                     to_release.push(pod.clone());
                 }
                 _ => {}
+            }
+
+            if uncounted.succeeded.as_ref().map_or(0, |v| v.len())
+                + uncounted.failed.as_ref().map_or(0, |v| v.len())
+                >= MAX_UNCOUNTED_PODS
+            {
+                break;
             }
         }
 
