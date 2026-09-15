@@ -45,6 +45,7 @@ mod job_completion_modes_test;
 mod job_controller_test;
 mod job_extended_test;
 mod job_success_policy_test;
+mod job_tracking_finalizer_test;
 mod loadbalancer_status_lifecycle_test;
 mod namespace_controller_test;
 mod networkpolicy_controller_test;

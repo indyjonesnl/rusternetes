@@ -95,14 +95,6 @@ pub fn uncounted_has_failed(uncounted: &UncountedTerminatedPods, uid: &str) -> b
     uncounted_has(&uncounted.failed, uid)
 }
 
-/// Number of UIDs currently parked in the uncounted lists.
-pub fn uncounted_len(uncounted: &UncountedTerminatedPods) -> (i32, i32) {
-    (
-        uncounted.succeeded.as_ref().map_or(0, |v| v.len() as i32),
-        uncounted.failed.as_ref().map_or(0, |v| v.len() as i32),
-    )
-}
-
 /// Append a UID to the uncounted succeeded list.
 pub fn push_uncounted_succeeded(uncounted: &mut UncountedTerminatedPods, uid: &str) {
     uncounted
