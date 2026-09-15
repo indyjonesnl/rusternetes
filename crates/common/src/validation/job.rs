@@ -858,6 +858,93 @@ fn validate_success_policy(
     errs
 }
 
+/// Which decreasing-counter rules apply to this status update.
+///
+/// Port of the two counter options upstream computes in
+/// `pkg/registry/batch/job/strategy.go:396-397`:
+///
+/// ```text
+/// // We allow to decrease the counter for succeeded pods for jobs which
+/// // have equal parallelism and completions, as they can be scaled-down.
+/// RejectDecreasingSucceededCounter: !isIndexed || !ptr.Equal(newJob.Spec.Completions, newJob.Spec.Parallelism),
+/// RejectDecreasingFailedCounter:    true,
+/// ```
+///
+/// Only these two options are ported here; the sibling options upstream builds
+/// in the same struct (completed/failed index formats, terminal-condition
+/// disabling, ...) are separate rules and are not covered by this function.
+pub struct JobStatusValidationOptions {
+    pub reject_decreasing_succeeded_counter: bool,
+    pub reject_decreasing_failed_counter: bool,
+}
+
+impl JobStatusValidationOptions {
+    /// Derive the options from the incoming Job, as upstream's strategy does.
+    pub fn for_job(new_job: &Job) -> Self {
+        let is_indexed = new_job.spec.completion_mode.as_deref() == Some("Indexed");
+        let completions_equal_parallelism = new_job.spec.completions == new_job.spec.parallelism;
+        Self {
+            reject_decreasing_succeeded_counter: !is_indexed || !completions_equal_parallelism,
+            reject_decreasing_failed_counter: true,
+        }
+    }
+}
+
+/// Validate a Job status update against the stored object.
+///
+/// Port of the decreasing-counter half of upstream `ValidateJobStatusUpdate`
+/// (`pkg/apis/batch/validation/validation.go:722-730`):
+///
+/// ```text
+/// if opts.RejectDecreasingFailedCounter {
+///     if job.Status.Failed < oldJob.Status.Failed {
+///         allErrs = append(allErrs, field.Invalid(statusFld.Child("failed"),
+///             job.Status.Failed, "cannot decrease the failed counter"))
+///     }
+/// }
+/// ```
+///
+/// The Job controller recomputes both counters from the live pod list, so
+/// without this rule a decreasing write is accepted here while a real
+/// api-server refuses it — which is how #1955 stayed invisible in-house and
+/// reddened only the vanilla-swap leg. The error wording is the contract:
+/// `status.failed: Invalid value: 0: cannot decrease the failed counter`.
+pub fn validate_job_status_update(new_job: &Job, old_job: &Job) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let opts = JobStatusValidationOptions::for_job(new_job);
+    let status_fld = Path::new("status");
+
+    let new_failed = new_job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
+    let old_failed = old_job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
+    if opts.reject_decreasing_failed_counter && new_failed < old_failed {
+        errs.push(Error::invalid(
+            &status_fld.child("failed"),
+            new_failed,
+            "cannot decrease the failed counter",
+        ));
+    }
+
+    let new_succeeded = new_job
+        .status
+        .as_ref()
+        .and_then(|s| s.succeeded)
+        .unwrap_or(0);
+    let old_succeeded = old_job
+        .status
+        .as_ref()
+        .and_then(|s| s.succeeded)
+        .unwrap_or(0);
+    if opts.reject_decreasing_succeeded_counter && new_succeeded < old_succeeded {
+        errs.push(Error::invalid(
+            &status_fld.child("succeeded"),
+            new_succeeded,
+            "cannot decrease the succeeded counter",
+        ));
+    }
+
+    errs
+}
+
 #[cfg(test)]
 mod success_policy_indexes_tests {
     use super::{parse_index_interval, validate_indexes_format};
