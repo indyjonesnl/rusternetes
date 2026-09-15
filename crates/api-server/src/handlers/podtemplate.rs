@@ -49,6 +49,14 @@ pub async fn create_podtemplate(
     // Ensure namespace is set from the URL path
     podtemplate.metadata.namespace = Some(namespace.clone());
 
+    // SetDefaults_PodSpec + SetDefaults_Container on the embedded template.
+    // Upstream defaults on decode, before `strategy.Validate`
+    // (staging/src/k8s.io/apiserver/pkg/registry/rest/create.go:26-28), which
+    // matters because `validateObjectFieldSelector` requires
+    // `fieldRef.apiVersion` that `SetDefaults_ObjectFieldSelector` supplies
+    // (pkg/apis/core/v1/defaults.go).
+    crate::handlers::defaults::apply_pod_template_defaults(&mut podtemplate.template);
+
     // Validate the embedded template (upstream ValidatePodTemplateSpec): labels,
     // annotations, and the pod spec.
     let errs = rusternetes_common::validation::podtemplate::validate_pod_template(&podtemplate);
@@ -136,6 +144,14 @@ pub async fn update_podtemplate(
 
     podtemplate.metadata.name = name.clone();
     podtemplate.metadata.namespace = Some(namespace.clone());
+
+    // SetDefaults_PodSpec + SetDefaults_Container on the embedded template.
+    // Upstream defaults on decode, before `strategy.Validate`
+    // (staging/src/k8s.io/apiserver/pkg/registry/rest/create.go:26-28), which
+    // matters because `validateObjectFieldSelector` requires
+    // `fieldRef.apiVersion` that `SetDefaults_ObjectFieldSelector` supplies
+    // (pkg/apis/core/v1/defaults.go).
+    crate::handlers::defaults::apply_pod_template_defaults(&mut podtemplate.template);
 
     // Field validation on update (upstream ValidatePodTemplateUpdate re-runs
     // ValidatePodTemplateSpec on the new object). The create path validated but

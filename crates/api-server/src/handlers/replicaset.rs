@@ -51,6 +51,19 @@ pub async fn create(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Defaulting runs before validation, as upstream does it: the codec
+    // defaults on decode and `BeforeCreate` then calls `PrepareForCreate`
+    // before `strategy.Validate`
+    // (staging/src/k8s.io/apiserver/pkg/registry/rest/create.go:26-28).
+    // Order matters because validators hard-require fields that defaulting
+    // supplies -- `validateObjectFieldSelector` requires `fieldRef.apiVersion`,
+    // which `SetDefaults_ObjectFieldSelector` sets to "v1"
+    // (pkg/apis/core/v1/defaults.go). Validating first rejects manifests the
+    // real API server accepts, e.g. every cert-manager Deployment.
+    //
+    // SetDefaults_ReplicaSet + SetDefaults_PodSpec + SetDefaults_Container.
+    crate::handlers::defaults::apply_replicaset_defaults(&mut replicaset);
+
     // Field validation (mirrors upstream ValidateReplicaSet).
     {
         let errs = rusternetes_common::validation::apps::validate_replicaset(&replicaset);
@@ -63,9 +76,6 @@ pub async fn create(
     replicaset.metadata.ensure_uid();
     replicaset.metadata.ensure_creation_timestamp();
     crate::handlers::lifecycle::set_initial_generation(&mut replicaset.metadata);
-
-    // Apply K8s defaults (SetDefaults_ReplicaSet + SetDefaults_PodSpec + SetDefaults_Container)
-    crate::handlers::defaults::apply_replicaset_defaults(&mut replicaset);
 
     // Initialize status if not present
     if replicaset.status.is_none() {
