@@ -557,3 +557,63 @@ async fn the_orphan_sweep_leaves_a_live_jobs_pods_alone() {
         );
     }
 }
+
+/// Suspending an Indexed Job must not erase the indexes it has completed.
+///
+/// `.status.completedIndexes` is the durable record of an Indexed Job's
+/// successes — upstream's `calculateSucceededIndexes`
+/// (`pkg/controller/job/indexed_job_utils.go`) reads it back and unions it with
+/// whatever pods are still around. Blanking it on a suspend pass, in the same
+/// breath as releasing the pods that were the only other record, loses those
+/// completions for good.
+#[tokio::test]
+async fn suspending_an_indexed_job_keeps_its_completed_indexes() {
+    let storage = setup().await;
+    let mut job = make_job("indexed", "default", 3, 3);
+    job.spec.completion_mode = Some("Indexed".to_string());
+    let key = build_key("jobs", Some("default"), "indexed");
+    storage.create(&key, &job).await.unwrap();
+    let controller = JobController::new(storage.clone());
+    controller.reconcile_all().await.unwrap();
+
+    // Index 0 completes.
+    let pods = job_pods(&storage, "default").await;
+    let first = pods
+        .iter()
+        .find(|p| {
+            p.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("batch.kubernetes.io/job-completion-index"))
+                .is_some_and(|v| v == "0")
+        })
+        .expect("an Indexed Job labels its pods with a completion index");
+    set_phase(&storage, "default", first, Phase::Succeeded).await;
+    controller.reconcile_all().await.unwrap();
+    assert_eq!(
+        status_of(&storage.get::<Job>(&key).await.unwrap()).completed_indexes,
+        Some("0".to_string()),
+        "index 0 is recorded once its pod succeeds"
+    );
+
+    // Now suspend. The remaining pods are deleted and index 0's pod is gone.
+    let mut suspended: Job = storage.get(&key).await.unwrap();
+    suspended.spec.suspend = Some(true);
+    storage.update(&key, &suspended).await.unwrap();
+    hard_delete(
+        &storage,
+        "default",
+        &storage
+            .get::<Pod>(&build_key("pods", Some("default"), &first.metadata.name))
+            .await
+            .unwrap(),
+    )
+    .await;
+    controller.reconcile_all().await.unwrap();
+
+    assert_eq!(
+        status_of(&storage.get::<Job>(&key).await.unwrap()).completed_indexes,
+        Some("0".to_string()),
+        "a suspend pass must not erase an index that already completed"
+    );
+}

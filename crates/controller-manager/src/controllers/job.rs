@@ -1252,6 +1252,19 @@ impl<S: Storage + 'static> JobController<S> {
             HashSet::new()
         };
 
+        // For Indexed completion mode, report the durable succeeded-index set.
+        // Computed here, before ANY status write: every write site must carry
+        // it, or a suspend or deadline pass would blank `.status.completedIndexes`
+        // in the same breath as releasing the pods that were the only other
+        // record of those indexes.
+        let completed_indexes: Option<String> = if is_indexed && !succeeded_index_set.is_empty() {
+            let mut indexes: Vec<i32> = succeeded_index_set.iter().copied().collect();
+            indexes.sort();
+            Some(format_index_ranges(&indexes))
+        } else {
+            None
+        };
+
         // Failures that must never reach `.status.failed`: the ones an `Ignore`
         // rule matched, and — for Indexed Jobs — a failure on an index that has
         // already succeeded.
@@ -1355,7 +1368,7 @@ impl<S: Storage + 'static> JobController<S> {
                 completion_time: None,
                 ready: Some(ready),
                 terminating: None,
-                completed_indexes: None,
+                completed_indexes: completed_indexes.clone(),
                 failed_indexes: None,
                 uncounted_terminated_pods: uncounted_status.clone(),
                 observed_generation: job.metadata.generation,
@@ -1410,7 +1423,7 @@ impl<S: Storage + 'static> JobController<S> {
                         completion_time: None,
                         ready: Some(ready),
                         terminating: None,
-                        completed_indexes: None,
+                        completed_indexes: completed_indexes.clone(),
                         failed_indexes: None,
                         uncounted_terminated_pods: uncounted_status.clone(),
                         observed_generation: job.metadata.generation,
@@ -1429,15 +1442,6 @@ impl<S: Storage + 'static> JobController<S> {
                 }
             }
         }
-
-        // For Indexed completion mode, report the durable succeeded-index set.
-        let completed_indexes: Option<String> = if is_indexed && !succeeded_index_set.is_empty() {
-            let mut indexes: Vec<i32> = succeeded_index_set.iter().copied().collect();
-            indexes.sort();
-            Some(format_index_ranges(&indexes))
-        } else {
-            None
-        };
 
         // Track failed indexes for backoffLimitPerIndex
         let backoff_limit_per_index = job.spec.backoff_limit_per_index;
