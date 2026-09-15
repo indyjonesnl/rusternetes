@@ -86,6 +86,42 @@ fn failed_job_conditions(reason: String, message: String) -> Vec<JobCondition> {
     ]
 }
 
+/// Raise outgoing Job status counters to the persisted values so they never
+/// decrease.
+///
+/// Upstream's api-server refuses a status update that lowers `failed` or
+/// `succeeded` — `RejectDecreasingFailedCounter` /
+/// `RejectDecreasingSucceededCounter` in
+/// `pkg/apis/batch/validation/validation.go:722-730` — with
+/// `status.failed: Invalid value: 0: cannot decrease the failed counter`.
+///
+/// This controller recomputes both counters from the live pod list on every
+/// reconcile and additionally subtracts pods matched by an `Ignore`
+/// podFailurePolicy rule, so a count that was already written can drop back
+/// down: the pods carrying those failures get deleted, or the Ignore rule only
+/// matches once the `DisruptionTarget` condition is observed. The first such
+/// write is rejected and so is every write after it, so the terminal
+/// `Complete=True` condition never lands and the Job hangs until the e2e
+/// timeout (#1955).
+///
+/// Upstream never needs this clamp because it accumulates the counters in the
+/// Job status and gates each pod's accounting on the
+/// `batch.kubernetes.io/job-tracking` finalizer, so a failure is counted
+/// exactly once and an ignored one is never counted at all. Porting that
+/// accounting is tracked separately; until then, keeping the counters
+/// monotonic is what the API contract requires.
+fn clamp_counters_monotonic(next: &mut JobStatus, persisted: Option<&JobStatus>) {
+    let Some(old) = persisted else {
+        return;
+    };
+    if next.failed.unwrap_or(0) < old.failed.unwrap_or(0) {
+        next.failed = old.failed;
+    }
+    if next.succeeded.unwrap_or(0) < old.succeeded.unwrap_or(0) {
+        next.succeeded = old.succeeded;
+    }
+}
+
 impl<S: Storage + 'static> JobController<S> {
     pub fn new(storage: Arc<S>) -> Self {
         Self { storage }
@@ -611,6 +647,12 @@ impl<S: Storage + 'static> JobController<S> {
             let key = format!("/registry/jobs/{}/{}", namespace, name);
             // Status subresource write — see the note above (#1723).
             if let Ok(fresh) = self.storage.get::<Job>(&key).await {
+                // Counters must not go backwards against what is already
+                // persisted, or the api-server refuses this and every later
+                // write (#1955).
+                if let Some(next) = job.status.as_mut() {
+                    clamp_counters_monotonic(next, fresh.status.as_ref());
+                }
                 if fresh.status != job.status {
                     self.storage.update_status(&key, &*job).await?;
                 }
@@ -1012,6 +1054,12 @@ impl<S: Storage + 'static> JobController<S> {
             let key = format!("/registry/jobs/{}/{}", namespace, name);
             // Status subresource write — see the note above (#1723).
             if let Ok(fresh) = self.storage.get::<Job>(&key).await {
+                // Counters must not go backwards against what is already
+                // persisted, or the api-server refuses this and every later
+                // write (#1955).
+                if let Some(next) = job.status.as_mut() {
+                    clamp_counters_monotonic(next, fresh.status.as_ref());
+                }
                 if fresh.status != job.status {
                     self.storage.update_status(&key, &*job).await?;
                 }
@@ -1330,12 +1378,19 @@ impl<S: Storage + 'static> JobController<S> {
         for attempt in 0..3 {
             match self.storage.get::<Job>(&key).await {
                 Ok(mut fresh_job) => {
+                    // Counters must not go backwards against what is already
+                    // persisted, or the api-server refuses this and every later
+                    // write (#1955).
+                    let mut next_status = status_to_save.clone();
+                    if let Some(next) = next_status.as_mut() {
+                        clamp_counters_monotonic(next, fresh_job.status.as_ref());
+                    }
                     // Only write status if it actually changed to avoid unnecessary
                     // storage writes that trigger watch events and cause feedback loops
-                    if fresh_job.status == status_to_save {
+                    if fresh_job.status == next_status {
                         break;
                     }
-                    fresh_job.status = status_to_save.clone();
+                    fresh_job.status = next_status;
                     // Status subresource write (#1723).
                     match self.storage.update_status(&key, &fresh_job).await {
                         Ok(_) => {
@@ -1935,6 +1990,79 @@ mod tests {
     ///
     /// `completionTime` stays REQUIRED here — validation.go:505-513 demands it
     /// for Complete jobs (the inverse of the failed-job rule).
+    /// Job status counters are monotonically non-decreasing: upstream's
+    /// api-server rejects any status update that lowers them —
+    /// `RejectDecreasingFailedCounter` / `RejectDecreasingSucceededCounter` in
+    /// `pkg/apis/batch/validation/validation.go:722-730`, producing
+    /// `status.failed: Invalid value: 0: cannot decrease the failed counter`.
+    ///
+    /// We recompute the counters from the live pod list every reconcile and
+    /// additionally subtract pods matched by an `Ignore` podFailurePolicy rule,
+    /// so a `failed` count that was already persisted can drop back down. When
+    /// it does, a real api-server rejects every subsequent write, the terminal
+    /// `Complete=True` condition never lands, and the Job hangs until the e2e
+    /// timeout. That is #1955: the `vanilla-swap-controller-manager` leg's
+    /// "ignore failure matching on DisruptionTarget condition" spec, where the
+    /// evicted pods' failures are ignored after having been counted.
+    #[tokio::test]
+    async fn job_status_counters_never_decrease() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("monotonic", "default", 3, 3);
+        job.spec.backoff_limit = Some(2);
+        // The evicted failures were already accounted into the persisted status
+        // by an earlier reconcile, before the Ignore rule matched them.
+        job.status = Some(JobStatus {
+            active: Some(0),
+            succeeded: Some(1),
+            failed: Some(3),
+            conditions: None,
+            start_time: Some(chrono::Utc::now()),
+            completion_time: None,
+            ready: Some(0),
+            terminating: None,
+            completed_indexes: None,
+            failed_indexes: None,
+            uncounted_terminated_pods: None,
+            observed_generation: None,
+        });
+        let job_key = build_key("jobs", Some("default"), "monotonic");
+        storage.create(&job_key, &job).await.unwrap();
+
+        // The pods that carried those failures are gone (evicted and deleted);
+        // only the succeeded replacements remain, so a recompute from live pods
+        // yields failed=0 — lower than what is already persisted.
+        for name in ["monotonic-1", "monotonic-2", "monotonic-3"] {
+            let pod = make_pod(name, "default", Phase::Succeeded, "monotonic", "job-uid-1");
+            storage
+                .create(&build_key("pods", Some("default"), name), &pod)
+                .await
+                .unwrap();
+        }
+
+        let controller = JobController::new(storage.clone());
+        controller.reconcile_all().await.unwrap();
+
+        let status = storage
+            .get::<Job>(&job_key)
+            .await
+            .unwrap()
+            .status
+            .expect("job must have status");
+
+        assert!(
+            status.failed.unwrap_or(0) >= 3,
+            "status.failed must never drop below the persisted 3 (got {:?}) — \
+             a real api-server rejects the write with \"cannot decrease the \
+             failed counter\" and the Job never reaches Complete",
+            status.failed
+        );
+        assert!(
+            status.succeeded.unwrap_or(0) >= 1,
+            "status.succeeded must never drop below the persisted 1 (got {:?})",
+            status.succeeded
+        );
+    }
+
     #[tokio::test]
     async fn completed_job_stages_success_criteria_met_before_complete() {
         let storage = Arc::new(MemoryStorage::new());
