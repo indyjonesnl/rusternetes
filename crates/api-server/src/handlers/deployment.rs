@@ -69,6 +69,19 @@ pub async fn create(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Defaulting runs before validation, as upstream does it: the codec
+    // defaults on decode and `BeforeCreate` then calls `PrepareForCreate`
+    // before `strategy.Validate`
+    // (staging/src/k8s.io/apiserver/pkg/registry/rest/create.go:26-28).
+    // Order matters because validators hard-require fields that defaulting
+    // supplies -- `validateObjectFieldSelector` requires `fieldRef.apiVersion`,
+    // which `SetDefaults_ObjectFieldSelector` sets to "v1"
+    // (pkg/apis/core/v1/defaults.go). Validating first rejects manifests the
+    // real API server accepts, e.g. every cert-manager Deployment.
+    //
+    // SetDefaults_Deployment + SetDefaults_PodSpec + SetDefaults_Container.
+    crate::handlers::defaults::apply_deployment_defaults(&mut deployment);
+
     // Field validation (mirrors upstream ValidateDeployment).
     {
         let errs = rusternetes_common::validation::apps::validate_deployment(&deployment);
@@ -116,9 +129,6 @@ pub async fn create(
     deployment.metadata.ensure_uid();
     deployment.metadata.ensure_creation_timestamp();
     crate::handlers::lifecycle::set_initial_generation(&mut deployment.metadata);
-
-    // Apply K8s defaults (SetDefaults_Deployment + SetDefaults_PodSpec + SetDefaults_Container)
-    crate::handlers::defaults::apply_deployment_defaults(&mut deployment);
 
     // Set initial revision annotation if not already present
     let annotations = deployment
