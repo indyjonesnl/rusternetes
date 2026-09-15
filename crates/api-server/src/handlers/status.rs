@@ -25,7 +25,11 @@ use tracing::{debug, info};
 /// Run resource-type-specific status validation before persisting a status
 /// update. Currently covers Node `/status` (upstream `ValidateNodeUpdate`
 /// status-field checks: addresses, declaredFeatures, capacity/allocatable).
-fn validate_status_subresource(resource_type: &str, resource: &Value) -> Result<()> {
+fn validate_status_subresource(
+    resource_type: &str,
+    resource: &Value,
+    stored: &Value,
+) -> Result<()> {
     if resource_type == "nodes" {
         let node: rusternetes_common::resources::Node = serde_json::from_value(resource.clone())
             .map_err(|e| {
@@ -68,6 +72,27 @@ fn validate_status_subresource(resource_type: &str, resource: &Value) -> Result<
             .into_iter()
             .filter(|e| e.field != "resourceVersion")
             .collect();
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    } else if resource_type == "jobs" {
+        // Job status counters are monotonically non-decreasing. Upstream's
+        // strategy turns this on for every Job status update
+        // (pkg/registry/batch/job/strategy.go:396-397) and the check lives in
+        // ValidateJobStatusUpdate (pkg/apis/batch/validation/validation.go:722-730).
+        // Unlike the validators above, this one genuinely needs the stored
+        // object: it compares the incoming counters against the persisted ones.
+        let new_job: rusternetes_common::resources::workloads::Job =
+            serde_json::from_value(resource.clone()).map_err(|e| {
+                rusternetes_common::Error::InvalidResource(format!("invalid Job: {e}"))
+            })?;
+        // A stored object that will not decode is not a reason to reject the
+        // update — fall back to comparing against the incoming object, which
+        // can never be a decrease.
+        let old_job: rusternetes_common::resources::workloads::Job =
+            serde_json::from_value(stored.clone()).unwrap_or_else(|_| new_job.clone());
+        let errs =
+            rusternetes_common::validation::job::validate_job_status_update(&new_job, &old_job);
         if !errs.is_empty() {
             return Err(rusternetes_common::Error::Invalid(errs));
         }
@@ -393,7 +418,7 @@ pub async fn update_status(
             }
         }
 
-        validate_status_subresource(&resource_type, &result)?;
+        validate_status_subresource(&resource_type, &result, &current_resource)?;
 
         let mut saved: Value = state.storage.update(&key, &result).await?;
         // Ensure kind/apiVersion in response
@@ -455,7 +480,7 @@ pub async fn update_status(
         // json-patch branch above already does this; the PUT / merge-patch path
         // previously skipped it, so e.g. a ResourceQuota /status with an
         // unparseable used/hard quantity was persisted unchecked (#1484).
-        validate_status_subresource(&resource_type, &updated_resource)?;
+        validate_status_subresource(&resource_type, &updated_resource, &current_resource)?;
         match state.storage.update(&key, &updated_resource).await {
             Ok(v) => break v,
             Err(rusternetes_common::Error::Conflict(_)) if attempts < 8 => {
@@ -582,7 +607,7 @@ pub async fn update_cluster_status(
             }
         }
 
-        validate_status_subresource(&resource_type, &result)?;
+        validate_status_subresource(&resource_type, &result, &current_resource)?;
 
         let mut saved: Value = state.storage.update(&key, &result).await?;
         // Ensure kind/apiVersion in response
@@ -731,7 +756,7 @@ pub async fn update_cluster_status(
         }
     }
 
-    validate_status_subresource(&resource_type, &updated_resource)?;
+    validate_status_subresource(&resource_type, &updated_resource, &current_resource)?;
 
     // Save the updated resource
     let mut saved: Value = state.storage.update(&key, &updated_resource).await?;

@@ -124,6 +124,7 @@ mod integration_watch_rv_test;
 mod intorstring_roundtrip_test;
 mod job_defaults_test;
 mod job_handler_test;
+mod job_status_monotonic_counters_test;
 mod lease_handler_test;
 mod limitrange_handler_test;
 mod limitrange_pdb_update_validation_test;
