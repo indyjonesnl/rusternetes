@@ -703,7 +703,84 @@ impl<S: Storage + 'static> JobController<S> {
             }
         }
 
+        self.reconcile_orphan_pods().await;
+
         Ok(())
+    }
+
+    /// Strip the tracking finalizer from pods whose Job can no longer account
+    /// for them.
+    ///
+    /// Port of upstream's orphan-pod reconciler — `enqueueOrphanPod` /
+    /// `syncOrphanPod` / `handleSingleOrphanPod`
+    /// (`pkg/controller/job/job_controller.go:688-766`), which upstream reaches
+    /// from its pod event handlers whenever a pod carrying the finalizer has no
+    /// controller, or one whose Job is gone or finished: "syncJob will not
+    /// remove this finalizer."
+    ///
+    /// Shipping the finalizer without this is what turns a Job deletion into a
+    /// namespace stuck in `Terminating`: the garbage collector deletes the Job,
+    /// `reconcile` never runs for it again, and its pods hold a finalizer that
+    /// nobody is left to remove.
+    async fn reconcile_orphan_pods(&self) {
+        let Ok(pods) = self.storage.list::<Pod>("/registry/pods/").await else {
+            return;
+        };
+        for pod in pods.iter().filter(|p| has_job_tracking_finalizer(p)) {
+            let Some(namespace) = pod.metadata.namespace.as_deref() else {
+                continue;
+            };
+            let owner = pod
+                .metadata
+                .owner_references
+                .as_ref()
+                .and_then(|refs| refs.iter().find(|r| r.controller == Some(true)));
+
+            if let Some(owner) = owner {
+                // A pod controlled by something that is not a batch/v1 Job is
+                // not ours to strip.
+                if owner.kind != "Job" || owner.api_version != "batch/v1" {
+                    continue;
+                }
+                let job_key = build_key("jobs", Some(namespace), &owner.name);
+                if let Ok(job) = self.storage.get::<Job>(&job_key).await {
+                    if job.metadata.uid == owner.uid {
+                        // Managed by an external controller: not ours either.
+                        if job
+                            .spec
+                            .managed_by
+                            .as_deref()
+                            .is_some_and(|m| m != "kubernetes.io/job-controller")
+                        {
+                            continue;
+                        }
+                        // The Job is alive and still counting. Leave it alone.
+                        if !job_is_finished(&job) {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
+            let Ok(mut fresh) = self.storage.get::<Pod>(&pod_key).await else {
+                continue;
+            };
+            if !remove_tracking_finalizer(&mut fresh) {
+                continue;
+            }
+            if let Err(e) = self.storage.update(&pod_key, &fresh).await {
+                warn!(
+                    "Failed to release orphan pod {}/{} from the job-tracking finalizer: {}",
+                    namespace, fresh.metadata.name, e
+                );
+            } else {
+                debug!(
+                    "Released orphan pod {}/{} from the job-tracking finalizer",
+                    namespace, fresh.metadata.name
+                );
+            }
+        }
     }
 
     async fn reconcile(&self, job: &mut Job) -> Result<()> {

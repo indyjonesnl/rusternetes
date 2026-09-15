@@ -487,3 +487,73 @@ async fn a_finished_job_releases_every_pod_it_still_holds() {
         }
     }
 }
+
+/// A pod whose Job is gone must not keep the tracking finalizer.
+///
+/// Upstream reaches this through `enqueueOrphanPod` → `handleSingleOrphanPod`
+/// (`job_controller.go:688-766`) — "syncJob will not remove this finalizer."
+/// Without it, deleting a Job leaves its pods undeletable and the namespace
+/// stuck in `Terminating` forever.
+#[tokio::test]
+async fn a_pod_whose_job_is_gone_is_released() {
+    let storage = setup().await;
+    let job = make_job("orphan", "default", 2, 2);
+    let key = build_key("jobs", Some("default"), "orphan");
+    storage.create(&key, &job).await.unwrap();
+    let controller = JobController::new(storage.clone());
+    controller.reconcile_all().await.unwrap();
+
+    let pods = job_pods(&storage, "default").await;
+    assert_eq!(pods.len(), 2);
+    assert!(pods.iter().all(|p| p
+        .metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|f| f.iter().any(|x| x == JOB_TRACKING_FINALIZER))));
+
+    // The Job is deleted outright, as the garbage collector does on namespace
+    // teardown. Nothing will ever reconcile it again.
+    storage.delete(&key).await.unwrap();
+    controller.reconcile_all().await.unwrap();
+
+    for pod in &pods {
+        let p: Pod = storage
+            .get(&build_key("pods", Some("default"), &pod.metadata.name))
+            .await
+            .unwrap();
+        assert!(
+            !p.metadata
+                .finalizers
+                .as_ref()
+                .is_some_and(|f| f.iter().any(|x| x == JOB_TRACKING_FINALIZER)),
+            "orphan pod {} would block its own deletion forever",
+            p.metadata.name
+        );
+    }
+}
+
+/// A live Job's pods keep the finalizer — the orphan sweep must not strip pods
+/// that are still being counted.
+#[tokio::test]
+async fn the_orphan_sweep_leaves_a_live_jobs_pods_alone() {
+    let storage = setup().await;
+    let job = make_job("live", "default", 2, 2);
+    storage
+        .create(&build_key("jobs", Some("default"), "live"), &job)
+        .await
+        .unwrap();
+    let controller = JobController::new(storage.clone());
+    controller.reconcile_all().await.unwrap();
+    controller.reconcile_all().await.unwrap();
+
+    for pod in job_pods(&storage, "default").await {
+        assert!(
+            pod.metadata
+                .finalizers
+                .as_ref()
+                .is_some_and(|f| f.iter().any(|x| x == JOB_TRACKING_FINALIZER)),
+            "pod {} of a running Job must stay held",
+            pod.metadata.name
+        );
+    }
+}
