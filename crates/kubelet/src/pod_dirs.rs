@@ -31,7 +31,9 @@ use std::path::{Path, PathBuf};
 /// `pkg/kubelet/kubeletconfig/defaults.go:21`
 const PODS_DIR_NAME: &str = "pods";
 /// `pkg/kubelet/kubeletconfig/defaults.go:22`
-const VOLUMES_DIR_NAME: &str = "volumes";
+pub const VOLUMES_DIR_NAME: &str = "volumes";
+/// `pkg/kubelet/kubeletconfig/defaults.go:23`
+const VOLUME_SUBPATHS_DIR_NAME: &str = "volume-subpaths";
 
 /// Upstream volume plugin names. Each is the `<plugin>PluginName` constant from
 /// the corresponding `pkg/volume/<plugin>` package; they appear on disk escaped
@@ -119,6 +121,12 @@ pub fn get_pod_volumes_dir(root: &str, pod_uid: &str) -> PathBuf {
     get_pod_dir(root, pod_uid).join(VOLUMES_DIR_NAME)
 }
 
+/// `<root>/pods/<podUID>/volume-subpaths` — `getPodVolumeSubpathsDir`
+/// (`kubelet_getters.go:167-169`).
+pub fn get_pod_volume_subpaths_dir(root: &str, pod_uid: &str) -> PathBuf {
+    get_pod_dir(root, pod_uid).join(VOLUME_SUBPATHS_DIR_NAME)
+}
+
 /// `<root>/pods/<podUID>/volumes/<escaped-plugin>/<volumeName>` —
 /// `getPodVolumeDir` (`kubelet_getters.go:181-183`).
 pub fn get_pod_volume_dir(
@@ -130,6 +138,128 @@ pub fn get_pod_volume_dir(
     get_pod_volumes_dir(root, pod_uid)
         .join(escape_qualified_name(plugin_name))
         .join(volume_name)
+}
+
+/// Report whether `path` is *likely not* a mount point, by comparing its device
+/// with its parent's.
+///
+/// Port of `isLikelyNotMountPointStat`
+/// (`staging/src/k8s.io/mount-utils/mount_linux.go:443-458`), which is the
+/// fallback `IsLikelyNotMountPoint` uses when `statx` is unavailable.
+///
+/// The error case carries the safety property: upstream returns `(true, err)`
+/// on a failed stat, callers propagate the error, and
+/// [`crate::volumes::VolumeManager::pod_volumes_exist`] turns any error into
+/// "volumes might still exist" so cleanup is **skipped**. Never collapse this
+/// into a bare bool — swallowing the error flips the default from "leave it
+/// alone" to "delete it".
+pub fn is_likely_not_mount_point(path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let stat = std::fs::metadata(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other(format!("{} has no parent", path.display())))?;
+    let root_stat = std::fs::metadata(parent)?;
+    // A different device from the parent means this is a mount point.
+    Ok(stat.dev() == root_stat.dev())
+}
+
+/// The pod UIDs that have a directory on disk.
+///
+/// Port of `listPodsFromDisk` (`pkg/kubelet/kubelet_pods.go:185-197`): every
+/// entry under `<root>/pods` is named by a pod UID, which is what makes the
+/// orphan sweep exact rather than heuristic. A missing pods dir yields an empty
+/// list, not an error — nothing has run yet.
+pub fn list_pods_from_disk(root: &str) -> std::io::Result<Vec<String>> {
+    let pods_dir = get_pods_dir(root);
+    let entries = match std::fs::read_dir(&pods_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut uids = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            uids.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(uids)
+}
+
+/// Every per-volume directory a pod has on disk.
+///
+/// Port of `getPodVolumePathListFromDisk`
+/// (`pkg/kubelet/kubelet_getters.go:337-379`). Walks
+/// `<pod>/volumes/<plugin>/<volume>`.
+///
+/// CSI is special-cased exactly as upstream does: a CSI volume's mount lives one
+/// level deeper, at `<volume>/mount` (`GetCSIMounterPath`,
+/// `pkg/volume/csi/csi_util.go:177-179`), so that path is listed instead — and
+/// only when it exists.
+pub fn get_pod_volume_path_list_from_disk(
+    root: &str,
+    pod_uid: &str,
+) -> std::io::Result<Vec<PathBuf>> {
+    let pod_vol_dir = get_pod_volumes_dir(root, pod_uid);
+    let plugin_dirs = match std::fs::read_dir(&pod_vol_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+
+    let mut volumes = Vec::new();
+    for plugin_dir in plugin_dirs {
+        let plugin_path = plugin_dir?.path();
+        let unescaped =
+            unescape_qualified_name(&plugin_path.file_name().unwrap().to_string_lossy());
+        for volume_dir in std::fs::read_dir(&plugin_path)? {
+            let volume_path = volume_dir?.path();
+            if unescaped == plugin::CSI {
+                let csi_mount_path = volume_path.join("mount");
+                if csi_mount_path.exists() {
+                    volumes.push(csi_mount_path);
+                }
+            } else {
+                volumes.push(volume_path);
+            }
+        }
+    }
+    Ok(volumes)
+}
+
+/// Every subpath bind-mount target a pod has on disk.
+///
+/// Port of `getPodVolumeSubpathListFromDisk`
+/// (`pkg/kubelet/kubelet_getters.go:406-447`). Walks the fixed
+/// `<volume>/<container name>/<subPathIndex>` shape.
+pub fn get_pod_volume_subpath_list_from_disk(
+    root: &str,
+    pod_uid: &str,
+) -> std::io::Result<Vec<PathBuf>> {
+    let subpaths_dir = get_pod_volume_subpaths_dir(root, pod_uid);
+    let volume_dirs = match std::fs::read_dir(&subpaths_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+
+    let mut subpaths = Vec::new();
+    for volume_dir in volume_dirs {
+        for container_dir in std::fs::read_dir(volume_dir?.path())? {
+            for sub_path in std::fs::read_dir(container_dir?.path())? {
+                subpaths.push(sub_path?.path());
+            }
+        }
+    }
+    Ok(subpaths)
+}
+
+/// Inverse of [`escape_qualified_name`].
+///
+/// Port of `k8s.io/utils/strings/escape.go::UnescapeQualifiedName`.
+fn unescape_qualified_name(name: &str) -> String {
+    name.replace('~', "/")
 }
 
 #[cfg(test)]

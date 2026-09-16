@@ -1794,6 +1794,24 @@ impl Kubelet {
             error!("Error cleaning up orphaned containers: {}", e);
         }
 
+        // ...and the pod directories those containers left behind. Upstream
+        // pairs the two in HandlePodCleanups, which calls
+        // cleanupOrphanedPodDirs right after its container cleanup
+        // (pkg/kubelet/kubelet_pods.go:1304). Running it on the sync loop rather
+        // than at shutdown is what makes it survive a crash or a killed
+        // teardown, which is when directories are most likely to be stranded.
+        //
+        // The live set is deliberately over-inclusive: a UID missing from it
+        // would make a live pod look orphaned, so every pod we know about goes
+        // in. A pod listed here that has no directory costs nothing.
+        let live_pod_uids: std::collections::HashSet<String> = all_pods
+            .iter()
+            .chain(node_pods.iter())
+            .map(|p| p.metadata.uid.clone())
+            .filter(|uid| !uid.is_empty())
+            .collect();
+        self.runtime.cleanup_orphaned_pod_dirs(&live_pod_uids);
+
         // Garbage-collect terminal pods (Succeeded/Failed) from storage.
         // K8s has a terminated-pod-gc-threshold (default 12500) and the kubelet
         // periodically cleans up terminal pods. This prevents accumulation of
