@@ -30,16 +30,16 @@ pub trait VolumeHost: Send + Sync {
     /// `GetServiceAccountTokenFunc` (`plugins.go:405`).
     fn get_service_account_token_func(&self) -> &TokenManager;
 
-    /// The node's `status.allocatable`.
+    /// `GetNodeAllocatable` (`plugins.go:397`). The kubelet implementation
+    /// (`pkg/kubelet/volume_host.go:226-232`) looks the node up through a
+    /// lister and returns `node.Status.Allocatable`.
     ///
-    /// DEVIATION (CLAUDE.md rule 8): upstream has no `VolumeHost` method for
-    /// this. It defaults an unset downwardAPI `limits.*` in the kubelet before
-    /// the plugin runs — `defaultPodLimitsForDownwardAPI`
-    /// (`pkg/kubelet/kubelet_resources.go:43-47`) mutates the pod. Our
-    /// downwardAPI block does it inline instead, so the value has to reach the
-    /// plugin somehow. Moving the defaulting to the kubelet is a behaviour
-    /// change and belongs in the per-plugin fidelity follow-up, not here.
-    fn node_allocatable(&self) -> &HashMap<String, String>;
+    /// Expression difference, not a mechanism change: upstream is fallible
+    /// because it fetches the node on every call; ours is constructed with
+    /// the map already in hand (the kubelet already tracks it), so there is
+    /// no lookup and therefore no error path — `Result<_, Error>` would have
+    /// nothing to return but `Ok`.
+    fn get_node_allocatable(&self) -> &HashMap<String, String>;
 }
 
 /// The kubelet's `VolumeHost`. Owns clones of the three values
@@ -91,7 +91,7 @@ impl VolumeHost for KubeletVolumeHost {
         &self.token_manager
     }
 
-    fn node_allocatable(&self) -> &HashMap<String, String> {
+    fn get_node_allocatable(&self) -> &HashMap<String, String> {
         &self.node_allocatable
     }
 }
