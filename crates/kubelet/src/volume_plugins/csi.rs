@@ -9,9 +9,18 @@ use tracing::info;
 ///
 /// Only the ephemeral-inline path is implemented, matching what
 /// `create_volume` did: a placeholder directory for the CSI driver to
-/// populate. The `can_support` implementation checks both the inline and
-/// PersistentVolume arms (`csi_plugin.go:447-455`), though the PV arm is
-/// unreachable until the PVC resolution step in Task 10.
+/// populate.
+///
+/// **Deliberate deviation:** Upstream's `csiPlugin.CanSupport`
+/// (`csi_plugin.go:447-455`) checks both the PersistentVolume arm and the
+/// inline arm. We deliberately implement only the inline arm (see
+/// `can_support` below). The reason: this mounter creates a placeholder
+/// directory and never calls `NodePublishVolume`, so claiming a
+/// CSI-sourced PV would convert today's loud failure ("PersistentVolume
+/// does not have a hostPath volume source") into a pod starting with an
+/// empty volume — a behaviour change this pure refactor forbids. The PV
+/// arm and `NodePublishVolume` must land together in the CSI fidelity
+/// follow-up.
 pub struct CsiPlugin {
     host: Arc<dyn VolumeHost>,
 }
@@ -28,17 +37,11 @@ impl VolumePlugin for CsiPlugin {
         crate::pod_dirs::plugin::CSI
     }
 
-    /// `CanSupport` (`csi_plugin.go:447-455`), both arms verbatim:
-    ///
-    /// ```go
-    /// return (spec.PersistentVolume != nil && spec.PersistentVolume.Spec.CSI != nil) ||
-    ///     (spec.Volume != nil && spec.Volume.CSI != nil)
-    /// ```
+    /// `CanSupport` — inline arm only. Upstream checks both
+    /// (`csi_plugin.go:447-455`), but we only support the ephemeral-inline
+    /// path; see the struct-level doc comment for the reason.
     fn can_support(&self, spec: &Spec<'_>) -> bool {
-        spec.persistent_volume
-            .map(|pv| pv.spec.csi.is_some())
-            .unwrap_or(false)
-            || spec.volume.csi.is_some()
+        spec.volume.csi.is_some()
     }
 
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
@@ -103,29 +106,6 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
-        };
-        assert!(plugin().can_support(&spec));
-    }
-
-    #[test]
-    fn supports_a_pv_csi_volume() {
-        use rusternetes_common::resources::PersistentVolume;
-
-        let v: rusternetes_common::resources::Volume =
-            serde_json::from_value(json!({"name": "pvc-backed"})).unwrap();
-        let pv: PersistentVolume = serde_json::from_value(json!({
-            "apiVersion": "v1",
-            "kind": "PersistentVolume",
-            "metadata": {"name": "pv-csi"},
-            "spec": {
-                "capacity": {"storage": "10Gi"},
-                "csi": {"driver": "example.com/csi", "volumeHandle": "vol-123"}
-            }
-        }))
-        .unwrap();
-        let spec = Spec {
-            volume: &v,
-            persistent_volume: Some(&pv),
         };
         assert!(plugin().can_support(&spec));
     }
