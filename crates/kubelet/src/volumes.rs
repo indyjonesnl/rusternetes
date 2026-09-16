@@ -210,6 +210,7 @@ impl VolumeManager {
             Box::new(crate::volume_plugins::config_map::ConfigMapPlugin::new(
                 host.clone(),
             )),
+            Box::new(crate::volume_plugins::csi::CsiPlugin::new(host.clone())),
             Box::new(crate::volume_plugins::secret::SecretPlugin::new(
                 host.clone(),
             )),
@@ -1075,18 +1076,15 @@ impl VolumeManager {
         }
 
         // CSI: ephemeral inline volume (handled by external CSI driver)
-        if let Some(_csi) = &volume.csi {
-            // CSI ephemeral inline volumes are managed by the CSI driver via the kubelet CSI plugin
-            // For conformance, we create a placeholder directory and rely on the CSI driver to populate it
-            let volume_dir = self.pod_volume_dir(pod, volume);
-            std::fs::create_dir_all(&volume_dir)
-                .context("Failed to create CSI volume directory")?;
-
-            info!(
-                "Created CSI ephemeral volume {} at {} (managed by CSI driver)",
-                volume.name, volume_dir
-            );
-            return Ok(volume_dir);
+        if volume.csi.is_some() {
+            let spec = crate::volume_plugins::Spec {
+                volume,
+                persistent_volume: None,
+            };
+            let plugin = crate::volume_plugins::csi::CsiPlugin::new(self.host.clone());
+            let mounter = plugin.new_mounter(&spec, pod).await?;
+            mounter.set_up().await?;
+            return Ok(mounter.get_path());
         }
 
         // Ephemeral: generic ephemeral volume with PVC template
