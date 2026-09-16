@@ -11,6 +11,7 @@ pub mod host;
 pub mod host_path;
 pub mod plugin;
 pub mod registry;
+pub mod secret;
 
 pub use host::{KubeletVolumeHost, VolumeHost};
 pub use plugin::{Mounter, Spec, VolumePlugin};
