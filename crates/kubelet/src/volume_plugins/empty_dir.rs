@@ -50,7 +50,7 @@ impl Mounter for EmptyDirMounter {
     }
 
     async fn set_up(&self) -> Result<()> {
-        // ---- moved verbatim from volumes.rs:931-953 ----
+        // ---- moved verbatim from create_volume's emptyDir branch (b22ed559) ----
         let volume_dir = &self.path;
         let volume = &self.volume;
         // K8s setupDir does best-effort chmod on emptyDir directories.

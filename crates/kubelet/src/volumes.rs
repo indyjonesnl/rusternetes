@@ -20,7 +20,6 @@ use tracing::{debug, info, warn};
 // shared with non-volume code paths there). Imported so the moved bodies keep
 // calling them by their bare names, verbatim.
 use crate::atomic_writer::FileProjection;
-use crate::runtime::{check_host_path_type, HostPathCheck};
 use crate::volume_plugins::VolumePlugin;
 
 /// Build the projection payload (relative user-visible path -> bytes) for a
@@ -201,9 +200,14 @@ impl VolumeManager {
                 token_manager.clone(),
                 node_allocatable.clone(),
             ));
-        let plugin_mgr = Arc::new(crate::volume_plugins::VolumePluginMgr::new(vec![Box::new(
-            crate::volume_plugins::empty_dir::EmptyDirPlugin::new(host.clone()),
-        )]));
+        let plugin_mgr = Arc::new(crate::volume_plugins::VolumePluginMgr::new(vec![
+            Box::new(crate::volume_plugins::empty_dir::EmptyDirPlugin::new(
+                host.clone(),
+            )),
+            Box::new(crate::volume_plugins::host_path::HostPathPlugin::new(
+                host.clone(),
+            )),
+        ]));
         Self {
             volumes_base_path,
             storage,
@@ -962,35 +966,15 @@ impl VolumeManager {
         // (and "OrCreate" variants are materialised) via `check_host_path_type`,
         // mirroring upstream `pkg/volume/host_path/host_path.go::checkType` —
         // see also tests/conformance_storage_emptydir_hostpath.rs.
-        if let Some(host_path) = &volume.host_path {
-            // Expand environment variables in the path
-            let path = crate::runtime::expand_env_vars(&host_path.path);
-            match check_host_path_type(&path, host_path.type_.as_deref()) {
-                HostPathCheck::Ok => {}
-                HostPathCheck::Missing => {
-                    return Err(anyhow::anyhow!(
-                        "hostPath {} does not exist (type={:?})",
-                        path,
-                        host_path.type_
-                    ));
-                }
-                HostPathCheck::WrongKind => {
-                    return Err(anyhow::anyhow!(
-                        "hostPath {} exists but does not match type={:?}",
-                        path,
-                        host_path.type_
-                    ));
-                }
-                HostPathCheck::UnsupportedType => {
-                    return Err(anyhow::anyhow!(
-                        "hostPath {} declared unknown type {:?}",
-                        path,
-                        host_path.type_
-                    ));
-                }
-            }
-            info!("Using hostPath volume {} at {}", volume.name, path);
-            return Ok(path);
+        if volume.host_path.is_some() {
+            let spec = crate::volume_plugins::Spec {
+                volume,
+                persistent_volume: None,
+            };
+            let plugin = crate::volume_plugins::host_path::HostPathPlugin::new(self.host.clone());
+            let mounter = plugin.new_mounter(&spec, pod).await?;
+            mounter.set_up().await?;
+            return Ok(mounter.get_path());
         }
 
         // ConfigMap: mount configmap data as files
