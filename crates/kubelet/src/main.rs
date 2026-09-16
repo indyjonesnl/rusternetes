@@ -35,6 +35,7 @@ mod labels;
 mod lifecycle;
 mod pod_dirs;
 mod poll;
+mod removeall;
 mod serving_tls;
 // The standalone bin no longer uses the bollard ContainerRuntime (the kubelet
 // runs on the CRI backend); runtime.rs is kept only for the still-shared free

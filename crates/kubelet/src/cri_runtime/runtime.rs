@@ -2510,6 +2510,14 @@ impl CriContainerRuntime {
             .unwrap_or("")
     }
 
+    /// Reap the on-disk directories of pods that are gone. No-op when no
+    /// [`VolumeManager`](crate::volumes::VolumeManager) is attached.
+    pub fn cleanup_orphaned_pod_dirs(&self, live_pod_uids: &std::collections::HashSet<String>) {
+        if let Some(volumes) = self.volumes.as_ref() {
+            volumes.cleanup_orphaned_pod_dirs(live_pod_uids);
+        }
+    }
+
     /// Refresh a pod's volumes (re-render configMap/secret/projected content).
     /// No-op when no VolumeManager is attached.
     pub async fn refresh_volumes(&self, pod: &Pod) -> Result<()> {

@@ -13,6 +13,7 @@ pub mod labels;
 pub mod lifecycle;
 pub mod pod_dirs;
 mod poll;
+pub mod removeall;
 pub mod runtime;
 pub mod server;
 pub mod serving_tls;

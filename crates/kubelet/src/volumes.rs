@@ -14,7 +14,7 @@ use rusternetes_common::resources::{
 use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // Free helpers that stay in `runtime.rs` (they are not runtime-specific but are
 // shared with non-volume code paths there). Imported so the moved bodies keep
@@ -192,6 +192,255 @@ impl VolumeManager {
             storage,
             token_manager,
             node_allocatable: crate::kubelet::node_allocatable_map(),
+        }
+    }
+
+    /// Whether a pod still has volumes mounted, in which case its directory
+    /// must not be touched.
+    ///
+    /// Port of `podVolumesExist` (`pkg/kubelet/kubelet_volumes.go:78-96`) built
+    /// on `getMountedVolumePathListFromDisk` (`kubelet_getters.go:381-402`).
+    ///
+    /// Any error answers **true**. That is upstream's rule, not caution added
+    /// here: "If checking returns error, podVolumesExist will return true which
+    /// means we consider volumes might exist and requires further checking."
+    /// Deleting a directory whose volumes are still mounted can corrupt data,
+    /// so an unreadable path must never be read as "safe to remove".
+    ///
+    /// Upstream also consults the volume manager's in-memory record
+    /// (`HasPossiblyMountedVolumesForPod`) before going to disk. We have no such
+    /// record, so this is the disk check alone — noted as a gap rather than
+    /// papered over: it makes the guard weaker than upstream's, never stronger.
+    fn pod_volumes_exist(&self, pod_uid: &str) -> bool {
+        let volume_paths = match crate::pod_dirs::get_pod_volume_path_list_from_disk(
+            &self.volumes_base_path,
+            pod_uid,
+        ) {
+            Ok(paths) => paths,
+            Err(e) => {
+                warn!(
+                    "Pod {} found, but error occurred during checking mounted volumes: {}",
+                    pod_uid, e
+                );
+                return true;
+            }
+        };
+        for path in &volume_paths {
+            match crate::pod_dirs::is_likely_not_mount_point(path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    debug!(
+                        "Pod {} found, but volumes are still mounted on disk: {}",
+                        pod_uid,
+                        path.display()
+                    );
+                    return true;
+                }
+                Err(e) => {
+                    warn!("Fail to check mount point {}: {}", path.display(), e);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Remove a pod's volumes directory and its subdirectories.
+    ///
+    /// Port of `removeOrphanedPodVolumeDirs`
+    /// (`pkg/kubelet/kubelet_volumes.go:119-165`). Returns every error it hit;
+    /// an empty vec means the volumes dir is gone.
+    ///
+    /// Each individual volume path is removed with `rmdir`, never a recursive
+    /// delete: under normal conditions these are empty mount points, and `rmdir`
+    /// failing on a non-empty directory is what stops us deleting the contents
+    /// of something still mounted.
+    fn remove_orphaned_pod_volume_dirs(&self, pod_uid: &str) -> Vec<String> {
+        let root = &self.volumes_base_path;
+        let mut errors = Vec::new();
+
+        // If there are still volume directories, attempt to rmdir them.
+        match crate::pod_dirs::get_pod_volume_path_list_from_disk(root, pod_uid) {
+            Ok(volume_paths) => {
+                for volume_path in volume_paths {
+                    if let Err(e) = std::fs::remove_dir(&volume_path) {
+                        errors.push(format!(
+                            "orphaned pod {} found, but failed to rmdir() volume at path {}: {}",
+                            pod_uid,
+                            volume_path.display(),
+                            e
+                        ));
+                    } else {
+                        info!(
+                            "Cleaned up orphaned volume from pod {}: {}",
+                            pod_uid,
+                            volume_path.display()
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                errors.push(format!(
+                    "orphaned pod {pod_uid} found, but error occurred during reading volume dir from disk: {e}"
+                ));
+                return errors;
+            }
+        }
+
+        // If there are any volume-subpaths, attempt to remove them. These may be
+        // bind mounts of a file OR a directory, so plain remove, not rmdir.
+        match crate::pod_dirs::get_pod_volume_subpath_list_from_disk(root, pod_uid) {
+            Ok(subpaths) => {
+                for subpath in subpaths {
+                    let removed =
+                        std::fs::remove_file(&subpath).or_else(|_| std::fs::remove_dir(&subpath));
+                    if let Err(e) = removed {
+                        errors.push(format!(
+                            "orphaned pod {} found, but failed to rmdir() subpath at path {}: {}",
+                            pod_uid,
+                            subpath.display(),
+                            e
+                        ));
+                    } else {
+                        info!(
+                            "Cleaned up orphaned volume subpath from pod {}: {}",
+                            pod_uid,
+                            subpath.display()
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                errors.push(format!(
+                    "orphaned pod {pod_uid} found, but error occurred during reading of volume-subpaths dir from disk: {e}"
+                ));
+                return errors;
+            }
+        }
+
+        // Remove any remaining subdirectories along with the volumes directory
+        // itself. Fails if any regular file is encountered.
+        let pod_vol_dir = crate::pod_dirs::get_pod_volumes_dir(root, pod_uid);
+        match crate::removeall::remove_dirs_one_filesystem(&pod_vol_dir) {
+            Ok(()) => info!(
+                "Cleaned up orphaned pod volumes dir for {}: {}",
+                pod_uid,
+                pod_vol_dir.display()
+            ),
+            Err(e) => errors.push(format!(
+                "orphaned pod {pod_uid} found, but error occurred when trying to remove the volumes dir: {e}"
+            )),
+        }
+
+        errors
+    }
+
+    /// Remove the directories of pods that should not be running and have no
+    /// containers running.
+    ///
+    /// Port of `cleanupOrphanedPodDirs`
+    /// (`pkg/kubelet/kubelet_volumes.go:169-260`). Upstream calls this from
+    /// `HandlePodCleanups` (`kubelet_pods.go:1304`) on the sync loop, next to
+    /// its container cleanup — which is why this sits beside
+    /// `cleanup_orphaned_containers` rather than on a shutdown path. A periodic
+    /// sweep is also the only form that survives a crash or a killed teardown.
+    ///
+    /// `live_pod_uids` must contain every pod the kubelet knows about *and*
+    /// every pod with a running container, matching upstream's union of `pods`
+    /// and `runningPods`.
+    pub fn cleanup_orphaned_pod_dirs(&self, live_pod_uids: &std::collections::HashSet<String>) {
+        let root = &self.volumes_base_path;
+        let found = match crate::pod_dirs::list_pods_from_disk(root) {
+            Ok(uids) => uids,
+            Err(e) => {
+                warn!("Could not list pods from disk: {}", e);
+                return;
+            }
+        };
+
+        for uid in found {
+            if live_pod_uids.contains(&uid) {
+                continue;
+            }
+
+            // If volumes have not been unmounted, do not delete the directory.
+            // Doing so may result in corruption of data.
+            if self.pod_volumes_exist(&uid) {
+                debug!("Orphaned pod {} found, but volumes are not cleaned up", uid);
+                continue;
+            }
+
+            let volume_errors = self.remove_orphaned_pod_volume_dirs(&uid);
+            if !volume_errors.is_empty() {
+                // Not all volumes were removed, so don't clean up the pod
+                // directory yet — mountpoints or files left behind would make
+                // the removal below fail anyway.
+                for e in &volume_errors {
+                    warn!("{}", e);
+                }
+                continue;
+            }
+
+            let pod_dir = crate::pod_dirs::get_pod_dir(root, &uid);
+            let subdirs = match std::fs::read_dir(&pod_dir) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warn!(
+                        "Orphaned pod {} found, but error occurred during reading the pod dir from disk: {}",
+                        uid, e
+                    );
+                    continue;
+                }
+            };
+
+            let mut cleanup_failed = false;
+            for subdir in subdirs {
+                let subdir_path = match subdir {
+                    Ok(entry) => entry.path(),
+                    Err(e) => {
+                        cleanup_failed = true;
+                        warn!("Failed to read a subdir of pod dir {}: {}", uid, e);
+                        continue;
+                    }
+                };
+                // Never recursively delete the volumes directory: that could
+                // lose data. It should already be gone, so finding it here is an
+                // error to report, not something to force.
+                if subdir_path
+                    .file_name()
+                    .map(|n| n == crate::pod_dirs::VOLUMES_DIR_NAME)
+                    == Some(true)
+                {
+                    cleanup_failed = true;
+                    warn!(
+                        "Orphaned pod {} found, but failed to remove volumes subdir: volumes subdir was found after it was removed ({})",
+                        uid,
+                        subdir_path.display()
+                    );
+                    continue;
+                }
+                if let Err(e) = crate::removeall::remove_all_one_filesystem(&subdir_path) {
+                    cleanup_failed = true;
+                    warn!(
+                        "Failed to remove orphaned pod subdir {}: {}",
+                        subdir_path.display(),
+                        e
+                    );
+                }
+            }
+
+            // Rmdir the pod dir, which should be empty if everything above
+            // succeeded.
+            if !cleanup_failed {
+                debug!("Orphaned pod {} found, removing", uid);
+                if let Err(e) = std::fs::remove_dir(&pod_dir) {
+                    warn!(
+                        "Failed to remove orphaned pod dir {}: {}",
+                        pod_dir.display(),
+                        e
+                    );
+                }
+            }
         }
     }
 
@@ -2319,5 +2568,149 @@ mod projected_mode_tests {
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         assert_eq!(vm.volume_gids(&pod).await, vec![7777]);
+    }
+}
+
+/// Orphaned pod directory sweep — port of `cleanupOrphanedPodDirs`
+/// (`pkg/kubelet/kubelet_volumes.go:169-260`).
+#[cfg(test)]
+mod orphan_sweep_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn tmp(tag: &str) -> String {
+        let p = std::env::temp_dir().join(format!("rn-sweep-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    fn vm(root: &str) -> VolumeManager {
+        VolumeManager::new(
+            root.to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        )
+    }
+
+    /// Lay down `<root>/pods/<uid>/volumes/<plugin>/<volume>` as create_volume
+    /// would, so the sweep sees a realistic tree.
+    fn seed_pod(root: &str, uid: &str, volume: &str) -> std::path::PathBuf {
+        let dir = crate::pod_dirs::get_pod_volume_dir(
+            root,
+            uid,
+            crate::pod_dirs::plugin::EMPTY_DIR,
+            volume,
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_pod_dir_with_no_live_pod_is_removed() {
+        let root = tmp("orphan");
+        seed_pod(&root, "uid-gone", "scratch");
+
+        vm(&root).cleanup_orphaned_pod_dirs(&HashSet::new());
+
+        assert!(
+            !crate::pod_dirs::get_pod_dir(&root, "uid-gone").exists(),
+            "an orphaned pod dir must be reaped"
+        );
+    }
+
+    #[test]
+    fn a_live_pods_dir_is_left_alone() {
+        let root = tmp("live");
+        seed_pod(&root, "uid-live", "scratch");
+
+        let live: HashSet<String> = ["uid-live".to_string()].into_iter().collect();
+        vm(&root).cleanup_orphaned_pod_dirs(&live);
+
+        assert!(
+            crate::pod_dirs::get_pod_volume_dir(
+                &root,
+                "uid-live",
+                crate::pod_dirs::plugin::EMPTY_DIR,
+                "scratch"
+            )
+            .exists(),
+            "a live pod's volumes must survive the sweep"
+        );
+    }
+
+    /// Only the orphan goes; a live pod sharing the sweep is untouched.
+    #[test]
+    fn the_sweep_removes_only_the_orphans() {
+        let root = tmp("mixed");
+        seed_pod(&root, "uid-live", "scratch");
+        seed_pod(&root, "uid-gone", "scratch");
+
+        let live: HashSet<String> = ["uid-live".to_string()].into_iter().collect();
+        vm(&root).cleanup_orphaned_pod_dirs(&live);
+
+        assert!(crate::pod_dirs::get_pod_dir(&root, "uid-live").exists());
+        assert!(!crate::pod_dirs::get_pod_dir(&root, "uid-gone").exists());
+    }
+
+    /// The property that makes the sweep safe to run unattended: a volume dir
+    /// holding real content is removed with `rmdir`, which fails, so the data
+    /// stays. Upstream relies on exactly this rather than a recursive delete
+    /// (`kubelet_volumes.go:114-118`).
+    #[test]
+    fn content_left_in_a_volume_dir_is_never_deleted() {
+        let root = tmp("content");
+        let vol = seed_pod(&root, "uid-data", "scratch");
+        let payload = vol.join("important.txt");
+        std::fs::write(&payload, b"do not delete me").unwrap();
+
+        vm(&root).cleanup_orphaned_pod_dirs(&HashSet::new());
+
+        assert!(payload.exists(), "file content must survive the sweep");
+        assert_eq!(
+            std::fs::read(&payload).unwrap(),
+            b"do not delete me",
+            "and must be unmodified"
+        );
+        assert!(
+            crate::pod_dirs::get_pod_dir(&root, "uid-data").exists(),
+            "the pod dir must be kept while content remains under it"
+        );
+    }
+
+    /// Non-`volumes` subdirs of the pod dir are reaped with the recursive
+    /// remover, matching upstream's RemoveAllOneFilesystem pass.
+    #[test]
+    fn other_pod_subdirs_are_reaped() {
+        let root = tmp("subdirs");
+        seed_pod(&root, "uid-sub", "scratch");
+        let containers = crate::pod_dirs::get_pod_dir(&root, "uid-sub").join("containers");
+        std::fs::create_dir_all(&containers).unwrap();
+        std::fs::write(containers.join("log"), b"x").unwrap();
+
+        vm(&root).cleanup_orphaned_pod_dirs(&HashSet::new());
+
+        assert!(!crate::pod_dirs::get_pod_dir(&root, "uid-sub").exists());
+    }
+
+    #[test]
+    fn a_missing_pods_dir_is_not_an_error() {
+        let root = tmp("empty");
+        // No pods/ dir at all — nothing has run yet.
+        vm(&root).cleanup_orphaned_pod_dirs(&HashSet::new());
+        assert!(crate::pod_dirs::list_pods_from_disk(&root)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn list_pods_from_disk_returns_the_uids_on_disk() {
+        let root = tmp("list");
+        seed_pod(&root, "uid-a", "v");
+        seed_pod(&root, "uid-b", "v");
+
+        let mut found = crate::pod_dirs::list_pods_from_disk(&root).unwrap();
+        found.sort();
+        assert_eq!(found, vec!["uid-a".to_string(), "uid-b".to_string()]);
     }
 }
