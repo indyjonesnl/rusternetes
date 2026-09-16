@@ -49,6 +49,20 @@ pub async fn create_pvc(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Defaulting runs before validation, as upstream does it: the codec
+    // defaults on decode and `BeforeCreate` then calls `PrepareForCreate`
+    // before `strategy.Validate`
+    // (staging/src/k8s.io/apiserver/pkg/registry/rest/create.go:26-28).
+    //
+    // No PVC create validator reads a defaulted field today, so this is
+    // behaviour-neutral right now. It is the same latent trap that took the
+    // cert-manager smoke red for four nights (#1956): Deployment's inversion
+    // was equally harmless until `validateObjectFieldSelector` started
+    // requiring `fieldRef.apiVersion`, which defaulting supplies.
+    //
+    // SetDefaults_PersistentVolumeClaimSpec: volumeMode defaults to Filesystem.
+    crate::handlers::defaults::apply_pvc_spec_defaults(&mut pvc.spec);
+
     // Field validation (mirrors upstream ValidatePersistentVolumeClaim).
     {
         let errs = rusternetes_common::validation::pvc::validate_persistent_volume_claim(&pvc);
@@ -93,9 +107,6 @@ pub async fn create_pvc(
 
     pvc.metadata.ensure_uid();
     pvc.metadata.ensure_creation_timestamp();
-
-    // SetDefaults_PersistentVolumeClaimSpec: volumeMode defaults to Filesystem.
-    crate::handlers::defaults::apply_pvc_spec_defaults(&mut pvc.spec);
 
     let key = build_key(
         "persistentvolumeclaims",
