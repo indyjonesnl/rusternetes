@@ -2355,6 +2355,145 @@ mod projected_mode_tests {
         let dir_mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(dir_mode & 0o777, 0o640 | 0o111);
     }
+
+    /// Characterization test for the projected volume plugin's `set_up` body,
+    /// written and run BEFORE that body moves out of `create_volume` (#1970
+    /// Task 8) — see the task-8 report for the equivalence run against the
+    /// pre-move commit. Goes through the public entry point,
+    /// `VolumeManager::create_volume`, not the plugin directly, and combines
+    /// the three source kinds a projected volume fans out to in production
+    /// (configMap, secret, downwardAPI) in one volume, matching the whole
+    /// point of the projected plugin: asserts on the real on-disk result —
+    /// the returned path, each source's file contents, a per-item `mode`
+    /// override (the configMap item), the `defaultMode` fallback (the secret
+    /// and downwardAPI items, which set no `mode`), and the directory mode
+    /// (`defaultMode | 0o111`).
+    ///
+    /// The serviceAccountToken source is NOT covered here — it mints a real
+    /// token via `TokenManager` and reads ServiceAccount/Node uids from
+    /// storage, which is a materially different code path from the other
+    /// three. Left as a follow-up, same as the gap flagged for the secret
+    /// plugin in Task 6.
+    #[tokio::test]
+    async fn create_volume_writes_projected_sources_to_disk() {
+        let storage = Arc::new(StorageBackend::new_memory());
+
+        let cm = ConfigMap::new("cfg", "default").with_data(HashMap::from([(
+            "app.conf".to_string(),
+            "hello".to_string(),
+        )]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("configmaps", Some("default"), "cfg"),
+            &cm,
+        )
+        .await
+        .unwrap();
+
+        let secret = Secret::new("sec", "default").with_data(HashMap::from([(
+            "password".to_string(),
+            b"hunter2".to_vec(),
+        )]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("secrets", Some("default"), "sec"),
+            &secret,
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+        let volume: rusternetes_common::resources::Volume = serde_json::from_value(json!({
+            "name": "proj",
+            "projected": {
+                "defaultMode": 416,
+                "sources": [
+                    {"configMap": {
+                        "name": "cfg",
+                        "items": [{"key": "app.conf", "path": "app.conf", "mode": 256}]
+                    }},
+                    {"secret": {
+                        "name": "sec",
+                        "items": [{"key": "password", "path": "password"}]
+                    }},
+                    {"downwardAPI": {
+                        "items": [{"path": "podname", "fieldRef": {"fieldPath": "metadata.name"}}]
+                    }}
+                ]
+            }
+        }))
+        .unwrap();
+
+        let path = vm.create_volume(&pod, &volume).await.unwrap();
+        assert_eq!(
+            path,
+            format!(
+                "{}/pods/uid-1/volumes/kubernetes.io~projected/proj",
+                tmp.path().to_string_lossy()
+            )
+        );
+
+        let app_conf = std::fs::read_to_string(format!("{path}/app.conf")).unwrap();
+        assert_eq!(
+            app_conf, "hello",
+            "configMap item must contain its key's value"
+        );
+        let password = std::fs::read(format!("{path}/password")).unwrap();
+        assert_eq!(
+            password, b"hunter2",
+            "secret item must contain its key's value"
+        );
+        let podname = std::fs::read_to_string(format!("{path}/podname")).unwrap();
+        assert_eq!(
+            podname, "p",
+            "downwardAPI fieldRef item must contain metadata.name"
+        );
+
+        let app_conf_mode = std::fs::metadata(format!("{path}/app.conf"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            app_conf_mode & 0o777,
+            0o400,
+            "configMap item's own mode must override the volume's defaultMode"
+        );
+
+        let password_mode = std::fs::metadata(format!("{path}/password"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            password_mode & 0o777,
+            0o640,
+            "secret item with no mode must fall back to the volume's defaultMode"
+        );
+
+        let podname_mode = std::fs::metadata(format!("{path}/podname"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            podname_mode & 0o777,
+            0o640,
+            "downwardAPI item with no mode must fall back to the volume's defaultMode"
+        );
+
+        // proj_dir_mode = defaultMode | 0o111 (volumes.rs's moved body)
+        let dir_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o640 | 0o111);
+    }
 }
 
 /// Orphaned pod directory sweep — port of `cleanupOrphanedPodDirs`
