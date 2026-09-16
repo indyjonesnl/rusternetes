@@ -68,7 +68,6 @@ mod tests {
 
     /// A plugin that matches when the volume's name starts with its prefix.
     /// Stands in for a real plugin so the registry can be tested without one.
-    #[derive(Debug)]
     struct PrefixPlugin {
         name: &'static str,
         prefix: &'static str,
@@ -144,7 +143,7 @@ mod tests {
             volume: &v,
             persistent_volume: None,
         };
-        let err = mgr().find_plugin_by_spec(&spec).unwrap_err();
+        let err = mgr().find_plugin_by_spec(&spec).err().unwrap();
         let msg = err.to_string();
         assert!(msg.contains("multiple volume plugins matched"), "{msg}");
         assert!(msg.contains("kubernetes.io/a"), "{msg}");

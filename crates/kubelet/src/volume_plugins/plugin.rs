@@ -19,13 +19,8 @@ pub struct Spec<'a> {
 /// Only the methods with a consumer in this sub-project are ported.
 /// `GetVolumeName`, `RequiresRemount`, `ConstructVolumeSpec` and
 /// `NewUnmounter` arrive with the sub-project that calls them (#1970).
-///
-/// `Debug` is not part of the upstream Go interface — Go has no equivalent
-/// requirement — but `PluginLookupError` is asserted with `unwrap_err()` in
-/// tests, and `Result::unwrap_err` requires the `Ok` side to implement
-/// `Debug`. A Rust-only addition, not a mechanism change.
 #[async_trait]
-pub trait VolumePlugin: Send + Sync + std::fmt::Debug {
+pub trait VolumePlugin: Send + Sync {
     /// `GetPluginName` (`plugins.go:138`). Namespaced, exactly one `/`.
     fn name(&self) -> &'static str;
 
