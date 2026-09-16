@@ -28,7 +28,7 @@ use crate::volume_plugins::VolumePlugin;
 /// truth for what a ConfigMap volume should contain, shared by the initial
 /// mount and every re-projection so they all feed the same bytes to the
 /// AtomicWriter (and therefore no-op identically when unchanged).
-fn build_configmap_payload(
+pub(crate) fn build_configmap_payload(
     configmap: &ConfigMap,
     items: Option<&Vec<KeyToPath>>,
     configmap_name: &str,
@@ -205,6 +205,9 @@ impl VolumeManager {
                 host.clone(),
             )),
             Box::new(crate::volume_plugins::host_path::HostPathPlugin::new(
+                host.clone(),
+            )),
+            Box::new(crate::volume_plugins::config_map::ConfigMapPlugin::new(
                 host.clone(),
             )),
         ]));
@@ -978,74 +981,15 @@ impl VolumeManager {
         }
 
         // ConfigMap: mount configmap data as files
-        if let Some(configmap_source) = &volume.config_map {
-            let storage = self
-                .storage
-                .as_ref()
-                .context("Storage not available for ConfigMap volumes")?;
-
-            let configmap_name = configmap_source
-                .name
-                .as_ref()
-                .context("ConfigMap volume must specify name")?;
-
-            let is_optional = configmap_source.optional.unwrap_or(false);
-
-            let key = build_key("configmaps", Some(namespace), configmap_name);
-            let configmap_result: Result<ConfigMap, _> = storage.get(&key).await;
-
-            // Create volume directory
-            let volume_dir = self.pod_volume_dir(pod, volume);
-            std::fs::create_dir_all(&volume_dir)
-                .context("Failed to create ConfigMap volume directory")?;
-
-            // Determine the default file mode: spec defaultMode, or 0644 (Kubernetes default)
-            let cm_default_mode = configmap_source.default_mode.unwrap_or(0o644);
-
-            match configmap_result {
-                Ok(configmap) => {
-                    // Build the projection payload (relative path -> bytes),
-                    // honoring `items` (specific keys → mapped paths) or all keys
-                    // from data + binaryData, then project it via the upstream
-                    // AtomicWriter. Re-projecting an unchanged payload is a no-op
-                    // (no write, no chmod, no symlink swap), so a running pod's
-                    // config watcher (kube-proxy) is never disturbed by the
-                    // kubelet's periodic re-SetUp. Each entry carries its own
-                    // mode: `items[].mode` when set, else the volume defaultMode.
-                    let payload = build_configmap_payload(
-                        &configmap,
-                        configmap_source.items.as_ref(),
-                        configmap_name,
-                        is_optional,
-                        cm_default_mode as u32,
-                    );
-                    crate::atomic_writer::write_projected_payload(
-                        std::path::Path::new(&volume_dir),
-                        &payload,
-                    )
-                    .with_context(|| format!("failed to project ConfigMap {configmap_name}"))?;
-                }
-                Err(e) => {
-                    if is_optional {
-                        info!(
-                            "Optional ConfigMap {} not found in namespace {}, creating empty volume",
-                            configmap_name, namespace
-                        );
-                    } else {
-                        // Required ConfigMap not found — abort pod start so kubelet
-                        // retries on next reconciliation (when the ConfigMap exists).
-                        return Err(anyhow::anyhow!(
-                            "ConfigMap {} not found in namespace {}: {}",
-                            configmap_name,
-                            namespace,
-                            e
-                        ));
-                    }
-                }
-            }
-
-            info!("Created ConfigMap volume {} at {}", volume.name, volume_dir);
-            return Ok(volume_dir);
+        if volume.config_map.is_some() {
+            let spec = crate::volume_plugins::Spec {
+                volume,
+                persistent_volume: None,
+            };
+            let plugin = crate::volume_plugins::config_map::ConfigMapPlugin::new(self.host.clone());
+            let mounter = plugin.new_mounter(&spec, pod).await?;
+            mounter.set_up().await?;
+            return Ok(mounter.get_path());
         }
 
         // Secret: mount secret data as files
