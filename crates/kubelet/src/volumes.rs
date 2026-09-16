@@ -20,10 +20,8 @@ use tracing::{debug, info, warn};
 // shared with non-volume code paths there). Imported so the moved bodies keep
 // calling them by their bare names, verbatim.
 use crate::atomic_writer::FileProjection;
-use crate::runtime::{
-    check_host_path_type, mount_tmpfs_for_emptydir, parse_quantity_bytes, setup_emptydir_dir,
-    HostPathCheck,
-};
+use crate::runtime::{check_host_path_type, HostPathCheck};
+use crate::volume_plugins::VolumePlugin;
 
 /// Build the projection payload (relative user-visible path -> bytes) for a
 /// ConfigMap volume, honoring `items` (specific keys → mapped paths) or, when
@@ -177,6 +175,14 @@ pub struct VolumeManager {
     /// [`crate::kubelet::node_allocatable_map`] the kubelet posts in NodeStatus,
     /// so a volume file and the NodeStatus can never disagree.
     pub node_allocatable: std::collections::HashMap<String, String>,
+    /// The plugin registry. Built in `new` from the same host every plugin
+    /// receives, so a plugin's directory can never disagree with the
+    /// manager's. `Arc`-wrapped (rather than the bare `VolumePluginMgr` Task 3's
+    /// brief showed) because `VolumeManager` is `#[derive(Clone)]` —
+    /// `CriContainerRuntime` clones it per attach — and `VolumePluginMgr`'s
+    /// `Vec<Box<dyn VolumePlugin>>` cannot itself derive `Clone`.
+    pub plugin_mgr: Arc<crate::volume_plugins::VolumePluginMgr>,
+    pub host: Arc<dyn crate::volume_plugins::VolumeHost>,
 }
 
 impl VolumeManager {
@@ -187,11 +193,24 @@ impl VolumeManager {
         storage: Option<Arc<rusternetes_storage::StorageBackend>>,
         token_manager: rusternetes_common::auth::TokenManager,
     ) -> Self {
+        let node_allocatable = crate::kubelet::node_allocatable_map();
+        let host: Arc<dyn crate::volume_plugins::VolumeHost> =
+            Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
+                volumes_base_path.clone(),
+                storage.clone(),
+                token_manager.clone(),
+                node_allocatable.clone(),
+            ));
+        let plugin_mgr = Arc::new(crate::volume_plugins::VolumePluginMgr::new(vec![Box::new(
+            crate::volume_plugins::empty_dir::EmptyDirPlugin::new(host.clone()),
+        )]));
         Self {
             volumes_base_path,
             storage,
             token_manager,
-            node_allocatable: crate::kubelet::node_allocatable_map(),
+            node_allocatable,
+            plugin_mgr,
+            host,
         }
     }
 
@@ -929,27 +948,14 @@ impl VolumeManager {
         // ensures the directory exists with mode 0o777 and idempotently re-chmods even
         // when the directory pre-exists from a prior run.
         if volume.empty_dir.is_some() {
-            let volume_dir = self.pod_volume_dir(pod, volume);
-            // K8s setupDir does best-effort chmod on emptyDir directories.
-            // A failed chmod must never block the volume mount.
-            let _ = setup_emptydir_dir(&volume_dir);
-
-            // Memory-medium emptyDir is a tmpfs. Mount it on the host volume dir
-            // (propagated to the host daemon via the kubelet's rshared bind) so
-            // it persists across container restarts AND reports fs_type=tmpfs.
-            // K8s ref: pkg/volume/emptydir/empty_dir.go.
-            let is_memory =
-                volume.empty_dir.as_ref().and_then(|e| e.medium.as_deref()) == Some("Memory");
-            if is_memory {
-                let size_bytes = volume
-                    .empty_dir
-                    .as_ref()
-                    .and_then(|e| e.size_limit.as_deref())
-                    .and_then(parse_quantity_bytes);
-                mount_tmpfs_for_emptydir(&volume_dir, size_bytes);
-            }
-            info!("Created emptyDir volume {} at {}", volume.name, volume_dir);
-            return Ok(volume_dir);
+            let spec = crate::volume_plugins::Spec {
+                volume,
+                persistent_volume: None,
+            };
+            let plugin = crate::volume_plugins::empty_dir::EmptyDirPlugin::new(self.host.clone());
+            let mounter = plugin.new_mounter(&spec, pod).await?;
+            mounter.set_up().await?;
+            return Ok(mounter.get_path());
         }
 
         // HostPath: use the specified host path. The `type` field is validated
