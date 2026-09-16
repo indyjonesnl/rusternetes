@@ -21,8 +21,8 @@ use tracing::{info, warn};
 // calling them by their bare names, verbatim.
 use crate::atomic_writer::FileProjection;
 use crate::runtime::{
-    check_host_path_type, mount_tmpfs_for_emptydir, parse_quantity_bytes, pod_dir_key,
-    setup_emptydir_dir, HostPathCheck,
+    check_host_path_type, mount_tmpfs_for_emptydir, parse_quantity_bytes, setup_emptydir_dir,
+    HostPathCheck,
 };
 
 /// Build the projection payload (relative user-visible path -> bytes) for a
@@ -195,20 +195,27 @@ impl VolumeManager {
         }
     }
 
-    /// Remove the runtime-agnostic per-pod volume directory tree. The bollard
-    /// runtime's `cleanup_pod_volumes` calls this after its own
-    /// runtime-specific teardown (hostport rules, live-incarnation check,
-    /// Docker named-volume removal). Kept verbatim from the original
-    /// `cleanup_pod_volumes` body.
-    pub fn remove_pod_volume_dir(&self, pod_name: &str) {
-        let volume_dir = format!("{}/{}", self.volumes_base_path, pod_name);
-        if std::path::Path::new(&volume_dir).exists() {
-            if let Err(e) = std::fs::remove_dir_all(&volume_dir) {
-                warn!("Failed to remove volume directory {}: {}", volume_dir, e);
-            } else {
-                info!("Cleaned up volumes for pod {}", pod_name);
-            }
-        }
+    /// The on-disk directory for one of a pod's volumes:
+    /// `<root>/pods/<podUID>/volumes/<escaped-plugin>/<volumeName>`.
+    ///
+    /// The single place a pod volume path is built, mirroring upstream's one
+    /// `getPodVolumeDir` (`pkg/kubelet/kubelet_getters.go:181-183`). Every
+    /// volume kind routes through here so the layout cannot drift between kinds
+    /// — it previously did, with emptyDir keyed on the pod UID and every other
+    /// kind keyed on the pod name.
+    pub(crate) fn pod_volume_dir(
+        &self,
+        pod: &Pod,
+        volume: &rusternetes_common::resources::Volume,
+    ) -> String {
+        crate::pod_dirs::get_pod_volume_dir(
+            &self.volumes_base_path,
+            &pod.metadata.uid,
+            crate::pod_dirs::plugin_for_volume(volume),
+            &volume.name,
+        )
+        .to_string_lossy()
+        .into_owned()
     }
 
     /// Create volumes for a pod and return volume bindings for containers
@@ -312,7 +319,6 @@ impl VolumeManager {
         pod: &Pod,
         storage: &S,
     ) -> Result<()> {
-        let pod_name = &pod.metadata.name;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
 
         if let Some(volumes) = &pod.spec.as_ref().unwrap().volumes {
@@ -325,8 +331,7 @@ impl VolumeManager {
                     };
                     let key =
                         rusternetes_storage::build_key("secrets", Some(namespace), secret_name);
-                    let volume_dir =
-                        format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+                    let volume_dir = self.pod_volume_dir(pod, volume);
                     if let Ok(secret) = storage
                         .get::<rusternetes_common::resources::Secret>(&key)
                         .await
@@ -400,8 +405,7 @@ impl VolumeManager {
                             .get::<rusternetes_common::resources::ConfigMap>(&key)
                             .await
                         {
-                            let volume_dir =
-                                format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+                            let volume_dir = self.pod_volume_dir(pod, volume);
                             let is_optional = cm_source.optional.unwrap_or(false);
                             let mode = cm_source.default_mode.unwrap_or(0o644) as u32;
                             let payload = build_configmap_payload(
@@ -421,8 +425,7 @@ impl VolumeManager {
                 // Resync projected volumes (may contain configmap/secret projections)
                 if let Some(projected) = &volume.projected {
                     if let Some(sources) = &projected.sources {
-                        let volume_dir =
-                            format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+                        let volume_dir = self.pod_volume_dir(pod, volume);
                         // Track expected files so we can delete stale ones
                         let mut expected_files: std::collections::HashSet<String> =
                             std::collections::HashSet::new();
@@ -629,8 +632,7 @@ impl VolumeManager {
                 // Resync standalone downwardAPI volumes
                 if let Some(downward_api) = &volume.downward_api {
                     if let Some(items) = &downward_api.items {
-                        let volume_dir =
-                            format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+                        let volume_dir = self.pod_volume_dir(pod, volume);
                         for item in items {
                             let file_path = format!("{}/{}", volume_dir, item.path);
                             let value = if let Some(ref field_ref) = item.field_ref {
@@ -662,6 +664,10 @@ impl VolumeManager {
         pod: &Pod,
         volume: &rusternetes_common::resources::Volume,
     ) -> Result<String> {
+        // Used for content that legitimately carries the pod's NAME — the
+        // service-account token audience, the generated ephemeral-PVC name, and
+        // projected sources. On-disk paths never use it; those go through
+        // `pod_volume_dir`, which keys on the pod UID.
         let pod_name = &pod.metadata.name;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
 
@@ -674,13 +680,7 @@ impl VolumeManager {
         // ensures the directory exists with mode 0o777 and idempotently re-chmods even
         // when the directory pre-exists from a prior run.
         if volume.empty_dir.is_some() {
-            // Key the on-disk path on pod UID, not name, to mirror upstream
-            // pkg/kubelet/kubelet_getters.go::getPodVolumeDir +
-            // pkg/volume/emptydir/empty_dir.go::getPath. A recreated pod gets a
-            // new UID, so the new emptyDir is guaranteed fresh — kubelet never
-            // reads the previous pod's files.
-            let pod_key = pod_dir_key(pod);
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_key, volume.name);
+            let volume_dir = self.pod_volume_dir(pod, volume);
             // K8s setupDir does best-effort chmod on emptyDir directories.
             // A failed chmod must never block the volume mount.
             let _ = setup_emptydir_dir(&volume_dir);
@@ -756,7 +756,7 @@ impl VolumeManager {
             let configmap_result: Result<ConfigMap, _> = storage.get(&key).await;
 
             // Create volume directory
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            let volume_dir = self.pod_volume_dir(pod, volume);
             std::fs::create_dir_all(&volume_dir)
                 .context("Failed to create ConfigMap volume directory")?;
 
@@ -899,7 +899,7 @@ impl VolumeManager {
             let secret_result: Result<Secret, _> = storage.get(&key).await;
 
             // Create volume directory
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            let volume_dir = self.pod_volume_dir(pod, volume);
             std::fs::create_dir_all(&volume_dir)
                 .context("Failed to create Secret volume directory")?;
 
@@ -1125,7 +1125,7 @@ impl VolumeManager {
 
         // DownwardAPI: expose pod/container metadata as files
         if let Some(downward_api) = &volume.downward_api {
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            let volume_dir = self.pod_volume_dir(pod, volume);
             std::fs::create_dir_all(&volume_dir)
                 .context("Failed to create DownwardAPI volume directory")?;
 
@@ -1200,7 +1200,7 @@ impl VolumeManager {
         if let Some(_csi) = &volume.csi {
             // CSI ephemeral inline volumes are managed by the CSI driver via the kubelet CSI plugin
             // For conformance, we create a placeholder directory and rely on the CSI driver to populate it
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            let volume_dir = self.pod_volume_dir(pod, volume);
             std::fs::create_dir_all(&volume_dir)
                 .context("Failed to create CSI volume directory")?;
 
@@ -1303,7 +1303,7 @@ impl VolumeManager {
 
         // Projected: combine multiple volume sources (configMap, secret, downwardAPI, serviceAccountToken) into one directory
         if let Some(projected) = &volume.projected {
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            let volume_dir = self.pod_volume_dir(pod, volume);
             std::fs::create_dir_all(&volume_dir)
                 .context("Failed to create projected volume directory")?;
 
@@ -1699,7 +1699,7 @@ impl VolumeManager {
             volume.csi.is_some(),
             volume.ephemeral.is_some(),
         );
-        let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+        let volume_dir = self.pod_volume_dir(pod, volume);
         std::fs::create_dir_all(&volume_dir)
             .context("Failed to create fallback volume directory")?;
         Ok(volume_dir)
@@ -1712,7 +1712,6 @@ impl VolumeManager {
             Some(s) => s,
             None => return Ok(()),
         };
-        let pod_name = &pod.metadata.name;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
         let spec = match &pod.spec {
             Some(s) => s,
@@ -1724,7 +1723,7 @@ impl VolumeManager {
         };
 
         for volume in volumes {
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            let volume_dir = self.pod_volume_dir(pod, volume);
 
             // Refresh Secret volumes
             if let Some(secret_source) = &volume.secret {
@@ -1983,7 +1982,7 @@ mod projected_mode_tests {
 
         // defaultMode 0644 (420), item mode 0400 (256).
         let pod: Pod = serde_json::from_value(json!({
-            "metadata": {"name": "p", "namespace": "default"},
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-p"},
             "spec": {"containers": [], "volumes": [{
                 "name": "proj",
                 "projected": {
@@ -2004,7 +2003,13 @@ mod projected_mode_tests {
         );
         vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
 
-        let file = tmp.join("p").join("proj").join("app.conf");
+        let file = crate::pod_dirs::get_pod_volume_dir(
+            &tmp.to_string_lossy(),
+            "uid-p",
+            crate::pod_dirs::plugin::PROJECTED,
+            "proj",
+        )
+        .join("app.conf");
         let perms = std::fs::metadata(&file)
             .expect("projected file must exist after resync")
             .permissions();
@@ -2047,7 +2052,7 @@ mod projected_mode_tests {
         .unwrap();
 
         let pod: Pod = serde_json::from_value(json!({
-            "metadata": {"name": "kube-proxy-xyz", "namespace": "kube-system"},
+            "metadata": {"name": "kube-proxy-xyz", "namespace": "kube-system", "uid": "uid-kp"},
             "spec": {"containers": [], "volumes": [{
                 "name": "kube-proxy",
                 "configMap": {"name": "kube-proxy"}
@@ -2063,10 +2068,13 @@ mod projected_mode_tests {
 
         // Initial projection (AtomicWriter layout: config.conf -> ..data/config.conf).
         vm.create_pod_volumes(&pod).await.unwrap();
-        let visible = tmp
-            .join("kube-proxy-xyz")
-            .join("kube-proxy")
-            .join("config.conf");
+        let visible = crate::pod_dirs::get_pod_volume_dir(
+            &tmp.to_string_lossy(),
+            "uid-kp",
+            crate::pod_dirs::plugin::CONFIG_MAP,
+            "kube-proxy",
+        )
+        .join("config.conf");
         assert!(
             std::fs::symlink_metadata(&visible)
                 .unwrap()
@@ -2076,9 +2084,16 @@ mod projected_mode_tests {
         );
         let real = std::fs::canonicalize(&visible).unwrap();
         let ctime_before = std::fs::metadata(&real).unwrap().ctime();
-        let data_link_before =
-            std::fs::read_link(tmp.join("kube-proxy-xyz").join("kube-proxy").join("..data"))
-                .unwrap();
+        let data_link_before = std::fs::read_link(
+            crate::pod_dirs::get_pod_volume_dir(
+                &tmp.to_string_lossy(),
+                "uid-kp",
+                crate::pod_dirs::plugin::CONFIG_MAP,
+                "kube-proxy",
+            )
+            .join("..data"),
+        )
+        .unwrap();
 
         // Re-project the UNCHANGED ConfigMap through BOTH sync-loop paths repeatedly.
         for _ in 0..3 {
@@ -2100,9 +2115,16 @@ mod projected_mode_tests {
             ctime_before, ctime_after,
             "unchanged re-projection must not rewrite the config file in place (would crash kube-proxy)"
         );
-        let data_link_after =
-            std::fs::read_link(tmp.join("kube-proxy-xyz").join("kube-proxy").join("..data"))
-                .unwrap();
+        let data_link_after = std::fs::read_link(
+            crate::pod_dirs::get_pod_volume_dir(
+                &tmp.to_string_lossy(),
+                "uid-kp",
+                crate::pod_dirs::plugin::CONFIG_MAP,
+                "kube-proxy",
+            )
+            .join("..data"),
+        )
+        .unwrap();
         assert_eq!(
             data_link_before, data_link_after,
             "..data must not swap when the ConfigMap is unchanged"
@@ -2139,7 +2161,7 @@ mod projected_mode_tests {
         .unwrap();
 
         let pod: Pod = serde_json::from_value(json!({
-            "metadata": {"name": "p", "namespace": "default"},
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-p"},
             "spec": {"containers": [], "volumes": [{
                 "name": "proj",
                 "projected": {
@@ -2153,7 +2175,12 @@ mod projected_mode_tests {
         }))
         .unwrap();
 
-        let volume_dir = tmp.join("p").join("proj");
+        let volume_dir = crate::pod_dirs::get_pod_volume_dir(
+            &tmp.to_string_lossy(),
+            "uid-p",
+            crate::pod_dirs::plugin::PROJECTED,
+            "proj",
+        );
         std::fs::create_dir_all(&volume_dir).unwrap();
         std::fs::write(volume_dir.join("data-1"), b"stale-root").unwrap();
 
@@ -2278,7 +2305,7 @@ mod projected_mode_tests {
         }
 
         let pod: Pod = serde_json::from_value(json!({
-            "metadata": {"name": "p", "namespace": "default"},
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-p"},
             "spec": {"containers": [], "volumes": [
                 {"name": "with-gid", "persistentVolumeClaim": {"claimName": "claim-gid"}},
                 {"name": "no-gid", "persistentVolumeClaim": {"claimName": "claim-nogid"}}

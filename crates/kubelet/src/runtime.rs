@@ -143,26 +143,6 @@ pub fn setup_termination_message_file(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Return the per-pod filesystem key used to compose host-side volume paths.
-///
-/// Mirrors upstream `pkg/kubelet/kubelet_getters.go::getPodDir`, which keys
-/// pod directories on `pod.metadata.uid`. Two pods that share a name but have
-/// distinct UIDs (the recreation case — e.g. hydrophone's `e2e-conformance-test`
-/// driver pod) must not collide on disk, or the new pod's container will read
-/// stale files written by the previous one.
-///
-/// Falls back to the pod's name when `uid` is empty. Real pods admitted through
-/// the api-server always have a non-empty UID (assigned at `BeforeCreate`), so
-/// the fallback only matters for in-process test fixtures that construct a Pod
-/// without going through the registry.
-pub(crate) fn pod_dir_key(pod: &Pod) -> &str {
-    if !pod.metadata.uid.is_empty() {
-        &pod.metadata.uid
-    } else {
-        &pod.metadata.name
-    }
-}
-
 /// Unix special-file kinds that HostPath validates separately from
 /// regular files / directories. Internal helper for `check_host_path_type`.
 #[derive(Debug, Clone, Copy)]
@@ -556,7 +536,7 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_quantity_bytes, pod_dir_key};
+    use super::parse_quantity_bytes;
 
     #[test]
     fn parse_quantity_bytes_handles_binary_and_decimal_suffixes() {
@@ -842,49 +822,6 @@ mod tests {
         let spec = restored.spec.as_ref().unwrap();
         assert_eq!(spec.subdomain, Some("nginx".to_string()));
         assert_eq!(spec.hostname, Some("web-0".to_string()));
-    }
-
-    #[test]
-    fn test_emptydir_volume_path_format() {
-        let pod_name = "test-pod-emptydir";
-        let volume_name = "test-volume";
-        let expected_path = format!("/volumes/{}/{}", pod_name, volume_name);
-
-        assert_eq!(expected_path, "/volumes/test-pod-emptydir/test-volume");
-    }
-
-    // --- pod_dir_key: UID-keyed pod filesystem paths ---
-    //
-    // Mirrors upstream Kubernetes pkg/kubelet/kubelet_getters.go::getPodDir,
-    // which keys per-pod on-disk paths on `pod.metadata.uid`. Without this,
-    // a recreated pod with the same name (common in conformance test runners
-    // like hydrophone, which always names its driver pod "e2e-conformance-test")
-    // reuses the previous pod's host-side emptyDir directory and reads stale
-    // /tmp/results from the prior run.
-
-    #[test]
-    fn pod_dir_key_uses_uid_when_present() {
-        let mut pod = make_pod("p", "default", None, None);
-        pod.metadata.uid = "abc-123".to_string();
-        assert_eq!(pod_dir_key(&pod), "abc-123");
-    }
-
-    #[test]
-    fn pod_dir_key_falls_back_to_name_when_uid_empty() {
-        let mut pod = make_pod("static-pod", "kube-system", None, None);
-        pod.metadata.uid = String::new();
-        assert_eq!(pod_dir_key(&pod), "static-pod");
-    }
-
-    #[test]
-    fn pod_dir_key_isolates_recreated_pod_with_same_name() {
-        // Two pods with identical name but distinct UIDs (the recreation case
-        // that breaks emptyDir reuse) must yield distinct on-disk keys.
-        let mut a = make_pod("e2e-conformance-test", "conformance", None, None);
-        let mut b = make_pod("e2e-conformance-test", "conformance", None, None);
-        a.metadata.uid = "uid-a".to_string();
-        b.metadata.uid = "uid-b".to_string();
-        assert_ne!(pod_dir_key(&a), pod_dir_key(&b));
     }
 
     // --- EmptyDir mode bits regression tests (conformance [Conformance].*EmptyDir.*) ---

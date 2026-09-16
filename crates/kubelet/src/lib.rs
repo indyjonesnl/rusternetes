@@ -11,6 +11,7 @@ pub mod host_port;
 pub mod kubelet;
 pub mod labels;
 pub mod lifecycle;
+pub mod pod_dirs;
 mod poll;
 pub mod runtime;
 pub mod server;

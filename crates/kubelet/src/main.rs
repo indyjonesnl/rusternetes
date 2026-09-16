@@ -33,6 +33,7 @@ mod kubelet;
 mod labels;
 #[allow(dead_code)]
 mod lifecycle;
+mod pod_dirs;
 mod poll;
 mod serving_tls;
 // The standalone bin no longer uses the bollard ContainerRuntime (the kubelet
