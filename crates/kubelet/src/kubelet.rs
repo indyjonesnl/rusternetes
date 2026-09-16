@@ -3090,12 +3090,18 @@ impl Kubelet {
                                     .map(|vols| {
                                         vols.iter()
                                             .map(|v| {
-                                                let path = format!(
-                                                    "{}/{}/{}",
+                                                // Must agree with what
+                                                // VolumeManager::create_volume
+                                                // provisioned, so it goes
+                                                // through the same getter.
+                                                let path = crate::pod_dirs::get_pod_volume_dir(
                                                     self.runtime.volumes_base_path(),
-                                                    pod_name,
-                                                    v.name
-                                                );
+                                                    &pod.metadata.uid,
+                                                    crate::pod_dirs::plugin_for_volume(v),
+                                                    &v.name,
+                                                )
+                                                .to_string_lossy()
+                                                .into_owned();
                                                 (v.name.clone(), path)
                                             })
                                             .collect()
