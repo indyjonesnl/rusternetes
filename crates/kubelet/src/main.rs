@@ -48,6 +48,8 @@ mod static_pods;
 mod streaming_server;
 mod sync_locks;
 mod sysctl;
+#[allow(dead_code, unused_imports)]
+mod volume_plugins;
 #[allow(dead_code)]
 mod volumes;
 

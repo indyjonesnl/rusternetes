@@ -20,6 +20,7 @@ pub mod serving_tls;
 pub mod static_pods;
 pub mod sync_locks;
 pub mod sysctl;
+pub mod volume_plugins;
 pub mod volumes;
 
 pub use kubelet::PodWorkerState;
