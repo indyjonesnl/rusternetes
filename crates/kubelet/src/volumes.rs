@@ -2252,6 +2252,80 @@ mod projected_mode_tests {
         );
         assert_eq!(vm.volume_gids(&pod).await, vec![7777]);
     }
+
+    /// Characterization test for the secret volume plugin's `set_up` body
+    /// (moved verbatim from `create_volume` in #1970's Task 6). Goes through
+    /// the public entry point, `VolumeManager::create_volume`, not the plugin
+    /// directly, and asserts on the real on-disk result: the returned path,
+    /// the written file contents, and the mode the body applies from
+    /// `defaultMode`. This is the test the Task 6 review found missing — the
+    /// safety argument for the highest-risk moved body in the refactor had
+    /// rested entirely on the text diff. It was re-run unmodified against
+    /// `395a9c08` (the pre-move commit) to confirm it characterizes the OLD
+    /// behaviour too, not just whatever the new code happens to do — see the
+    /// task-6 report for both runs.
+    #[tokio::test]
+    async fn create_volume_writes_secret_data_to_disk() {
+        let storage = Arc::new(StorageBackend::new_memory());
+
+        let secret = Secret::new("mysecret", "default").with_data(HashMap::from([
+            ("username".to_string(), b"admin".to_vec()),
+            ("password".to_string(), b"hunter2".to_vec()),
+        ]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("secrets", Some("default"), "mysecret"),
+            &secret,
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+        let volume: rusternetes_common::resources::Volume = serde_json::from_value(json!({
+            "name": "sec",
+            "secret": {"secretName": "mysecret", "defaultMode": 0o400}
+        }))
+        .unwrap();
+
+        let path = vm.create_volume(&pod, &volume).await.unwrap();
+        assert_eq!(
+            path,
+            format!(
+                "{}/pods/uid-1/volumes/kubernetes.io~secret/sec",
+                tmp.path().to_string_lossy()
+            )
+        );
+
+        let username = std::fs::read(format!("{path}/username")).unwrap();
+        assert_eq!(username, b"admin");
+        let password = std::fs::read(format!("{path}/password")).unwrap();
+        assert_eq!(password, b"hunter2");
+
+        let mode = std::fs::metadata(format!("{path}/username"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o400,
+            "file mode must come from the volume's defaultMode"
+        );
+
+        // secret_dir_mode = defaultMode | 0o111 (secret.rs's moved body)
+        let dir_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o400 | 0o111);
+    }
 }
 
 /// Orphaned pod directory sweep — port of `cleanupOrphanedPodDirs`
