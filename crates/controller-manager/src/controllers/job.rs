@@ -1,9 +1,17 @@
 use anyhow::Result;
 use futures::StreamExt;
-use rusternetes_common::resources::workloads::{Job, JobCondition, JobStatus};
+use rusternetes_common::resources::workloads::{
+    Job, JobCondition, JobStatus, UncountedTerminatedPods,
+};
 use rusternetes_common::resources::{Pod, PodStatus};
 use rusternetes_common::types::{OwnerReference, Phase};
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+
+use super::job_tracking::{
+    clean_uncounted_pods_without_finalizers, has_job_tracking_finalizer, push_uncounted_failed,
+    push_uncounted_succeeded, remove_tracking_finalizer, uncounted_has_failed,
+    uncounted_has_succeeded, FinalizerExpectations, JOB_TRACKING_FINALIZER,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +20,46 @@ use tracing::{debug, error, info, warn};
 
 pub struct JobController<S: Storage> {
     storage: Arc<S>,
+    /// Pod UIDs whose tracking-finalizer removal has been issued but not yet
+    /// observed. Upstream's `uidTrackingExpectations`
+    /// (`pkg/controller/job/tracking_utils.go:48`) — the brake that stops a
+    /// stale pod list from claiming the same termination twice.
+    finalizer_expectations: FinalizerExpectations,
+}
+
+/// Cap on how many UIDs one pass may park in `.status.uncountedTerminatedPods`.
+///
+/// Upstream `MaxUncountedPods = 500` (`pkg/controller/job/job_controller.go:76`),
+/// which stops at the cap with the reasoning: "1. Ensure that the UIDs
+/// representation are under 20 KB. 2. Cap the number of finalizer removals so
+/// that syncing of big Jobs doesn't starve smaller ones." The remaining pods
+/// are picked up on the next pass — the status write and the pod updates
+/// re-enqueue the Job anyway.
+const MAX_UNCOUNTED_PODS: usize = 500;
+
+/// What one pass of the tracking protocol concluded.
+///
+/// The two pairs of counters are deliberately distinct, and conflating them
+/// double-counts every pod. `.status.succeeded` / `.status.failed` hold only
+/// what has been *counted* — the API contract says so outright
+/// (`staging/src/k8s.io/api/batch/v1/types.go:588`: "UncountedTerminatedPods
+/// holds UIDs of Pods that have terminated but haven't been accounted in Job
+/// status counters"). The decision values add the parked UIDs on top, mirroring
+/// upstream's `jobCtx.succeeded` / `jobCtx.failed` (`job_controller.go:925-926`).
+struct TrackedPods {
+    /// What to persist in `.status.succeeded`: counted pods only.
+    status_succeeded: Option<i32>,
+    /// What to persist in `.status.failed`: counted pods only.
+    status_failed: Option<i32>,
+    /// Successes for completion decisions: counted plus parked.
+    succeeded: i32,
+    /// Failures for backoff decisions: counted plus parked.
+    failed: i32,
+    /// The list to persist in `.status.uncountedTerminatedPods`.
+    uncounted: UncountedTerminatedPods,
+    /// Pods whose tracking finalizer must come off — but only AFTER the status
+    /// above has been written, never before.
+    to_release: Vec<Pod>,
 }
 
 /// Terminal-failure conditions for a Job, in the order the api-server demands.
@@ -42,6 +90,46 @@ pub struct JobController<S: Storage> {
 /// ```
 ///
 /// A lone `Complete=True` is rejected, so the Job never leaves `active`.
+/// Does this pod count as a failure for its Job?
+///
+/// Port of upstream `isPodFailed` (`pkg/controller/job/job_controller.go:2011`).
+/// The second clause is the one that is easy to miss and expensive to omit:
+///
+/// ```text
+/// // Count deleted Pods as failures to account for orphan Pods that
+/// // never have a chance to reach the Failed phase.
+/// return p.DeletionTimestamp != nil && p.Status.Phase != v1.PodSucceeded
+/// ```
+///
+/// A pod that is deleted while still Running never reports a terminal phase, so
+/// without this it would hold its tracking finalizer forever and sit in
+/// `Terminating` — the Job controller waiting for a phase the kubelet will
+/// never write. `podReplacementPolicy: Failed` opts out, because there the Job
+/// deliberately waits for the real terminal phase before replacing the pod.
+fn is_pod_failed(pod: &Pod, only_replace_failed_pods: bool) -> bool {
+    let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
+    if matches!(phase, Some(Phase::Failed)) {
+        return true;
+    }
+    if only_replace_failed_pods {
+        return false;
+    }
+    pod.metadata.deletion_timestamp.is_some() && !matches!(phase, Some(Phase::Succeeded))
+}
+
+/// Has this Job reached a terminal condition?
+fn job_is_finished(job: &Job) -> bool {
+    job.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .is_some_and(|cs| {
+            cs.iter().any(|c| {
+                (c.condition_type == "Complete" || c.condition_type == "Failed")
+                    && c.status == "True"
+            })
+        })
+}
+
 fn complete_job_conditions(reason: String, message: String) -> Vec<JobCondition> {
     let now = chrono::Utc::now();
     vec![
@@ -124,7 +212,326 @@ fn clamp_counters_monotonic(next: &mut JobStatus, persisted: Option<&JobStatus>)
 
 impl<S: Storage + 'static> JobController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            finalizer_expectations: FinalizerExpectations::new(),
+        }
+    }
+
+    /// Phase 1 of the exactly-once protocol: claim every terminal pod that is
+    /// still held by the tracking finalizer.
+    ///
+    /// Port of the accounting half of upstream's
+    /// `trackJobStatusAndRemoveFinalizers` (`pkg/controller/job/job_controller.go`),
+    /// which builds `uidsWithFinalizer`, folds already-released UIDs into the
+    /// real counters via `cleanUncountedPodsWithoutFinalizers`, and appends
+    /// newly-finished pods to `.status.uncountedTerminatedPods`.
+    ///
+    /// The counters it returns are cumulative — upstream's
+    ///
+    /// ```text
+    /// jobCtx.succeeded = job.Status.Succeeded + int32(len(newSucceededPods)) +
+    ///     int32(len(jobCtx.uncounted.succeeded))
+    /// ```
+    ///
+    /// — so they cannot fall when a pod is deleted, and a pod that terminates
+    /// and is collected between two passes is still counted, because it was
+    /// held in place until its UID was written down.
+    fn track_terminated_pods(
+        &self,
+        job_key: &str,
+        persisted: Option<&JobStatus>,
+        job_pods: &[Pod],
+        never_count_failed: &HashSet<String>,
+        is_indexed: bool,
+        only_replace_failed_pods: bool,
+    ) -> TrackedPods {
+        // Upstream satisfies an expectation when its informer delivers the pod
+        // without the finalizer (`finalizerRemovalObserved`). Our equivalent
+        // signal is this list: a pod that no longer carries the finalizer — or
+        // that is gone entirely — has had its removal observed.
+        let still_held: HashSet<&str> = job_pods
+            .iter()
+            .filter(|p| has_job_tracking_finalizer(p))
+            .map(|p| p.metadata.uid.as_str())
+            .collect();
+        for uid in self.finalizer_expectations.expected(job_key) {
+            if !still_held.contains(uid.as_str()) {
+                self.finalizer_expectations.removal_observed(job_key, &uid);
+            }
+        }
+        let expected_removed = self.finalizer_expectations.expected(job_key);
+
+        // A pod with a removal in flight is NOT counted as holding the
+        // finalizer, exactly as upstream excludes `expectedRmFinalizers` when
+        // building `uidsWithFinalizer`.
+        let uids_with_finalizer: HashSet<String> = job_pods
+            .iter()
+            .filter(|p| {
+                has_job_tracking_finalizer(p) && !expected_removed.contains(&p.metadata.uid)
+            })
+            .map(|p| p.metadata.uid.clone())
+            .collect();
+
+        let mut base_succeeded = persisted.and_then(|s| s.succeeded);
+        let mut base_failed = persisted.and_then(|s| s.failed);
+        let mut uncounted = persisted
+            .and_then(|s| s.uncounted_terminated_pods.clone())
+            .unwrap_or(UncountedTerminatedPods {
+                succeeded: None,
+                failed: None,
+            });
+
+        // Phase 3 of the previous pass: UIDs whose finalizer removal has landed
+        // become real counter increments.
+        clean_uncounted_pods_without_finalizers(
+            &mut base_succeeded,
+            &mut base_failed,
+            &mut uncounted,
+            &uids_with_finalizer,
+        );
+
+        // Phase 1 of this pass: claim newly-finished pods.
+        let mut to_release: Vec<Pod> = Vec::new();
+        for pod in job_pods.iter() {
+            if !has_job_tracking_finalizer(pod) || expected_removed.contains(&pod.metadata.uid) {
+                continue;
+            }
+            let uid = pod.metadata.uid.as_str();
+            let phase = if matches!(
+                pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+                Some(Phase::Succeeded)
+            ) {
+                Some(Phase::Succeeded)
+            } else if is_pod_failed(pod, only_replace_failed_pods) {
+                Some(Phase::Failed)
+            } else {
+                None
+            };
+            match phase {
+                Some(Phase::Succeeded) => {
+                    // An Indexed Job tracks successes by completion index in
+                    // `.status.completedIndexes`, which is durable on its own,
+                    // so upstream never parks their UIDs: "The completion index
+                    // is enough to avoid recounting succeeded pods. No need to
+                    // track UIDs."
+                    if !is_indexed && !uncounted_has_succeeded(&uncounted, uid) {
+                        push_uncounted_succeeded(&mut uncounted, uid);
+                    }
+                    to_release.push(pod.clone());
+                }
+                Some(Phase::Failed) => {
+                    // An excluded failure is still released — it just never
+                    // reaches a counter. Upstream's `Ignore` action does the
+                    // same: the pod goes into `podsToRemoveFinalizer` without
+                    // ever being appended to the uncounted list.
+                    if !never_count_failed.contains(&pod.metadata.name)
+                        && !uncounted_has_failed(&uncounted, uid)
+                    {
+                        push_uncounted_failed(&mut uncounted, uid);
+                    }
+                    to_release.push(pod.clone());
+                }
+                _ => {}
+            }
+
+            if uncounted.succeeded.as_ref().map_or(0, |v| v.len())
+                + uncounted.failed.as_ref().map_or(0, |v| v.len())
+                >= MAX_UNCOUNTED_PODS
+            {
+                break;
+            }
+        }
+
+        let succeeded = base_succeeded.unwrap_or(0)
+            + uncounted.succeeded.as_ref().map_or(0, |v| v.len() as i32);
+        let failed =
+            base_failed.unwrap_or(0) + uncounted.failed.as_ref().map_or(0, |v| v.len() as i32);
+
+        TrackedPods {
+            status_succeeded: Some(base_succeeded.unwrap_or(0)),
+            status_failed: Some(base_failed.unwrap_or(0)),
+            succeeded,
+            failed,
+            uncounted,
+            to_release,
+        }
+    }
+
+    /// Phase 2 of the exactly-once protocol: release the pods whose outcome the
+    /// status write just recorded.
+    ///
+    /// Ordering is the whole point — upstream's
+    /// `flushUncountedAndRemoveFinalizers` writes the status FIRST and only
+    /// then removes finalizers, so a crash in between leaves a pod that is
+    /// still held and still claimable rather than one that is gone and lost.
+    /// Call this only after the status write has succeeded.
+    /// Returns the UIDs whose finalizer is confirmed gone, so the caller can
+    /// fold exactly those into the counters — upstream deletes the same UIDs
+    /// from `uidsWithFinalizer` before re-running
+    /// `cleanUncountedPodsWithoutFinalizers`.
+    async fn release_tracked_pods(
+        &self,
+        job_key: &str,
+        namespace: &str,
+        pods: &[Pod],
+    ) -> HashSet<String> {
+        let mut released = HashSet::new();
+        for pod in pods {
+            let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
+            let Ok(mut fresh) = self.storage.get::<Pod>(&pod_key).await else {
+                // Already gone: nothing holds it, so the expectation is moot.
+                self.finalizer_expectations
+                    .removal_observed(job_key, &pod.metadata.uid);
+                released.insert(pod.metadata.uid.clone());
+                continue;
+            };
+            if !remove_tracking_finalizer(&mut fresh) {
+                released.insert(pod.metadata.uid.clone());
+                continue;
+            }
+            // Record the expectation BEFORE the write, as upstream does: if the
+            // write lands but our next list is stale, the expectation is what
+            // stops the pod being counted a second time.
+            self.finalizer_expectations
+                .expect_removed(job_key, [pod.metadata.uid.clone()]);
+            if let Err(e) = self.storage.update(&pod_key, &fresh).await {
+                // The removal did not happen, so it must not stay expected —
+                // otherwise the pod is skipped forever and its outcome is lost.
+                self.finalizer_expectations
+                    .removal_observed(job_key, &pod.metadata.uid);
+                warn!(
+                    "Failed to remove the job-tracking finalizer from pod {}: {}",
+                    pod.metadata.name, e
+                );
+            } else {
+                released.insert(pod.metadata.uid.clone());
+            }
+        }
+        released
+    }
+
+    /// Write `.status`, release the pods it accounted for, then fold those
+    /// releases into the counters and write again.
+    ///
+    /// These three steps and their order are upstream's
+    /// `flushUncountedAndRemoveFinalizers` (`job_controller.go:1388`): flush
+    /// first so a crash leaves a pod still held and still claimable rather than
+    /// gone and forgotten, remove the finalizers, then re-run
+    /// `cleanUncountedPodsWithoutFinalizers` over the UIDs that were actually
+    /// released — in the SAME pass, so the visible counters converge here
+    /// instead of waiting for a sync that a finished Job never gets.
+    async fn flush_status_and_release(
+        &self,
+        key: &str,
+        job_tracking_key: &str,
+        namespace: &str,
+        job: &mut Job,
+        pods_to_release: &[Pod],
+        job_pods: &[Pod],
+    ) -> Result<()> {
+        self.write_status(key, job).await?;
+
+        // Upstream's `canRemoveFinalizer` (`job_controller.go:1359`) short-
+        // circuits to true the moment the Job is being deleted or has reached a
+        // terminal condition: nothing more will ever be counted, so holding the
+        // pods back only wedges them in `Terminating`.
+        let mut to_release: Vec<Pod> = pods_to_release.to_vec();
+        if job.metadata.is_being_deleted() || job_is_finished(job) {
+            let already: HashSet<&str> = pods_to_release
+                .iter()
+                .map(|p| p.metadata.uid.as_str())
+                .collect();
+            for pod in job_pods {
+                if has_job_tracking_finalizer(pod) && !already.contains(pod.metadata.uid.as_str()) {
+                    to_release.push(pod.clone());
+                }
+            }
+        }
+
+        let released = self
+            .release_tracked_pods(job_tracking_key, namespace, &to_release)
+            .await;
+        if released.is_empty() {
+            return Ok(());
+        }
+
+        let mut folded = false;
+        if let Some(status) = job.status.as_mut() {
+            if let Some(mut uncounted) = status.uncounted_terminated_pods.take() {
+                // Everything still parked that was NOT released stays parked.
+                let still_held: HashSet<String> = uncounted
+                    .succeeded
+                    .iter()
+                    .chain(uncounted.failed.iter())
+                    .flatten()
+                    .filter(|uid| !released.contains(*uid))
+                    .cloned()
+                    .collect();
+                folded = clean_uncounted_pods_without_finalizers(
+                    &mut status.succeeded,
+                    &mut status.failed,
+                    &mut uncounted,
+                    &still_held,
+                );
+                let empty = uncounted.succeeded.as_ref().map_or(0, |v| v.len())
+                    + uncounted.failed.as_ref().map_or(0, |v| v.len())
+                    == 0;
+                status.uncounted_terminated_pods = if empty { None } else { Some(uncounted) };
+            }
+        }
+        if folded {
+            self.write_status(key, job).await?;
+        }
+        Ok(())
+    }
+
+    /// Persist `job.status`, retrying a CAS conflict, and skipping the write
+    /// entirely when nothing changed (a redundant write wakes every watcher).
+    async fn write_status(&self, key: &str, job: &mut Job) -> Result<()> {
+        let status_to_save = job.status.clone();
+        for attempt in 0..3 {
+            match self.storage.get::<Job>(key).await {
+                Ok(mut fresh_job) => {
+                    // Counters must not go backwards against what is already
+                    // persisted, or the api-server refuses this and every later
+                    // write (#1955).
+                    let mut next_status = status_to_save.clone();
+                    if let Some(next) = next_status.as_mut() {
+                        clamp_counters_monotonic(next, fresh_job.status.as_ref());
+                    }
+                    if fresh_job.status == next_status {
+                        job.status = next_status;
+                        return Ok(());
+                    }
+                    fresh_job.status = next_status.clone();
+                    // Status subresource write (#1723).
+                    match self.storage.update_status(key, &fresh_job).await {
+                        Ok(_) => {
+                            job.status = next_status;
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Job status update CAS conflict on {} (attempt {}): {}",
+                                key,
+                                attempt + 1,
+                                e
+                            );
+                            if attempt == 2 {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // The Job was deleted between the list and this write.
+                    debug!("Job {} no longer exists: {}", key, e);
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -313,15 +720,123 @@ impl<S: Storage + 'static> JobController<S> {
             }
         }
 
+        self.reconcile_orphan_pods().await;
+
         Ok(())
     }
 
-    async fn reconcile(&self, job: &mut Job) -> Result<()> {
-        let name = &job.metadata.name;
-        let namespace = job.metadata.namespace.as_ref().unwrap();
+    /// Strip the tracking finalizer from pods whose Job can no longer account
+    /// for them.
+    ///
+    /// Port of upstream's orphan-pod reconciler — `enqueueOrphanPod` /
+    /// `syncOrphanPod` / `handleSingleOrphanPod`
+    /// (`pkg/controller/job/job_controller.go:688-766`), which upstream reaches
+    /// from its pod event handlers whenever a pod carrying the finalizer has no
+    /// controller, or one whose Job is gone or finished: "syncJob will not
+    /// remove this finalizer."
+    ///
+    /// Shipping the finalizer without this is what turns a Job deletion into a
+    /// namespace stuck in `Terminating`: the garbage collector deletes the Job,
+    /// `reconcile` never runs for it again, and its pods hold a finalizer that
+    /// nobody is left to remove.
+    async fn reconcile_orphan_pods(&self) {
+        let Ok(pods) = self.storage.list::<Pod>("/registry/pods/").await else {
+            return;
+        };
+        for pod in pods.iter().filter(|p| has_job_tracking_finalizer(p)) {
+            let Some(namespace) = pod.metadata.namespace.as_deref() else {
+                continue;
+            };
+            let owner = pod
+                .metadata
+                .owner_references
+                .as_ref()
+                .and_then(|refs| refs.iter().find(|r| r.controller == Some(true)));
 
-        // Skip reconciliation for Jobs being deleted — GC handles pod cleanup
+            if let Some(owner) = owner {
+                // A pod controlled by something that is not a batch/v1 Job is
+                // not ours to strip.
+                if owner.kind != "Job" || owner.api_version != "batch/v1" {
+                    continue;
+                }
+                let job_key = build_key("jobs", Some(namespace), &owner.name);
+                if let Ok(job) = self.storage.get::<Job>(&job_key).await {
+                    if job.metadata.uid == owner.uid {
+                        // Managed by an external controller: not ours either.
+                        if job
+                            .spec
+                            .managed_by
+                            .as_deref()
+                            .is_some_and(|m| m != "kubernetes.io/job-controller")
+                        {
+                            continue;
+                        }
+                        // The Job is alive and still counting. Leave it alone.
+                        if !job_is_finished(&job) {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
+            let Ok(mut fresh) = self.storage.get::<Pod>(&pod_key).await else {
+                continue;
+            };
+            if !remove_tracking_finalizer(&mut fresh) {
+                continue;
+            }
+            if let Err(e) = self.storage.update(&pod_key, &fresh).await {
+                warn!(
+                    "Failed to release orphan pod {}/{} from the job-tracking finalizer: {}",
+                    namespace, fresh.metadata.name, e
+                );
+            } else {
+                debug!(
+                    "Released orphan pod {}/{} from the job-tracking finalizer",
+                    namespace, fresh.metadata.name
+                );
+            }
+        }
+    }
+
+    async fn reconcile(&self, job: &mut Job) -> Result<()> {
+        // Owned, not borrowed from `job`: the status flush needs `&mut job`
+        // while these are still in use.
+        let name = job.metadata.name.clone();
+        let namespace = job.metadata.namespace.clone().unwrap();
+        let name = name.as_str();
+        let namespace = namespace.as_str();
+
+        // Skip reconciliation for Jobs being deleted — GC handles pod cleanup.
         if job.metadata.is_being_deleted() {
+            // But first let go of every pod this Job still holds. Nothing more
+            // will ever be counted, and a pod left holding the tracking
+            // finalizer can never be deleted — the Job's own teardown would
+            // block forever. Upstream's `canRemoveFinalizer` returns true
+            // outright when `jobCtx.job.DeletionTimestamp != nil`.
+            let job_tracking_key = format!("{}/{}", namespace, name);
+            let pod_prefix = format!("/registry/pods/{}/", namespace);
+            if let Ok(all_pods) = self.storage.list::<Pod>(&pod_prefix).await {
+                let held: Vec<Pod> = all_pods
+                    .into_iter()
+                    .filter(|p| {
+                        has_job_tracking_finalizer(p)
+                            && p.metadata
+                                .owner_references
+                                .as_ref()
+                                .is_some_and(|refs| refs.iter().any(|r| r.uid == job.metadata.uid))
+                    })
+                    .collect();
+                if !held.is_empty() {
+                    self.release_tracked_pods(&job_tracking_key, namespace, &held)
+                        .await;
+                }
+            }
+            // Upstream drops the job's entry from `uidTrackingExpectations`
+            // when the Job goes away (`deleteExpectations`); keeping it would
+            // leak a growing set of UIDs for an object that no longer exists.
+            self.finalizer_expectations.forget(&job_tracking_key);
             return Ok(());
         }
 
@@ -445,7 +960,7 @@ impl<S: Storage + 'static> JobController<S> {
             .selector
             .as_ref()
             .and_then(|s| s.match_labels.as_ref());
-        let job_pods: Vec<Pod> = all_pods
+        let mut job_pods: Vec<Pod> = all_pods
             .into_iter()
             .filter(|pod| {
                 let owned_by_ref = pod
@@ -551,195 +1066,66 @@ impl<S: Storage + 'static> JobController<S> {
         }
 
         // Adopt orphaned pods — re-add ownerReference if pod matches by label but not by ownerRef
-        for pod in &job_pods {
-            let has_owner_ref = pod
+        for slot in job_pods.iter_mut() {
+            let has_owner_ref = slot
                 .metadata
                 .owner_references
                 .as_ref()
                 .map(|refs| refs.iter().any(|r| &r.uid == job_uid))
                 .unwrap_or(false);
-            if !has_owner_ref {
-                let mut adopted_pod = pod.clone();
-                let owner_ref = rusternetes_common::types::OwnerReference {
-                    api_version: "batch/v1".to_string(),
-                    kind: "Job".to_string(),
-                    name: name.to_string(),
-                    uid: job.metadata.uid.clone(),
-                    controller: Some(true),
-                    block_owner_deletion: Some(true),
-                };
+            if has_owner_ref {
+                continue;
+            }
+            let mut adopted_pod = slot.clone();
+            let owner_ref = rusternetes_common::types::OwnerReference {
+                api_version: "batch/v1".to_string(),
+                kind: "Job".to_string(),
+                name: name.to_string(),
+                uid: job.metadata.uid.clone(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            };
+            adopted_pod
+                .metadata
+                .owner_references
+                .get_or_insert_with(Vec::new)
+                .push(owner_ref);
+            // Adoption also takes on the tracking finalizer, or the adopted pod
+            // is invisible to the accounting protocol for the rest of its life.
+            // Upstream does exactly this, with the comment "When adopting Pods,
+            // this operation adds an ownerRef and finalizers"
+            // (`job_controller.go:795-814`).
+            if !has_job_tracking_finalizer(&adopted_pod) {
                 adopted_pod
                     .metadata
-                    .owner_references
+                    .finalizers
                     .get_or_insert_with(Vec::new)
-                    .push(owner_ref);
-                let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-                if let Err(e) = self.storage.update(&pod_key, &adopted_pod).await {
-                    tracing::warn!("Failed to adopt pod {}: {}", pod.metadata.name, e);
-                } else {
-                    info!(
-                        "Adopted orphaned pod {} for job {}/{}",
-                        pod.metadata.name, namespace, name
-                    );
-                }
+                    .push(JOB_TRACKING_FINALIZER.to_string());
+            }
+            let pod_key = build_key("pods", Some(namespace), &adopted_pod.metadata.name);
+            if let Err(e) = self.storage.update(&pod_key, &adopted_pod).await {
+                tracing::warn!("Failed to adopt pod {}: {}", adopted_pod.metadata.name, e);
+            } else {
+                info!(
+                    "Adopted orphaned pod {} for job {}/{}",
+                    adopted_pod.metadata.name, namespace, name
+                );
+                // Keep the local view in step, as upstream does, so this pass
+                // already accounts for the pod it just adopted.
+                *slot = adopted_pod;
             }
         }
+        let job_pods = job_pods;
 
         let is_indexed = job.spec.completion_mode.as_deref() == Some("Indexed");
 
-        let mut active = 0;
-        let mut succeeded = 0;
-        let mut failed = 0;
-        let mut ready = 0i32;
-
-        for pod in job_pods.iter() {
-            if let Some(status) = &pod.status {
-                match &status.phase {
-                    Some(Phase::Running) | Some(Phase::Pending) => active += 1,
-                    Some(Phase::Succeeded) => succeeded += 1,
-                    Some(Phase::Failed) => failed += 1,
-                    _ => {}
-                }
-                // Count pods with Ready condition = True
-                if let Some(conditions) = &status.conditions {
-                    if conditions
-                        .iter()
-                        .any(|c| c.condition_type == "Ready" && c.status == "True")
-                    {
-                        ready += 1;
-                    }
-                }
-            }
-        }
-
-        // Handle suspended jobs: delete all active pods and set active to 0
-        if job.spec.suspend.unwrap_or(false) {
-            if active > 0 {
-                for pod in job_pods.iter() {
-                    let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
-                    if matches!(phase, Some(Phase::Running) | Some(Phase::Pending)) {
-                        let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-                        let _ = self.storage.delete(&pod_key).await;
-                        info!(
-                            "Suspended job {}/{}: deleted active pod {}",
-                            namespace, name, pod.metadata.name
-                        );
-                    }
-                }
-            }
-            // Preserve existing start_time
-            let existing_start_time = job.status.as_ref().and_then(|s| s.start_time);
-            let existing_conditions = job.status.as_ref().and_then(|s| s.conditions.clone());
-            job.status = Some(JobStatus {
-                active: Some(0),
-                succeeded: Some(succeeded),
-                failed: Some(failed),
-                conditions: existing_conditions,
-                start_time: existing_start_time,
-                completion_time: None,
-                ready: Some(ready),
-                terminating: None,
-                completed_indexes: None,
-                failed_indexes: None,
-                uncounted_terminated_pods: None,
-                observed_generation: job.metadata.generation,
-            });
-            let key = format!("/registry/jobs/{}/{}", namespace, name);
-            // Status subresource write — see the note above (#1723).
-            if let Ok(fresh) = self.storage.get::<Job>(&key).await {
-                // Counters must not go backwards against what is already
-                // persisted, or the api-server refuses this and every later
-                // write (#1955).
-                if let Some(next) = job.status.as_mut() {
-                    clamp_counters_monotonic(next, fresh.status.as_ref());
-                }
-                if fresh.status != job.status {
-                    self.storage.update_status(&key, &*job).await?;
-                }
-            }
-            return Ok(());
-        }
-
-        // Handle activeDeadlineSeconds — fail the job if it has been active too long
-        if let Some(deadline) = job.spec.active_deadline_seconds {
-            if let Some(start) = job.status.as_ref().and_then(|s| s.start_time) {
-                let elapsed = chrono::Utc::now()
-                    .signed_duration_since(start)
-                    .num_seconds();
-                if elapsed > deadline {
-                    warn!(
-                        "Job {}/{} exceeded activeDeadlineSeconds ({} > {})",
-                        namespace, name, elapsed, deadline
-                    );
-                    // Delete all active pods
-                    for pod in job_pods.iter() {
-                        let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
-                        if matches!(phase, Some(Phase::Running) | Some(Phase::Pending)) {
-                            let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-                            let _ = self.storage.delete(&pod_key).await;
-                        }
-                    }
-                    job.status = Some(JobStatus {
-                        active: Some(0),
-                        succeeded: Some(succeeded),
-                        failed: Some(failed),
-                        conditions: Some(failed_job_conditions(
-                            "DeadlineExceeded".to_string(),
-                            format!(
-                                "Job was active longer than specified deadline of {} seconds",
-                                deadline
-                            ),
-                        )),
-                        start_time: job.status.as_ref().and_then(|s| s.start_time),
-                        // completionTime is valid ONLY on a Complete job
-                        // (validation.go:505-513: "cannot set completionTime
-                        // when there is no Complete=True condition").
-                        completion_time: None,
-                        ready: Some(ready),
-                        terminating: None,
-                        completed_indexes: None,
-                        failed_indexes: None,
-                        uncounted_terminated_pods: None,
-                        observed_generation: job.metadata.generation,
-                    });
-                    let key = format!("/registry/jobs/{}/{}", namespace, name);
-                    // Status subresource write: a full-object PUT through the
-                    // api-server strips `.status`, so status must go via
-                    // update_status — which does its own CAS read-modify-write,
-                    // making the manual re-read redundant (#1723).
-                    if let Ok(fresh) = self.storage.get::<Job>(&key).await {
-                        if fresh.status != job.status {
-                            self.storage.update_status(&key, &*job).await?;
-                        }
-                    }
-                    return Ok(());
-                }
-            }
-        }
-
-        // For Indexed completion mode, track which indexes have completed
-        let completed_indexes: Option<String> = if is_indexed {
-            let mut indexes: Vec<i32> = Vec::new();
-            for pod in job_pods.iter() {
-                if let Some(status) = &pod.status {
-                    if matches!(&status.phase, Some(Phase::Succeeded)) {
-                        if let Some(idx) = get_pod_index(pod) {
-                            indexes.push(idx);
-                        }
-                    }
-                }
-            }
-            indexes.sort();
-            indexes.dedup();
-            if indexes.is_empty() {
-                None
-            } else {
-                Some(format_index_ranges(&indexes))
-            }
-        } else {
-            None
-        };
-
+        // podFailurePolicy is evaluated BEFORE any counting, because an
+        // `Ignore` match must stop a failure from ever being counted rather
+        // than subtract it afterwards. Upstream reaches the same ordering via
+        // `matchPodFailurePolicy` (`pkg/controller/job/pod_failure_policy.go`),
+        // which returns `(nil, false, &ignore)` so the caller never appends the
+        // UID to `.status.uncountedTerminatedPods` at all
+        // (`job_controller.go` -> `trackJobStatusAndRemoveFinalizers`).
         // Build a set of indexes that failed due to FailIndex podFailurePolicy
         let mut fail_index_set: HashSet<i32> = HashSet::new();
 
@@ -847,12 +1233,214 @@ impl<S: Storage + 'static> JobController<S> {
             }
         }
 
-        // Subtract ignored pods from the failed count — pods matching an "Ignore"
-        // pod failure policy rule should not count against the backoff limit.
-        let ignored_failed_count = ignored_pods.len() as i32;
-        failed -= ignored_failed_count;
-        if failed < 0 {
-            failed = 0;
+        // Indexes that have EVER succeeded. Upstream keeps this in
+        // `.status.completedIndexes` precisely so it outlives the pods:
+        // `calculateSucceededIndexes` (`pkg/controller/job/indexed_job_utils.go`)
+        // unions the persisted string with the succeeded pods it can still see.
+        // Recomputing it from the live list alone loses an index the moment its
+        // pod is collected.
+        let succeeded_index_set: HashSet<i32> = if is_indexed {
+            let mut set = parse_index_ranges(
+                job.status
+                    .as_ref()
+                    .and_then(|s| s.completed_indexes.as_deref())
+                    .unwrap_or(""),
+            );
+            set.extend(collect_indexes_in_phase(job_pods.iter(), Phase::Succeeded));
+            set
+        } else {
+            HashSet::new()
+        };
+
+        // For Indexed completion mode, report the durable succeeded-index set.
+        // Computed here, before ANY status write: every write site must carry
+        // it, or a suspend or deadline pass would blank `.status.completedIndexes`
+        // in the same breath as releasing the pods that were the only other
+        // record of those indexes.
+        let completed_indexes: Option<String> = if is_indexed && !succeeded_index_set.is_empty() {
+            let mut indexes: Vec<i32> = succeeded_index_set.iter().copied().collect();
+            indexes.sort();
+            Some(format_index_ranges(&indexes))
+        } else {
+            None
+        };
+
+        // Failures that must never reach `.status.failed`: the ones an `Ignore`
+        // rule matched, and — for Indexed Jobs — a failure on an index that has
+        // already succeeded.
+        let mut never_count_failed: HashSet<String> = ignored_pods.clone();
+        if is_indexed {
+            for pod in job_pods.iter() {
+                if get_pod_index(pod).is_some_and(|i| succeeded_index_set.contains(&i)) {
+                    never_count_failed.insert(pod.metadata.name.clone());
+                }
+            }
+        }
+
+        // Exactly-once accounting. `succeeded` / `failed` are no longer a
+        // recount of whichever pods happen to still exist — they are the
+        // persisted counters plus the terminal pods this pass is claiming
+        // (#1959). See `job_tracking` for the protocol.
+        let only_replace_failed_pods = job.spec.pod_replacement_policy.as_deref() == Some("Failed");
+        let tracked = self.track_terminated_pods(
+            &format!("{}/{}", namespace, name),
+            job.status.as_ref(),
+            &job_pods,
+            &never_count_failed,
+            is_indexed,
+            only_replace_failed_pods,
+        );
+
+        // Decision values (counted + parked) drive completion and backoff.
+        let succeeded = if is_indexed {
+            succeeded_index_set.len() as i32
+        } else {
+            tracked.succeeded
+        };
+        let failed = tracked.failed;
+        // Persisted values (counted only) go into `.status`. For an Indexed Job
+        // the succeeded-index set IS the durable record, so the two coincide.
+        let status_succeeded = if is_indexed {
+            Some(succeeded_index_set.len() as i32)
+        } else {
+            tracked.status_succeeded
+        };
+        let status_failed = tracked.status_failed;
+        let uncounted_terminated = tracked.uncounted;
+        let pods_to_release = tracked.to_release;
+        let job_tracking_key = format!("{}/{}", namespace, name);
+        // Upstream drops the field once both lists drain, rather than
+        // persisting an empty object.
+        let uncounted_status = match (
+            uncounted_terminated
+                .succeeded
+                .as_ref()
+                .map_or(0, |v| v.len()),
+            uncounted_terminated.failed.as_ref().map_or(0, |v| v.len()),
+        ) {
+            (0, 0) => None,
+            _ => Some(uncounted_terminated),
+        };
+
+        let mut active = 0;
+        let mut ready = 0i32;
+        for pod in job_pods.iter() {
+            if let Some(status) = &pod.status {
+                if matches!(&status.phase, Some(Phase::Running) | Some(Phase::Pending)) {
+                    active += 1;
+                }
+                // Count pods with Ready condition = True
+                if let Some(conditions) = &status.conditions {
+                    if conditions
+                        .iter()
+                        .any(|c| c.condition_type == "Ready" && c.status == "True")
+                    {
+                        ready += 1;
+                    }
+                }
+            }
+        }
+
+        // Handle suspended jobs: delete all active pods and set active to 0
+        if job.spec.suspend.unwrap_or(false) {
+            if active > 0 {
+                for pod in job_pods.iter() {
+                    let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
+                    if matches!(phase, Some(Phase::Running) | Some(Phase::Pending)) {
+                        let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
+                        let _ = self.storage.delete(&pod_key).await;
+                        info!(
+                            "Suspended job {}/{}: deleted active pod {}",
+                            namespace, name, pod.metadata.name
+                        );
+                    }
+                }
+            }
+            // Preserve existing start_time
+            let existing_start_time = job.status.as_ref().and_then(|s| s.start_time);
+            let existing_conditions = job.status.as_ref().and_then(|s| s.conditions.clone());
+            job.status = Some(JobStatus {
+                active: Some(0),
+                succeeded: status_succeeded,
+                failed: status_failed,
+                conditions: existing_conditions,
+                start_time: existing_start_time,
+                completion_time: None,
+                ready: Some(ready),
+                terminating: None,
+                completed_indexes: completed_indexes.clone(),
+                failed_indexes: None,
+                uncounted_terminated_pods: uncounted_status.clone(),
+                observed_generation: job.metadata.generation,
+            });
+            let key = format!("/registry/jobs/{}/{}", namespace, name);
+            self.flush_status_and_release(
+                &key,
+                &job_tracking_key,
+                namespace,
+                job,
+                &pods_to_release,
+                &job_pods,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // Handle activeDeadlineSeconds — fail the job if it has been active too long
+        if let Some(deadline) = job.spec.active_deadline_seconds {
+            if let Some(start) = job.status.as_ref().and_then(|s| s.start_time) {
+                let elapsed = chrono::Utc::now()
+                    .signed_duration_since(start)
+                    .num_seconds();
+                if elapsed > deadline {
+                    warn!(
+                        "Job {}/{} exceeded activeDeadlineSeconds ({} > {})",
+                        namespace, name, elapsed, deadline
+                    );
+                    // Delete all active pods
+                    for pod in job_pods.iter() {
+                        let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
+                        if matches!(phase, Some(Phase::Running) | Some(Phase::Pending)) {
+                            let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
+                            let _ = self.storage.delete(&pod_key).await;
+                        }
+                    }
+                    job.status = Some(JobStatus {
+                        active: Some(0),
+                        succeeded: status_succeeded,
+                        failed: status_failed,
+                        conditions: Some(failed_job_conditions(
+                            "DeadlineExceeded".to_string(),
+                            format!(
+                                "Job was active longer than specified deadline of {} seconds",
+                                deadline
+                            ),
+                        )),
+                        start_time: job.status.as_ref().and_then(|s| s.start_time),
+                        // completionTime is valid ONLY on a Complete job
+                        // (validation.go:505-513: "cannot set completionTime
+                        // when there is no Complete=True condition").
+                        completion_time: None,
+                        ready: Some(ready),
+                        terminating: None,
+                        completed_indexes: completed_indexes.clone(),
+                        failed_indexes: None,
+                        uncounted_terminated_pods: uncounted_status.clone(),
+                        observed_generation: job.metadata.generation,
+                    });
+                    let key = format!("/registry/jobs/{}/{}", namespace, name);
+                    self.flush_status_and_release(
+                        &key,
+                        &job_tracking_key,
+                        namespace,
+                        job,
+                        &pods_to_release,
+                        &job_pods,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
         }
 
         // Track failed indexes for backoffLimitPerIndex
@@ -879,34 +1467,14 @@ impl<S: Storage + 'static> JobController<S> {
         };
 
         // For Indexed mode, K8s sets status.succeeded to the count of unique
-        // succeeded indexes (NOT raw succeeded pod count); status.failed
-        // excludes pods whose index has already succeeded. K8s ref:
+        // succeeded indexes (NOT the raw succeeded pod count). K8s ref:
         //   pkg/controller/job/job_controller.go — status.Succeeded =
         //   succeededIndexes.total().
-        let succeeded_index_set: HashSet<i32> = if is_indexed {
-            collect_indexes_in_phase(job_pods.iter(), Phase::Succeeded)
-        } else {
-            HashSet::new()
-        };
         let succeeded_index_count = if is_indexed {
             succeeded_index_set.len() as i32
         } else {
             succeeded
         };
-
-        if is_indexed {
-            succeeded = succeeded_index_count;
-            failed = job_pods
-                .iter()
-                .filter(|p| {
-                    matches!(
-                        p.status.as_ref().and_then(|s| s.phase.as_ref()),
-                        Some(Phase::Failed)
-                    ) && !ignored_pods.contains(&p.metadata.name)
-                        && !get_pod_index(p).is_some_and(|i| succeeded_index_set.contains(&i))
-                })
-                .count() as i32;
-        }
 
         info!(
             "Job {}/{}: active={}, succeeded={}, failed={}, target={}",
@@ -1019,22 +1587,10 @@ impl<S: Storage + 'static> JobController<S> {
                 }
             }
 
-            // For indexed jobs, succeeded = number of unique succeeded indexes,
-            // not the total succeeded pod count.
-            // K8s ref: pkg/controller/job/job_controller.go — status.Succeeded = succeededIndexes.total()
-            let succeeded_count = if is_indexed {
-                completed_indexes
-                    .as_ref()
-                    .map(|ci| parse_index_ranges(ci).len() as i32)
-                    .unwrap_or(0)
-            } else {
-                succeeded
-            };
-
             job.status = Some(JobStatus {
                 active: Some(0),
-                succeeded: Some(succeeded_count),
-                failed: Some(failed),
+                succeeded: status_succeeded,
+                failed: status_failed,
                 conditions: Some(complete_job_conditions(
                     "SuccessPolicy".to_string(),
                     "Matched rules in the SuccessPolicy".to_string(),
@@ -1048,22 +1604,19 @@ impl<S: Storage + 'static> JobController<S> {
                 terminating: Some(0),
                 completed_indexes: completed_indexes.clone(),
                 failed_indexes: failed_indexes.clone(),
-                uncounted_terminated_pods: None,
+                uncounted_terminated_pods: uncounted_status.clone(),
                 observed_generation: job.metadata.generation,
             });
             let key = format!("/registry/jobs/{}/{}", namespace, name);
-            // Status subresource write — see the note above (#1723).
-            if let Ok(fresh) = self.storage.get::<Job>(&key).await {
-                // Counters must not go backwards against what is already
-                // persisted, or the api-server refuses this and every later
-                // write (#1955).
-                if let Some(next) = job.status.as_mut() {
-                    clamp_counters_monotonic(next, fresh.status.as_ref());
-                }
-                if fresh.status != job.status {
-                    self.storage.update_status(&key, &*job).await?;
-                }
-            }
+            self.flush_status_and_release(
+                &key,
+                &job_tracking_key,
+                namespace,
+                job,
+                &pods_to_release,
+                &job_pods,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -1071,8 +1624,8 @@ impl<S: Storage + 'static> JobController<S> {
             info!("Job {}/{} completed successfully", namespace, name);
             job.status = Some(JobStatus {
                 active: Some(0),
-                succeeded: Some(succeeded),
-                failed: Some(failed),
+                succeeded: status_succeeded,
+                failed: status_failed,
                 conditions: Some(complete_job_conditions(
                     "CompletionsReached".to_string(),
                     "Reached expected number of succeeded pods".to_string(),
@@ -1085,7 +1638,7 @@ impl<S: Storage + 'static> JobController<S> {
                 terminating: Some(0),
                 completed_indexes: completed_indexes.clone(),
                 failed_indexes: failed_indexes.clone(),
-                uncounted_terminated_pods: None,
+                uncounted_terminated_pods: uncounted_status.clone(),
                 observed_generation: job.metadata.generation,
             });
         } else if is_failed {
@@ -1119,8 +1672,8 @@ impl<S: Storage + 'static> JobController<S> {
 
             job.status = Some(JobStatus {
                 active: Some(0),
-                succeeded: Some(succeeded),
-                failed: Some(failed),
+                succeeded: status_succeeded,
+                failed: status_failed,
                 conditions: Some(failed_job_conditions(reason, message)),
                 start_time,
                 // completionTime is valid ONLY on a Complete job
@@ -1131,7 +1684,7 @@ impl<S: Storage + 'static> JobController<S> {
                 terminating: Some(0),
                 completed_indexes: completed_indexes.clone(),
                 failed_indexes: failed_indexes.clone(),
-                uncounted_terminated_pods: None,
+                uncounted_terminated_pods: uncounted_status.clone(),
                 observed_generation: job.metadata.generation,
             });
         } else {
@@ -1269,42 +1822,21 @@ impl<S: Storage + 'static> JobController<S> {
                     })
                     .collect();
 
-                // Recalculate counts. For Indexed jobs apply the same unique-index
-                // semantics as above so status.succeeded/failed stay consistent.
-                active = 0;
-                succeeded = 0;
-                failed = 0;
-
-                let after_succeeded_idx: HashSet<i32> = if is_indexed {
-                    collect_indexes_in_phase(job_pods_after.iter(), Phase::Succeeded)
-                } else {
-                    HashSet::new()
-                };
-
-                for pod in job_pods_after.iter() {
-                    let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
-                    match phase {
-                        Some(Phase::Running) | Some(Phase::Pending) => active += 1,
-                        Some(Phase::Succeeded) if !is_indexed => succeeded += 1,
-                        Some(Phase::Failed) => {
-                            if ignored_pods.contains(&pod.metadata.name) {
-                                continue;
-                            }
-                            // For Indexed jobs, skip Failed pods on an already-succeeded index.
-                            if is_indexed
-                                && get_pod_index(pod)
-                                    .is_some_and(|i| after_succeeded_idx.contains(&i))
-                            {
-                                continue;
-                            }
-                            failed += 1;
-                        }
-                        _ => {}
-                    }
-                }
-                if is_indexed {
-                    succeeded = after_succeeded_idx.len() as i32;
-                }
+                // Only `active` is re-derived here. `succeeded` and `failed`
+                // are cumulative counters owned by the tracking protocol — a
+                // pod contributes to them exactly once, when its UID is claimed
+                // — so recounting them from this list would count every
+                // already-counted pod a second time. The pods just created are
+                // Pending, which is precisely what `active` measures.
+                active = job_pods_after
+                    .iter()
+                    .filter(|pod| {
+                        matches!(
+                            pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+                            Some(Phase::Running) | Some(Phase::Pending)
+                        )
+                    })
+                    .count() as i32;
             }
 
             // Update status — but preserve conditions and completion_time if job
@@ -1326,8 +1858,8 @@ impl<S: Storage + 'static> JobController<S> {
             if !already_complete {
                 job.status = Some(JobStatus {
                     active: Some(active),
-                    succeeded: Some(succeeded),
-                    failed: Some(failed),
+                    succeeded: status_succeeded,
+                    failed: status_failed,
                     conditions: existing_conditions,
                     start_time,
                     completion_time: existing_completion,
@@ -1335,7 +1867,7 @@ impl<S: Storage + 'static> JobController<S> {
                     terminating: None,
                     completed_indexes: completed_indexes.clone(),
                     failed_indexes: failed_indexes.clone(),
-                    uncounted_terminated_pods: None,
+                    uncounted_terminated_pods: uncounted_status.clone(),
                     observed_generation: job.metadata.generation,
                 });
             }
@@ -1371,60 +1903,15 @@ impl<S: Storage + 'static> JobController<S> {
                 job.status.as_ref().and_then(|s| s.conditions.as_ref())
             );
         }
-        // Refresh resourceVersion before update to avoid CAS conflicts.
-        // The job's RV may be stale from the list() at the start of reconcile_all().
-        // Other components (API server, kubelet) may have modified the job since then.
-        let status_to_save = job.status.clone();
-        for attempt in 0..3 {
-            match self.storage.get::<Job>(&key).await {
-                Ok(mut fresh_job) => {
-                    // Counters must not go backwards against what is already
-                    // persisted, or the api-server refuses this and every later
-                    // write (#1955).
-                    let mut next_status = status_to_save.clone();
-                    if let Some(next) = next_status.as_mut() {
-                        clamp_counters_monotonic(next, fresh_job.status.as_ref());
-                    }
-                    // Only write status if it actually changed to avoid unnecessary
-                    // storage writes that trigger watch events and cause feedback loops
-                    if fresh_job.status == next_status {
-                        break;
-                    }
-                    fresh_job.status = next_status;
-                    // Status subresource write (#1723).
-                    match self.storage.update_status(&key, &fresh_job).await {
-                        Ok(_) => {
-                            if has_complete || has_failed {
-                                info!(
-                                    "Job {}/{} status update persisted (attempt {})",
-                                    namespace,
-                                    name,
-                                    attempt + 1
-                                );
-                            }
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Job {}/{} status update CAS conflict (attempt {}): {}",
-                                namespace,
-                                name,
-                                attempt + 1,
-                                e
-                            );
-                            if attempt == 2 {
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Job was deleted between list and update
-                    debug!("Job {}/{} no longer exists: {}", namespace, name, e);
-                    break;
-                }
-            }
-        }
+        self.flush_status_and_release(
+            &key,
+            &job_tracking_key,
+            namespace,
+            job,
+            &pods_to_release,
+            &job_pods,
+        )
+        .await?;
 
         Ok(())
     }
@@ -1526,7 +2013,13 @@ impl<S: Storage + 'static> JobController<S> {
                 deletion_timestamp: None,
                 resource_version: None,
                 deletion_grace_period_seconds: None,
-                finalizers: None,
+                // Hold the pod until the Job status has accounted for it.
+                // Upstream sets the same finalizer on every pod it creates
+                // (`batch.JobTrackingFinalizer`,
+                // staging/src/k8s.io/api/batch/v1/types.go:44): "It prevents
+                // them from being deleted before being accounted in the Job
+                // status."
+                finalizers: Some(vec![JOB_TRACKING_FINALIZER.to_string()]),
                 owner_references: Some(vec![OwnerReference {
                     api_version: "batch/v1".to_string(),
                     kind: "Job".to_string(),
@@ -1797,6 +2290,12 @@ mod tests {
                 name: name.to_string(),
                 namespace: Some(namespace.to_string()),
                 uid: format!("pod-uid-{}", name),
+                // Model a controller-created pod: the Job controller stamps
+                // every pod it creates with the tracking finalizer, and a pod
+                // without it is invisible to the accounting protocol by design
+                // (upstream `getValidPodsWithFilter`: "Pods that don't have a
+                // completion finalizer ... have already been accounted for").
+                finalizers: Some(vec![JOB_TRACKING_FINALIZER.to_string()]),
                 labels: Some({
                     let mut m = HashMap::new();
                     m.insert("job-name".to_string(), job_name.to_string());
