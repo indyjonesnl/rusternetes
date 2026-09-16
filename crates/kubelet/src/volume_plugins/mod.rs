@@ -11,6 +11,7 @@ pub mod empty_dir;
 pub mod host;
 pub mod host_path;
 pub mod plugin;
+pub mod projected;
 pub mod registry;
 pub mod secret;
 
