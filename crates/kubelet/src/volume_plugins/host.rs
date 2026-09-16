@@ -40,6 +40,21 @@ pub trait VolumeHost: Send + Sync {
     /// no lookup and therefore no error path — `Result<_, Error>` would have
     /// nothing to return but `Ok`.
     fn get_node_allocatable(&self) -> &HashMap<String, String>;
+
+    /// Not a port — upstream's `VolumeHost` has no root-directory accessor
+    /// (`pkg/volume/plugins.go` and `pkg/kubelet/volume_host.go` expose only
+    /// derived dirs: `GetPluginDir`, `GetPodsDir`, `GetPodVolumeDir`,
+    /// `GetPodPluginDir`, `GetVolumeDevicePluginDir`,
+    /// `GetPodVolumeDeviceDir` — none return the bare root). This exists
+    /// because the secret plugin's CA-cert injection is a Rusternetes-only
+    /// mechanism with no upstream counterpart, and it needs the root to build
+    /// a `_certs` path alongside `pods`. It returns the host's *stored* root
+    /// rather than inverting `get_pods_dir()` (i.e. re-deriving it via
+    /// `.parent()`), so the pod-directory layout keeps exactly one
+    /// definition — [`crate::pod_dirs`] — instead of a second implicit one
+    /// that silently breaks if the layout ever changes. That was #1967: two
+    /// path builders disagreeing.
+    fn get_volumes_base_path(&self) -> &str;
 }
 
 /// The kubelet's `VolumeHost`. Owns clones of the three values
@@ -94,6 +109,10 @@ impl VolumeHost for KubeletVolumeHost {
     fn get_node_allocatable(&self) -> &HashMap<String, String> {
         &self.node_allocatable
     }
+
+    fn get_volumes_base_path(&self) -> &str {
+        &self.volumes_base_path
+    }
 }
 
 #[cfg(test)]
@@ -127,5 +146,14 @@ mod tests {
             host().get_pods_dir(),
             std::path::PathBuf::from("/var/lib/rusternetes/pods")
         );
+    }
+
+    /// The accessor must return exactly the root the host was constructed
+    /// with — no re-derivation from `get_pods_dir()` or any other getter.
+    /// This is the invariant a `.parent()`-based derivation would silently
+    /// assume instead of stating.
+    #[test]
+    fn volumes_base_path_matches_constructor_argument() {
+        assert_eq!(host().get_volumes_base_path(), "/var/lib/rusternetes");
     }
 }

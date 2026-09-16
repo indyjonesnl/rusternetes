@@ -37,11 +37,6 @@ impl VolumePlugin for SecretPlugin {
     }
 
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
-        let pods_dir = self.host.get_pods_dir();
-        let volumes_base_path = pods_dir
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
         Ok(Box::new(SecretMounter {
             path: self
                 .host
@@ -63,7 +58,7 @@ impl VolumePlugin for SecretPlugin {
                 .and_then(|s| s.service_account_name.clone()),
             node_name: pod.spec.as_ref().and_then(|s| s.node_name.clone()),
             storage: self.host.get_kube_client().cloned(),
-            volumes_base_path,
+            volumes_base_path: self.host.get_volumes_base_path().to_string(),
             token_manager: self.host.get_service_account_token_func().clone(),
         }))
     }
