@@ -2326,6 +2326,92 @@ mod projected_mode_tests {
         let dir_mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(dir_mode & 0o777, 0o400 | 0o111);
     }
+
+    /// Characterization test for the downwardAPI volume plugin's `set_up`
+    /// body, written and run BEFORE that body moves out of `create_volume`
+    /// (#1970 Task 7) — see the task-7 report for the equivalence run against
+    /// the pre-move commit. Goes through the public entry point,
+    /// `VolumeManager::create_volume`, not the plugin directly, and asserts
+    /// on the real on-disk result: the returned path, a `fieldRef` item's
+    /// contents, a `resourceFieldRef` item's contents, the mode a per-item
+    /// `mode` applies, the mode `defaultMode` applies to an item with no
+    /// override, and the directory mode (`defaultMode | 0o111`).
+    #[tokio::test]
+    async fn create_volume_writes_downward_api_data_to_disk() {
+        let storage = Arc::new(StorageBackend::new_memory());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {"containers": [{
+                "name": "app",
+                "resources": {"limits": {"cpu": "2"}}
+            }]}
+        }))
+        .unwrap();
+        let volume: rusternetes_common::resources::Volume = serde_json::from_value(json!({
+            "name": "podinfo",
+            "downwardAPI": {
+                "defaultMode": 416,
+                "items": [
+                    {"path": "podname", "fieldRef": {"fieldPath": "metadata.name"}},
+                    {
+                        "path": "cpu_limit",
+                        "resourceFieldRef": {"containerName": "app", "resource": "limits.cpu"},
+                        "mode": 256
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+
+        let path = vm.create_volume(&pod, &volume).await.unwrap();
+        assert_eq!(
+            path,
+            format!(
+                "{}/pods/uid-1/volumes/kubernetes.io~downward-api/podinfo",
+                tmp.path().to_string_lossy()
+            )
+        );
+
+        let podname = std::fs::read_to_string(format!("{path}/podname")).unwrap();
+        assert_eq!(podname, "p", "fieldRef item must contain metadata.name");
+        let cpu_limit = std::fs::read_to_string(format!("{path}/cpu_limit")).unwrap();
+        assert_eq!(
+            cpu_limit, "2",
+            "resourceFieldRef item must contain the container's limits.cpu, in whole cores"
+        );
+
+        let podname_mode = std::fs::metadata(format!("{path}/podname"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            podname_mode & 0o777,
+            0o640,
+            "file mode must come from the volume's defaultMode when the item has no mode"
+        );
+
+        let cpu_limit_mode = std::fs::metadata(format!("{path}/cpu_limit"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            cpu_limit_mode & 0o777,
+            0o400,
+            "file mode must come from the item's own mode when set"
+        );
+
+        // da_dir_mode = defaultMode | 0o111 (volumes.rs's moved body)
+        let dir_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o640 | 0o111);
+    }
 }
 
 /// Orphaned pod directory sweep — port of `cleanupOrphanedPodDirs`
