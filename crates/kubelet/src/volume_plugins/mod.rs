@@ -5,8 +5,10 @@
 //! (caches, reconciler, reconstruction) is written against that interface, so
 //! it is the seam the rest of epic #1970 needs.
 
+pub mod host;
 pub mod plugin;
 pub mod registry;
 
+pub use host::{KubeletVolumeHost, VolumeHost};
 pub use plugin::{Mounter, Spec, VolumePlugin};
 pub use registry::{PluginLookupError, VolumePluginMgr};
