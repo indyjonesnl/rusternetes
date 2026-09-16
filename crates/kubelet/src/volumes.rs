@@ -213,6 +213,9 @@ impl VolumeManager {
             Box::new(crate::volume_plugins::secret::SecretPlugin::new(
                 host.clone(),
             )),
+            Box::new(crate::volume_plugins::downward_api::DownwardApiPlugin::new(
+                host.clone(),
+            )),
         ]));
         Self {
             volumes_base_path,
@@ -1056,76 +1059,16 @@ impl VolumeManager {
         }
 
         // DownwardAPI: expose pod/container metadata as files
-        if let Some(downward_api) = &volume.downward_api {
-            let volume_dir = self.pod_volume_dir(pod, volume);
-            std::fs::create_dir_all(&volume_dir)
-                .context("Failed to create DownwardAPI volume directory")?;
-
-            // Determine the default file mode: spec defaultMode, or 0644 (Kubernetes default)
-            let da_default_mode = downward_api.default_mode.unwrap_or(0o644);
-
-            // Compute final directory permissions (applied after files are written)
-            #[cfg(unix)]
-            let da_dir_mode = da_default_mode as u32 | 0o111;
-
-            if let Some(items) = &downward_api.items {
-                for item in items {
-                    let file_path = format!("{}/{}", volume_dir, item.path);
-
-                    // Create parent directories if needed
-                    if let Some(parent) = std::path::Path::new(&file_path).parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-
-                    // Get the value from field_ref or resource_field_ref
-                    let value = if let Some(field_ref) = &item.field_ref {
-                        self.get_pod_field_value(pod, &field_ref.field_path)?
-                    } else if let Some(resource_ref) = &item.resource_field_ref {
-                        self.get_container_resource_value(pod, resource_ref)?
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "DownwardAPI item must have either fieldRef or resourceFieldRef"
-                        ));
-                    };
-
-                    std::fs::write(&file_path, value).with_context(|| {
-                        format!("Failed to write DownwardAPI file {}", file_path)
-                    })?;
-
-                    // Set file permissions: per-item mode overrides defaultMode
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mode = item.mode.unwrap_or(da_default_mode) as u32;
-                        std::fs::set_permissions(
-                            &file_path,
-                            std::fs::Permissions::from_mode(mode),
-                        )?;
-                    }
-
-                    info!(
-                        "Wrote DownwardAPI file {} with value from {}",
-                        file_path, item.path
-                    );
-                }
-            }
-
-            // Set directory permissions after files are written so that restrictive
-            // defaultMode values don't prevent file creation.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    &volume_dir,
-                    std::fs::Permissions::from_mode(da_dir_mode),
-                )?;
-            }
-
-            info!(
-                "Created DownwardAPI volume {} at {}",
-                volume.name, volume_dir
-            );
-            return Ok(volume_dir);
+        if volume.downward_api.is_some() {
+            let spec = crate::volume_plugins::Spec {
+                volume,
+                persistent_volume: None,
+            };
+            let plugin =
+                crate::volume_plugins::downward_api::DownwardApiPlugin::new(self.host.clone());
+            let mounter = plugin.new_mounter(&spec, pod).await?;
+            mounter.set_up().await?;
+            return Ok(mounter.get_path());
         }
 
         // CSI: ephemeral inline volume (handled by external CSI driver)
