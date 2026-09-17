@@ -1,5 +1,5 @@
 use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::{Pod, Secret, SecretVolumeSource};
 use rusternetes_storage::{build_key, Storage, StorageBackend};
@@ -21,6 +21,28 @@ impl SecretPlugin {
 impl VolumePlugin for SecretPlugin {
     fn name(&self) -> &'static str {
         crate::pod_dirs::plugin::SECRET
+    }
+
+    /// `GetVolumeName` (`secret.go:72-79`): the referenced Secret's name.
+    ///
+    /// `SecretVolumeSource.secret_name` is `Option<String>` here where
+    /// upstream's is a plain string whose zero value is `""`;
+    /// `unwrap_or_default` reproduces that zero value.
+    fn get_volume_name(&self, spec: &Spec<'_>) -> Result<String> {
+        let Some(source) = &spec.volume.secret else {
+            return Err(anyhow!("Spec does not reference a Secret volume type"));
+        };
+        Ok(source.secret_name.clone().unwrap_or_default())
+    }
+
+    /// `RequiresRemount` (`secret.go:85-87`): `true`.
+    fn requires_remount(&self, _spec: &Spec<'_>) -> bool {
+        true
+    }
+
+    /// `SupportsSELinuxContextMount` (`secret.go:93-95`): `(false, nil)`.
+    fn supports_selinux_context_mount(&self, _spec: &Spec<'_>) -> Result<bool> {
+        Ok(false)
     }
 
     /// `CanSupport` (`secret.go:81-83`), verbatim:

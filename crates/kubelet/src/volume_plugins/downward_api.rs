@@ -1,5 +1,5 @@
 use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::{Pod, Volume};
 use std::collections::HashMap;
@@ -21,6 +21,25 @@ impl DownwardApiPlugin {
 impl VolumePlugin for DownwardApiPlugin {
     fn name(&self) -> &'static str {
         crate::pod_dirs::plugin::DOWNWARD_API
+    }
+
+    /// `GetVolumeName` (`downwardapi.go:69-77`): the user-defined volume name,
+    /// because this is an ephemeral volume type.
+    fn get_volume_name(&self, spec: &Spec<'_>) -> Result<String> {
+        if spec.volume.downward_api.is_none() {
+            return Err(anyhow!("Spec does not reference a DownwardAPI volume type"));
+        }
+        Ok(spec.name().to_string())
+    }
+
+    /// `RequiresRemount` (`downwardapi.go:83-85`): `true`.
+    fn requires_remount(&self, _spec: &Spec<'_>) -> bool {
+        true
+    }
+
+    /// `SupportsSELinuxContextMount` (`downwardapi.go:91-93`): `(false, nil)`.
+    fn supports_selinux_context_mount(&self, _spec: &Spec<'_>) -> Result<bool> {
+        Ok(false)
     }
 
     /// `CanSupport` (`downwardapi.go:79-81`), verbatim:

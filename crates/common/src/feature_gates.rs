@@ -59,6 +59,32 @@ pub enum Feature {
     /// Beta + default-on in v1.33; rusternetes targets v1.35 so the default
     /// is `true`.
     InPlacePodVerticalScaling,
+
+    /// When enabled, the kubelet computes an SELinux mount label for
+    /// `ReadWriteOncePod` volumes and mounts them with `-o context=`, and the
+    /// volume-manager caches treat two volumes with the same name but
+    /// different SELinux contexts as different volumes.
+    ///
+    /// Upstream: `pkg/features/kube_features.go::SELinuxMountReadWriteOncePod`
+    /// — Beta + default-on since v1.28 (`kube_features.go:1743-1747`), so the
+    /// v1.35 default is `true`.
+    SELinuxMountReadWriteOncePod,
+
+    /// When enabled, the `-o context=` mount is extended from `ReadWriteOncePod`
+    /// volumes to every access mode.
+    ///
+    /// Upstream: `pkg/features/kube_features.go::SELinuxMount` — Beta but
+    /// off-by-default in v1.33 (`kube_features.go:1738-1741`), unchanged in
+    /// v1.35, so the default is `false`.
+    SELinuxMount,
+
+    /// When enabled, a pod may opt out of `-o context=` mounting via
+    /// `spec.securityContext.seLinuxChangePolicy: Recursive`.
+    ///
+    /// Upstream: `pkg/features/kube_features.go::SELinuxChangePolicy` — Beta +
+    /// default-on since v1.33 (`kube_features.go:1733-1736`), so the v1.35
+    /// default is `true`.
+    SELinuxChangePolicy,
 }
 
 impl Feature {
@@ -69,6 +95,9 @@ impl Feature {
             Feature::PodTopologyLabelsAdmission => 1,
             Feature::NodeDeclaredFeatures => 2,
             Feature::InPlacePodVerticalScaling => 3,
+            Feature::SELinuxMountReadWriteOncePod => 4,
+            Feature::SELinuxMount => 5,
+            Feature::SELinuxChangePolicy => 6,
         }
     }
 
@@ -83,6 +112,12 @@ impl Feature {
             Feature::NodeDeclaredFeatures => false,
             // Beta + default-on since v1.33.
             Feature::InPlacePodVerticalScaling => true,
+            // Beta + default-on since v1.28.
+            Feature::SELinuxMountReadWriteOncePod => true,
+            // Beta but off-by-default since v1.33.
+            Feature::SELinuxMount => false,
+            // Beta + default-on since v1.33.
+            Feature::SELinuxChangePolicy => true,
         }
     }
 }
@@ -103,6 +138,9 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::PodTopologyLabelsAdmission,
     Feature::NodeDeclaredFeatures,
     Feature::InPlacePodVerticalScaling,
+    Feature::SELinuxMountReadWriteOncePod,
+    Feature::SELinuxMount,
+    Feature::SELinuxChangePolicy,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -121,6 +159,9 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::PodTopologyLabelsAdmission.default_enabled()),
     AtomicBool::new(Feature::NodeDeclaredFeatures.default_enabled()),
     AtomicBool::new(Feature::InPlacePodVerticalScaling.default_enabled()),
+    AtomicBool::new(Feature::SELinuxMountReadWriteOncePod.default_enabled()),
+    AtomicBool::new(Feature::SELinuxMount.default_enabled()),
+    AtomicBool::new(Feature::SELinuxChangePolicy.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.

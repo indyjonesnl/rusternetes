@@ -1,5 +1,5 @@
 use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::Pod;
 use std::sync::Arc;
@@ -35,6 +35,49 @@ impl CsiPlugin {
 impl VolumePlugin for CsiPlugin {
     fn name(&self) -> &'static str {
         crate::pod_dirs::plugin::CSI
+    }
+
+    /// `GetVolumeName` (`csi_plugin.go:437-445`): `"<driver>^<volumeHandle>"`,
+    /// where `^` is upstream's `volNameSep` (`csi_plugin.go:57`).
+    ///
+    /// Upstream resolves the source with `getPVSourceFromSpec`
+    /// (`csi_util.go:165-174`), which rejects an inline `CSIVolumeSource`
+    /// outright — an inline CSI volume is ephemeral and pod-scoped, so it never
+    /// reaches the unique-name-from-spec branch. That rejection is ported
+    /// verbatim even though this plugin only supports the inline arm today
+    /// (see the struct doc): the error is upstream's answer, not a gap.
+    fn get_volume_name(&self, spec: &Spec<'_>) -> Result<String> {
+        if spec.volume.csi.is_some() {
+            return Err(anyhow!(
+                "plugin.GetVolumeName failed to extract volume source from spec: unexpected api.CSIVolumeSource found in volume.Spec"
+            ));
+        }
+        let Some(source) = spec.persistent_volume.and_then(|pv| pv.spec.csi.as_ref()) else {
+            return Err(anyhow!(
+                "plugin.GetVolumeName failed to extract volume source from spec: volume source not found in volume.Spec"
+            ));
+        };
+        Ok(format!(
+            "{}^{}",
+            source.driver,
+            source.volume_handle.as_deref().unwrap_or_default()
+        ))
+    }
+
+    /// `RequiresRemount` (`csi_plugin.go:457-460`): upstream consults the
+    /// CSIDriver lister and returns `false` when it is nil. We have no lister,
+    /// which is exactly that nil case.
+    fn requires_remount(&self, _spec: &Spec<'_>) -> bool {
+        false
+    }
+
+    /// `SupportsSELinuxContextMount` (`csi_plugin.go:637-...`): upstream looks
+    /// the driver up in the CSIDriver lister to read its `SELinuxMount` field.
+    /// With no lister we cannot answer `true` for any driver, so this reports
+    /// `false` — the same answer upstream gives for a driver that does not
+    /// declare `seLinuxMount: true`, which is the default.
+    fn supports_selinux_context_mount(&self, _spec: &Spec<'_>) -> Result<bool> {
+        Ok(false)
     }
 
     /// `CanSupport` — inline arm only. Upstream checks both

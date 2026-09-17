@@ -1,6 +1,6 @@
 use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
 use crate::volumes::build_configmap_payload;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::{ConfigMap, ConfigMapVolumeSource, Pod};
 use rusternetes_storage::{build_key, Storage, StorageBackend};
@@ -22,6 +22,35 @@ impl ConfigMapPlugin {
 impl VolumePlugin for ConfigMapPlugin {
     fn name(&self) -> &'static str {
         crate::pod_dirs::plugin::CONFIG_MAP
+    }
+
+    /// `GetVolumeName` (`configmap.go:65-75`): `"<spec name>/<configMap name>"`
+    /// — the pair, not either alone, because one pod may mount two different
+    /// ConfigMaps and two pods may mount the same one.
+    ///
+    /// `ConfigMapVolumeSource.name` is `Option<String>` here where upstream's
+    /// embedded `LocalObjectReference.Name` is a plain string whose zero value
+    /// is `""`; `unwrap_or_default` reproduces that zero value.
+    fn get_volume_name(&self, spec: &Spec<'_>) -> Result<String> {
+        let Some(source) = &spec.volume.config_map else {
+            return Err(anyhow!("Spec does not reference a ConfigMap volume type"));
+        };
+        Ok(format!(
+            "{}/{}",
+            spec.name(),
+            source.name.as_deref().unwrap_or_default()
+        ))
+    }
+
+    /// `RequiresRemount` (`configmap.go:81-83`): `true` — a ConfigMap volume
+    /// tracks its API object, so an update must re-run the mount.
+    fn requires_remount(&self, _spec: &Spec<'_>) -> bool {
+        true
+    }
+
+    /// `SupportsSELinuxContextMount` (`configmap.go:89-91`): `(false, nil)`.
+    fn supports_selinux_context_mount(&self, _spec: &Spec<'_>) -> Result<bool> {
+        Ok(false)
     }
 
     /// `CanSupport` (`configmap.go:77-79`), verbatim:

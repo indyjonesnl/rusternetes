@@ -1,5 +1,5 @@
 use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::{ConfigMap, Pod, Secret, Volume};
 use rusternetes_storage::{build_key, Storage, StorageBackend};
@@ -22,6 +22,26 @@ impl ProjectedPlugin {
 impl VolumePlugin for ProjectedPlugin {
     fn name(&self) -> &'static str {
         crate::pod_dirs::plugin::PROJECTED
+    }
+
+    /// `GetVolumeName` (`projected.go:87-94`): the user-defined volume name,
+    /// after `getVolumeSource` (`projected.go:459-465`) confirms the spec is
+    /// actually a projected volume.
+    fn get_volume_name(&self, spec: &Spec<'_>) -> Result<String> {
+        if spec.volume.projected.is_none() {
+            return Err(anyhow!("spec does not reference a projected volume type"));
+        }
+        Ok(spec.name().to_string())
+    }
+
+    /// `RequiresRemount` (`projected.go:100-102`): `true`.
+    fn requires_remount(&self, _spec: &Spec<'_>) -> bool {
+        true
+    }
+
+    /// `SupportsSELinuxContextMount` (`projected.go:108-110`): `(false, nil)`.
+    fn supports_selinux_context_mount(&self, _spec: &Spec<'_>) -> Result<bool> {
+        Ok(false)
     }
 
     /// `CanSupport` (`projected.go:96-98`), verbatim:
