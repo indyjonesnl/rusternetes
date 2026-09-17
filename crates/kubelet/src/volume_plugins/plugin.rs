@@ -134,6 +134,23 @@ pub trait VolumePlugin: Send + Sync {
         false
     }
 
+    /// `NodeExpandableVolumePlugin.RequiresFSResize` (`plugins.go:258-263`),
+    /// gated on the plugin being node-expandable at all.
+    ///
+    /// **Deliberate collapse**, the same one as [`VolumePlugin::can_attach`]:
+    /// upstream's `FindNodeExpandablePluginBySpec` (`plugins.go:926-935`)
+    /// type-asserts the plugin to `NodeExpandableVolumePlugin` and the caller
+    /// then calls `RequiresFSResize()` on it, so a plugin that is not
+    /// node-expandable and one that is but does not need an FS resize reach
+    /// the same branch in `volumeNeedsExpansion`
+    /// (`actual_state_of_world.go:981-992`). We have no
+    /// `NodeExpandableVolumePlugin` sub-interface, so the two collapse into
+    /// one predicate. Every plugin this crate registers answers `false`,
+    /// which is the answer upstream gives for all seven of them.
+    fn requires_fs_resize(&self, _spec: &Spec<'_>) -> bool {
+        false
+    }
+
     /// `NewMounter` (`plugins.go:162`).
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>>;
 }
@@ -148,8 +165,14 @@ pub trait VolumePlugin: Send + Sync {
 /// because every caller in this crate already threads volume paths as
 /// `String`. It is not necessarily under the pod directory — the hostPath
 /// plugin's path is wherever the host path points.
+///
+/// **`Sync` added.** Upstream's `volume.Mounter` carries no such bound, but the
+/// value is stored in `actualStateOfWorld.attachedVolumes` — a map behind an
+/// `RWMutex` that every kubelet goroutine reads (`actual_state_of_world.go:256`,
+/// `:359`). `ActualStateOfWorld` holding an `Arc<dyn Mounter>` is only `Sync`
+/// if the mounter is, so Rust makes explicit the sharing Go leaves implicit.
 #[async_trait]
-pub trait Mounter: Send {
+pub trait Mounter: Send + Sync {
     /// `Volume::GetPath` (`volume.go:36`).
     fn get_path(&self) -> String;
 
@@ -157,4 +180,28 @@ pub trait Mounter: Send {
     /// (fsGroup, SELinux label); no moved body reads any of it, so the
     /// argument is not ported until a consumer needs it.
     async fn set_up(&self) -> Result<()>;
+}
+
+/// Port of `volume.BlockVolumeMapper` (`pkg/volume/volume.go:200-203`), which
+/// is `volume.BlockVolume` (`volume.go:45-62`) under another name.
+///
+/// `ActualStateOfWorld` only ever stores this value and hands it back out in a
+/// `MountedVolume`; it never calls a method on it. Following the convention
+/// this module already set for [`Mounter`] and [`VolumePlugin`], only the
+/// methods that identify the mapping are ported — `SupportsMetrics` and the
+/// embedded `MetricsProvider` arrive with the sub-project that reports volume
+/// metrics, and `CustomBlockVolumeMapper`'s `SetUpDevice` / `MapPodDevice` /
+/// `GetStagingPath` (`volume.go:205-225`) with the block-volume reconciler.
+///
+/// No plugin in this crate implements it yet — block volumes are not
+/// supported — but the field exists so the reconciler can thread a mapper
+/// through without reshaping the cache. `Send + Sync` for the same reason as
+/// [`Mounter`].
+pub trait BlockVolumeMapper: Send + Sync {
+    /// `BlockVolume::GetGlobalMapPath` (`volume.go:49`).
+    fn get_global_map_path(&self, spec: &Spec<'_>) -> Result<String>;
+
+    /// `BlockVolume::GetPodDeviceMapPath` (`volume.go:53`). Returns the pod
+    /// device map path and the name of the symlink to the block device.
+    fn get_pod_device_map_path(&self) -> (String, String);
 }
