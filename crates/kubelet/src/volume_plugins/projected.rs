@@ -93,7 +93,8 @@ impl Mounter for ProjectedMounter {
     }
 
     async fn set_up(&self) -> Result<()> {
-        // ---- moved verbatim from create_volume's projected branch (62e70477) ----
+        // ---- moved verbatim from create_volume's projected branch
+        //      (991a503d:crates/kubelet/src/volumes.rs:1554-1933) ----
         let projected = self
             .volume
             .projected

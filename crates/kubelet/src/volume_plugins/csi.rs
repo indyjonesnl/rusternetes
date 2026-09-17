@@ -66,7 +66,8 @@ impl Mounter for CsiMounter {
     }
 
     async fn set_up(&self) -> Result<()> {
-        // ---- moved verbatim from create_volume's CSI branch (51c5c955) ----
+        // ---- moved verbatim from create_volume's CSI branch
+        //      (991a503d:crates/kubelet/src/volumes.rs:1449-1461) ----
         // CSI ephemeral inline volumes are managed by the CSI driver via the kubelet CSI plugin
         // For conformance, we create a placeholder directory and rely on the CSI driver to populate it
         let volume_dir = &self.path;

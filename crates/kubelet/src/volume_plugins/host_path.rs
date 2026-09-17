@@ -117,7 +117,8 @@ impl Mounter for HostPathMounter {
     /// `create_volume`'s PVC branch did not check it. Sanctioned delta, see
     /// the plan.
     async fn set_up(&self) -> Result<()> {
-        // ---- moved verbatim from create_volume's hostPath branch (d401f4ea) ----
+        // ---- moved verbatim from create_volume's hostPath branch
+        //      (991a503d:crates/kubelet/src/volumes.rs:959-988) ----
         let path = &self.path;
         let host_path_type = self.path_type.as_deref();
         match check_host_path_type(path, host_path_type) {

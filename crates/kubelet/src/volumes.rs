@@ -1000,7 +1000,8 @@ impl VolumeManager {
 
         // PersistentVolumeClaim: find bound PV and use its path
         if let Some(pvc_source) = &volume.persistent_volume_claim {
-            // ---- moved verbatim from create_volume's PersistentVolumeClaim branch (c605ea36) ----
+            // ---- moved verbatim from create_volume's PersistentVolumeClaim branch
+            //      (991a503d:crates/kubelet/src/volumes.rs:1328-1373) ----
             let storage = self
                 .storage
                 .as_ref()
@@ -1048,7 +1049,8 @@ impl VolumeManager {
         // Ephemeral: generic ephemeral volume with PVC template
         if let Some(ephemeral) = &volume.ephemeral {
             if let Some(pvc_template) = &ephemeral.volume_claim_template {
-                // ---- moved verbatim from create_volume's Ephemeral branch (c605ea36) ----
+                // ---- moved verbatim from create_volume's Ephemeral branch
+                //      (991a503d:crates/kubelet/src/volumes.rs:1464-1551) ----
                 let storage = self
                     .storage
                     .as_ref()
@@ -1837,7 +1839,7 @@ mod projected_mode_tests {
     /// `defaultMode`. This is the test the Task 6 review found missing — the
     /// safety argument for the highest-risk moved body in the refactor had
     /// rested entirely on the text diff. It was re-run unmodified against
-    /// `395a9c08` (the pre-move commit) to confirm it characterizes the OLD
+    /// `991a503d` (the pre-move commit) to confirm it characterizes the OLD
     /// behaviour too, not just whatever the new code happens to do — see the
     /// task-6 report for both runs.
     #[tokio::test]

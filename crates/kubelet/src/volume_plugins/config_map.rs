@@ -73,7 +73,8 @@ impl Mounter for ConfigMapMounter {
     }
 
     async fn set_up(&self) -> Result<()> {
-        // ---- moved verbatim from create_volume's configMap branch (a1a39354) ----
+        // ---- moved verbatim from create_volume's configMap branch
+        //      (991a503d:crates/kubelet/src/volumes.rs:991-1059) ----
         let storage = self
             .storage
             .as_ref()

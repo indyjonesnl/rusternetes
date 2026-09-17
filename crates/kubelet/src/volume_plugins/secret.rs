@@ -87,7 +87,8 @@ impl Mounter for SecretMounter {
     }
 
     async fn set_up(&self) -> Result<()> {
-        // ---- moved verbatim from create_volume's secret branch (395a9c08) ----
+        // ---- moved verbatim from create_volume's secret branch
+        //      (991a503d:crates/kubelet/src/volumes.rs:1062-1325) ----
         let storage = self
             .storage
             .as_ref()

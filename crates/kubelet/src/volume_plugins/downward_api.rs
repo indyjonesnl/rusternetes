@@ -69,7 +69,8 @@ impl Mounter for DownwardApiMounter {
     }
 
     async fn set_up(&self) -> Result<()> {
-        // ---- moved verbatim from create_volume's downwardAPI branch (4ac888ac) ----
+        // ---- moved verbatim from create_volume's downwardAPI branch
+        //      (991a503d:crates/kubelet/src/volumes.rs:1376-1446) ----
         let downward_api = self
             .volume
             .downward_api
