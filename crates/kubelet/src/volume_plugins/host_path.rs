@@ -67,7 +67,15 @@ impl VolumePlugin for HostPathPlugin {
     /// order only matters for fidelity to upstream, not for behaviour here.
     async fn new_mounter(&self, spec: &Spec<'_>, _pod: &Pod) -> Result<Box<dyn Mounter>> {
         let (path, path_type) = if let Some(hp) = spec.volume.host_path.as_ref() {
-            (hp.path.clone(), hp.type_.clone())
+            // Pre-move behaviour expanded only the inline arm's path
+            // (`991a503d:volumes.rs:961`, `expand_env_vars(&host_path.path)`).
+            // The PV arm was always a plain clone (`:1361`) and so was the
+            // ephemeral arm (`:1531`) — deliberately asymmetric, kept here.
+            // `expand_env_vars` (`crate::runtime`) resolves an unset name to
+            // the empty string via `unwrap_or_default()`, so expanding the PV
+            // arm too would silently turn a `spec.hostPath.path` typo into a
+            // different, existing directory with no error.
+            (crate::runtime::expand_env_vars(&hp.path), hp.type_.clone())
         } else if let Some(hp) = spec
             .persistent_volume
             .and_then(|pv| pv.spec.host_path.as_ref())
@@ -85,8 +93,7 @@ impl VolumePlugin for HostPathPlugin {
             ));
         };
         Ok(Box::new(HostPathMounter {
-            // Expand environment variables in the path
-            path: crate::runtime::expand_env_vars(&path),
+            path,
             path_type,
             volume_name: spec.volume.name.clone(),
         }))
@@ -233,5 +240,39 @@ mod tests {
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
         assert_eq!(m.get_path(), "/mnt/data");
+    }
+
+    /// Pre-move, only the inline hostPath arm was environment-expanded
+    /// (`991a503d:volumes.rs:961`); the PV arm was a plain clone
+    /// (`:1361`). An unset var expands to "" via `expand_env_vars`'s
+    /// `unwrap_or_default()`, so this also proves the split does not
+    /// silently turn a typo'd env-var reference into a different,
+    /// existing directory.
+    #[tokio::test]
+    async fn only_the_inline_arm_expands_environment_variables() {
+        let v = inline_host_path("/data/$RUSTERNETES_HOSTPATH_TEST_UNSET_VAR");
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+        };
+        let pod = test_pod();
+        let m = plugin().new_mounter(&spec, &pod).await.unwrap();
+        assert_eq!(m.get_path(), "/data/");
+    }
+
+    /// The PV arm's counterpart to the test above: same unset var, but
+    /// sourced from `pv.spec.host_path` instead of the inline volume, must
+    /// come through unexpanded.
+    #[tokio::test]
+    async fn the_pv_arm_does_not_expand_environment_variables() {
+        let v = claimed_volume();
+        let pv = pv_host_path("/data/$RUSTERNETES_HOSTPATH_TEST_UNSET_VAR");
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: Some(&pv),
+        };
+        let pod = test_pod();
+        let m = plugin().new_mounter(&spec, &pod).await.unwrap();
+        assert_eq!(m.get_path(), "/data/$RUSTERNETES_HOSTPATH_TEST_UNSET_VAR");
     }
 }

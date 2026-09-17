@@ -1031,6 +1031,16 @@ impl VolumeManager {
                 .await
                 .with_context(|| format!("PersistentVolume {} not found", pv_name))?;
             // ---- end moved body ----
+            // The final mount path is not known here — the matched plugin
+            // resolves and logs it separately — so log what this step has:
+            // the pod's volume name and the PV it resolved to. Restores the
+            // claim/PV pairing that used to be logged from this branch's
+            // tail before that tail moved into the hostPath plugin
+            // (`991a503d:volumes.rs:1364`).
+            info!(
+                "Using PersistentVolumeClaim volume {} backed by PV {}",
+                volume.name, pv_name
+            );
             return Ok(Some(pv));
         }
 
@@ -1103,6 +1113,14 @@ impl VolumeManager {
                         )
                     })?;
                     // ---- end moved body ----
+                    // Same rationale as the PersistentVolumeClaim branch
+                    // above: no mount path here, so log the claim/PV pairing
+                    // only. Restores the tail dropped from this branch
+                    // (`991a503d:volumes.rs:1538`).
+                    info!(
+                        "Using ephemeral volume {} backed by PVC {} and PV {}",
+                        volume.name, pvc_name, pv_name
+                    );
                     return Ok(Some(pv));
                 } else {
                     return Err(anyhow::anyhow!(
