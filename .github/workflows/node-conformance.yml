@@ -103,8 +103,12 @@ jobs:
         # communication" → 2 specs) must NOT clobber the nightly pass-rate.
         # Scheduled runs leave inputs.focus empty (defaults to the full focus);
         # manual runs must keep the default to qualify.
+        #
+        # `main` only: the README badge reports main's state, so a dispatch on
+        # a branch must not overwrite it (#1835).
         if: >-
           always() &&
+          github.ref == 'refs/heads/main' &&
           (github.event.inputs.focus == '' ||
            github.event.inputs.focus == '\[NodeConformance\]')
         continue-on-error: true

@@ -143,7 +143,14 @@ jobs:
       - name: Update target badge
         # Full runs only (empty focus) — a focused run must not clobber the
         # target's aggregate badge (FR-011). Best-effort: never reddens the run.
-        if: ${{ always() && steps.run.outcome == 'success' && inputs.publish-badge && inputs.focus == '' }}
+        #
+        # `main` only. The README badge is the project's source of truth for a
+        # target's pass rate, so it must report main and nothing else. Without
+        # this, a full run dispatched on a branch overwrites it: run
+        # 33417910655 on fix/1831-put-should-delete-during-update pushed 93/95
+        # over the sig-api-machinery badge (#1835). A branch run still produces
+        # counts and artifacts — it just may not publish.
+        if: ${{ always() && steps.run.outcome == 'success' && inputs.publish-badge && inputs.focus == '' && github.ref == 'refs/heads/main' }}
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -69,7 +69,10 @@ jobs:
       - name: Update smoke badge
         # The smoke is a single pass/fail signal (no spec counts), so it uses
         # update-badge.sh's --status mode. Best-effort: never reddens the run.
-        if: always()
+        #
+        # `main` only: the README badge reports main's state, so a dispatch on
+        # a branch must not overwrite it (#1835).
+        if: ${{ always() && github.ref == 'refs/heads/main' }}
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
