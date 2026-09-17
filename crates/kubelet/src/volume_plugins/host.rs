@@ -45,10 +45,10 @@ pub trait VolumeHost: Send + Sync {
     /// because the secret plugin's CA-cert injection is a Rusternetes-only
     /// mechanism with no upstream counterpart, and it needs the root to build
     /// a `_certs` path alongside `pods`. It returns the host's *stored* root
-    /// rather than inverting `get_pods_dir()` (i.e. re-deriving it via
-    /// `.parent()`), so the pod-directory layout keeps exactly one
-    /// definition — [`crate::pod_dirs`] — instead of a second implicit one
-    /// that silently breaks if the layout ever changes. That was #1967: two
+    /// rather than inverting `crate::pod_dirs::get_pods_dir()` (i.e.
+    /// re-deriving it via `.parent()`), so the pod-directory layout keeps
+    /// exactly one definition — [`crate::pod_dirs`] — instead of a second
+    /// implicit one that silently breaks if the layout ever changes. That was #1967: two
     /// path builders disagreeing.
     fn get_volumes_base_path(&self) -> &str;
 }
@@ -133,9 +133,9 @@ mod tests {
     }
 
     /// The accessor must return exactly the root the host was constructed
-    /// with — no re-derivation from `get_pods_dir()` or any other getter.
-    /// This is the invariant a `.parent()`-based derivation would silently
-    /// assume instead of stating.
+    /// with — no re-derivation from `crate::pod_dirs::get_pods_dir()` or any
+    /// other getter. This is the invariant a `.parent()`-based derivation
+    /// would silently assume instead of stating.
     #[test]
     fn volumes_base_path_matches_constructor_argument() {
         assert_eq!(host().get_volumes_base_path(), "/var/lib/rusternetes");

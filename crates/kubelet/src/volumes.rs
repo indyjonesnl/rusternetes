@@ -2653,10 +2653,10 @@ mod dispatch_tests {
             }))
             .unwrap();
             let path = vm.create_volume(&pod, &v).await.unwrap();
-            // hostPath's mounter returns the host path itself, unchanged
-            // (it is not under the pod dir, and not environment-expanded —
-            // the fixture path deliberately has no `$` in it), so assert
-            // the literal instead of the plugin-dir shape asserted below.
+            // hostPath's mounter returns the host path itself rather than a
+            // pod-dir-derived path, so this row asserts the literal instead
+            // of the plugin-dir shape asserted below. The fixture is an
+            // inline hostPath with no `$`, so its env expansion is a no-op.
             if want == crate::pod_dirs::plugin::HOST_PATH {
                 assert_eq!(path, "/tmp");
             } else {
