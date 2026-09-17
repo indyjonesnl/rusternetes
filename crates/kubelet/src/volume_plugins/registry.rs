@@ -79,6 +79,22 @@ impl VolumePluginMgr {
         let plugin = self.find_plugin_by_spec(spec).ok()?;
         plugin.can_device_mount(spec).then_some(plugin)
     }
+
+    /// Port of `FindNodeExpandablePluginBySpec` (`pkg/volume/plugins.go:926-935`).
+    ///
+    /// Upstream returns `(nil, nil)` when a plugin matched but is not
+    /// node-expandable and `(nil, err)` when none matched; both collapse to
+    /// `None` here because the sole caller,
+    /// `ActualStateOfWorld::volume_needs_expansion`
+    /// (`actual_state_of_world.go:981-985`), logs and treats either as "no
+    /// expansion". The `NodeExpandableVolumePlugin` type assertion is folded
+    /// into [`VolumePlugin::requires_fs_resize`]; see its comment.
+    pub fn find_node_expandable_plugin_by_spec(
+        &self,
+        spec: &Spec<'_>,
+    ) -> Option<&dyn VolumePlugin> {
+        self.find_plugin_by_spec(spec).ok()
+    }
 }
 
 #[cfg(test)]
