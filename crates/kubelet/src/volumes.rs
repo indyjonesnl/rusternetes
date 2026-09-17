@@ -20,7 +20,6 @@ use tracing::{debug, info, warn};
 // shared with non-volume code paths there). Imported so the moved bodies keep
 // calling them by their bare names, verbatim.
 use crate::atomic_writer::FileProjection;
-use crate::volume_plugins::VolumePlugin;
 
 /// Build the projection payload (relative user-visible path -> bytes) for a
 /// ConfigMap volume, honoring `items` (specific keys → mapped paths) or, when
@@ -181,7 +180,6 @@ pub struct VolumeManager {
     /// `CriContainerRuntime` clones it per attach — and `VolumePluginMgr`'s
     /// `Vec<Box<dyn VolumePlugin>>` cannot itself derive `Clone`.
     pub plugin_mgr: Arc<crate::volume_plugins::VolumePluginMgr>,
-    pub host: Arc<dyn crate::volume_plugins::VolumeHost>,
 }
 
 impl VolumeManager {
@@ -227,7 +225,6 @@ impl VolumeManager {
             token_manager,
             node_allocatable,
             plugin_mgr,
-            host,
         }
     }
 
@@ -480,6 +477,43 @@ impl VolumeManager {
         }
     }
 
+    /// The plugin that owns a volume, and hence the plugin segment of its
+    /// on-disk path. Replaces `pod_dirs::plugin_for_volume`: upstream resolves
+    /// this by asking every plugin `CanSupport`
+    /// (`pkg/volume/plugins.go:634-666`), which is what the registry does.
+    ///
+    /// Both registry failures collapse to [`crate::pod_dirs::UNSUPPORTED_PLUGIN`]:
+    ///
+    /// - `NoPluginMatched` is exactly what `pod_dirs::plugin_for_volume`'s
+    ///   else-arm used to return, so `resync_volumes`, `refresh_volumes` and
+    ///   the `kubelet.rs` init-container-restart path map keep looking in the
+    ///   identical directory. This is the whole reason the mapping exists.
+    /// - `MultipleMatched` would, under the old first-match-wins chain, have
+    ///   picked a real plugin name here — but `create_volume` now **errors**
+    ///   on `MultipleMatched` before any directory is created, so the pod
+    ///   fails and nothing ever reads a path for that volume. The divergence
+    ///   between this helper and `create_volume` is therefore unreachable.
+    ///
+    /// A `PersistentVolume` is never passed in: this helper answers "what
+    /// plugin does the pod's directory belong to", which for a
+    /// `persistentVolumeClaim`/`ephemeral` volume is moot — those never get a
+    /// directory under the pod dir (they resolve to a path elsewhere on the
+    /// host), so an unmatched PVC/ephemeral volume correctly falls back to
+    /// `UNSUPPORTED_PLUGIN` here too.
+    pub(crate) fn plugin_name_for_volume(
+        &self,
+        volume: &rusternetes_common::resources::Volume,
+    ) -> &'static str {
+        let spec = crate::volume_plugins::Spec {
+            volume,
+            persistent_volume: None,
+        };
+        match self.plugin_mgr.find_plugin_by_spec(&spec) {
+            Ok(plugin) => plugin.name(),
+            Err(_) => crate::pod_dirs::UNSUPPORTED_PLUGIN,
+        }
+    }
+
     /// The on-disk directory for one of a pod's volumes:
     /// `<root>/pods/<podUID>/volumes/<escaped-plugin>/<volumeName>`.
     ///
@@ -496,7 +530,7 @@ impl VolumeManager {
         crate::pod_dirs::get_pod_volume_dir(
             &self.volumes_base_path,
             &pod.metadata.uid,
-            crate::pod_dirs::plugin_for_volume(volume),
+            self.plugin_name_for_volume(volume),
             &volume.name,
         )
         .to_string_lossy()
@@ -950,7 +984,7 @@ impl VolumeManager {
     /// PV's SOURCE. `desiredStateOfWorldPopulator.createVolumeSpec`
     /// (`pkg/kubelet/volumemanager/populator/desired_state_of_world_populator.go:426-471`)
     /// fetches the PVC, reads `pvc.Spec.VolumeName`, then `getPVSpec`
-    /// (`:562-587`) fetches the PV and builds a `volume.Spec` from it via
+    /// (`:562-589`) fetches the PV and builds a `volume.Spec` from it via
     /// `NewSpecFromPersistentVolume` — the plugin lookup then runs against
     /// that `Spec`, exactly as `find_plugin_by_spec` does below. This is that
     /// resolution step. Returns `Ok(None)` for a volume that is neither a
@@ -1082,155 +1116,81 @@ impl VolumeManager {
         Ok(None)
     }
 
-    /// Create a single volume and return its host path
+    /// Create a single volume and return its host path.
+    ///
+    /// Port of `pkg/volume/plugins.go:634-666`'s `FindPluginBySpec` used the
+    /// way `desiredStateOfWorldPopulator.createVolumeSpec` uses it: resolve a
+    /// `persistentVolumeClaim`/`ephemeral` volume to its bound PV first (see
+    /// `resolve_persistent_volume` — upstream has no separate pvc plugin), then
+    /// look the resulting `Spec` up in the registry exactly once. What used to
+    /// be eight `if volume.<kind>.is_some()` blocks, each constructing its own
+    /// plugin, is now the one dispatch the registry exists for.
     pub(crate) async fn create_volume(
         &self,
         pod: &Pod,
         volume: &rusternetes_common::resources::Volume,
     ) -> Result<String> {
-        // EmptyDir: create a directory on the shared volumes path.
-        // K8s ref: pkg/volume/emptydir/empty_dir.go — setupDir() sets mode 0777.
-        // Note: host bind mounts through virtiofs (Podman Machine / Docker Desktop)
-        // may not enforce chmod correctly. The emptyDir 0777/0666 permission tests
-        // are pre-existing failures on macOS VM-based runtimes. On Linux (where
-        // conformance actually runs), bind mounts preserve mode bits, so setup_emptydir_dir
-        // ensures the directory exists with mode 0o777 and idempotently re-chmods even
-        // when the directory pre-exists from a prior run.
-        if volume.empty_dir.is_some() {
-            let spec = crate::volume_plugins::Spec {
-                volume,
-                persistent_volume: None,
-            };
-            let plugin = crate::volume_plugins::empty_dir::EmptyDirPlugin::new(self.host.clone());
-            let mounter = plugin.new_mounter(&spec, pod).await?;
-            mounter.set_up().await?;
-            return Ok(mounter.get_path());
-        }
+        // persistentVolumeClaim / ephemeral resolve to a PersistentVolume
+        // first; the PV's source then selects the plugin. Returns `None` for
+        // every other volume kind, and for an ephemeral volume with no claim
+        // template (which is not actionable and falls through like upstream's
+        // empty spec would).
+        let pv = self.resolve_persistent_volume(pod, volume).await?;
+        let spec = crate::volume_plugins::Spec {
+            volume,
+            persistent_volume: pv.as_ref(),
+        };
 
-        // HostPath: use the specified host path. The `type` field is validated
-        // (and "OrCreate" variants are materialised) via `check_host_path_type`,
-        // mirroring upstream `pkg/volume/host_path/host_path.go::checkType` —
-        // see also tests/conformance_storage_emptydir_hostpath.rs.
-        if volume.host_path.is_some() {
-            let spec = crate::volume_plugins::Spec {
-                volume,
-                persistent_volume: None,
-            };
-            let plugin = crate::volume_plugins::host_path::HostPathPlugin::new(self.host.clone());
-            let mounter = plugin.new_mounter(&spec, pod).await?;
-            mounter.set_up().await?;
-            return Ok(mounter.get_path());
-        }
-
-        // ConfigMap: mount configmap data as files
-        if volume.config_map.is_some() {
-            let spec = crate::volume_plugins::Spec {
-                volume,
-                persistent_volume: None,
-            };
-            let plugin = crate::volume_plugins::config_map::ConfigMapPlugin::new(self.host.clone());
-            let mounter = plugin.new_mounter(&spec, pod).await?;
-            mounter.set_up().await?;
-            return Ok(mounter.get_path());
-        }
-
-        // Secret: mount secret data as files
-        if volume.secret.is_some() {
-            let spec = crate::volume_plugins::Spec {
-                volume,
-                persistent_volume: None,
-            };
-            let plugin = crate::volume_plugins::secret::SecretPlugin::new(self.host.clone());
-            let mounter = plugin.new_mounter(&spec, pod).await?;
-            mounter.set_up().await?;
-            return Ok(mounter.get_path());
-        }
-
-        // persistentVolumeClaim / ephemeral: resolve to the bound PV, then let
-        // the PV's source pick the plugin. Upstream has no pvc plugin — see
-        // `resolve_persistent_volume`.
-        if volume.persistent_volume_claim.is_some() || volume.ephemeral.is_some() {
-            if let Some(pv) = self.resolve_persistent_volume(pod, volume).await? {
-                let spec = crate::volume_plugins::Spec {
-                    volume,
-                    persistent_volume: Some(&pv),
-                };
-                let plugin = match self.plugin_mgr.find_plugin_by_spec(&spec) {
-                    Ok(plugin) => plugin,
-                    // Preserve the pre-registry message: today only a
-                    // hostPath-sourced PV resolves, so "no plugin matched"
-                    // means the PV has no hostPath source. `lifecycle.rs:486`
-                    // documents this exact string as a non-wait error.
-                    Err(crate::volume_plugins::PluginLookupError::NoPluginMatched) => {
-                        return Err(anyhow::anyhow!(
-                            "PersistentVolume does not have a hostPath volume source"
-                        ));
-                    }
-                    Err(e) => return Err(e.into()),
-                };
+        match self.plugin_mgr.find_plugin_by_spec(&spec) {
+            Ok(plugin) => {
                 let mounter = plugin.new_mounter(&spec, pod).await?;
                 mounter.set_up().await?;
-                return Ok(mounter.get_path());
+                Ok(mounter.get_path())
             }
+            Err(crate::volume_plugins::PluginLookupError::NoPluginMatched) if pv.is_some() => {
+                // Preserve the pre-registry message: today only a
+                // hostPath-sourced PV resolves, so "no plugin matched" for a
+                // resolved PV means it has no hostPath source. `lifecycle.rs`
+                // documents this exact string as a non-wait error.
+                Err(anyhow::anyhow!(
+                    "PersistentVolume does not have a hostPath volume source"
+                ))
+            }
+            // DEVIATION from upstream, preserved from the pre-registry
+            // `create_volume` and documented at
+            // `pod_dirs::UNSUPPORTED_PLUGIN`: upstream fails the pod for an
+            // unimplemented inline kind (nfs, iscsi, image, ...); we
+            // provision an empty directory so it can run instead. Kept at
+            // this call site rather than inside the registry — a catch-all
+            // plugin cannot know whether another plugin already matched, so
+            // it would trip `MultipleMatched` on every volume — so the
+            // registry stays a faithful port and this is one match arm to
+            // delete once every kind is implemented.
+            Err(crate::volume_plugins::PluginLookupError::NoPluginMatched) => {
+                warn!(
+                    "Unknown volume type for volume {}, creating empty directory as fallback (volume debug: downward_api={}, empty_dir={}, host_path={}, config_map={}, secret={}, projected={}, pvc={}, csi={}, ephemeral={})",
+                    volume.name,
+                    volume.downward_api.is_some(),
+                    volume.empty_dir.is_some(),
+                    volume.host_path.is_some(),
+                    volume.config_map.is_some(),
+                    volume.secret.is_some(),
+                    volume.projected.is_some(),
+                    volume.persistent_volume_claim.is_some(),
+                    volume.csi.is_some(),
+                    volume.ephemeral.is_some(),
+                );
+                let volume_dir = self.pod_volume_dir(pod, volume);
+                std::fs::create_dir_all(&volume_dir)
+                    .context("Failed to create fallback volume directory")?;
+                Ok(volume_dir)
+            }
+            // A volume declaring two sources (e.g. both emptyDir and
+            // configMap) previously resolved silently, first-arm-wins, under
+            // the ordered if-chain. The registry rejects it outright
+            // (`pkg/volume/plugins.go:661-663`).
+            Err(e) => Err(e.into()),
         }
-
-        // DownwardAPI: expose pod/container metadata as files
-        if volume.downward_api.is_some() {
-            let spec = crate::volume_plugins::Spec {
-                volume,
-                persistent_volume: None,
-            };
-            let plugin =
-                crate::volume_plugins::downward_api::DownwardApiPlugin::new(self.host.clone());
-            let mounter = plugin.new_mounter(&spec, pod).await?;
-            mounter.set_up().await?;
-            return Ok(mounter.get_path());
-        }
-
-        // CSI: ephemeral inline volume (handled by external CSI driver)
-        if volume.csi.is_some() {
-            let spec = crate::volume_plugins::Spec {
-                volume,
-                persistent_volume: None,
-            };
-            let plugin = crate::volume_plugins::csi::CsiPlugin::new(self.host.clone());
-            let mounter = plugin.new_mounter(&spec, pod).await?;
-            mounter.set_up().await?;
-            return Ok(mounter.get_path());
-        }
-
-        // Projected: combine multiple volume sources (configMap, secret, downwardAPI, serviceAccountToken) into one directory
-        if volume.projected.is_some() {
-            let spec = crate::volume_plugins::Spec {
-                volume,
-                persistent_volume: None,
-            };
-            let plugin = crate::volume_plugins::projected::ProjectedPlugin::new(self.host.clone());
-            let mounter = plugin.new_mounter(&spec, pod).await?;
-            mounter.set_up().await?;
-            return Ok(mounter.get_path());
-        }
-
-        // Fallback: create an empty directory for unrecognized volume types
-        // (e.g. nfs, iscsi, image, or any future types)
-        // This prevents pod startup failures for volumes we don't natively handle.
-        warn!(
-            "Unknown volume type for volume {}, creating empty directory as fallback (volume debug: downward_api={}, empty_dir={}, host_path={}, config_map={}, secret={}, projected={}, pvc={}, csi={}, ephemeral={})",
-            volume.name,
-            volume.downward_api.is_some(),
-            volume.empty_dir.is_some(),
-            volume.host_path.is_some(),
-            volume.config_map.is_some(),
-            volume.secret.is_some(),
-            volume.projected.is_some(),
-            volume.persistent_volume_claim.is_some(),
-            volume.csi.is_some(),
-            volume.ephemeral.is_some(),
-        );
-        let volume_dir = self.pod_volume_dir(pod, volume);
-        std::fs::create_dir_all(&volume_dir)
-            .context("Failed to create fallback volume directory")?;
-        Ok(volume_dir)
     }
 
     /// Refresh Secret and ConfigMap volumes for a running pod.
@@ -2552,6 +2512,198 @@ mod pvc_resolution_tests {
         assert_eq!(
             err.to_string(),
             "PersistentVolume does not have a hostPath volume source"
+        );
+    }
+}
+
+/// Task 11 (#1970): `create_volume`'s eight-branch `if let` chain becomes one
+/// `find_plugin_by_spec` lookup. These pin the #1967 invariant directly: the
+/// directory a volume is created in (`create_volume`) must be the directory
+/// every other code path looks for it in (`plugin_name_for_volume`, hence
+/// `pod_volume_dir` and the `kubelet.rs` init-container-restart path map).
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use rusternetes_common::resources::Volume;
+    use serde_json::json;
+
+    fn vm() -> VolumeManager {
+        VolumeManager::new(
+            std::env::temp_dir().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        )
+    }
+
+    fn volume(name: &str, source: serde_json::Value) -> Volume {
+        let mut fields = source;
+        fields
+            .as_object_mut()
+            .unwrap()
+            .insert("name".to_string(), json!(name));
+        serde_json::from_value(fields).unwrap()
+    }
+
+    /// Every implemented kind reaches its own plugin through the registry.
+    /// `plugin_name_for_volume` and `create_volume` build the identical
+    /// `Spec` and call the identical `find_plugin_by_spec`, so this is also
+    /// the "same name the registry dispatches to" half of the #1967
+    /// invariant — the other half is `an_unimplemented_kind_falls_back_to_unsupported`.
+    #[test]
+    fn each_kind_resolves_to_its_own_plugin() {
+        let vm = vm();
+        let cases: Vec<(Volume, &str)> = vec![
+            (
+                volume("a", json!({"emptyDir": {}})),
+                crate::pod_dirs::plugin::EMPTY_DIR,
+            ),
+            (
+                volume("b", json!({"configMap": {"name": "cm"}})),
+                crate::pod_dirs::plugin::CONFIG_MAP,
+            ),
+            (
+                volume("c", json!({"secret": {"secretName": "s"}})),
+                crate::pod_dirs::plugin::SECRET,
+            ),
+            (
+                volume("d", json!({"downwardAPI": {}})),
+                crate::pod_dirs::plugin::DOWNWARD_API,
+            ),
+            (
+                volume("e", json!({"projected": {}})),
+                crate::pod_dirs::plugin::PROJECTED,
+            ),
+            (
+                volume("f", json!({"csi": {"driver": "d"}})),
+                crate::pod_dirs::plugin::CSI,
+            ),
+            (
+                volume("g", json!({"hostPath": {"path": "/tmp"}})),
+                "kubernetes.io/host-path",
+            ),
+        ];
+        for (v, want) in cases {
+            assert_eq!(vm.plugin_name_for_volume(&v), want, "volume {}", v.name);
+        }
+    }
+
+    /// The storage-free kinds (emptyDir, hostPath, downwardAPI, csi, and
+    /// projected with no sources) prove `create_volume` itself — not just
+    /// `plugin_name_for_volume` — routes through the same single
+    /// `find_plugin_by_spec` call and lands the mount under the matched
+    /// plugin's directory segment. configMap/secret/PVC dispatch through the
+    /// identical call and are exercised with storage by
+    /// `create_volume_writes_secret_data_to_disk`,
+    /// `create_volume_writes_downward_api_data_to_disk`,
+    /// `create_volume_writes_projected_sources_to_disk` and
+    /// `pvc_resolution_tests`.
+    #[tokio::test]
+    async fn create_volume_dispatches_storage_free_kinds_to_their_plugin_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let cases: Vec<(Volume, &str)> = vec![
+            (
+                volume("a", json!({"emptyDir": {}})),
+                crate::pod_dirs::plugin::EMPTY_DIR,
+            ),
+            (
+                volume("d", json!({"downwardAPI": {}})),
+                crate::pod_dirs::plugin::DOWNWARD_API,
+            ),
+            (
+                volume("e", json!({"projected": {}})),
+                crate::pod_dirs::plugin::PROJECTED,
+            ),
+            (
+                volume("f", json!({"csi": {"driver": "d"}})),
+                crate::pod_dirs::plugin::CSI,
+            ),
+            (
+                volume("g", json!({"hostPath": {"path": "/tmp"}})),
+                "kubernetes.io/host-path",
+            ),
+        ];
+        for (v, want) in cases {
+            let pod: Pod = serde_json::from_value(json!({
+                "metadata": {"name": "p", "namespace": "default", "uid": format!("uid-{}", v.name)},
+                "spec": {"containers": []}
+            }))
+            .unwrap();
+            let path = vm.create_volume(&pod, &v).await.unwrap();
+            // hostPath's mounter returns the host path itself (it is not
+            // under the pod dir), so only assert the plugin-dir shape for
+            // the kinds whose mounter path is `pod_volume_dir`-derived.
+            if want != "kubernetes.io/host-path" {
+                assert!(
+                    path.contains(&crate::pod_dirs::escape_qualified_name(want)),
+                    "volume {} took path {path}, want it to contain the {want} plugin segment",
+                    v.name
+                );
+            }
+        }
+    }
+
+    /// An unimplemented kind (nfs, iscsi, image, ...) matches no plugin.
+    /// `create_volume` applies the documented empty-directory fallback rather
+    /// than erroring, and `plugin_name_for_volume` reports the same
+    /// `UNSUPPORTED_PLUGIN` segment that fallback directory sits under — the
+    /// other half of the #1967 invariant.
+    #[tokio::test]
+    async fn an_unimplemented_kind_falls_back_to_unsupported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let v = volume(
+            "nfs-vol",
+            json!({"nfs": {"server": "10.0.0.1", "path": "/export"}}),
+        );
+
+        assert_eq!(
+            vm.plugin_name_for_volume(&v),
+            crate::pod_dirs::UNSUPPORTED_PLUGIN
+        );
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-nfs"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+        let path = vm.create_volume(&pod, &v).await.unwrap();
+        assert!(
+            path.contains(&crate::pod_dirs::escape_qualified_name(
+                crate::pod_dirs::UNSUPPORTED_PLUGIN
+            )),
+            "path {path} should sit under the unsupported-plugin segment"
+        );
+        assert!(std::path::Path::new(&path).is_dir());
+    }
+
+    /// The case `pod_dirs::plugin_for_volume`'s ordered if-else silently
+    /// resolved: two sources set, first arm wins. The registry rejects it
+    /// (`pkg/volume/plugins.go:661-663`), and `create_volume` now propagates
+    /// that error instead of mounting either source.
+    #[tokio::test]
+    async fn a_volume_with_two_sources_is_rejected() {
+        let mut v = volume("malformed", json!({"emptyDir": {}}));
+        v.config_map = Some(serde_json::from_value(json!({"name": "cm"})).unwrap());
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-malformed"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        let err = vm().create_volume(&pod, &v).await.unwrap_err();
+        assert!(
+            err.to_string().contains("multiple volume plugins matched"),
+            "{err}"
         );
     }
 }
