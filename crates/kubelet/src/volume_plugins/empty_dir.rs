@@ -1,5 +1,5 @@
 use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::{EmptyDirVolumeSource, Pod};
 use std::sync::Arc;
@@ -20,6 +20,25 @@ impl EmptyDirPlugin {
 impl VolumePlugin for EmptyDirPlugin {
     fn name(&self) -> &'static str {
         crate::pod_dirs::plugin::EMPTY_DIR
+    }
+
+    /// `GetVolumeName` (`empty_dir.go:84-92`): the user-defined volume name,
+    /// because this is an ephemeral volume type.
+    fn get_volume_name(&self, spec: &Spec<'_>) -> Result<String> {
+        if spec.volume.empty_dir.is_none() {
+            return Err(anyhow!("spec does not reference an emptyDir volume type"));
+        }
+        Ok(spec.name().to_string())
+    }
+
+    /// `RequiresRemount` (`empty_dir.go:98-100`): `false`.
+    fn requires_remount(&self, _spec: &Spec<'_>) -> bool {
+        false
+    }
+
+    /// `SupportsSELinuxContextMount` (`empty_dir.go:106-108`): `(false, nil)`.
+    fn supports_selinux_context_mount(&self, _spec: &Spec<'_>) -> Result<bool> {
+        Ok(false)
     }
 
     /// `CanSupport` (`empty_dir.go:94`). emptyDir has no PV form, so only the

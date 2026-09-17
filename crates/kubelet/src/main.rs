@@ -48,7 +48,11 @@ mod static_pods;
 mod streaming_server;
 mod sync_locks;
 mod sysctl;
-#[allow(dead_code)]
+// The binary does not use the volume-manager caches yet; population arrives
+// with the desired-state-of-world populator (#1970).
+#[allow(dead_code, unused_imports)]
+mod volume_manager;
+#[allow(dead_code, unused_imports)]
 mod volume_plugins;
 #[allow(dead_code)]
 mod volumes;

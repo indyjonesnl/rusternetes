@@ -1,6 +1,6 @@
 use crate::runtime::{check_host_path_type, HostPathCheck};
 use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::volume::HostPathType;
 use rusternetes_common::resources::Pod;
@@ -45,6 +45,32 @@ fn host_path_type_as_str(t: &HostPathType) -> &'static str {
 impl VolumePlugin for HostPathPlugin {
     fn name(&self) -> &'static str {
         crate::pod_dirs::plugin::HOST_PATH
+    }
+
+    /// `GetVolumeName` (`host_path.go:89-96`): the host path itself, via
+    /// `getVolumeSource` (`host_path.go:362-371`), which prefers the inline
+    /// source and falls back to the PV's.
+    fn get_volume_name(&self, spec: &Spec<'_>) -> Result<String> {
+        if let Some(source) = &spec.volume.host_path {
+            return Ok(source.path.clone());
+        }
+        if let Some(source) = spec
+            .persistent_volume
+            .and_then(|pv| pv.spec.host_path.as_ref())
+        {
+            return Ok(source.path.clone());
+        }
+        Err(anyhow!("spec does not reference an HostPath volume type"))
+    }
+
+    /// `RequiresRemount` (`host_path.go:103-105`): `false`.
+    fn requires_remount(&self, _spec: &Spec<'_>) -> bool {
+        false
+    }
+
+    /// `SupportsSELinuxContextMount` (`host_path.go:111-113`): `(false, nil)`.
+    fn supports_selinux_context_mount(&self, _spec: &Spec<'_>) -> Result<bool> {
+        Ok(false)
     }
 
     /// `CanSupport` (`host_path.go:98-101`), both arms verbatim:

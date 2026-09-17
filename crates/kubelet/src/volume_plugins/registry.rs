@@ -55,6 +55,30 @@ impl VolumePluginMgr {
             )),
         }
     }
+
+    /// Port of `FindAttachablePluginBySpec` (`pkg/volume/plugins.go:805-818`).
+    ///
+    /// Upstream returns `(nil, nil)` when a plugin matched but is not
+    /// attachable, and `(nil, err)` when no plugin matched at all; both
+    /// collapse to `None` here because the sole caller,
+    /// `util::is_attachable_volume` (`pkg/volume/util/util.go:635-645`),
+    /// discards the error and tests only for a non-nil plugin.
+    pub fn find_attachable_plugin_by_spec(&self, spec: &Spec<'_>) -> Option<&dyn VolumePlugin> {
+        let plugin = self.find_plugin_by_spec(spec).ok()?;
+        plugin.can_attach(spec).then_some(plugin)
+    }
+
+    /// Port of `FindDeviceMountablePluginBySpec` (`pkg/volume/plugins.go:836-849`).
+    /// Same `(nil, nil)` / `(nil, err)` collapse as
+    /// [`VolumePluginMgr::find_attachable_plugin_by_spec`], for the sole caller
+    /// `util::is_device_mountable_volume` (`util.go:648-658`).
+    pub fn find_device_mountable_plugin_by_spec(
+        &self,
+        spec: &Spec<'_>,
+    ) -> Option<&dyn VolumePlugin> {
+        let plugin = self.find_plugin_by_spec(spec).ok()?;
+        plugin.can_device_mount(spec).then_some(plugin)
+    }
 }
 
 #[cfg(test)]
@@ -78,8 +102,17 @@ mod tests {
         fn name(&self) -> &'static str {
             self.name
         }
+        fn get_volume_name(&self, spec: &Spec<'_>) -> Result<String> {
+            Ok(spec.volume.name.clone())
+        }
         fn can_support(&self, spec: &Spec<'_>) -> bool {
             spec.volume.name.starts_with(self.prefix)
+        }
+        fn requires_remount(&self, _spec: &Spec<'_>) -> bool {
+            false
+        }
+        fn supports_selinux_context_mount(&self, _spec: &Spec<'_>) -> Result<bool> {
+            Ok(false)
         }
         async fn new_mounter(&self, _spec: &Spec<'_>, _pod: &Pod) -> Result<Box<dyn Mounter>> {
             unimplemented!("registry tests never mount")
