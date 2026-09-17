@@ -51,6 +51,8 @@ pub mod plugin {
     pub const PROJECTED: &str = "kubernetes.io/projected";
     /// `pkg/volume/csi/csi_plugin.go:54`
     pub const CSI: &str = "kubernetes.io/csi";
+    /// `pkg/volume/hostpath/host_path.go:77`
+    pub const HOST_PATH: &str = "kubernetes.io/host-path";
 }
 
 /// Convert a plugin name, which contains a `/`, into a form safe to use on
@@ -73,37 +75,6 @@ pub fn escape_qualified_name(name: &str) -> String {
 /// guarantees the segment can never collide with a real `kubernetes.io/` plugin
 /// if one of these types is implemented properly later.
 pub const UNSUPPORTED_PLUGIN: &str = "rusternetes.io/unsupported";
-
-/// Resolve the volume plugin that owns a volume, and hence the plugin segment
-/// of its on-disk path.
-///
-/// Upstream resolves this by asking every registered plugin `CanSupport(spec)`
-/// (`pkg/volume/plugins.go::FindPluginBySpec:634`). We have no plugin registry,
-/// so the equivalent is a match over the volume source. The arm order mirrors
-/// the branch order in [`crate::volumes::VolumeManager::create_volume`] so the
-/// directory always agrees with the branch that actually populates it.
-///
-/// Returns [`UNSUPPORTED_PLUGIN`] for volume sources that reach
-/// `create_volume`'s fallback. `hostPath`, `persistentVolumeClaim` and
-/// `ephemeral` volumes never get a directory under the pod dir — they resolve
-/// to a path elsewhere on the host — so they are not represented here.
-pub fn plugin_for_volume(volume: &rusternetes_common::resources::Volume) -> &'static str {
-    if volume.empty_dir.is_some() {
-        plugin::EMPTY_DIR
-    } else if volume.config_map.is_some() {
-        plugin::CONFIG_MAP
-    } else if volume.secret.is_some() {
-        plugin::SECRET
-    } else if volume.downward_api.is_some() {
-        plugin::DOWNWARD_API
-    } else if volume.csi.is_some() {
-        plugin::CSI
-    } else if volume.projected.is_some() {
-        plugin::PROJECTED
-    } else {
-        UNSUPPORTED_PLUGIN
-    }
-}
 
 /// `<root>/pods` — `getPodsDir` (`kubelet_getters.go:60-62`).
 pub fn get_pods_dir(root: &str) -> PathBuf {

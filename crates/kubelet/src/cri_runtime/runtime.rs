@@ -2510,6 +2510,24 @@ impl CriContainerRuntime {
             .unwrap_or("")
     }
 
+    /// Delegate to the volume manager's plugin registry.
+    ///
+    /// Falls back to [`crate::pod_dirs::UNSUPPORTED_PLUGIN`] when no
+    /// [`VolumeManager`](crate::volumes::VolumeManager) is attached, the same
+    /// way [`Self::volumes_base_path`] falls back to `""` above: with no
+    /// `VolumeManager`, `get_pod_volume_dir("", uid, plugin, name)` already
+    /// produces a meaningless path regardless of the plugin segment, so this
+    /// arm is unobservable — nothing runs the volume paths without one.
+    pub fn plugin_name_for_volume(
+        &self,
+        volume: &rusternetes_common::resources::Volume,
+    ) -> &'static str {
+        self.volumes
+            .as_ref()
+            .map(|v| v.plugin_name_for_volume(volume))
+            .unwrap_or(crate::pod_dirs::UNSUPPORTED_PLUGIN)
+    }
+
     /// Reap the on-disk directories of pods that are gone. No-op when no
     /// [`VolumeManager`](crate::volumes::VolumeManager) is attached.
     pub fn cleanup_orphaned_pod_dirs(&self, live_pod_uids: &std::collections::HashSet<String>) {

@@ -49,6 +49,8 @@ mod streaming_server;
 mod sync_locks;
 mod sysctl;
 #[allow(dead_code)]
+mod volume_plugins;
+#[allow(dead_code)]
 mod volumes;
 
 use anyhow::{Context, Result};

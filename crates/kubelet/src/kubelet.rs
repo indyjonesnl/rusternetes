@@ -3115,7 +3115,7 @@ impl Kubelet {
                                                 let path = crate::pod_dirs::get_pod_volume_dir(
                                                     self.runtime.volumes_base_path(),
                                                     &pod.metadata.uid,
-                                                    crate::pod_dirs::plugin_for_volume(v),
+                                                    self.runtime.plugin_name_for_volume(v),
                                                     &v.name,
                                                 )
                                                 .to_string_lossy()

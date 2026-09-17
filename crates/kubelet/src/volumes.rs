@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use rusternetes_common::resources::{
-    ConfigMap, KeyToPath, PersistentVolume, PersistentVolumeClaim, Pod, Secret,
+    ConfigMap, KeyToPath, PersistentVolume, PersistentVolumeClaim, Pod,
 };
 use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
@@ -20,10 +20,6 @@ use tracing::{debug, info, warn};
 // shared with non-volume code paths there). Imported so the moved bodies keep
 // calling them by their bare names, verbatim.
 use crate::atomic_writer::FileProjection;
-use crate::runtime::{
-    check_host_path_type, mount_tmpfs_for_emptydir, parse_quantity_bytes, setup_emptydir_dir,
-    HostPathCheck,
-};
 
 /// Build the projection payload (relative user-visible path -> bytes) for a
 /// ConfigMap volume, honoring `items` (specific keys → mapped paths) or, when
@@ -31,7 +27,7 @@ use crate::runtime::{
 /// truth for what a ConfigMap volume should contain, shared by the initial
 /// mount and every re-projection so they all feed the same bytes to the
 /// AtomicWriter (and therefore no-op identically when unchanged).
-fn build_configmap_payload(
+pub(crate) fn build_configmap_payload(
     configmap: &ConfigMap,
     items: Option<&Vec<KeyToPath>>,
     configmap_name: &str,
@@ -177,6 +173,13 @@ pub struct VolumeManager {
     /// [`crate::kubelet::node_allocatable_map`] the kubelet posts in NodeStatus,
     /// so a volume file and the NodeStatus can never disagree.
     pub node_allocatable: std::collections::HashMap<String, String>,
+    /// The plugin registry. Built in `new` from the same host every plugin
+    /// receives, so a plugin's directory can never disagree with the
+    /// manager's. `Arc`-wrapped (rather than the bare `VolumePluginMgr` Task 3's
+    /// brief showed) because `VolumeManager` is `#[derive(Clone)]` —
+    /// `CriContainerRuntime` clones it per attach — and `VolumePluginMgr`'s
+    /// `Vec<Box<dyn VolumePlugin>>` cannot itself derive `Clone`.
+    pub plugin_mgr: Arc<crate::volume_plugins::VolumePluginMgr>,
 }
 
 impl VolumeManager {
@@ -187,11 +190,41 @@ impl VolumeManager {
         storage: Option<Arc<rusternetes_storage::StorageBackend>>,
         token_manager: rusternetes_common::auth::TokenManager,
     ) -> Self {
+        let node_allocatable = crate::kubelet::node_allocatable_map();
+        let host: Arc<dyn crate::volume_plugins::VolumeHost> =
+            Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
+                volumes_base_path.clone(),
+                storage.clone(),
+                token_manager.clone(),
+                node_allocatable.clone(),
+            ));
+        let plugin_mgr = Arc::new(crate::volume_plugins::VolumePluginMgr::new(vec![
+            Box::new(crate::volume_plugins::empty_dir::EmptyDirPlugin::new(
+                host.clone(),
+            )),
+            Box::new(crate::volume_plugins::host_path::HostPathPlugin::new(
+                host.clone(),
+            )),
+            Box::new(crate::volume_plugins::config_map::ConfigMapPlugin::new(
+                host.clone(),
+            )),
+            Box::new(crate::volume_plugins::csi::CsiPlugin::new(host.clone())),
+            Box::new(crate::volume_plugins::secret::SecretPlugin::new(
+                host.clone(),
+            )),
+            Box::new(crate::volume_plugins::downward_api::DownwardApiPlugin::new(
+                host.clone(),
+            )),
+            Box::new(crate::volume_plugins::projected::ProjectedPlugin::new(
+                host.clone(),
+            )),
+        ]));
         Self {
             volumes_base_path,
             storage,
             token_manager,
-            node_allocatable: crate::kubelet::node_allocatable_map(),
+            node_allocatable,
+            plugin_mgr,
         }
     }
 
@@ -444,6 +477,44 @@ impl VolumeManager {
         }
     }
 
+    /// The plugin that owns a volume, and hence the plugin segment of its
+    /// on-disk path. Replaces the ordered if-else chain this file used to
+    /// dispatch `create_volume` through: upstream resolves this by asking
+    /// every plugin `CanSupport` (`pkg/volume/plugins.go:634-666`), which is
+    /// what the registry does.
+    ///
+    /// Both registry failures collapse to [`crate::pod_dirs::UNSUPPORTED_PLUGIN`]:
+    ///
+    /// - `NoPluginMatched` is exactly what the old if-else chain's
+    ///   else-arm used to return, so `resync_volumes`, `refresh_volumes` and
+    ///   the `kubelet.rs` init-container-restart path map keep looking in the
+    ///   identical directory. This is the whole reason the mapping exists.
+    /// - `MultipleMatched` would, under the old first-match-wins chain, have
+    ///   picked a real plugin name here — but `create_volume` now **errors**
+    ///   on `MultipleMatched` before any directory is created, so the pod
+    ///   fails and nothing ever reads a path for that volume. The divergence
+    ///   between this helper and `create_volume` is therefore unreachable.
+    ///
+    /// A `PersistentVolume` is never passed in: this helper answers "what
+    /// plugin does the pod's directory belong to", which for a
+    /// `persistentVolumeClaim`/`ephemeral` volume is moot — those never get a
+    /// directory under the pod dir (they resolve to a path elsewhere on the
+    /// host), so an unmatched PVC/ephemeral volume correctly falls back to
+    /// `UNSUPPORTED_PLUGIN` here too.
+    pub(crate) fn plugin_name_for_volume(
+        &self,
+        volume: &rusternetes_common::resources::Volume,
+    ) -> &'static str {
+        let spec = crate::volume_plugins::Spec {
+            volume,
+            persistent_volume: None,
+        };
+        match self.plugin_mgr.find_plugin_by_spec(&spec) {
+            Ok(plugin) => plugin.name(),
+            Err(_) => crate::pod_dirs::UNSUPPORTED_PLUGIN,
+        }
+    }
+
     /// The on-disk directory for one of a pod's volumes:
     /// `<root>/pods/<podUID>/volumes/<escaped-plugin>/<volumeName>`.
     ///
@@ -460,7 +531,7 @@ impl VolumeManager {
         crate::pod_dirs::get_pod_volume_dir(
             &self.volumes_base_path,
             &pod.metadata.uid,
-            crate::pod_dirs::plugin_for_volume(volume),
+            self.plugin_name_for_volume(volume),
             &volume.name,
         )
         .to_string_lossy()
@@ -907,425 +978,30 @@ impl VolumeManager {
         Ok(())
     }
 
-    /// Create a single volume and return its host path
-    pub(crate) async fn create_volume(
+    /// Resolve a claim-backed volume to the PersistentVolume that backs it.
+    ///
+    /// There is no `pvc` or `ephemeral` package under `pkg/volume`: upstream
+    /// resolves the claim in the volume manager and then dispatches on the
+    /// PV's SOURCE. `desiredStateOfWorldPopulator.createVolumeSpec`
+    /// (`pkg/kubelet/volumemanager/populator/desired_state_of_world_populator.go:426-471`)
+    /// fetches the PVC, reads `pvc.Spec.VolumeName`, then `getPVSpec`
+    /// (`:562-589`) fetches the PV and builds a `volume.Spec` from it via
+    /// `NewSpecFromPersistentVolume` — the plugin lookup then runs against
+    /// that `Spec`, exactly as `find_plugin_by_spec` does below. This is that
+    /// resolution step. Returns `Ok(None)` for a volume that is neither a
+    /// claim nor an ephemeral claim template.
+    pub(crate) async fn resolve_persistent_volume(
         &self,
         pod: &Pod,
         volume: &rusternetes_common::resources::Volume,
-    ) -> Result<String> {
-        // Used for content that legitimately carries the pod's NAME — the
-        // service-account token audience, the generated ephemeral-PVC name, and
-        // projected sources. On-disk paths never use it; those go through
-        // `pod_volume_dir`, which keys on the pod UID.
+    ) -> Result<Option<PersistentVolume>> {
         let pod_name = &pod.metadata.name;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
 
-        // EmptyDir: create a directory on the shared volumes path.
-        // K8s ref: pkg/volume/emptydir/empty_dir.go — setupDir() sets mode 0777.
-        // Note: host bind mounts through virtiofs (Podman Machine / Docker Desktop)
-        // may not enforce chmod correctly. The emptyDir 0777/0666 permission tests
-        // are pre-existing failures on macOS VM-based runtimes. On Linux (where
-        // conformance actually runs), bind mounts preserve mode bits, so setup_emptydir_dir
-        // ensures the directory exists with mode 0o777 and idempotently re-chmods even
-        // when the directory pre-exists from a prior run.
-        if volume.empty_dir.is_some() {
-            let volume_dir = self.pod_volume_dir(pod, volume);
-            // K8s setupDir does best-effort chmod on emptyDir directories.
-            // A failed chmod must never block the volume mount.
-            let _ = setup_emptydir_dir(&volume_dir);
-
-            // Memory-medium emptyDir is a tmpfs. Mount it on the host volume dir
-            // (propagated to the host daemon via the kubelet's rshared bind) so
-            // it persists across container restarts AND reports fs_type=tmpfs.
-            // K8s ref: pkg/volume/emptydir/empty_dir.go.
-            let is_memory =
-                volume.empty_dir.as_ref().and_then(|e| e.medium.as_deref()) == Some("Memory");
-            if is_memory {
-                let size_bytes = volume
-                    .empty_dir
-                    .as_ref()
-                    .and_then(|e| e.size_limit.as_deref())
-                    .and_then(parse_quantity_bytes);
-                mount_tmpfs_for_emptydir(&volume_dir, size_bytes);
-            }
-            info!("Created emptyDir volume {} at {}", volume.name, volume_dir);
-            return Ok(volume_dir);
-        }
-
-        // HostPath: use the specified host path. The `type` field is validated
-        // (and "OrCreate" variants are materialised) via `check_host_path_type`,
-        // mirroring upstream `pkg/volume/host_path/host_path.go::checkType` —
-        // see also tests/conformance_storage_emptydir_hostpath.rs.
-        if let Some(host_path) = &volume.host_path {
-            // Expand environment variables in the path
-            let path = crate::runtime::expand_env_vars(&host_path.path);
-            match check_host_path_type(&path, host_path.type_.as_deref()) {
-                HostPathCheck::Ok => {}
-                HostPathCheck::Missing => {
-                    return Err(anyhow::anyhow!(
-                        "hostPath {} does not exist (type={:?})",
-                        path,
-                        host_path.type_
-                    ));
-                }
-                HostPathCheck::WrongKind => {
-                    return Err(anyhow::anyhow!(
-                        "hostPath {} exists but does not match type={:?}",
-                        path,
-                        host_path.type_
-                    ));
-                }
-                HostPathCheck::UnsupportedType => {
-                    return Err(anyhow::anyhow!(
-                        "hostPath {} declared unknown type {:?}",
-                        path,
-                        host_path.type_
-                    ));
-                }
-            }
-            info!("Using hostPath volume {} at {}", volume.name, path);
-            return Ok(path);
-        }
-
-        // ConfigMap: mount configmap data as files
-        if let Some(configmap_source) = &volume.config_map {
-            let storage = self
-                .storage
-                .as_ref()
-                .context("Storage not available for ConfigMap volumes")?;
-
-            let configmap_name = configmap_source
-                .name
-                .as_ref()
-                .context("ConfigMap volume must specify name")?;
-
-            let is_optional = configmap_source.optional.unwrap_or(false);
-
-            let key = build_key("configmaps", Some(namespace), configmap_name);
-            let configmap_result: Result<ConfigMap, _> = storage.get(&key).await;
-
-            // Create volume directory
-            let volume_dir = self.pod_volume_dir(pod, volume);
-            std::fs::create_dir_all(&volume_dir)
-                .context("Failed to create ConfigMap volume directory")?;
-
-            // Determine the default file mode: spec defaultMode, or 0644 (Kubernetes default)
-            let cm_default_mode = configmap_source.default_mode.unwrap_or(0o644);
-
-            match configmap_result {
-                Ok(configmap) => {
-                    // Build the projection payload (relative path -> bytes),
-                    // honoring `items` (specific keys → mapped paths) or all keys
-                    // from data + binaryData, then project it via the upstream
-                    // AtomicWriter. Re-projecting an unchanged payload is a no-op
-                    // (no write, no chmod, no symlink swap), so a running pod's
-                    // config watcher (kube-proxy) is never disturbed by the
-                    // kubelet's periodic re-SetUp. Each entry carries its own
-                    // mode: `items[].mode` when set, else the volume defaultMode.
-                    let payload = build_configmap_payload(
-                        &configmap,
-                        configmap_source.items.as_ref(),
-                        configmap_name,
-                        is_optional,
-                        cm_default_mode as u32,
-                    );
-                    crate::atomic_writer::write_projected_payload(
-                        std::path::Path::new(&volume_dir),
-                        &payload,
-                    )
-                    .with_context(|| format!("failed to project ConfigMap {configmap_name}"))?;
-                }
-                Err(e) => {
-                    if is_optional {
-                        info!(
-                            "Optional ConfigMap {} not found in namespace {}, creating empty volume",
-                            configmap_name, namespace
-                        );
-                    } else {
-                        // Required ConfigMap not found — abort pod start so kubelet
-                        // retries on next reconciliation (when the ConfigMap exists).
-                        return Err(anyhow::anyhow!(
-                            "ConfigMap {} not found in namespace {}: {}",
-                            configmap_name,
-                            namespace,
-                            e
-                        ));
-                    }
-                }
-            }
-
-            info!("Created ConfigMap volume {} at {}", volume.name, volume_dir);
-            return Ok(volume_dir);
-        }
-
-        // Secret: mount secret data as files
-        if let Some(secret_source) = &volume.secret {
-            let storage = self
-                .storage
-                .as_ref()
-                .context("Storage not available for Secret volumes")?;
-
-            let secret_name = secret_source
-                .secret_name
-                .as_ref()
-                .context("Secret volume must specify secret_name")?;
-
-            let is_optional = secret_source.optional.unwrap_or(false);
-
-            // For SA token volumes, generate a bound token with pod reference
-            // instead of using the static token from the Secret.
-            let is_sa_token_volume =
-                volume.name.contains("kube-api-access") || secret_name.ends_with("-token");
-            let bound_token: Option<String> = if is_sa_token_volume {
-                let sa_name = pod
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.service_account_name.as_deref())
-                    .unwrap_or("default");
-                let sa_key = build_key("serviceaccounts", Some(namespace), sa_name);
-                let sa_uid = storage
-                    .get::<serde_json::Value>(&sa_key)
-                    .await
-                    .ok()
-                    .and_then(|v| {
-                        v.pointer("/metadata/uid")
-                            .and_then(|u| u.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .unwrap_or_default();
-                let node_name = pod.spec.as_ref().and_then(|s| s.node_name.clone());
-                let node_uid = if let Some(ref nn) = node_name {
-                    let node_key = build_key("nodes", None::<&str>, nn);
-                    storage
-                        .get::<serde_json::Value>(&node_key)
-                        .await
-                        .ok()
-                        .and_then(|v| {
-                            v.pointer("/metadata/uid")
-                                .and_then(|u| u.as_str())
-                                .map(|s| s.to_string())
-                        })
-                } else {
-                    None
-                };
-                let now = chrono::Utc::now();
-                let claims = rusternetes_common::auth::ServiceAccountClaims {
-                    sub: format!("system:serviceaccount:{}:{}", namespace, sa_name),
-                    namespace: namespace.to_string(),
-                    uid: sa_uid.clone(),
-                    iat: now.timestamp(),
-                    exp: (now + chrono::Duration::hours(1)).timestamp(),
-                    iss: "https://kubernetes.default.svc.cluster.local".to_string(),
-                    aud: vec!["rusternetes".to_string()],
-                    kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
-                        namespace: namespace.to_string(),
-                        svcacct: rusternetes_common::auth::KubeRef {
-                            name: sa_name.to_string(),
-                            uid: sa_uid,
-                        },
-                        pod: Some(rusternetes_common::auth::KubeRef {
-                            name: pod_name.to_string(),
-                            uid: pod.metadata.uid.clone(),
-                        }),
-                        node: node_name
-                            .as_ref()
-                            .map(|nn| rusternetes_common::auth::KubeRef {
-                                name: nn.clone(),
-                                uid: node_uid.clone().unwrap_or_default(),
-                            }),
-                    }),
-                    pod_name: Some(pod_name.to_string()),
-                    pod_uid: Some(pod.metadata.uid.clone()),
-                    node_name,
-                    node_uid,
-                };
-                self.token_manager.generate_token(claims).ok()
-            } else {
-                None
-            };
-
-            let key = build_key("secrets", Some(namespace), secret_name);
-            let secret_result: Result<Secret, _> = storage.get(&key).await;
-
-            // Create volume directory
-            let volume_dir = self.pod_volume_dir(pod, volume);
-            std::fs::create_dir_all(&volume_dir)
-                .context("Failed to create Secret volume directory")?;
-
-            // Compute final directory permissions (will be applied after files are written)
-            #[cfg(unix)]
-            let secret_dir_mode = secret_source.default_mode.unwrap_or(0o644) as u32 | 0o111;
-
-            let secret = match secret_result {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    if is_optional {
-                        info!(
-                            "Optional Secret {} not found in namespace {}, creating empty volume",
-                            secret_name, namespace
-                        );
-                        None
-                    } else {
-                        // Required secret not found — return error so the kubelet
-                        // retries on next sync. K8s leaves the pod in Pending with
-                        // ContainerCreating and retries until the secret exists.
-                        // K8s ref: pkg/kubelet/kubelet_pods.go — makeVolumes
-                        return Err(anyhow::anyhow!(
-                            "Secret {} not found in namespace {}: {}",
-                            secret_name,
-                            namespace,
-                            e
-                        ));
-                    }
-                }
-            };
-
-            // Determine the default file mode: spec defaultMode, or 0644 (Kubernetes default)
-            let secret_default_mode = secret_source.default_mode.unwrap_or(0o644);
-
-            // Write secret data as files
-            if let Some(data) = secret.as_ref().and_then(|s| s.data.as_ref()) {
-                if let Some(ref items) = secret_source.items {
-                    // Only mount the specified keys
-                    for item in items {
-                        if let Some(value) = data.get(&item.key) {
-                            let file_path = format!("{}/{}", volume_dir, item.path);
-                            // Create parent directories if needed
-                            if let Some(parent) = std::path::Path::new(&file_path).parent() {
-                                std::fs::create_dir_all(parent).with_context(|| {
-                                    format!(
-                                        "Failed to create directory for Secret item {}",
-                                        item.path
-                                    )
-                                })?;
-                            }
-                            // For SA token volumes, substitute the bound token
-                            let write_value: &[u8] = if item.key == "token" {
-                                if let Some(ref bt) = bound_token {
-                                    bt.as_bytes()
-                                } else {
-                                    value
-                                }
-                            } else {
-                                value
-                            };
-                            std::fs::write(&file_path, write_value).with_context(|| {
-                                format!("Failed to write Secret key {} to file", item.key)
-                            })?;
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                let mode = item.mode.unwrap_or(secret_default_mode) as u32;
-                                std::fs::set_permissions(
-                                    &file_path,
-                                    std::fs::Permissions::from_mode(mode),
-                                )?;
-                            }
-                            if bound_token.is_some() && item.key == "token" {
-                                info!("Wrote bound SA token for pod {} to {}", pod_name, file_path);
-                            } else {
-                                info!("Wrote Secret key {} to {}", item.key, file_path);
-                            }
-                        }
-                    }
-                } else {
-                    // Mount all keys
-                    for (key, value) in data {
-                        let file_path = format!("{}/{}", volume_dir, key);
-                        // For SA token volumes, substitute the bound token
-                        let write_value: &[u8] = if key == "token" {
-                            if let Some(ref bt) = bound_token {
-                                bt.as_bytes()
-                            } else {
-                                value.as_slice()
-                            }
-                        } else {
-                            value.as_slice()
-                        };
-                        std::fs::write(&file_path, write_value).with_context(|| {
-                            format!("Failed to write Secret key {} to file", key)
-                        })?;
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            std::fs::set_permissions(
-                                &file_path,
-                                std::fs::Permissions::from_mode(secret_default_mode as u32),
-                            )?;
-                        }
-                        info!("Wrote Secret key {} to {}", key, file_path);
-                    }
-                }
-            }
-
-            // Special handling for service account token secrets - add ca.crt
-            // Service account secrets are identified by having a "token" key or by name pattern
-            let is_service_account_secret = secret
-                .as_ref()
-                .and_then(|s| s.data.as_ref())
-                .map(|data| data.contains_key("token"))
-                .unwrap_or(false)
-                || secret_name.ends_with("-token");
-
-            if is_service_account_secret {
-                // Check if ca.crt already exists in the secret data
-                let has_ca_cert = secret
-                    .as_ref()
-                    .and_then(|s| s.data.as_ref())
-                    .map(|data| data.contains_key("ca.crt"))
-                    .unwrap_or(false);
-
-                if !has_ca_cert {
-                    // Inject ca.crt from the cluster CA certificate
-                    // Try multiple locations: environment variable, volumes/_certs, then fallback to .rusternetes/certs
-                    let ca_cert_source = std::env::var("CA_CERT_PATH").unwrap_or_else(|_| {
-                        // First try volumes/_certs (accessible from kubelet container)
-                        let volumes_cert_path = format!("{}/_certs/ca.crt", self.volumes_base_path);
-                        if std::path::Path::new(&volumes_cert_path).exists() {
-                            volumes_cert_path
-                        } else {
-                            // Fallback to .rusternetes/certs (for host-based kubelet)
-                            format!(
-                                "{}/.rusternetes/certs/ca.crt",
-                                std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
-                            )
-                        }
-                    });
-
-                    let ca_path = format!("{}/ca.crt", volume_dir);
-                    if let Ok(ca_content) = std::fs::read(&ca_cert_source) {
-                        std::fs::write(&ca_path, ca_content)
-                            .context("Failed to write CA certificate")?;
-                        info!(
-                            "Injected CA certificate into service account secret volume at {} (from {})",
-                            ca_path, ca_cert_source
-                        );
-                    } else {
-                        warn!(
-                            "CA certificate not found at {}, pods may not be able to verify API server",
-                            ca_cert_source
-                        );
-                    }
-                }
-            }
-
-            // Set directory permissions after files are written so that restrictive
-            // defaultMode values (e.g., 0o400) don't prevent file creation.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    &volume_dir,
-                    std::fs::Permissions::from_mode(secret_dir_mode),
-                )?;
-            }
-
-            info!("Created Secret volume {} at {}", volume.name, volume_dir);
-            return Ok(volume_dir);
-        }
-
         // PersistentVolumeClaim: find bound PV and use its path
         if let Some(pvc_source) = &volume.persistent_volume_claim {
+            // ---- moved verbatim from create_volume's PersistentVolumeClaim branch
+            //      (991a503d:crates/kubelet/src/volumes.rs:1328-1373) ----
             let storage = self
                 .storage
                 .as_ref()
@@ -1356,113 +1032,25 @@ impl VolumeManager {
                 .get(&pv_key)
                 .await
                 .with_context(|| format!("PersistentVolume {} not found", pv_name))?;
-
-            // Get the host path from the PV
-            let path = if let Some(hp) = &pv.spec.host_path {
-                hp.path.clone()
-            } else {
-                return Err(anyhow::anyhow!(
-                    "PersistentVolume does not have a hostPath volume source"
-                ));
-            };
+            // ---- end moved body ----
+            // The final mount path is not known here — the matched plugin
+            // resolves and logs it separately — so log what this step has:
+            // the pod's volume name and the PV it resolved to. Restores the
+            // claim/PV pairing that used to be logged from this branch's
+            // tail before that tail moved into the hostPath plugin
+            // (`991a503d:volumes.rs:1364`).
             info!(
-                "Using PersistentVolumeClaim volume {} backed by PV {} at {}",
-                volume.name, pv_name, path
+                "Using PersistentVolumeClaim volume {} backed by PV {}",
+                volume.name, pv_name
             );
-            return Ok(path);
-        }
-
-        // DownwardAPI: expose pod/container metadata as files
-        if let Some(downward_api) = &volume.downward_api {
-            let volume_dir = self.pod_volume_dir(pod, volume);
-            std::fs::create_dir_all(&volume_dir)
-                .context("Failed to create DownwardAPI volume directory")?;
-
-            // Determine the default file mode: spec defaultMode, or 0644 (Kubernetes default)
-            let da_default_mode = downward_api.default_mode.unwrap_or(0o644);
-
-            // Compute final directory permissions (applied after files are written)
-            #[cfg(unix)]
-            let da_dir_mode = da_default_mode as u32 | 0o111;
-
-            if let Some(items) = &downward_api.items {
-                for item in items {
-                    let file_path = format!("{}/{}", volume_dir, item.path);
-
-                    // Create parent directories if needed
-                    if let Some(parent) = std::path::Path::new(&file_path).parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-
-                    // Get the value from field_ref or resource_field_ref
-                    let value = if let Some(field_ref) = &item.field_ref {
-                        self.get_pod_field_value(pod, &field_ref.field_path)?
-                    } else if let Some(resource_ref) = &item.resource_field_ref {
-                        self.get_container_resource_value(pod, resource_ref)?
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "DownwardAPI item must have either fieldRef or resourceFieldRef"
-                        ));
-                    };
-
-                    std::fs::write(&file_path, value).with_context(|| {
-                        format!("Failed to write DownwardAPI file {}", file_path)
-                    })?;
-
-                    // Set file permissions: per-item mode overrides defaultMode
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mode = item.mode.unwrap_or(da_default_mode) as u32;
-                        std::fs::set_permissions(
-                            &file_path,
-                            std::fs::Permissions::from_mode(mode),
-                        )?;
-                    }
-
-                    info!(
-                        "Wrote DownwardAPI file {} with value from {}",
-                        file_path, item.path
-                    );
-                }
-            }
-
-            // Set directory permissions after files are written so that restrictive
-            // defaultMode values don't prevent file creation.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    &volume_dir,
-                    std::fs::Permissions::from_mode(da_dir_mode),
-                )?;
-            }
-
-            info!(
-                "Created DownwardAPI volume {} at {}",
-                volume.name, volume_dir
-            );
-            return Ok(volume_dir);
-        }
-
-        // CSI: ephemeral inline volume (handled by external CSI driver)
-        if let Some(_csi) = &volume.csi {
-            // CSI ephemeral inline volumes are managed by the CSI driver via the kubelet CSI plugin
-            // For conformance, we create a placeholder directory and rely on the CSI driver to populate it
-            let volume_dir = self.pod_volume_dir(pod, volume);
-            std::fs::create_dir_all(&volume_dir)
-                .context("Failed to create CSI volume directory")?;
-
-            info!(
-                "Created CSI ephemeral volume {} at {} (managed by CSI driver)",
-                volume.name, volume_dir
-            );
-            return Ok(volume_dir);
+            return Ok(Some(pv));
         }
 
         // Ephemeral: generic ephemeral volume with PVC template
         if let Some(ephemeral) = &volume.ephemeral {
             if let Some(pvc_template) = &ephemeral.volume_claim_template {
+                // ---- moved verbatim from create_volume's Ephemeral branch
+                //      (991a503d:crates/kubelet/src/volumes.rs:1464-1551) ----
                 let storage = self
                     .storage
                     .as_ref()
@@ -1527,20 +1115,16 @@ impl VolumeManager {
                             pv_name
                         )
                     })?;
-
-                    let path = if let Some(hp) = &pv.spec.host_path {
-                        hp.path.clone()
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "PersistentVolume does not have a hostPath volume source"
-                        ));
-                    };
-
+                    // ---- end moved body ----
+                    // Same rationale as the PersistentVolumeClaim branch
+                    // above: no mount path here, so log the claim/PV pairing
+                    // only. Restores the tail dropped from this branch
+                    // (`991a503d:volumes.rs:1538`).
                     info!(
-                        "Using ephemeral volume {} backed by PVC {} and PV {} at {}",
-                        volume.name, pvc_name, pv_name, path
+                        "Using ephemeral volume {} backed by PVC {} and PV {}",
+                        volume.name, pvc_name, pv_name
                     );
-                    return Ok(path);
+                    return Ok(Some(pv));
                 } else {
                     return Err(anyhow::anyhow!(
                         "Ephemeral PVC {} is not bound yet",
@@ -1550,408 +1134,84 @@ impl VolumeManager {
             }
         }
 
-        // Projected: combine multiple volume sources (configMap, secret, downwardAPI, serviceAccountToken) into one directory
-        if let Some(projected) = &volume.projected {
-            let volume_dir = self.pod_volume_dir(pod, volume);
-            std::fs::create_dir_all(&volume_dir)
-                .context("Failed to create projected volume directory")?;
+        Ok(None)
+    }
 
-            // Determine the default file mode: spec defaultMode, or 0644 (Kubernetes default)
-            let proj_default_mode = projected.default_mode.unwrap_or(0o644);
+    /// Create a single volume and return its host path.
+    ///
+    /// Port of `pkg/volume/plugins.go:634-666`'s `FindPluginBySpec` used the
+    /// way `desiredStateOfWorldPopulator.createVolumeSpec` uses it: resolve a
+    /// `persistentVolumeClaim`/`ephemeral` volume to its bound PV first (see
+    /// `resolve_persistent_volume` — upstream has no separate pvc plugin), then
+    /// look the resulting `Spec` up in the registry exactly once. What used to
+    /// be eight `if volume.<kind>.is_some()` blocks, each constructing its own
+    /// plugin, is now the one dispatch the registry exists for.
+    pub(crate) async fn create_volume(
+        &self,
+        pod: &Pod,
+        volume: &rusternetes_common::resources::Volume,
+    ) -> Result<String> {
+        // persistentVolumeClaim / ephemeral resolve to a PersistentVolume
+        // first; the PV's source then selects the plugin. Returns `None` for
+        // every other volume kind, and for an ephemeral volume with no claim
+        // template (which is not actionable and falls through like upstream's
+        // empty spec would).
+        let pv = self.resolve_persistent_volume(pod, volume).await?;
+        let spec = crate::volume_plugins::Spec {
+            volume,
+            persistent_volume: pv.as_ref(),
+        };
 
-            // Compute final directory permissions (will be applied after files are written)
-            #[cfg(unix)]
-            let proj_dir_mode = proj_default_mode as u32 | 0o111;
-
-            if let Some(sources) = &projected.sources {
-                let storage = self.storage.as_ref();
-
-                for source in sources {
-                    // ConfigMap projection
-                    if let Some(cm_proj) = &source.config_map {
-                        if let Some(cm_name) = &cm_proj.name {
-                            let key = build_key("configmaps", Some(namespace), cm_name);
-                            if let Some(storage) = storage {
-                                match storage.get::<ConfigMap>(&key).await {
-                                    Ok(cm) => {
-                                        // Helper to write a projected file with permissions
-                                        let write_proj_file =
-                                            |path: &str, content: &[u8], mode: i32| -> Result<()> {
-                                                if let Some(parent) =
-                                                    std::path::Path::new(path).parent()
-                                                {
-                                                    std::fs::create_dir_all(parent)?;
-                                                }
-                                                std::fs::write(path, content)?;
-                                                #[cfg(unix)]
-                                                {
-                                                    use std::os::unix::fs::PermissionsExt;
-                                                    std::fs::set_permissions(
-                                                        path,
-                                                        std::fs::Permissions::from_mode(
-                                                            mode as u32,
-                                                        ),
-                                                    )?;
-                                                }
-                                                Ok(())
-                                            };
-
-                                        if let Some(items) = &cm_proj.items {
-                                            for item in items {
-                                                let mode = item.mode.unwrap_or(proj_default_mode);
-                                                let file_path =
-                                                    format!("{}/{}", volume_dir, item.path);
-                                                // Try data first, then binaryData
-                                                if let Some(value) =
-                                                    cm.data.as_ref().and_then(|d| d.get(&item.key))
-                                                {
-                                                    write_proj_file(
-                                                        &file_path,
-                                                        value.as_bytes(),
-                                                        mode,
-                                                    )?;
-                                                } else if let Some(value) = cm
-                                                    .binary_data
-                                                    .as_ref()
-                                                    .and_then(|d| d.get(&item.key))
-                                                {
-                                                    write_proj_file(&file_path, value, mode)?;
-                                                }
-                                            }
-                                        } else {
-                                            // Mount all keys from data
-                                            if let Some(data) = &cm.data {
-                                                for (k, v) in data {
-                                                    let file_path = format!("{}/{}", volume_dir, k);
-                                                    write_proj_file(
-                                                        &file_path,
-                                                        v.as_bytes(),
-                                                        proj_default_mode,
-                                                    )?;
-                                                }
-                                            }
-                                            // Mount all keys from binaryData
-                                            if let Some(binary_data) = &cm.binary_data {
-                                                for (k, v) in binary_data {
-                                                    let file_path = format!("{}/{}", volume_dir, k);
-                                                    write_proj_file(
-                                                        &file_path,
-                                                        v,
-                                                        proj_default_mode,
-                                                    )?;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(_) if cm_proj.optional.unwrap_or(false) => {
-                                        // Optional configmap not found, skip
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to get ConfigMap {} for projected volume: {}. Skipping.",
-                                            cm_name, e
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Secret projection
-                    if let Some(secret_proj) = &source.secret {
-                        if let Some(secret_name) = &secret_proj.name {
-                            let key = build_key("secrets", Some(namespace), secret_name);
-                            if let Some(storage) = storage {
-                                match storage.get::<Secret>(&key).await {
-                                    Ok(secret) => {
-                                        if let Some(data) = &secret.data {
-                                            if let Some(items) = &secret_proj.items {
-                                                for item in items {
-                                                    if let Some(value) = data.get(&item.key) {
-                                                        let file_path =
-                                                            format!("{}/{}", volume_dir, item.path);
-                                                        if let Some(parent) =
-                                                            std::path::Path::new(&file_path)
-                                                                .parent()
-                                                        {
-                                                            std::fs::create_dir_all(parent)?;
-                                                        }
-                                                        std::fs::write(&file_path, value)?;
-                                                        #[cfg(unix)]
-                                                        {
-                                                            use std::os::unix::fs::PermissionsExt;
-                                                            let mode = item
-                                                                .mode
-                                                                .unwrap_or(proj_default_mode)
-                                                                as u32;
-                                                            std::fs::set_permissions(
-                                                                &file_path,
-                                                                std::fs::Permissions::from_mode(
-                                                                    mode,
-                                                                ),
-                                                            )?;
-                                                        }
-                                                    }
-                                                }
-                                            } else {
-                                                for (k, v) in data {
-                                                    let file_path = format!("{}/{}", volume_dir, k);
-                                                    std::fs::write(&file_path, v)?;
-                                                    #[cfg(unix)]
-                                                    {
-                                                        use std::os::unix::fs::PermissionsExt;
-                                                        std::fs::set_permissions(
-                                                            &file_path,
-                                                            std::fs::Permissions::from_mode(
-                                                                proj_default_mode as u32,
-                                                            ),
-                                                        )?;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(_) if secret_proj.optional.unwrap_or(false) => {
-                                        // Optional secret not found, skip
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to get Secret {} for projected volume: {}. Skipping.",
-                                            secret_name, e
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // DownwardAPI projection
-                    if let Some(downward_api) = &source.downward_api {
-                        if let Some(items) = &downward_api.items {
-                            for item in items {
-                                let file_path = format!("{}/{}", volume_dir, item.path);
-                                if let Some(parent) = std::path::Path::new(&file_path).parent() {
-                                    std::fs::create_dir_all(parent)?;
-                                }
-                                let value = if let Some(ref field_ref) = item.field_ref {
-                                    self.get_pod_field_value(pod, &field_ref.field_path)
-                                        .unwrap_or_default()
-                                } else if let Some(ref resource_ref) = item.resource_field_ref {
-                                    self.get_container_resource_value(pod, resource_ref)
-                                        .unwrap_or_default()
-                                } else {
-                                    String::new()
-                                };
-                                std::fs::write(&file_path, &value)?;
-                                #[cfg(unix)]
-                                {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    let mode = item.mode.unwrap_or(proj_default_mode) as u32;
-                                    std::fs::set_permissions(
-                                        &file_path,
-                                        std::fs::Permissions::from_mode(mode),
-                                    )?;
-                                }
-                            }
-                        }
-                    }
-
-                    // ServiceAccountToken projection
-                    if let Some(sa_token) = &source.service_account_token {
-                        let token_path = format!("{}/{}", volume_dir, sa_token.path);
-                        if let Some(parent) = std::path::Path::new(&token_path).parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        // Generate a real JWT token bound to this pod
-                        let sa_name = pod
-                            .spec
-                            .as_ref()
-                            .and_then(|s| s.service_account_name.as_deref())
-                            .unwrap_or("default");
-                        let sa_uid = if let Some(storage) = storage {
-                            let sa_key = build_key("serviceaccounts", Some(namespace), sa_name);
-                            match storage
-                                .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
-                                .await
-                            {
-                                Ok(sa) => sa.metadata.uid.clone(),
-                                Err(_) => String::new(),
-                            }
-                        } else {
-                            String::new()
-                        };
-                        // TokenRequest requires expirationSeconds >= 600 (10m).
-                        let expiration_seconds =
-                            sa_token.expiration_seconds.unwrap_or(3600).max(600);
-                        let now = chrono::Utc::now();
-                        let exp = now.timestamp() + expiration_seconds;
-                        // Audience to REQUEST from the api-server: exactly what the
-                        // projection asked for (empty => the api-server's own
-                        // default api-audience, which it will then accept — do NOT
-                        // force "rusternetes", or a vanilla api-server issues a
-                        // token whose audience it rejects on use).
-                        let requested_audiences: Vec<String> =
-                            sa_token.audience.iter().cloned().collect();
-                        // Audience baked into the self-mint FALLBACK claims (native
-                        // storage-mode only): default to "rusternetes".
-                        let mut audiences = vec!["rusternetes".to_string()];
-                        if let Some(ref aud) = sa_token.audience {
-                            audiences = vec![aud.clone()];
-                        }
-                        let node_name = pod.spec.as_ref().and_then(|s| s.node_name.clone());
-                        let node_uid = if let (Some(ref nn), Some(st)) = (&node_name, storage) {
-                            let node_key = build_key("nodes", None::<&str>, nn);
-                            st.get::<serde_json::Value>(&node_key)
-                                .await
-                                .ok()
-                                .and_then(|v| {
-                                    v.pointer("/metadata/uid")
-                                        .and_then(|u| u.as_str())
-                                        .map(|s| s.to_string())
-                                })
-                        } else {
-                            None
-                        };
-                        let claims = rusternetes_common::auth::ServiceAccountClaims {
-                            sub: format!("system:serviceaccount:{}:{}", namespace, sa_name),
-                            namespace: namespace.to_string(),
-                            uid: sa_uid.clone(),
-                            iat: now.timestamp(),
-                            exp,
-                            iss: "https://kubernetes.default.svc.cluster.local".to_string(),
-                            aud: audiences.clone(),
-                            kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
-                                namespace: namespace.to_string(),
-                                svcacct: rusternetes_common::auth::KubeRef {
-                                    name: sa_name.to_string(),
-                                    uid: sa_uid,
-                                },
-                                pod: Some(rusternetes_common::auth::KubeRef {
-                                    name: pod_name.clone(),
-                                    uid: pod.metadata.uid.clone(),
-                                }),
-                                node: node_name.as_ref().map(|nn| {
-                                    rusternetes_common::auth::KubeRef {
-                                        name: nn.clone(),
-                                        uid: node_uid.clone().unwrap_or_default(),
-                                    }
-                                }),
-                            }),
-                            pod_name: Some(pod_name.clone()),
-                            pod_uid: Some(pod.metadata.uid.clone()),
-                            node_name,
-                            node_uid,
-                        };
-                        // Reuse a still-fresh token: re-mint only when the file is
-                        // missing or past ~80% of its lifetime. The per-sync volume
-                        // re-creation would otherwise hit the api-server TokenRequest
-                        // endpoint every few seconds per pod and churn the token file.
-                        let refresh_after = (expiration_seconds * 8 / 10).max(60);
-                        let token_fresh = std::fs::metadata(&token_path)
-                            .and_then(|m| m.modified())
-                            .ok()
-                            .and_then(|mt| mt.elapsed().ok())
-                            .map(|age| (age.as_secs() as i64) < refresh_after)
-                            .unwrap_or(false);
-                        if !token_fresh {
-                            // Prefer an api-server-issued bound token (TokenRequest),
-                            // matching the upstream kubelet (pkg/kubelet/token) — it
-                            // never self-signs. A vanilla api-server only trusts
-                            // tokens IT signed, so a self-minted token is 401-rejected
-                            // for in-cluster clients (kindnet et al.). Self-mint only
-                            // as a fallback for the storage-direct backends
-                            // (all-in-one), whose co-located api-server trusts our key.
-                            let mut issued: Option<String> = None;
-                            if let Some(st) = storage {
-                                // Bind the token to this pod, as upstream's
-                                // projected volume plugin does
-                                // (pkg/volume/projected/projected.go). The
-                                // api-server derives the pod/node claims from
-                                // the ref, and a TokenReview on the mounted
-                                // token then reports the
-                                // authentication.kubernetes.io/pod-name,
-                                // pod-uid and node-name extras (#1684).
-                                match st
-                                    .create_sa_token(
-                                        namespace,
-                                        sa_name,
-                                        &requested_audiences,
-                                        expiration_seconds,
-                                        Some((pod_name.as_str(), pod.metadata.uid.as_str())),
-                                    )
-                                    .await
-                                {
-                                    Ok(Some(t)) => issued = Some(t),
-                                    Ok(None) => {}
-                                    Err(e) => warn!(
-                                        "TokenRequest for {}/{} failed: {}; self-minting",
-                                        namespace, sa_name, e
-                                    ),
-                                }
-                            }
-                            let token = match issued {
-                                Some(t) => t,
-                                None => match self.token_manager.generate_token(claims) {
-                                    Ok(t) => t,
-                                    Err(e) => {
-                                        warn!(
-                                    "Failed to generate SA token for pod {}: {}, using placeholder",
-                                    pod_name, e
-                                );
-                                        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder"
-                                            .to_string()
-                                    }
-                                },
-                            };
-                            std::fs::write(&token_path, &token)?;
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                std::fs::set_permissions(
-                                    &token_path,
-                                    std::fs::Permissions::from_mode(proj_default_mode as u32),
-                                )?;
-                            }
-                        } // end if !token_fresh
-                    }
-                }
+        match self.plugin_mgr.find_plugin_by_spec(&spec) {
+            Ok(plugin) => {
+                let mounter = plugin.new_mounter(&spec, pod).await?;
+                mounter.set_up().await?;
+                Ok(mounter.get_path())
             }
-
-            // Set directory permissions after files are written so that restrictive
-            // defaultMode values don't prevent file creation.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    &volume_dir,
-                    std::fs::Permissions::from_mode(proj_dir_mode),
-                )?;
+            Err(crate::volume_plugins::PluginLookupError::NoPluginMatched) if pv.is_some() => {
+                // Preserve the pre-registry message: today only a
+                // hostPath-sourced PV resolves, so "no plugin matched" for a
+                // resolved PV means it has no hostPath source. `lifecycle.rs`
+                // documents this exact string as a non-wait error.
+                Err(anyhow::anyhow!(
+                    "PersistentVolume does not have a hostPath volume source"
+                ))
             }
-
-            info!("Created projected volume {} at {}", volume.name, volume_dir);
-            return Ok(volume_dir);
+            // DEVIATION from upstream, preserved from the pre-registry
+            // `create_volume` and documented at
+            // `pod_dirs::UNSUPPORTED_PLUGIN`: upstream fails the pod for an
+            // unimplemented inline kind (nfs, iscsi, image, ...); we
+            // provision an empty directory so it can run instead. Kept at
+            // this call site rather than inside the registry — a catch-all
+            // plugin cannot know whether another plugin already matched, so
+            // it would trip `MultipleMatched` on every volume — so the
+            // registry stays a faithful port and this is one match arm to
+            // delete once every kind is implemented.
+            Err(crate::volume_plugins::PluginLookupError::NoPluginMatched) => {
+                warn!(
+                    "Unknown volume type for volume {}, creating empty directory as fallback (volume debug: downward_api={}, empty_dir={}, host_path={}, config_map={}, secret={}, projected={}, pvc={}, csi={}, ephemeral={})",
+                    volume.name,
+                    volume.downward_api.is_some(),
+                    volume.empty_dir.is_some(),
+                    volume.host_path.is_some(),
+                    volume.config_map.is_some(),
+                    volume.secret.is_some(),
+                    volume.projected.is_some(),
+                    volume.persistent_volume_claim.is_some(),
+                    volume.csi.is_some(),
+                    volume.ephemeral.is_some(),
+                );
+                let volume_dir = self.pod_volume_dir(pod, volume);
+                std::fs::create_dir_all(&volume_dir)
+                    .context("Failed to create fallback volume directory")?;
+                Ok(volume_dir)
+            }
+            // A volume declaring two sources (e.g. both emptyDir and
+            // configMap) previously resolved silently, first-arm-wins, under
+            // the ordered if-chain. The registry rejects it outright
+            // (`pkg/volume/plugins.go:661-663`).
+            Err(e) => Err(e.into()),
         }
-
-        // Fallback: create an empty directory for unrecognized volume types
-        // (e.g. nfs, iscsi, image, or any future types)
-        // This prevents pod startup failures for volumes we don't natively handle.
-        warn!(
-            "Unknown volume type for volume {}, creating empty directory as fallback (volume debug: downward_api={}, empty_dir={}, host_path={}, config_map={}, secret={}, projected={}, pvc={}, csi={}, ephemeral={})",
-            volume.name,
-            volume.downward_api.is_some(),
-            volume.empty_dir.is_some(),
-            volume.host_path.is_some(),
-            volume.config_map.is_some(),
-            volume.secret.is_some(),
-            volume.projected.is_some(),
-            volume.persistent_volume_claim.is_some(),
-            volume.csi.is_some(),
-            volume.ephemeral.is_some(),
-        );
-        let volume_dir = self.pod_volume_dir(pod, volume);
-        std::fs::create_dir_all(&volume_dir)
-            .context("Failed to create fallback volume directory")?;
-        Ok(volume_dir)
     }
 
     /// Refresh Secret and ConfigMap volumes for a running pod.
@@ -2201,6 +1461,7 @@ mod configmap_payload_tests {
 #[cfg(all(test, unix))]
 mod projected_mode_tests {
     use super::*;
+    use rusternetes_common::resources::Secret;
     use rusternetes_storage::{build_key, Storage, StorageBackend};
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
@@ -2569,6 +1830,305 @@ mod projected_mode_tests {
         );
         assert_eq!(vm.volume_gids(&pod).await, vec![7777]);
     }
+
+    /// Characterization test for the secret volume plugin's `set_up` body
+    /// (moved verbatim from `create_volume` in #1970's Task 6). Goes through
+    /// the public entry point, `VolumeManager::create_volume`, not the plugin
+    /// directly, and asserts on the real on-disk result: the returned path,
+    /// the written file contents, and the mode the body applies from
+    /// `defaultMode`. This is the test the Task 6 review found missing — the
+    /// safety argument for the highest-risk moved body in the refactor had
+    /// rested entirely on the text diff. It was re-run unmodified against
+    /// `991a503d` (the pre-move commit) to confirm it characterizes the OLD
+    /// behaviour too, not just whatever the new code happens to do — see the
+    /// task-6 report for both runs.
+    #[tokio::test]
+    async fn create_volume_writes_secret_data_to_disk() {
+        let storage = Arc::new(StorageBackend::new_memory());
+
+        let secret = Secret::new("mysecret", "default").with_data(HashMap::from([
+            ("username".to_string(), b"admin".to_vec()),
+            ("password".to_string(), b"hunter2".to_vec()),
+        ]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("secrets", Some("default"), "mysecret"),
+            &secret,
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+        let volume: rusternetes_common::resources::Volume = serde_json::from_value(json!({
+            "name": "sec",
+            "secret": {"secretName": "mysecret", "defaultMode": 0o400}
+        }))
+        .unwrap();
+
+        let path = vm.create_volume(&pod, &volume).await.unwrap();
+        assert_eq!(
+            path,
+            format!(
+                "{}/pods/uid-1/volumes/kubernetes.io~secret/sec",
+                tmp.path().to_string_lossy()
+            )
+        );
+
+        let username = std::fs::read(format!("{path}/username")).unwrap();
+        assert_eq!(username, b"admin");
+        let password = std::fs::read(format!("{path}/password")).unwrap();
+        assert_eq!(password, b"hunter2");
+
+        let mode = std::fs::metadata(format!("{path}/username"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o400,
+            "file mode must come from the volume's defaultMode"
+        );
+
+        // secret_dir_mode = defaultMode | 0o111 (secret.rs's moved body)
+        let dir_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o400 | 0o111);
+    }
+
+    /// Characterization test for the downwardAPI volume plugin's `set_up`
+    /// body, written and run BEFORE that body moves out of `create_volume`
+    /// (#1970 Task 7) — see the task-7 report for the equivalence run against
+    /// the pre-move commit. Goes through the public entry point,
+    /// `VolumeManager::create_volume`, not the plugin directly, and asserts
+    /// on the real on-disk result: the returned path, a `fieldRef` item's
+    /// contents, a `resourceFieldRef` item's contents, the mode a per-item
+    /// `mode` applies, the mode `defaultMode` applies to an item with no
+    /// override, and the directory mode (`defaultMode | 0o111`).
+    #[tokio::test]
+    async fn create_volume_writes_downward_api_data_to_disk() {
+        let storage = Arc::new(StorageBackend::new_memory());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {"containers": [{
+                "name": "app",
+                "resources": {"limits": {"cpu": "2"}}
+            }]}
+        }))
+        .unwrap();
+        let volume: rusternetes_common::resources::Volume = serde_json::from_value(json!({
+            "name": "podinfo",
+            "downwardAPI": {
+                "defaultMode": 416,
+                "items": [
+                    {"path": "podname", "fieldRef": {"fieldPath": "metadata.name"}},
+                    {
+                        "path": "cpu_limit",
+                        "resourceFieldRef": {"containerName": "app", "resource": "limits.cpu"},
+                        "mode": 256
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+
+        let path = vm.create_volume(&pod, &volume).await.unwrap();
+        assert_eq!(
+            path,
+            format!(
+                "{}/pods/uid-1/volumes/kubernetes.io~downward-api/podinfo",
+                tmp.path().to_string_lossy()
+            )
+        );
+
+        let podname = std::fs::read_to_string(format!("{path}/podname")).unwrap();
+        assert_eq!(podname, "p", "fieldRef item must contain metadata.name");
+        let cpu_limit = std::fs::read_to_string(format!("{path}/cpu_limit")).unwrap();
+        assert_eq!(
+            cpu_limit, "2",
+            "resourceFieldRef item must contain the container's limits.cpu, in whole cores"
+        );
+
+        let podname_mode = std::fs::metadata(format!("{path}/podname"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            podname_mode & 0o777,
+            0o640,
+            "file mode must come from the volume's defaultMode when the item has no mode"
+        );
+
+        let cpu_limit_mode = std::fs::metadata(format!("{path}/cpu_limit"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            cpu_limit_mode & 0o777,
+            0o400,
+            "file mode must come from the item's own mode when set"
+        );
+
+        // da_dir_mode = defaultMode | 0o111 (volumes.rs's moved body)
+        let dir_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o640 | 0o111);
+    }
+
+    /// Characterization test for the projected volume plugin's `set_up` body,
+    /// written and run BEFORE that body moves out of `create_volume` (#1970
+    /// Task 8) — see the task-8 report for the equivalence run against the
+    /// pre-move commit. Goes through the public entry point,
+    /// `VolumeManager::create_volume`, not the plugin directly, and combines
+    /// the three source kinds a projected volume fans out to in production
+    /// (configMap, secret, downwardAPI) in one volume, matching the whole
+    /// point of the projected plugin: asserts on the real on-disk result —
+    /// the returned path, each source's file contents, a per-item `mode`
+    /// override (the configMap item), the `defaultMode` fallback (the secret
+    /// and downwardAPI items, which set no `mode`), and the directory mode
+    /// (`defaultMode | 0o111`).
+    ///
+    /// The serviceAccountToken source is NOT covered here — it mints a real
+    /// token via `TokenManager` and reads ServiceAccount/Node uids from
+    /// storage, which is a materially different code path from the other
+    /// three. Left as a follow-up, same as the gap flagged for the secret
+    /// plugin in Task 6.
+    #[tokio::test]
+    async fn create_volume_writes_projected_sources_to_disk() {
+        let storage = Arc::new(StorageBackend::new_memory());
+
+        let cm = ConfigMap::new("cfg", "default").with_data(HashMap::from([(
+            "app.conf".to_string(),
+            "hello".to_string(),
+        )]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("configmaps", Some("default"), "cfg"),
+            &cm,
+        )
+        .await
+        .unwrap();
+
+        let secret = Secret::new("sec", "default").with_data(HashMap::from([(
+            "password".to_string(),
+            b"hunter2".to_vec(),
+        )]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("secrets", Some("default"), "sec"),
+            &secret,
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+        let volume: rusternetes_common::resources::Volume = serde_json::from_value(json!({
+            "name": "proj",
+            "projected": {
+                "defaultMode": 416,
+                "sources": [
+                    {"configMap": {
+                        "name": "cfg",
+                        "items": [{"key": "app.conf", "path": "app.conf", "mode": 256}]
+                    }},
+                    {"secret": {
+                        "name": "sec",
+                        "items": [{"key": "password", "path": "password"}]
+                    }},
+                    {"downwardAPI": {
+                        "items": [{"path": "podname", "fieldRef": {"fieldPath": "metadata.name"}}]
+                    }}
+                ]
+            }
+        }))
+        .unwrap();
+
+        let path = vm.create_volume(&pod, &volume).await.unwrap();
+        assert_eq!(
+            path,
+            format!(
+                "{}/pods/uid-1/volumes/kubernetes.io~projected/proj",
+                tmp.path().to_string_lossy()
+            )
+        );
+
+        let app_conf = std::fs::read_to_string(format!("{path}/app.conf")).unwrap();
+        assert_eq!(
+            app_conf, "hello",
+            "configMap item must contain its key's value"
+        );
+        let password = std::fs::read(format!("{path}/password")).unwrap();
+        assert_eq!(
+            password, b"hunter2",
+            "secret item must contain its key's value"
+        );
+        let podname = std::fs::read_to_string(format!("{path}/podname")).unwrap();
+        assert_eq!(
+            podname, "p",
+            "downwardAPI fieldRef item must contain metadata.name"
+        );
+
+        let app_conf_mode = std::fs::metadata(format!("{path}/app.conf"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            app_conf_mode & 0o777,
+            0o400,
+            "configMap item's own mode must override the volume's defaultMode"
+        );
+
+        let password_mode = std::fs::metadata(format!("{path}/password"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            password_mode & 0o777,
+            0o640,
+            "secret item with no mode must fall back to the volume's defaultMode"
+        );
+
+        let podname_mode = std::fs::metadata(format!("{path}/podname"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            podname_mode & 0o777,
+            0o640,
+            "downwardAPI item with no mode must fall back to the volume's defaultMode"
+        );
+
+        // proj_dir_mode = defaultMode | 0o111 (volumes.rs's moved body)
+        let dir_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o640 | 0o111);
+    }
 }
 
 /// Orphaned pod directory sweep — port of `cleanupOrphanedPodDirs`
@@ -2712,5 +2272,462 @@ mod orphan_sweep_tests {
         let mut found = crate::pod_dirs::list_pods_from_disk(&root).unwrap();
         found.sort();
         assert_eq!(found, vec!["uid-a".to_string(), "uid-b".to_string()]);
+    }
+}
+
+/// Task 10 (#1970): `persistentVolumeClaim` and `ephemeral` have no plugin of
+/// their own — they resolve to a `PersistentVolume` and the PV's SOURCE picks
+/// the plugin (`host_path.go:98-101`). These tests cover
+/// `VolumeManager::resolve_persistent_volume` and the dispatch that follows
+/// it in `create_volume`, with particular attention to the error strings
+/// `lifecycle.rs::is_volume_wait_error` matches on byte-for-byte.
+#[cfg(test)]
+mod pvc_resolution_tests {
+    use super::*;
+    use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim, Pod, Volume};
+    use rusternetes_storage::StorageBackend;
+    use serde_json::json;
+
+    fn vm(storage: Option<Arc<StorageBackend>>) -> VolumeManager {
+        VolumeManager::new(
+            std::env::temp_dir().to_string_lossy().to_string(),
+            storage,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        )
+    }
+
+    /// A PVC-backed volume must reach the plugin that owns the PV's SOURCE.
+    /// There is no pvc plugin upstream: hostPath claims it via the
+    /// PersistentVolume arm of `CanSupport` (`host_path.go:98-101`).
+    #[tokio::test]
+    async fn a_bound_pvc_resolves_to_its_pv_and_dispatches_on_the_pv_source() {
+        let storage = Arc::new(StorageBackend::new_memory());
+
+        let pv: PersistentVolume = serde_json::from_value(json!({
+            "metadata": {"name": "pv-1"},
+            "spec": {
+                "capacity": {"storage": "1Gi"},
+                "accessModes": ["ReadWriteOnce"],
+                "hostPath": {"path": "/mnt/data"}
+            }
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("persistentvolumes", None, "pv-1"), &pv)
+            .await
+            .unwrap();
+
+        let pvc: PersistentVolumeClaim = serde_json::from_value(json!({
+            "metadata": {"name": "claim-1", "namespace": "default"},
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeName": "pv-1",
+                "resources": {"requests": {"storage": "1Gi"}}
+            }
+        }))
+        .unwrap();
+        storage
+            .create(
+                &build_key("persistentvolumeclaims", Some("default"), "claim-1"),
+                &pvc,
+            )
+            .await
+            .unwrap();
+
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "claimed",
+            "persistentVolumeClaim": {"claimName": "claim-1"}
+        }))
+        .unwrap();
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        let manager = vm(Some(storage));
+        let resolved = manager
+            .resolve_persistent_volume(&pod, &volume)
+            .await
+            .unwrap();
+        let resolved = resolved.expect("a bound PVC resolves to a PV");
+        let spec = crate::volume_plugins::Spec {
+            volume: &volume,
+            persistent_volume: Some(&resolved),
+        };
+        let plugin = manager.plugin_mgr.find_plugin_by_spec(&spec).unwrap();
+        assert_eq!(plugin.name(), crate::pod_dirs::plugin::HOST_PATH);
+
+        // And create_volume must dispatch to the same plugin end-to-end.
+        let path = manager.create_volume(&pod, &volume).await.unwrap();
+        assert_eq!(path, "/mnt/data");
+    }
+
+    #[tokio::test]
+    async fn a_non_claim_volume_resolves_to_no_pv() {
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "scratch",
+            "emptyDir": {}
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        assert!(vm(None)
+            .resolve_persistent_volume(&pod, &volume)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Preserved byte-for-byte: `lifecycle.rs::is_volume_wait_error` matches
+    /// "not found in namespace" together with "PersistentVolumeClaim" to keep
+    /// a pod in `ContainerCreating` rather than failing it outright.
+    #[tokio::test]
+    async fn a_missing_pvc_yields_the_exact_not_found_message() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "claimed",
+            "persistentVolumeClaim": {"claimName": "missing"}
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "ns"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        let err = vm(Some(storage))
+            .resolve_persistent_volume(&pod, &volume)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "PersistentVolumeClaim missing not found in namespace ns"
+        );
+    }
+
+    /// Preserved byte-for-byte: `lifecycle.rs::is_volume_wait_error` matches
+    /// this exact string to keep the pod waiting instead of failing it.
+    #[tokio::test]
+    async fn an_unbound_pvc_yields_the_exact_not_bound_message() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        let pvc: PersistentVolumeClaim = serde_json::from_value(json!({
+            "metadata": {"name": "claim-1", "namespace": "ns"},
+            "spec": {"accessModes": ["ReadWriteOnce"],
+                     "resources": {"requests": {"storage": "1Gi"}}}
+        }))
+        .unwrap();
+        storage
+            .create(
+                &build_key("persistentvolumeclaims", Some("ns"), "claim-1"),
+                &pvc,
+            )
+            .await
+            .unwrap();
+
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "claimed",
+            "persistentVolumeClaim": {"claimName": "claim-1"}
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "ns"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        let err = vm(Some(storage))
+            .resolve_persistent_volume(&pod, &volume)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "PersistentVolumeClaim is not bound to a volume"
+        );
+    }
+
+    /// Ruling 3: `ephemeral` set but `volumeClaimTemplate` absent falls
+    /// through both arms silently — upstream's structure (nested `if let`)
+    /// is reproduced verbatim, not converted into an error. `create_volume`
+    /// then hits the unsupported-kind fallback and gets an empty directory.
+    #[tokio::test]
+    async fn an_ephemeral_volume_without_a_template_resolves_to_no_pv() {
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "eph",
+            "ephemeral": {}
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        assert!(vm(None)
+            .resolve_persistent_volume(&pod, &volume)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Ruling 2: a PV with no claimable source (today, anything but hostPath)
+    /// must surface the pre-registry message verbatim, not the registry's own
+    /// "no volume plugin matched" — `lifecycle.rs:486` documents this exact
+    /// string as a worked example of a non-wait error.
+    #[tokio::test]
+    async fn a_pv_without_a_hostpath_source_yields_the_preserved_message() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        // No source field on the PV at all — deliberately not a CSI source
+        // (that specific case is not this test's concern); any PV with no
+        // claimable source must produce this message.
+        let pv: PersistentVolume = serde_json::from_value(json!({
+            "metadata": {"name": "pv-1"},
+            "spec": {
+                "capacity": {"storage": "1Gi"},
+                "accessModes": ["ReadWriteOnce"]
+            }
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("persistentvolumes", None, "pv-1"), &pv)
+            .await
+            .unwrap();
+
+        let pvc: PersistentVolumeClaim = serde_json::from_value(json!({
+            "metadata": {"name": "claim-1", "namespace": "default"},
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeName": "pv-1",
+                "resources": {"requests": {"storage": "1Gi"}}
+            }
+        }))
+        .unwrap();
+        storage
+            .create(
+                &build_key("persistentvolumeclaims", Some("default"), "claim-1"),
+                &pvc,
+            )
+            .await
+            .unwrap();
+
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "claimed",
+            "persistentVolumeClaim": {"claimName": "claim-1"}
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        let err = vm(Some(storage))
+            .create_volume(&pod, &volume)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "PersistentVolume does not have a hostPath volume source"
+        );
+    }
+}
+
+/// Task 11 (#1970): `create_volume`'s eight-branch `if let` chain becomes one
+/// `find_plugin_by_spec` lookup. These pin the #1967 invariant directly: the
+/// directory a volume is created in (`create_volume`) must be the directory
+/// every other code path looks for it in (`plugin_name_for_volume`, hence
+/// `pod_volume_dir` and the `kubelet.rs` init-container-restart path map).
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use rusternetes_common::resources::Volume;
+    use serde_json::json;
+
+    fn vm() -> VolumeManager {
+        VolumeManager::new(
+            std::env::temp_dir().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        )
+    }
+
+    fn volume(name: &str, source: serde_json::Value) -> Volume {
+        let mut fields = source;
+        fields
+            .as_object_mut()
+            .unwrap()
+            .insert("name".to_string(), json!(name));
+        serde_json::from_value(fields).unwrap()
+    }
+
+    /// Every implemented kind reaches its own plugin through the registry.
+    /// `plugin_name_for_volume` and `create_volume` build the identical
+    /// `Spec` and call the identical `find_plugin_by_spec`, so this is also
+    /// the "same name the registry dispatches to" half of the #1967
+    /// invariant — the other half is `an_unimplemented_kind_falls_back_to_unsupported`.
+    #[test]
+    fn each_kind_resolves_to_its_own_plugin() {
+        let vm = vm();
+        let cases: Vec<(Volume, &str)> = vec![
+            (
+                volume("a", json!({"emptyDir": {}})),
+                crate::pod_dirs::plugin::EMPTY_DIR,
+            ),
+            (
+                volume("b", json!({"configMap": {"name": "cm"}})),
+                crate::pod_dirs::plugin::CONFIG_MAP,
+            ),
+            (
+                volume("c", json!({"secret": {"secretName": "s"}})),
+                crate::pod_dirs::plugin::SECRET,
+            ),
+            (
+                volume("d", json!({"downwardAPI": {}})),
+                crate::pod_dirs::plugin::DOWNWARD_API,
+            ),
+            (
+                volume("e", json!({"projected": {}})),
+                crate::pod_dirs::plugin::PROJECTED,
+            ),
+            (
+                volume("f", json!({"csi": {"driver": "d"}})),
+                crate::pod_dirs::plugin::CSI,
+            ),
+            (
+                volume("g", json!({"hostPath": {"path": "/tmp"}})),
+                crate::pod_dirs::plugin::HOST_PATH,
+            ),
+        ];
+        for (v, want) in cases {
+            assert_eq!(vm.plugin_name_for_volume(&v), want, "volume {}", v.name);
+        }
+    }
+
+    /// The storage-free kinds (emptyDir, hostPath, downwardAPI, csi, and
+    /// projected with no sources) prove `create_volume` itself — not just
+    /// `plugin_name_for_volume` — routes through the same single
+    /// `find_plugin_by_spec` call and lands the mount under the matched
+    /// plugin's directory segment. configMap/secret/PVC dispatch through the
+    /// identical call and are exercised with storage by
+    /// `create_volume_writes_secret_data_to_disk`,
+    /// `create_volume_writes_downward_api_data_to_disk`,
+    /// `create_volume_writes_projected_sources_to_disk` and
+    /// `pvc_resolution_tests`.
+    #[tokio::test]
+    async fn create_volume_dispatches_storage_free_kinds_to_their_plugin_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let cases: Vec<(Volume, &str)> = vec![
+            (
+                volume("a", json!({"emptyDir": {}})),
+                crate::pod_dirs::plugin::EMPTY_DIR,
+            ),
+            (
+                volume("d", json!({"downwardAPI": {}})),
+                crate::pod_dirs::plugin::DOWNWARD_API,
+            ),
+            (
+                volume("e", json!({"projected": {}})),
+                crate::pod_dirs::plugin::PROJECTED,
+            ),
+            (
+                volume("f", json!({"csi": {"driver": "d"}})),
+                crate::pod_dirs::plugin::CSI,
+            ),
+            (
+                volume("g", json!({"hostPath": {"path": "/tmp"}})),
+                crate::pod_dirs::plugin::HOST_PATH,
+            ),
+        ];
+        for (v, want) in cases {
+            let pod: Pod = serde_json::from_value(json!({
+                "metadata": {"name": "p", "namespace": "default", "uid": format!("uid-{}", v.name)},
+                "spec": {"containers": []}
+            }))
+            .unwrap();
+            let path = vm.create_volume(&pod, &v).await.unwrap();
+            // hostPath's mounter returns the host path itself rather than a
+            // pod-dir-derived path, so this row asserts the literal instead
+            // of the plugin-dir shape asserted below. The fixture is an
+            // inline hostPath with no `$`, so its env expansion is a no-op.
+            if want == crate::pod_dirs::plugin::HOST_PATH {
+                assert_eq!(path, "/tmp");
+            } else {
+                assert!(
+                    path.contains(&crate::pod_dirs::escape_qualified_name(want)),
+                    "volume {} took path {path}, want it to contain the {want} plugin segment",
+                    v.name
+                );
+            }
+        }
+    }
+
+    /// An unimplemented kind (nfs, iscsi, image, ...) matches no plugin.
+    /// `create_volume` applies the documented empty-directory fallback rather
+    /// than erroring, and `plugin_name_for_volume` reports the same
+    /// `UNSUPPORTED_PLUGIN` segment that fallback directory sits under — the
+    /// other half of the #1967 invariant.
+    #[tokio::test]
+    async fn an_unimplemented_kind_falls_back_to_unsupported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let v = volume(
+            "nfs-vol",
+            json!({"nfs": {"server": "10.0.0.1", "path": "/export"}}),
+        );
+
+        assert_eq!(
+            vm.plugin_name_for_volume(&v),
+            crate::pod_dirs::UNSUPPORTED_PLUGIN
+        );
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-nfs"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+        let path = vm.create_volume(&pod, &v).await.unwrap();
+        assert!(
+            path.contains(&crate::pod_dirs::escape_qualified_name(
+                crate::pod_dirs::UNSUPPORTED_PLUGIN
+            )),
+            "path {path} should sit under the unsupported-plugin segment"
+        );
+        assert!(std::path::Path::new(&path).is_dir());
+    }
+
+    /// The case the ordered if-else this replaced silently resolved: two
+    /// sources set, first arm wins. The registry rejects it
+    /// (`pkg/volume/plugins.go:661-663`), and `create_volume` now propagates
+    /// that error instead of mounting either source.
+    #[tokio::test]
+    async fn a_volume_with_two_sources_is_rejected() {
+        let mut v = volume("malformed", json!({"emptyDir": {}}));
+        v.config_map = Some(serde_json::from_value(json!({"name": "cm"})).unwrap());
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-malformed"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        let err = vm().create_volume(&pod, &v).await.unwrap_err();
+        assert!(
+            err.to_string().contains("multiple volume plugins matched"),
+            "{err}"
+        );
     }
 }
