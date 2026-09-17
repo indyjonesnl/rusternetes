@@ -943,79 +943,29 @@ impl VolumeManager {
         Ok(())
     }
 
-    /// Create a single volume and return its host path
-    pub(crate) async fn create_volume(
+    /// Resolve a claim-backed volume to the PersistentVolume that backs it.
+    ///
+    /// There is no `pvc` or `ephemeral` package under `pkg/volume`: upstream
+    /// resolves the claim in the volume manager and then dispatches on the
+    /// PV's SOURCE. `desiredStateOfWorldPopulator.createVolumeSpec`
+    /// (`pkg/kubelet/volumemanager/populator/desired_state_of_world_populator.go:426-471`)
+    /// fetches the PVC, reads `pvc.Spec.VolumeName`, then `getPVSpec`
+    /// (`:562-587`) fetches the PV and builds a `volume.Spec` from it via
+    /// `NewSpecFromPersistentVolume` — the plugin lookup then runs against
+    /// that `Spec`, exactly as `find_plugin_by_spec` does below. This is that
+    /// resolution step. Returns `Ok(None)` for a volume that is neither a
+    /// claim nor an ephemeral claim template.
+    pub(crate) async fn resolve_persistent_volume(
         &self,
         pod: &Pod,
         volume: &rusternetes_common::resources::Volume,
-    ) -> Result<String> {
-        // Used for content that legitimately carries the pod's NAME — the
-        // service-account token audience, the generated ephemeral-PVC name, and
-        // projected sources. On-disk paths never use it; those go through
-        // `pod_volume_dir`, which keys on the pod UID.
+    ) -> Result<Option<PersistentVolume>> {
         let pod_name = &pod.metadata.name;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
 
-        // EmptyDir: create a directory on the shared volumes path.
-        // K8s ref: pkg/volume/emptydir/empty_dir.go — setupDir() sets mode 0777.
-        // Note: host bind mounts through virtiofs (Podman Machine / Docker Desktop)
-        // may not enforce chmod correctly. The emptyDir 0777/0666 permission tests
-        // are pre-existing failures on macOS VM-based runtimes. On Linux (where
-        // conformance actually runs), bind mounts preserve mode bits, so setup_emptydir_dir
-        // ensures the directory exists with mode 0o777 and idempotently re-chmods even
-        // when the directory pre-exists from a prior run.
-        if volume.empty_dir.is_some() {
-            let spec = crate::volume_plugins::Spec {
-                volume,
-                persistent_volume: None,
-            };
-            let plugin = crate::volume_plugins::empty_dir::EmptyDirPlugin::new(self.host.clone());
-            let mounter = plugin.new_mounter(&spec, pod).await?;
-            mounter.set_up().await?;
-            return Ok(mounter.get_path());
-        }
-
-        // HostPath: use the specified host path. The `type` field is validated
-        // (and "OrCreate" variants are materialised) via `check_host_path_type`,
-        // mirroring upstream `pkg/volume/host_path/host_path.go::checkType` —
-        // see also tests/conformance_storage_emptydir_hostpath.rs.
-        if volume.host_path.is_some() {
-            let spec = crate::volume_plugins::Spec {
-                volume,
-                persistent_volume: None,
-            };
-            let plugin = crate::volume_plugins::host_path::HostPathPlugin::new(self.host.clone());
-            let mounter = plugin.new_mounter(&spec, pod).await?;
-            mounter.set_up().await?;
-            return Ok(mounter.get_path());
-        }
-
-        // ConfigMap: mount configmap data as files
-        if volume.config_map.is_some() {
-            let spec = crate::volume_plugins::Spec {
-                volume,
-                persistent_volume: None,
-            };
-            let plugin = crate::volume_plugins::config_map::ConfigMapPlugin::new(self.host.clone());
-            let mounter = plugin.new_mounter(&spec, pod).await?;
-            mounter.set_up().await?;
-            return Ok(mounter.get_path());
-        }
-
-        // Secret: mount secret data as files
-        if volume.secret.is_some() {
-            let spec = crate::volume_plugins::Spec {
-                volume,
-                persistent_volume: None,
-            };
-            let plugin = crate::volume_plugins::secret::SecretPlugin::new(self.host.clone());
-            let mounter = plugin.new_mounter(&spec, pod).await?;
-            mounter.set_up().await?;
-            return Ok(mounter.get_path());
-        }
-
         // PersistentVolumeClaim: find bound PV and use its path
         if let Some(pvc_source) = &volume.persistent_volume_claim {
+            // ---- moved verbatim from create_volume's PersistentVolumeClaim branch (0e57daec) ----
             let storage = self
                 .storage
                 .as_ref()
@@ -1046,50 +996,14 @@ impl VolumeManager {
                 .get(&pv_key)
                 .await
                 .with_context(|| format!("PersistentVolume {} not found", pv_name))?;
-
-            // Get the host path from the PV
-            let path = if let Some(hp) = &pv.spec.host_path {
-                hp.path.clone()
-            } else {
-                return Err(anyhow::anyhow!(
-                    "PersistentVolume does not have a hostPath volume source"
-                ));
-            };
-            info!(
-                "Using PersistentVolumeClaim volume {} backed by PV {} at {}",
-                volume.name, pv_name, path
-            );
-            return Ok(path);
-        }
-
-        // DownwardAPI: expose pod/container metadata as files
-        if volume.downward_api.is_some() {
-            let spec = crate::volume_plugins::Spec {
-                volume,
-                persistent_volume: None,
-            };
-            let plugin =
-                crate::volume_plugins::downward_api::DownwardApiPlugin::new(self.host.clone());
-            let mounter = plugin.new_mounter(&spec, pod).await?;
-            mounter.set_up().await?;
-            return Ok(mounter.get_path());
-        }
-
-        // CSI: ephemeral inline volume (handled by external CSI driver)
-        if volume.csi.is_some() {
-            let spec = crate::volume_plugins::Spec {
-                volume,
-                persistent_volume: None,
-            };
-            let plugin = crate::volume_plugins::csi::CsiPlugin::new(self.host.clone());
-            let mounter = plugin.new_mounter(&spec, pod).await?;
-            mounter.set_up().await?;
-            return Ok(mounter.get_path());
+            // ---- end moved body ----
+            return Ok(Some(pv));
         }
 
         // Ephemeral: generic ephemeral volume with PVC template
         if let Some(ephemeral) = &volume.ephemeral {
             if let Some(pvc_template) = &ephemeral.volume_claim_template {
+                // ---- moved verbatim from create_volume's Ephemeral branch (0e57daec) ----
                 let storage = self
                     .storage
                     .as_ref()
@@ -1154,20 +1068,8 @@ impl VolumeManager {
                             pv_name
                         )
                     })?;
-
-                    let path = if let Some(hp) = &pv.spec.host_path {
-                        hp.path.clone()
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "PersistentVolume does not have a hostPath volume source"
-                        ));
-                    };
-
-                    info!(
-                        "Using ephemeral volume {} backed by PVC {} and PV {} at {}",
-                        volume.name, pvc_name, pv_name, path
-                    );
-                    return Ok(path);
+                    // ---- end moved body ----
+                    return Ok(Some(pv));
                 } else {
                     return Err(anyhow::anyhow!(
                         "Ephemeral PVC {} is not bound yet",
@@ -1175,6 +1077,126 @@ impl VolumeManager {
                     ));
                 }
             }
+        }
+
+        Ok(None)
+    }
+
+    /// Create a single volume and return its host path
+    pub(crate) async fn create_volume(
+        &self,
+        pod: &Pod,
+        volume: &rusternetes_common::resources::Volume,
+    ) -> Result<String> {
+        // EmptyDir: create a directory on the shared volumes path.
+        // K8s ref: pkg/volume/emptydir/empty_dir.go — setupDir() sets mode 0777.
+        // Note: host bind mounts through virtiofs (Podman Machine / Docker Desktop)
+        // may not enforce chmod correctly. The emptyDir 0777/0666 permission tests
+        // are pre-existing failures on macOS VM-based runtimes. On Linux (where
+        // conformance actually runs), bind mounts preserve mode bits, so setup_emptydir_dir
+        // ensures the directory exists with mode 0o777 and idempotently re-chmods even
+        // when the directory pre-exists from a prior run.
+        if volume.empty_dir.is_some() {
+            let spec = crate::volume_plugins::Spec {
+                volume,
+                persistent_volume: None,
+            };
+            let plugin = crate::volume_plugins::empty_dir::EmptyDirPlugin::new(self.host.clone());
+            let mounter = plugin.new_mounter(&spec, pod).await?;
+            mounter.set_up().await?;
+            return Ok(mounter.get_path());
+        }
+
+        // HostPath: use the specified host path. The `type` field is validated
+        // (and "OrCreate" variants are materialised) via `check_host_path_type`,
+        // mirroring upstream `pkg/volume/host_path/host_path.go::checkType` —
+        // see also tests/conformance_storage_emptydir_hostpath.rs.
+        if volume.host_path.is_some() {
+            let spec = crate::volume_plugins::Spec {
+                volume,
+                persistent_volume: None,
+            };
+            let plugin = crate::volume_plugins::host_path::HostPathPlugin::new(self.host.clone());
+            let mounter = plugin.new_mounter(&spec, pod).await?;
+            mounter.set_up().await?;
+            return Ok(mounter.get_path());
+        }
+
+        // ConfigMap: mount configmap data as files
+        if volume.config_map.is_some() {
+            let spec = crate::volume_plugins::Spec {
+                volume,
+                persistent_volume: None,
+            };
+            let plugin = crate::volume_plugins::config_map::ConfigMapPlugin::new(self.host.clone());
+            let mounter = plugin.new_mounter(&spec, pod).await?;
+            mounter.set_up().await?;
+            return Ok(mounter.get_path());
+        }
+
+        // Secret: mount secret data as files
+        if volume.secret.is_some() {
+            let spec = crate::volume_plugins::Spec {
+                volume,
+                persistent_volume: None,
+            };
+            let plugin = crate::volume_plugins::secret::SecretPlugin::new(self.host.clone());
+            let mounter = plugin.new_mounter(&spec, pod).await?;
+            mounter.set_up().await?;
+            return Ok(mounter.get_path());
+        }
+
+        // persistentVolumeClaim / ephemeral: resolve to the bound PV, then let
+        // the PV's source pick the plugin. Upstream has no pvc plugin — see
+        // `resolve_persistent_volume`.
+        if volume.persistent_volume_claim.is_some() || volume.ephemeral.is_some() {
+            if let Some(pv) = self.resolve_persistent_volume(pod, volume).await? {
+                let spec = crate::volume_plugins::Spec {
+                    volume,
+                    persistent_volume: Some(&pv),
+                };
+                let plugin = match self.plugin_mgr.find_plugin_by_spec(&spec) {
+                    Ok(plugin) => plugin,
+                    // Preserve the pre-registry message: today only a
+                    // hostPath-sourced PV resolves, so "no plugin matched"
+                    // means the PV has no hostPath source. `lifecycle.rs:486`
+                    // documents this exact string as a non-wait error.
+                    Err(crate::volume_plugins::PluginLookupError::NoPluginMatched) => {
+                        return Err(anyhow::anyhow!(
+                            "PersistentVolume does not have a hostPath volume source"
+                        ));
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let mounter = plugin.new_mounter(&spec, pod).await?;
+                mounter.set_up().await?;
+                return Ok(mounter.get_path());
+            }
+        }
+
+        // DownwardAPI: expose pod/container metadata as files
+        if volume.downward_api.is_some() {
+            let spec = crate::volume_plugins::Spec {
+                volume,
+                persistent_volume: None,
+            };
+            let plugin =
+                crate::volume_plugins::downward_api::DownwardApiPlugin::new(self.host.clone());
+            let mounter = plugin.new_mounter(&spec, pod).await?;
+            mounter.set_up().await?;
+            return Ok(mounter.get_path());
+        }
+
+        // CSI: ephemeral inline volume (handled by external CSI driver)
+        if volume.csi.is_some() {
+            let spec = crate::volume_plugins::Spec {
+                volume,
+                persistent_volume: None,
+            };
+            let plugin = crate::volume_plugins::csi::CsiPlugin::new(self.host.clone());
+            let mounter = plugin.new_mounter(&spec, pod).await?;
+            mounter.set_up().await?;
+            return Ok(mounter.get_path());
         }
 
         // Projected: combine multiple volume sources (configMap, secret, downwardAPI, serviceAccountToken) into one directory
@@ -2269,5 +2291,267 @@ mod orphan_sweep_tests {
         let mut found = crate::pod_dirs::list_pods_from_disk(&root).unwrap();
         found.sort();
         assert_eq!(found, vec!["uid-a".to_string(), "uid-b".to_string()]);
+    }
+}
+
+/// Task 10 (#1970): `persistentVolumeClaim` and `ephemeral` have no plugin of
+/// their own — they resolve to a `PersistentVolume` and the PV's SOURCE picks
+/// the plugin (`host_path.go:98-101`). These tests cover
+/// `VolumeManager::resolve_persistent_volume` and the dispatch that follows
+/// it in `create_volume`, with particular attention to the error strings
+/// `lifecycle.rs::is_volume_wait_error` matches on byte-for-byte.
+#[cfg(test)]
+mod pvc_resolution_tests {
+    use super::*;
+    use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim, Pod, Volume};
+    use rusternetes_storage::StorageBackend;
+    use serde_json::json;
+
+    fn vm(storage: Option<Arc<StorageBackend>>) -> VolumeManager {
+        VolumeManager::new(
+            std::env::temp_dir().to_string_lossy().to_string(),
+            storage,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        )
+    }
+
+    /// A PVC-backed volume must reach the plugin that owns the PV's SOURCE.
+    /// There is no pvc plugin upstream: hostPath claims it via the
+    /// PersistentVolume arm of `CanSupport` (`host_path.go:98-101`).
+    #[tokio::test]
+    async fn a_bound_pvc_resolves_to_its_pv_and_dispatches_on_the_pv_source() {
+        let storage = Arc::new(StorageBackend::new_memory());
+
+        let pv: PersistentVolume = serde_json::from_value(json!({
+            "metadata": {"name": "pv-1"},
+            "spec": {
+                "capacity": {"storage": "1Gi"},
+                "accessModes": ["ReadWriteOnce"],
+                "hostPath": {"path": "/mnt/data"}
+            }
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("persistentvolumes", None, "pv-1"), &pv)
+            .await
+            .unwrap();
+
+        let pvc: PersistentVolumeClaim = serde_json::from_value(json!({
+            "metadata": {"name": "claim-1", "namespace": "default"},
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeName": "pv-1",
+                "resources": {"requests": {"storage": "1Gi"}}
+            }
+        }))
+        .unwrap();
+        storage
+            .create(
+                &build_key("persistentvolumeclaims", Some("default"), "claim-1"),
+                &pvc,
+            )
+            .await
+            .unwrap();
+
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "claimed",
+            "persistentVolumeClaim": {"claimName": "claim-1"}
+        }))
+        .unwrap();
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        let manager = vm(Some(storage));
+        let resolved = manager
+            .resolve_persistent_volume(&pod, &volume)
+            .await
+            .unwrap();
+        let resolved = resolved.expect("a bound PVC resolves to a PV");
+        let spec = crate::volume_plugins::Spec {
+            volume: &volume,
+            persistent_volume: Some(&resolved),
+        };
+        let plugin = manager.plugin_mgr.find_plugin_by_spec(&spec).unwrap();
+        assert_eq!(plugin.name(), "kubernetes.io/host-path");
+
+        // And create_volume must dispatch to the same plugin end-to-end.
+        let path = manager.create_volume(&pod, &volume).await.unwrap();
+        assert_eq!(path, "/mnt/data");
+    }
+
+    #[tokio::test]
+    async fn a_non_claim_volume_resolves_to_no_pv() {
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "scratch",
+            "emptyDir": {}
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        assert!(vm(None)
+            .resolve_persistent_volume(&pod, &volume)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Preserved byte-for-byte: `lifecycle.rs::is_volume_wait_error` matches
+    /// "not found in namespace" together with "PersistentVolumeClaim" to keep
+    /// a pod in `ContainerCreating` rather than failing it outright.
+    #[tokio::test]
+    async fn a_missing_pvc_yields_the_exact_not_found_message() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "claimed",
+            "persistentVolumeClaim": {"claimName": "missing"}
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "ns"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        let err = vm(Some(storage))
+            .resolve_persistent_volume(&pod, &volume)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "PersistentVolumeClaim missing not found in namespace ns"
+        );
+    }
+
+    /// Preserved byte-for-byte: `lifecycle.rs::is_volume_wait_error` matches
+    /// this exact string to keep the pod waiting instead of failing it.
+    #[tokio::test]
+    async fn an_unbound_pvc_yields_the_exact_not_bound_message() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        let pvc: PersistentVolumeClaim = serde_json::from_value(json!({
+            "metadata": {"name": "claim-1", "namespace": "ns"},
+            "spec": {"accessModes": ["ReadWriteOnce"],
+                     "resources": {"requests": {"storage": "1Gi"}}}
+        }))
+        .unwrap();
+        storage
+            .create(
+                &build_key("persistentvolumeclaims", Some("ns"), "claim-1"),
+                &pvc,
+            )
+            .await
+            .unwrap();
+
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "claimed",
+            "persistentVolumeClaim": {"claimName": "claim-1"}
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "ns"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        let err = vm(Some(storage))
+            .resolve_persistent_volume(&pod, &volume)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "PersistentVolumeClaim is not bound to a volume"
+        );
+    }
+
+    /// Ruling 3: `ephemeral` set but `volumeClaimTemplate` absent falls
+    /// through both arms silently — upstream's structure (nested `if let`)
+    /// is reproduced verbatim, not converted into an error. `create_volume`
+    /// then hits the unsupported-kind fallback and gets an empty directory.
+    #[tokio::test]
+    async fn an_ephemeral_volume_without_a_template_resolves_to_no_pv() {
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "eph",
+            "ephemeral": {}
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        assert!(vm(None)
+            .resolve_persistent_volume(&pod, &volume)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Ruling 2: a PV with no claimable source (today, anything but hostPath)
+    /// must surface the pre-registry message verbatim, not the registry's own
+    /// "no volume plugin matched" — `lifecycle.rs:486` documents this exact
+    /// string as a worked example of a non-wait error.
+    #[tokio::test]
+    async fn a_pv_without_a_hostpath_source_yields_the_preserved_message() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        // No source field on the PV at all — deliberately not a CSI source
+        // (that specific case is not this test's concern); any PV with no
+        // claimable source must produce this message.
+        let pv: PersistentVolume = serde_json::from_value(json!({
+            "metadata": {"name": "pv-1"},
+            "spec": {
+                "capacity": {"storage": "1Gi"},
+                "accessModes": ["ReadWriteOnce"]
+            }
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("persistentvolumes", None, "pv-1"), &pv)
+            .await
+            .unwrap();
+
+        let pvc: PersistentVolumeClaim = serde_json::from_value(json!({
+            "metadata": {"name": "claim-1", "namespace": "default"},
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeName": "pv-1",
+                "resources": {"requests": {"storage": "1Gi"}}
+            }
+        }))
+        .unwrap();
+        storage
+            .create(
+                &build_key("persistentvolumeclaims", Some("default"), "claim-1"),
+                &pvc,
+            )
+            .await
+            .unwrap();
+
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "claimed",
+            "persistentVolumeClaim": {"claimName": "claim-1"}
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        let err = vm(Some(storage))
+            .create_volume(&pod, &volume)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "PersistentVolume does not have a hostPath volume source"
+        );
     }
 }
