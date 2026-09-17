@@ -478,13 +478,14 @@ impl VolumeManager {
     }
 
     /// The plugin that owns a volume, and hence the plugin segment of its
-    /// on-disk path. Replaces `pod_dirs::plugin_for_volume`: upstream resolves
-    /// this by asking every plugin `CanSupport`
-    /// (`pkg/volume/plugins.go:634-666`), which is what the registry does.
+    /// on-disk path. Replaces the ordered if-else chain this file used to
+    /// dispatch `create_volume` through: upstream resolves this by asking
+    /// every plugin `CanSupport` (`pkg/volume/plugins.go:634-666`), which is
+    /// what the registry does.
     ///
     /// Both registry failures collapse to [`crate::pod_dirs::UNSUPPORTED_PLUGIN`]:
     ///
-    /// - `NoPluginMatched` is exactly what `pod_dirs::plugin_for_volume`'s
+    /// - `NoPluginMatched` is exactly what the old if-else chain's
     ///   else-arm used to return, so `resync_volumes`, `refresh_volumes` and
     ///   the `kubelet.rs` init-container-restart path map keep looking in the
     ///   identical directory. This is the whole reason the mapping exists.
@@ -999,7 +1000,7 @@ impl VolumeManager {
 
         // PersistentVolumeClaim: find bound PV and use its path
         if let Some(pvc_source) = &volume.persistent_volume_claim {
-            // ---- moved verbatim from create_volume's PersistentVolumeClaim branch (0e57daec) ----
+            // ---- moved verbatim from create_volume's PersistentVolumeClaim branch (c605ea36) ----
             let storage = self
                 .storage
                 .as_ref()
@@ -1047,7 +1048,7 @@ impl VolumeManager {
         // Ephemeral: generic ephemeral volume with PVC template
         if let Some(ephemeral) = &volume.ephemeral {
             if let Some(pvc_template) = &ephemeral.volume_claim_template {
-                // ---- moved verbatim from create_volume's Ephemeral branch (0e57daec) ----
+                // ---- moved verbatim from create_volume's Ephemeral branch (c605ea36) ----
                 let storage = self
                     .storage
                     .as_ref()
@@ -2354,7 +2355,7 @@ mod pvc_resolution_tests {
             persistent_volume: Some(&resolved),
         };
         let plugin = manager.plugin_mgr.find_plugin_by_spec(&spec).unwrap();
-        assert_eq!(plugin.name(), "kubernetes.io/host-path");
+        assert_eq!(plugin.name(), crate::pod_dirs::plugin::HOST_PATH);
 
         // And create_volume must dispatch to the same plugin end-to-end.
         let path = manager.create_volume(&pod, &volume).await.unwrap();
@@ -2597,7 +2598,7 @@ mod dispatch_tests {
             ),
             (
                 volume("g", json!({"hostPath": {"path": "/tmp"}})),
-                "kubernetes.io/host-path",
+                crate::pod_dirs::plugin::HOST_PATH,
             ),
         ];
         for (v, want) in cases {
@@ -2642,7 +2643,7 @@ mod dispatch_tests {
             ),
             (
                 volume("g", json!({"hostPath": {"path": "/tmp"}})),
-                "kubernetes.io/host-path",
+                crate::pod_dirs::plugin::HOST_PATH,
             ),
         ];
         for (v, want) in cases {
@@ -2652,10 +2653,13 @@ mod dispatch_tests {
             }))
             .unwrap();
             let path = vm.create_volume(&pod, &v).await.unwrap();
-            // hostPath's mounter returns the host path itself (it is not
-            // under the pod dir), so only assert the plugin-dir shape for
-            // the kinds whose mounter path is `pod_volume_dir`-derived.
-            if want != "kubernetes.io/host-path" {
+            // hostPath's mounter returns the host path itself, unchanged
+            // (it is not under the pod dir, and not environment-expanded —
+            // the fixture path deliberately has no `$` in it), so assert
+            // the literal instead of the plugin-dir shape asserted below.
+            if want == crate::pod_dirs::plugin::HOST_PATH {
+                assert_eq!(path, "/tmp");
+            } else {
                 assert!(
                     path.contains(&crate::pod_dirs::escape_qualified_name(want)),
                     "volume {} took path {path}, want it to contain the {want} plugin segment",
@@ -2703,8 +2707,8 @@ mod dispatch_tests {
         assert!(std::path::Path::new(&path).is_dir());
     }
 
-    /// The case `pod_dirs::plugin_for_volume`'s ordered if-else silently
-    /// resolved: two sources set, first arm wins. The registry rejects it
+    /// The case the ordered if-else this replaced silently resolved: two
+    /// sources set, first arm wins. The registry rejects it
     /// (`pkg/volume/plugins.go:661-663`), and `create_volume` now propagates
     /// that error instead of mounting either source.
     #[tokio::test]

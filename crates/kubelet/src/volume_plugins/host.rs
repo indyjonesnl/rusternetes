@@ -1,7 +1,6 @@
 use rusternetes_common::auth::TokenManager;
 use rusternetes_storage::StorageBackend;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Port of `volume.VolumeHost` (`pkg/volume/plugins.go:341-422`).
@@ -14,12 +13,9 @@ use std::sync::Arc;
 /// a port, not a parameter bag invented for the refactor.
 ///
 /// Only the methods with a consumer are ported. `GetMounter`, `GetHostUtil`,
-/// `GetPluginDir`, `GetPodPluginDir` and the block-device methods have no
-/// caller in epic #1970.
+/// `GetPluginDir`, `GetPodPluginDir`, `GetPodsDir` and the block-device
+/// methods have no caller in epic #1970.
 pub trait VolumeHost: Send + Sync {
-    /// `GetPodsDir` (`plugins.go:355`).
-    fn get_pods_dir(&self) -> PathBuf;
-
     /// `GetPodVolumeDir` (`plugins.go:361`).
     fn get_pod_volume_dir(&self, pod_uid: &str, plugin_name: &str, volume_name: &str) -> String;
 
@@ -83,10 +79,6 @@ impl KubeletVolumeHost {
 }
 
 impl VolumeHost for KubeletVolumeHost {
-    fn get_pods_dir(&self) -> PathBuf {
-        crate::pod_dirs::get_pods_dir(&self.volumes_base_path)
-    }
-
     fn get_pod_volume_dir(&self, pod_uid: &str, plugin_name: &str, volume_name: &str) -> String {
         crate::pod_dirs::get_pod_volume_dir(
             &self.volumes_base_path,
@@ -137,14 +129,6 @@ mod tests {
         assert_eq!(
             got,
             "/var/lib/rusternetes/pods/uid-1/volumes/kubernetes.io~empty-dir/data"
-        );
-    }
-
-    #[test]
-    fn pods_dir_matches_pod_dirs() {
-        assert_eq!(
-            host().get_pods_dir(),
-            std::path::PathBuf::from("/var/lib/rusternetes/pods")
         );
     }
 

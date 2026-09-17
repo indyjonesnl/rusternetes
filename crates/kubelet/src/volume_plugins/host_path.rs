@@ -44,7 +44,7 @@ fn host_path_type_as_str(t: &HostPathType) -> &'static str {
 #[async_trait]
 impl VolumePlugin for HostPathPlugin {
     fn name(&self) -> &'static str {
-        "kubernetes.io/host-path"
+        crate::pod_dirs::plugin::HOST_PATH
     }
 
     /// `CanSupport` (`host_path.go:98-101`), both arms verbatim:

@@ -134,8 +134,8 @@ mod tests {
     }
 
     /// Upstream errors rather than letting first-match-wins pick one
-    /// (`pkg/volume/plugins.go:659-662`). `pod_dirs::plugin_for_volume`
-    /// silently picked; the registry must not.
+    /// (`pkg/volume/plugins.go:659-662`). The ordered if-else chain this
+    /// registry replaced picked silently; the registry must not.
     #[test]
     fn two_matches_is_an_error_naming_both() {
         let v = volume("ab-volume");
