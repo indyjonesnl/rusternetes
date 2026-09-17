@@ -40,7 +40,12 @@ on:
       - 'scripts/update-badge.sh'
       - 'scripts/tests/test-vanilla-swap-workflows-sync.sh'
       - 'scripts/tests/test-update-badge.sh'
+      - 'scripts/tests/test-badge-publish-guard.sh'
       - '.github/workflows/vanilla-swap-*.yml'
+      # Every badge publisher — the guard test reads all of them.
+      - '.github/workflows/conformance-target.yml'
+      - '.github/workflows/node-conformance.yml'
+      - '.github/workflows/cert-manager-smoke.yml'
       # The harness's own TDD suites (registry parser, guard, junit counting).
       - 'scripts/vanilla-swap-common.sh'
       - 'scripts/vanilla-swap-common-test.sh'
@@ -98,6 +103,8 @@ jobs:
         run: bash scripts/tests/test-vanilla-swap-workflows-sync.sh
       - name: Badge publisher unit tests
         run: bash scripts/tests/test-update-badge.sh
+      - name: Badge publish guard (main only)
+        run: bash scripts/tests/test-badge-publish-guard.sh
       - name: SIG coverage (sample fixture)
         run: bash scripts/tests/test-target-coverage.sh
       - name: GHCR overlay sync test
