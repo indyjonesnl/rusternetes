@@ -15,6 +15,7 @@ pub mod openapi;
 pub mod patch;
 pub mod peer_cert_acceptor;
 pub mod prometheus_client;
+pub mod registry;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]
 pub mod response;
