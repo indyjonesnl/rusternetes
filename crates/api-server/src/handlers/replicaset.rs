@@ -1,20 +1,88 @@
+//! ReplicaSet endpoints.
+//!
+//! Writes, and the `/status` and `/scale` subresources, go through the
+//! generic endpoint handlers and [`crate::registry::generic::Store`] with the
+//! ReplicaSet strategies ([`crate::registry::apps::replicaset`]) — upstream's
+//! `pkg/registry/apps/replicaset/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::apps::replicaset;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
-    resources::{ReplicaSet, ReplicaSetStatus},
+    resources::{ReplicaSet, Scale},
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The ReplicaSet `RequestScope`: `apps/v1` `ReplicaSet` served as
+/// `replicasets` (or its `/status`), backed by `replicaset.NewREST`'s stores.
+fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestScope<ReplicaSet> {
+    let store = match subresource {
+        Some(_) => replicaset::new_status_store(state.storage.clone()),
+        None => replicaset::new_store(state.storage.clone()),
+    };
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            kind: "ReplicaSet".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            resource: "replicasets".to_string(),
+        },
+        subresource,
+        store: Box::new(store),
+        apply: Some(crate::ssa::apply_legacy::<ReplicaSet>),
+        convert_to_internal: Some(replicaset::convert_to_internal),
+    }
+}
+
+/// The `/scale` `RequestScope`: `autoscaling/v1` `Scale` served as
+/// `replicasets/scale`, over `ScaleREST` (storage.go:77).
+fn scale_scope(state: &ApiServerState) -> RequestScope<Scale> {
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "autoscaling".to_string(),
+            version: "v1".to_string(),
+            kind: "Scale".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            resource: "replicasets".to_string(),
+        },
+        subresource: Some("scale"),
+        store: Box::new(replicaset::new_scale_rest(state.storage.clone())),
+        apply: Some(crate::ssa::apply_legacy::<Scale>),
+        convert_to_internal: None,
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
@@ -22,113 +90,31 @@ pub async fn create(
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
-) -> Result<(StatusCode, Json<ReplicaSet>)> {
-    let mut replicaset: ReplicaSet = rusternetes_common::dump::decode_request_body(&body)?;
-    info!(
-        "Creating replicaset: {}/{}",
-        namespace, replicaset.metadata.name
-    );
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "replicasets")
-        .with_namespace(&namespace)
-        .with_api_group("apps");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &replicaset.metadata,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Defaulting runs before validation, as upstream does it: the codec
-    // defaults on decode and `BeforeCreate` then calls `PrepareForCreate`
-    // before `strategy.Validate`
-    // (staging/src/k8s.io/apiserver/pkg/registry/rest/create.go:26-28).
-    // Order matters because validators hard-require fields that defaulting
-    // supplies -- `validateObjectFieldSelector` requires `fieldRef.apiVersion`,
-    // which `SetDefaults_ObjectFieldSelector` sets to "v1"
-    // (pkg/apis/core/v1/defaults.go). Validating first rejects manifests the
-    // real API server accepts, e.g. every cert-manager Deployment.
-    //
-    // SetDefaults_ReplicaSet + SetDefaults_PodSpec + SetDefaults_Container.
-    crate::handlers::defaults::apply_replicaset_defaults(&mut replicaset);
-
-    // Field validation (mirrors upstream ValidateReplicaSet).
-    {
-        let errs = rusternetes_common::validation::apps::validate_replicaset(&replicaset);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    replicaset.metadata.namespace = Some(namespace.clone());
-    replicaset.metadata.ensure_uid();
-    replicaset.metadata.ensure_creation_timestamp();
-    crate::handlers::lifecycle::set_initial_generation(&mut replicaset.metadata);
-
-    // Initialize status if not present
-    if replicaset.status.is_none() {
-        replicaset.status = Some(ReplicaSetStatus {
-            replicas: 0,
-            fully_labeled_replicas: Some(0),
-            ready_replicas: 0,
-            available_replicas: 0,
-            observed_generation: Some(0),
-            conditions: None,
-            terminating_replicas: None,
-        });
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: ReplicaSet {}/{} validated successfully (not created)",
-            namespace, replicaset.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(replicaset)));
-    }
-
-    let key = build_key("replicasets", Some(&namespace), &replicaset.metadata.name);
-    let created = state.storage.create(&key, &replicaset).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<ReplicaSet>> {
-    debug!("Getting replicaset: {}/{}", namespace, name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "replicasets")
-        .with_namespace(&namespace)
-        .with_api_group("apps")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("replicasets", Some(&namespace), &name);
-    let replicaset = state.storage.get(&key).await?;
-
-    Ok(Json(replicaset))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn update(
@@ -137,198 +123,196 @@ pub async fn update(
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
-) -> Result<Json<ReplicaSet>> {
-    let mut replicaset: ReplicaSet = rusternetes_common::dump::decode_request_body(&body)?;
-    info!("Updating replicaset: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "replicasets")
-        .with_namespace(&namespace)
-        .with_api_group("apps")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("replicasets", Some(&namespace), &name),
-        "apps",
-        "replicasets",
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    replicaset.metadata.name = name.clone();
-    replicaset.metadata.namespace = Some(namespace.clone());
-    if replicaset.type_meta.kind.is_empty() {
-        replicaset.type_meta.kind = "ReplicaSet".to_string();
-    }
-    if replicaset.type_meta.api_version.is_empty() {
-        replicaset.type_meta.api_version = "apps/v1".to_string();
-    }
-
-    // Apply K8s defaults (SetDefaults_ReplicaSet + SetDefaults_PodSpec + SetDefaults_Container)
-    crate::handlers::defaults::apply_replicaset_defaults(&mut replicaset);
-
-    let key = build_key("replicasets", Some(&namespace), &name);
-
-    // Load stored object so we can enforce upstream Strategy.PrepareForUpdate
-    // (status reset + selector immutability) and ValidateReplicaSetUpdate.
-    let old_replicaset: ReplicaSet = state.storage.get(&key).await?;
-
-    crate::handlers::lifecycle::check_resource_version(
-        old_replicaset.metadata.resource_version.as_deref(),
-        replicaset.metadata.resource_version.as_deref(),
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
-    )?;
-
-    crate::handlers::lifecycle::validate_selector_immutable(
-        &old_replicaset.spec.selector,
-        &replicaset.spec.selector,
-        "ReplicaSet",
-    )?;
-
-    // Full spec validation on update (upstream ValidateReplicaSetUpdate re-runs
-    // ValidateReplicaSetSpec on the new object). Only selector immutability was
-    // checked before, so an otherwise-invalid spec slipped through on update.
-    {
-        let errs = rusternetes_common::validation::apps::validate_replicaset(&replicaset);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // Status only mutates via /status; mirror upstream PrepareForUpdate.
-    replicaset.status = old_replicaset.status.clone();
-
-    // Reinstate the server-owned metadata a PUT body may omit (uid,
-    // creationTimestamp, a pending deletion). A locally-built object — what the
-    // dynamic client's Update() sends — carries none of them, and storing the
-    // blanks orphans every child: the ownerReferences[].uid no longer matches a
-    // live owner, so the garbage collector deletes the children (#1605).
-    // Upstream: registry/rest/update.go::BeforeUpdate (lines 123-146).
-    crate::handlers::lifecycle::inherit_server_owned_metadata(
-        &mut replicaset.metadata,
-        &old_replicaset.metadata,
-    );
-
-    // Increment generation if spec changed
-    let old_value = serde_json::to_value(&old_replicaset)
-        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
-    let new_value = serde_json::to_value(&replicaset)
-        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
-    crate::handlers::lifecycle::maybe_increment_generation(
-        &old_value,
-        &new_value,
-        &mut replicaset.metadata,
-    );
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: ReplicaSet {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(replicaset));
-    }
-
-    let result = state.storage.update(&key, &replicaset).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete_replicaset(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<ReplicaSet>> {
-    info!("Deleting replicaset: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "replicasets")
-        .with_namespace(&namespace)
-        .with_api_group("apps")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("replicasets", Some(&namespace), &name);
-    let replicaset: ReplicaSet = state.storage.get(&key).await?;
-
-    // Run validating admission webhooks for DELETE (object=nil, oldObject=replicaset).
-    crate::handlers::admission_helper::run_delete_validating_webhooks(
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
         &state,
-        "apps",
-        "v1",
-        "ReplicaSet",
-        "replicasets",
+        &scope(&state, None),
+        &auth_ctx.user,
         Some(&namespace),
         &name,
-        &replicaset,
-        &user_for_webhook,
-        is_dry_run,
+        &params,
+        &body,
+    )
+    .await
+}
+
+pub async fn deletecollection_replicasets(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// GET `/status`: `StatusREST.Get` is the store's `Get` (storage.go:147-150).
+pub async fn get_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
+}
+
+/// PUT `/status`: `StatusREST.Update` (storage.go:152-157).
+pub async fn update_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// PATCH `/status`: a patch into `StatusREST.Update`.
+pub async fn patch_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
+}
+
+/// GET `/scale`: `ScaleREST.Get` (storage.go:202-214).
+pub async fn get_scale(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let response = endpoints::get_resource(
+        &state,
+        &scale_scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
     )
     .await?;
+    Ok(endpoints::negotiate(&headers, response).await)
+}
 
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: ReplicaSet {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(replicaset));
-    }
+/// PUT `/scale`: `ScaleREST.Update` (storage.go:216-235).
+pub async fn update_scale(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    let response = endpoints::update_resource(
+        &state,
+        &scale_scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await?;
+    Ok(endpoints::negotiate(&headers, response).await)
+}
 
-    // Handle deletion with finalizers and propagation policy
-    let deleted_immediately =
-        !crate::handlers::finalizers::handle_delete_with_finalizers_and_propagation(
-            &state.storage,
-            &key,
-            &replicaset,
-            &delete_opts,
-        )
-        .await?;
-
-    if deleted_immediately {
-        Ok(Json(replicaset))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: ReplicaSet = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+/// PATCH `/scale`: a patch of the Scale into `ScaleREST.Update`.
+pub async fn patch_scale(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    let response = endpoints::patch_resource(
+        &state,
+        &scale_scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await?;
+    Ok(endpoints::negotiate(&headers, response).await)
 }
 
 pub async fn list(
@@ -488,93 +472,4 @@ pub async fn list_all_replicasets(
     let mut list = List::new("ReplicaSetList", "apps/v1", replicasets);
     list.metadata.resource_version = Some(resource_version);
     Ok(Json(list).into_response())
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(patch, ReplicaSet, "replicasets", "apps");
-
-pub async fn deletecollection_replicasets(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection replicasets in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "replicasets")
-        .with_namespace(&namespace)
-        .with_api_group("apps");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ReplicaSet collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all replicasets in the namespace
-    let prefix = build_prefix("replicasets", Some(&namespace));
-    let mut items = state.storage.list::<ReplicaSet>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("replicasets", Some(&namespace), &item.metadata.name);
-
-        // Run validating admission webhooks for DELETE per item.
-        crate::handlers::admission_helper::run_delete_validating_webhooks(
-            &state,
-            "apps",
-            "v1",
-            "ReplicaSet",
-            "replicasets",
-            Some(&namespace),
-            &item.metadata.name,
-            &item,
-            &user_for_webhook,
-            false,
-        )
-        .await?;
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} replicasets deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }
