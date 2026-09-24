@@ -91,6 +91,7 @@ fn scope(state: &ApiServerState) -> RequestScope<Secret> {
             version: "v1".to_string(),
             resource: "secrets".to_string(),
         },
+        subresource: None,
         store: crate::registry::core::secret::new_store(state.storage.clone()),
         apply: Some(crate::ssa::apply_secret),
         convert_to_internal: Some(crate::registry::core::secret::convert_to_internal),

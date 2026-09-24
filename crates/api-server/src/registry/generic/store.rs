@@ -165,6 +165,15 @@ impl<T: Object, S: Storage> Store<T, S> {
         }
     }
 
+    /// A copy of this store that updates with `strategy` — how a subresource
+    /// store is built: `statusStore := *store; statusStore.UpdateStrategy =
+    /// StatusStrategy` (e.g. apps/deployment/storage/storage.go:109-111).
+    pub fn with_update_strategy(&self, strategy: Arc<dyn RestUpdateStrategy<T>>) -> Self {
+        let mut store = self.clone();
+        store.update_strategy = strategy;
+        store
+    }
+
     /// `KeyFunc`: `NamespaceKeyFunc` / `NoNamespaceKeyFunc` (store.go:280-307),
     /// chosen by the create strategy's scope as `CompleteWithOptions` does.
     pub fn key_func(&self, ctx: &RequestContext, name: &str) -> Result<String> {
