@@ -85,6 +85,17 @@ pub enum Feature {
     /// default-on since v1.33 (`kube_features.go:1733-1736`), so the v1.35
     /// default is `true`.
     SELinuxChangePolicy,
+
+    /// When enabled, a StatefulSet's `spec.updateStrategy.rollingUpdate.
+    /// maxUnavailable` is honoured; when disabled the StatefulSet strategy
+    /// drops it unless the stored object already uses it
+    /// (`dropStatefulSetDisabledFields`,
+    /// pkg/registry/apps/statefulset/strategy.go).
+    ///
+    /// Upstream: `pkg/features/kube_features.go::MaxUnavailableStatefulSet` —
+    /// Beta but off-by-default in v1.35 (`kube_features.go:1515-1518`), so the
+    /// default is `false`.
+    MaxUnavailableStatefulSet,
 }
 
 impl Feature {
@@ -98,6 +109,7 @@ impl Feature {
             Feature::SELinuxMountReadWriteOncePod => 4,
             Feature::SELinuxMount => 5,
             Feature::SELinuxChangePolicy => 6,
+            Feature::MaxUnavailableStatefulSet => 7,
         }
     }
 
@@ -118,6 +130,8 @@ impl Feature {
             Feature::SELinuxMount => false,
             // Beta + default-on since v1.33.
             Feature::SELinuxChangePolicy => true,
+            // Beta but off-by-default in v1.35.
+            Feature::MaxUnavailableStatefulSet => false,
         }
     }
 }
@@ -141,6 +155,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::SELinuxMountReadWriteOncePod,
     Feature::SELinuxMount,
     Feature::SELinuxChangePolicy,
+    Feature::MaxUnavailableStatefulSet,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -162,6 +177,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::SELinuxMountReadWriteOncePod.default_enabled()),
     AtomicBool::new(Feature::SELinuxMount.default_enabled()),
     AtomicBool::new(Feature::SELinuxChangePolicy.default_enabled()),
+    AtomicBool::new(Feature::MaxUnavailableStatefulSet.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.

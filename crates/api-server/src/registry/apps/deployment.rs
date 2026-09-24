@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use rusternetes_common::equality::semantic_equal;
 use rusternetes_common::resources::{Deployment, DeploymentStatus, Scale, ScaleSpec, ScaleStatus};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_common::validation::apps::{
@@ -13,7 +14,6 @@ use rusternetes_common::validation::field::ErrorList;
 use rusternetes_common::validation::metav1::is_dns1123_label;
 use rusternetes_storage::StorageBackend;
 
-use crate::registry::equality::semantic_equal;
 use crate::registry::generic::Store;
 use crate::registry::rest::{
     GarbageCollectionPolicy, GroupResource, NamespaceScopedStrategy, RequestContext,
