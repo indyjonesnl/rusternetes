@@ -43,6 +43,8 @@ fn scope(state: &ApiServerState) -> RequestScope<ConfigMap> {
         },
         store: crate::registry::core::configmap::new_store(state.storage.clone()),
         apply: Some(crate::ssa::apply_configmap),
+        // ConfigMap has no defaulter and no conversion logic.
+        convert_to_internal: None,
     }
 }
 

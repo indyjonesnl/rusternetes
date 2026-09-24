@@ -20,7 +20,7 @@ use rusternetes_common::admission::{
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::{Error, Result};
 
-use super::rest::authorize;
+use super::rest::{authorize, RequestScope};
 use crate::registry::rest::{
     Object, RequestContext, TransformFunc, ValidateObject, ValidateObjectUpdate,
 };
@@ -196,23 +196,28 @@ impl<T: Object> ValidateObject<T> for DeleteValidation<'_> {
 /// (update.go:170-189) and the patcher's `applyAdmission` (patch.go:631-651):
 /// CREATE when there is no live object (`hasUID(old)` is false), UPDATE
 /// otherwise.
-pub struct MutatingAdmission<'a> {
+pub struct MutatingAdmission<'a, T: Object> {
     pub admission: &'a Admission<'a>,
+    /// The mutating-webhook dispatcher decodes a webhook's patched object,
+    /// so it is defaulted and converted as any request body is.
+    pub scope: &'a RequestScope<T>,
 }
 
 #[async_trait]
-impl<T: Object> TransformFunc<T> for MutatingAdmission<'_> {
+impl<T: Object> TransformFunc<T> for MutatingAdmission<'_, T> {
     async fn transform(&self, _ctx: &RequestContext, new: Option<T>, old: Option<&T>) -> Result<T> {
         let new = new.ok_or_else(|| {
             Error::Internal("mutating admission ran before an object was built".to_string())
         })?;
-        match old.filter(|o| !o.metadata().uid.is_empty()) {
-            None => self.admission.admit(Operation::Create, new, None).await,
+        let mut obj = match old.filter(|o| !o.metadata().uid.is_empty()) {
+            None => self.admission.admit(Operation::Create, new, None).await?,
             Some(old) => {
                 self.admission
                     .admit(Operation::Update, new, Some(old))
-                    .await
+                    .await?
             }
-        }
+        };
+        self.scope.convert(&mut obj);
+        Ok(obj)
     }
 }

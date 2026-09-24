@@ -202,6 +202,7 @@ mod runtimeclass_servicecidr_update_test;
 mod sar_both_attributes_test;
 mod scale_nonnegative_replicas_test;
 mod secret_consumption_test;
+mod secret_generic_store_test;
 mod secret_handler_test;
 mod secret_update_type_validation_test;
 mod service_externalname_transition_test;

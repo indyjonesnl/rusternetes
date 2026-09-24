@@ -520,8 +520,7 @@ async fn test_secret_strategy_immutable_cannot_be_unset() {
 async fn test_secret_strategy_type_immutable_post_create() {
     // Upstream `pkg/registry/core/secret/strategy.go::ValidateUpdate` calls
     // `apivalidation.ValidateImmutableField(newSecret.Type, oldSecret.Type, …)`
-    // unconditionally. rusternetes' `handlers::secret::update` enforces the
-    // same fence in `handlers/secret.rs`.
+    // unconditionally; the Secret strategy's `validate_update` runs it.
     let (_mem, router) = spawn_router();
 
     let create = json!({
