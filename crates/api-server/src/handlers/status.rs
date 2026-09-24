@@ -185,7 +185,7 @@ fn resource_type_to_kind_api_version(resource_type: &str) -> (String, String) {
         "endpointslices" => ("EndpointSlice".into(), "discovery.k8s.io/v1".into()),
         _ => {
             let s = resource_type.strip_suffix('s').unwrap_or(resource_type);
-            let kind = format!("{}{}", &s[..1].to_uppercase(), &s[1..]);
+            let kind = format!("{}{}", s[..1].to_uppercase(), &s[1..]);
             (kind, "v1".into())
         }
     }

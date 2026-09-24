@@ -103,12 +103,7 @@ fn find_duplicates_in_object(
 
         // Now we need to skip the value, but also recurse into objects/arrays
         // to check for nested duplicates
-        match collect_value_duplicates(bytes, pos, &dotted_path, results) {
-            Some(end) => {
-                pos = end;
-            }
-            None => return None,
-        }
+        pos = collect_value_duplicates(bytes, pos, &dotted_path, results)?;
     }
 }
 
@@ -148,13 +143,8 @@ fn collect_value_duplicates(
                 }
 
                 let elem_prefix = format!("{}[{}]", prefix, idx);
-                match collect_value_duplicates(bytes, p, &elem_prefix, results) {
-                    Some(end) => {
-                        p = end;
-                        idx += 1;
-                    }
-                    None => return None,
-                }
+                p = collect_value_duplicates(bytes, p, &elem_prefix, results)?;
+                idx += 1;
             }
         }
         _ => {

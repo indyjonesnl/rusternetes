@@ -312,6 +312,10 @@ fn forbidden(message: &str) -> Response {
 ///
 /// Returns the effective [`UserInfo`] for the request. On a missing-user or
 /// authorization failure it returns the appropriate `Err(Response)`.
+#[allow(
+    clippy::result_large_err,
+    reason = "axum middleware early-returns a Response as the Err; it is never propagated further"
+)]
 async fn apply_impersonation(
     headers: &axum::http::HeaderMap,
     requestor: UserInfo,
@@ -402,6 +406,10 @@ async fn apply_impersonation(
 }
 
 /// Middleware that adds a default admin AuthContext when skip_auth is enabled
+#[allow(
+    clippy::result_large_err,
+    reason = "axum middleware early-returns a Response as the Err; it is never propagated further"
+)]
 pub async fn skip_auth_middleware(
     Extension(authorizer): Extension<Arc<dyn Authorizer>>,
     mut request: Request,
@@ -440,6 +448,10 @@ pub async fn skip_auth_middleware(
 /// names still exists. Deleting the SA therefore invalidates outstanding
 /// tokens (a stateless JWT cannot be "revoked" cryptographically — upstream
 /// achieves this by re-checking the SA Getter on every authenticate call).
+#[allow(
+    clippy::result_large_err,
+    reason = "axum middleware early-returns a Response as the Err; it is never propagated further"
+)]
 pub async fn auth_middleware(
     Extension(token_manager): Extension<Arc<TokenManager>>,
     Extension(bootstrap_token_manager): Extension<Arc<BootstrapTokenManager>>,
@@ -558,6 +570,10 @@ pub async fn auth_middleware(
 /// The Kubernetes client defaults to application/vnd.kubernetes.protobuf, but we only
 /// support JSON. Axum's Json extractor rejects non-application/json content types with
 /// HTTP 415, so we rewrite the header before the request reaches the handler.
+#[allow(
+    clippy::result_large_err,
+    reason = "axum middleware early-returns a Response as the Err; it is never propagated further"
+)]
 pub async fn normalize_content_type_middleware(
     mut request: Request,
     next: Next,

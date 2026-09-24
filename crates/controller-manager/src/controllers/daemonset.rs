@@ -305,7 +305,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         // The ControllerRevision data must match getPatch() format exactly:
         //   {"spec":{"template":{...,"$patch":"replace"}}}
         let template_hash = Self::compute_template_hash(&daemonset.spec.template);
-        let cr_name = format!("{}-{}", name, &template_hash);
+        let cr_name = format!("{}-{}", name, template_hash);
 
         // Check if ControllerRevision already exists before creating
         let cr_key =

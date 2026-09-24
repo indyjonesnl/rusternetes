@@ -1171,7 +1171,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
         let pod_template_hash = Self::compute_pod_template_hash(deployment);
 
         // Generate ReplicaSet name using the pod-template-hash
-        let rs_name = format!("{}-{}", deployment.metadata.name, &pod_template_hash);
+        let rs_name = format!("{}-{}", deployment.metadata.name, pod_template_hash);
 
         let mut metadata = ObjectMeta::new(&rs_name);
         metadata.namespace = Some(namespace.to_string());
