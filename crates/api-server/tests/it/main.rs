@@ -88,6 +88,7 @@ mod delete_propagation_guard_test;
 mod delete_propagation_lateral_test;
 mod deployment_generic_store_test;
 mod deployment_handler_test;
+mod deployment_scale_test;
 mod dra_finalizers_test;
 mod dra_test;
 mod e2e_inprocess_smoke_test;

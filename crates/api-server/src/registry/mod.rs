@@ -24,3 +24,4 @@ pub mod core;
 pub mod generic;
 pub mod names;
 pub mod rest;
+pub mod scale;

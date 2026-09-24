@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::{Deployment, DeploymentStatus};
+use rusternetes_common::resources::{Deployment, DeploymentStatus, Scale, ScaleSpec, ScaleStatus};
+use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_common::validation::apps::{
     validate_deployment, validate_deployment_status_update, validate_deployment_update,
 };
@@ -18,6 +19,7 @@ use crate::registry::rest::{
     GarbageCollectionPolicy, GroupResource, NamespaceScopedStrategy, RequestContext,
     RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
 };
+use crate::registry::scale::{Scalable, ScaleRest};
 
 /// `apiequality.Semantic.DeepEqual` over serialized values: unlike
 /// `reflect.DeepEqual` it treats nil and empty slices and maps as equal
@@ -184,6 +186,48 @@ pub fn new_store(storage: Arc<StorageBackend>) -> Store<Deployment, StorageBacke
 /// [`StatusStrategy`] (storage/storage.go:109-111).
 pub fn new_status_store(storage: Arc<StorageBackend>) -> Store<Deployment, StorageBackend> {
     new_store(storage).with_update_strategy(Arc::new(StatusStrategy))
+}
+
+/// `scaleFromDeployment` (storage/storage.go:381-406).
+pub fn scale_from_deployment(deployment: &Deployment) -> Result<Scale, String> {
+    let selector = deployment.spec.selector.as_selector_string()?;
+    let meta = &deployment.metadata;
+    Ok(Scale {
+        type_meta: TypeMeta {
+            kind: "Scale".to_string(),
+            api_version: "autoscaling/v1".to_string(),
+        },
+        metadata: ObjectMeta {
+            name: meta.name.clone(),
+            namespace: meta.namespace.clone(),
+            uid: meta.uid.clone(),
+            resource_version: meta.resource_version.clone(),
+            creation_timestamp: meta.creation_timestamp,
+            ..ObjectMeta::default()
+        },
+        spec: ScaleSpec {
+            replicas: deployment.spec.replicas.unwrap_or(0),
+        },
+        status: ScaleStatus {
+            replicas: deployment
+                .status
+                .as_ref()
+                .and_then(|s| s.replicas)
+                .unwrap_or(0),
+            selector,
+        },
+    })
+}
+
+/// `ScaleREST{store: deploymentRest.Store}` (storage/storage.go:80-83).
+pub fn new_scale_rest(storage: Arc<StorageBackend>) -> ScaleRest<Deployment> {
+    ScaleRest::new(
+        new_store(storage),
+        Scalable {
+            to_scale: scale_from_deployment,
+            set_replicas: |deployment, replicas| deployment.spec.replicas = Some(replicas),
+        },
+    )
 }
 
 #[cfg(test)]

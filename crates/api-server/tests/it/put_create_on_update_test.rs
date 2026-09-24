@@ -556,6 +556,11 @@ async fn a_put_to_a_missing_objects_subresource_is_not_a_create() {
 /// `update_scale` validated `spec.replicas >= 0` before reading the object, so
 /// this exact request used to answer 422 Invalid for an object that was never
 /// there.
+///
+/// The resource is `deployments.apps`: `Store.Update` answers
+/// `NewNotFound(qualifiedResource, name)` before `scaleUpdatedObjectInfo`
+/// runs (registry/store.go:645-649), and `qualifiedResourceFromContext`
+/// takes `RequestInfo.Resource` without the subresource (store.go:864-867).
 #[tokio::test]
 async fn an_invalid_scale_on_a_missing_deployment_is_a_notfound() {
     let api = TestApiServer::new();
@@ -576,7 +581,10 @@ async fn an_invalid_scale_on_a_missing_deployment_is_a_notfound() {
 
     assert_eq!(status.as_u16(), 404, "{answer}");
     assert_eq!(answer["reason"], json!("NotFound"));
-    assert_eq!(answer["message"], json!("deployments \"nope\" not found"));
+    assert_eq!(
+        answer["message"],
+        json!("deployments.apps \"nope\" not found")
+    );
 }
 
 /// The status subresource of a resource that does exist still writes, so the

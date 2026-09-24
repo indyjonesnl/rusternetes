@@ -1225,9 +1225,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/apps/v1/namespaces/:namespace/deployments/:name/scale",
-            get(handlers::scale::get_scale)
-                .put(handlers::scale::update_scale)
-                .patch(handlers::scale::patch_scale),
+            get(handlers::deployment::get_scale)
+                .put(handlers::deployment::update_scale)
+                .patch(handlers::deployment::patch_scale),
         )
         // Deployments (all namespaces)
         .route(
