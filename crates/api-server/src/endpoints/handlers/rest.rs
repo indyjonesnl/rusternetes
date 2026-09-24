@@ -11,11 +11,9 @@ use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Decision, RequestAttributes};
 use rusternetes_common::dump::decode_request_body;
 use rusternetes_common::{Error, Result};
-use rusternetes_storage::StorageBackend;
 use serde::Serialize;
 
-use crate::registry::generic::Store;
-use crate::registry::rest::{Object, RequestContext};
+use crate::registry::rest::{Object, RequestContext, RestStorage};
 use crate::ssa::{ApplyError, ApplyOptions, ApplyOutcome};
 use crate::state::ApiServerState;
 
@@ -37,8 +35,9 @@ pub struct RequestScope<T: Object> {
     pub resource: GroupVersionResource,
     /// `Subresource`: e.g. `status`, or `None` for the resource itself.
     pub subresource: Option<&'static str>,
-    /// The `rest.Storage` behind the endpoints.
-    pub store: Store<T, StorageBackend>,
+    /// The `rest.Storage` behind the endpoints: a Store, or a subresource
+    /// REST over one.
+    pub store: Box<dyn RestStorage<T>>,
     /// Server-side apply, when the resource supports it.
     pub apply: Option<ApplyFn<T>>,
     /// What decoding a request body does beyond the field mapping: the
@@ -68,7 +67,7 @@ impl<T: Object> RequestScope<T> {
     }
 
     pub(super) fn namespace_scoped(&self) -> bool {
-        self.store.create_strategy.namespace_scoped()
+        self.store.namespace_scoped()
     }
 }
 

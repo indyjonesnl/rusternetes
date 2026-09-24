@@ -205,16 +205,11 @@ impl<T: Object, S: Storage> Store<T, S> {
     // -- error interpretation (storage/errors/storage.go) -------------------
 
     pub(crate) fn not_found(&self, name: &str) -> Error {
-        // `errors.NewNotFound(qualifiedResource, name)`.
-        Error::NotFound(format!("{} \"{name}\" not found", self.qualified_resource))
+        crate::registry::rest::not_found(&self.qualified_resource, name)
     }
 
     pub(crate) fn conflict(&self, name: &str, reason: impl std::fmt::Display) -> Error {
-        // `errors.NewConflict(qualifiedResource, name, err)` (errors.go:232-244).
-        Error::Conflict(format!(
-            "Operation cannot be fulfilled on {} \"{name}\": {reason}",
-            self.qualified_resource
-        ))
+        crate::registry::rest::conflict(&self.qualified_resource, name, reason)
     }
 
     /// A storage error in the shape upstream's `StorageError.Error()` prints
@@ -1164,6 +1159,84 @@ fn should_delete_dependents(
         }
     }
     false
+}
+
+/// The Store serves every verb (store.go's `Store` implements all of
+/// `rest.StandardStorage`).
+#[async_trait]
+impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestStorage<T>
+    for Store<T, S>
+{
+    fn qualified_resource(&self) -> &GroupResource {
+        &self.qualified_resource
+    }
+
+    fn namespace_scoped(&self) -> bool {
+        self.create_strategy.namespace_scoped()
+    }
+
+    async fn get(&self, ctx: &RequestContext, name: &str) -> Result<T> {
+        Store::get(self, ctx, name).await
+    }
+
+    async fn create(
+        &self,
+        ctx: &RequestContext,
+        obj: T,
+        create_validation: Option<&dyn ValidateObject<T>>,
+        options: &CreateOptions,
+    ) -> Result<T> {
+        Store::create(self, ctx, obj, create_validation, options).await
+    }
+
+    async fn update(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        obj_info: &dyn UpdatedObjectInfo<T>,
+        create_validation: Option<&dyn ValidateObject<T>>,
+        update_validation: Option<&dyn ValidateObjectUpdate<T>>,
+        force_allow_create: bool,
+        options: &UpdateOptions,
+    ) -> Result<(T, bool)> {
+        Store::update(
+            self,
+            ctx,
+            name,
+            obj_info,
+            create_validation,
+            update_validation,
+            force_allow_create,
+            options,
+        )
+        .await
+    }
+
+    async fn delete(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        delete_validation: Option<&dyn ValidateObject<T>>,
+        options: DeleteOptions,
+    ) -> Result<(Deleted<T>, bool)> {
+        Store::delete(self, ctx, name, delete_validation, options).await
+    }
+
+    /// `Store.DeleteCollection` lists with the request's options, then
+    /// deletes each item (store.go:1237-1384).
+    async fn delete_collection(
+        &self,
+        ctx: &RequestContext,
+        delete_validation: Option<&dyn ValidateObject<T>>,
+        options: &DeleteOptions,
+        list_options: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<T>> {
+        let prefix =
+            rusternetes_storage::build_prefix(&self.storage_prefix, ctx.namespace.as_deref());
+        let mut items: Vec<T> = self.storage.list(&prefix).await?;
+        crate::handlers::filtering::apply_selectors(&mut items, list_options)?;
+        Store::delete_collection(self, ctx, items, delete_validation, options).await
+    }
 }
 
 #[cfg(test)]

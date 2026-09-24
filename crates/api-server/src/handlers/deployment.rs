@@ -47,7 +47,7 @@ fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestSc
             resource: "deployments".to_string(),
         },
         subresource,
-        store,
+        store: Box::new(store),
         apply: Some(crate::ssa::apply_legacy::<Deployment>),
         convert_to_internal: Some(deployment::convert_to_internal),
     }
