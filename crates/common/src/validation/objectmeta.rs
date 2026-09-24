@@ -400,7 +400,7 @@ pub fn validate_no_new_finalizers(
 /// Upstream `ValidateImmutableField` specialised for JSON-serializable values.
 /// Upstream uses `apiequality.Semantic.DeepEqual` over `interface{}`; here we
 /// compare via `serde_json::Value` to keep the call sites generic.
-fn validate_immutable_field<T: serde::Serialize + ?Sized>(
+pub fn validate_immutable_field<T: serde::Serialize + ?Sized>(
     new_val: &T,
     old_val: &T,
     fld_path: &Path,

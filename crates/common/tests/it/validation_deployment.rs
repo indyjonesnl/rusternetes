@@ -7,6 +7,7 @@
 //! in the upstream Go file. Error wording and field paths must match upstream
 //! exactly so conformance log greps remain valid.
 
+use rusternetes_common::resources::deployment::DeploymentStatus;
 use rusternetes_common::resources::deployment::{
     Deployment, DeploymentSpec, DeploymentStrategy, RollingUpdateDeployment,
 };
@@ -14,7 +15,9 @@ use rusternetes_common::resources::pod::{Container, PodSpec};
 use rusternetes_common::resources::policy::IntOrString;
 use rusternetes_common::resources::workloads::PodTemplateSpec;
 use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
-use rusternetes_common::validation::apps::{validate_deployment, validate_deployment_update};
+use rusternetes_common::validation::apps::{
+    validate_deployment, validate_deployment_status_update, validate_deployment_update,
+};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -76,6 +79,8 @@ fn make_deployment(
         metadata: ObjectMeta {
             name: "test-deployment".to_string(),
             namespace: Some("default".to_string()),
+            // `ValidateObjectMetaUpdate` requires one on the new object.
+            resource_version: Some("1".to_string()),
             ..ObjectMeta::default()
         },
         spec: DeploymentSpec {
@@ -518,5 +523,83 @@ fn test_validate_deployment_update_inherits_spec_validation() {
     assert!(
         agg.contains("replicas"),
         "expected replicas in error, got: {agg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ValidateDeploymentUpdate / ValidateDeploymentStatusUpdate
+// (pkg/apis/apps/validation/validation.go:678-730)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_validate_deployment_update_validates_metadata() {
+    let app_labels = [("app", "nginx")];
+    let old = make_deployment(Some(1), make_selector(&app_labels), &app_labels, None);
+    let mut new = old.clone();
+    new.metadata.namespace = Some("elsewhere".to_string());
+    let agg = aggregate(&validate_deployment_update(&new, &old));
+    assert!(agg.contains("metadata.namespace"), "got: {agg}");
+}
+
+fn with_status(status: DeploymentStatus) -> Deployment {
+    let app_labels = [("app", "nginx")];
+    let mut d = make_deployment(Some(1), make_selector(&app_labels), &app_labels, None);
+    d.status = Some(status);
+    d
+}
+
+#[test]
+fn test_validate_deployment_status_update() {
+    let old = with_status(DeploymentStatus {
+        collision_count: Some(2),
+        ..DeploymentStatus::default()
+    });
+
+    let ok = with_status(DeploymentStatus {
+        replicas: Some(3),
+        updated_replicas: Some(3),
+        ready_replicas: Some(2),
+        available_replicas: Some(2),
+        collision_count: Some(2),
+        ..DeploymentStatus::default()
+    });
+    let errs = validate_deployment_status_update(&ok, &old);
+    assert!(errs.is_empty(), "got: {}", aggregate(&errs));
+
+    let bad = with_status(DeploymentStatus {
+        replicas: Some(1),
+        updated_replicas: Some(2),
+        ready_replicas: Some(1),
+        available_replicas: Some(-1),
+        collision_count: Some(1),
+        ..DeploymentStatus::default()
+    });
+    let agg = aggregate(&validate_deployment_status_update(&bad, &old));
+    assert!(agg.contains("status.availableReplicas"), "got: {agg}");
+    assert!(agg.contains("status.updatedReplicas"), "got: {agg}");
+    assert!(
+        agg.contains("cannot be greater than status.replicas"),
+        "got: {agg}"
+    );
+    assert!(agg.contains("status.collisionCount"), "got: {agg}");
+    assert!(agg.contains("cannot be decremented"), "got: {agg}");
+
+    // `IsDecremented`: dropping a set collisionCount counts as decrementing.
+    let dropped = with_status(DeploymentStatus::default());
+    let agg = aggregate(&validate_deployment_status_update(&dropped, &old));
+    assert!(agg.contains("cannot be decremented"), "got: {agg}");
+
+    // availableReplicas is also bounded by readyReplicas.
+    let over_ready = with_status(DeploymentStatus {
+        replicas: Some(3),
+        ready_replicas: Some(1),
+        available_replicas: Some(2),
+        collision_count: Some(2),
+        ..DeploymentStatus::default()
+    });
+    let agg = aggregate(&validate_deployment_status_update(&over_ready, &old));
+    assert!(
+        agg.contains("cannot be greater than readyReplicas"),
+        "got: {agg}"
     );
 }
