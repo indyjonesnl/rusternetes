@@ -1253,15 +1253,15 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/apps/v1/namespaces/:namespace/replicasets/:name/status",
-            get(handlers::status::get_status)
-                .put(handlers::status::update_status)
-                .patch(handlers::status::update_status),
+            get(handlers::replicaset::get_status)
+                .put(handlers::replicaset::update_status)
+                .patch(handlers::replicaset::patch_status),
         )
         .route(
             "/apis/apps/v1/namespaces/:namespace/replicasets/:name/scale",
-            get(handlers::scale::get_scale)
-                .put(handlers::scale::update_scale)
-                .patch(handlers::scale::patch_scale),
+            get(handlers::replicaset::get_scale)
+                .put(handlers::replicaset::update_scale)
+                .patch(handlers::replicaset::patch_scale),
         )
         // ReplicaSets (all namespaces)
         .route(

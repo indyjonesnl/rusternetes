@@ -12,46 +12,14 @@ use rusternetes_common::validation::apps::{
 use rusternetes_common::validation::field::ErrorList;
 use rusternetes_common::validation::metav1::is_dns1123_label;
 use rusternetes_storage::StorageBackend;
-use serde::Serialize;
 
+use crate::registry::equality::semantic_equal;
 use crate::registry::generic::Store;
 use crate::registry::rest::{
     GarbageCollectionPolicy, GroupResource, NamespaceScopedStrategy, RequestContext,
     RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
 };
 use crate::registry::scale::{Scalable, ScaleRest};
-
-/// `apiequality.Semantic.DeepEqual` over serialized values: unlike
-/// `reflect.DeepEqual` it treats nil and empty slices and maps as equal
-/// (third_party/forked/golang/reflect/deep_equal.go). Serialized, "nil" is an
-/// absent key or `null`, so both sides drop those and empty containers first.
-fn semantic_equal<A: Serialize>(a: &A, b: &A) -> bool {
-    fn normalize(v: &mut serde_json::Value) -> bool {
-        use serde_json::Value;
-        match v {
-            Value::Null => true,
-            Value::Object(map) => {
-                map.retain(|_, child| !normalize(child));
-                map.is_empty()
-            }
-            Value::Array(items) => {
-                for item in items.iter_mut() {
-                    normalize(item);
-                }
-                items.is_empty()
-            }
-            _ => false,
-        }
-    }
-    let normalized = |v: &A| {
-        let mut v = serde_json::to_value(v).unwrap_or_default();
-        if normalize(&mut v) {
-            v = serde_json::Value::Null;
-        }
-        v
-    };
-    normalized(a) == normalized(b)
-}
 
 /// The v1 defaulting a decoded Deployment goes through: `SetDefaults_Deployment`
 /// (pkg/apis/apps/v1/defaults.go:38-73) and the pod template's defaults.
