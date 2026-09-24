@@ -230,6 +230,7 @@ mod small_api_decode_when_absent_test;
 mod spdy_test;
 mod ssa_configmap_apply_test;
 mod ssa_secret_apply_test;
+mod statefulset_generic_store_test;
 mod statefulset_handler_test;
 mod statefulset_pvc_retention_default_test;
 mod status_field_error_shape_test;

@@ -119,6 +119,7 @@ pub fn new_store(storage: Arc<StorageBackend>) -> Store<Secret, StorageBackend> 
         GroupResource::new("", "secrets"),
         Arc::new(Strategy),
     )
+    .with_decode_defaulter(convert_to_internal)
 }
 
 #[cfg(test)]

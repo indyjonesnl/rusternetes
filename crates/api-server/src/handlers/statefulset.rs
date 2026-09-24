@@ -1,20 +1,88 @@
+//! StatefulSet endpoints.
+//!
+//! Writes, and the `/status` and `/scale` subresources, go through the
+//! generic endpoint handlers and [`crate::registry::generic::Store`] with the
+//! StatefulSet strategies ([`crate::registry::apps::statefulset`]) — upstream's
+//! `pkg/registry/apps/statefulset/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::apps::statefulset;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
-    resources::StatefulSet,
+    resources::{Scale, StatefulSet},
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The StatefulSet `RequestScope`: `apps/v1` `StatefulSet` served as
+/// `statefulsets` (or its `/status`), backed by `statefulset.NewREST`'s stores.
+fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestScope<StatefulSet> {
+    let store = match subresource {
+        Some(_) => statefulset::new_status_store(state.storage.clone()),
+        None => statefulset::new_store(state.storage.clone()),
+    };
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            kind: "StatefulSet".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            resource: "statefulsets".to_string(),
+        },
+        subresource,
+        store: Box::new(store),
+        apply: Some(crate::ssa::apply_legacy::<StatefulSet>),
+        convert_to_internal: Some(statefulset::convert_to_internal),
+    }
+}
+
+/// The `/scale` `RequestScope`: `autoscaling/v1` `Scale` served as
+/// `statefulsets/scale`, over `ScaleREST` (storage.go:75).
+fn scale_scope(state: &ApiServerState) -> RequestScope<Scale> {
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "autoscaling".to_string(),
+            version: "v1".to_string(),
+            kind: "Scale".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            resource: "statefulsets".to_string(),
+        },
+        subresource: Some("scale"),
+        store: Box::new(statefulset::new_scale_rest(state.storage.clone())),
+        apply: Some(crate::ssa::apply_legacy::<Scale>),
+        convert_to_internal: None,
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
@@ -22,91 +90,31 @@ pub async fn create(
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
-) -> Result<(StatusCode, Json<StatefulSet>)> {
-    let mut statefulset: StatefulSet = rusternetes_common::dump::decode_request_body(&body)?;
-    info!(
-        "Creating statefulset: {}/{}",
-        namespace, statefulset.metadata.name
-    );
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &statefulset.metadata,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "statefulsets")
-        .with_namespace(&namespace)
-        .with_api_group("apps");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    statefulset.metadata.namespace = Some(namespace.clone());
-    statefulset.metadata.ensure_uid();
-    statefulset.metadata.ensure_creation_timestamp();
-    crate::handlers::lifecycle::set_initial_generation(&mut statefulset.metadata);
-
-    // Apply K8s defaults (SetDefaults_StatefulSet + SetDefaults_PodSpec + SetDefaults_Container)
-    crate::handlers::defaults::apply_statefulset_defaults(&mut statefulset);
-
-    // Field validation (mirrors upstream ValidateStatefulSet). Runs after
-    // defaulting so podManagementPolicy/updateStrategy are populated.
-    {
-        let errs = rusternetes_common::validation::apps::validate_statefulset(&statefulset);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: StatefulSet {}/{} validated successfully (not created)",
-            namespace, statefulset.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(statefulset)));
-    }
-
-    let key = build_key("statefulsets", Some(&namespace), &statefulset.metadata.name);
-    let created = state.storage.create(&key, &statefulset).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<StatefulSet>> {
-    debug!("Getting statefulset: {}/{}", namespace, name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "statefulsets")
-        .with_namespace(&namespace)
-        .with_api_group("apps")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("statefulsets", Some(&namespace), &name);
-    let statefulset = state.storage.get(&key).await?;
-
-    Ok(Json(statefulset))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn update(
@@ -115,248 +123,196 @@ pub async fn update(
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
-) -> Result<Json<StatefulSet>> {
-    let mut statefulset: StatefulSet = rusternetes_common::dump::decode_request_body(&body)?;
-    info!("Updating statefulset: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "statefulsets")
-        .with_namespace(&namespace)
-        .with_api_group("apps")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("statefulsets", Some(&namespace), &name),
-        "apps",
-        "statefulsets",
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    statefulset.metadata.name = name.clone();
-    statefulset.metadata.namespace = Some(namespace.clone());
-    if statefulset.type_meta.kind.is_empty() {
-        statefulset.type_meta.kind = "StatefulSet".to_string();
-    }
-    if statefulset.type_meta.api_version.is_empty() {
-        statefulset.type_meta.api_version = "apps/v1".to_string();
-    }
-
-    // Apply K8s defaults (SetDefaults_StatefulSet + SetDefaults_PodSpec + SetDefaults_Container)
-    crate::handlers::defaults::apply_statefulset_defaults(&mut statefulset);
-
-    let key = build_key("statefulsets", Some(&namespace), &name);
-
-    // Load stored object so we can enforce upstream Strategy.PrepareForUpdate
-    // (status reset + selector immutability) and ValidateStatefulSetUpdate.
-    let mut old_statefulset: StatefulSet = state.storage.get(&key).await?;
-
-    // Default the stored object the same way as the incoming one before the
-    // immutability comparison. Upstream validates new vs old in their defaulted
-    // internal form (old is already defaulted in etcd); defaulting is idempotent,
-    // so this is a no-op for normally-created objects but prevents a defaulted
-    // field (e.g. podManagementPolicy "OrderedReady") on the new object from
-    // looking like a forbidden change against an undefaulted stored object.
-    crate::handlers::defaults::apply_statefulset_defaults(&mut old_statefulset);
-
-    crate::handlers::lifecycle::check_resource_version(
-        old_statefulset.metadata.resource_version.as_deref(),
-        statefulset.metadata.resource_version.as_deref(),
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
-    )?;
-
-    crate::handlers::lifecycle::validate_selector_immutable(
-        &old_statefulset.spec.selector,
-        &statefulset.spec.selector,
-        "StatefulSet",
-    )?;
-
-    // Enforce the remaining update immutability (upstream ValidateStatefulSetUpdate):
-    // serviceName, podManagementPolicy and volumeClaimTemplates are immutable.
-    let errs = rusternetes_common::validation::apps::validate_statefulset_update(
-        &statefulset,
-        &old_statefulset,
-    );
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Status only mutates via /status; mirror upstream PrepareForUpdate.
-    statefulset.status = old_statefulset.status.clone();
-
-    // Reinstate the server-owned metadata a PUT body may omit (uid,
-    // creationTimestamp, a pending deletion). A locally-built object — what the
-    // dynamic client's Update() sends — carries none of them, and storing the
-    // blanks orphans every child: the ownerReferences[].uid no longer matches a
-    // live owner, so the garbage collector deletes the children (#1605).
-    // Upstream: registry/rest/update.go::BeforeUpdate (lines 123-146).
-    crate::handlers::lifecycle::inherit_server_owned_metadata(
-        &mut statefulset.metadata,
-        &old_statefulset.metadata,
-    );
-
-    // Increment generation if spec changed
-    let old_value = serde_json::to_value(&old_statefulset)
-        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
-    let new_value = serde_json::to_value(&statefulset)
-        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
-    crate::handlers::lifecycle::maybe_increment_generation(
-        &old_value,
-        &new_value,
-        &mut statefulset.metadata,
-    );
-
-    // Compute the updateRevision from the new template. If the template changed,
-    // this produces a different hash. K8s conformance tests expect updateRevision
-    // to be set immediately after an update, not on the next controller cycle.
-    // This runs AFTER the upstream-mirroring status reset above, so it layers a
-    // synthetic updateRevision onto the preserved old status.
-    {
-        use sha2::{Digest, Sha256};
-        let tmpl_value = serde_json::to_value(&statefulset.spec.template).unwrap_or_default();
-        let serialized = serde_json::to_string(&tmpl_value).unwrap_or_default();
-        let hash = Sha256::digest(serialized.as_bytes());
-        let new_revision = format!(
-            "{:010x}",
-            u64::from_be_bytes(hash[..8].try_into().unwrap_or([0u8; 8]))
-        );
-
-        let status = statefulset.status.get_or_insert({
-            rusternetes_common::resources::StatefulSetStatus {
-                replicas: 0,
-                ready_replicas: None,
-                current_replicas: None,
-                updated_replicas: None,
-                available_replicas: None,
-                collision_count: None,
-                observed_generation: None,
-                current_revision: None,
-                update_revision: None,
-                conditions: None,
-            }
-        });
-        let old_update_rev = status.update_revision.clone();
-        status.update_revision = Some(new_revision.clone());
-        // If currentRevision wasn't set yet, initialize it to the updateRevision
-        if status.current_revision.is_none() {
-            status.current_revision = Some(new_revision);
-        }
-        info!(
-            "StatefulSet {}/{} update: old_updateRevision={:?}, new_updateRevision={:?}",
-            namespace, name, old_update_rev, status.update_revision
-        );
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: StatefulSet {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(statefulset));
-    }
-
-    let result = state.storage.update(&key, &statefulset).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete_statefulset(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<StatefulSet>> {
-    info!("Deleting statefulset: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "statefulsets")
-        .with_namespace(&namespace)
-        .with_api_group("apps")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("statefulsets", Some(&namespace), &name);
-
-    // Get the resource to check if it exists
-    let statefulset: StatefulSet = state.storage.get(&key).await?;
-
-    // Run validating admission webhooks for DELETE (object=nil, oldObject=statefulset).
-    crate::handlers::admission_helper::run_delete_validating_webhooks(
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
         &state,
-        "apps",
-        "v1",
-        "StatefulSet",
-        "statefulsets",
+        &scope(&state, None),
+        &auth_ctx.user,
         Some(&namespace),
         &name,
-        &statefulset,
-        &user_for_webhook,
-        is_dry_run,
+        &params,
+        &body,
+    )
+    .await
+}
+
+pub async fn deletecollection_statefulsets(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// GET `/status`: `StatusREST.Get` is the store's `Get` (storage.go:135-138).
+pub async fn get_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
+}
+
+/// PUT `/status`: `StatusREST.Update` (storage.go:140-145).
+pub async fn update_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// PATCH `/status`: a patch into `StatusREST.Update`.
+pub async fn patch_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
+}
+
+/// GET `/scale`: `ScaleREST.Get` (storage.go:196-208).
+pub async fn get_scale(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let response = endpoints::get_resource(
+        &state,
+        &scale_scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
     )
     .await?;
+    Ok(endpoints::negotiate(&headers, response).await)
+}
 
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: StatefulSet {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(statefulset));
-    }
+/// PUT `/scale`: `ScaleREST.Update` (storage.go:210-229).
+pub async fn update_scale(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    let response = endpoints::update_resource(
+        &state,
+        &scale_scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await?;
+    Ok(endpoints::negotiate(&headers, response).await)
+}
 
-    let has_finalizers =
-        crate::handlers::finalizers::handle_delete_with_finalizers_and_propagation(
-            &*state.storage,
-            &key,
-            &statefulset,
-            &delete_opts,
-        )
-        .await?;
-
-    if has_finalizers {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: StatefulSet = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    } else {
-        Ok(Json(statefulset))
-    }
+/// PATCH `/scale`: a patch of the Scale into `ScaleREST.Update`.
+pub async fn patch_scale(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    let response = endpoints::patch_resource(
+        &state,
+        &scale_scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await?;
+    Ok(endpoints::negotiate(&headers, response).await)
 }
 
 pub async fn list(
@@ -487,107 +443,4 @@ pub async fn list_all_statefulsets(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(patch, StatefulSet, "statefulsets", "apps");
-
-pub async fn deletecollection_statefulsets(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>> {
-    info!(
-        "DeleteCollection statefulsets in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "statefulsets")
-        .with_namespace(&namespace)
-        .with_api_group("apps");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: StatefulSet collection would be deleted (not deleted)");
-        return Ok(Json(serde_json::json!({
-            "kind": "Status", "apiVersion": "v1", "metadata": {},
-            "status": "Success", "code": 200
-        })));
-    }
-
-    // Get all statefulsets in the namespace
-    let prefix = build_prefix("statefulsets", Some(&namespace));
-    let mut items = state.storage.list::<StatefulSet>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("statefulsets", Some(&namespace), &item.metadata.name);
-
-        // Run validating admission webhooks for DELETE per item.
-        crate::handlers::admission_helper::run_delete_validating_webhooks(
-            &state,
-            "apps",
-            "v1",
-            "StatefulSet",
-            "statefulsets",
-            Some(&namespace),
-            &item.metadata.name,
-            &item,
-            &user_for_webhook,
-            false,
-        )
-        .await?;
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} statefulsets deleted",
-        deleted_count
-    );
-    // K8s returns a Status object for deleteCollection
-    // See: staging/src/k8s.io/apiserver/pkg/endpoints/handlers/delete.go:340
-    Ok(Json(serde_json::json!({
-        "kind": "Status",
-        "apiVersion": "v1",
-        "metadata": {},
-        "status": "Success",
-        "code": 200,
-        "details": {
-            "kind": "StatefulSet"
-        }
-    })))
 }

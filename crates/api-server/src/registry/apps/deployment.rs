@@ -148,6 +148,7 @@ pub fn new_store(storage: Arc<StorageBackend>) -> Store<Deployment, StorageBacke
         GroupResource::new("apps", "deployments"),
         Arc::new(Strategy),
     )
+    .with_decode_defaulter(convert_to_internal)
 }
 
 /// The `/status` store: the Deployment store updating with

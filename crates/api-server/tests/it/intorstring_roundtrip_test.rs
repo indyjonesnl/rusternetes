@@ -156,7 +156,15 @@ async fn daemonset_partial_rolling_update_defaults_the_missing_half_as_an_intege
 
 /// StatefulSet shares the same lossy helper, so it shares the same bug.
 #[tokio::test]
+#[serial_test::serial]
 async fn statefulset_integer_max_unavailable_stays_an_integer() {
+    // `maxUnavailable` is gated by `MaxUnavailableStatefulSet`, off by
+    // default in 1.35: the StatefulSet strategy drops it otherwise
+    // (`dropStatefulSetDisabledFields`, pkg/registry/apps/statefulset/strategy.go:120-126).
+    let _gate = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::MaxUnavailableStatefulSet,
+        true,
+    );
     let state = TestApiServer::new();
     let uri = format!("/apis/apps/v1/namespaces/{NS}/statefulsets");
     let (code, body) = state
@@ -177,7 +185,15 @@ async fn statefulset_integer_max_unavailable_stays_an_integer() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn statefulset_percentage_max_unavailable_stays_a_string() {
+    // `maxUnavailable` is gated by `MaxUnavailableStatefulSet`, off by
+    // default in 1.35: the StatefulSet strategy drops it otherwise
+    // (`dropStatefulSetDisabledFields`, pkg/registry/apps/statefulset/strategy.go:120-126).
+    let _gate = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::MaxUnavailableStatefulSet,
+        true,
+    );
     let state = TestApiServer::new();
     let uri = format!("/apis/apps/v1/namespaces/{NS}/statefulsets");
     let (code, body) = state

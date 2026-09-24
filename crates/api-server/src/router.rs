@@ -1287,15 +1287,15 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/apps/v1/namespaces/:namespace/statefulsets/:name/status",
-            get(handlers::status::get_status)
-                .put(handlers::status::update_status)
-                .patch(handlers::status::update_status),
+            get(handlers::statefulset::get_status)
+                .put(handlers::statefulset::update_status)
+                .patch(handlers::statefulset::patch_status),
         )
         .route(
             "/apis/apps/v1/namespaces/:namespace/statefulsets/:name/scale",
-            get(handlers::scale::get_scale)
-                .put(handlers::scale::update_scale)
-                .patch(handlers::scale::patch_scale),
+            get(handlers::statefulset::get_scale)
+                .put(handlers::statefulset::update_scale)
+                .patch(handlers::statefulset::patch_scale),
         )
         // StatefulSets (all namespaces)
         .route(
