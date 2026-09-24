@@ -63,9 +63,9 @@ pub use autoscaling::{
     MetricIdentifier, MetricSpec, MetricStatus, MetricTarget, MetricValueStatus,
     ObjectMetricSource, ObjectMetricStatus, PodResourcePolicy, PodUpdatePolicy, PodsMetricSource,
     PodsMetricStatus, RecommendedContainerResources, RecommendedPodResources, ResourceMetricSource,
-    ResourceMetricStatus, VerticalPodAutoscaler, VerticalPodAutoscalerCondition,
-    VerticalPodAutoscalerRecommenderSelector, VerticalPodAutoscalerSpec,
-    VerticalPodAutoscalerStatus,
+    ResourceMetricStatus, Scale, ScaleSpec, ScaleStatus, VerticalPodAutoscaler,
+    VerticalPodAutoscalerCondition, VerticalPodAutoscalerRecommenderSelector,
+    VerticalPodAutoscalerSpec, VerticalPodAutoscalerStatus,
 };
 pub use binding::Binding;
 pub use certificates::{

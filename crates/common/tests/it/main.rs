@@ -73,6 +73,7 @@ mod validation_replicationcontroller;
 mod validation_resourcequota;
 mod validation_resourcequota_update;
 mod validation_runtimeclass;
+mod validation_scale;
 mod validation_secret;
 mod validation_service;
 mod validation_servicecidr;
