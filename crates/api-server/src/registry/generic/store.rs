@@ -71,6 +71,10 @@ pub enum Deleted<T> {
 /// keep a namespace alive while `spec.finalizers` remain.
 pub type ShouldDeleteDuringUpdateFn<T> = fn(&T, &T) -> bool;
 
+/// The scheme defaulter of the storage codec: applied to every object the
+/// Store decodes from storage. See [`Store::decode_defaulter`].
+pub type DecodeDefaulterFn<T> = fn(&mut T);
+
 /// `genericregistry.Store`, reduced to the fields a resource sets today.
 pub struct Store<T: Object, S: Storage> {
     pub storage: Arc<S>,
@@ -89,6 +93,15 @@ pub struct Store<T: Object, S: Storage> {
     /// `ReturnDeletedObject`.
     pub return_deleted_object: bool,
     pub should_delete_during_update: Option<ShouldDeleteDuringUpdateFn<T>>,
+    /// The defaulting the storage codec applies on decode. Upstream's storage
+    /// decoder is `CodecFactory.DecoderToVersion`
+    /// (serializer/codec_factory.go:291-293), a
+    /// `NewDefaultingCodecForScheme` codec whose `Decode` runs the scheme
+    /// defaulter on every object it reads (serializer/versioning/
+    /// versioning.go:32-41, 166-188). So an object stored before a default
+    /// existed, or written around the API, comes back defaulted — which the
+    /// strategies' update validation relies on when it compares old and new.
+    pub decode_defaulter: Option<DecodeDefaulterFn<T>>,
 }
 
 impl<T: Object, S: Storage> Clone for Store<T, S> {
@@ -103,6 +116,7 @@ impl<T: Object, S: Storage> Clone for Store<T, S> {
             enable_garbage_collection: self.enable_garbage_collection,
             return_deleted_object: self.return_deleted_object,
             should_delete_during_update: self.should_delete_during_update,
+            decode_defaulter: self.decode_defaulter,
         }
     }
 }
@@ -162,7 +176,23 @@ impl<T: Object, S: Storage> Store<T, S> {
             enable_garbage_collection: true,
             return_deleted_object: false,
             should_delete_during_update: None,
+            decode_defaulter: None,
         }
+    }
+
+    /// This store with the storage codec's defaulting (see
+    /// [`Store::decode_defaulter`]).
+    pub fn with_decode_defaulter(mut self, defaulter: DecodeDefaulterFn<T>) -> Self {
+        self.decode_defaulter = Some(defaulter);
+        self
+    }
+
+    /// An object as the storage codec decodes it.
+    fn decoded(&self, mut obj: T) -> T {
+        if let Some(default) = self.decode_defaulter {
+            default(&mut obj);
+        }
+        obj
     }
 
     /// A copy of this store that updates with `strategy` — how a subresource
@@ -325,7 +355,7 @@ impl<T: Object, S: Storage> Store<T, S> {
     ) -> std::result::Result<T, Abort<T>> {
         loop {
             let current: Option<T> = match self.storage.get::<T>(key).await {
-                Ok(obj) => Some(obj),
+                Ok(obj) => Some(self.decoded(obj)),
                 Err(Error::NotFound(_)) if ignore_not_found => None,
                 Err(Error::NotFound(_)) => return Err(Abort::Api(self.not_found(name))),
                 Err(e) => return Err(Abort::Api(e)),
@@ -345,7 +375,7 @@ impl<T: Object, S: Storage> Store<T, S> {
 
             let Some(current) = current else {
                 match self.storage.create(key, &updated).await {
-                    Ok(stored) => return Ok(stored),
+                    Ok(stored) => return Ok(self.decoded(stored)),
                     // Someone created it between the read and the write.
                     Err(Error::AlreadyExists(_)) => continue,
                     Err(e) => return Err(Abort::Api(e)),
@@ -358,7 +388,7 @@ impl<T: Object, S: Storage> Store<T, S> {
                 return Ok(current);
             }
             match self.storage.update(key, &updated).await {
-                Ok(stored) => return Ok(stored),
+                Ok(stored) => return Ok(self.decoded(stored)),
                 Err(Error::Conflict(msg)) => {
                     debug!("{key}: write lost a race ({msg}); retrying on the current object");
                     continue;
@@ -388,7 +418,7 @@ impl<T: Object, S: Storage> Store<T, S> {
         delete_validation: Option<&dyn ValidateObject<T>>,
         dry_run: bool,
     ) -> Result<T> {
-        let current: T = self.storage.get(key).await?;
+        let current: T = self.decoded(self.storage.get(key).await?);
         if let Err(failure) = Self::check_preconditions(preconditions, Some(&current)) {
             return Err(self.conflict(name, Self::storage_error_text(key, &failure)));
         }
@@ -409,6 +439,7 @@ impl<T: Object, S: Storage> Store<T, S> {
         self.storage
             .get(&key)
             .await
+            .map(|obj| self.decoded(obj))
             .map_err(|e| self.interpret_get_error(e, name))
     }
 
@@ -456,7 +487,10 @@ impl<T: Object, S: Storage> Store<T, S> {
                 Err(e) => Err(e),
             }
         } else {
-            self.storage.create(&key, &obj).await
+            self.storage
+                .create(&key, &obj)
+                .await
+                .map(|out| self.decoded(out))
         };
 
         match result {
@@ -1233,7 +1267,13 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
     ) -> Result<Vec<T>> {
         let prefix =
             rusternetes_storage::build_prefix(&self.storage_prefix, ctx.namespace.as_deref());
-        let mut items: Vec<T> = self.storage.list(&prefix).await?;
+        let mut items: Vec<T> = self
+            .storage
+            .list(&prefix)
+            .await?
+            .into_iter()
+            .map(|obj| self.decoded(obj))
+            .collect();
         crate::handlers::filtering::apply_selectors(&mut items, list_options)?;
         Store::delete_collection(self, ctx, items, delete_validation, options).await
     }

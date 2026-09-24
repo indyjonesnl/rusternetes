@@ -328,8 +328,11 @@ async fn every_update_handler_consults_the_create_on_update_table() {
         }
     }
 
+    // Each resource that moves onto the generic Store (#1990) leaves this
+    // scan — its update path is `Store.Update`, whose create-on-update gate
+    // `configmap_generic_store_test` pins — so the floor falls with them.
     assert!(
-        checked >= 64,
+        checked >= 60,
         "guard scanned only {checked} update handlers that can create -- the \
          parser stopped matching, which would make this test vacuously green"
     );

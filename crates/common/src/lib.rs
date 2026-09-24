@@ -10,6 +10,7 @@ pub mod defaults;
 pub mod deletion;
 pub mod dump;
 pub mod encryption;
+pub mod equality;
 pub mod error;
 pub mod event_correlator;
 pub mod feature_gates;
