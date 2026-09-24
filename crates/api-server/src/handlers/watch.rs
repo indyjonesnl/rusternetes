@@ -1797,7 +1797,7 @@ fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (S
             // CamelCase heuristic: capitalize first letter, remove trailing 's'
             let s = other.strip_suffix('s').unwrap_or(other);
             return (
-                format!("{}{}", &s[..1].to_uppercase(), &s[1..]),
+                format!("{}{}", s[..1].to_uppercase(), &s[1..]),
                 if api_group.is_empty() {
                     "v1".to_string()
                 } else {

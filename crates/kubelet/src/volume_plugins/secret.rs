@@ -159,7 +159,7 @@ impl Mounter for SecretMounter {
             };
             let now = chrono::Utc::now();
             let claims = rusternetes_common::auth::ServiceAccountClaims {
-                sub: format!("system:serviceaccount:{}:{}", &self.namespace, sa_name),
+                sub: format!("system:serviceaccount:{}:{}", self.namespace, sa_name),
                 namespace: self.namespace.to_string(),
                 uid: sa_uid.clone(),
                 iat: now.timestamp(),
@@ -221,7 +221,7 @@ impl Mounter for SecretMounter {
                     return Err(anyhow::anyhow!(
                         "Secret {} not found in namespace {}: {}",
                         secret_name,
-                        &self.namespace,
+                        self.namespace,
                         e
                     ));
                 }

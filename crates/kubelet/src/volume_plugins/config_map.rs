@@ -163,7 +163,7 @@ impl Mounter for ConfigMapMounter {
                     return Err(anyhow::anyhow!(
                         "ConfigMap {} not found in namespace {}: {}",
                         configmap_name,
-                        &self.namespace,
+                        self.namespace,
                         e
                     ));
                 }

@@ -379,7 +379,7 @@ impl Mounter for ProjectedMounter {
                         None
                     };
                     let claims = rusternetes_common::auth::ServiceAccountClaims {
-                        sub: format!("system:serviceaccount:{}:{}", &self.namespace, sa_name),
+                        sub: format!("system:serviceaccount:{}:{}", self.namespace, sa_name),
                         namespace: self.namespace.to_string(),
                         uid: sa_uid.clone(),
                         iat: now.timestamp(),

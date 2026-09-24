@@ -569,6 +569,10 @@ async fn resolve_aggregator_backend_address<S: Storage + Send + Sync>(
     None
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is the axum error Response the handler returns as-is"
+)]
 pub async fn resolve_aggregator_target(
     state: &Arc<ApiServerState>,
     group: &str,
@@ -580,6 +584,10 @@ pub async fn resolve_aggregator_target(
 /// Storage-only flavour of [`resolve_aggregator_target`] — exposed for
 /// integration tests that want to exercise the resolver without spinning up
 /// the whole `ApiServerState`.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is the axum error Response the handler returns as-is"
+)]
 pub async fn resolve_aggregator_target_with_storage<S: Storage + Send + Sync>(
     storage: &S,
     group: &str,
