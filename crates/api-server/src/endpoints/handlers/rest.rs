@@ -11,11 +11,9 @@ use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Decision, RequestAttributes};
 use rusternetes_common::dump::decode_request_body;
 use rusternetes_common::{Error, Result};
-use rusternetes_storage::StorageBackend;
 use serde::Serialize;
 
-use crate::registry::generic::Store;
-use crate::registry::rest::{Object, RequestContext};
+use crate::registry::rest::{Object, RequestContext, RestStorage};
 use crate::ssa::{ApplyError, ApplyOptions, ApplyOutcome};
 use crate::state::ApiServerState;
 
@@ -37,8 +35,9 @@ pub struct RequestScope<T: Object> {
     pub resource: GroupVersionResource,
     /// `Subresource`: e.g. `status`, or `None` for the resource itself.
     pub subresource: Option<&'static str>,
-    /// The `rest.Storage` behind the endpoints.
-    pub store: Store<T, StorageBackend>,
+    /// The `rest.Storage` behind the endpoints: a Store, or a subresource
+    /// REST over one.
+    pub store: Box<dyn RestStorage<T>>,
     /// Server-side apply, when the resource supports it.
     pub apply: Option<ApplyFn<T>>,
     /// What decoding a request body does beyond the field mapping: the
@@ -68,7 +67,7 @@ impl<T: Object> RequestScope<T> {
     }
 
     pub(super) fn namespace_scoped(&self) -> bool {
-        self.store.create_strategy.namespace_scoped()
+        self.store.namespace_scoped()
     }
 }
 
@@ -211,4 +210,35 @@ pub(super) fn respond<B: Serialize>(
         }
     }
     (status, headers, Json(body)).into_response()
+}
+
+/// The serializer choice of `transformResponseObject`
+/// (endpoints/handlers/response.go): a client that negotiates
+/// `application/vnd.kubernetes.protobuf` gets the object in the protobuf
+/// envelope instead of JSON. Only successful responses are re-encoded; an
+/// error Status stays JSON, as every rusternetes error does today.
+pub async fn negotiate(headers: &HeaderMap, response: Response) -> Response {
+    use crate::response::{encode_native_or_wrapped, negotiate_content_type, ContentType};
+
+    if negotiate_content_type(headers) != ContentType::Protobuf || !response.status().is_success() {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let Ok(json) = axum::body::to_bytes(body, usize::MAX).await else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to read the response",
+        )
+            .into_response();
+    };
+    let type_meta: serde_json::Value = serde_json::from_slice(&json).unwrap_or_default();
+    let api_version = type_meta["apiVersion"].as_str().unwrap_or_default();
+    let kind = type_meta["kind"].as_str().unwrap_or_default();
+    let bytes = encode_native_or_wrapped(&json, api_version, kind);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(ContentType::Protobuf.mime_type()),
+    );
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(bytes))
 }

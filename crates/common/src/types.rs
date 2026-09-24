@@ -571,6 +571,103 @@ pub struct LabelSelectorRequirement {
 }
 
 impl LabelSelector {
+    /// `metav1.LabelSelectorAsSelector(ps).String()`
+    /// (apimachinery/pkg/apis/meta/v1/helpers.go:36-74 and
+    /// labels/selector.go): each `matchLabels` entry becomes `k=v`, each
+    /// expression `k in (a,b)` / `k notin (a,b)` / `k` / `!k` with its values
+    /// sorted, and the requirements are sorted by key (`Selector.Add`) and
+    /// joined with `,`. An empty selector is `Everything()`, whose string is
+    /// empty. The error is `NewRequirement`'s aggregate for a requirement it
+    /// refuses.
+    pub fn as_selector_string(&self) -> std::result::Result<String, String> {
+        use crate::validation::field::{Error, Path};
+        use crate::validation::metav1::{is_qualified_name, is_valid_label_value};
+
+        let mut requirements: Vec<(String, String)> = Vec::new();
+        let mut errs = Vec::new();
+        // `NewRequirement` (labels/selector.go:185-225).
+        let mut require = |key: &str, op: &str, values: &[String]| {
+            let key_errs = is_qualified_name(key);
+            if !key_errs.is_empty() {
+                errs.push(Error::invalid(&Path::new("key"), key, key_errs.join("; ")));
+            }
+            let values_path = Path::new("values");
+            let count_error = match op {
+                "in" | "notin" if values.is_empty() => {
+                    Some("for 'in', 'notin' operators, values set can't be empty")
+                }
+                "=" if values.len() != 1 => {
+                    Some("exact-match compatibility requires one single value")
+                }
+                "" | "!" if !values.is_empty() => {
+                    Some("values set must be empty for exists and does not exist")
+                }
+                _ => None,
+            };
+            if let Some(msg) = count_error {
+                errs.push(Error::invalid(&values_path, values.to_vec(), msg));
+            }
+            for value in values {
+                let value_errs = is_valid_label_value(value);
+                if !value_errs.is_empty() {
+                    errs.push(Error::invalid(
+                        &values_path.key(key),
+                        value.as_str(),
+                        value_errs.join("; "),
+                    ));
+                }
+            }
+            // `Requirement.String` (labels/selector.go:344-395).
+            let mut sorted = values.to_vec();
+            sorted.sort();
+            let text = match op {
+                "=" => format!("{key}={}", sorted.join(",")),
+                "in" | "notin" => format!("{key} {op} ({})", sorted.join(",")),
+                "!" => format!("!{key}"),
+                _ => key.to_string(),
+            };
+            requirements.push((key.to_string(), text));
+        };
+
+        if let Some(labels) = &self.match_labels {
+            for (k, v) in labels {
+                require(k, "=", std::slice::from_ref(v));
+            }
+        }
+        for expr in self.match_expressions.iter().flatten() {
+            let op = match expr.operator.as_str() {
+                "In" => "in",
+                "NotIn" => "notin",
+                "Exists" => "",
+                "DoesNotExist" => "!",
+                other => {
+                    return Err(format!(
+                        "\"{other}\" is not a valid label selector operator"
+                    ))
+                }
+            };
+            require(&expr.key, op, expr.values.as_deref().unwrap_or_default());
+        }
+        match errs.len() {
+            0 => {}
+            // `ErrorList.ToAggregate().Error()`: one error bare, several in
+            // brackets.
+            1 => return Err(errs[0].to_string()),
+            _ => {
+                let all: Vec<String> = errs.iter().map(ToString::to_string).collect();
+                return Err(format!("[{}]", all.join(", ")));
+            }
+        }
+        // `sort.Sort(ByKey(...))` is not stable, but requirements with equal
+        // keys only arise from a selector repeating a key.
+        requirements.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(requirements
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join(","))
+    }
+
     /// Whether `labels` satisfies this selector (both `matchLabels` and
     /// `matchExpressions`). Mirrors upstream
     /// `apimachinery/pkg/apis/meta/v1.LabelSelectorAsSelector` +
