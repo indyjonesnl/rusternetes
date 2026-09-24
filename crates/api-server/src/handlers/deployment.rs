@@ -1,11 +1,11 @@
 //! Deployment endpoints.
 //!
-//! Writes, and the `/status` subresource, go through the generic endpoint
-//! handlers and [`crate::registry::generic::Store`] with the Deployment
-//! strategies ([`crate::registry::apps::deployment`]) — upstream's
+//! Writes, and the `/status` and `/scale` subresources, go through the
+//! generic endpoint handlers and [`crate::registry::generic::Store`] with the
+//! Deployment strategies ([`crate::registry::apps::deployment`]) — upstream's
 //! `pkg/registry/apps/deployment/storage` wired into
-//! `endpoints/handlers/{create,update,patch,delete}.go`. Reads (list, watch)
-//! and `/scale` are still served by their own handlers.
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
 
 use crate::endpoints::handlers::{self as endpoints, RequestScope};
 use crate::registry::apps::deployment;
@@ -20,7 +20,7 @@ use axum::{
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
-    resources::Deployment,
+    resources::{Deployment, Scale},
     List, Result,
 };
 use rusternetes_storage::{build_prefix, Storage};
@@ -50,6 +50,27 @@ fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestSc
         store: Box::new(store),
         apply: Some(crate::ssa::apply_legacy::<Deployment>),
         convert_to_internal: Some(deployment::convert_to_internal),
+    }
+}
+
+/// The `/scale` `RequestScope`: `autoscaling/v1` `Scale` served as
+/// `deployments/scale`, over `ScaleREST` (storage.go:80-83).
+fn scale_scope(state: &ApiServerState) -> RequestScope<Scale> {
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "autoscaling".to_string(),
+            version: "v1".to_string(),
+            kind: "Scale".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            resource: "deployments".to_string(),
+        },
+        subresource: Some("scale"),
+        store: Box::new(deployment::new_scale_rest(state.storage.clone())),
+        apply: Some(crate::ssa::apply_legacy::<Scale>),
+        convert_to_internal: None,
     }
 }
 
@@ -229,6 +250,69 @@ pub async fn patch_status(
         &body,
     )
     .await
+}
+
+/// GET `/scale`: `ScaleREST.Get` (storage.go:314-326).
+pub async fn get_scale(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let response = endpoints::get_resource(
+        &state,
+        &scale_scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await?;
+    Ok(endpoints::negotiate(&headers, response).await)
+}
+
+/// PUT `/scale`: `ScaleREST.Update` (storage.go:328-352).
+pub async fn update_scale(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    let response = endpoints::update_resource(
+        &state,
+        &scale_scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await?;
+    Ok(endpoints::negotiate(&headers, response).await)
+}
+
+/// PATCH `/scale`: a patch of the Scale into `ScaleREST.Update`.
+pub async fn patch_scale(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    let response = endpoints::patch_resource(
+        &state,
+        &scale_scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await?;
+    Ok(endpoints::negotiate(&headers, response).await)
 }
 
 pub async fn list(

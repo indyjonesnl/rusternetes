@@ -211,3 +211,34 @@ pub(super) fn respond<B: Serialize>(
     }
     (status, headers, Json(body)).into_response()
 }
+
+/// The serializer choice of `transformResponseObject`
+/// (endpoints/handlers/response.go): a client that negotiates
+/// `application/vnd.kubernetes.protobuf` gets the object in the protobuf
+/// envelope instead of JSON. Only successful responses are re-encoded; an
+/// error Status stays JSON, as every rusternetes error does today.
+pub async fn negotiate(headers: &HeaderMap, response: Response) -> Response {
+    use crate::response::{encode_native_or_wrapped, negotiate_content_type, ContentType};
+
+    if negotiate_content_type(headers) != ContentType::Protobuf || !response.status().is_success() {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let Ok(json) = axum::body::to_bytes(body, usize::MAX).await else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to read the response",
+        )
+            .into_response();
+    };
+    let type_meta: serde_json::Value = serde_json::from_slice(&json).unwrap_or_default();
+    let api_version = type_meta["apiVersion"].as_str().unwrap_or_default();
+    let kind = type_meta["kind"].as_str().unwrap_or_default();
+    let bytes = encode_native_or_wrapped(&json, api_version, kind);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(ContentType::Protobuf.mime_type()),
+    );
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(bytes))
+}
