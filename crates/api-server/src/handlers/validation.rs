@@ -557,10 +557,8 @@ where
 /// Field-validation mode resolved from the `?fieldValidation=` query param.
 ///
 /// Mirrors upstream k8s `apimachinery/pkg/runtime/serializer/json/json.go`
-/// validation directive parsing. Starting with Kubernetes 1.25 (`PR #107807`,
-/// promoted to GA in 1.27), the server-side default when the param is absent
-/// is `Strict`. Earlier clients that omit the param therefore now get the same
-/// behaviour as if they had asked for it explicitly.
+/// validation directive parsing. An absent directive means `Warn` (see
+/// [`FieldValidationMode::from_query`]); kubectl sends `Strict` explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldValidationMode {
     /// Reject unknown / duplicate fields with a 400 BadRequest.
@@ -573,15 +571,30 @@ pub enum FieldValidationMode {
 }
 
 impl FieldValidationMode {
-    /// Resolve the mode from the query param map, defaulting to `Strict` when
-    /// the param is absent. Unknown values fall back to `Strict` to match
-    /// upstream's conservative behaviour.
+    /// Resolve the mode from the query param map.
+    ///
+    /// An absent (or empty) directive is `Warn`, as upstream's
+    /// `fieldValidation` resolves it
+    /// (staging/src/k8s.io/apiserver/pkg/endpoints/handlers/rest.go:409-413):
+    ///
+    /// ```go
+    /// func fieldValidation(directive string) string {
+    ///     if directive == "" {
+    ///         return metav1.FieldValidationWarn
+    ///     }
+    ///     return directive
+    /// }
+    /// ```
+    ///
+    /// kubectl rejects unknown fields by default only because its own
+    /// `--validate` flag defaults to `strict` and sends `fieldValidation=Strict`;
+    /// a client that sends nothing gets warnings. Values other than the three
+    /// directives are rejected before decoding by `ValidateFieldValidation`;
+    /// here they are treated as `Strict`.
     pub fn from_query(params: &HashMap<String, String>) -> Self {
         match params.get("fieldValidation").map(|v| v.as_str()) {
-            Some("Warn") => Self::Warn,
+            None | Some("") | Some("Warn") => Self::Warn,
             Some("Ignore") => Self::Ignore,
-            // Strict, missing, or unknown values: default to Strict per
-            // K8s 1.25+ server-side default.
             _ => Self::Strict,
         }
     }
@@ -604,11 +617,11 @@ fn build_strict_decoding_message(unknown: &[String], duplicates: &[String]) -> S
 /// `?fieldValidation=` directive.
 ///
 /// Behaviour by mode (matches upstream k8s 1.35):
-/// - `Strict` (or absent param, since 1.25): unknown / duplicate fields are
+/// - `Strict`: unknown / duplicate fields are
 ///   rejected with `Error::BadRequest` → HTTP 400 reason=BadRequest. Message
 ///   format: `strict decoding error: unknown field "spec.foo", duplicate field
 ///   "spec.bar"`.
-/// - `Warn`: unknown fields are returned in the `Ok(Vec<String>)` so the
+/// - `Warn` (also an absent param): unknown fields are returned in the `Ok(Vec<String>)` so the
 ///   handler can emit one `Warning: 299 - "..."` response header per field.
 ///   Duplicate fields are NOT enforced in Warn mode (matches upstream — only
 ///   strict decoding splits on duplicates).
@@ -1258,9 +1271,11 @@ mod tests {
     }
 
     #[test]
-    fn test_strict_validation_default_is_strict() {
-        // K8s 1.25+ default: missing ?fieldValidation= behaves like
-        // ?fieldValidation=Strict, so unknown fields must be rejected.
+    fn test_strict_validation_default_is_warn() {
+        // Upstream fieldValidation("") returns Warn
+        // (staging/src/k8s.io/apiserver/pkg/endpoints/handlers/rest.go:409-413):
+        // a missing ?fieldValidation= must not reject, only warn. (kubectl
+        // sends Strict itself; that is a client default, not a server one.)
         #[derive(serde::Serialize, serde::Deserialize)]
         struct Simple {
             name: String,
@@ -1272,16 +1287,13 @@ mod tests {
         };
         let params = HashMap::new(); // no fieldValidation param
 
-        let result = validate_strict_fields(&params, body, &parsed);
+        let warnings = validate_strict_fields(&params, body, &parsed)
+            .expect("default mode must not reject unknown fields");
+        assert_eq!(warnings.len(), 1, "expected one warning: {:?}", warnings);
         assert!(
-            result.is_err(),
-            "default mode must reject unknown fields (K8s 1.25+ default is Strict)"
-        );
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("strict decoding error") && err_msg.contains("unknown field"),
-            "default rejection should match strict decoder format: {}",
-            err_msg
+            warnings[0].contains("unknown field"),
+            "warning should name the unknown field: {:?}",
+            warnings
         );
     }
 
@@ -1467,11 +1479,18 @@ mod tests {
     }
 
     #[test]
-    fn test_field_validation_mode_from_query_defaults_to_strict() {
+    fn test_field_validation_mode_from_query_defaults_to_warn() {
         let empty = HashMap::new();
         assert_eq!(
             FieldValidationMode::from_query(&empty),
-            FieldValidationMode::Strict
+            FieldValidationMode::Warn
+        );
+
+        let mut blank = HashMap::new();
+        blank.insert("fieldValidation".to_string(), String::new());
+        assert_eq!(
+            FieldValidationMode::from_query(&blank),
+            FieldValidationMode::Warn
         );
 
         let mut warn = HashMap::new();

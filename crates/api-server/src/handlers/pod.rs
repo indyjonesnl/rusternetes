@@ -74,7 +74,7 @@ pub async fn create(
     body: Bytes,
 ) -> Result<axum::response::Response> {
     // Parse the body manually so we can do strict field validation against the
-    // raw bytes. In strict mode (now the K8s 1.25+ default) serde_json will
+    // raw bytes. In strict mode serde_json will
     // reject duplicate keys outright — fall back to a lenient Value parse so
     // validate_strict_fields can report the duplicate in the canonical
     // `strict decoding error: duplicate field "..."` shape rather than a raw
