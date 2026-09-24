@@ -44,11 +44,14 @@ pub enum CriError {
     },
 
     /// A gRPC call returned an error status.
+    ///
+    /// Boxed: `tonic::Status` is large enough that carrying it inline trips
+    /// clippy `result_large_err` on every `Result<_, CriError>`.
     #[error("CRI rpc {rpc} failed: {source}")]
     Rpc {
         rpc: &'static str,
         #[source]
-        source: tonic::Status,
+        source: Box<tonic::Status>,
     },
 
     /// The socket path was not a valid endpoint.
@@ -139,7 +142,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "Version",
-                source,
+                source: Box::new(source),
             })?;
         Ok(response.into_inner())
     }
@@ -173,7 +176,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "PullImage",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner().image_ref)
     }
@@ -193,7 +196,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ImageStatus",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner().image)
     }
@@ -219,7 +222,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "RunPodSandbox",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner().pod_sandbox_id)
     }
@@ -234,7 +237,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "StopPodSandbox",
-                source,
+                source: Box::new(source),
             })?;
         Ok(())
     }
@@ -249,7 +252,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "RemovePodSandbox",
-                source,
+                source: Box::new(source),
             })?;
         Ok(())
     }
@@ -270,7 +273,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "PodSandboxStatus",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner())
     }
@@ -296,7 +299,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "CreateContainer",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner().container_id)
     }
@@ -311,7 +314,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "StartContainer",
-                source,
+                source: Box::new(source),
             })?;
         Ok(())
     }
@@ -328,7 +331,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "StopContainer",
-                source,
+                source: Box::new(source),
             })?;
         Ok(())
     }
@@ -343,7 +346,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "RemoveContainer",
-                source,
+                source: Box::new(source),
             })?;
         Ok(())
     }
@@ -365,7 +368,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "UpdateContainerResources",
-                source,
+                source: Box::new(source),
             })?;
         Ok(())
     }
@@ -386,7 +389,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ContainerStatus",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner())
     }
@@ -405,7 +408,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ListContainers",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner().containers)
     }
@@ -422,7 +425,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ListPodSandbox",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner().items)
     }
@@ -437,7 +440,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "Status",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner())
     }
@@ -458,7 +461,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ContainerStats",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner().stats)
     }
@@ -476,7 +479,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ListContainerStats",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner().stats)
     }
@@ -503,7 +506,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ExecSync",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner())
     }
@@ -517,7 +520,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "Exec",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner().url)
     }
@@ -530,7 +533,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "Attach",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner().url)
     }
@@ -547,7 +550,7 @@ impl CriClient {
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "PortForward",
-                source,
+                source: Box::new(source),
             })?;
         Ok(resp.into_inner().url)
     }

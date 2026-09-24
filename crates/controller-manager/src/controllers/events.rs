@@ -115,7 +115,7 @@ impl<S: Storage + 'static> EventsController<S> {
             if let Err(e) = self.reconcile_pod_events(&pod).await {
                 eprintln!(
                     "Error reconciling events for pod {}: {}",
-                    &pod.metadata.name, e
+                    pod.metadata.name, e
                 );
             }
         }

@@ -318,14 +318,11 @@ fn resource_error_status(msg: &str, suffix: &str) -> (String, Option<crate::type
 /// Fallback for messages `resource_identity` cannot parse.
 #[cfg(feature = "axum-support")]
 fn extract_resource_details(msg: &str) -> Option<crate::types::StatusDetails> {
-    let name = if let Some(path) = msg.split(": ").last() {
-        if path.starts_with("/registry/") {
-            path.rsplit('/').next().unwrap_or(path).to_string()
-        } else {
-            path.to_string()
-        }
+    let path = msg.split(": ").last()?;
+    let name = if path.starts_with("/registry/") {
+        path.rsplit('/').next().unwrap_or(path).to_string()
     } else {
-        return None;
+        path.to_string()
     };
 
     if name.is_empty() {

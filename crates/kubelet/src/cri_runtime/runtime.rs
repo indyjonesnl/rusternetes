@@ -2861,7 +2861,7 @@ mod tests {
             \"637489deadebe17e8bc434d0bb3bffb2d7fdc1c83b42055b4cc20fddadc93c78\"";
         let err = CriError::Rpc {
             rpc: "RunPodSandbox",
-            source: tonic::Status::failed_precondition(msg),
+            source: Box::new(tonic::Status::failed_precondition(msg)),
         };
         assert_eq!(
             reserved_sandbox_id(&err).as_deref(),
@@ -2871,7 +2871,7 @@ mod tests {
         // An unrelated RPC error must not match (we'd wrongly remove a sandbox).
         let other = CriError::Rpc {
             rpc: "RunPodSandbox",
-            source: tonic::Status::unavailable("connection refused"),
+            source: Box::new(tonic::Status::unavailable("connection refused")),
         };
         assert_eq!(reserved_sandbox_id(&other), None);
     }

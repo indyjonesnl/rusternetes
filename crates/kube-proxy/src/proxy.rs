@@ -65,7 +65,7 @@ impl<S: Storage> KubeProxy<S> {
             .into_iter()
             .filter_map(|ep| {
                 let namespace = ep.metadata.namespace.as_ref()?;
-                let key = format!("{}/{}", namespace, &ep.metadata.name);
+                let key = format!("{}/{}", namespace, ep.metadata.name);
                 Some((key, ep))
             })
             .collect();
