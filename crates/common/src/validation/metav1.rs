@@ -716,6 +716,61 @@ pub fn validate_ignore_store_read_error(fld_path: &Path, options: &DeleteOptions
     errs
 }
 
+/// Subset of upstream `metav1.CreateOptions` exercised by
+/// [`validate_create_options`].
+#[derive(Debug, Clone, Default)]
+pub struct CreateOptions {
+    pub field_manager: Option<String>,
+    pub dry_run: Option<Vec<String>>,
+    pub field_validation: Option<String>,
+}
+
+/// Upstream `ValidateCreateOptions`
+/// (`staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/validation/validation.go:174-180`).
+pub fn validate_create_options(options: &CreateOptions) -> ErrorList {
+    validate_write_options(
+        options.field_manager.as_deref(),
+        options.dry_run.as_deref(),
+        options.field_validation.as_deref(),
+    )
+}
+
+/// Subset of upstream `metav1.UpdateOptions` exercised by
+/// [`validate_update_options`].
+#[derive(Debug, Clone, Default)]
+pub struct UpdateOptions {
+    pub field_manager: Option<String>,
+    pub dry_run: Option<Vec<String>>,
+    pub field_validation: Option<String>,
+}
+
+/// Upstream `ValidateUpdateOptions` (validation.go:182-188).
+pub fn validate_update_options(options: &UpdateOptions) -> ErrorList {
+    validate_write_options(
+        options.field_manager.as_deref(),
+        options.dry_run.as_deref(),
+        options.field_validation.as_deref(),
+    )
+}
+
+/// The body `ValidateCreateOptions` and `ValidateUpdateOptions` share.
+fn validate_write_options(
+    field_manager: Option<&str>,
+    dry_run: Option<&[String]>,
+    field_validation: Option<&str>,
+) -> ErrorList {
+    let mut errs = validate_field_manager(field_manager.unwrap_or(""), &Path::new("fieldManager"));
+    errs.extend(validate_dry_run(
+        &Path::new("dryRun"),
+        dry_run.unwrap_or(&[]),
+    ));
+    errs.extend(validate_field_validation(
+        &Path::new("fieldValidation"),
+        field_validation.unwrap_or(""),
+    ));
+    errs
+}
+
 /// Apply-patch content types upstream uses. Exposed so callers passing a
 /// concrete `Content-Type` header can match against the same constants.
 pub const APPLY_YAML_PATCH_TYPE: &str = "application/apply-patch+yaml";

@@ -2,13 +2,18 @@
 //! `pkg/apis/core/validation/validation.go::ValidateConfigMap` and
 //! `ValidateConfigMapUpdate` (release-1.35).
 //!
-//! Scope: key validity (`IsConfigMapKey`) for `data` and `binaryData`, the
-//! cross-bag duplicate-key check, the `MaxSecretSize` (1 MiB) total-size cap,
-//! and the update-time immutability enforcement (`immutable: true` freezes
+//! Scope: object metadata (`ValidateObjectMeta` with `ValidateConfigMapName`
+//! == `NameIsDNSSubdomain`, and `ValidateObjectMetaUpdate` on update), key
+//! validity (`IsConfigMapKey`) for `data` and `binaryData`, the cross-bag
+//! duplicate-key check, the `MaxSecretSize` (1 MiB) total-size cap, and the
+//! update-time immutability enforcement (`immutable: true` freezes
 //! `immutable`, `data`, and `binaryData`).
 
 use crate::resources::ConfigMap;
 use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
+};
 
 /// Upstream `core.MaxSecretSize` (`pkg/apis/core/types.go`): the combined byte
 /// length of a ConfigMap's `data` + `binaryData` (and a Secret's `data`) values
@@ -50,9 +55,17 @@ pub fn config_map_key_errors(key: &str) -> Vec<String> {
     errs
 }
 
-/// Validate a `ConfigMap`. Mirrors the core of upstream `ValidateConfigMap`.
+/// Validate a `ConfigMap`. Port of upstream `ValidateConfigMap`
+/// (`pkg/apis/core/validation/validation.go:7758-7787`).
 pub fn validate_config_map(cfg: &ConfigMap) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
+    // `ValidateObjectMeta(&cfg.ObjectMeta, true, ValidateConfigMapName, ...)`.
+    // ValidateConfigMapName == apimachineryvalidation.NameIsDNSSubdomain.
+    let mut errs = validate_object_meta(
+        &cfg.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
     let mut total_size: usize = 0;
 
     if let Some(data) = &cfg.data {
@@ -94,15 +107,14 @@ pub fn validate_config_map(cfg: &ConfigMap) -> ErrorList {
     errs
 }
 
-/// Validate a `ConfigMap` update. Mirrors upstream `ValidateConfigMapUpdate`:
-/// when the **old** object is immutable (`immutable: true`), the `immutable`
-/// flag, `data`, and `binaryData` may not change; then the full
+/// Validate a `ConfigMap` update. Port of upstream `ValidateConfigMapUpdate`
+/// (`pkg/apis/core/validation/validation.go:7790-7808`): the object-meta
+/// update rules; when the **old** object is immutable (`immutable: true`), the
+/// `immutable` flag, `data`, and `binaryData` may not change; then the full
 /// `ValidateConfigMap` checks run against the new object.
-///
-/// ObjectMeta-update validation (`ValidateObjectMetaUpdate`) is enforced by the
-/// generic api-server update path, so it is not re-run here.
 pub fn validate_config_map_update(old: &ConfigMap, new: &ConfigMap) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
+    let mut errs =
+        validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
 
     if old.immutable == Some(true) {
         if new.immutable != Some(true) {
@@ -140,6 +152,8 @@ mod tests {
             type_meta: Default::default(),
             metadata: crate::types::ObjectMeta {
                 name: "cm".to_string(),
+                namespace: Some("default".to_string()),
+                resource_version: Some("1".to_string()),
                 ..Default::default()
             },
             data: None,
@@ -305,5 +319,20 @@ mod tests {
         labels.insert("x".to_string(), "y".to_string());
         new.metadata.labels = Some(labels);
         assert!(validate_config_map_update(&old, &new).is_empty());
+    }
+
+    // Upstream `ValidateConfigMapUpdate` starts with `ValidateObjectMetaUpdate`.
+    #[test]
+    fn config_map_update_validates_object_meta() {
+        let old = cm();
+        let mut new = cm();
+        new.metadata.name = "renamed".to_string();
+        new.metadata.resource_version = None;
+        let errs = validate_config_map_update(&old, &new);
+        assert!(errs.iter().any(|e| e.field == "metadata.name"), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.field == "metadata.resourceVersion"),
+            "{errs:?}"
+        );
     }
 }
