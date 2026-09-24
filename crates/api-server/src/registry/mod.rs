@@ -21,7 +21,6 @@
 
 pub mod apps;
 pub mod core;
-pub mod equality;
 pub mod generic;
 pub mod names;
 pub mod rest;
