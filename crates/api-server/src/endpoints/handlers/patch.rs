@@ -25,8 +25,8 @@ use super::rest::{
 use crate::patch::{apply_patch, PatchType};
 use crate::registry::generic;
 use crate::registry::rest::{
-    ensure_object_namespace_matches_request_namespace, expected_namespace_for_scope,
-    DefaultUpdatedObjectInfo, Object, RequestContext, TransformFunc,
+    conflict, ensure_object_namespace_matches_request_namespace, expected_namespace_for_scope,
+    not_found, DefaultUpdatedObjectInfo, Object, RequestContext, TransformFunc,
 };
 use crate::ssa::{decode_apply_body, ApplyOptions, ApplyOutcome};
 use crate::state::ApiServerState;
@@ -282,7 +282,9 @@ impl<T: Object> TransformFunc<T> for Patcher<'_, T> {
                 self.apply(*apply, options, current)?
             }
             // jsonPatcher / smpPatcher.createNewObject: nothing to patch.
-            (Mechanism::Json(_), None) => return Err(self.scope.store.not_found(self.name)),
+            (Mechanism::Json(_), None) => {
+                return Err(not_found(self.scope.store.qualified_resource(), self.name))
+            }
             (Mechanism::Json(patch_type), Some(current)) => {
                 self.patch_current(ctx, patch_type, current)?
             }
@@ -294,7 +296,8 @@ impl<T: Object> TransformFunc<T> for Patcher<'_, T> {
 
         let uid = &obj.metadata().uid;
         if !uid.is_empty() && current.is_none() {
-            return Err(self.scope.store.conflict(
+            return Err(conflict(
+                self.scope.store.qualified_resource(),
                 self.name,
                 format!(
                     "uid mismatch: the provided object specified uid {uid}, and no existing object was found"

@@ -9,7 +9,6 @@ use rusternetes_common::auth::UserInfo;
 use rusternetes_common::deletion::DeleteOptions;
 use rusternetes_common::validation::metav1::validate_delete_options;
 use rusternetes_common::{Error, List, Result, Status};
-use rusternetes_storage::{build_prefix, Storage};
 
 use super::admission::{Admission, DeleteValidation};
 use super::rest::{authorize, dry_run_param, is_dry_run, respond, RequestScope};
@@ -140,10 +139,6 @@ pub async fn delete_collection<T: Object>(
     let options = decode_delete_options(params, body)?;
     let ctx = RequestContext::new(namespace);
 
-    let prefix = build_prefix(&scope.store.storage_prefix, ctx.namespace.as_deref());
-    let mut items: Vec<T> = scope.store.storage.list(&prefix).await?;
-    crate::handlers::filtering::apply_selectors(&mut items, params)?;
-
     let admission = Admission {
         state,
         kind: &scope.kind,
@@ -158,7 +153,7 @@ pub async fn delete_collection<T: Object>(
     };
     let items = scope
         .store
-        .delete_collection(&ctx, items, Some(&validation), &options)
+        .delete_collection(&ctx, Some(&validation), &options, params)
         .await?;
 
     let list = List::new(

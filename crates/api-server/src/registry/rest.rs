@@ -644,6 +644,97 @@ pub fn before_delete<T: Object>(
     })
 }
 
+/// `rest.Storage` together with the verb interfaces a REST endpoint may also
+/// implement — `Getter`, `Creater`, `Updater`, `GracefulDeleter`,
+/// `CollectionDeleter` (rest/rest.go). The endpoint handlers only call these,
+/// never a concrete store, which is what lets a subresource such as
+/// `ScaleREST` serve one type over another's store. Go discovers the verbs by
+/// type assertion and the installer registers only those; here a verb's
+/// default answers "not supported", and the router registers only the verbs a
+/// storage serves.
+#[async_trait]
+pub trait RestStorage<T: Object>: Send + Sync {
+    /// The resource named in this storage's errors.
+    fn qualified_resource(&self) -> &GroupResource;
+
+    /// `NamespaceScoped` of the create strategy.
+    fn namespace_scoped(&self) -> bool;
+
+    /// `rest.Getter`.
+    async fn get(&self, ctx: &RequestContext, name: &str) -> Result<T>;
+
+    /// `rest.Creater`.
+    async fn create(
+        &self,
+        _ctx: &RequestContext,
+        _obj: T,
+        _create_validation: Option<&dyn ValidateObject<T>>,
+        _options: &crate::registry::generic::CreateOptions,
+    ) -> Result<T> {
+        Err(method_not_supported(self.qualified_resource(), "create"))
+    }
+
+    /// `rest.Updater`.
+    #[allow(clippy::too_many_arguments)]
+    async fn update(
+        &self,
+        _ctx: &RequestContext,
+        _name: &str,
+        _obj_info: &dyn UpdatedObjectInfo<T>,
+        _create_validation: Option<&dyn ValidateObject<T>>,
+        _update_validation: Option<&dyn ValidateObjectUpdate<T>>,
+        _force_allow_create: bool,
+        _options: &crate::registry::generic::UpdateOptions,
+    ) -> Result<(T, bool)> {
+        Err(method_not_supported(self.qualified_resource(), "update"))
+    }
+
+    /// `rest.GracefulDeleter`.
+    async fn delete(
+        &self,
+        _ctx: &RequestContext,
+        _name: &str,
+        _delete_validation: Option<&dyn ValidateObject<T>>,
+        _options: DeleteOptions,
+    ) -> Result<(crate::registry::generic::Deleted<T>, bool)> {
+        Err(method_not_supported(self.qualified_resource(), "delete"))
+    }
+
+    /// `rest.CollectionDeleter`: `list_options` are the request's selectors.
+    async fn delete_collection(
+        &self,
+        _ctx: &RequestContext,
+        _delete_validation: Option<&dyn ValidateObject<T>>,
+        _options: &DeleteOptions,
+        _list_options: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<T>> {
+        Err(method_not_supported(
+            self.qualified_resource(),
+            "deletecollection",
+        ))
+    }
+}
+
+/// `errors.NewMethodNotSupported(qualifiedResource, action)`. Unreachable
+/// through the router, which registers only the verbs a storage serves.
+fn method_not_supported(resource: &GroupResource, action: &str) -> Error {
+    Error::Internal(format!(
+        "{action} is not supported on resources of kind \"{resource}\""
+    ))
+}
+
+/// `errors.NewNotFound(qualifiedResource, name)`.
+pub fn not_found(resource: &GroupResource, name: &str) -> Error {
+    Error::NotFound(format!("{resource} \"{name}\" not found"))
+}
+
+/// `errors.NewConflict(qualifiedResource, name, err)` (errors.go:232-244).
+pub fn conflict(resource: &GroupResource, name: &str, reason: impl std::fmt::Display) -> Error {
+    Error::Conflict(format!(
+        "Operation cannot be fulfilled on {resource} \"{name}\": {reason}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
