@@ -35,6 +35,7 @@ pub async fn update_resource<T: Object>(
         user,
         "update",
         &scope.resource,
+        scope.subresource,
         namespace,
         Some(name),
     )
@@ -68,6 +69,7 @@ pub async fn update_resource<T: Object>(
         state,
         kind: &scope.kind,
         resource: &scope.resource,
+        subresource: scope.subresource,
         namespace,
         user,
         dry_run,

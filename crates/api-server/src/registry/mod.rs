@@ -19,6 +19,7 @@
 //! instead, and they drifted (#1990). Resources move onto this Store one at a
 //! time; each migration deletes its bespoke handler code.
 
+pub mod apps;
 pub mod core;
 pub mod generic;
 pub mod names;

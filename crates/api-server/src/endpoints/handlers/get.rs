@@ -20,7 +20,16 @@ pub async fn get_resource<T: Object>(
     namespace: Option<&str>,
     name: &str,
 ) -> Result<Response> {
-    authorize(state, user, "get", &scope.resource, namespace, Some(name)).await?;
+    authorize(
+        state,
+        user,
+        "get",
+        &scope.resource,
+        scope.subresource,
+        namespace,
+        Some(name),
+    )
+    .await?;
     let ctx = RequestContext::new(namespace);
     let obj = scope.store.get(&ctx, name).await?;
     Ok(respond(StatusCode::OK, &obj, &ctx))

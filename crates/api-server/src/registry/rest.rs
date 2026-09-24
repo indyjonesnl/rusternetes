@@ -149,9 +149,6 @@ pub trait RestUpdateStrategy<T>: NamespaceScopedStrategy + Send + Sync {
 /// `rest.GarbageCollectionPolicy` (rest/delete.go:40-47).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GarbageCollectionPolicy {
-    // No strategy on the Store returns it yet; the ReplicaSet-family
-    // strategies will.
-    #[allow(dead_code)]
     DeleteDependents,
     OrphanDependents,
     /// The resource does not support garbage collection: DELETE never adds a
