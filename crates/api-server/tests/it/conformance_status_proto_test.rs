@@ -441,20 +441,34 @@ async fn status_422_invalid_pod_round_trips_causes_as_native_protobuf() {
     );
 }
 
-/// 200 Status responses (e.g. `deleteCollection` success) must also be
-/// re-encoded as native protobuf when the client negotiates it. Upstream
-/// `responsewriters/writers.go::SerializeObject` encodes any `runtime.Object`
-/// — Status included — as proto when negotiated, regardless of HTTP status.
-/// Trigger: `DELETE /apis/apps/v1/namespaces/default/statefulsets` which
-/// returns the K8s-canonical `{kind:Status, status:Success, code:200}`.
+/// 200 Status responses must also be re-encoded as native protobuf when the
+/// client negotiates it. Upstream `responsewriters/writers.go::SerializeObject`
+/// encodes any `runtime.Object` — Status included — as proto when negotiated,
+/// regardless of HTTP status.
+///
+/// Trigger: deleting a ConfigMap, which has no finalizers or grace period, so
+/// `Store.Delete` answers `finalizeDelete`'s `{kind:Status, status:Success,
+/// code:200}` (registry/store.go:1386-1411). A `deleteCollection` is not a
+/// Status trigger: `Store.DeleteCollection` returns the list of deleted
+/// objects (store.go:1237-1384).
 #[tokio::test]
 async fn status_200_success_returns_native_protobuf_when_accept_is_protobuf() {
     let router = spawn_router();
+    let (created, _) = router
+        .post(
+            "/api/v1/namespaces/default/configmaps",
+            &serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {"name": "status-proto"}
+            }),
+        )
+        .await;
+    assert_eq!(created, StatusCode::CREATED);
 
     let (status, content_type, bytes) = send_accept(
         &router,
         "DELETE",
-        "/apis/apps/v1/namespaces/default/statefulsets",
+        "/api/v1/namespaces/default/configmaps/status-proto",
         "application/vnd.kubernetes.protobuf",
         None,
         None,
@@ -464,7 +478,7 @@ async fn status_200_success_returns_native_protobuf_when_accept_is_protobuf() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "deleteCollection (empty) must return 200; got {status} body={:?}",
+        "delete must return 200; got {status} body={:?}",
         String::from_utf8_lossy(&bytes),
     );
     assert!(
@@ -489,7 +503,7 @@ async fn status_200_success_returns_native_protobuf_when_accept_is_protobuf() {
     assert_eq!(
         decoded.get("status").and_then(Value::as_str),
         Some("Success"),
-        "Status.status must be 'Success' for a successful deleteCollection; got {decoded}",
+        "Status.status must be 'Success' for a successful delete; got {decoded}",
     );
     assert_eq!(
         decoded.get("code").and_then(Value::as_i64),

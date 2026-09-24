@@ -145,6 +145,7 @@ pub fn new_store(storage: Arc<StorageBackend>) -> Store<ReplicaSet, StorageBacke
         GroupResource::new("apps", "replicasets"),
         Arc::new(Strategy),
     )
+    .with_decode_defaulter(convert_to_internal)
 }
 
 /// The `/status` store: the ReplicaSet store updating with
