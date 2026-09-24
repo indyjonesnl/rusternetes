@@ -11,6 +11,7 @@ mod bootstrap;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
 mod conversion;
 mod dynamic_routes;
+mod endpoints;
 #[allow(dead_code)]
 mod flow_control;
 mod gnostic;
@@ -21,8 +22,6 @@ mod openapi;
 mod patch;
 mod peer_cert_acceptor;
 mod prometheus_client;
-// No resource is served through the registry yet; ConfigMap is first (#1990).
-#[allow(dead_code, unused_imports)]
 mod registry;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]

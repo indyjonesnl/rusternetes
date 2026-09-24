@@ -80,10 +80,17 @@ impl RequestContext {
         }
     }
 
-    /// `warning.AddWarning(ctx, "", w)`.
+    /// `warning.AddWarning(ctx, "", w)`. Like upstream's recorder
+    /// (endpoints/filters/warning.go:69-92) an empty warning is dropped and a
+    /// repeated one is recorded once.
     pub fn add_warning(&self, warning: String) {
+        if warning.is_empty() {
+            return;
+        }
         if let Ok(mut w) = self.warnings.lock() {
-            w.push(warning);
+            if !w.contains(&warning) {
+                w.push(warning);
+            }
         }
     }
 
@@ -142,6 +149,9 @@ pub trait RestUpdateStrategy<T>: NamespaceScopedStrategy + Send + Sync {
 /// `rest.GarbageCollectionPolicy` (rest/delete.go:40-47).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GarbageCollectionPolicy {
+    // No strategy on the Store returns it yet; the ReplicaSet-family
+    // strategies will.
+    #[allow(dead_code)]
     DeleteDependents,
     OrphanDependents,
     /// The resource does not support garbage collection: DELETE never adds a
@@ -432,19 +442,22 @@ pub trait UpdatedObjectInfo<T>: Send + Sync {
 }
 
 /// `rest.DefaultUpdatedObjectInfo` (rest/update.go:173-228).
-pub struct DefaultUpdatedObjectInfo<T> {
+///
+/// The transformers may borrow request state (the admission chain, the
+/// patch body) for `'a`, as upstream's closures capture it.
+pub struct DefaultUpdatedObjectInfo<'a, T> {
     obj: Option<T>,
-    transformers: Vec<Box<dyn TransformFunc<T>>>,
+    transformers: Vec<Box<dyn TransformFunc<T> + 'a>>,
 }
 
-impl<T> DefaultUpdatedObjectInfo<T> {
-    pub fn new(obj: Option<T>, transformers: Vec<Box<dyn TransformFunc<T>>>) -> Self {
+impl<'a, T> DefaultUpdatedObjectInfo<'a, T> {
+    pub fn new(obj: Option<T>, transformers: Vec<Box<dyn TransformFunc<T> + 'a>>) -> Self {
         Self { obj, transformers }
     }
 }
 
 #[async_trait]
-impl<T: Object> UpdatedObjectInfo<T> for DefaultUpdatedObjectInfo<T> {
+impl<T: Object> UpdatedObjectInfo<T> for DefaultUpdatedObjectInfo<'_, T> {
     /// `defaultUpdatedObjectInfo.Preconditions` (update.go:188-203): the UID of
     /// the supplied object, if it has one.
     fn preconditions(&self) -> Option<Preconditions> {

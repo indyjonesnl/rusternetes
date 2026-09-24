@@ -1,197 +1,92 @@
+//! ConfigMap endpoints.
+//!
+//! Writes go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the ConfigMap strategy
+//! ([`crate::registry::core::configmap`]) — upstream's
+//! `pkg/registry/core/configmap/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Reads (get, list,
+//! watch) are still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
-    Extension, Json,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
+    Extension,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
-    admission::{GroupVersionKind, Operation},
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::ConfigMap,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+/// The ConfigMap `RequestScope`: `v1` `ConfigMap` served as `configmaps`,
+/// backed by `configmap.NewREST`'s store.
+fn scope(state: &ApiServerState) -> RequestScope<ConfigMap> {
+    RequestScope {
+        kind: GroupVersionKind {
+            group: String::new(),
+            version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "configmaps".to_string(),
+        },
+        store: crate::registry::core::configmap::new_store(state.storage.clone()),
+        apply: Some(crate::ssa::apply_configmap),
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut configmap): DumpingJson<ConfigMap>,
-) -> Result<(StatusCode, Json<ConfigMap>)> {
-    info!(
-        "Creating configmap: {} in namespace: {}",
-        configmap.metadata.name, namespace
-    );
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &configmap.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Validate resource name
-    crate::handlers::validation::validate_resource_name(&configmap.metadata.name)?;
-
-    // Validate ConfigMap data/binaryData keys (upstream ValidateConfigMap).
-    let errs = rusternetes_common::validation::configmap::validate_config_map(&configmap);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "configmaps")
-        .with_api_group("")
-        .with_namespace(&namespace);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Ensure namespace is set from the URL path
-    configmap.metadata.namespace = Some(namespace.clone());
-
-    // Enrich metadata with system fields
-    configmap.metadata.ensure_uid();
-    configmap.metadata.ensure_creation_timestamp();
-
-    // Run ValidatingAdmissionPolicy checks
-    let gvk = GroupVersionKind {
-        group: "".to_string(),
-        version: "v1".to_string(),
-        kind: "ConfigMap".to_string(),
-    };
-    let cm_value = serde_json::to_value(&configmap).ok();
-    state
-        .webhook_manager
-        .run_validating_admission_policies_ext(
-            &Operation::Create,
-            &gvk,
-            cm_value.as_ref(),
-            None,
-            Some("configmaps"),
-            Some(&namespace),
-        )
-        .await?;
-
-    // Run admission webhooks (mutating + validating)
-    {
-        let gvr = rusternetes_common::admission::GroupVersionResource {
-            group: "".to_string(),
-            version: "v1".to_string(),
-            resource: "configmaps".to_string(),
-        };
-        let user = &user_for_webhook;
-        let user_info = rusternetes_common::admission::UserInfo {
-            username: user.username.clone(),
-            uid: user.uid.clone(),
-            groups: user.groups.clone(),
-        };
-        let cm_val = serde_json::to_value(&configmap).ok();
-        // Run mutating webhooks
-        let (_response, mutated_obj) = state
-            .webhook_manager
-            .run_mutating_webhooks_with_dryrun(
-                &rusternetes_common::admission::Operation::Create,
-                &gvk,
-                &gvr,
-                Some(&namespace),
-                &configmap.metadata.name,
-                cm_val.clone(),
-                None,
-                &user_info,
-                is_dry_run,
-            )
-            .await?;
-        // Check if the mutating webhook DENIED the request.
-        // K8s mutating webhooks CAN deny — the denial must be enforced.
-        if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = &_response {
-            return Err(rusternetes_common::Error::Forbidden(format!(
-                "admission webhook denied the request: {}",
-                reason
-            )));
-        }
-        if let Some(mutated) = mutated_obj {
-            if let Ok(m) = serde_json::from_value::<ConfigMap>(mutated) {
-                configmap = m;
-            }
-        }
-        // Run validating webhooks
-        if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
-            .webhook_manager
-            .run_validating_webhooks_with_dryrun(
-                &rusternetes_common::admission::Operation::Create,
-                &gvk,
-                &gvr,
-                Some(&namespace),
-                &configmap.metadata.name,
-                serde_json::to_value(&configmap).ok(),
-                None,
-                &user_info,
-                is_dry_run,
-            )
-            .await?
-        {
-            return Err(rusternetes_common::Error::Forbidden(format!(
-                "admission webhook denied the request: {}",
-                reason
-            )));
-        }
-    }
-
-    let key = build_key("configmaps", Some(&namespace), &configmap.metadata.name);
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: ConfigMap {}/{} validated successfully (not created)",
-            namespace, configmap.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(configmap)));
-    }
-
-    let created = state.storage.create(&key, &configmap).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<ConfigMap>> {
-    debug!("Getting configmap: {} in namespace: {}", name, namespace);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "configmaps")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("configmaps", Some(&namespace), &name);
-    let configmap = state.storage.get(&key).await?;
-
-    Ok(Json(configmap))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn update(
@@ -199,263 +94,76 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut configmap): DumpingJson<ConfigMap>,
-) -> Result<Json<ConfigMap>> {
-    info!("Updating configmap: {} in namespace: {}", name, namespace);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "configmaps")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("configmaps", Some(&namespace), &name),
-        "",
-        "configmaps",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    configmap.metadata.name = name.clone();
-    configmap.metadata.namespace = Some(namespace.clone());
-
-    // Validate the new object + immutability against the stored object
-    // (upstream ValidateConfigMapUpdate: key/size/dup checks plus the
-    // immutable-field freeze). Falls back to create-time validation when the
-    // object does not yet exist (upsert path below).
-    let key = build_key("configmaps", Some(&namespace), &name);
-    let existing_for_validation = state.storage.get::<ConfigMap>(&key).await.ok();
-    let validation_errs = match &existing_for_validation {
-        Some(existing) => rusternetes_common::validation::configmap::validate_config_map_update(
-            existing, &configmap,
-        ),
-        None => rusternetes_common::validation::configmap::validate_config_map(&configmap),
-    };
-    if !validation_errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(validation_errs));
-    }
-
-    // Run ValidatingAdmissionPolicy checks for UPDATE
-    let gvk = GroupVersionKind {
-        group: "".to_string(),
-        version: "v1".to_string(),
-        kind: "ConfigMap".to_string(),
-    };
-    let cm_value = serde_json::to_value(&configmap).ok();
-    state
-        .webhook_manager
-        .run_validating_admission_policies_ext(
-            &Operation::Update,
-            &gvk,
-            cm_value.as_ref(),
-            None,
-            Some("configmaps"),
-            Some(&namespace),
-        )
-        .await?;
-
-    // Run admission webhooks (mutating + validating) for UPDATE
-    {
-        let gvr = rusternetes_common::admission::GroupVersionResource {
-            group: "".to_string(),
-            version: "v1".to_string(),
-            resource: "configmaps".to_string(),
-        };
-        let user = &user_for_webhook;
-        let user_info = rusternetes_common::admission::UserInfo {
-            username: user.username.clone(),
-            uid: user.uid.clone(),
-            groups: user.groups.clone(),
-        };
-        let cm_val = serde_json::to_value(&configmap).ok();
-        // Run mutating webhooks
-        let (_response, mutated_obj) = state
-            .webhook_manager
-            .run_mutating_webhooks_with_dryrun(
-                &rusternetes_common::admission::Operation::Update,
-                &gvk,
-                &gvr,
-                Some(&namespace),
-                &name,
-                cm_val.clone(),
-                None,
-                &user_info,
-                is_dry_run,
-            )
-            .await?;
-        // Check if the mutating webhook DENIED the request.
-        if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = &_response {
-            return Err(rusternetes_common::Error::Forbidden(format!(
-                "admission webhook denied the request: {}",
-                reason
-            )));
-        }
-        if let Some(mutated) = mutated_obj {
-            if let Ok(m) = serde_json::from_value::<ConfigMap>(mutated) {
-                configmap = m;
-            }
-        }
-        // Run validating webhooks
-        if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
-            .webhook_manager
-            .run_validating_webhooks(
-                &rusternetes_common::admission::Operation::Update,
-                &gvk,
-                &gvr,
-                Some(&namespace),
-                &name,
-                serde_json::to_value(&configmap).ok(),
-                None,
-                &user_info,
-            )
-            .await?
-        {
-            return Err(rusternetes_common::Error::Forbidden(format!(
-                "admission webhook denied the request: {}",
-                reason
-            )));
-        }
-    }
-
-    // Immutability + key/size/dup validation already ran above via
-    // validate_config_map_update.
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: ConfigMap {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(configmap));
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    // The stored object is already in hand from the read above; re-reading it
-    // here would cost a second round-trip on every PUT and widen the window
-    // between read and write for no benefit.
-    if let Some(stored) = existing_for_validation.as_ref() {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut configmap.metadata,
-            &stored.metadata,
-        );
-    }
-
-    let result = state.storage.update(&key, &configmap).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete_configmap(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    body: axum::body::Bytes,
-) -> Result<Json<ConfigMap>> {
-    info!("Deleting configmap: {} in namespace: {}", name, namespace);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "configmaps")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("configmaps", Some(&namespace), &name);
-
-    // Get the resource to check if it exists
-    let configmap: ConfigMap = state.storage.get(&key).await?;
-
-    // Enforce deleteOptions.preconditions.{resourceVersion,uid} before mutating
-    // anything. Upstream: pkg/registry/generic/registry/store.go::Delete calls
-    // preconditions.Check() before invoking storage.Delete; a mismatch returns
-    // 409 Conflict with reason `Conflict`.
-    crate::handlers::lifecycle::check_delete_preconditions(&body, &configmap.metadata, &name)?;
-
-    // Run validating admission webhooks for DELETE (object=nil, oldObject=configmap).
-    crate::handlers::admission_helper::run_delete_validating_webhooks(
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
         &state,
-        "",
-        "v1",
-        "ConfigMap",
-        "configmaps",
+        &scope(&state),
+        &auth_ctx.user,
         Some(&namespace),
         &name,
-        &configmap,
-        &user_for_webhook,
-        is_dry_run,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: ConfigMap {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(configmap));
-    }
-
-    // Handle deletion with finalizers
-    let has_finalizers = crate::handlers::finalizers::handle_delete_with_finalizers(
-        &*state.storage,
-        &key,
-        &configmap,
-        &delete_opts,
+pub async fn deletecollection_configmaps(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
     )
-    .await?;
-
-    if has_finalizers {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: ConfigMap = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    } else {
-        Ok(Json(configmap))
-    }
+    .await
 }
 
 pub async fn list(
@@ -654,376 +362,11 @@ async fn paginate_configmaps_response(
     Ok(axum::Json(list).into_response())
 }
 
-// Generic PATCH handler used for all non-SSA patch types (strategic merge,
-// JSON merge, JSON patch). The wrapper above intercepts SSA before
-// delegating here so this macro still drives all the legacy patch paths.
-crate::patch_handler_namespaced!(patch_legacy, ConfigMap, "configmaps", "");
-
-/// ConfigMap PATCH dispatcher.
-///
-/// Branches on `Content-Type`:
-///
-/// - `application/apply-patch+yaml` / `application/apply-patch+json` →
-///   structural-merge SSA via [`crate::ssa::apply_configmap`].
-/// - everything else → the legacy [`patch_legacy`] handler (strategic
-///   merge, JSON merge, JSON patch).
-///
-/// This is the SCAFFOLD: ConfigMap is the only resource wired to the new
-/// SSA module today. Other resources still go through the legacy
-/// top-level-key SSA in `rusternetes_common::server_side_apply` via the
-/// generic patch macro.
-pub async fn patch(
-    state: axum::extract::State<Arc<ApiServerState>>,
-    auth_ctx: axum::Extension<AuthContext>,
-    path: axum::extract::Path<(String, String)>,
-    query: axum::extract::Query<HashMap<String, String>>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<axum::response::Response> {
-    let content_type = headers
-        .get("x-original-content-type")
-        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    if content_type.contains("apply-patch") {
-        return apply_configmap_ssa(state, auth_ctx, path, query, &content_type, body).await;
-    }
-
-    // Delegate to the legacy patch handler.
-    let response = patch_legacy(state, auth_ctx, path, query, headers, body).await?;
-    Ok(response.into_response())
-}
-
-/// Server-Side Apply branch for ConfigMap PATCH.
-///
-/// Translates the HTTP request into an [`crate::ssa::ApplyOptions`] +
-/// desired-state value, runs [`crate::ssa::apply_configmap`], and maps the
-/// outcome to a Response:
-///
-/// - new object → HTTP 201 Created
-/// - merged object → HTTP 200 OK
-/// - conflicts without `?force=true` → HTTP 409 Conflict (Status body)
-async fn apply_configmap_ssa(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path((namespace, name)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
-    content_type: &str,
-    body: axum::body::Bytes,
-) -> Result<axum::response::Response> {
-    info!(
-        "SSA apply configmap {}/{} (Content-Type: {})",
-        namespace, name, content_type
-    );
-
-    // Save user info for webhooks before RBAC check consumes it.
-    let webhook_user = auth_ctx.user.clone();
-
-    // RBAC: SSA uses the `patch` verb.
-    let attrs = RequestAttributes::new(auth_ctx.user, "patch", "configmaps")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // ?fieldManager= is mandatory for SSA; upstream returns 400 when
-    // missing.
-    let field_manager = params.get("fieldManager").cloned().ok_or_else(|| {
-        rusternetes_common::Error::BadRequest(
-            "fieldManager query parameter is required for apply-patch requests".to_string(),
-        )
-    })?;
-    let force = params
-        .get("force")
-        .map(|v| rusternetes_common::query::k8s_query_bool(v))
-        .unwrap_or(false);
-    let opts = crate::ssa::ApplyOptions::new(field_manager).with_force(force);
-
-    // Decode the body — apply-patch+yaml or apply-patch+json.
-    let mut desired = crate::ssa::decode_apply_body(content_type, &body)
-        .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
-    // Path-coerce name/namespace so the body cannot rename the object.
-    if let Some(meta) = desired
-        .as_object_mut()
-        .and_then(|o| o.get_mut("metadata"))
-        .and_then(|m| m.as_object_mut())
-    {
-        meta.insert("name".to_string(), serde_json::Value::String(name.clone()));
-        meta.insert(
-            "namespace".to_string(),
-            serde_json::Value::String(namespace.clone()),
-        );
-    }
-
-    let key = build_key("configmaps", Some(&namespace), &name);
-
-    // Load current object (if any) for the merge.
-    let current: Option<ConfigMap> = match state.storage.get::<ConfigMap>(&key).await {
-        Ok(cm) => Some(cm),
-        Err(rusternetes_common::Error::NotFound(_)) => None,
-        Err(e) => return Err(e),
-    };
-
-    let outcome = crate::ssa::apply_configmap(current.as_ref(), &desired, &opts)
-        .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
-
-    // Validate the SSA-merged object through the same upstream-parity path as
-    // the create/update handlers: validate_config_map_update for a merge over
-    // an existing object (key/size/duplicate checks PLUS the immutable-field
-    // freeze, emitting upstream field.Forbidden errors), validate_config_map
-    // for a fresh create. This replaces the earlier ad-hoc immutability guard
-    // so SSA, update, and create all run identical validation (#1466).
-    if let crate::ssa::ApplyOutcome::Applied { ref object, .. } = &outcome {
-        let validation_errs = match current.as_ref() {
-            Some(existing) => {
-                rusternetes_common::validation::configmap::validate_config_map_update(
-                    existing, object,
-                )
-            }
-            None => rusternetes_common::validation::configmap::validate_config_map(object),
-        };
-        if !validation_errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(validation_errs));
-        }
-    }
-
-    match outcome {
-        crate::ssa::ApplyOutcome::Applied {
-            object: boxed,
-            created,
-        } => {
-            // The SSA module returns the object boxed to keep ApplyOutcome
-            // small (clippy::large_enum_variant); unbox once here so the rest
-            // of the handler can treat it as a plain ConfigMap value.
-            let mut object: ConfigMap = *boxed;
-            // Ensure path-derived metadata is set even when the merge
-            // started from a brand-new body.
-            object.metadata.name = name.clone();
-            object.metadata.namespace = Some(namespace.clone());
-            if created {
-                object.metadata.ensure_uid();
-                object.metadata.ensure_creation_timestamp();
-            }
-            let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-            // Run mutating + validating admission webhooks on the
-            // SSA-produced object, mirroring the non-SSA PATCH path. The
-            // operation is Create for new objects, Update for merges, so
-            // policies attached to either bucket fire correctly.
-            let op = if created {
-                Operation::Create
-            } else {
-                Operation::Update
-            };
-            let gvk = GroupVersionKind {
-                group: "".to_string(),
-                version: "v1".to_string(),
-                kind: "ConfigMap".to_string(),
-            };
-            let cm_val = serde_json::to_value(&object).ok();
-            state
-                .webhook_manager
-                .run_validating_admission_policies_ext(
-                    &op,
-                    &gvk,
-                    cm_val.as_ref(),
-                    None,
-                    Some("configmaps"),
-                    Some(&namespace),
-                )
-                .await?;
-            {
-                let gvr = rusternetes_common::admission::GroupVersionResource {
-                    group: "".to_string(),
-                    version: "v1".to_string(),
-                    resource: "configmaps".to_string(),
-                };
-                let user_info = rusternetes_common::admission::UserInfo {
-                    username: webhook_user.username.clone(),
-                    uid: webhook_user.uid.clone(),
-                    groups: webhook_user.groups.clone(),
-                };
-                let (response, mutated_obj) = state
-                    .webhook_manager
-                    .run_mutating_webhooks_with_dryrun(
-                        &op,
-                        &gvk,
-                        &gvr,
-                        Some(&namespace),
-                        &name,
-                        cm_val.clone(),
-                        None,
-                        &user_info,
-                        is_dry_run,
-                    )
-                    .await?;
-                if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = &response {
-                    return Err(rusternetes_common::Error::Forbidden(format!(
-                        "admission webhook denied the request: {}",
-                        reason
-                    )));
-                }
-                if let Some(mutated) = mutated_obj {
-                    if let Ok(m) = serde_json::from_value::<ConfigMap>(mutated) {
-                        object = m;
-                    }
-                }
-                if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
-                    .webhook_manager
-                    .run_validating_webhooks_with_dryrun(
-                        &op,
-                        &gvk,
-                        &gvr,
-                        Some(&namespace),
-                        &name,
-                        serde_json::to_value(&object).ok(),
-                        None,
-                        &user_info,
-                        is_dry_run,
-                    )
-                    .await?
-                {
-                    return Err(rusternetes_common::Error::Forbidden(format!(
-                        "admission webhook denied the request: {}",
-                        reason
-                    )));
-                }
-            }
-
-            let saved: ConfigMap = if is_dry_run {
-                object
-            } else if created {
-                state.storage.create::<ConfigMap>(&key, &object).await?
-            } else {
-                state.storage.update::<ConfigMap>(&key, &object).await?
-            };
-            let status = if created {
-                StatusCode::CREATED
-            } else {
-                StatusCode::OK
-            };
-            Ok((status, axum::Json(saved)).into_response())
-        }
-        crate::ssa::ApplyOutcome::Conflicts(conflicts) => {
-            // Mirror upstream: 409 Conflict with reason=Conflict.
-            let detail = conflicts
-                .iter()
-                .map(|c| {
-                    format!(
-                        ".{} is managed by {}",
-                        c.path.replace('/', "."),
-                        c.current_manager
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(rusternetes_common::Error::Conflict(format!(
-                "Apply failed with {} conflict{}: {}",
-                conflicts.len(),
-                if conflicts.len() == 1 { "" } else { "s" },
-                detail
-            )))
-        }
-    }
-}
-
-pub async fn deletecollection_configmaps(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection configmaps in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "configmaps")
-        .with_namespace(&namespace)
-        .with_api_group("");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ConfigMap collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all configmaps in the namespace
-    let prefix = build_prefix("configmaps", Some(&namespace));
-    let mut items = state.storage.list::<ConfigMap>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("configmaps", Some(&namespace), &item.metadata.name);
-
-        // Run validating admission webhooks for DELETE per item.
-        crate::handlers::admission_helper::run_delete_validating_webhooks(
-            &state,
-            "",
-            "v1",
-            "ConfigMap",
-            "configmaps",
-            Some(&namespace),
-            &item.metadata.name,
-            &item,
-            &user_for_webhook,
-            false,
-        )
-        .await?;
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} configmaps deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
-}
-
 #[cfg(test)]
 mod finalizer_drain_put_tests {
     use super::*;
     use crate::state::ApiServerState;
+    use rusternetes_storage::build_key;
     use serde_json::json;
 
     async fn test_state() -> Arc<ApiServerState> {
@@ -1081,7 +424,7 @@ mod finalizer_drain_put_tests {
             }),
             Path(("default".to_string(), "cm-fin".to_string())),
             Query(HashMap::new()),
-            DumpingJson(sent),
+            Bytes::from(serde_json::to_vec(&sent).unwrap()),
         )
         .await
         .expect("update must succeed");
@@ -1127,7 +470,7 @@ mod finalizer_drain_put_tests {
             }),
             Path(("default".to_string(), "cm-keep".to_string())),
             Query(HashMap::new()),
-            DumpingJson(sent),
+            Bytes::from(serde_json::to_vec(&sent).unwrap()),
         )
         .await
         .expect("update must succeed");

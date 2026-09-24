@@ -16,6 +16,8 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use rusternetes_common::deletion::{DeleteOptions, Preconditions};
 use rusternetes_common::types::{ObjectMeta, StatusDetails};
 use rusternetes_common::validation::field::{Error as FieldError, Path};
@@ -133,6 +135,16 @@ enum StorageFailure {
     InvalidObj(String),
 }
 
+/// `storage.UpdateFunc`: the callback [`Store::guaranteed_update`] calls with
+/// the current object. A trait rather than an async closure so the future it
+/// returns is `Send` for every borrow of `existing` — an axum handler must be
+/// `Send`, and rustc cannot prove that of an `AsyncFnMut` future yet
+/// (rust-lang/rust#110338).
+#[async_trait]
+trait TryUpdate<T>: Send {
+    async fn try_update(&mut self, existing: Option<&T>) -> std::result::Result<T, Abort<T>>;
+}
+
 impl<T: Object, S: Storage> Store<T, S> {
     /// A store for a resource whose create, update and delete strategies are
     /// the same object — the shape of every in-tree strategy.
@@ -183,12 +195,12 @@ impl<T: Object, S: Storage> Store<T, S> {
 
     // -- error interpretation (storage/errors/storage.go) -------------------
 
-    fn not_found(&self, name: &str) -> Error {
+    pub(crate) fn not_found(&self, name: &str) -> Error {
         // `errors.NewNotFound(qualifiedResource, name)`.
         Error::NotFound(format!("{} \"{name}\" not found", self.qualified_resource))
     }
 
-    fn conflict(&self, name: &str, reason: impl std::fmt::Display) -> Error {
+    pub(crate) fn conflict(&self, name: &str, reason: impl std::fmt::Display) -> Error {
         // `errors.NewConflict(qualifiedResource, name, err)` (errors.go:232-244).
         Error::Conflict(format!(
             "Operation cannot be fulfilled on {} \"{name}\": {reason}",
@@ -298,18 +310,15 @@ impl<T: Object, S: Storage> Store<T, S> {
     /// A write that would store exactly what is already stored is skipped and
     /// the stored object returned, so a no-op update does not bump the
     /// resourceVersion (etcd3/store.go:553-577).
-    async fn guaranteed_update<F>(
+    async fn guaranteed_update(
         &self,
         key: &str,
         name: &str,
         ignore_not_found: bool,
         preconditions: Option<&Preconditions>,
         dry_run: bool,
-        mut try_update: F,
-    ) -> std::result::Result<T, Abort<T>>
-    where
-        F: AsyncFnMut(Option<&T>) -> std::result::Result<T, Abort<T>>,
-    {
+        try_update: &mut dyn TryUpdate<T>,
+    ) -> std::result::Result<T, Abort<T>> {
         loop {
             let current: Option<T> = match self.storage.get::<T>(key).await {
                 Ok(obj) => Some(obj),
@@ -324,7 +333,7 @@ impl<T: Object, S: Storage> Store<T, S> {
                 ));
             }
 
-            let mut updated = try_update(current.as_ref()).await?;
+            let mut updated = try_update.try_update(current.as_ref()).await?;
 
             if dry_run {
                 return Ok(updated);
@@ -488,9 +497,17 @@ impl<T: Object, S: Storage> Store<T, S> {
         let preconditions = obj_info.preconditions();
         let allow_create = self.update_strategy.allow_create_on_update() || force_allow_create;
 
-        let mut creating = false;
-        let mut creating_obj: Option<T> = None;
-
+        let mut attempt = UpdateAttempt {
+            store: self,
+            ctx,
+            name,
+            obj_info,
+            allow_create,
+            create_validation,
+            update_validation,
+            creating: false,
+            creating_obj: None,
+        };
         let outcome = self
             .guaranteed_update(
                 &key,
@@ -498,66 +515,14 @@ impl<T: Object, S: Storage> Store<T, S> {
                 allow_create,
                 preconditions.as_ref(),
                 options.dry_run,
-                async |existing: Option<&T>| -> std::result::Result<T, Abort<T>> {
-                    if existing.is_none() && !allow_create {
-                        return Err(Abort::Api(self.not_found(name)));
-                    }
-
-                    // Given the existing object, get the new object.
-                    let mut obj = obj_info.updated_object(ctx, existing).await?;
-
-                    // An update that names no resourceVersion is applied to
-                    // the latest object when the strategy allows it, and is
-                    // otherwise rejected; one that names a stale version
-                    // conflicts.
-                    let new_rv = parse_resource_version(obj.metadata())?;
-                    let unconditional =
-                        new_rv == 0 && self.update_strategy.allow_unconditional_update();
-
-                    let Some(existing) = existing else {
-                        // Create on update.
-                        fill_object_meta_system_fields(obj.metadata_mut());
-                        creating = true;
-                        creating_obj = Some(obj.clone());
-                        before_create(self.create_strategy.as_ref(), ctx, &mut obj)?;
-                        if let Some(v) = create_validation {
-                            v.validate(ctx, &obj).await?;
-                        }
-                        return Ok(obj);
-                    };
-
-                    creating = false;
-                    creating_obj = None;
-                    if unconditional {
-                        obj.metadata_mut().resource_version =
-                            existing.metadata().resource_version.clone();
-                    } else if new_rv == 0 {
-                        return Err(Abort::Api(Error::Invalid(vec![FieldError::invalid(
-                            &Path::new("metadata").child("resourceVersion"),
-                            0i64,
-                            "must be specified for an update",
-                        )])));
-                    } else if new_rv != parse_resource_version(existing.metadata())? {
-                        return Err(Abort::Api(self.conflict(name, OPTIMISTIC_LOCK_ERROR_MSG)));
-                    }
-
-                    before_update(self.update_strategy.as_ref(), ctx, &mut obj, existing)?;
-
-                    if let Some(v) = update_validation {
-                        v.validate(ctx, &obj, existing).await?;
-                    }
-
-                    if should_delete_during_update(&obj, existing)
-                        && self
-                            .should_delete_during_update
-                            .is_none_or(|extra| extra(&obj, existing))
-                    {
-                        return Err(Abort::EmptiedFinalizers(Box::new(obj)));
-                    }
-                    Ok(obj)
-                },
+                &mut attempt,
             )
             .await;
+        let UpdateAttempt {
+            creating,
+            creating_obj,
+            ..
+        } = attempt;
 
         match outcome {
             Ok(out) => Ok((out, creating)),
@@ -752,70 +717,25 @@ impl<T: Object, S: Storage> Store<T, S> {
         delete_validation: Option<&dyn ValidateObject<T>>,
         input: T,
     ) -> Result<GracefulOutcome<T>> {
-        let mut last_graceful: i64 = 0;
-        let mut pending_finalizers = false;
-        let mut last_existing: Option<T> = None;
         let dry_run = is_dry_run(options);
-
+        let mut attempt = GracefulAttempt {
+            store: self,
+            ctx,
+            options,
+            delete_validation,
+            last_graceful: 0,
+            pending_finalizers: false,
+            last_existing: None,
+        };
         let outcome = self
-            .guaranteed_update(
-                key,
-                name,
-                false,
-                preconditions,
-                dry_run,
-                async |existing: Option<&T>| -> std::result::Result<T, Abort<T>> {
-                    let mut existing = existing
-                        .expect("the object exists: ignore_not_found is false")
-                        .clone();
-                    if let Some(v) = delete_validation {
-                        v.validate(ctx, &existing).await?;
-                    }
-                    let decision = before_delete(
-                        self.delete_strategy.as_ref(),
-                        &self.qualified_resource,
-                        ctx,
-                        &mut existing,
-                        options,
-                    )?;
-                    if decision.graceful_pending {
-                        return Err(Abort::AlreadyDeleting);
-                    }
-
-                    // Add/remove the GC finalizers as the options dictate.
-                    // This comes after the pending-graceful check, so the
-                    // finalizers cannot be changed once deletion has started.
-                    let (needs_update, new_finalizers) = self
-                        .deletion_finalizers_for_garbage_collection(
-                            ctx,
-                            existing.metadata(),
-                            options,
-                        );
-                    if needs_update {
-                        existing.metadata_mut().finalizers =
-                            (!new_finalizers.is_empty()).then_some(new_finalizers);
-                    }
-
-                    pending_finalizers = existing
-                        .metadata()
-                        .finalizers
-                        .as_ref()
-                        .is_some_and(|f| !f.is_empty());
-                    if !decision.graceful {
-                        // Not graceful but held by finalizers: mark it as
-                        // deleting with a zero grace period.
-                        if pending_finalizers {
-                            mark_as_deleting(existing.metadata_mut(), chrono::Utc::now());
-                            return Ok(existing);
-                        }
-                        return Err(Abort::DeleteNow);
-                    }
-                    last_graceful = options.grace_period_seconds.unwrap_or(0);
-                    last_existing = Some(existing.clone());
-                    Ok(existing)
-                },
-            )
+            .guaranteed_update(key, name, false, preconditions, dry_run, &mut attempt)
             .await;
+        let GracefulAttempt {
+            last_graceful,
+            pending_finalizers,
+            last_existing,
+            ..
+        } = attempt;
 
         match outcome {
             Ok(out) => {
@@ -899,6 +819,42 @@ impl<T: Object, S: Storage> Store<T, S> {
         (true, new_finalizers)
     }
 
+    /// `Store.DeleteCollection` (store.go:1237-1384): delete every listed
+    /// item, ignoring the ones already gone, and return the list.
+    ///
+    /// Upstream lists through `Store.List` with the request's `ListOptions`;
+    /// the caller passes the listed, selector-filtered items instead, since
+    /// list and selector handling live in the handlers today. Items are
+    /// deleted one at a time, which is upstream's default
+    /// (`DeleteCollectionWorkers: 1`, server/options/etcd.go:82). Like
+    /// upstream it is not atomic: an error stops the sweep with some items
+    /// already deleted.
+    pub async fn delete_collection(
+        &self,
+        ctx: &RequestContext,
+        items: Vec<T>,
+        delete_validation: Option<&dyn ValidateObject<T>>,
+        options: &DeleteOptions,
+    ) -> Result<Vec<T>> {
+        for item in &items {
+            // Each delete gets its own copy of the options: a graceful
+            // strategy may rewrite them (store.go:1275-1279).
+            match self
+                .delete(
+                    ctx,
+                    &item.metadata().name,
+                    delete_validation,
+                    options.clone(),
+                )
+                .await
+            {
+                Ok(_) | Err(Error::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(items)
+    }
+
     /// `finalizeDelete` (store.go:1386-1411).
     fn finalize_delete(&self, obj: T) -> Deleted<T> {
         if self.return_deleted_object {
@@ -914,6 +870,154 @@ impl<T: Object, S: Storage> Store<T, S> {
             causes: None,
             retry_after_seconds: None,
         })
+    }
+}
+
+/// The `tryUpdate` closure of `Store.Update` (store.go:655-786).
+struct UpdateAttempt<'a, T: Object, S: Storage> {
+    store: &'a Store<T, S>,
+    ctx: &'a RequestContext,
+    name: &'a str,
+    obj_info: &'a dyn UpdatedObjectInfo<T>,
+    allow_create: bool,
+    create_validation: Option<&'a dyn ValidateObject<T>>,
+    update_validation: Option<&'a dyn ValidateObjectUpdate<T>>,
+    /// Whether the last attempt was a create, and the object it created
+    /// before `BeforeCreate` — for the error interpretation afterwards.
+    creating: bool,
+    creating_obj: Option<T>,
+}
+
+#[async_trait]
+impl<T: Object, S: Storage> TryUpdate<T> for UpdateAttempt<'_, T, S> {
+    async fn try_update(&mut self, existing: Option<&T>) -> std::result::Result<T, Abort<T>> {
+        if existing.is_none() && !self.allow_create {
+            return Err(Abort::Api(self.store.not_found(self.name)));
+        }
+
+        // Given the existing object, get the new object.
+        let mut obj = self.obj_info.updated_object(self.ctx, existing).await?;
+
+        // An update that names no resourceVersion is applied to
+        // the latest object when the strategy allows it, and is
+        // otherwise rejected; one that names a stale version
+        // conflicts.
+        let new_rv = parse_resource_version(obj.metadata())?;
+        let unconditional = new_rv == 0 && self.store.update_strategy.allow_unconditional_update();
+
+        let Some(existing) = existing else {
+            // Create on update.
+            fill_object_meta_system_fields(obj.metadata_mut());
+            self.creating = true;
+            self.creating_obj = Some(obj.clone());
+            before_create(self.store.create_strategy.as_ref(), self.ctx, &mut obj)?;
+            if let Some(v) = self.create_validation {
+                v.validate(self.ctx, &obj).await?;
+            }
+            return Ok(obj);
+        };
+
+        self.creating = false;
+        self.creating_obj = None;
+        if unconditional {
+            obj.metadata_mut().resource_version = existing.metadata().resource_version.clone();
+        } else if new_rv == 0 {
+            return Err(Abort::Api(Error::Invalid(vec![FieldError::invalid(
+                &Path::new("metadata").child("resourceVersion"),
+                0i64,
+                "must be specified for an update",
+            )])));
+        } else if new_rv != parse_resource_version(existing.metadata())? {
+            return Err(Abort::Api(
+                self.store.conflict(self.name, OPTIMISTIC_LOCK_ERROR_MSG),
+            ));
+        }
+
+        before_update(
+            self.store.update_strategy.as_ref(),
+            self.ctx,
+            &mut obj,
+            existing,
+        )?;
+
+        if let Some(v) = self.update_validation {
+            v.validate(self.ctx, &obj, existing).await?;
+        }
+
+        if should_delete_during_update(&obj, existing)
+            && self
+                .store
+                .should_delete_during_update
+                .is_none_or(|extra| extra(&obj, existing))
+        {
+            return Err(Abort::EmptiedFinalizers(Box::new(obj)));
+        }
+        Ok(obj)
+    }
+}
+
+/// The `tryUpdate` closure of `updateForGracefulDeletionAndFinalizers`
+/// (store.go:1044-1098).
+struct GracefulAttempt<'a, T: Object, S: Storage> {
+    store: &'a Store<T, S>,
+    ctx: &'a RequestContext,
+    options: &'a mut DeleteOptions,
+    delete_validation: Option<&'a dyn ValidateObject<T>>,
+    last_graceful: i64,
+    pending_finalizers: bool,
+    last_existing: Option<T>,
+}
+
+#[async_trait]
+impl<T: Object, S: Storage> TryUpdate<T> for GracefulAttempt<'_, T, S> {
+    async fn try_update(&mut self, existing: Option<&T>) -> std::result::Result<T, Abort<T>> {
+        let mut existing = existing
+            .expect("the object exists: ignore_not_found is false")
+            .clone();
+        if let Some(v) = self.delete_validation {
+            v.validate(self.ctx, &existing).await?;
+        }
+        let decision = before_delete(
+            self.store.delete_strategy.as_ref(),
+            &self.store.qualified_resource,
+            self.ctx,
+            &mut existing,
+            self.options,
+        )?;
+        if decision.graceful_pending {
+            return Err(Abort::AlreadyDeleting);
+        }
+
+        // Add/remove the GC finalizers as the options dictate.
+        // This comes after the pending-graceful check, so the
+        // finalizers cannot be changed once deletion has started.
+        let (needs_update, new_finalizers) = self.store.deletion_finalizers_for_garbage_collection(
+            self.ctx,
+            existing.metadata(),
+            self.options,
+        );
+        if needs_update {
+            existing.metadata_mut().finalizers =
+                (!new_finalizers.is_empty()).then_some(new_finalizers);
+        }
+
+        self.pending_finalizers = existing
+            .metadata()
+            .finalizers
+            .as_ref()
+            .is_some_and(|f| !f.is_empty());
+        if !decision.graceful {
+            // Not graceful but held by finalizers: mark it as
+            // deleting with a zero grace period.
+            if self.pending_finalizers {
+                mark_as_deleting(existing.metadata_mut(), chrono::Utc::now());
+                return Ok(existing);
+            }
+            return Err(Abort::DeleteNow);
+        }
+        self.last_graceful = self.options.grace_period_seconds.unwrap_or(0);
+        self.last_existing = Some(existing.clone());
+        Ok(existing)
     }
 }
 

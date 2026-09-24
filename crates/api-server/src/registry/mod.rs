@@ -8,6 +8,7 @@
 //! | [`rest`] | `registry/rest/{create,update,delete,meta}.go` — the strategy interfaces and `BeforeCreate` / `BeforeUpdate` / `BeforeDelete` |
 //! | [`names`] | `storage/names/generate.go` — `SimpleNameGenerator` |
 //! | [`generic::store`] | `registry/generic/registry/{store,dryrun}.go` — `Store` |
+//! | [`core`] | `pkg/registry/core/<resource>/` (kubernetes) — per-resource strategies |
 //!
 //! Upstream has exactly one create/update/delete path: every built-in
 //! resource is a `genericregistry.Store` configured with a per-resource
@@ -18,6 +19,7 @@
 //! instead, and they drifted (#1990). Resources move onto this Store one at a
 //! time; each migration deletes its bespoke handler code.
 
+pub mod core;
 pub mod generic;
 pub mod names;
 pub mod rest;

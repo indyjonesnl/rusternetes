@@ -245,7 +245,9 @@ async fn watch_envelope_modified_carries_updated_resource() {
     let mut seed = cm_stub("envelope-mod");
     seed["metadata"]["resourceVersion"] = json!("1");
     seed["metadata"]["uid"] = json!("u-mod");
-    mem.create(&key, &seed).await.unwrap();
+    // Storage assigns its own resourceVersion; the PUT must carry that one or
+    // it conflicts, as upstream's Store.Update does.
+    let seed: serde_json::Value = mem.create(&key, &seed).await.unwrap();
 
     let writer_router = router.clone();
     let seed_for_writer = seed.clone();

@@ -131,7 +131,7 @@ impl ValidateObjectUpdate<ConfigMap> for Deny {
     }
 }
 
-fn info(obj: ConfigMap) -> DefaultUpdatedObjectInfo<ConfigMap> {
+fn info(obj: ConfigMap) -> DefaultUpdatedObjectInfo<'static, ConfigMap> {
     DefaultUpdatedObjectInfo::new(Some(obj), Vec::new())
 }
 
