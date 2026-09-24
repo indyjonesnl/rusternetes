@@ -190,6 +190,7 @@ mod pvc_default_volume_mode_test;
 mod rbac_authorization_test;
 mod rbac_handler_test;
 mod rc_default_replicas_test;
+mod replicaset_generic_store_test;
 mod replicaset_handler_test;
 mod replicationcontroller_handler_test;
 mod replicationcontroller_post_e2e_test;
