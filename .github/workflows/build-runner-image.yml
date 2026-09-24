@@ -11,6 +11,12 @@ on:
       - ci/arc-runner/Dockerfile
       - .github/workflows/build-runner-image.yml
   workflow_dispatch:
+  # The image is `FROM ghcr.io/actions/actions-runner:latest`, and GitHub
+  # deprecates old runner versions: a runner too old to register exits 7 and
+  # ARC parks every scale set in phase Outdated, so all self-hosted CI stops
+  # (#2002). Rebuild weekly so the embedded runner keeps up.
+  schedule:
+    - cron: '17 4 * * 1'
 
 env:
   IMAGE: ghcr.io/indyjonesnl/rusternetes-arc-runner
@@ -19,8 +25,10 @@ jobs:
   build:
     name: Build and push ARC runner image
     # GH-hosted on purpose: the ARC runner pods don't have a docker
-    # daemon, and image builds happen rarely (only when this Dockerfile
-    # changes), so the minute cost is acceptable.
+    # daemon, and image builds are rare (Dockerfile changes plus the weekly
+    # refresh), so the minute cost is acceptable. It also means this job
+    # still runs when the ARC runners are down — which is exactly when a
+    # fresh image is needed.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -51,6 +59,11 @@ jobs:
             echo "${IMAGE}:sha-${short_sha}"
             if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
               echo "${IMAGE}:latest"
+              # A scheduled rebuild of an unchanged commit gets a new base,
+              # so it needs a tag of its own: pin the helm values to this one.
+              # `:latest` cannot clear an Outdated scale set — only a change
+              # to the ARS spec (a new image tag) does.
+              echo "${IMAGE}:$(date -u +%Y%m%d)-${short_sha}"
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
@@ -60,10 +73,13 @@ jobs:
         with:
           context: ci/arc-runner
           file: ci/arc-runner/Dockerfile
-          # Push only on direct pushes to main; PRs from this repo build
-          # but don't publish. Forks skip the login step above and so
-          # would fail to push anyway.
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # Re-resolve `actions-runner:latest` rather than reuse a cached base.
+          pull: true
+          # Publish from main — a push, the weekly schedule, or a manual
+          # dispatch (a dispatch that only built was how #2002's recovery
+          # first went wrong). PRs build but don't publish; forks skip the
+          # login step above and so would fail to push anyway.
+          push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
