@@ -2,6 +2,47 @@ use crate::types::{ObjectMeta, TypeMeta};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+fn is_zero(n: &i32) -> bool {
+    *n == 0
+}
+
+/// `autoscaling/v1` `Scale` (staging/src/k8s.io/api/autoscaling/v1/types.go):
+/// the `/scale` subresource of a scalable resource.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Scale {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+
+    #[serde(default)]
+    pub spec: ScaleSpec,
+
+    #[serde(default)]
+    pub status: ScaleStatus,
+}
+
+/// `ScaleSpec`: `replicas` is `omitempty`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScaleSpec {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub replicas: i32,
+}
+
+/// `ScaleStatus`: `replicas` is always present, `selector` is `omitempty`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScaleStatus {
+    #[serde(default)]
+    pub replicas: i32,
+
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub selector: String,
+}
+
 /// HorizontalPodAutoscaler automatically scales the number of pods
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
