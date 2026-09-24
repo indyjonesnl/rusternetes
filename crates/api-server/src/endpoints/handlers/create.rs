@@ -27,7 +27,16 @@ pub async fn create_resource<T: Object>(
     params: &HashMap<String, String>,
     body: &[u8],
 ) -> Result<Response> {
-    authorize(state, user, "create", &scope.resource, namespace, None).await?;
+    authorize(
+        state,
+        user,
+        "create",
+        &scope.resource,
+        scope.subresource,
+        namespace,
+        None,
+    )
+    .await?;
 
     let options = CreateOptions {
         field_manager: params.get("fieldManager").cloned(),
@@ -57,6 +66,7 @@ pub async fn create_resource<T: Object>(
         state,
         kind: &scope.kind,
         resource: &scope.resource,
+        subresource: scope.subresource,
         namespace,
         user,
         dry_run,
