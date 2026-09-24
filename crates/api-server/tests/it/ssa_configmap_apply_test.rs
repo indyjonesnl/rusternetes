@@ -207,11 +207,13 @@ async fn ssa_force_transfers_ownership_and_returns_200() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Bonus: missing fieldManager is rejected.
+// 5. Bonus: missing fieldManager is rejected — `ValidatePatchOptions`
+//    requires it for apply (apimachinery/pkg/apis/meta/v1/validation/
+//    validation.go:190-205), and PatchResource returns that as Invalid (422).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn ssa_missing_field_manager_returns_400() {
+async fn ssa_missing_field_manager_returns_422() {
     let state = make_state();
     let body = desired_configmap("cm-nofm", json!({"k1": "v1"}));
     let (status, _) = state
@@ -222,15 +224,18 @@ async fn ssa_missing_field_manager_returns_400() {
             Some(&body),
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 // ---------------------------------------------------------------------------
-// 6. Bonus: apply-patch+json content-type also works.
+// 6. `apply-patch+json` is not a patch type upstream serves: the endpoint
+//    accepts json-patch, merge-patch, strategic-merge-patch and
+//    apply-patch+yaml (endpoints/installer.go:895-900), and answers anything
+//    else with 415 (patch.go:85-89).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn ssa_apply_patch_json_content_type_is_accepted() {
+async fn ssa_apply_patch_json_content_type_is_unsupported() {
     let state = make_state();
     let body = desired_configmap("cm-json", json!({"k1": "v1"}));
     let (status, body) = state
@@ -241,8 +246,7 @@ async fn ssa_apply_patch_json_content_type_is_accepted() {
             Some(&body),
         )
         .await;
-    assert_eq!(status, StatusCode::CREATED, "body: {body}");
-    assert_eq!(body["data"]["k1"], "v1");
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "body: {body}");
 }
 
 // ---------------------------------------------------------------------------

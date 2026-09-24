@@ -35,7 +35,7 @@ async fn send(api: TestApiServer, method: Method, uri: &str, body: Value) -> (St
 }
 
 /// Pod create with `status.containerStatuses[0].lastState: {}` must be
-/// accepted under default-Strict. Mirrors what client-go emits when a
+/// accepted under Strict. Mirrors what client-go emits when a
 /// container has no prior terminated/waiting/running state.
 #[tokio::test]
 async fn test_pod_with_empty_last_state_accepted_under_strict() {
@@ -62,13 +62,13 @@ async fn test_pod_with_empty_last_state_accepted_under_strict() {
     let (status, resp) = send(
         router,
         Method::POST,
-        &format!("/api/v1/namespaces/{}/pods", TEST_NS),
+        &format!("/api/v1/namespaces/{}/pods?fieldValidation=Strict", TEST_NS),
         body,
     )
     .await;
     assert!(
         status.is_success(),
-        "containerStatus.lastState: {{}} must be accepted under default-Strict; got {} body={}",
+        "containerStatus.lastState: {{}} must be accepted under Strict; got {} body={}",
         status,
         resp
     );
@@ -103,13 +103,13 @@ async fn test_pod_with_empty_init_container_last_state_accepted_under_strict() {
     let (status, resp) = send(
         router,
         Method::POST,
-        &format!("/api/v1/namespaces/{}/pods", TEST_NS),
+        &format!("/api/v1/namespaces/{}/pods?fieldValidation=Strict", TEST_NS),
         body,
     )
     .await;
     assert!(
         status.is_success(),
-        "initContainerStatus.lastState: {{}} must be accepted under default-Strict; got {} body={}",
+        "initContainerStatus.lastState: {{}} must be accepted under Strict; got {} body={}",
         status,
         resp
     );
@@ -132,7 +132,7 @@ async fn test_genuinely_unknown_non_empty_field_still_rejected_under_strict() {
     let (status, resp) = send(
         router,
         Method::POST,
-        &format!("/api/v1/namespaces/{}/pods", TEST_NS),
+        &format!("/api/v1/namespaces/{}/pods?fieldValidation=Strict", TEST_NS),
         body,
     )
     .await;

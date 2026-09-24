@@ -549,8 +549,9 @@ crate::patch_handler_namespaced!(patch_legacy, Secret, "secrets", "");
 /// ConfigMap and Secret are the two resources wired to the new SSA module
 /// today. Other resources (Pod / Deployment / Service / …) still go through
 /// the legacy top-level-key SSA in `rusternetes_common::server_side_apply`
-/// via the generic patch macro — see `handlers::configmap::patch` for the
-/// pattern this mirrors.
+/// via the generic patch macro. ConfigMap has since moved onto the generic
+/// Store, where apply is one mechanism of `endpoints::handlers::patch`
+/// (#1990); Secret is next.
 pub async fn patch(
     state: axum::extract::State<Arc<ApiServerState>>,
     auth_ctx: axum::Extension<AuthContext>,
@@ -577,8 +578,8 @@ pub async fn patch(
 
 /// Server-Side Apply branch for Secret PATCH.
 ///
-/// Mirrors `handlers::configmap::apply_configmap_ssa` line-for-line — the
-/// only Secret-specific bits are:
+/// Mirrors the ConfigMap SSA handler this was copied from (since replaced by
+/// the generic Store path, #1990) — the only Secret-specific bits are:
 ///
 /// 1. `Secret.type` immutability fence post-create. Upstream
 ///    `pkg/registry/core/secret/strategy.go::ValidateUpdate` calls

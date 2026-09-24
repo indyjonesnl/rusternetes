@@ -227,8 +227,14 @@ fn every_put_handler_reinstates_server_owned_metadata() {
             // which is what a handler with no other need for the stored object
             // should call. Both spellings satisfy the invariant; what matters
             // is that the stored metadata reaches the object being written.
+            //
+            // A handler that delegates to the generic `update_resource`
+            // endpoint gets the rule from where upstream keeps it:
+            // `registry::rest::before_update`, which `Store::update` runs for
+            // every resource on the registry (#1990).
             if body.contains("inherit_server_owned_metadata")
                 || body.contains("update_inheriting_server_owned_metadata")
+                || body.contains("update_resource(")
             {
                 continue;
             }

@@ -492,10 +492,8 @@ async fn test_field_validation_ignore_deployment_unknown_field_silently_accepted
 
 #[tokio::test]
 async fn test_field_validation_default_pod_clean_body_accepted() {
-    // After unit #7 flipped the default to Strict, the no-param + clean-body
-    // path must still succeed. This is the regression guard for the default
-    // change: only *unknown* fields should be rejected, valid bodies pass
-    // through.
+    // The no-param path (Warn, upstream's default) must accept a clean
+    // body with no warnings to report.
     let (_mem, router) = spawn_router();
     let stub = pod_stub("pod-default-clean");
     let uri = pod_uri();
@@ -504,34 +502,38 @@ async fn test_field_validation_default_pod_clean_body_accepted() {
 
     assert!(
         status.is_success(),
-        "clean body must succeed under default-Strict; got {}: body={}",
+        "clean body must succeed with no fieldValidation param; got {}: body={}",
         status,
         body
     );
     assert_eq!(body["metadata"]["name"], "pod-default-clean");
 }
 
+/// No `?fieldValidation=` means Warn upstream — `fieldValidation("")`
+/// returns `metav1.FieldValidationWarn`
+/// (staging/src/k8s.io/apiserver/pkg/endpoints/handlers/rest.go:409-413).
+/// The create succeeds and the unknown field comes back as a 299 warning.
 #[tokio::test]
-async fn test_field_validation_default_pod_unknown_field_rejected_k8s_1_35() {
+async fn test_field_validation_default_pod_unknown_field_warns() {
     let (_mem, router) = spawn_router();
-    let mut stub = pod_stub("pod-default-strict");
+    let mut stub = pod_stub("pod-default-warn");
     stub["spec"]["bogusField"] = json!("nope");
     let uri = pod_uri();
 
-    let (status, _hdrs, body) = send_json(router, Method::POST, &uri, &stub).await;
+    let (status, hdrs, body) = send_json(router, Method::POST, &uri, &stub).await;
 
     assert!(
-        status.is_client_error(),
-        "K8s 1.35 default must reject unknown fields without explicit param; \
-         got {}: body={}",
+        status.is_success(),
+        "default (Warn) must accept unknown fields; got {}: body={}",
         status,
         body
     );
-    let message = body["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("strict decoding error"),
-        "default rejection should match strict decoder format: {}",
-        message
+        hdrs.iter().any(|(k, v)| k.eq_ignore_ascii_case("warning")
+            && v.contains("unknown field")
+            && v.contains("bogusField")),
+        "default (Warn) must emit a 299 warning for the unknown field; headers={:?}",
+        hdrs
     );
 }
 

@@ -11,6 +11,7 @@ mod bootstrap;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
 mod conversion;
 mod dynamic_routes;
+mod endpoints;
 #[allow(dead_code)]
 mod flow_control;
 mod gnostic;
@@ -21,6 +22,7 @@ mod openapi;
 mod patch;
 mod peer_cert_acceptor;
 mod prometheus_client;
+mod registry;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]
 mod response;

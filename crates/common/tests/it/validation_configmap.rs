@@ -5,9 +5,19 @@ use rusternetes_common::validation::configmap::validate_config_map;
 use std::collections::HashMap;
 
 fn cm() -> ConfigMap {
+    named("validname", "validns")
+}
+
+// Upstream `newConfigMap(name, namespace, ...)` in `TestValidateConfigMap`
+// (pkg/apis/core/validation/validation_test.go).
+fn named(name: &str, namespace: &str) -> ConfigMap {
     ConfigMap {
         type_meta: Default::default(),
-        metadata: Default::default(),
+        metadata: rusternetes_common::types::ObjectMeta {
+            name: name.to_string(),
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        },
         data: None,
         binary_data: None,
         immutable: None,
@@ -109,4 +119,34 @@ fn at_limit_configmap_ok() {
     assert!(validate_config_map(&c)
         .iter()
         .all(|e| e.error_type != rusternetes_common::validation::field::ErrorType::TooLong));
+}
+
+// The ObjectMeta cases of upstream `TestValidateConfigMap`: emptyName,
+// invalidName, emptyNs, invalidNs.
+#[test]
+fn object_meta_is_validated() {
+    for (case, c, field) in [
+        ("empty name", named("", "validns"), "metadata.name"),
+        (
+            "invalid name",
+            named("NoUppercaseOrSpecialCharsLike=Equals", "validns"),
+            "metadata.name",
+        ),
+        (
+            "empty namespace",
+            named("validname", ""),
+            "metadata.namespace",
+        ),
+        (
+            "invalid namespace",
+            named("validname", "NoUppercaseOrSpecialCharsLike=Equals"),
+            "metadata.namespace",
+        ),
+    ] {
+        let errs = validate_config_map(&c);
+        assert!(
+            errs.iter().any(|e| e.field == field),
+            "{case}: expected an error on {field}, got {errs:?}"
+        );
+    }
 }

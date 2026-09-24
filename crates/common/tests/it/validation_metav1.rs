@@ -30,6 +30,9 @@ use rusternetes_common::validation::metav1::{
     validate_label_selector, validate_labels, validate_managed_fields, validate_patch_options,
     LabelSelectorValidationOptions, PatchOptions, APPLY_CBOR_PATCH_TYPE, APPLY_YAML_PATCH_TYPE,
 };
+use rusternetes_common::validation::metav1::{
+    validate_create_options, validate_update_options, CreateOptions, UpdateOptions,
+};
 
 const MERGE_PATCH_TYPE: &str = "application/merge-patch+json";
 
@@ -689,4 +692,32 @@ fn test_label_selector_match_expression_invalid_value() {
         "missing {needle:?} in {errs:?}",
     );
     assert_eq!(errs.len(), 1, "expected exactly one error, got {errs:?}");
+}
+
+// -- ValidateCreateOptions / ValidateUpdateOptions ---------------------------
+// Upstream has no dedicated test; these pin the three checks both run
+// (validation.go:174-188): fieldManager, dryRun, fieldValidation.
+
+#[test]
+fn test_validate_create_and_update_options() {
+    assert!(validate_create_options(&CreateOptions::default()).is_empty());
+    assert!(validate_update_options(&UpdateOptions::default()).is_empty());
+
+    let bad = CreateOptions {
+        field_manager: Some("x".repeat(129)),
+        dry_run: Some(vec!["Nope".to_string()]),
+        field_validation: Some("Loose".to_string()),
+    };
+    let fields: Vec<String> = validate_create_options(&bad)
+        .into_iter()
+        .map(|e| e.field)
+        .collect();
+    assert_eq!(fields, vec!["fieldManager", "dryRun", "fieldValidation"]);
+
+    let bad = UpdateOptions {
+        field_manager: None,
+        dry_run: Some(vec!["All".to_string()]),
+        field_validation: Some("Strict".to_string()),
+    };
+    assert!(validate_update_options(&bad).is_empty());
 }

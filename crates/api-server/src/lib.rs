@@ -5,6 +5,7 @@ pub use rusternetes_admission_webhook::cel_evaluators as cel;
 pub use rusternetes_middleware::cbor;
 pub mod conversion;
 pub mod dynamic_routes;
+pub mod endpoints;
 #[allow(dead_code)]
 pub mod flow_control;
 pub mod gnostic;
@@ -15,6 +16,7 @@ pub mod openapi;
 pub mod patch;
 pub mod peer_cert_acceptor;
 pub mod prometheus_client;
+pub mod registry;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]
 pub mod response;

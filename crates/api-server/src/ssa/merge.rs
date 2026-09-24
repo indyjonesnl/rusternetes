@@ -340,8 +340,8 @@ pub struct ResourceLeafSchema {
     pub atomic_leaves: &'static [&'static str],
     /// Whether the resource honours `immutable: true` post-create (true
     /// for both ConfigMap and Secret). The post-merge enforcement lives
-    /// in the per-resource HTTP handler (`apply_configmap_ssa`,
-    /// `apply_secret_ssa`) rather than in the merge core; this flag is
+    /// in the resource's update validation (ConfigMap's strategy, and
+    /// `apply_secret_ssa` for Secret) rather than in the merge core; this flag is
     /// exposed so a future generic immutability fence can consult the
     /// schema instead of being hard-coded per resource.
     #[allow(dead_code)]

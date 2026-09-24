@@ -1,8 +1,9 @@
 //! Strict-decoding regression tests for client-go-shaped Pod bodies.
 //!
-//! After PR #675 made `?fieldValidation=Strict` the server-side default
-//! (matching K8s 1.25+), any Pod create issued by stock client-go
-//! against rusternetes started failing with
+//! Under `?fieldValidation=Strict` (what kubectl and the FieldValidation
+//! conformance specs send; the server default is Warn, see
+//! staging/src/k8s.io/apiserver/pkg/endpoints/handlers/rest.go:409-413),
+//! Pod creates issued by stock client-go once failed with
 //!
 //!     strict decoding error: unknown field "metadata.creationTimestamp",
 //!     unknown field "spec.hostIPC", unknown field "spec.hostPID"
@@ -41,9 +42,15 @@ fn spawn_router() -> TestApiServer {
 }
 
 // Consumes the harness per request, matching the original by-value Router.
+// `fieldValidation=Strict` is explicit, as client-go / kubectl and the
+// FieldValidation conformance specs send it: the server default is Warn
+// (staging/src/k8s.io/apiserver/pkg/endpoints/handlers/rest.go:409-413).
 async fn post_pod(api: TestApiServer, body: Value) -> (StatusCode, Value) {
-    api.post(&format!("/api/v1/namespaces/{TEST_NS}/pods"), &body)
-        .await
+    api.post(
+        &format!("/api/v1/namespaces/{TEST_NS}/pods?fieldValidation=Strict"),
+        &body,
+    )
+    .await
 }
 
 /// `metadata.creationTimestamp: null` is what `time.Time{}.MarshalJSON()`
@@ -70,7 +77,7 @@ async fn test_client_go_pod_with_creation_timestamp_null_accepted_under_strict()
     let (status, resp) = post_pod(router, body).await;
     assert!(
         status.is_success(),
-        "creationTimestamp: null must be accepted under default-Strict; got {} body={}",
+        "creationTimestamp: null must be accepted under Strict; got {} body={}",
         status,
         resp
     );
@@ -94,7 +101,7 @@ async fn test_client_go_pod_with_host_pid_accepted_under_strict() {
     let (status, resp) = post_pod(router, body).await;
     assert!(
         status.is_success(),
-        "spec.hostPID must be accepted under default-Strict; got {} body={}",
+        "spec.hostPID must be accepted under Strict; got {} body={}",
         status,
         resp
     );
@@ -117,7 +124,7 @@ async fn test_client_go_pod_with_host_ipc_accepted_under_strict() {
     let (status, resp) = post_pod(router, body).await;
     assert!(
         status.is_success(),
-        "spec.hostIPC must be accepted under default-Strict; got {} body={}",
+        "spec.hostIPC must be accepted under Strict; got {} body={}",
         status,
         resp
     );
@@ -149,7 +156,7 @@ async fn test_hydrophone_conformance_pod_shape_accepted_under_strict() {
     let (status, resp) = post_pod(router, body).await;
     assert!(
         status.is_success(),
-        "hydrophone-shaped pod must be accepted under default-Strict; got {} body={}",
+        "hydrophone-shaped pod must be accepted under Strict; got {} body={}",
         status,
         resp
     );

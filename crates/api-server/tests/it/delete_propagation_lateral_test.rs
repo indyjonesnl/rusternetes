@@ -184,18 +184,17 @@ async fn a_user_finalizer_survives_the_gc_recomputation() {
     );
 }
 
-/// The deprecated `orphanDependents` bool overrides `propagationPolicy`
-/// entirely — upstream checks it first, ahead of the policy
-/// (store.go:898-901), and older clients still send it.
+/// The deprecated `orphanDependents` bool still orphans — upstream checks it
+/// ahead of the policy (store.go:898-901), and older clients still send it.
 #[tokio::test]
-async fn the_deprecated_orphan_dependents_bool_overrides_the_policy() {
+async fn the_deprecated_orphan_dependents_bool_orphans() {
     let state = TestApiServer::new();
     let left = delete_with_body(
         &state,
         "/api/v1/namespaces/default/configmaps",
         "cm-deprecated",
         &configmap("cm-deprecated"),
-        &json!({"propagationPolicy":"Foreground","orphanDependents":true}),
+        &json!({"orphanDependents":true}),
     )
     .await
     .expect("orphanDependents=true must orphan, so the object stays");
@@ -203,8 +202,41 @@ async fn the_deprecated_orphan_dependents_bool_overrides_the_policy() {
     assert_eq!(
         finalizers(&left),
         vec!["orphan".to_string()],
-        "orphanDependents=true wins over propagationPolicy=Foreground \
-         (store.go:898-901); got {left}"
+        "orphanDependents=true must add the orphan finalizer; got {left}"
+    );
+}
+
+/// Both at once is refused before the registry sees it:
+/// `ValidateDeleteOptions` (apimachinery/pkg/apis/meta/v1/validation) —
+/// "orphanDependents and deletionPropagation cannot be both set".
+#[tokio::test]
+async fn orphan_dependents_and_propagation_policy_together_are_invalid() {
+    let state = TestApiServer::new();
+    let (status, _, created) = state
+        .send_raw(
+            "POST",
+            "/api/v1/namespaces/default/configmaps",
+            Some("application/json"),
+            Some(&configmap("cm-both")),
+        )
+        .await;
+    assert!(status.is_success(), "create failed {status}: {created}");
+
+    let (status, _, body) = state
+        .send_raw(
+            "DELETE",
+            "/api/v1/namespaces/default/configmaps/cm-both",
+            Some("application/json"),
+            Some(&json!({"propagationPolicy":"Foreground","orphanDependents":true})),
+        )
+        .await;
+    assert_eq!(status.as_u16(), 422, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("orphanDependents and deletionPropagation cannot be both set"),
+        "{body}"
     );
 }
 
