@@ -197,6 +197,7 @@ mod replicaset_handler_test;
 mod replicationcontroller_handler_test;
 mod replicationcontroller_post_e2e_test;
 mod require_create_name_router_test;
+mod resourceclaim_decode_when_absent_test;
 mod resourcequota_handler_test;
 mod resourcequota_status_preserve_test;
 mod resourcequota_status_validation_test;
