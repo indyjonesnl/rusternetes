@@ -81,7 +81,12 @@ pub enum VolumeLifecycleMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenRequest {
-    /// audience is the intended audience of the token
+    /// audience is the intended audience of the token.
+    ///
+    /// An empty audience is legal: `validateTokenRequests`
+    /// (`pkg/apis/storage/validation/validation.go`) rejects only *duplicate*
+    /// audiences and out-of-range expirations.
+    #[serde(default)]
     pub audience: String,
 
     /// expirationSeconds is the requested duration of validity of the request
@@ -155,12 +160,19 @@ pub struct VolumeAttachment {
 #[serde(rename_all = "camelCase")]
 pub struct VolumeAttachmentSpec {
     /// attacher indicates the name of the volume driver that MUST handle this request
+    #[serde(default)]
     pub attacher: String,
 
     /// nodeName represents the node that the volume should be attached to
+    #[serde(default)]
     pub node_name: String,
 
-    /// source represents the volume that should be attached
+    /// source represents the volume that should be attached. A value upstream,
+    /// and `ValidateVolumeAttachmentSpec`
+    /// (`pkg/apis/storage/validation/validation.go:165-175`) answers an empty
+    /// one with "must specify exactly one of inlineVolumeSpec and
+    /// persistentVolumeName".
+    #[serde(default)]
     pub source: VolumeAttachmentSource,
 }
 
@@ -213,7 +225,9 @@ pub struct CSIVolumeSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeAttachmentStatus {
-    /// attached indicates the volume is successfully attached
+    /// attached indicates the volume is successfully attached. A plain bool
+    /// upstream, so an absent key is `false`, not an error.
+    #[serde(default)]
     pub attached: bool,
 
     /// attachmentMetadata is populated with any information returned by the attach operation

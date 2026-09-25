@@ -451,7 +451,13 @@ pub struct ModifyVolumeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_volume_attributes_class_name: Option<String>,
 
-    /// status is the status of the ControllerModifyVolume operation
+    /// status is the status of the ControllerModifyVolume operation.
+    ///
+    /// Upstream validates nothing here — the type's own comment says "New
+    /// statuses can be added in the future. Consumers should check for unknown
+    /// statuses and fail appropriately" (`pkg/apis/core/types.go:665-677`) —
+    /// so an absent status decodes rather than failing the request.
+    #[serde(default)]
     pub status: String,
 }
 
@@ -561,7 +567,13 @@ pub struct TopologySelectorTerm {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TopologySelectorLabelRequirement {
+    /// Both are plain fields upstream, answered by
+    /// `validateTopologySelectorLabelRequirement`
+    /// (`pkg/apis/core/validation/validation.go:5094-5113`): `values` is
+    /// `Required` when empty and `key` goes through `ValidateLabelName`.
+    #[serde(default)]
     pub key: String,
+    #[serde(default)]
     pub values: Vec<String>,
 }
 
