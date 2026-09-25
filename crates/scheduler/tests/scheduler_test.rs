@@ -776,14 +776,14 @@ async fn test_pod_affinity_required() {
         node_affinity: None,
         pod_affinity: Some(PodAffinity {
             required_during_scheduling_ignored_during_execution: Some(vec![PodAffinityTerm {
-                label_selector: LabelSelector {
+                label_selector: Some(LabelSelector {
                     match_labels: {
                         let mut labels = HashMap::new();
                         labels.insert("app".to_string(), "cache".to_string());
                         Some(labels)
                     },
                     match_expressions: None,
-                },
+                }),
                 namespaces: None,
                 topology_key: "topology.kubernetes.io/zone".to_string(),
                 ..Default::default()
@@ -838,14 +838,14 @@ async fn test_pod_affinity_preferred() {
                 WeightedPodAffinityTerm {
                     weight: 100,
                     pod_affinity_term: PodAffinityTerm {
-                        label_selector: LabelSelector {
+                        label_selector: Some(LabelSelector {
                             match_labels: {
                                 let mut labels = HashMap::new();
                                 labels.insert("tier".to_string(), "backend".to_string());
                                 Some(labels)
                             },
                             match_expressions: None,
-                        },
+                        }),
                         namespaces: None,
                         topology_key: "topology.kubernetes.io/zone".to_string(),
                         ..Default::default()
@@ -916,14 +916,14 @@ async fn test_pod_anti_affinity_required() {
         pod_affinity: None,
         pod_anti_affinity: Some(PodAntiAffinity {
             required_during_scheduling_ignored_during_execution: Some(vec![PodAffinityTerm {
-                label_selector: LabelSelector {
+                label_selector: Some(LabelSelector {
                     match_labels: {
                         let mut labels = HashMap::new();
                         labels.insert("app".to_string(), "web".to_string());
                         Some(labels)
                     },
                     match_expressions: None,
-                },
+                }),
                 namespaces: None,
                 topology_key: "kubernetes.io/hostname".to_string(),
                 ..Default::default()
@@ -980,14 +980,14 @@ async fn test_pod_anti_affinity_preferred() {
                 WeightedPodAffinityTerm {
                     weight: 80,
                     pod_affinity_term: PodAffinityTerm {
-                        label_selector: LabelSelector {
+                        label_selector: Some(LabelSelector {
                             match_labels: {
                                 let mut labels = HashMap::new();
                                 labels.insert("app".to_string(), "database".to_string());
                                 Some(labels)
                             },
                             match_expressions: None,
-                        },
+                        }),
                         namespaces: None,
                         topology_key: "kubernetes.io/hostname".to_string(),
                         ..Default::default()
@@ -1077,14 +1077,14 @@ async fn test_topology_spread_with_affinity() {
                     WeightedPodAffinityTerm {
                         weight: 100,
                         pod_affinity_term: PodAffinityTerm {
-                            label_selector: LabelSelector {
+                            label_selector: Some(LabelSelector {
                                 match_labels: {
                                     let mut labels = HashMap::new();
                                     labels.insert("app".to_string(), "spread-test".to_string());
                                     Some(labels)
                                 },
                                 match_expressions: None,
-                            },
+                            }),
                             namespaces: None,
                             topology_key: "topology.kubernetes.io/zone".to_string(),
                             ..Default::default()

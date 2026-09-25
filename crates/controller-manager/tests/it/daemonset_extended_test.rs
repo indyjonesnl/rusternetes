@@ -1192,10 +1192,10 @@ async fn daemonset_with_pod_anti_affinity_skips_conflicting_node() {
         pod_affinity: None,
         pod_anti_affinity: Some(PodAntiAffinity {
             required_during_scheduling_ignored_during_execution: Some(vec![PodAffinityTerm {
-                label_selector: LabelSelector {
+                label_selector: Some(LabelSelector {
                     match_labels: Some(conflict_labels),
                     match_expressions: None,
-                },
+                }),
                 namespaces: Some(vec![ns.to_string()]),
                 topology_key: "kubernetes.io/hostname".to_string(),
                 ..Default::default()

@@ -436,8 +436,10 @@ pub struct ContainerRestartRuleOnExitCodes {
 pub struct PodExtendedResourceClaimStatus {
     /// RequestMappings map each container extended-resource request to a
     /// DeviceRequest in the generated ResourceClaim.
+    #[serde(default)]
     pub request_mappings: Vec<ContainerExtendedResourceRequest>,
     /// ResourceClaimName is the name of the generated ResourceClaim.
+    #[serde(default)]
     pub resource_claim_name: String,
 }
 
@@ -446,8 +448,11 @@ pub struct PodExtendedResourceClaimStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerExtendedResourceRequest {
+    #[serde(default)]
     pub container_name: String,
+    #[serde(default)]
     pub request_name: String,
+    #[serde(default)]
     pub resource_name: String,
 }
 
@@ -1492,8 +1497,11 @@ pub struct PodStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerStatus {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub ready: bool,
+    #[serde(default)]
     pub restart_count: u32,
 
     #[serde(
@@ -1557,6 +1565,7 @@ pub struct ContainerStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceStatus {
     /// Name of the resource (e.g., "cpu", "memory", or extended resource)
+    #[serde(default)]
     pub name: String,
 
     /// List of individual resources tracked for this allocation
@@ -1569,7 +1578,7 @@ pub struct ResourceStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceHealth {
     /// Unique identifier of the resource (e.g., device ID)
-    #[serde(rename = "resourceID")]
+    #[serde(rename = "resourceID", default)]
     pub resource_id: String,
 
     /// Health status of the resource (Healthy, Unhealthy, Unknown)
@@ -1651,11 +1660,12 @@ pub struct NodeAffinity {
 #[serde(rename_all = "camelCase")]
 pub struct NodeSelector {
     /// A list of node selector terms (ORed together)
+    #[serde(default)]
     pub node_selector_terms: Vec<NodeSelectorTerm>,
 }
 
 /// A node selector term is associated with the corresponding weight
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeSelectorTerm {
     /// A list of node selector requirements by node's labels
@@ -1672,9 +1682,11 @@ pub struct NodeSelectorTerm {
 #[serde(rename_all = "camelCase")]
 pub struct NodeSelectorRequirement {
     /// The label key
+    #[serde(default)]
     pub key: String,
 
     /// Operator: In, NotIn, Exists, DoesNotExist, Gt, Lt
+    #[serde(default)]
     pub operator: String,
 
     /// An array of string values
@@ -1687,9 +1699,11 @@ pub struct NodeSelectorRequirement {
 #[serde(rename_all = "camelCase")]
 pub struct PreferredSchedulingTerm {
     /// Weight associated with matching the corresponding nodeSelectorTerm, in the range 1-100
+    #[serde(default)]
     pub weight: i32,
 
     /// A node selector term, associated with the corresponding weight
+    #[serde(default)]
     pub preference: NodeSelectorTerm,
 }
 
@@ -1723,14 +1737,24 @@ pub struct PodAntiAffinity {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PodAffinityTerm {
-    /// A label selector over a set of resources
-    pub label_selector: crate::types::LabelSelector,
+    /// A label selector over a set of resources.
+    ///
+    /// A **pointer** upstream (`staging/src/k8s.io/api/core/v1/types.go`,
+    /// `PodAffinityTerm.LabelSelector *metav1.LabelSelector`), and the
+    /// distinction is load-bearing: `LabelSelectorAsSelector(nil)` returns
+    /// `labels.Nothing()` while `&LabelSelector{}` returns `labels.Everything()`
+    /// (`apimachinery/pkg/apis/meta/v1/helpers.go:37-43`). An absent selector
+    /// therefore matches **no** pods, and an empty one matches every pod — so
+    /// this is `Option`, not a defaulted value (#1939).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_selector: Option<crate::types::LabelSelector>,
 
     /// Namespaces specifies which namespaces the labelSelector applies to
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespaces: Option<Vec<String>>,
 
     /// Topology key for pod placement
+    #[serde(default)]
     pub topology_key: String,
 
     /// A label query over the set of namespaces that the term applies to.
@@ -1753,9 +1777,11 @@ pub struct PodAffinityTerm {
 #[serde(rename_all = "camelCase")]
 pub struct WeightedPodAffinityTerm {
     /// Weight associated with matching the corresponding podAffinityTerm, in the range 1-100
+    #[serde(default)]
     pub weight: i32,
 
     /// Required pod affinity term
+    #[serde(default)]
     pub pod_affinity_term: PodAffinityTerm,
 }
 
@@ -1952,7 +1978,9 @@ pub struct LinuxContainerUser {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeMountStatus {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub mount_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
@@ -1964,6 +1992,7 @@ pub struct VolumeMountStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PodResourceClaimStatus {
+    #[serde(default)]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_claim_name: Option<String>,

@@ -26,10 +26,11 @@ use crate::resources::pod::{
     AppArmorProfile, ConfigMapVolumeSource, Container, ContainerPort, ContainerResizePolicy,
     ContainerRestartRule, DownwardAPIVolumeFile, DownwardAPIVolumeSource, EnvFromSource, EnvVar,
     EphemeralVolumeSource, ExecAction, GRPCAction, HTTPGetAction, HostPathVolumeSource, KeyToPath,
-    Lifecycle, LifecycleHandler, NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodOS,
-    PodReadinessGate, PodResourceClaim, PodSchedulingGate, PodSecurityContext, PodSpec, Probe,
-    ProjectedVolumeSource, ResourceFieldSelector, SeccompProfile, SecretVolumeSource, SleepAction,
-    TCPSocketAction, Toleration, TopologySpreadConstraint, Volume, VolumeDevice, VolumeMount,
+    Lifecycle, LifecycleHandler, NodeAffinity, NodeSelectorTerm, Pod, PodAffinityTerm,
+    PodDNSConfig, PodOS, PodReadinessGate, PodResourceClaim, PodSchedulingGate, PodSecurityContext,
+    PodSpec, PreferredSchedulingTerm, Probe, ProjectedVolumeSource, ResourceFieldSelector,
+    SeccompProfile, SecretVolumeSource, SleepAction, TCPSocketAction, Toleration,
+    TopologySpreadConstraint, Volume, VolumeDevice, VolumeMount, WeightedPodAffinityTerm,
     WorkloadReference,
 };
 use crate::resources::policy::IntOrString;
@@ -415,6 +416,48 @@ pub fn validate_pod_spec(
         errs.extend(validate_os(pod_os, &fld_path.child("os")));
     }
 
+    // affinity (upstream `validatePodSpec`,
+    // `pkg/apis/core/validation/validation.go:4655`).
+    if let Some(affinity) = spec.affinity.as_ref() {
+        let affinity_path = fld_path.child("affinity");
+        if let Some(na) = affinity.node_affinity.as_ref() {
+            errs.extend(validate_node_affinity(
+                na,
+                &affinity_path.child("nodeAffinity"),
+            ));
+        }
+        if let Some(pa) = affinity.pod_affinity.as_ref() {
+            let path = affinity_path.child("podAffinity");
+            errs.extend(validate_pod_affinity_terms(
+                pa.required_during_scheduling_ignored_during_execution
+                    .as_deref()
+                    .unwrap_or(&[]),
+                &path.child("requiredDuringSchedulingIgnoredDuringExecution"),
+            ));
+            errs.extend(validate_weighted_pod_affinity_terms(
+                pa.preferred_during_scheduling_ignored_during_execution
+                    .as_deref()
+                    .unwrap_or(&[]),
+                &path.child("preferredDuringSchedulingIgnoredDuringExecution"),
+            ));
+        }
+        if let Some(paa) = affinity.pod_anti_affinity.as_ref() {
+            let path = affinity_path.child("podAntiAffinity");
+            errs.extend(validate_pod_affinity_terms(
+                paa.required_during_scheduling_ignored_during_execution
+                    .as_deref()
+                    .unwrap_or(&[]),
+                &path.child("requiredDuringSchedulingIgnoredDuringExecution"),
+            ));
+            errs.extend(validate_weighted_pod_affinity_terms(
+                paa.preferred_during_scheduling_ignored_during_execution
+                    .as_deref()
+                    .unwrap_or(&[]),
+                &path.child("preferredDuringSchedulingIgnoredDuringExecution"),
+            ));
+        }
+    }
+
     // workloadRef (upstream `:4728`).
     if let Some(workload_ref) = spec.workload_ref.as_ref() {
         errs.extend(validate_workload_reference(
@@ -423,6 +466,284 @@ pub fn validate_pod_spec(
         ));
     }
 
+    errs
+}
+
+/// Port of upstream `validateNodeAffinity`
+/// (`pkg/apis/core/validation/validation.go:5209-5223`).
+fn validate_node_affinity(na: &NodeAffinity, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if let Some(required) = na
+        .required_during_scheduling_ignored_during_execution
+        .as_ref()
+    {
+        errs.extend(validate_node_selector(
+            required,
+            &fld_path.child("requiredDuringSchedulingIgnoredDuringExecution"),
+        ));
+    }
+    if let Some(preferred) = na
+        .preferred_during_scheduling_ignored_during_execution
+        .as_deref()
+        .filter(|p| !p.is_empty())
+    {
+        errs.extend(validate_preferred_scheduling_terms(
+            preferred,
+            &fld_path.child("preferredDuringSchedulingIgnoredDuringExecution"),
+        ));
+    }
+    errs
+}
+
+/// Port of upstream `ValidateNodeSelector`
+/// (`pkg/apis/core/validation/validation.go:5034-5048`): at least one term,
+/// and each term validated.
+fn validate_node_selector(
+    node_selector: &crate::resources::pod::NodeSelector,
+    fld_path: &Path,
+) -> ErrorList {
+    let terms_path = fld_path.child("nodeSelectorTerms");
+    if node_selector.node_selector_terms.is_empty() {
+        return vec![Error::required(
+            &terms_path,
+            "must have at least one node selector term",
+        )];
+    }
+    let mut errs: ErrorList = Vec::new();
+    for (i, term) in node_selector.node_selector_terms.iter().enumerate() {
+        errs.extend(validate_node_selector_term(term, &terms_path.index(i)));
+    }
+    errs
+}
+
+/// Port of upstream `ValidateNodeSelectorTerm`
+/// (`pkg/apis/core/validation/validation.go:5019-5032`).
+fn validate_node_selector_term(term: &NodeSelectorTerm, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    for (i, req) in term
+        .match_expressions
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        errs.extend(validate_node_selector_requirement(
+            req,
+            &fld_path.child("matchExpressions").index(i),
+        ));
+    }
+    for (i, req) in term
+        .match_fields
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        errs.extend(validate_node_field_selector_requirement(
+            req,
+            &fld_path.child("matchFields").index(i),
+        ));
+    }
+    errs
+}
+
+/// Port of upstream `ValidateNodeSelectorRequirement`
+/// (`pkg/apis/core/validation/validation.go:4956-4985`): the operator decides
+/// how many values are allowed, and the key is a label name.
+fn validate_node_selector_requirement(
+    req: &crate::resources::pod::NodeSelectorRequirement,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let values = req.values.as_deref().unwrap_or(&[]);
+    let values_path = fld_path.child("values");
+
+    match req.operator.as_str() {
+        "In" | "NotIn" => {
+            if values.is_empty() {
+                errs.push(Error::required(
+                    &values_path,
+                    "must be specified when `operator` is 'In' or 'NotIn'",
+                ));
+            }
+        }
+        "Exists" | "DoesNotExist" => {
+            if !values.is_empty() {
+                errs.push(Error::forbidden(
+                    &values_path,
+                    "may not be specified when `operator` is 'Exists' or 'DoesNotExist'",
+                ));
+            }
+        }
+        "Gt" | "Lt" => {
+            if values.len() != 1 {
+                errs.push(Error::required(
+                    &values_path,
+                    "must be specified single value when `operator` is 'Lt' or 'Gt'",
+                ));
+            }
+        }
+        other => errs.push(Error::invalid(
+            &fld_path.child("operator"),
+            other.to_string(),
+            "not a valid selector operator",
+        )),
+    }
+
+    errs.extend(validate_label_name(&req.key, &fld_path.child("key")));
+    for (i, value) in values.iter().enumerate() {
+        for msg in crate::validation::metav1::is_valid_label_value(value) {
+            errs.push(Error::invalid(&values_path.index(i), value.clone(), msg));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `ValidateNodeFieldSelectorRequirement`
+/// (`pkg/apis/core/validation/validation.go:4991-5016`): `matchFields` may only
+/// select `metadata.name`, with exactly one value.
+fn validate_node_field_selector_requirement(
+    req: &crate::resources::pod::NodeSelectorRequirement,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let values = req.values.as_deref().unwrap_or(&[]);
+
+    match req.operator.as_str() {
+        "In" | "NotIn" => {
+            if values.len() != 1 {
+                errs.push(Error::required(
+                    &fld_path.child("values"),
+                    "must be only one value when `operator` is 'In' or 'NotIn' for node field selector",
+                ));
+            }
+        }
+        other => errs.push(Error::invalid(
+            &fld_path.child("operator"),
+            other.to_string(),
+            "not a valid selector operator",
+        )),
+    }
+
+    if req.key != "metadata.name" {
+        errs.push(Error::invalid(
+            &fld_path.child("key"),
+            req.key.clone(),
+            "not a valid field selector key",
+        ));
+    }
+    errs
+}
+
+/// Port of upstream `ValidatePreferredSchedulingTerms`
+/// (`pkg/apis/core/validation/validation.go:5114-5128`). Upstream always allows
+/// an invalid label *value* in a preferred term — the comment there is that it
+/// "can success when cluster has only one node" — which is why this path does
+/// not reuse the required-affinity strictness.
+fn validate_preferred_scheduling_terms(
+    terms: &[PreferredSchedulingTerm],
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    for (i, term) in terms.iter().enumerate() {
+        let idx = fld_path.index(i);
+        if term.weight <= 0 || term.weight > 100 {
+            errs.push(Error::invalid(
+                &idx.child("weight"),
+                term.weight,
+                "must be in the range 1-100",
+            ));
+        }
+        errs.extend(validate_node_selector_term(
+            &term.preference,
+            &idx.child("preference"),
+        ));
+    }
+    errs
+}
+
+/// Port of upstream `validatePodAffinityTerms`
+/// (`pkg/apis/core/validation/validation.go:5169-5176`).
+fn validate_pod_affinity_terms(terms: &[PodAffinityTerm], fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    for (i, term) in terms.iter().enumerate() {
+        errs.extend(validate_pod_affinity_term(term, &fld_path.index(i)));
+    }
+    errs
+}
+
+/// Port of upstream `validateWeightedPodAffinityTerms`
+/// (`pkg/apis/core/validation/validation.go:5178-5188`).
+fn validate_weighted_pod_affinity_terms(
+    terms: &[WeightedPodAffinityTerm],
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    for (i, weighted) in terms.iter().enumerate() {
+        let idx = fld_path.index(i);
+        if weighted.weight <= 0 || weighted.weight > 100 {
+            errs.push(Error::invalid(
+                &idx.child("weight"),
+                weighted.weight,
+                "must be in the range 1-100",
+            ));
+        }
+        errs.extend(validate_pod_affinity_term(
+            &weighted.pod_affinity_term,
+            &idx.child("podAffinityTerm"),
+        ));
+    }
+    errs
+}
+
+/// Port of upstream `validatePodAffinityTerm`
+/// (`pkg/apis/core/validation/validation.go:5152-5166`) together with
+/// `ValidatePodAffinityTermSelector` (`:5130-5137`): both selectors are
+/// validated, every listed namespace is a DNS label, and `topologyKey` is a
+/// required label name.
+fn validate_pod_affinity_term(term: &PodAffinityTerm, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let opts = LabelSelectorValidationOptions {
+        allow_invalid_label_value_in_selector: false,
+        ..Default::default()
+    };
+
+    if let Some(selector) = term.label_selector.as_ref() {
+        errs.extend(validate_label_selector(
+            selector,
+            opts,
+            &fld_path.child("labelSelector"),
+        ));
+    }
+    if let Some(selector) = term.namespace_selector.as_ref() {
+        errs.extend(validate_label_selector(
+            selector,
+            opts,
+            &fld_path.child("namespaceSelector"),
+        ));
+    }
+
+    for name in term.namespaces.as_deref().unwrap_or(&[]) {
+        for msg in is_dns1123_label(name) {
+            // Upstream names the singular child here (`:5158`).
+            errs.push(Error::invalid(
+                &fld_path.child("namespace"),
+                name.clone(),
+                msg,
+            ));
+        }
+    }
+
+    if term.topology_key.is_empty() {
+        errs.push(Error::required(
+            &fld_path.child("topologyKey"),
+            "can not be empty",
+        ));
+    }
+    errs.extend(validate_label_name(
+        &term.topology_key,
+        &fld_path.child("topologyKey"),
+    ));
     errs
 }
 

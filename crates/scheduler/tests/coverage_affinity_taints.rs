@@ -242,7 +242,7 @@ fn pod_with_required_pod_affinity(
         node_affinity: None,
         pod_affinity: Some(PodAffinity {
             required_during_scheduling_ignored_during_execution: Some(vec![PodAffinityTerm {
-                label_selector: selector,
+                label_selector: Some(selector),
                 namespaces,
                 topology_key: topology_key.to_string(),
                 ..Default::default()
@@ -274,7 +274,7 @@ fn pod_with_preferred_pod_affinity(
                 WeightedPodAffinityTerm {
                     weight,
                     pod_affinity_term: PodAffinityTerm {
-                        label_selector: selector,
+                        label_selector: Some(selector),
                         namespaces: None,
                         topology_key: topology_key.to_string(),
                         ..Default::default()
@@ -299,7 +299,7 @@ fn pod_with_required_anti_affinity(name: &str, selector: LabelSelector, topology
         pod_affinity: None,
         pod_anti_affinity: Some(PodAntiAffinity {
             required_during_scheduling_ignored_during_execution: Some(vec![PodAffinityTerm {
-                label_selector: selector,
+                label_selector: Some(selector),
                 namespaces: None,
                 topology_key: topology_key.to_string(),
                 ..Default::default()
@@ -331,7 +331,7 @@ fn pod_with_preferred_anti_affinity(
                 WeightedPodAffinityTerm {
                     weight,
                     pod_affinity_term: PodAffinityTerm {
-                        label_selector: selector,
+                        label_selector: Some(selector),
                         namespaces: None,
                         topology_key: topology_key.to_string(),
                         ..Default::default()
@@ -1160,7 +1160,7 @@ fn pod_anti_affinity_preferred_multiple_terms_accumulate() {
                 WeightedPodAffinityTerm {
                     weight: 30,
                     pod_affinity_term: PodAffinityTerm {
-                        label_selector: label_sel(&[("app", "db")]),
+                        label_selector: Some(label_sel(&[("app", "db")])),
                         namespaces: None,
                         topology_key: "kubernetes.io/hostname".to_string(),
                         ..Default::default()
@@ -1169,7 +1169,7 @@ fn pod_anti_affinity_preferred_multiple_terms_accumulate() {
                 WeightedPodAffinityTerm {
                     weight: 20,
                     pod_affinity_term: PodAffinityTerm {
-                        label_selector: label_sel(&[("tier", "backend")]),
+                        label_selector: Some(label_sel(&[("tier", "backend")])),
                         namespaces: None,
                         topology_key: "kubernetes.io/hostname".to_string(),
                         ..Default::default()
