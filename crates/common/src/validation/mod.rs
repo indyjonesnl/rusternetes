@@ -53,4 +53,5 @@ pub mod storageclass;
 pub mod validating_admission_policy;
 pub mod volumeattachment;
 pub mod volumeattributesclass;
+pub mod volumesnapshot;
 pub mod webhookconfiguration;

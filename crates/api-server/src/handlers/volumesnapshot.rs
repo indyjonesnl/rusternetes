@@ -47,6 +47,17 @@ pub async fn create_volumesnapshot(
     }
 
     vs.metadata.namespace = Some(namespace.clone());
+
+    // The external-snapshotter CRD's `required:` list and its
+    // `x-kubernetes-validations` CEL rules — see
+    // `crates/common/src/validation/volumesnapshot.rs`. Rusternetes serves this
+    // type natively rather than through the CRD machinery, so nothing else
+    // applies the schema.
+    let errs = rusternetes_common::validation::volumesnapshot::validate_volume_snapshot(&vs);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     vs.metadata.ensure_uid();
     vs.metadata.ensure_creation_timestamp();
 
@@ -206,6 +217,19 @@ pub async fn update_volumesnapshot(
 
     vs.metadata.name = name.clone();
     vs.metadata.namespace = Some(namespace.clone());
+
+    // The CRD's source names are `self == oldSelf` immutable and "required
+    // once set", so the update path needs the stored object.
+    let stored: VolumeSnapshot = state
+        .storage
+        .get(&build_key("volumesnapshots", Some(&namespace), &name))
+        .await?;
+    let errs = rusternetes_common::validation::volumesnapshot::validate_volume_snapshot_update(
+        &vs, &stored,
+    );
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
 
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {

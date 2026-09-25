@@ -29,7 +29,7 @@ fn create_test_volumesnapshot(name: &str, namespace: &str, pvc_name: &str) -> Vo
                 persistent_volume_claim_name: Some(pvc_name.to_string()),
                 volume_snapshot_content_name: None,
             },
-            volume_snapshot_class_name: "csi-snapclass".to_string(),
+            volume_snapshot_class_name: Some("csi-snapclass".to_string()),
         },
         status: None,
     }
@@ -47,7 +47,10 @@ async fn test_volumesnapshot_create_and_get() {
     assert_eq!(created.metadata.name, "test-snapshot");
     assert_eq!(created.metadata.namespace, Some("default".to_string()));
     assert!(!created.metadata.uid.is_empty());
-    assert_eq!(created.spec.volume_snapshot_class_name, "csi-snapclass");
+    assert_eq!(
+        created.spec.volume_snapshot_class_name.as_deref(),
+        Some("csi-snapclass")
+    );
     assert_eq!(
         created.spec.source.persistent_volume_claim_name,
         Some("test-pvc".to_string())
@@ -56,7 +59,10 @@ async fn test_volumesnapshot_create_and_get() {
     // Get
     let retrieved: VolumeSnapshot = storage.get(&key).await.unwrap();
     assert_eq!(retrieved.metadata.name, "test-snapshot");
-    assert_eq!(retrieved.spec.volume_snapshot_class_name, "csi-snapclass");
+    assert_eq!(
+        retrieved.spec.volume_snapshot_class_name.as_deref(),
+        Some("csi-snapclass")
+    );
 
     // Clean up
     storage.delete(&key).await.unwrap();
@@ -433,7 +439,7 @@ async fn test_volumesnapshot_from_snapshot_content() {
                 persistent_volume_claim_name: None,
                 volume_snapshot_content_name: Some("snapcontent-existing".to_string()),
             },
-            volume_snapshot_class_name: "csi-snapclass".to_string(),
+            volume_snapshot_class_name: Some("csi-snapclass".to_string()),
         },
         status: None,
     };
@@ -457,13 +463,16 @@ async fn test_volumesnapshot_class_name() {
     let storage = Arc::new(MemoryStorage::new());
 
     let mut vs = create_test_volumesnapshot("test-class", "default", "test-pvc");
-    vs.spec.volume_snapshot_class_name = "custom-snapclass".to_string();
+    vs.spec.volume_snapshot_class_name = Some("custom-snapclass".to_string());
 
     let key = build_key("volumesnapshots", Some("default"), "test-class");
 
     // Create with custom snapshot class
     let created: VolumeSnapshot = storage.create(&key, &vs).await.unwrap();
-    assert_eq!(created.spec.volume_snapshot_class_name, "custom-snapclass");
+    assert_eq!(
+        created.spec.volume_snapshot_class_name.as_deref(),
+        Some("custom-snapclass")
+    );
 
     // Clean up
     storage.delete(&key).await.unwrap();
