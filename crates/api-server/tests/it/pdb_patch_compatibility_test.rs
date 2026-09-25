@@ -71,7 +71,7 @@ fn base_pdb() -> PodDisruptionBudget {
         spec: PodDisruptionBudgetSpec {
             min_available: None,
             max_unavailable: Some(IntOrString::Int(2)),
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(HashMap::from([(
                     "basematch".to_string(),
                     "true".to_string(),
@@ -81,7 +81,7 @@ fn base_pdb() -> PodDisruptionBudget {
                     operator: "In".to_string(),
                     values: Some(vec!["true".to_string()]),
                 }]),
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
         status: None,

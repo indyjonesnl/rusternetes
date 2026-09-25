@@ -1216,7 +1216,13 @@ fn pdb_covers_pod(pdb: &PodDisruptionBudget, pod: &Pod) -> bool {
     {
         return false;
     }
-    match_selector(&pdb.spec.selector, &pod.metadata.labels)
+    // A null selector matches no pods: upstream reads it through
+    // `LabelSelectorAsSelector`, which returns `labels.Nothing()` for nil
+    // (`apimachinery/pkg/apis/meta/v1/helpers.go:37-43`).
+    let Some(selector) = &pdb.spec.selector else {
+        return false;
+    };
+    match_selector(selector, &pod.metadata.labels)
 }
 
 fn is_pod_terminal(p: &Pod) -> bool {
@@ -2419,10 +2425,10 @@ mod tests {
             rusternetes_common::resources::PodDisruptionBudgetSpec {
                 min_available: Some(IntOrString::Int(min_available)),
                 max_unavailable: None,
-                selector: rusternetes_common::types::LabelSelector {
+                selector: Some(rusternetes_common::types::LabelSelector {
                     match_labels: Some(selector_labels),
                     match_expressions: None,
-                },
+                }),
                 unhealthy_pod_eviction_policy: None,
             },
         )

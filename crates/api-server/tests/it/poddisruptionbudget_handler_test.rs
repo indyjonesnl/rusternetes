@@ -30,10 +30,10 @@ fn create_test_pdb(name: &str, namespace: &str, min_available: i32) -> PodDisrup
         spec: PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(min_available)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(match_labels),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
         status: None,
@@ -191,10 +191,10 @@ async fn test_pdb_with_max_unavailable() {
         spec: PodDisruptionBudgetSpec {
             min_available: None,
             max_unavailable: Some(IntOrString::Int(1)),
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(match_labels),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
         status: None,
@@ -236,10 +236,10 @@ async fn test_pdb_with_percentage() {
         spec: PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::String("80%".to_string())),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(match_labels),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
         status: None,
@@ -529,10 +529,10 @@ async fn test_pdb_empty_selector() {
         spec: PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(1)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: None,
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
         status: None,
@@ -546,8 +546,9 @@ async fn test_pdb_empty_selector() {
 
     // Create with empty selector
     let created: PodDisruptionBudget = storage.create(&key, &pdb).await.unwrap();
-    assert!(created.spec.selector.match_labels.is_none());
-    assert!(created.spec.selector.match_expressions.is_none());
+    let selector = created.spec.selector.expect("selector present");
+    assert!(selector.match_labels.is_none());
+    assert!(selector.match_expressions.is_none());
 
     // Clean up
     storage.delete(&key).await.unwrap();

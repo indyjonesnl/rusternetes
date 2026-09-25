@@ -211,7 +211,7 @@ fn make_pdb(
         PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(min_available)),
             max_unavailable: None,
-            selector: make_label_selector(selector_key, selector_val),
+            selector: Some(make_label_selector(selector_key, selector_val)),
             unhealthy_pod_eviction_policy: None,
         },
     )

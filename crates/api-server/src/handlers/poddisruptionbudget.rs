@@ -554,10 +554,10 @@ mod tests {
         let spec = PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(2)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         };
 

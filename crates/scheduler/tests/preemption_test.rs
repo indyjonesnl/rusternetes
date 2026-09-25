@@ -106,10 +106,10 @@ fn make_pdb(name: &str, min_available: i32, app_label: &str) -> PodDisruptionBud
         PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(min_available)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(match_labels),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
     )

@@ -64,6 +64,7 @@ pub struct ResourceQuotaSpec {
 #[serde(rename_all = "camelCase")]
 pub struct ScopeSelector {
     /// A list of scope selector requirements by scope
+    #[serde(default)]
     pub match_expressions: Vec<ScopedResourceSelectorRequirement>,
 }
 
@@ -72,9 +73,11 @@ pub struct ScopeSelector {
 #[serde(rename_all = "camelCase")]
 pub struct ScopedResourceSelectorRequirement {
     /// The name of the scope that the selector applies to
+    #[serde(default)]
     pub scope_name: String,
 
     /// Operator: In, NotIn, Exists, DoesNotExist
+    #[serde(default)]
     pub operator: String,
 
     /// An array of string values
@@ -139,6 +142,7 @@ impl LimitRange {
 #[serde(rename_all = "camelCase")]
 pub struct LimitRangeSpec {
     /// Limits is a list of LimitRangeItem objects
+    #[serde(default)]
     pub limits: Vec<LimitRangeItem>,
 }
 
@@ -148,7 +152,7 @@ pub struct LimitRangeSpec {
 pub struct LimitRangeItem {
     /// Type of resource that this limit applies to
     /// Valid values: Pod, Container, PersistentVolumeClaim
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub item_type: String,
 
     /// Max usage constraints on this kind by resource name
@@ -301,8 +305,22 @@ pub struct PodDisruptionBudgetSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_unavailable: Option<IntOrString>,
 
-    /// Label selector to identify the set of pods
-    pub selector: LabelSelector,
+    /// Label selector to identify the set of pods.
+    ///
+    /// A **pointer** upstream (`staging/src/k8s.io/api/policy/v1/types.go:36-42`,
+    /// `Selector *metav1.LabelSelector`), and its doc comment spells out why
+    /// that matters: "A null selector will match no pods, while an empty ({})
+    /// selector will select all pods within the namespace." Both readers — the
+    /// eviction endpoint (`pkg/registry/core/pod/storage/eviction.go:498`) and
+    /// the disruption controller
+    /// (`pkg/controller/disruption/disruption.go:630`) — go through
+    /// `LabelSelectorAsSelector`, which maps `nil` to `labels.Nothing()` and
+    /// `&LabelSelector{}` to `labels.Everything()`
+    /// (`apimachinery/pkg/apis/meta/v1/helpers.go:37-43`). So this is an
+    /// `Option`, never a defaulted value: defaulting it would turn a PDB that
+    /// guards nothing into one that guards every pod in its namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<LabelSelector>,
 
     /// UnhealthyPodEvictionPolicy controls when unhealthy pods should be considered for eviction
     /// Valid values: IfHealthyBudget, AlwaysAllow
@@ -579,10 +597,10 @@ mod tests {
         let spec = PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(2)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         };
 
@@ -600,10 +618,10 @@ mod tests {
         let int_spec = PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(3)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(HashMap::new()),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         };
 
@@ -617,10 +635,10 @@ mod tests {
         let percent_spec = PodDisruptionBudgetSpec {
             min_available: None,
             max_unavailable: Some(IntOrString::String("20%".to_string())),
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(HashMap::new()),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         };
 

@@ -509,10 +509,10 @@ async fn test_deployment_with_pod_disruption_budget() {
         spec: policy::PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(3)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(labels_for("pdb-app")),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
         status: None,

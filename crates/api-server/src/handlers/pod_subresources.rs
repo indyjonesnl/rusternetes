@@ -1149,7 +1149,12 @@ pub async fn create_eviction(
             // Full label-selector match (matchLabels + matchExpressions).
             // Upstream eviction skips PDBs whose selector is empty or does not
             // match the pod (`selector.Empty() || !selector.Matches(...)`).
-            if !pdb.spec.selector.matches_labels(&pod_labels) {
+            if !pdb
+                .spec
+                .selector
+                .as_ref()
+                .is_some_and(|s| s.matches_labels(&pod_labels))
+            {
                 continue;
             }
 
@@ -1349,11 +1354,21 @@ async fn append_disruption_target_condition<S: Storage>(storage: &S, pod_key: &s
     Ok(())
 }
 
-/// Check if a pod matches a PDB's label selector
+/// Check if a pod matches a PDB's label selector.
+///
+/// A **null** selector matches nothing. Upstream reads `pdb.Spec.Selector`
+/// through `LabelSelectorAsSelector`, which returns `labels.Nothing()` for nil
+/// and `labels.Everything()` for `&LabelSelector{}`
+/// (`apimachinery/pkg/apis/meta/v1/helpers.go:37-43`), so the eviction path
+/// skips a PDB with no selector entirely
+/// (`pkg/registry/core/pod/storage/eviction.go:498-505`).
 fn pod_matches_pdb_selector(
     pod: &rusternetes_common::resources::Pod,
-    selector: &rusternetes_common::types::LabelSelector,
+    selector: &Option<rusternetes_common::types::LabelSelector>,
 ) -> bool {
+    let Some(selector) = selector else {
+        return false;
+    };
     let pod_labels = match &pod.metadata.labels {
         Some(labels) => labels,
         None => return false,
@@ -1865,10 +1880,10 @@ mod tests {
             spec: PodDisruptionBudgetSpec {
                 min_available: Some(IntOrString::Int(min_available)),
                 max_unavailable: None,
-                selector: LabelSelector {
+                selector: Some(LabelSelector {
                     match_labels: Some(match_labels),
                     match_expressions: None,
-                },
+                }),
                 unhealthy_pod_eviction_policy: None,
             },
             status: None,
@@ -2058,13 +2073,18 @@ mod tests {
             match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
             match_expressions: None,
         };
-        assert!(pod_matches_pdb_selector(&pod, &selector));
+        assert!(pod_matches_pdb_selector(&pod, &Some(selector)));
 
         let wrong_selector = LabelSelector {
             match_labels: Some(HashMap::from([("app".to_string(), "api".to_string())])),
             match_expressions: None,
         };
-        assert!(!pod_matches_pdb_selector(&pod, &wrong_selector));
+        assert!(!pod_matches_pdb_selector(&pod, &Some(wrong_selector)));
+
+        // A null selector matches nothing, even a pod that every other
+        // selector here matches (`LabelSelectorAsSelector(nil)` =
+        // `labels.Nothing()`, `apimachinery/pkg/apis/meta/v1/helpers.go:37-43`).
+        assert!(!pod_matches_pdb_selector(&pod, &None));
     }
 
     #[test]
@@ -2095,10 +2115,10 @@ mod tests {
             spec: PodDisruptionBudgetSpec {
                 min_available: Some(IntOrString::String("50%".to_string())),
                 max_unavailable: None,
-                selector: LabelSelector {
+                selector: Some(LabelSelector {
                     match_labels: Some(HashMap::new()),
                     match_expressions: None,
-                },
+                }),
                 unhealthy_pod_eviction_policy: None,
             },
             status: None,
