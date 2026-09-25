@@ -68,6 +68,28 @@ fn spawn_state() -> TestApiServer {
     TestApiServer::new()
 }
 
+/// Seed a CRD straight into storage, bypassing the create handler's validation.
+///
+/// Upstream requires a conversion webhook URL to be `https`
+/// (`validateCustomResourceConversion` -> `webhook.ValidateWebhookURL(..., true)`,
+/// `apiextensions-apiserver/.../validation/validation.go:628`), and the mock
+/// webhook these two tests drive speaks plain HTTP in-process. The tests are
+/// about the conversion *call path*, not about CRD admission, so they install
+/// the CRD the way a cluster that already holds one behaves, rather than
+/// weakening the validator to accept a URL no real cluster would.
+async fn seed_crd(state: &TestApiServer, crd_body: &Value) {
+    use rusternetes_storage::Storage;
+    let name = crd_body["metadata"]["name"].as_str().expect("crd name");
+    state
+        .storage
+        .create(
+            &rusternetes_storage::build_key("customresourcedefinitions", None, name),
+            crd_body,
+        )
+        .await
+        .expect("seed crd");
+}
+
 /// POST the given CRD JSON. Returns `(status, body)`.
 async fn post_crd(state: &TestApiServer, crd_body: &Value) -> (u16, Value) {
     let (status, value) = state.post(CRDS_URI, crd_body).await;
@@ -1044,13 +1066,7 @@ async fn crd_conversion_webhook_converts_v1_to_v2() {
             ]
         }
     });
-    let (status, body) = post_crd(&state, &crd).await;
-    assert!(
-        (200..300).contains(&status),
-        "conversion-strategy=Webhook CRD must be accepted, got {} body={:?}",
-        status,
-        body
-    );
+    seed_crd(&state, &crd).await;
 
     // Create a v1 CR with `hostPort: localhost:8080`.
     let cr_v1 = json!({
@@ -1157,8 +1173,7 @@ async fn crd_conversion_webhook_converts_non_homogeneous_list() {
             ]
         }
     });
-    let (status, _) = post_crd(&state, &crd).await;
-    assert!((200..300).contains(&status));
+    seed_crd(&state, &crd).await;
 
     // CR #1: created at v1 (stored as v1).
     let cr_v1 = json!({

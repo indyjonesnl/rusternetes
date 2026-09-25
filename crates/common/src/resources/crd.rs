@@ -78,9 +78,18 @@ impl CustomResourceDefinition {
 #[serde(rename_all = "camelCase")]
 pub struct CustomResourceDefinitionSpec {
     /// Group is the API group of the custom resource
+    ///
+    /// `validateCustomResourceDefinitionSpec` answers an absent group with
+    /// `Required`
+    /// (`apiextensions-apiserver/pkg/apis/apiextensions/validation/validation.go:356`).
+    #[serde(default)]
     pub group: String,
 
     /// Names specify the resource and kind names for the custom resource
+    ///
+    /// Absent is the zero `CustomResourceDefinitionNames` upstream, whose
+    /// `plural`/`singular`/`kind`/`listKind` are each `Required` (`:456-470`).
+    #[serde(default)]
     pub names: CustomResourceDefinitionNames,
 
     /// Scope indicates whether the resource is cluster-scoped or namespace-scoped
@@ -91,6 +100,10 @@ pub struct CustomResourceDefinitionSpec {
     pub scope: ResourceScope,
 
     /// Versions is the list of versions for this custom resource
+    ///
+    /// An absent list is an empty one upstream, which fails the
+    /// `storageFlagCount != 1` check (`:437-439`).
+    #[serde(default)]
     pub versions: Vec<CustomResourceDefinitionVersion>,
 
     /// Conversion defines conversion settings for the CRD
@@ -160,13 +173,21 @@ pub enum ResourceScope {
 #[serde(rename_all = "camelCase")]
 pub struct CustomResourceDefinitionVersion {
     /// Name is the version name (e.g., "v1", "v1beta1")
+    ///
+    /// An absent name is `""`, which `IsDNS1035Label` rejects (`:409-411`).
+    #[serde(default)]
     pub name: String,
 
     /// Served indicates whether this version is served by the API server
+    #[serde(default)]
     pub served: bool,
 
     /// Storage indicates whether this version should be used when persisting to storage
     /// Only one version can be marked as storage version
+    ///
+    /// Absent is `false`; a spec with no storage version fails
+    /// `must have exactly one version marked as storage version` (`:437`).
+    #[serde(default)]
     pub storage: bool,
 
     /// Deprecated indicates this version is deprecated
@@ -206,6 +227,10 @@ pub struct CustomResourceDefinitionVersion {
 pub struct SelectableField {
     /// JSONPath of the field, rooted at the custom resource. Must start
     /// with `.` (e.g. `.spec.color`).
+    ///
+    /// `ValidateCustomResourceSelectableFields` answers an absent path with
+    /// `Required` (`validation.go:860`).
+    #[serde(default)]
     pub json_path: String,
 }
 
@@ -214,7 +239,10 @@ pub struct SelectableField {
 #[serde(rename_all = "camelCase")]
 pub struct CustomResourceValidation {
     /// OpenAPIV3Schema is the OpenAPI v3 schema to validate against
-    #[serde(rename = "openAPIV3Schema")]
+    ///
+    /// A `schema: {}` with no `openAPIV3Schema` is the zero schema upstream,
+    /// which the structural-schema check rejects rather than the decoder.
+    #[serde(rename = "openAPIV3Schema", default)]
     pub open_apiv3_schema: JSONSchemaProps,
 }
 
@@ -558,9 +586,16 @@ pub struct CustomResourceSubresourceStatus {}
 #[serde(rename_all = "camelCase")]
 pub struct CustomResourceSubresourceScale {
     /// SpecReplicasPath is the JSON path in the custom resource for the replica count
+    ///
+    /// `ValidateCustomResourceDefinitionSubresources` answers an absent path
+    /// with `Required` (`validation.go:1533`).
+    #[serde(default)]
     pub spec_replicas_path: String,
 
     /// StatusReplicasPath is the JSON path in the custom resource for the status replica count
+    ///
+    /// `Required` when absent (`validation.go:1544`).
+    #[serde(default)]
     pub status_replicas_path: String,
 
     /// LabelSelectorPath is the JSON path for the label selector
@@ -593,7 +628,10 @@ pub struct CustomResourceColumnDefinition {
     pub priority: Option<i32>,
 
     /// JSONPath is the JSON path to the field in the custom resource
-    #[serde(rename = "jsonPath")]
+    ///
+    /// `ValidateCustomResourceColumnDefinition` answers an absent path with
+    /// `Required` (`validation.go:838`).
+    #[serde(rename = "jsonPath", default)]
     pub json_path: String,
 }
 
@@ -602,7 +640,13 @@ pub struct CustomResourceColumnDefinition {
 #[serde(rename_all = "camelCase")]
 pub struct CustomResourceConversion {
     /// Strategy specifies how to convert between versions
-    pub strategy: ConversionStrategyType,
+    ///
+    /// Upstream's is a string type, so an absent strategy is `""` and
+    /// `validateEnumStrings(..., required=true)` answers `Required`
+    /// (`validation.go:617`). A closed Rust enum has no member for `""`, so the
+    /// absent case is an `Option`, reported as `Required` by the same rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<ConversionStrategyType>,
 
     /// Webhook describes how to call the conversion webhook (if strategy is Webhook)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -624,9 +668,17 @@ pub enum ConversionStrategyType {
 #[serde(rename_all = "camelCase")]
 pub struct WebhookConversion {
     /// ClientConfig describes how to connect to the webhook
+    ///
+    /// Absent is the zero client config upstream, which fails
+    /// `exactly one of url or service is required` (`validation.go:624`).
+    #[serde(default)]
     pub client_config: WebhookClientConfig,
 
     /// ConversionReviewVersions is the ordered list of API versions the webhook accepts
+    ///
+    /// An absent list is `Required` (`validateConversionReviewVersions`,
+    /// `validation.go:529-530`).
+    #[serde(default)]
     pub conversion_review_versions: Vec<String>,
 }
 
@@ -651,7 +703,13 @@ pub struct WebhookClientConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceReference {
+    /// `ValidateWebhookService` answers an absent namespace with `Required`
+    /// (`apiserver/pkg/util/webhook/validation.go:71-73`).
+    #[serde(default)]
     pub namespace: String,
+
+    /// `Required` when absent (`validation.go:67-69`).
+    #[serde(default)]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
