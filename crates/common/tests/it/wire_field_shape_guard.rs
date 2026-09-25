@@ -460,6 +460,23 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// create-time validation at all before these slices: volume sources (a pod
 /// whose only volume was `{"name":"v"}` was a 201) and affinity.
 ///
+/// `ingress.rs` / `ingressclass.rs` / `event.rs` / `metrics.rs` /
+/// `service_account.rs` / `policy.rs`: every field here already had a
+/// validator, so the slice was pure reachability — `HTTPIngressRuleValue.paths`
+/// and `HTTPIngressPath.pathType`/`.backend` (`validateHTTPIngressPath` /
+/// `ValidateIngressSpec`, `pkg/apis/networking/validation/validation.go`),
+/// `IngressClassSpec.controller` and its `parameters` reference
+/// (`ValidateIngressClassSpec`), `EventSeries.count`/`.lastObservedTime`
+/// (`ValidateEventCreate`, `pkg/apis/core/validation/events.go`), and the
+/// ResourceQuota scope selector plus LimitRange item type
+/// (`validateScopedResourceSelectorRequirement`, `ValidateLimitRange`).
+///
+/// Two of those carry the opposite obligation: `ServiceAccount`'s
+/// `imagePullSecrets[].name` and `metrics.k8s.io`'s `ContainerMetrics.name`
+/// have no upstream validation at all — `ValidateServiceAccount` checks only
+/// ObjectMeta, and `metrics.k8s.io` is a read-only aggregated API — so the
+/// tests pin the *accept*, not a rejection.
+///
 /// Not every pod field could be defaulted. `PodAffinityTerm.labelSelector` is a
 /// **pointer** upstream and stays an `Option` here, because
 /// `LabelSelectorAsSelector(nil)` is `labels.Nothing()` while
@@ -520,13 +537,19 @@ const AUDITED_MODULES: &[&str] = &[
     "admission_webhook.rs",
     "deployment.rs",
     "endpointslice.rs",
+    "event.rs",
     "flowcontrol.rs",
+    "ingress.rs",
+    "ingressclass.rs",
     "ipaddress.rs",
+    "metrics.rs",
     "networking.rs",
     "node.rs",
     "pod.rs",
+    "policy.rs",
     "rbac.rs",
     "service.rs",
+    "service_account.rs",
     "workloads.rs",
 ];
 

@@ -192,11 +192,21 @@ pub enum EventType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EventSeries {
-    /// Number of occurrences in this series up to the last heartbeat time
+    /// Number of occurrences in this series up to the last heartbeat time.
+    ///
+    /// Plain (non-pointer) upstream, so an absent key decodes to `0` and
+    /// `ValidateEventCreate` answers it: a series must have `count >= 2`
+    /// (`pkg/apis/core/validation/events.go`).
+    #[serde(default)]
     pub count: i32,
 
     /// Time of the last occurrence observed (MicroTime format for K8s compatibility)
+    /// Absent decodes to the zero time, which validation reports as
+    /// `series.lastObservedTime: Required value` — upstream's `MicroTime` is a
+    /// plain struct whose zero value `ValidateEventCreate` rejects
+    /// (`pkg/apis/core/validation/events.go`).
     #[serde(
+        default = "zero_micro_time",
         serialize_with = "crate::types::k8s_micro_time_required::serialize",
         deserialize_with = "crate::types::k8s_micro_time_required::deserialize"
     )]
@@ -213,8 +223,10 @@ pub struct EventList {
     #[serde(default = "default_kind_list")]
     pub kind: String,
 
+    #[serde(default)]
     pub metadata: crate::types::ListMeta,
 
+    #[serde(default)]
     pub items: Vec<Event>,
 }
 
@@ -235,6 +247,12 @@ fn default_api_version() -> String {
 
 fn default_kind() -> String {
     "Event".to_string()
+}
+
+/// Go's zero `metav1.MicroTime` — what an absent `lastObservedTime` decodes to,
+/// and what `ValidateEventCreate` rejects as missing.
+fn zero_micro_time() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch is a valid timestamp")
 }
 
 fn default_kind_list() -> String {
@@ -454,8 +472,10 @@ pub struct EventV1List {
     #[serde(default = "default_kind_list")]
     pub kind: String,
 
+    #[serde(default)]
     pub metadata: crate::types::ListMeta,
 
+    #[serde(default)]
     pub items: Vec<EventV1>,
 }
 

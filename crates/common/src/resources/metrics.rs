@@ -56,6 +56,9 @@ pub struct PodMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerMetrics {
+    /// `metrics.k8s.io` is a read-only aggregated API with no upstream
+    /// validation, so an absent name decodes rather than failing.
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub usage: BTreeMap<String, String>,

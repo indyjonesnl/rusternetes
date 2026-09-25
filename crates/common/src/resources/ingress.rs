@@ -88,7 +88,11 @@ pub struct IngressRule {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HTTPIngressRuleValue {
-    /// Paths is a collection of paths that map requests to backends
+    /// Paths is a collection of paths that map requests to backends.
+    ///
+    /// Absent decodes to an empty list, which `ValidateIngressSpec` reports as
+    /// `Required` (`pkg/apis/networking/validation/validation.go`).
+    #[serde(default)]
     pub paths: Vec<HTTPIngressPath>,
 }
 
@@ -102,15 +106,22 @@ pub struct HTTPIngressPath {
 
     /// PathType determines the interpretation of the Path matching
     /// Exact, Prefix, or ImplementationSpecific
-    #[serde(alias = "pathType")]
+    /// A pointer upstream whose absence `validateHTTPIngressPath` reports as
+    /// `Required(pathType, "pathType must be specified")`; the empty string
+    /// takes the same branch here.
+    #[serde(alias = "pathType", default)]
     pub path_type: String,
 
-    /// Backend defines the referenced service endpoint
+    /// Backend defines the referenced service endpoint. A value upstream, and
+    /// `validateHTTPIngressPath` always runs `validateIngressBackend` over it,
+    /// so an absent backend is answered with "must specify a service or
+    /// resource" rather than a decode failure.
+    #[serde(default)]
     pub backend: IngressBackend,
 }
 
 /// IngressBackend describes all endpoints for a given service and port
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct IngressBackend {
     /// Service references a Service as a backend
@@ -130,8 +141,10 @@ pub struct TypedLocalObjectReference {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_group: Option<String>,
     /// Kind of the referent.
+    #[serde(default)]
     pub kind: String,
     /// Name of the referent.
+    #[serde(default)]
     pub name: String,
 }
 
@@ -139,7 +152,10 @@ pub struct TypedLocalObjectReference {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct IngressServiceBackend {
-    /// Name is the referenced service
+    /// Name is the referenced service. `validateIngressBackend` requires it
+    /// once a service backend is present, so an absent name is a 422 with a
+    /// field path rather than a decode failure.
+    #[serde(default)]
     pub name: String,
 
     /// Port of the referenced service
@@ -203,7 +219,9 @@ fn default_protocol() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct IngressPortStatus {
-    /// Port is the port number of the ingress port
+    /// Port is the port number of the ingress port. Status-only, and upstream
+    /// validates nothing here.
+    #[serde(default)]
     pub port: i32,
 
     /// Protocol is the protocol of the ingress port (TCP, UDP, SCTP)
