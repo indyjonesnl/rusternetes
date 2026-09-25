@@ -536,6 +536,25 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// never creates or validates, so their tests pin the *accept*, as
 /// `ServiceAccount.imagePullSecrets[].name` and `ContainerMetrics.name` do.
 ///
+/// `validating_admission_policy.rs`: 8 fields over the policy spec
+/// (`ParamKind.kind`, `Validation.expression`, `AuditAnnotation.key` and
+/// `.valueExpression`, `Variable.name` and `.expression`) and the status
+/// (`ExpressionWarning.fieldRef` and `.warning`). Rusternetes had no
+/// admissionregistration policy validator at all — a policy with an empty
+/// `validations[0].expression`, a duplicate variable name or an unsupported
+/// `validationActions` entry was a 201 — so this slice ported
+/// `validateValidatingAdmissionPolicySpec`
+/// (`pkg/apis/admissionregistration/validation/validation.go:772`) and its
+/// children, `validateValidatingAdmissionPolicyBindingSpec` (`:1181`) and
+/// `validateValidatingAdmissionPolicyStatusUpdate` (`:1247`) before defaulting
+/// anything, for the usual reason: defaulting a field whose validator does not
+/// exist converts serde's 400 into a silent accept rather than into upstream's
+/// 422. Upstream's rule surface is shared with the admission webhooks —
+/// `validateRuleWithOperations` and `validateMatchConditions` are the same
+/// predicates a webhook's rules go through — so the port calls the one
+/// `webhookconfiguration.rs` copy (`validate_rule_parts`) rather than growing a
+/// second.
+///
 /// Not every pod field could be defaulted. `PodAffinityTerm.labelSelector` is a
 /// **pointer** upstream and stays an `Option` here, because
 /// `LabelSelectorAsSelector(nil)` is `labels.Nothing()` while
@@ -617,6 +636,7 @@ const AUDITED_MODULES: &[&str] = &[
     "rbac.rs",
     "service.rs",
     "service_account.rs",
+    "validating_admission_policy.rs",
     "workloads.rs",
 ];
 

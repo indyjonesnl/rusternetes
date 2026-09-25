@@ -37,7 +37,7 @@ impl ValidatingAdmissionPolicy {
 }
 
 /// ValidatingAdmissionPolicySpec describes the policy spec
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidatingAdmissionPolicySpec {
     /// ParamKind specifies the kind of resources used to parameterize this policy
@@ -82,6 +82,10 @@ pub struct ParamKind {
     pub api_version: Option<String>,
 
     /// Kind is the API kind the resources belong to
+    ///
+    /// `validateParamKind` answers an absent kind with `Required`
+    /// (`pkg/apis/admissionregistration/validation/validation.go:866-871`).
+    #[serde(default)]
     pub kind: String,
 }
 
@@ -180,6 +184,10 @@ pub enum MatchPolicyType {
 #[serde(rename_all = "camelCase")]
 pub struct Validation {
     /// Expression is the CEL expression which is evaluated to validate the request
+    ///
+    /// `validateValidation` answers an absent or whitespace-only expression
+    /// with `Required: expression is not specified` (`validation.go:1039-1041`).
+    #[serde(default)]
     pub expression: String,
 
     /// Message is the message to display when validation fails
@@ -242,9 +250,16 @@ pub enum FailurePolicy {
 #[serde(rename_all = "camelCase")]
 pub struct AuditAnnotation {
     /// Key is the audit annotation key
+    ///
+    /// Validated as `<policy name>/<key>` against the qualified-name rule
+    /// (`validateAuditAnnotation`, `validation.go:1130-1134`).
+    #[serde(default)]
     pub key: String,
 
     /// ValueExpression is a CEL expression which is evaluated to produce an audit annotation value
+    ///
+    /// `Required: valueExpression is not specified` when absent (`:1137-1139`).
+    #[serde(default)]
     pub value_expression: String,
 }
 
@@ -253,9 +268,16 @@ pub struct AuditAnnotation {
 #[serde(rename_all = "camelCase")]
 pub struct Variable {
     /// Name is the name of the variable
+    ///
+    /// `validateVariable` answers an absent name with
+    /// `Required: name is not specified` (`validation.go:1001-1003`).
+    #[serde(default)]
     pub name: String,
 
     /// Expression is the CEL expression which is evaluated to set the value of the variable
+    ///
+    /// `Required: expression is not specified` when absent (`:1008-1010`).
+    #[serde(default)]
     pub expression: String,
 }
 
@@ -290,9 +312,17 @@ pub struct TypeChecking {
 #[serde(rename_all = "camelCase")]
 pub struct ExpressionWarning {
     /// FieldRef is a reference to the field containing the expression
+    ///
+    /// `validateFieldRef` answers an absent (or whitespace-only) reference with
+    /// `Required` (`pkg/apis/admissionregistration/validation/validation.go:1287-1291`).
+    #[serde(default)]
     pub field_ref: String,
 
     /// Warning is the warning message
+    ///
+    /// `validateExpressionWarning` answers an absent warning with `Required`
+    /// (`validation.go:1280-1282`).
+    #[serde(default)]
     pub warning: String,
 }
 
@@ -347,7 +377,7 @@ impl ValidatingAdmissionPolicyBinding {
 }
 
 /// ValidatingAdmissionPolicyBindingSpec is the specification of the ValidatingAdmissionPolicyBinding
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidatingAdmissionPolicyBindingSpec {
     /// PolicyName references a ValidatingAdmissionPolicy

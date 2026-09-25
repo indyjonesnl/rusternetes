@@ -284,7 +284,7 @@ pub enum ReinvocationPolicy {
 }
 
 /// LabelSelector is used to select resources by labels
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LabelSelector {
     /// MatchLabels is a map of {key,value} pairs
