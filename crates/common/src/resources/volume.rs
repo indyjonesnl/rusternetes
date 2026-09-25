@@ -113,7 +113,9 @@ pub enum HostPathType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NFSVolumeSource {
+    #[serde(default)]
     pub server: String,
+    #[serde(default)]
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
@@ -122,8 +124,11 @@ pub struct NFSVolumeSource {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ISCSIVolumeSource {
+    #[serde(default)]
     pub target_portal: String,
+    #[serde(default)]
     pub iqn: String,
+    #[serde(default)]
     pub lun: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iscsi_interface: Option<String>,

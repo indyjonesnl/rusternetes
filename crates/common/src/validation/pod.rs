@@ -23,10 +23,12 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::resources::pod::{
-    AppArmorProfile, Container, ContainerPort, ContainerResizePolicy, ContainerRestartRule,
-    EnvFromSource, EnvVar, ExecAction, GRPCAction, HTTPGetAction, Lifecycle, LifecycleHandler,
-    NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodOS, PodReadinessGate, PodResourceClaim,
-    PodSchedulingGate, PodSecurityContext, PodSpec, Probe, SeccompProfile, SleepAction,
+    AppArmorProfile, ConfigMapVolumeSource, Container, ContainerPort, ContainerResizePolicy,
+    ContainerRestartRule, DownwardAPIVolumeFile, DownwardAPIVolumeSource, EnvFromSource, EnvVar,
+    EphemeralVolumeSource, ExecAction, GRPCAction, HTTPGetAction, HostPathVolumeSource, KeyToPath,
+    Lifecycle, LifecycleHandler, NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodOS,
+    PodReadinessGate, PodResourceClaim, PodSchedulingGate, PodSecurityContext, PodSpec, Probe,
+    ProjectedVolumeSource, ResourceFieldSelector, SeccompProfile, SecretVolumeSource, SleepAction,
     TCPSocketAction, Toleration, TopologySpreadConstraint, Volume, VolumeDevice, VolumeMount,
     WorkloadReference,
 };
@@ -2076,11 +2078,24 @@ fn validate_config_or_secret_key_selector(name: &str, key: &str, fld_path: &Path
 ///
 /// Mirrors upstream `validateVolumes`
 /// (`pkg/apis/core/validation/validation.go`, release-1.35).
+/// Port of upstream `ValidateVolumes`
+/// (`pkg/apis/core/validation/validation.go:453-495`): each volume's name is a
+/// required, unique DNS-1123 label, and its **source** is validated by
+/// [`validate_volume_source`].
+///
+/// Upstream also rejects a `persistentVolumeClaim` that names a PVC an
+/// `ephemeral` volume in the same pod would create (`:487-492`). That check
+/// needs the pod's name, which this validator is not given — and upstream
+/// itself skips it in exactly that case ("Without it, this sanity check has to
+/// be skipped", `:459-461`), so skipping it here is the same behaviour, not a
+/// shortcut.
 fn validate_volumes(volumes: &[Volume], fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
     for (i, vol) in volumes.iter().enumerate() {
-        let vpath = fld_path.index(i).child("name");
+        let idx = fld_path.index(i);
+        let vpath = idx.child("name");
+        errs.extend(validate_volume_source(vol, &idx));
         if vol.name.is_empty() {
             errs.push(Error::required(&vpath, ""));
         } else {
@@ -2090,6 +2105,691 @@ fn validate_volumes(volumes: &[Volume], fld_path: &Path) -> ErrorList {
             if !seen.insert(vol.name.as_str()) {
                 errs.push(Error::duplicate(&vpath, vol.name.clone()));
             }
+        }
+    }
+    errs
+}
+
+/// Upstream `supportedHostPathTypes`
+/// (`pkg/apis/core/validation/validation.go:1400-1408`). `""` is
+/// `HostPathUnset`, the zero value, and is supported.
+const HOST_PATH_TYPES: &[&str] = &[
+    "",
+    "DirectoryOrCreate",
+    "Directory",
+    "FileOrCreate",
+    "File",
+    "Socket",
+    "CharDevice",
+    "BlockDevice",
+];
+
+/// Upstream `validVolumeDownwardAPIFieldPathExpressions`
+/// (`pkg/apis/core/validation/validation.go:1114-1119`) — a strict subset of
+/// the env-var list: a volume file cannot project `spec.*` or `status.*`.
+const VOLUME_DOWNWARD_API_FIELD_PATHS: &[&str] = &[
+    "metadata.name",
+    "metadata.namespace",
+    "metadata.labels",
+    "metadata.annotations",
+    "metadata.uid",
+];
+
+/// Upstream `validContainerResourceFieldPathExpressions`
+/// (`pkg/apis/core/validation/validation.go:2796-2803`).
+const CONTAINER_RESOURCE_FIELD_PATHS: &[&str] = &[
+    "limits.cpu",
+    "limits.memory",
+    "limits.ephemeral-storage",
+    "requests.cpu",
+    "requests.memory",
+    "requests.ephemeral-storage",
+];
+
+/// Upstream `hugepagesRequestsPrefixDownwardAPI` /
+/// `hugepagesLimitsPrefixDownwardAPI` (`validation.go:2807-2808`).
+const CONTAINER_RESOURCE_FIELD_PREFIXES: &[&str] = &["requests.hugepages-", "limits.hugepages-"];
+
+/// Upstream `keyType` allowlist for a podCertificate projection
+/// (`pkg/apis/core/validation/validation.go:1305-1310`).
+const POD_CERTIFICATE_KEY_TYPES: &[&str] = &[
+    "RSA3072",
+    "RSA4096",
+    "ECDSAP256",
+    "ECDSAP384",
+    "ECDSAP521",
+    "ED25519",
+];
+
+/// Upstream `fileModeErrorMsg` (`pkg/apis/core/validation/validation.go`).
+const FILE_MODE_ERR_MSG: &str = "must be a number between 0 and 0777 (octal), both inclusive";
+
+/// Port of upstream `ValidateLocalNonReservedPath`: a relative path with no
+/// `..` component that additionally must not *start* with `..`.
+fn validate_local_non_reserved_path(target: &str, fld_path: &Path) -> ErrorList {
+    let mut errs = validate_local_descending_path(target, fld_path);
+    // Upstream suppresses this when the `..` element check already fired.
+    if target.starts_with("..") && !target.starts_with("../") {
+        errs.push(Error::invalid(
+            fld_path,
+            target.to_string(),
+            "must not start with '..'",
+        ));
+    }
+    errs
+}
+
+/// Upstream's file-mode bound, applied to `defaultMode` and to a projected
+/// item's `mode`.
+fn validate_file_mode(mode: Option<i32>, fld_path: &Path) -> ErrorList {
+    match mode {
+        Some(m) if !(0..=0o777).contains(&m) => {
+            vec![Error::invalid(fld_path, m, FILE_MODE_ERR_MSG)]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Port of upstream `validateVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:552-814`): exactly one volume type
+/// must be set, and the one that is gets its own validator. Every arm follows
+/// upstream's shape — a second type is `Forbidden` with "may not specify more
+/// than 1 volume type", and no type at all is `Required` with "must specify a
+/// volume type" (`:808-810`).
+fn validate_volume_source(vol: &Volume, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let mut num_volumes = 0usize;
+
+    /// Upstream's `if numVolumes > 0 { Forbidden } else { numVolumes++; validate }`.
+    macro_rules! source {
+        ($opt:expr, $child:expr, $validate:expr) => {
+            if let Some(src) = $opt {
+                let child_path = fld_path.child($child);
+                if num_volumes > 0 {
+                    errs.push(Error::forbidden(
+                        &child_path,
+                        "may not specify more than 1 volume type",
+                    ));
+                } else {
+                    num_volumes += 1;
+                    #[allow(clippy::redundant_closure_call)]
+                    errs.extend($validate(src, &child_path));
+                }
+            }
+        };
+    }
+
+    source!(
+        vol.empty_dir.as_ref(),
+        "emptyDir",
+        |ed: &crate::resources::pod::EmptyDirVolumeSource, path: &Path| {
+            // Upstream rejects a negative `sizeLimit` (`:556-558`); a value that is
+            // not a quantity at all cannot reach here in Go, but can in Rust.
+            let mut e: ErrorList = Vec::new();
+            if let Some(limit) = ed.size_limit.as_deref().filter(|l| !l.is_empty()) {
+                match crate::quantity::Quantity::parse(limit) {
+                    Ok(q) if q.is_negative() => e.push(Error::forbidden(
+                        &path.child("sizeLimit"),
+                        "SizeLimit field must be a valid resource quantity",
+                    )),
+                    Ok(_) => {}
+                    Err(_) => e.push(Error::forbidden(
+                        &path.child("sizeLimit"),
+                        "SizeLimit field must be a valid resource quantity",
+                    )),
+                }
+            }
+            e
+        }
+    );
+    source!(
+        vol.host_path.as_ref(),
+        "hostPath",
+        validate_host_path_volume_source
+    );
+    source!(vol.secret.as_ref(), "secret", validate_secret_volume_source);
+    source!(vol.nfs.as_ref(), "nfs", validate_nfs_volume_source);
+    source!(vol.iscsi.as_ref(), "iscsi", validate_iscsi_volume_source);
+    source!(
+        vol.persistent_volume_claim.as_ref(),
+        "persistentVolumeClaim",
+        |pvc: &crate::resources::pod::PersistentVolumeClaimVolumeSource, path: &Path| {
+            if pvc.claim_name.is_empty() {
+                vec![Error::required(&path.child("claimName"), "")]
+            } else {
+                Vec::new()
+            }
+        }
+    );
+    source!(
+        vol.config_map.as_ref(),
+        "configMap",
+        validate_config_map_volume_source
+    );
+    source!(
+        vol.downward_api.as_ref(),
+        "downwardAPI",
+        validate_downward_api_volume_source
+    );
+    source!(
+        vol.projected.as_ref(),
+        "projected",
+        validate_projected_volume_source
+    );
+    source!(vol.csi.as_ref(), "csi", validate_csi_volume_source);
+    source!(
+        vol.ephemeral.as_ref(),
+        "ephemeral",
+        validate_ephemeral_volume_source
+    );
+    source!(vol.image.as_ref(), "image", validate_image_volume_source);
+
+    if num_volumes == 0 {
+        errs.push(Error::required(fld_path, "must specify a volume type"));
+    }
+    errs
+}
+
+/// Port of upstream `validateHostPathVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:816-827`).
+fn validate_host_path_volume_source(hp: &HostPathVolumeSource, fld_path: &Path) -> ErrorList {
+    if hp.path.is_empty() {
+        return vec![Error::required(&fld_path.child("path"), "")];
+    }
+    let mut errs: ErrorList = Vec::new();
+    if hp.path.split('/').any(|seg| seg == "..") {
+        errs.push(Error::invalid(
+            &fld_path.child("path"),
+            hp.path.clone(),
+            "must not contain '..'",
+        ));
+    }
+    if let Some(t) = hp.type_.as_deref() {
+        if !HOST_PATH_TYPES.contains(&t) {
+            errs.push(Error::not_supported(
+                &fld_path.child("type"),
+                t.to_string(),
+                HOST_PATH_TYPES,
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateSecretVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:972-989`).
+fn validate_secret_volume_source(sec: &SecretVolumeSource, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if sec.secret_name.as_deref().unwrap_or("").is_empty() {
+        errs.push(Error::required(&fld_path.child("secretName"), ""));
+    }
+    errs.extend(validate_file_mode(
+        sec.default_mode,
+        &fld_path.child("defaultMode"),
+    ));
+    let items_path = fld_path.child("items");
+    for (i, kp) in sec.items.as_deref().unwrap_or(&[]).iter().enumerate() {
+        errs.extend(validate_key_to_path(kp, &items_path.index(i)));
+    }
+    errs
+}
+
+/// Port of upstream `validateConfigMapVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:991-1008`).
+fn validate_config_map_volume_source(cm: &ConfigMapVolumeSource, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if cm.name.as_deref().unwrap_or("").is_empty() {
+        errs.push(Error::required(&fld_path.child("name"), ""));
+    }
+    errs.extend(validate_file_mode(
+        cm.default_mode,
+        &fld_path.child("defaultMode"),
+    ));
+    let items_path = fld_path.child("items");
+    for (i, kp) in cm.items.as_deref().unwrap_or(&[]).iter().enumerate() {
+        errs.extend(validate_key_to_path(kp, &items_path.index(i)));
+    }
+    errs
+}
+
+/// Port of upstream `validateKeyToPath`
+/// (`pkg/apis/core/validation/validation.go:1010-1024`).
+fn validate_key_to_path(kp: &KeyToPath, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if kp.key.is_empty() {
+        errs.push(Error::required(&fld_path.child("key"), ""));
+    }
+    if kp.path.is_empty() {
+        errs.push(Error::required(&fld_path.child("path"), ""));
+    }
+    errs.extend(validate_local_non_reserved_path(
+        &kp.path,
+        &fld_path.child("path"),
+    ));
+    errs.extend(validate_file_mode(kp.mode, &fld_path.child("mode")));
+    errs
+}
+
+/// Port of upstream `validateNFSVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:1034-1046`).
+fn validate_nfs_volume_source(
+    nfs: &crate::resources::volume::NFSVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if nfs.server.is_empty() {
+        errs.push(Error::required(&fld_path.child("server"), ""));
+    }
+    if nfs.path.is_empty() {
+        errs.push(Error::required(&fld_path.child("path"), ""));
+    }
+    if !nfs.path.starts_with('/') {
+        errs.push(Error::invalid(
+            &fld_path.child("path"),
+            nfs.path.clone(),
+            "must be an absolute path",
+        ));
+    }
+    errs
+}
+
+/// Port of the field-shape half of upstream `validateISCSIVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:840-880`): `targetPortal` and
+/// `iqn` are required, the IQN carries a recognised prefix, and `lun` is in
+/// `[0, 255]`.
+fn validate_iscsi_volume_source(
+    iscsi: &crate::resources::volume::ISCSIVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if iscsi.target_portal.is_empty() {
+        errs.push(Error::required(&fld_path.child("targetPortal"), ""));
+    }
+    if iscsi.iqn.is_empty() {
+        errs.push(Error::required(&fld_path.child("iqn"), ""));
+    } else if !["iqn", "eui", "naa"]
+        .iter()
+        .any(|p| iscsi.iqn.starts_with(p))
+    {
+        errs.push(Error::invalid(
+            &fld_path.child("iqn"),
+            iscsi.iqn.clone(),
+            "must be valid format starting with iqn, eui, or naa",
+        ));
+    }
+    if !(0..=255).contains(&iscsi.lun) {
+        errs.push(Error::invalid(
+            &fld_path.child("lun"),
+            iscsi.lun,
+            "must be between 0 and 255, inclusive",
+        ));
+    }
+    errs
+}
+
+/// Port of upstream `validateDownwardAPIVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:1145-1157`).
+fn validate_downward_api_volume_source(
+    dapi: &DownwardAPIVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs = validate_file_mode(dapi.default_mode, &fld_path.child("defaultMode"));
+    for file in dapi.items.as_deref().unwrap_or(&[]) {
+        // Upstream passes the *list* path here, not the index (`:1155`).
+        errs.extend(validate_downward_api_volume_file(file, fld_path));
+    }
+    errs
+}
+
+/// Port of upstream `validateDownwardAPIVolumeFile`
+/// (`pkg/apis/core/validation/validation.go:1121-1143`): a required local
+/// path, and exactly one of `fieldRef` / `resourceFieldRef`.
+fn validate_downward_api_volume_file(file: &DownwardAPIVolumeFile, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if file.path.is_empty() {
+        errs.push(Error::required(&fld_path.child("path"), ""));
+    }
+    errs.extend(validate_local_non_reserved_path(
+        &file.path,
+        &fld_path.child("path"),
+    ));
+
+    match (file.field_ref.as_ref(), file.resource_field_ref.as_ref()) {
+        (Some(field_ref), resource_ref) => {
+            errs.extend(validate_object_field_selector(
+                field_ref,
+                VOLUME_DOWNWARD_API_FIELD_PATHS,
+                &fld_path.child("fieldRef"),
+            ));
+            if resource_ref.is_some() {
+                errs.push(Error::invalid(
+                    fld_path,
+                    "resource".to_string(),
+                    "fieldRef and resourceFieldRef can not be specified simultaneously",
+                ));
+            }
+        }
+        (None, Some(resource_ref)) => {
+            errs.extend(validate_container_resource_field_selector(
+                resource_ref,
+                &fld_path.child("resourceFieldRef"),
+            ));
+        }
+        (None, None) => errs.push(Error::required(
+            fld_path,
+            "one of fieldRef and resourceFieldRef is required",
+        )),
+    }
+
+    errs.extend(validate_file_mode(file.mode, &fld_path.child("mode")));
+    errs
+}
+
+/// Port of upstream `validateContainerResourceFieldSelector` with
+/// `volume = true` (`pkg/apis/core/validation/validation.go:2860-2883`): in a
+/// volume the `containerName` is required, and upstream's `else if` chain means
+/// only the first unmet condition is reported.
+fn validate_container_resource_field_selector(
+    fs: &ResourceFieldSelector,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if fs.container_name.as_deref().unwrap_or("").is_empty() {
+        errs.push(Error::required(&fld_path.child("containerName"), ""));
+    } else if fs.resource.is_empty() {
+        errs.push(Error::required(&fld_path.child("resource"), ""));
+    } else if !CONTAINER_RESOURCE_FIELD_PATHS.contains(&fs.resource.as_str())
+        && !CONTAINER_RESOURCE_FIELD_PREFIXES
+            .iter()
+            .any(|prefix| fs.resource.starts_with(prefix))
+    {
+        errs.push(Error::not_supported(
+            &fld_path.child("resource"),
+            fs.resource.clone(),
+            CONTAINER_RESOURCE_FIELD_PATHS,
+        ));
+    }
+    if let Some(div) = fs.divisor.as_deref().filter(|d| !d.is_empty()) {
+        if crate::quantity::Quantity::parse(div).is_err() {
+            errs.push(Error::invalid(
+                &fld_path.child("divisor"),
+                div.to_string(),
+                "must be a valid resource quantity",
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateProjectedVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:1370-1380`) and
+/// `validateProjectionSources` (`:1159-1368`): every source contributes at
+/// most one projection type, and no two projected files may claim the same
+/// path.
+fn validate_projected_volume_source(
+    projected: &ProjectedVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs = validate_file_mode(projected.default_mode, &fld_path.child("defaultMode"));
+    let mut all_paths: HashSet<String> = HashSet::new();
+
+    for (i, source) in projected
+        .sources
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        let src_path = fld_path.child("sources").index(i);
+        let mut num_sources = 0usize;
+
+        if let Some(secret) = source.secret.as_ref() {
+            num_sources += 1;
+            let proj_path = src_path.child("secret");
+            if secret.name.as_deref().unwrap_or("").is_empty() {
+                errs.push(Error::required(&proj_path.child("name"), ""));
+            }
+            let items_path = proj_path.child("items");
+            for (j, kp) in secret.items.as_deref().unwrap_or(&[]).iter().enumerate() {
+                errs.extend(validate_key_to_path(kp, &items_path.index(j)));
+                if !kp.path.is_empty() && !all_paths.insert(kp.path.clone()) {
+                    errs.push(Error::invalid(
+                        fld_path,
+                        secret.name.clone().unwrap_or_default(),
+                        "conflicting duplicate paths",
+                    ));
+                }
+            }
+        }
+        if let Some(cm) = source.config_map.as_ref() {
+            num_sources += 1;
+            let proj_path = src_path.child("configMap");
+            if cm.name.as_deref().unwrap_or("").is_empty() {
+                errs.push(Error::required(&proj_path.child("name"), ""));
+            }
+            let items_path = proj_path.child("items");
+            for (j, kp) in cm.items.as_deref().unwrap_or(&[]).iter().enumerate() {
+                errs.extend(validate_key_to_path(kp, &items_path.index(j)));
+                if !kp.path.is_empty() && !all_paths.insert(kp.path.clone()) {
+                    errs.push(Error::invalid(
+                        fld_path,
+                        cm.name.clone().unwrap_or_default(),
+                        "conflicting duplicate paths",
+                    ));
+                }
+            }
+        }
+        if let Some(dapi) = source.downward_api.as_ref() {
+            num_sources += 1;
+            let proj_path = src_path.child("downwardAPI");
+            for file in dapi.items.as_deref().unwrap_or(&[]) {
+                errs.extend(validate_downward_api_volume_file(file, &proj_path));
+                if !file.path.is_empty() && !all_paths.insert(file.path.clone()) {
+                    errs.push(Error::invalid(
+                        fld_path,
+                        file.path.clone(),
+                        "conflicting duplicate paths",
+                    ));
+                }
+            }
+        }
+        if let Some(sat) = source.service_account_token.as_ref() {
+            num_sources += 1;
+            let proj_path = src_path.child("serviceAccountToken");
+            if let Some(exp) = sat.expiration_seconds {
+                if exp < 10 * 60 {
+                    errs.push(Error::invalid(
+                        &proj_path.child("expirationSeconds"),
+                        exp,
+                        "may not specify a duration less than 10 minutes",
+                    ));
+                }
+                if exp > 1i64 << 32 {
+                    errs.push(Error::invalid(
+                        &proj_path.child("expirationSeconds"),
+                        exp,
+                        "may not specify a duration larger than 2^32 seconds",
+                    ));
+                }
+            }
+            // Upstream reports this one on the projected-volume path, not on
+            // the source (`:1226-1230`).
+            if sat.path.is_empty() {
+                errs.push(Error::required(&fld_path.child("path"), ""));
+            } else {
+                errs.extend(validate_local_non_reserved_path(
+                    &sat.path,
+                    &fld_path.child("path"),
+                ));
+            }
+        }
+        if let Some(ctb) = source.cluster_trust_bundle.as_ref() {
+            num_sources += 1;
+            let proj_path = src_path.child("clusterTrustBundle");
+            match (ctb.name.as_deref(), ctb.signer_name.as_deref()) {
+                (Some(_), Some(_)) => errs.push(Error::invalid(
+                    &proj_path,
+                    String::new(),
+                    "only one of name and signerName may be used",
+                )),
+                (Some(name), None) => {
+                    if name.is_empty() {
+                        errs.push(Error::required(
+                            &proj_path.child("name"),
+                            "must be a valid object name",
+                        ));
+                    }
+                    if ctb.label_selector.is_some() {
+                        errs.push(Error::invalid(
+                            &proj_path.child("labelSelector"),
+                            String::new(),
+                            "labelSelector must be unset if name is specified",
+                        ));
+                    }
+                }
+                (None, Some(signer)) => {
+                    if signer.is_empty() {
+                        errs.push(Error::required(
+                            &proj_path.child("signerName"),
+                            "must be a valid signer name",
+                        ));
+                    }
+                }
+                (None, None) => errs.push(Error::required(
+                    &proj_path,
+                    "either name or signerName must be specified",
+                )),
+            }
+            if ctb.path.is_empty() {
+                errs.push(Error::required(&proj_path.child("path"), ""));
+            }
+            errs.extend(validate_local_non_reserved_path(
+                &ctb.path,
+                &proj_path.child("path"),
+            ));
+            if !all_paths.insert(ctb.path.clone()) {
+                errs.push(Error::invalid(
+                    fld_path,
+                    ctb.path.clone(),
+                    "conflicting duplicate paths",
+                ));
+            }
+        }
+        if let Some(pc) = source.pod_certificate.as_ref() {
+            num_sources += 1;
+            let proj_path = src_path.child("podCertificate");
+            if !POD_CERTIFICATE_KEY_TYPES.contains(&pc.key_type.as_str()) {
+                errs.push(Error::not_supported(
+                    &proj_path.child("keyType"),
+                    pc.key_type.clone(),
+                    POD_CERTIFICATE_KEY_TYPES,
+                ));
+            }
+            if let Some(max) = pc.max_expiration_seconds {
+                if max < 3600 {
+                    errs.push(Error::invalid(
+                        &proj_path.child("maxExpirationSeconds"),
+                        max,
+                        "if provided, maxExpirationSeconds must be >= 3600",
+                    ));
+                }
+            }
+            let mut num_paths = 0usize;
+            for (value, child) in [
+                (pc.credential_bundle_path.as_deref(), "credentialBundlePath"),
+                (pc.key_path.as_deref(), "keyPath"),
+                (pc.certificate_chain_path.as_deref(), "certificateChainPath"),
+            ] {
+                let Some(path_value) = value.filter(|v| !v.is_empty()) else {
+                    continue;
+                };
+                num_paths += 1;
+                errs.extend(validate_local_non_reserved_path(
+                    path_value,
+                    &proj_path.child(child),
+                ));
+                if !all_paths.insert(path_value.to_string()) {
+                    errs.push(Error::invalid(
+                        fld_path,
+                        path_value.to_string(),
+                        "conflicting duplicate paths",
+                    ));
+                }
+            }
+            if num_paths == 0 {
+                errs.push(Error::required(
+                    &proj_path,
+                    "specify at least one of credentialBundlePath, keyPath, and certificateChainPath",
+                ));
+            }
+        }
+
+        if num_sources > 1 {
+            errs.push(Error::forbidden(
+                &src_path,
+                "may not specify more than 1 volume type per source",
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateCSIVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:1856-1870`): the driver name is a
+/// required DNS-1123 subdomain.
+fn validate_csi_volume_source(
+    csi: &crate::resources::csi::CSIVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if csi.driver.is_empty() {
+        errs.push(Error::required(&fld_path.child("driver"), ""));
+    } else {
+        for msg in is_dns1123_subdomain(&csi.driver) {
+            errs.push(Error::invalid(
+                &fld_path.child("driver"),
+                csi.driver.clone(),
+                msg,
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateEphemeralVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:1888-1896`) plus
+/// `ValidatePersistentVolumeClaimTemplate` (`:1900-1904`): the template is
+/// required, and its spec is held to the ordinary PVC-spec rules.
+fn validate_ephemeral_volume_source(
+    ephemeral: &EphemeralVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    match ephemeral.volume_claim_template.as_ref() {
+        None => vec![Error::required(&fld_path.child("volumeClaimTemplate"), "")],
+        Some(template) => crate::validation::pvc::validate_persistent_volume_claim_spec(
+            &template.spec,
+            &fld_path.child("volumeClaimTemplate").child("spec"),
+        ),
+    }
+}
+
+/// Port of upstream `validateImageVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:1872-1879`). `reference` is
+/// required only when the object being validated is a Pod — upstream gates it
+/// on `opts.ResourceIsPod`, because a workload template may legitimately leave
+/// it to be filled in later.
+fn validate_image_volume_source(
+    image: &crate::resources::pod::ImageVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if let Some(policy) = image.pull_policy.as_deref().filter(|p| !p.is_empty()) {
+        if !PULL_POLICIES.contains(&policy) {
+            errs.push(Error::not_supported(
+                &fld_path.child("pullPolicy"),
+                policy.to_string(),
+                PULL_POLICIES,
+            ));
         }
     }
     errs

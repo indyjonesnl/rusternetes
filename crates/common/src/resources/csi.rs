@@ -186,6 +186,7 @@ pub type InlineVolumeSpec = crate::resources::volume::PersistentVolumeSpec;
 #[serde(rename_all = "camelCase")]
 pub struct CSIVolumeSource {
     /// driver is the name of the driver to use for this volume
+    #[serde(default)]
     pub driver: String,
 
     /// volumeHandle is the unique volume name returned by the CSI volume plugin's CreateVolume

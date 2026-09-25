@@ -457,8 +457,10 @@ pub struct ContainerExtendedResourceRequest {
 #[serde(rename_all = "camelCase")]
 pub struct PodCertificateProjection {
     /// SignerName is the name of the signer that signs the certificate.
+    #[serde(default)]
     pub signer_name: String,
     /// KeyType is the type of keypair the kubelet generates (e.g. RSA3072, ED25519).
+    #[serde(default)]
     pub key_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_expiration_seconds: Option<i32>,
@@ -1142,6 +1144,7 @@ pub struct ConfigMapProjection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceAccountTokenProjection {
+    #[serde(default)]
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audience: Option<String>,
@@ -1169,6 +1172,7 @@ pub struct ClusterTrustBundleProjection {
     pub label_selector: Option<crate::types::LabelSelector>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
+    #[serde(default)]
     pub path: String,
 }
 
@@ -1195,6 +1199,7 @@ pub struct EmptyDirVolumeSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostPathVolumeSource {
+    #[serde(default)]
     pub path: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1236,7 +1241,9 @@ pub struct SecretVolumeSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyToPath {
+    #[serde(default)]
     pub key: String,
+    #[serde(default)]
     pub path: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1246,6 +1253,7 @@ pub struct KeyToPath {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistentVolumeClaimVolumeSource {
+    #[serde(default)]
     pub claim_name: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1270,6 +1278,7 @@ pub struct DownwardAPIVolumeSource {
 #[serde(rename_all = "camelCase")]
 pub struct DownwardAPIVolumeFile {
     /// Required: Path is the relative path name of the file to be created
+    #[serde(default)]
     pub path: String,
 
     /// Required: Selects a field of the pod
@@ -1290,6 +1299,7 @@ pub struct DownwardAPIVolumeFile {
 #[serde(rename_all = "camelCase")]
 pub struct ObjectFieldSelector {
     /// Path of the field to select in the specified API version
+    #[serde(default)]
     pub field_path: String,
 
     /// Version of the schema the FieldPath is written in terms of, defaults to "v1"
@@ -1306,6 +1316,7 @@ pub struct ResourceFieldSelector {
     pub container_name: Option<String>,
 
     /// Required: resource to select
+    #[serde(default)]
     pub resource: String,
 
     /// Specifies the output format of the exposed resources, defaults to "1"
@@ -1330,6 +1341,7 @@ pub struct PersistentVolumeClaimTemplate {
     pub metadata: Option<ObjectMeta>,
 
     /// The specification for the PersistentVolumeClaim
+    #[serde(default)]
     pub spec: crate::resources::volume::PersistentVolumeClaimSpec,
 }
 
