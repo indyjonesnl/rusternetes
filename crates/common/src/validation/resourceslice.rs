@@ -91,19 +91,10 @@ fn validate_resource_slice_spec(spec: &ResourceSliceSpec, fld_path: &Path) -> Er
 
     // pool.
     let pool_path = fld_path.child("pool");
-    let name_path = pool_path.child("name");
-    if spec.pool.name.is_empty() {
-        errs.push(Error::required(&name_path, ""));
-    } else {
-        if spec.pool.name.len() > POOL_NAME_MAX_LENGTH {
-            errs.push(Error::too_long(&name_path, POOL_NAME_MAX_LENGTH));
-        }
-        for part in spec.pool.name.split('/') {
-            for msg in is_dns1123_subdomain(part) {
-                errs.push(Error::invalid(&name_path, spec.pool.name.clone(), msg));
-            }
-        }
-    }
+    errs.extend(validate_pool_name(
+        &spec.pool.name,
+        &pool_path.child("name"),
+    ));
     if spec.pool.resource_slice_count <= 0 {
         errs.push(Error::invalid(
             &pool_path.child("resourceSliceCount"),
@@ -252,7 +243,7 @@ fn validate_device(device: &Device, fld_path: &Path) -> ErrorList {
 /// answered a nameless device with `Required`, and a client can act on either,
 /// so the empty case keeps the clearer `Required` and everything else takes
 /// upstream's label check.
-fn validate_device_name(name: &str, fld_path: &Path) -> ErrorList {
+pub(crate) fn validate_device_name(name: &str, fld_path: &Path) -> ErrorList {
     if name.is_empty() {
         return vec![Error::required(fld_path, "")];
     }
@@ -260,6 +251,28 @@ fn validate_device_name(name: &str, fld_path: &Path) -> ErrorList {
         .into_iter()
         .map(|msg| Error::invalid(fld_path, name.to_string(), msg))
         .collect()
+}
+
+/// Port of upstream `validatePoolName`
+/// (`pkg/apis/resource/validation/validation.go:82-96`): required, at most
+/// `PoolNameMaxLength`, and every `/`-separated part a DNS-1123 subdomain.
+/// Shared with the allocation results in a `ResourceClaim`'s status, which
+/// upstream validates with this same function.
+pub(crate) fn validate_pool_name(name: &str, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if name.is_empty() {
+        errs.push(Error::required(fld_path, ""));
+        return errs;
+    }
+    if name.len() > POOL_NAME_MAX_LENGTH {
+        errs.push(Error::too_long(fld_path, POOL_NAME_MAX_LENGTH));
+    }
+    for part in name.split('/') {
+        for msg in is_dns1123_subdomain(part) {
+            errs.push(Error::invalid(fld_path, name.to_string(), msg));
+        }
+    }
+    errs
 }
 
 /// Port of upstream `validateDeviceTaint`

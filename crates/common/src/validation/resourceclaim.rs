@@ -17,15 +17,20 @@
 //! ObjectMeta is validated separately.
 
 use crate::resources::{
-    DeviceAllocationMode, DeviceClaim, DeviceClaimConfiguration, DeviceSelector, DeviceToleration,
+    AllocationResult, DeviceAllocationConfiguration, DeviceAllocationMode, DeviceClaim,
+    DeviceClaimConfiguration, DeviceRequestAllocationResult, DeviceSelector, DeviceToleration,
     ExactDeviceRequest, OpaqueDeviceConfiguration, ResourceClaim, ResourceClaimSpec,
-    TolerationOperator,
+    ResourceClaimStatus, TolerationOperator,
 };
+use crate::types::Condition;
 use crate::validation::csinode::validate_csi_driver_name;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
-    is_dns1123_label, is_dns1123_subdomain, is_valid_label_value, validate_label_name,
+    is_dns1123_label, is_dns1123_subdomain, is_valid_label_value, validate_conditions,
+    validate_label_name,
 };
+use crate::validation::pod::validate_node_selector;
+use crate::validation::resourceslice::{validate_device_name, validate_pool_name};
 use std::collections::{HashMap, HashSet};
 
 const DEVICE_REQUESTS_MAX_SIZE: usize = 32;
@@ -40,6 +45,13 @@ const DEVICE_TOLERATIONS_MAX_LENGTH: usize = 16;
 const DEVICE_CONFIG_MAX_SIZE: usize = 32;
 /// `OpaqueParametersMaxLength` (`types.go:1305`).
 const OPAQUE_PARAMETERS_MAX_LENGTH: usize = 10 * 1024;
+/// `AllocationResultsMaxSize` (`types.go:1582`).
+const ALLOCATION_RESULTS_MAX_SIZE: usize = 32;
+/// `ResourceClaimReservedForMaxSize` (`types.go:1504`).
+const RESERVED_FOR_MAX_SIZE: usize = 256;
+/// `AllocatedDeviceStatusMaxConditions` (`types.go`), the cap upstream applies
+/// to a device's conditions.
+const ALLOCATED_DEVICE_STATUS_MAX_CONDITIONS: usize = 8;
 
 /// Validate a `ResourceClaim` on create. Mirrors the structural portion of
 /// upstream `ValidateResourceClaim` (minus CEL/constraints/config — see #1442).
@@ -215,6 +227,269 @@ fn validate_device_claim(claim: &DeviceClaim, fld_path: &Path) -> ErrorList {
         }
     }
 
+    errs
+}
+
+/// `validateResourceClaimStatusUpdate`
+/// (`pkg/apis/resource/validation/validation.go:434-466`).
+///
+/// `claim_deleted` is upstream's `resourceClaim.DeletionTimestamp != nil`: once
+/// a claim is being torn down, reservations may be dropped but not added.
+pub fn validate_resource_claim_status_update(
+    status: &ResourceClaimStatus,
+    old_status: &ResourceClaimStatus,
+    spec_devices: &DeviceClaim,
+    claim_deleted: bool,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let request_names = gather_request_names(spec_devices);
+
+    // reservedFor: capped, unique by UID, each entry identifying a consumer
+    // (`validateResourceClaimUserReference`, `:468-481`).
+    let reserved_path = fld_path.child("reservedFor");
+    if status.reserved_for.len() > RESERVED_FOR_MAX_SIZE {
+        errs.push(Error::too_many(&reserved_path, RESERVED_FOR_MAX_SIZE));
+    }
+    let mut seen_uids: HashSet<&str> = HashSet::new();
+    for (i, consumer) in status.reserved_for.iter().enumerate() {
+        let cp = reserved_path.index(i);
+        if consumer.resource.is_empty() {
+            errs.push(Error::required(&cp.child("resource"), ""));
+        }
+        if consumer.name.is_empty() {
+            errs.push(Error::required(&cp.child("name"), ""));
+        }
+        if consumer.uid.is_empty() {
+            errs.push(Error::required(&cp.child("uid"), ""));
+        } else if !seen_uids.insert(consumer.uid.as_str()) {
+            errs.push(Error::duplicate(&cp, consumer.uid.clone()));
+        }
+    }
+
+    // `status.devices` entries must refer to devices this claim actually holds
+    // (`gatherAllocatedDevices`, `:200-209`, and `validateDeviceStatus`,
+    // `:1272-1294`).
+    let allocated: HashSet<(String, String, String)> = status
+        .allocation
+        .as_ref()
+        .map(|allocation| {
+            allocation
+                .devices
+                .results
+                .iter()
+                .map(|r| (r.driver.clone(), r.pool.clone(), r.device.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let devices_path = fld_path.child("devices");
+    let mut seen_devices: HashSet<(String, String, String)> = HashSet::new();
+    for (i, device) in status.devices.iter().enumerate() {
+        let dp = devices_path.index(i);
+        errs.extend(validate_csi_driver_name(
+            &device.driver,
+            &dp.child("driver"),
+        ));
+        errs.extend(validate_pool_name(&device.pool, &dp.child("pool")));
+        errs.extend(validate_device_name(&device.device, &dp.child("device")));
+
+        let id = (
+            device.driver.clone(),
+            device.pool.clone(),
+            device.device.clone(),
+        );
+        if !allocated.contains(&id) {
+            errs.push(Error::invalid(
+                &dp,
+                format!("{}/{}/{}", device.driver, device.pool, device.device),
+                "must be an allocated device in the claim",
+            ));
+        }
+        if !seen_devices.insert(id) {
+            errs.push(Error::duplicate(
+                &dp,
+                format!("{}/{}/{}", device.driver, device.pool, device.device),
+            ));
+        }
+        if device.conditions.len() > ALLOCATED_DEVICE_STATUS_MAX_CONDITIONS {
+            errs.push(Error::too_many(
+                &dp.child("conditions"),
+                ALLOCATED_DEVICE_STATUS_MAX_CONDITIONS,
+            ));
+        }
+        // Upstream hands the device's conditions straight to
+        // `metav1validation.ValidateConditions` (`:1288`); ours are a DRA-local
+        // struct with the same fields, so they are lifted into the metav1 shape
+        // and validated by the one predicate rather than by a second copy.
+        let conditions: Vec<Condition> = device
+            .conditions
+            .iter()
+            .map(|c| Condition {
+                condition_type: c.condition_type.clone(),
+                status: c.status.clone(),
+                observed_generation: None,
+                last_transition_time: c.last_transition_time,
+                reason: c.reason.clone(),
+                message: c.message.clone(),
+            })
+            .collect();
+        errs.extend(validate_conditions(&conditions, &dp.child("conditions")));
+    }
+
+    // The invariants (`:438-456`).
+    if !status.reserved_for.is_empty() {
+        match &status.allocation {
+            None => errs.push(Error::forbidden(
+                &reserved_path,
+                "may not be specified when `allocated` is not set",
+            )),
+            Some(_) if claim_deleted => {
+                let old_uids: HashSet<&str> = old_status
+                    .reserved_for
+                    .iter()
+                    .map(|c| c.uid.as_str())
+                    .collect();
+                if status
+                    .reserved_for
+                    .iter()
+                    .any(|c| !old_uids.contains(c.uid.as_str()))
+                {
+                    errs.push(Error::forbidden(
+                        &reserved_path,
+                        "new entries may not be added while `deallocationRequested` or `deletionTimestamp` are set",
+                    ));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    // A populated allocation is immutable: the rules for a *new* result are
+    // tighter than the ones a stored one was admitted under (`:457-464`).
+    let allocation_path = fld_path.child("allocation");
+    match (&old_status.allocation, &status.allocation) {
+        (Some(old), Some(new)) => {
+            if serde_json::to_value(new).ok() != serde_json::to_value(old).ok() {
+                errs.push(Error::invalid(
+                    &allocation_path,
+                    "<allocation>".to_string(),
+                    "field is immutable",
+                ));
+            }
+        }
+        (None, Some(new)) => {
+            errs.extend(validate_allocation_result(
+                new,
+                &allocation_path,
+                &request_names,
+            ));
+        }
+        _ => {}
+    }
+
+    errs
+}
+
+/// `validateAllocationResult` (`validation.go:483-492`).
+fn validate_allocation_result(
+    allocation: &AllocationResult,
+    fld_path: &Path,
+    request_names: &RequestNames,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let devices_path = fld_path.child("devices");
+
+    let results_path = devices_path.child("results");
+    if allocation.devices.results.len() > ALLOCATION_RESULTS_MAX_SIZE {
+        errs.push(Error::too_many(&results_path, ALLOCATION_RESULTS_MAX_SIZE));
+    }
+    for (i, result) in allocation.devices.results.iter().enumerate() {
+        errs.extend(validate_device_request_allocation_result(
+            result,
+            &results_path.index(i),
+            request_names,
+        ));
+    }
+
+    // The config cap is `2 * DeviceConfigMaxSize` — class plus claim (`:500`).
+    let config_path = devices_path.child("config");
+    if allocation.devices.config.len() > 2 * DEVICE_CONFIG_MAX_SIZE {
+        errs.push(Error::too_many(&config_path, 2 * DEVICE_CONFIG_MAX_SIZE));
+    }
+    for (i, config) in allocation.devices.config.iter().enumerate() {
+        errs.extend(validate_device_allocation_configuration(
+            config,
+            &config_path.index(i),
+            request_names,
+        ));
+    }
+
+    if let Some(node_selector) = &allocation.node_selector {
+        errs.extend(validate_node_selector(
+            node_selector,
+            &fld_path.child("nodeSelector"),
+        ));
+    }
+    errs
+}
+
+/// `validateDeviceRequestAllocationResult` (`validation.go:509-520`).
+fn validate_device_request_allocation_result(
+    result: &DeviceRequestAllocationResult,
+    fld_path: &Path,
+    request_names: &RequestNames,
+) -> ErrorList {
+    let mut errs =
+        validate_request_name_ref(&result.request, &fld_path.child("request"), request_names);
+    errs.extend(validate_csi_driver_name(
+        &result.driver,
+        &fld_path.child("driver"),
+    ));
+    errs.extend(validate_pool_name(&result.pool, &fld_path.child("pool")));
+    errs.extend(validate_device_name(
+        &result.device,
+        &fld_path.child("device"),
+    ));
+    errs
+}
+
+/// `validateDeviceAllocationConfiguration` (`validation.go:522-532`) and
+/// `validateAllocationConfigSource` (`:534-545`). An unrecognised source cannot
+/// reach here: the closed Rust enum rejects it in the decoder, where upstream
+/// answers `NotSupported`.
+fn validate_device_allocation_configuration(
+    config: &DeviceAllocationConfiguration,
+    fld_path: &Path,
+    request_names: &RequestNames,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if config.source.is_none() {
+        errs.push(Error::required(&fld_path.child("source"), ""));
+    }
+
+    let requests_path = fld_path.child("requests");
+    if config.requests.len() > DEVICE_REQUESTS_MAX_SIZE {
+        errs.push(Error::too_many(&requests_path, DEVICE_REQUESTS_MAX_SIZE));
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (i, name) in config.requests.iter().enumerate() {
+        let rp = requests_path.index(i);
+        if !seen.insert(name.as_str()) {
+            errs.push(Error::duplicate(&rp, name.clone()));
+        }
+        errs.extend(validate_request_name_ref(name, &rp, request_names));
+    }
+
+    match &config.opaque {
+        None => errs.push(Error::required(&fld_path.child("opaque"), "")),
+        Some(opaque) => {
+            errs.extend(validate_opaque_configuration(
+                opaque,
+                &fld_path.child("opaque"),
+            ));
+        }
+    }
     errs
 }
 

@@ -332,15 +332,28 @@ pub struct DeviceAllocationResult {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceRequestAllocationResult {
     /// Request is the name of the request in the claim
+    ///
+    /// `validateDeviceRequestAllocationResult` resolves this against the
+    /// claim's request names (`validation.go:509-511`).
+    #[serde(default)]
     pub request: String,
 
     /// Driver specifies the name of the DRA driver
+    ///
+    /// `Required` when absent, via the CSI driver-name rule (`:512`).
+    #[serde(default)]
     pub driver: String,
 
     /// Pool specifies the name of the device pool
+    ///
+    /// `Required` when absent (`validatePoolName`, `:82-96`).
+    #[serde(default)]
     pub pool: String,
 
     /// Device specifies the name of the allocated device
+    ///
+    /// `Required` when absent, then a DNS-1123 label (`:514`).
+    #[serde(default)]
     pub device: String,
 }
 
@@ -348,7 +361,14 @@ pub struct DeviceRequestAllocationResult {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceAllocationConfiguration {
     /// Source describes where the configuration comes from
-    pub source: AllocationConfigSource,
+    ///
+    /// Upstream's `AllocationConfigSource` is a string type whose `""` is
+    /// `Required` (`validateAllocationConfigSource`,
+    /// `pkg/apis/resource/validation/validation.go:534-545`). A closed Rust
+    /// enum has no member for `""`, so the absent case is an `Option`, reported
+    /// as `Required` by the same rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<AllocationConfigSource>,
 
     /// Requests lists the names of requests associated with the config
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -371,12 +391,18 @@ pub enum AllocationConfigSource {
 #[serde(rename_all = "camelCase")]
 pub struct AllocatedDeviceStatus {
     /// Device references one device instance
+    ///
+    /// `validateDeviceStatus` checks the triple against the claim's allocated
+    /// devices (`validation.go:1272-1284`).
+    #[serde(default)]
     pub device: String,
 
     /// Driver is the name of the DRA driver
+    #[serde(default)]
     pub driver: String,
 
     /// Pool is the name of the device pool
+    #[serde(default)]
     pub pool: String,
 
     /// Conditions represents the latest observation of the device
@@ -415,10 +441,15 @@ pub struct ResourceClaimConsumerReference {
     #[serde(rename = "apiGroup", default, skip_serializing_if = "Option::is_none")]
     pub api_group: Option<String>,
 
+    /// `validateResourceClaimUserReference` answers each absent field with
+    /// `Required` (`validation.go:468-481`).
+    #[serde(default)]
     pub resource: String,
 
+    #[serde(default)]
     pub name: String,
 
+    #[serde(default)]
     pub uid: String,
 }
 
