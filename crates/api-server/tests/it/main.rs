@@ -16,6 +16,7 @@ mod apiservice_delete_finalizers_test;
 mod apiservices_routing_test;
 mod apps_update_spec_validation_test;
 mod auth_integration_test;
+mod autoscaling_decode_when_absent_test;
 mod cel_matchcondition_eval_test;
 mod cel_vap_end_to_end_test;
 mod chunking_podtemplate_ordering_test;

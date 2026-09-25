@@ -555,6 +555,21 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// `webhookconfiguration.rs` copy (`validate_rule_parts`) rather than growing a
 /// second.
 ///
+/// `autoscaling.rs`: 41 fields — the whole HPA v2 metric surface plus the four
+/// VerticalPodAutoscaler ones. The HPA half needed no new validator: the port
+/// of `pkg/apis/autoscaling/validation/validation.go` in
+/// `crates/common/src/validation/hpa.rs` already answers every one of them, so
+/// defaulting moved the answer from serde to that validator rather than to a
+/// silent accept (`maxReplicas` `must be greater than 0` at `:62`,
+/// `scaleTargetRef.kind`/`.name` `Required` at `:117-133`, `metrics[].type`
+/// `Required` then `Unsupported` at `:186-200`, the scaling-policy counters at
+/// `:332-345`). The VPA four are a stated exception to the upstream-first rule
+/// (CLAUDE.md rule 8): VPA is not a Kubernetes API but a CRD from
+/// `kubernetes/autoscaler`, so there is no Go validator to port, and the only
+/// reader is `controller-manager/src/controllers/vpa.rs` — where a stored
+/// object missing one field failed to decode and the controller skipped the
+/// whole item.
+///
 /// Not every pod field could be defaulted. `PodAffinityTerm.labelSelector` is a
 /// **pointer** upstream and stays an `Option` here, because
 /// `LabelSelectorAsSelector(nil)` is `labels.Nothing()` while
@@ -614,6 +629,7 @@ fn every_field_of_an_audited_module_decodes_when_absent() {
 const AUDITED_MODULES: &[&str] = &[
     "admission_webhook.rs",
     "authentication.rs",
+    "autoscaling.rs",
     "binding.rs",
     "custom_metrics.rs",
     "crd.rs",
