@@ -67,6 +67,10 @@ pub struct DeviceClaim {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceRequest {
     /// Name can be used to reference this request in a pod.spec.containers[].resources.claims entry
+    ///
+    /// `validateRequestName` answers an absent name with `Required`
+    /// (`pkg/apis/resource/validation/validation.go:212`).
+    #[serde(default)]
     pub name: String,
 
     /// Exactly specifies the details for a single request
@@ -86,7 +90,10 @@ pub struct DeviceRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ExactDeviceRequest {
     /// DeviceClassName references a specific DeviceClass
-    #[serde(rename = "deviceClassName")]
+    ///
+    /// `validateDeviceClass` answers an absent name with `Required`
+    /// (`pkg/apis/resource/validation/validation.go:288-295`).
+    #[serde(rename = "deviceClassName", default)]
     pub device_class_name: String,
 
     /// Selectors define criteria which must be satisfied by a specific device
@@ -126,13 +133,33 @@ pub struct ExactDeviceRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceSubRequest {
+    /// `validateDeviceSubRequest` answers an absent name with `Required`
+    /// (`pkg/apis/resource/validation/validation.go:246-255`).
+    #[serde(default)]
     pub name: String,
 
-    #[serde(rename = "deviceClassName")]
+    #[serde(rename = "deviceClassName", default)]
     pub device_class_name: String,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selectors: Vec<DeviceSelector>,
+
+    /// AllocationMode defines how devices are allocated
+    #[serde(
+        rename = "allocationMode",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
+    pub allocation_mode: Option<DeviceAllocationMode>,
+
+    /// Count is used only when the mode is "ExactCount"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<i64>,
+
+    /// Tolerations for device taints
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tolerations: Vec<DeviceToleration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -153,6 +180,10 @@ pub struct DeviceSelector {
 #[serde(rename_all = "camelCase")]
 pub struct CELDeviceSelector {
     /// Expression is a CEL expression which evaluates to a boolean
+    ///
+    /// Absent is `""` upstream, which `validateCELSelector` hands to the CEL
+    /// compiler and rejects (`validation.go:317-352`).
+    #[serde(default)]
     pub expression: String,
 }
 
@@ -160,6 +191,11 @@ pub struct CELDeviceSelector {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceToleration {
     /// Key is the taint key that the toleration applies to
+    ///
+    /// Empty means "match every taint key", so `validateDeviceToleration`
+    /// checks the key only when it is set
+    /// (`pkg/apis/resource/validation/validation.go:1411-1415`).
+    #[serde(default)]
     pub key: String,
 
     /// Value is the taint value the toleration matches
@@ -167,7 +203,13 @@ pub struct DeviceToleration {
     pub value: Option<String>,
 
     /// Effect indicates the taint effect to match
-    pub effect: DeviceTaintEffect,
+    ///
+    /// Unlike a taint's effect, a toleration's is optional — upstream's switch
+    /// has an explicit `case toleration.Effect == "": // Optional in a
+    /// toleration` (`validation.go:1428-1433`) — and a closed Rust enum has no
+    /// member for `""`, so the absent case is an `Option`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<DeviceTaintEffect>,
 
     /// Operator represents a key's relationship to the value
     #[serde(
@@ -222,7 +264,15 @@ pub struct DeviceClaimConfiguration {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct OpaqueDeviceConfiguration {
+    /// `validateOpaqueConfiguration` answers an absent driver with `Required`
+    /// via `validateDriverName` (`validation.go:425-430`).
+    #[serde(default)]
     pub driver: String,
+
+    /// `validateRawExtension` answers absent (`len(Raw) == 0`) and JSON `null`
+    /// with `Required`, and a non-object with `must be a valid JSON object`
+    /// (`validation.go:1297-1316`).
+    #[serde(default)]
     pub parameters: serde_json::Value,
 }
 
@@ -803,6 +853,7 @@ pub struct ResourceClaimList {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ListMeta>,
 
+    #[serde(default)]
     pub items: Vec<ResourceClaim>,
 }
 
@@ -822,6 +873,7 @@ pub struct ResourceClaimTemplateList {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ListMeta>,
 
+    #[serde(default)]
     pub items: Vec<ResourceClaimTemplate>,
 }
 
@@ -841,6 +893,7 @@ pub struct DeviceClassList {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ListMeta>,
 
+    #[serde(default)]
     pub items: Vec<DeviceClass>,
 }
 
@@ -860,6 +913,7 @@ pub struct ResourceSliceList {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ListMeta>,
 
+    #[serde(default)]
     pub items: Vec<ResourceSlice>,
 }
 

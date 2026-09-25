@@ -9,10 +9,9 @@
 
 use crate::resources::{DeviceClass, DeviceClassSpec};
 use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::resourceclaim::validate_selector_slice;
 
-const DEVICE_SELECTORS_MAX_SIZE: usize = 32;
 const DEVICE_CONFIG_MAX_SIZE: usize = 32;
-const CEL_SELECTOR_EXPRESSION_MAX_LENGTH: usize = 10 * 1024;
 
 /// Validate a `DeviceClass` on create. Mirrors the structural part of upstream
 /// `ValidateDeviceClass` (minus CEL compilation — see #1442).
@@ -27,27 +26,13 @@ pub fn validate_device_class(class: &DeviceClass) -> ErrorList {
 fn validate_device_class_spec(spec: &DeviceClassSpec, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
-    let selectors_path = fld_path.child("selectors");
-    if spec.selectors.len() > DEVICE_SELECTORS_MAX_SIZE {
-        errs.push(Error::too_many(&selectors_path, DEVICE_SELECTORS_MAX_SIZE));
-    }
-    for (i, selector) in spec.selectors.iter().enumerate() {
-        let sp = selectors_path.index(i);
-        match &selector.cel {
-            None => errs.push(Error::required(&sp.child("cel"), "")),
-            Some(cel) => {
-                let expr_path = sp.child("cel").child("expression");
-                if cel.expression.is_empty() {
-                    errs.push(Error::required(&expr_path, ""));
-                } else if cel.expression.len() > CEL_SELECTOR_EXPRESSION_MAX_LENGTH {
-                    errs.push(Error::too_long(
-                        &expr_path,
-                        CEL_SELECTOR_EXPRESSION_MAX_LENGTH,
-                    ));
-                }
-            }
-        }
-    }
+    // Upstream reaches the identical `validateSelectorSlice` from both a
+    // DeviceClass and a claim's requests (`validation.go:298`), so this calls
+    // the one port of it rather than keeping a second copy.
+    errs.extend(validate_selector_slice(
+        &spec.selectors,
+        &fld_path.child("selectors"),
+    ));
 
     if spec.config.len() > DEVICE_CONFIG_MAX_SIZE {
         errs.push(Error::too_many(
@@ -62,6 +47,9 @@ fn validate_device_class_spec(spec: &DeviceClassSpec, fld_path: &Path) -> ErrorL
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validation::resourceclaim::{
+        CEL_SELECTOR_EXPRESSION_MAX_LENGTH, DEVICE_SELECTORS_MAX_SIZE,
+    };
 
     fn dc(spec: serde_json::Value) -> DeviceClass {
         serde_json::from_value(serde_json::json!({
