@@ -154,6 +154,7 @@ mod pdb_patch_compatibility_test;
 mod persistentvolume_handler_test;
 mod persistentvolumeclaim_handler_test;
 mod plc_update_validation_test;
+mod pod_affinity_validation_test;
 mod pod_binding_target_kind_test;
 mod pod_container_decodes_when_absent_test;
 mod pod_delete_cas_retry_test;

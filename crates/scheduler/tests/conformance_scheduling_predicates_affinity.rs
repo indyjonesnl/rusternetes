@@ -251,10 +251,10 @@ fn required_pod_affinity(topology_key: &str, match_labels: &[(&str, &str)]) -> A
         node_affinity: None,
         pod_affinity: Some(PodAffinity {
             required_during_scheduling_ignored_during_execution: Some(vec![PodAffinityTerm {
-                label_selector: LabelSelector {
+                label_selector: Some(LabelSelector {
                     match_labels: Some(ml),
                     match_expressions: None,
-                },
+                }),
                 namespaces: None,
                 topology_key: topology_key.to_string(),
                 ..Default::default()
@@ -282,10 +282,10 @@ fn preferred_pod_affinity(
                 WeightedPodAffinityTerm {
                     weight,
                     pod_affinity_term: PodAffinityTerm {
-                        label_selector: LabelSelector {
+                        label_selector: Some(LabelSelector {
                             match_labels: Some(ml),
                             match_expressions: None,
-                        },
+                        }),
                         namespaces: None,
                         topology_key: topology_key.to_string(),
                         ..Default::default()
@@ -307,10 +307,10 @@ fn required_pod_anti_affinity(topology_key: &str, match_labels: &[(&str, &str)])
         pod_affinity: None,
         pod_anti_affinity: Some(PodAntiAffinity {
             required_during_scheduling_ignored_during_execution: Some(vec![PodAffinityTerm {
-                label_selector: LabelSelector {
+                label_selector: Some(LabelSelector {
                     match_labels: Some(ml),
                     match_expressions: None,
-                },
+                }),
                 namespaces: None,
                 topology_key: topology_key.to_string(),
                 ..Default::default()

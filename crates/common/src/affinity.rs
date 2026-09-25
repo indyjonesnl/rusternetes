@@ -313,8 +313,16 @@ pub fn matches_pod_affinity_term(
             None => return false,
         };
 
-        // Check if pod matches the label selector.
-        if !match_selector(&term.label_selector, &p.metadata.labels) {
+        // Check if pod matches the label selector. An **absent** selector is
+        // not an empty one: upstream turns the term's selector into a
+        // `labels.Selector` with `LabelSelectorAsSelector`, which answers
+        // `labels.Nothing()` for nil and `labels.Everything()` for `{}`
+        // (`apimachinery/pkg/apis/meta/v1/helpers.go:37-43`). So a term with no
+        // `labelSelector` matches no pods at all.
+        let Some(selector) = term.label_selector.as_ref() else {
+            return false;
+        };
+        if !match_selector(selector, &p.metadata.labels) {
             return false;
         }
 
@@ -397,10 +405,10 @@ mod tests {
         let mut match_labels = HashMap::new();
         match_labels.insert("app".to_string(), "web".to_string());
         let term = PodAffinityTerm {
-            label_selector: LabelSelector {
+            label_selector: Some(LabelSelector {
                 match_labels: Some(match_labels),
                 match_expressions: None,
-            },
+            }),
             namespaces: None,
             topology_key: topology_key.to_string(),
             ..Default::default()
@@ -474,6 +482,57 @@ mod tests {
                 true,
             ),
             "a pod in the same namespace MUST match a namespaces=None term"
+        );
+    }
+
+    /// A term with **no** `labelSelector` selects no pods, and one with an
+    /// *empty* selector selects every pod. Upstream draws that line in
+    /// `LabelSelectorAsSelector`
+    /// (`apimachinery/pkg/apis/meta/v1/helpers.go:37-43`): `nil` is
+    /// `labels.Nothing()`, `&LabelSelector{}` is `labels.Everything()`. The two
+    /// are opposite, which is why the field is `Option` rather than a defaulted
+    /// value (#1939).
+    #[test]
+    fn an_absent_label_selector_matches_nothing_and_an_empty_one_matches_everything() {
+        let node = node_with_topology("node-1", "zone", "z1");
+        let candidate = candidate_with_affinity("candidate", "ns-a", "zone");
+        let running = scheduled_pod("web", "ns-a", &[("app", "web")], "node-1");
+
+        let absent = PodAffinityTerm {
+            label_selector: None,
+            namespaces: None,
+            topology_key: "zone".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            !matches_pod_affinity_term(
+                &node,
+                &candidate,
+                &absent,
+                std::slice::from_ref(&running),
+                std::slice::from_ref(&node),
+                true,
+            ),
+            "a term with no labelSelector must match no pods (labels.Nothing())"
+        );
+
+        let empty = PodAffinityTerm {
+            label_selector: Some(LabelSelector {
+                match_labels: None,
+                match_expressions: None,
+            }),
+            ..absent.clone()
+        };
+        assert!(
+            matches_pod_affinity_term(
+                &node,
+                &candidate,
+                &empty,
+                std::slice::from_ref(&running),
+                std::slice::from_ref(&node),
+                true,
+            ),
+            "a term with an empty labelSelector must match every pod (labels.Everything())"
         );
     }
 }
