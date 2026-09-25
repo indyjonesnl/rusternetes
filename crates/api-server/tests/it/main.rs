@@ -186,6 +186,7 @@ mod proxy_test;
 mod put_create_on_update_test;
 mod put_metadata_inheritance_guard_test;
 mod pv_defaults_test;
+mod pv_volume_source_validation_test;
 mod pvc_default_volume_mode_test;
 mod rbac_authorization_test;
 mod rbac_handler_test;

@@ -87,6 +87,10 @@ fn no_volume_source_required() {
     assert!(has(&errs, "spec", ErrorType::Required), "got: {errs:?}");
 }
 
+/// Upstream reports the *second* source's own field path, not the spec's:
+/// `field.Forbidden(fldPath.Child("nfs"), "may not specify more than 1 volume
+/// type")` (`pkg/apis/core/validation/validation.go:2044`). A client reading
+/// `spec: Forbidden` cannot tell which source to drop.
 #[test]
 fn multiple_volume_sources_forbidden() {
     let errs = validate_persistent_volume(&pv(json!({
@@ -95,7 +99,10 @@ fn multiple_volume_sources_forbidden() {
         "hostPath": {"path": "/data"},
         "nfs": {"server": "10.0.0.1", "path": "/exports"}
     })));
-    assert!(has(&errs, "spec", ErrorType::Forbidden), "got: {errs:?}");
+    assert!(
+        has(&errs, "spec.nfs", ErrorType::Forbidden),
+        "got: {errs:?}"
+    );
 }
 
 #[test]

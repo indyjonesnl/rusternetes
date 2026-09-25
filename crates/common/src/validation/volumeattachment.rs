@@ -67,6 +67,10 @@ pub fn validate_volume_attachment(va: &VolumeAttachment) -> ErrorList {
         (Some(inline), None) => {
             errs.extend(validate_persistent_volume_spec(
                 inline,
+                // Upstream passes an empty pvName here (`pkg/apis/storage/
+                // validation/validation.go:197`) — an inline spec has no object
+                // name for the iscsi `<name>:<targetPortal>` length bound.
+                "",
                 true,
                 &source_path.child("inlineVolumeSpec"),
             ));

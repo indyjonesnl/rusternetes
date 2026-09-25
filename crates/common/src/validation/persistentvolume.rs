@@ -4,8 +4,8 @@
 //! Scope: capacity (storage required, storage-only, non-negative), access modes
 //! (≥1 + ReadWriteOncePod exclusivity), exactly one volume source,
 //! nodeAffinity-required-for-Local, the hostPath-'/'-with-Recycle prohibition,
-//! and storageClassName. The exhaustive per-source field validation (each
-//! `validate*VolumeSource`) is left as a follow-up.
+//! and storageClassName, plus the per-source field validation each
+//! `numVolumes++` carries upstream and `validateVolumeNodeAffinity`.
 //!
 //! reclaimPolicy / volumeMode / accessModes enum-membership (upstream
 //! `supportedReclaimPolicy` / `supportedVolumeModes` / `supportedAccessModes`)
@@ -15,11 +15,30 @@
 
 use crate::quantity::Quantity;
 use crate::resources::volume::{
-    PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeMode,
-    PersistentVolumeReclaimPolicy, PersistentVolumeSpec,
+    CSIVolumeSource, HostPathVolumeSource, ISCSIVolumeSource, LocalVolumeSource, NodeSelector,
+    NodeSelectorRequirement, NodeSelectorTerm, PersistentVolume, PersistentVolumeAccessMode,
+    PersistentVolumeMode, PersistentVolumeReclaimPolicy, PersistentVolumeSpec, SecretReference,
+    VolumeNodeAffinity,
 };
+use crate::validation::csinode::validate_csi_driver_name;
 use crate::validation::field::{Error, ErrorList, Path};
-use crate::validation::metav1::is_dns1123_subdomain;
+use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
+use crate::validation::pod::{validate_nfs_volume_source, validate_node_selector};
+use once_cell::sync::Lazy;
+use regex::Regex;
+
+/// Upstream `iscsiInitiatorIqnRegex` / `iscsiInitiatorEuiRegex` /
+/// `iscsiInitiatorNaaRegex` (`pkg/apis/core/validation/validation.go:89-91`).
+/// Go's `[[:alnum:]]` is `[0-9A-Za-z]`; the Rust `regex` crate spells POSIX
+/// classes the same way inside a character class, so the patterns carry over
+/// verbatim apart from that.
+static ISCSI_IQN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"iqn\.\d{4}-\d{2}\.([[:alnum:]\-.]+)(:[^,;*&$|\s]+)$").expect("iscsi iqn regex")
+});
+static ISCSI_EUI_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^eui.[[:alnum:]]{16}$").expect("iscsi eui regex"));
+static ISCSI_NAA_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^naa.[[:alnum:]]{32}$").expect("iscsi naa regex"));
 
 /// Lexically normalise a path, mirroring Go's `path.Clean` for the cases that
 /// matter to the hostPath-root check: collapse repeated slashes and resolve
@@ -55,10 +74,230 @@ fn clean_path(p: &str) -> String {
     }
 }
 
+/// Port of upstream `validatePathNoBacksteps`
+/// (`pkg/apis/core/validation/validation.go:754-764`): one error is enough,
+/// even for `../../..`.
+fn validate_path_no_backsteps(target_path: &str, fld_path: &Path) -> ErrorList {
+    if target_path.split('/').any(|part| part == "..") {
+        return vec![Error::invalid(
+            fld_path,
+            target_path.to_string(),
+            "must not contain '..'",
+        )];
+    }
+    Vec::new()
+}
+
+/// Port of upstream `validateHostPathVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:816-826`). The `type` enum is a
+/// closed Rust enum, so upstream's `validateHostPathType` membership check is
+/// answered at decode time.
+fn validate_host_path_volume_source(hp: &HostPathVolumeSource, fld_path: &Path) -> ErrorList {
+    if hp.path.is_empty() {
+        return vec![Error::required(&fld_path.child("path"), "")];
+    }
+    validate_path_no_backsteps(&hp.path, &fld_path.child("path"))
+}
+
+/// Port of upstream `validateLocalVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:1735-1744`).
+fn validate_local_volume_source(ls: &LocalVolumeSource, fld_path: &Path) -> ErrorList {
+    if ls.path.is_empty() {
+        return vec![Error::required(&fld_path.child("path"), "")];
+    }
+    validate_path_no_backsteps(&ls.path, &fld_path.child("path"))
+}
+
+/// Port of upstream `validatePVSecretReference`
+/// (`pkg/apis/core/validation/validation.go:1829-1843`): unlike the pod-side
+/// `LocalObjectReference`, a PV secret reference carries a namespace and both
+/// halves are required.
+fn validate_pv_secret_reference(secret_ref: &SecretReference, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    match secret_ref.name.as_deref().unwrap_or("") {
+        "" => errs.push(Error::required(&fld_path.child("name"), "")),
+        name => {
+            for msg in is_dns1123_subdomain(name) {
+                errs.push(Error::invalid(
+                    &fld_path.child("name"),
+                    name.to_string(),
+                    msg,
+                ));
+            }
+        }
+    }
+    match secret_ref.namespace.as_deref().unwrap_or("") {
+        "" => errs.push(Error::required(&fld_path.child("namespace"), "")),
+        ns => {
+            for msg in is_dns1123_label(ns) {
+                errs.push(Error::invalid(
+                    &fld_path.child("namespace"),
+                    ns.to_string(),
+                    msg,
+                ));
+            }
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateCSIPersistentVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:1848-1869`). Note this is the
+/// *persistent* variant: `volumeHandle` is required and every secret reference
+/// is a namespaced `SecretReference`, where the pod-inline `CSIVolumeSource`
+/// (`:1871-1887`) has neither.
+fn validate_csi_persistent_volume_source(csi: &CSIVolumeSource, fld_path: &Path) -> ErrorList {
+    let mut errs = validate_csi_driver_name(&csi.driver, &fld_path.child("driver"));
+
+    if csi.volume_handle.as_deref().unwrap_or("").is_empty() {
+        errs.push(Error::required(&fld_path.child("volumeHandle"), ""));
+    }
+    for (secret_ref, child) in [
+        (
+            &csi.controller_publish_secret_ref,
+            "controllerPublishSecretRef",
+        ),
+        (
+            &csi.controller_expand_secret_ref,
+            "controllerExpandSecretRef",
+        ),
+        (&csi.node_publish_secret_ref, "nodePublishSecretRef"),
+        (&csi.node_expand_secret_ref, "nodeExpandSecretRef"),
+    ] {
+        if let Some(r) = secret_ref {
+            errs.extend(validate_pv_secret_reference(r, &fld_path.child(child)));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateISCSIPersistentVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:879-928`). The differences from the
+/// pod-inline `validateISCSIVolumeSource` are the `<pv name>:<targetPortal>`
+/// length bound that `initiatorName` imposes and the namespaced `secretRef`.
+fn validate_iscsi_persistent_volume_source(
+    iscsi: &ISCSIVolumeSource,
+    pv_name: &str,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    if iscsi.target_portal.is_empty() {
+        errs.push(Error::required(&fld_path.child("targetPortal"), ""));
+    }
+    if iscsi.initiator_name.is_some() && pv_name.len() + 1 + iscsi.target_portal.len() > 64 {
+        errs.push(Error::invalid(
+            &fld_path.child("targetportal"),
+            iscsi.target_portal.clone(),
+            "Total length of <volume name>:<iscsi.targetPortal> must be under 64 characters if              iscsi.initiatorName is specified.",
+        ));
+    }
+    if iscsi.iqn.is_empty() {
+        errs.push(Error::required(&fld_path.child("iqn"), ""));
+    } else {
+        errs.extend(validate_iscsi_name(&iscsi.iqn, &fld_path.child("iqn")));
+    }
+    if !(0..=255).contains(&iscsi.lun) {
+        errs.push(Error::invalid(
+            &fld_path.child("lun"),
+            iscsi.lun,
+            "must be between 0 and 255, inclusive",
+        ));
+    }
+    let chap =
+        iscsi.chap_auth_discovery.unwrap_or(false) || iscsi.chap_auth_session.unwrap_or(false);
+    match (&iscsi.secret_ref, chap) {
+        (None, true) => errs.push(Error::required(&fld_path.child("secretRef"), "")),
+        (Some(r), _) => {
+            if r.name.as_deref().unwrap_or("").is_empty() {
+                errs.push(Error::required(
+                    &fld_path.child("secretRef").child("name"),
+                    "",
+                ));
+            }
+        }
+        (None, false) => {}
+    }
+    if let Some(initiator) = &iscsi.initiator_name {
+        errs.extend(validate_iscsi_name(
+            initiator,
+            &fld_path.child("initiatorname"),
+        ));
+    }
+    errs
+}
+
+/// The iqn / initiatorName format check shared by both halves of
+/// `validateISCSIPersistentVolumeSource`
+/// (`pkg/apis/core/validation/validation.go:888-898`, `:918-927`): a recognised
+/// prefix, then the prefix's own regex.
+fn validate_iscsi_name(name: &str, fld_path: &Path) -> ErrorList {
+    let ok = if name.starts_with("iqn") {
+        ISCSI_IQN_RE.is_match(name)
+    } else if name.starts_with("eui") {
+        ISCSI_EUI_RE.is_match(name)
+    } else if name.starts_with("naa") {
+        ISCSI_NAA_RE.is_match(name)
+    } else {
+        false
+    };
+    if ok {
+        Vec::new()
+    } else {
+        vec![Error::invalid(
+            fld_path,
+            name.to_string(),
+            "must be valid format",
+        )]
+    }
+}
+
+/// Port of upstream `validateVolumeNodeAffinity`
+/// (`pkg/apis/core/validation/validation.go:8701-8714`): `required` is not
+/// optional once `nodeAffinity` is set.
+fn validate_volume_node_affinity(na: &VolumeNodeAffinity, fld_path: &Path) -> ErrorList {
+    let Some(required) = &na.required else {
+        return vec![Error::required(
+            &fld_path.child("required"),
+            "must specify required node constraints",
+        )];
+    };
+    validate_node_selector(&to_pod_node_selector(required), &fld_path.child("required"))
+}
+
+/// `volume.rs` carries its own structurally-identical copy of the node-selector
+/// types, so convert to the `resources::pod` shapes that
+/// `validation::pod::validate_node_selector` consumes — the same approach
+/// `pvc.rs::to_meta_label_selector` takes for label selectors.
+fn to_pod_node_selector(sel: &NodeSelector) -> crate::resources::pod::NodeSelector {
+    crate::resources::pod::NodeSelector {
+        node_selector_terms: sel.node_selector_terms.iter().map(to_pod_term).collect(),
+    }
+}
+
+fn to_pod_term(term: &NodeSelectorTerm) -> crate::resources::pod::NodeSelectorTerm {
+    let convert = |reqs: &Option<Vec<NodeSelectorRequirement>>| {
+        reqs.as_ref().map(|rs| {
+            rs.iter()
+                .map(|r| crate::resources::pod::NodeSelectorRequirement {
+                    key: r.key.clone(),
+                    operator: r.operator.clone(),
+                    values: r.values.clone(),
+                })
+                .collect()
+        })
+    };
+    crate::resources::pod::NodeSelectorTerm {
+        match_expressions: convert(&term.match_expressions),
+        match_fields: convert(&term.match_fields),
+    }
+}
+
 /// Validate a `PersistentVolumeSpec`. Mirrors the core of upstream
 /// `ValidatePersistentVolume`.
 pub fn validate_persistent_volume_spec(
     spec: &PersistentVolumeSpec,
+    pv_name: &str,
     inline: bool,
     fld_path: &Path,
 ) -> ErrorList {
@@ -153,24 +392,55 @@ pub fn validate_persistent_volume_spec(
         ));
     }
 
-    // Exactly one volume source must be specified.
-    let num_volumes = [
-        spec.host_path.is_some(),
-        spec.nfs.is_some(),
-        spec.iscsi.is_some(),
-        spec.local.is_some(),
-        spec.csi.is_some(),
-    ]
-    .iter()
-    .filter(|x| **x)
-    .count();
+    // nodeAffinity, when set, must carry `required` and a valid node selector
+    // (upstream `validateVolumeNodeAffinity`, validation.go:8701-8714). Upstream
+    // runs this *before* the source block, so a PV that is wrong in both places
+    // reports the affinity error first.
+    if let Some(na) = &spec.node_affinity {
+        if !inline {
+            errs.extend(validate_volume_node_affinity(
+                na,
+                &fld_path.child("nodeAffinity"),
+            ));
+        }
+    }
+
+    // Exactly one volume source must be specified, and that source's own fields
+    // are validated next to its `numVolumes++` (upstream
+    // `ValidatePersistentVolumeSpec`, validation.go:2037-2135). Counting the
+    // sources without validating them was the gap this closes: a PV whose only
+    // source was `{"nfs": {"server": "x"}}` was written with no path at all.
+    let mut num_volumes = 0usize;
+    macro_rules! source {
+        ($opt:expr, $child:expr, $validate:expr) => {
+            if let Some(src) = $opt {
+                let child_path = fld_path.child($child);
+                if num_volumes > 0 {
+                    errs.push(Error::forbidden(
+                        &child_path,
+                        "may not specify more than 1 volume type",
+                    ));
+                } else {
+                    num_volumes += 1;
+                    #[allow(clippy::redundant_closure_call)]
+                    errs.extend($validate(src, &child_path));
+                }
+            }
+        };
+    }
+    source!(
+        &spec.host_path,
+        "hostPath",
+        validate_host_path_volume_source
+    );
+    source!(&spec.nfs, "nfs", validate_nfs_volume_source);
+    source!(&spec.iscsi, "iscsi", |iscsi, p| {
+        validate_iscsi_persistent_volume_source(iscsi, pv_name, p)
+    });
+    source!(&spec.local, "local", validate_local_volume_source);
+    source!(&spec.csi, "csi", validate_csi_persistent_volume_source);
     if num_volumes == 0 {
         errs.push(Error::required(fld_path, "must specify a volume type"));
-    } else if num_volumes > 1 {
-        errs.push(Error::forbidden(
-            fld_path,
-            "may not specify more than 1 volume type",
-        ));
     }
 
     // A Local volume requires node affinity (upstream line ~2194-2197).
@@ -252,7 +522,7 @@ pub fn validate_persistent_volume_spec(
 
 /// Validate a new `PersistentVolume`. Mirrors upstream `ValidatePersistentVolume`.
 pub fn validate_persistent_volume(pv: &PersistentVolume) -> ErrorList {
-    validate_persistent_volume_spec(&pv.spec, false, &Path::new("spec"))
+    validate_persistent_volume_spec(&pv.spec, &pv.metadata.name, false, &Path::new("spec"))
 }
 
 /// JSON view of just the volume-source union of a `PersistentVolumeSpec`
