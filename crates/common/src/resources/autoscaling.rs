@@ -1,3 +1,37 @@
+//! autoscaling/v2 (HorizontalPodAutoscaler) and the VerticalPodAutoscaler
+//! add-on types.
+//!
+//! #1939: every wire field here decodes when absent, because Go has no
+//! required JSON fields — an absent key is the zero value and *validation*
+//! answers `422 Invalid` with a field path.
+//!
+//! For the HPA half that is exactly what upstream's validator then does, so
+//! nothing is weakened by defaulting
+//! (`pkg/apis/autoscaling/validation/validation.go`): an absent `maxReplicas`
+//! is `0` and `validateHorizontalPodAutoscalerSpec` answers
+//! `maxReplicas: Invalid value: 0: must be greater than 0` (`:62-64`); an
+//! absent `scaleTargetRef` is the zero reference and
+//! `validateCrossVersionObjectReference` answers `kind`/`name` `Required`
+//! (`:117-133`); an absent `metrics[].type` is `""` and `validateMetricSpec`
+//! answers `Required` then `Unsupported` (`:186-200`); an absent
+//! `behavior.scaleUp.policies[].value`/`.periodSeconds` is `0` and
+//! `validateScalingPolicy` answers `must be greater than zero` (`:332-345`).
+//! The HPA *status* counters are the same shape: an absent `currentReplicas`
+//! is `0`, which `ValidateHorizontalPodAutoscalerStatusUpdate` accepts, and so
+//! must we.
+//!
+//! The VerticalPodAutoscaler types are a deliberate exception to the
+//! upstream-first rule, stated per CLAUDE.md rule 8: VPA is not a Kubernetes
+//! API. It ships as a CRD from `kubernetes/autoscaler`
+//! (`vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1/types.go`), so
+//! there is no Go validator to port — a CRD's fields are checked by its
+//! OpenAPI schema. Rusternetes serves no VPA route; the only reader is
+//! `controller-manager/src/controllers/vpa.rs`, which does
+//! `list::<VerticalPodAutoscaler>("/registry/verticalpodautoscalers/")`. A
+//! stored object missing one field made that decode fail and the controller
+//! skip the whole item, so defaulting here is a decode-robustness fix with no
+//! validation counterpart to keep in step.
+
 use crate::types::{ObjectMeta, TypeMeta};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -42,12 +76,14 @@ impl HorizontalPodAutoscaler {
 #[serde(rename_all = "camelCase")]
 pub struct HorizontalPodAutoscalerSpec {
     /// Reference to the scaled resource (Deployment, ReplicaSet, StatefulSet, etc.)
+    #[serde(default)]
     pub scale_target_ref: CrossVersionObjectReference,
 
     /// Minimum number of replicas
     pub min_replicas: Option<i32>,
 
     /// Maximum number of replicas
+    #[serde(default)]
     pub max_replicas: i32,
 
     /// Metrics to use for scaling decisions
@@ -64,9 +100,11 @@ pub struct HorizontalPodAutoscalerSpec {
 #[serde(rename_all = "camelCase")]
 pub struct CrossVersionObjectReference {
     /// Kind of the referent (e.g., Deployment)
+    #[serde(default)]
     pub kind: String,
 
     /// Name of the referent
+    #[serde(default)]
     pub name: String,
 
     /// API version of the referent
@@ -80,6 +118,7 @@ pub struct CrossVersionObjectReference {
 pub struct MetricSpec {
     /// Type of metric: Resource, Pods, Object, External, ContainerResource
     #[serde(rename = "type")]
+    #[serde(default)]
     pub metric_type: String,
 
     /// Resource metric (CPU, memory)
@@ -108,9 +147,11 @@ pub struct MetricSpec {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceMetricSource {
     /// Name of the resource (cpu, memory)
+    #[serde(default)]
     pub name: String,
 
     /// Target specifies the target value for the metric
+    #[serde(default)]
     pub target: MetricTarget,
 }
 
@@ -119,9 +160,11 @@ pub struct ResourceMetricSource {
 #[serde(rename_all = "camelCase")]
 pub struct PodsMetricSource {
     /// Metric identifies the target metric
+    #[serde(default)]
     pub metric: MetricIdentifier,
 
     /// Target specifies the target value for the metric
+    #[serde(default)]
     pub target: MetricTarget,
 }
 
@@ -130,12 +173,15 @@ pub struct PodsMetricSource {
 #[serde(rename_all = "camelCase")]
 pub struct ObjectMetricSource {
     /// Described object
+    #[serde(default)]
     pub described_object: CrossVersionObjectReference,
 
     /// Metric identifies the target metric
+    #[serde(default)]
     pub metric: MetricIdentifier,
 
     /// Target specifies the target value for the metric
+    #[serde(default)]
     pub target: MetricTarget,
 }
 
@@ -144,9 +190,11 @@ pub struct ObjectMetricSource {
 #[serde(rename_all = "camelCase")]
 pub struct ExternalMetricSource {
     /// Metric identifies the target metric
+    #[serde(default)]
     pub metric: MetricIdentifier,
 
     /// Target specifies the target value for the metric
+    #[serde(default)]
     pub target: MetricTarget,
 }
 
@@ -155,20 +203,24 @@ pub struct ExternalMetricSource {
 #[serde(rename_all = "camelCase")]
 pub struct ContainerResourceMetricSource {
     /// Name of the resource (cpu, memory)
+    #[serde(default)]
     pub name: String,
 
     /// Container name
+    #[serde(default)]
     pub container: String,
 
     /// Target specifies the target value for the metric
+    #[serde(default)]
     pub target: MetricTarget,
 }
 
 /// MetricIdentifier defines the name and optionally selector for a metric
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricIdentifier {
     /// Name of the metric
+    #[serde(default)]
     pub name: String,
 
     /// Selector to refine the metric
@@ -177,11 +229,12 @@ pub struct MetricIdentifier {
 }
 
 /// MetricTarget defines the target value, average value, or average utilization
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricTarget {
     /// Type: Utilization, Value, AverageValue
     #[serde(rename = "type")]
+    #[serde(default)]
     pub target_type: String,
 
     /// Value is the target value of the metric (as a quantity)
@@ -236,12 +289,15 @@ pub struct HPAScalingRules {
 pub struct HPAScalingPolicy {
     /// Type is used to specify the scaling policy (Pods or Percent)
     #[serde(rename = "type")]
+    #[serde(default)]
     pub policy_type: String,
 
     /// Value contains the amount of change permitted
+    #[serde(default)]
     pub value: i32,
 
     /// PeriodSeconds specifies the window of time for which the policy should hold true
+    #[serde(default)]
     pub period_seconds: i32,
 }
 
@@ -263,9 +319,11 @@ pub struct HorizontalPodAutoscalerStatus {
     pub last_scale_time: Option<DateTime<Utc>>,
 
     /// Current number of replicas
+    #[serde(default)]
     pub current_replicas: i32,
 
     /// Desired number of replicas
+    #[serde(default)]
     pub desired_replicas: i32,
 
     /// Current metric values
@@ -283,6 +341,7 @@ pub struct HorizontalPodAutoscalerStatus {
 pub struct MetricStatus {
     /// Type of metric
     #[serde(rename = "type")]
+    #[serde(default)]
     pub metric_type: String,
 
     /// Resource metric status
@@ -311,12 +370,15 @@ pub struct MetricStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ContainerResourceMetricStatus {
     /// Name of the resource
+    #[serde(default)]
     pub name: String,
 
     /// Container is the name of the container the metric applies to
+    #[serde(default)]
     pub container: String,
 
     /// Current contains the current value for the metric
+    #[serde(default)]
     pub current: MetricValueStatus,
 }
 
@@ -325,9 +387,11 @@ pub struct ContainerResourceMetricStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceMetricStatus {
     /// Name of the resource
+    #[serde(default)]
     pub name: String,
 
     /// Current contains the current value for the metric
+    #[serde(default)]
     pub current: MetricValueStatus,
 }
 
@@ -336,9 +400,11 @@ pub struct ResourceMetricStatus {
 #[serde(rename_all = "camelCase")]
 pub struct PodsMetricStatus {
     /// Metric identifies the target metric
+    #[serde(default)]
     pub metric: MetricIdentifier,
 
     /// Current contains the current value for the metric
+    #[serde(default)]
     pub current: MetricValueStatus,
 }
 
@@ -347,12 +413,15 @@ pub struct PodsMetricStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ObjectMetricStatus {
     /// Metric identifies the target metric
+    #[serde(default)]
     pub metric: MetricIdentifier,
 
     /// Current contains the current value for the metric
+    #[serde(default)]
     pub current: MetricValueStatus,
 
     /// Described object
+    #[serde(default)]
     pub described_object: CrossVersionObjectReference,
 }
 
@@ -361,14 +430,16 @@ pub struct ObjectMetricStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ExternalMetricStatus {
     /// Metric identifies the target metric
+    #[serde(default)]
     pub metric: MetricIdentifier,
 
     /// Current contains the current value for the metric
+    #[serde(default)]
     pub current: MetricValueStatus,
 }
 
 /// MetricValueStatus holds the current value for a metric
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricValueStatus {
     /// Value is the current value of the metric
@@ -454,6 +525,7 @@ impl VerticalPodAutoscaler {
 #[serde(rename_all = "camelCase")]
 pub struct VerticalPodAutoscalerSpec {
     /// TargetRef points to the controller managing the set of pods
+    #[serde(default)]
     pub target_ref: CrossVersionObjectReference,
 
     /// UpdatePolicy controls how changes are applied to pods
@@ -517,6 +589,7 @@ pub struct ContainerResourcePolicy {
 #[serde(rename_all = "camelCase")]
 pub struct VerticalPodAutoscalerRecommenderSelector {
     /// Name of the recommender
+    #[serde(default)]
     pub name: String,
 }
 
@@ -547,9 +620,11 @@ pub struct RecommendedPodResources {
 #[serde(rename_all = "camelCase")]
 pub struct RecommendedContainerResources {
     /// Container name
+    #[serde(default)]
     pub container_name: String,
 
     /// Recommended resource amounts
+    #[serde(default)]
     pub target: std::collections::HashMap<String, String>,
 
     /// Lower bound on resource amounts
