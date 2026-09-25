@@ -17,11 +17,13 @@ pub struct ExternalMetricValue {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
     /// The name of the metric.
+    #[serde(default)]
     pub metric_name: String,
     /// The labels for the metric.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metric_labels: Option<BTreeMap<String, String>>,
     #[serde(
+        default = "zero_time",
         serialize_with = "crate::types::k8s_time_required::serialize",
         deserialize_with = "crate::types::k8s_time_required::deserialize"
     )]
@@ -30,6 +32,7 @@ pub struct ExternalMetricValue {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<String>,
     /// The value of the metric as a quantity string.
+    #[serde(default)]
     pub value: String,
 }
 
@@ -44,7 +47,16 @@ pub struct ExternalMetricValueList {
 
     #[serde(default)]
     pub metadata: ListMeta,
+    #[serde(default)]
     pub items: Vec<ExternalMetricValue>,
+}
+
+/// The Go zero `metav1.Time`, which is what an absent `timestamp` decodes to
+/// upstream. These are the response types of a read-only aggregated API —
+/// nothing upstream validates or creates them — so the absent case has to
+/// decode rather than be rejected.
+fn zero_time() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch is a valid timestamp")
 }
 
 #[cfg(test)]

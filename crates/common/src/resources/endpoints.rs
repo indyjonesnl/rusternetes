@@ -87,6 +87,11 @@ pub struct EndpointPort {
     pub name: Option<String>,
 
     /// The port number of the endpoint.
+    ///
+    /// Absent is `0` upstream, which `validateEndpointPort` rejects through
+    /// `IsValidPortNum` (`pkg/apis/core/validation/validation.go:8343-8345`) —
+    /// the check was already ported, the field just could not reach it.
+    #[serde(default)]
     pub port: u16,
 
     /// The IP protocol for this port. Must be UDP, TCP, or SCTP.

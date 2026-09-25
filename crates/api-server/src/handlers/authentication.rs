@@ -34,6 +34,15 @@ pub async fn create_token_review(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
+    // A TokenReview with no token is a 400 from the registry, not a 422 from a
+    // validator: `TokenREST.Create` checks it before touching the
+    // authenticator (`pkg/registry/authentication/tokenreview/storage.go:79-81`).
+    if token_review.spec.token.is_empty() {
+        return Err(rusternetes_common::Error::BadRequest(
+            "token is required for TokenReview in authentication".to_string(),
+        ));
+    }
+
     // Authenticate the provided token using the available authentication mechanisms
     // Try service account token first
     let status = if let Ok(claims) = state.token_manager.validate_token(&token_review.spec.token) {

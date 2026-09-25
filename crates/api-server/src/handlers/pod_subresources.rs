@@ -916,26 +916,37 @@ pub async fn create_binding(
     let binding: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| Error::InvalidResource(format!("Invalid binding format: {}", e)))?;
 
-    // target.kind, when set, must be "Node" (upstream ValidatePodBinding).
-    if let Some(kind) = binding
-        .get("target")
-        .and_then(|t| t.get("kind"))
-        .and_then(|k| k.as_str())
-    {
+    // `ValidatePodBinding` (`pkg/apis/core/validation/validation.go:6527-6539`):
+    // `target.kind`, when set, must be `Node`, and `target.name` is required.
+    // Both errors carry their field path, so a client sees one `Status` with
+    // `details.causes` rather than a bare sentence (#1939).
+    let target = binding.get("target");
+    let target_path = rusternetes_common::validation::field::Path::new("target");
+    let mut errs: rusternetes_common::validation::field::ErrorList = Vec::new();
+
+    if let Some(kind) = target.and_then(|t| t.get("kind")).and_then(|k| k.as_str()) {
         if !kind.is_empty() && kind != "Node" {
-            return Err(Error::InvalidResource(format!(
-                "Unsupported value: target.kind: \"{}\": supported values: \"Node\", \"<empty>\"",
-                kind
-            )));
+            errs.push(rusternetes_common::validation::field::Error::not_supported(
+                &target_path.child("kind"),
+                kind.to_string(),
+                &["Node", "<empty>"],
+            ));
         }
     }
 
-    // Extract target node from binding
-    let node_name = binding
-        .get("target")
+    let node_name = target
         .and_then(|t: &serde_json::Value| t.get("name"))
         .and_then(|n: &serde_json::Value| n.as_str())
-        .ok_or_else(|| Error::InvalidResource("Missing target.name in binding".to_string()))?;
+        .unwrap_or("");
+    if node_name.is_empty() {
+        errs.push(rusternetes_common::validation::field::Error::required(
+            &target_path.child("name"),
+            "",
+        ));
+    }
+    if !errs.is_empty() {
+        return Err(Error::Invalid(errs));
+    }
 
     // Update pod's spec.nodeName to bind it to the node
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
