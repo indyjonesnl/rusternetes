@@ -446,6 +446,27 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// slice had to wire it into all five validators *first*: defaulting the fields
 /// without it would have turned serde's 400 into a silent accept rather than
 /// into the 422 upstream answers.
+///
+/// `pod.rs`: 85 fields over four slices — the container surface (#1953), the
+/// pod-level surface (#1954), every volume source (#2005) and affinity (#2006).
+/// Most of them needed a validator ported before they could be defaulted, because
+/// Rusternetes had none: `validateEnvFrom`, `validateVolumeDevices`,
+/// `validateResizePolicy`, `validateContainerRestartRules`,
+/// `validateSeccompProfile`, `validateAppArmorProfile`, `validateOS`,
+/// `validatePodResourceClaims`, `validateReadinessGates`,
+/// `validateSchedulingGates`, every `validate*VolumeSource` under
+/// `ValidateVolumes`, and the `ValidateAffinity` tree — all in
+/// `pkg/apis/core/validation/validation.go`. Two whole subsystems had no
+/// create-time validation at all before these slices: volume sources (a pod
+/// whose only volume was `{"name":"v"}` was a 201) and affinity.
+///
+/// Not every pod field could be defaulted. `PodAffinityTerm.labelSelector` is a
+/// **pointer** upstream and stays an `Option` here, because
+/// `LabelSelectorAsSelector(nil)` is `labels.Nothing()` while
+/// `&LabelSelector{}` is `labels.Everything()`
+/// (`apimachinery/pkg/apis/meta/v1/helpers.go:37-43`) — defaulting it would have
+/// turned "match no pod" into "match every pod". The guard skips `Option`
+/// fields, so modelling a pointer correctly satisfies it too.
 #[test]
 fn every_field_of_an_audited_module_decodes_when_absent() {
     let mut offenders: Vec<String> = Vec::new();
@@ -503,6 +524,7 @@ const AUDITED_MODULES: &[&str] = &[
     "ipaddress.rs",
     "networking.rs",
     "node.rs",
+    "pod.rs",
     "rbac.rs",
     "service.rs",
     "workloads.rs",
