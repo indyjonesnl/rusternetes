@@ -501,6 +501,25 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// `CustomResourceConversion.strategy` stays an `Option` for the same reason
 /// `DeviceTaint.effect` does: upstream's is a string type whose `""` is
 /// `Required`, and a closed Rust enum has no member for it.
+/// `dra.rs`: the ResourceSlice half (#2015), the claim spec half and the claim
+/// status half. Each needed validators ported first, because two whole
+/// subsystems had none: `spec.devices` `selectors`/`tolerations`/`config` were
+/// stored exactly as posted, and `update_resourceclaim_status` did
+/// `existing.status = claim.status` with no validation whatsoever. The ports are
+/// `validateSelectorSlice` (`pkg/apis/resource/validation/validation.go:298`),
+/// `validateDeviceToleration` (`:1411`), `validateDeviceClaimConfiguration` +
+/// `validateRequestNameRef` (`:372-400`), `validateOpaqueConfiguration` +
+/// `validateRawExtension` (`:425`, `:1297`),
+/// `validateResourceClaimStatusUpdate` (`:434`), `validateAllocationResult`
+/// (`:483`), `validateDeviceRequestAllocationResult` (`:509`),
+/// `validateDeviceAllocationConfiguration` (`:522`) and `validateDeviceStatus`
+/// (`:1272`).
+///
+/// Three fields here are `Option` rather than defaulted, all for the same
+/// reason: upstream's type is a string whose `""` is a *validated* case, and a
+/// closed Rust enum has no member for `""` — `DeviceTaint.effect` (`Required`),
+/// `DeviceToleration.effect` (legal, "Optional in a toleration", `:1428`) and
+/// `DeviceAllocationConfiguration.source` (`Required`, `:534`).
 ///
 /// Not every pod field could be defaulted. `PodAffinityTerm.labelSelector` is a
 /// **pointer** upstream and stays an `Option` here, because
@@ -562,6 +581,7 @@ const AUDITED_MODULES: &[&str] = &[
     "admission_webhook.rs",
     "crd.rs",
     "deployment.rs",
+    "dra.rs",
     "endpointslice.rs",
     "event.rs",
     "flowcontrol.rs",

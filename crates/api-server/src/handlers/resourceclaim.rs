@@ -376,6 +376,24 @@ pub async fn update_resourceclaim_status(
     existing.kind = "ResourceClaim".to_string();
     existing.api_version = "resource.k8s.io/v1".to_string();
 
+    // `validateResourceClaimStatusUpdate`
+    // (`pkg/apis/resource/validation/validation.go:434-466`) runs on every
+    // status write upstream: the reservations must identify their consumers and
+    // may only exist alongside an allocation, an allocation result must name a
+    // request the claim declares, each `status.devices` entry must be one of
+    // the devices that allocation holds, and a populated allocation is
+    // immutable.
+    let errs = rusternetes_common::validation::resourceclaim::validate_resource_claim_status_update(
+        claim.status.as_ref().unwrap_or(&Default::default()),
+        existing.status.as_ref().unwrap_or(&Default::default()),
+        &existing.spec.devices,
+        existing.metadata.deletion_timestamp.is_some(),
+        &rusternetes_common::validation::field::Path::new("status"),
+    );
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Only update status
     existing.status = claim.status;
 
