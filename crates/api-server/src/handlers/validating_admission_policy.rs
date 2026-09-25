@@ -47,6 +47,18 @@ pub async fn create_validating_admission_policy(
         }
     }
 
+    // Default, then validate — upstream's registry strategy runs
+    // `SetDefaults_ValidatingAdmissionPolicySpec` / `SetDefaults_MatchResources`
+    // before `Validate`, and `failurePolicy`, `matchPolicy` and both selectors
+    // are `Required` by the validator precisely because defaulting fills them
+    // (`pkg/apis/admissionregistration/v1/defaults.go:97-119`,
+    // `.../validation/validation.go:772`).
+    rusternetes_common::validation::validating_admission_policy::set_defaults_validating_admission_policy(&mut policy);
+    let errs = rusternetes_common::validation::validating_admission_policy::validate_validating_admission_policy(&policy);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Enrich metadata with system fields
     policy.metadata.ensure_uid();
     policy.metadata.ensure_creation_timestamp();
@@ -124,6 +136,18 @@ pub async fn update_validating_admission_policy(
     .await?;
 
     policy.metadata.name = name.clone();
+
+    // Default, then validate — upstream's registry strategy runs
+    // `SetDefaults_ValidatingAdmissionPolicySpec` / `SetDefaults_MatchResources`
+    // before `Validate`, and `failurePolicy`, `matchPolicy` and both selectors
+    // are `Required` by the validator precisely because defaulting fills them
+    // (`pkg/apis/admissionregistration/v1/defaults.go:97-119`,
+    // `.../validation/validation.go:772`).
+    rusternetes_common::validation::validating_admission_policy::set_defaults_validating_admission_policy(&mut policy);
+    let errs = rusternetes_common::validation::validating_admission_policy::validate_validating_admission_policy(&policy);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
 
     // Check for dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
@@ -293,6 +317,14 @@ pub async fn create_validating_admission_policy_binding(
         }
     }
 
+    // Same order as the policy path: default `matchResources`, then validate
+    // (`validateValidatingAdmissionPolicyBindingSpec`, `validation.go:1181`).
+    rusternetes_common::validation::validating_admission_policy::set_defaults_validating_admission_policy_binding(&mut binding);
+    let errs = rusternetes_common::validation::validating_admission_policy::validate_validating_admission_policy_binding(&binding);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Enrich metadata with system fields
     binding.metadata.ensure_uid();
     binding.metadata.ensure_creation_timestamp();
@@ -375,6 +407,14 @@ pub async fn update_validating_admission_policy_binding(
     .await?;
 
     binding.metadata.name = name.clone();
+
+    // Same order as the policy path: default `matchResources`, then validate
+    // (`validateValidatingAdmissionPolicyBindingSpec`, `validation.go:1181`).
+    rusternetes_common::validation::validating_admission_policy::set_defaults_validating_admission_policy_binding(&mut binding);
+    let errs = rusternetes_common::validation::validating_admission_policy::validate_validating_admission_policy_binding(&binding);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
 
     // Check for dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);

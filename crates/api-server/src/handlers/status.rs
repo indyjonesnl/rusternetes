@@ -24,7 +24,8 @@ use tracing::{debug, info};
 
 /// Run resource-type-specific status validation before persisting a status
 /// update. Currently covers Node `/status` (upstream `ValidateNodeUpdate`
-/// status-field checks: addresses, declaredFeatures, capacity/allocatable).
+/// status-field checks: addresses, declaredFeatures, capacity/allocatable),
+/// Namespace, ResourceQuota, Job and ValidatingAdmissionPolicy.
 fn validate_status_subresource(
     resource_type: &str,
     resource: &Value,
@@ -93,6 +94,21 @@ fn validate_status_subresource(
             serde_json::from_value(stored.clone()).unwrap_or_else(|_| new_job.clone());
         let errs =
             rusternetes_common::validation::job::validate_job_status_update(&new_job, &old_job);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    } else if resource_type == "validatingadmissionpolicies" {
+        // Upstream ValidateValidatingAdmissionPolicyStatusUpdate
+        // (pkg/apis/admissionregistration/validation/validation.go:1247) runs
+        // only on the new object — typeChecking's expressionWarnings and the
+        // metav1 condition rules. `old` is unused by the validator.
+        let policy: rusternetes_common::resources::validating_admission_policy::ValidatingAdmissionPolicy =
+            serde_json::from_value(resource.clone()).map_err(|e| {
+                rusternetes_common::Error::InvalidResource(format!(
+                    "invalid ValidatingAdmissionPolicy: {e}"
+                ))
+            })?;
+        let errs = rusternetes_common::validation::validating_admission_policy::validate_validating_admission_policy_status_update(&policy);
         if !errs.is_empty() {
             return Err(rusternetes_common::Error::Invalid(errs));
         }

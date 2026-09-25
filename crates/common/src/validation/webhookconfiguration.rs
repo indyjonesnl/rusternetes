@@ -105,18 +105,26 @@ fn has_wildcard(values: &[String]) -> bool {
     values.iter().any(|v| v == "*")
 }
 
-/// Upstream `validateRuleWithOperations` + `validateRule` (allowSubResource).
-fn validate_rule_with_operations(rule: &RuleWithOperations, path: &Path) -> ErrorList {
+/// Upstream `validateRuleWithOperations` + `validateRule` (allowSubResource),
+/// expressed over the parts of a rule so the one port serves both shapes that
+/// carry them: a webhook's `RuleWithOperations` and a policy's
+/// `NamedRuleWithOperations` (upstream has a single type and a single
+/// validator — `pkg/apis/admissionregistration/validation/validation.go:109`).
+pub(crate) fn validate_rule_parts(
+    operations: &[String],
+    api_groups: &[String],
+    api_versions: &[String],
+    resources: &[String],
+    scope: Option<&str>,
+    path: &Path,
+) -> ErrorList {
     let mut errs = ErrorList::new();
 
-    if rule.operations.is_empty() {
+    if operations.is_empty() {
         errs.push(Error::required(&path.child("operations"), ""));
     }
-    let has_all = rule
-        .operations
-        .iter()
-        .any(|o| matches!(o, crate::resources::admission_webhook::OperationType::All));
-    if rule.operations.len() > 1 && has_all {
+    let has_all = operations.iter().any(|o| o == "*");
+    if operations.len() > 1 && has_all {
         errs.push(Error::invalid(
             &path.child("operations"),
             "*".to_string(),
@@ -124,52 +132,75 @@ fn validate_rule_with_operations(rule: &RuleWithOperations, path: &Path) -> Erro
         ));
     }
 
-    let r = &rule.rule;
-    if r.api_groups.is_empty() {
+    if api_groups.is_empty() {
         errs.push(Error::required(&path.child("apiGroups"), ""));
     }
-    if r.api_groups.len() > 1 && has_wildcard(&r.api_groups) {
+    if api_groups.len() > 1 && has_wildcard(api_groups) {
         errs.push(Error::invalid(
             &path.child("apiGroups"),
             "*".to_string(),
             "if '*' is present, must not specify other API groups",
         ));
     }
-    if r.api_versions.is_empty() {
+    if api_versions.is_empty() {
         errs.push(Error::required(&path.child("apiVersions"), ""));
     }
-    if r.api_versions.len() > 1 && has_wildcard(&r.api_versions) {
+    if api_versions.len() > 1 && has_wildcard(api_versions) {
         errs.push(Error::invalid(
             &path.child("apiVersions"),
             "*".to_string(),
             "if '*' is present, must not specify other API versions",
         ));
     }
-    for (i, v) in r.api_versions.iter().enumerate() {
+    for (i, v) in api_versions.iter().enumerate() {
         if v.is_empty() {
             errs.push(Error::required(&path.child("apiVersions").index(i), ""));
         }
     }
-    if r.resources.is_empty() {
+    if resources.is_empty() {
         errs.push(Error::required(&path.child("resources"), ""));
     }
-    if r.resources.len() > 1 && has_wildcard(&r.resources) {
+    if resources.len() > 1 && has_wildcard(resources) {
         errs.push(Error::invalid(
             &path.child("resources"),
             "*".to_string(),
             "if '*' is present, must not specify other resources",
         ));
     }
-    if let Some(scope) = &r.scope {
-        if !VALID_SCOPES.contains(&scope.as_str()) {
+    if let Some(scope) = scope {
+        if !VALID_SCOPES.contains(&scope) {
             errs.push(Error::not_supported(
                 &path.child("scope"),
-                scope.clone(),
+                scope.to_string(),
                 VALID_SCOPES,
             ));
         }
     }
     errs
+}
+
+/// The webhook shape of the same rule.
+fn validate_rule_with_operations(rule: &RuleWithOperations, path: &Path) -> ErrorList {
+    let operations: Vec<String> = rule
+        .operations
+        .iter()
+        .map(|o| match o {
+            crate::resources::admission_webhook::OperationType::All => "*".to_string(),
+            other => serde_json::to_value(other)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
+        })
+        .collect();
+    let r = &rule.rule;
+    validate_rule_parts(
+        &operations,
+        &r.api_groups,
+        &r.api_versions,
+        &r.resources,
+        r.scope.as_deref(),
+        path,
+    )
 }
 
 fn side_effect_str(s: &SideEffectClass) -> &'static str {
@@ -349,7 +380,7 @@ fn validate_client_config(cc: &WebhookClientConfig, path: &Path) -> ErrorList {
 
 /// Convert the webhook resource's `LabelSelector` to the shared
 /// `types::LabelSelector` so the common `validate_label_selector` can run.
-fn to_metav1_selector(s: &WebhookLabelSelector) -> crate::types::LabelSelector {
+pub(crate) fn to_metav1_selector(s: &WebhookLabelSelector) -> crate::types::LabelSelector {
     use crate::resources::admission_webhook::LabelSelectorOperator as Op;
     crate::types::LabelSelector {
         match_labels: s.match_labels.clone(),

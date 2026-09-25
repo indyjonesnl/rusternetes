@@ -240,6 +240,7 @@ mod subject_access_review_validation_test;
 mod tokenrequest_expiration_test;
 mod undecodable_body_status_test;
 mod unverified_fixes_test;
+mod vap_validation_test;
 mod volume_integration_test;
 mod volumeattachment_handler_test;
 mod volumeattachment_update_immutable_test;
