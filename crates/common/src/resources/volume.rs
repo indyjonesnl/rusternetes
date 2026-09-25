@@ -90,6 +90,7 @@ pub struct PersistentVolumeSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostPathVolumeSource {
+    #[serde(default)]
     pub path: String,
     #[serde(
         default,
@@ -166,6 +167,7 @@ pub struct SecretReference {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalVolumeSource {
+    #[serde(default)]
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fs_type: Option<String>,
@@ -174,6 +176,7 @@ pub struct LocalVolumeSource {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CSIVolumeSource {
+    #[serde(default)]
     pub driver: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_handle: Option<String>,
@@ -228,6 +231,7 @@ pub struct VolumeNodeAffinity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeSelector {
+    #[serde(default)]
     pub node_selector_terms: Vec<NodeSelectorTerm>,
 }
 
@@ -243,7 +247,9 @@ pub struct NodeSelectorTerm {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeSelectorRequirement {
+    #[serde(default)]
     pub key: String,
+    #[serde(default)]
     pub operator: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
@@ -365,7 +371,9 @@ pub struct LabelSelector {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LabelSelectorRequirement {
+    #[serde(default)]
     pub key: String,
+    #[serde(default)]
     pub operator: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
@@ -375,7 +383,9 @@ pub struct LabelSelectorRequirement {
 #[serde(rename_all = "camelCase")]
 pub struct TypedLocalObjectReference {
     pub api_group: Option<String>,
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub name: String,
 }
 
@@ -385,7 +395,9 @@ pub struct TypedLocalObjectReference {
 pub struct TypedObjectReference {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_group: Option<String>,
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,

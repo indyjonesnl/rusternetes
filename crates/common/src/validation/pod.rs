@@ -498,7 +498,7 @@ fn validate_node_affinity(na: &NodeAffinity, fld_path: &Path) -> ErrorList {
 /// Port of upstream `ValidateNodeSelector`
 /// (`pkg/apis/core/validation/validation.go:5034-5048`): at least one term,
 /// and each term validated.
-fn validate_node_selector(
+pub(crate) fn validate_node_selector(
     node_selector: &crate::resources::pod::NodeSelector,
     fld_path: &Path,
 ) -> ErrorList {
@@ -2693,7 +2693,7 @@ fn validate_key_to_path(kp: &KeyToPath, fld_path: &Path) -> ErrorList {
 
 /// Port of upstream `validateNFSVolumeSource`
 /// (`pkg/apis/core/validation/validation.go:1034-1046`).
-fn validate_nfs_volume_source(
+pub(crate) fn validate_nfs_volume_source(
     nfs: &crate::resources::volume::NFSVolumeSource,
     fld_path: &Path,
 ) -> ErrorList {
