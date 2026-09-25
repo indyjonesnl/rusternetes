@@ -78,6 +78,7 @@ pub async fn update_resource<T: Object>(
     // callback, and a create-on-update must also be allowed to `create`.
     let transformers: Vec<Box<dyn TransformFunc<T> + '_>> = vec![Box::new(MutatingAdmission {
         admission: &admission,
+        scope,
     })];
     let obj_info = DefaultUpdatedObjectInfo::new(Some(obj), transformers);
     let create_validation = CreateValidation {

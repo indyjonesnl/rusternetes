@@ -131,6 +131,7 @@ pub async fn patch_resource<T: Object>(
         Box::new(patcher),
         Box::new(MutatingAdmission {
             admission: &admission,
+            scope,
         }),
     ];
     let obj_info = DefaultUpdatedObjectInfo::new(None, transformers);
@@ -272,6 +273,10 @@ impl<T: Object> TransformFunc<T> for Patcher<'_, T> {
                 self.patch_current(ctx, patch_type, current)?
             }
         };
+
+        // The patched object is decoded, and so defaulted and converted, as a
+        // request body is (patch.go:357-363, :792).
+        self.scope.convert(&mut obj);
 
         let uid = &obj.metadata().uid;
         if !uid.is_empty() && current.is_none() {

@@ -2,3 +2,4 @@
 //! `pkg/registry/core/<resource>/`.
 
 pub mod configmap;
+pub mod secret;
