@@ -200,6 +200,7 @@ mod require_create_name_router_test;
 mod resourcequota_handler_test;
 mod resourcequota_status_preserve_test;
 mod resourcequota_status_validation_test;
+mod resourceslice_device_validation_test;
 mod router_smoke_test;
 mod runtimeclass_handler_test;
 mod runtimeclass_router_test;

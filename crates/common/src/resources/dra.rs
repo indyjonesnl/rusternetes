@@ -487,9 +487,11 @@ pub struct ResourceSlice {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceSliceSpec {
     /// Driver identifies the DRA driver providing the capacity information
+    #[serde(default)]
     pub driver: String,
 
     /// Pool describes the pool that this ResourceSlice belongs to
+    #[serde(default)]
     pub pool: ResourcePool,
 
     /// NodeName identifies the node which provides the resources
@@ -533,13 +535,17 @@ pub struct ResourceSliceSpec {
 #[serde(rename_all = "camelCase")]
 pub struct ResourcePool {
     /// Name is used to identify the pool
+    #[serde(default)]
     pub name: String,
 
     /// Generation tracks changes in a pool over time
+    #[serde(default)]
     pub generation: i64,
 
-    /// ResourceSliceCount is the total number of ResourceSlices in the pool
-    #[serde(rename = "resourceSliceCount")]
+    /// ResourceSliceCount is the total number of ResourceSlices in the pool.
+    /// Absent decodes to 0, which `validateResourcePool` reports as "must be
+    /// greater than zero" (`pkg/apis/resource/validation/validation.go:789`).
+    #[serde(rename = "resourceSliceCount", default)]
     pub resource_slice_count: i64,
 }
 
@@ -547,6 +553,7 @@ pub struct ResourcePool {
 #[serde(rename_all = "camelCase")]
 pub struct Device {
     /// Name is unique identifier among all devices managed by the driver
+    #[serde(default)]
     pub name: String,
 
     /// Attributes defines the set of attributes for this device
@@ -689,14 +696,23 @@ pub struct CapacityRequestPolicyRange {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceTaint {
     /// Key is the taint key to be applied to a device
+    #[serde(default)]
     pub key: String,
 
     /// Value is the taint value corresponding to the key
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
 
-    /// Effect is the effect of the taint
-    pub effect: DeviceTaintEffect,
+    /// Effect is the effect of the taint.
+    ///
+    /// Upstream's `DeviceTaintEffect` is a plain string type, so an absent
+    /// effect is `""` and `validateDeviceTaint`
+    /// (`pkg/apis/resource/validation/validation.go:1398-1405`) answers it with
+    /// `Required`. A closed Rust enum has no member for `""` — and `None` is a
+    /// real upstream effect, not the absent case — so the absent case is an
+    /// `Option`, reported as `Required` by the same rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<DeviceTaintEffect>,
 
     /// TimeAdded represents when the taint was added
     #[serde(
@@ -719,7 +735,7 @@ pub enum DeviceTaintEffect {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceCounterConsumption {
     /// CounterSet is the name of the set from which counters are consumed
-    #[serde(rename = "counterSet")]
+    #[serde(rename = "counterSet", default)]
     pub counter_set: String,
 
     /// Counters defines the counters consumed by the device
@@ -731,6 +747,7 @@ pub struct DeviceCounterConsumption {
 #[serde(rename_all = "camelCase")]
 pub struct CounterSet {
     /// Name defines the name of the counter set
+    #[serde(default)]
     pub name: String,
 
     /// Counters defines the set of counters for this CounterSet
