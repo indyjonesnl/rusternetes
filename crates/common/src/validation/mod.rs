@@ -52,4 +52,5 @@ pub mod servicecidr;
 pub mod storageclass;
 pub mod volumeattachment;
 pub mod volumeattributesclass;
+pub mod volumesnapshot;
 pub mod webhookconfiguration;

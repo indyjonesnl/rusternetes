@@ -153,7 +153,7 @@ async fn test_snapshot_content_auto_creation() {
                 persistent_volume_claim_name: Some("test-pvc".to_string()),
                 volume_snapshot_content_name: None,
             },
-            volume_snapshot_class_name: "test-snapclass".to_string(),
+            volume_snapshot_class_name: Some("test-snapclass".to_string()),
         },
         status: None,
     };
@@ -226,7 +226,7 @@ async fn test_snapshot_deletion_with_delete_policy() {
                 persistent_volume_claim_name: Some("test-pvc-delete".to_string()),
                 volume_snapshot_content_name: None,
             },
-            volume_snapshot_class_name: "delete-policy-class".to_string(),
+            volume_snapshot_class_name: Some("delete-policy-class".to_string()),
         },
         status: None,
     };
@@ -303,7 +303,7 @@ async fn test_snapshot_deletion_with_retain_policy() {
                 persistent_volume_claim_name: Some("test-pvc-retain".to_string()),
                 volume_snapshot_content_name: None,
             },
-            volume_snapshot_class_name: "retain-policy-class".to_string(),
+            volume_snapshot_class_name: Some("retain-policy-class".to_string()),
         },
         status: None,
     };
@@ -421,7 +421,7 @@ async fn test_snapshot_without_bound_pvc_fails() {
                 persistent_volume_claim_name: Some("unbound-pvc".to_string()),
                 volume_snapshot_content_name: None,
             },
-            volume_snapshot_class_name: "test-class-unbound".to_string(),
+            volume_snapshot_class_name: Some("test-class-unbound".to_string()),
         },
         status: None,
     };
@@ -469,7 +469,7 @@ async fn test_snapshot_with_invalid_class_fails() {
                 persistent_volume_claim_name: Some("test-pvc-invalid".to_string()),
                 volume_snapshot_content_name: None,
             },
-            volume_snapshot_class_name: "non-existent-class".to_string(),
+            volume_snapshot_class_name: Some("non-existent-class".to_string()),
         },
         status: None,
     };

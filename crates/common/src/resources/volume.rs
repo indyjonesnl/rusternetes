@@ -595,10 +595,23 @@ pub struct VolumeSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct VolumeSnapshotSpec {
     /// Source of the snapshot
+    ///
+    /// `required: [source]` in the external-snapshotter CRD, so an absent key
+    /// decodes to the empty source and `validate_volume_snapshot` answers the
+    /// CEL rule "exactly one of volumeSnapshotContentName and
+    /// persistentVolumeClaimName must be set".
+    #[serde(default)]
     pub source: VolumeSnapshotSource,
 
     /// VolumeSnapshotClass name
-    pub volume_snapshot_class_name: String,
+    ///
+    /// Optional in the CRD ("may be left nil to indicate that the default
+    /// SnapshotClass should be used"), which is why this is an `Option` and
+    /// not a defaulted `String`: absent and `""` are different, and the CRD
+    /// rejects the latter with "volumeSnapshotClassName must not be the empty
+    /// string when set".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_snapshot_class_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -700,18 +713,39 @@ pub struct VolumeSnapshotContent {
 #[serde(rename_all = "camelCase")]
 pub struct VolumeSnapshotContentSpec {
     /// Source of the snapshot
+    ///
+    /// `required` in the CRD; an absent key decodes to the empty source and
+    /// validation answers "exactly one of volumeHandle and snapshotHandle must
+    /// be set".
+    #[serde(default)]
     pub source: VolumeSnapshotContentSource,
 
     /// Reference to VolumeSnapshot
+    ///
+    /// `required` in the CRD; absent decodes to the empty reference and
+    /// validation answers `name`/`namespace` `Required`.
+    #[serde(default)]
     pub volume_snapshot_ref: ObjectReference,
 
     /// VolumeSnapshotClass name
-    pub volume_snapshot_class_name: String,
+    ///
+    /// Optional in the CRD, non-empty when set — see
+    /// [`VolumeSnapshotSpec::volume_snapshot_class_name`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_snapshot_class_name: Option<String>,
 
     /// Deletion policy
+    ///
+    /// `required` in the CRD; `DeletionPolicy::Unspecified` is the `""` a
+    /// missing key decodes to, and validation answers `Required`.
+    #[serde(default)]
     pub deletion_policy: DeletionPolicy,
 
     /// Driver name
+    ///
+    /// `required` in the CRD; absent decodes to `""` and validation answers
+    /// `Required`.
+    #[serde(default)]
     pub driver: String,
 }
 

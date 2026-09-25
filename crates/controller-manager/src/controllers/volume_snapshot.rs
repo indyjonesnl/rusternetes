@@ -174,8 +174,20 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
 
         debug!("Processing VolumeSnapshot {}/{}", namespace, vs_name);
 
-        // Get the VolumeSnapshotClass
-        let vsc_name = &vs.spec.volume_snapshot_class_name;
+        // Get the VolumeSnapshotClass. `volumeSnapshotClassName` is optional in
+        // the external-snapshotter CRD — nil means "use the default
+        // VolumeSnapshotClass for this driver", which needs the source PVC's
+        // provisioner to pick one and is not implemented here (tracked
+        // separately). Until it is, a snapshot with no class named cannot be
+        // provisioned, and saying so beats looking up a class named "".
+        let Some(vsc_name) = vs.spec.volume_snapshot_class_name.as_deref() else {
+            warn!(
+                "VolumeSnapshot {}/{} names no volumeSnapshotClassName and default-class \
+                 selection is not implemented; skipping",
+                namespace, vs_name
+            );
+            return Ok(());
+        };
         let vsc_key = build_key("volumesnapshotclasses", None, vsc_name);
         let vsc: VolumeSnapshotClass = self
             .storage
@@ -308,7 +320,7 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
                     resource_version: vs.metadata.resource_version.clone(),
                     field_path: None,
                 },
-                volume_snapshot_class_name: vsc.metadata.name.clone(),
+                volume_snapshot_class_name: Some(vsc.metadata.name.clone()),
                 deletion_policy: vsc.deletion_policy.clone(),
                 driver: vsc.driver.clone(),
             },

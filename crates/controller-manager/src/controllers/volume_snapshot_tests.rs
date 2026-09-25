@@ -45,7 +45,7 @@ fn test_create_snapshot_content_structure() {
                 persistent_volume_claim_name: Some("test-pvc".to_string()),
                 volume_snapshot_content_name: None,
             },
-            volume_snapshot_class_name: "test-class".to_string(),
+            volume_snapshot_class_name: Some("test-class".to_string()),
         },
         status: None,
     };
@@ -105,7 +105,7 @@ fn test_create_snapshot_content_with_retain_policy() {
                 persistent_volume_claim_name: Some("test-pvc".to_string()),
                 volume_snapshot_content_name: None,
             },
-            volume_snapshot_class_name: "test-class".to_string(),
+            volume_snapshot_class_name: Some("test-class".to_string()),
         },
         status: None,
     };
@@ -149,7 +149,7 @@ fn test_snapshot_handle_uniqueness() {
                 persistent_volume_claim_name: Some("test-pvc".to_string()),
                 volume_snapshot_content_name: None,
             },
-            volume_snapshot_class_name: "test-class".to_string(),
+            volume_snapshot_class_name: Some("test-class".to_string()),
         },
         status: None,
     };

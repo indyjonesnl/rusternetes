@@ -536,6 +536,22 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// never creates or validates, so their tests pin the *accept*, as
 /// `ServiceAccount.imagePullSecrets[].name` and `ContainerMetrics.name` do.
 ///
+/// `volume.rs`: the snapshot tail (#2011). `snapshot.storage.k8s.io` is not a
+/// Kubernetes API — `../kubernetes` has no validator for it, because the types
+/// are CRDs owned by `kubernetes-csi/external-snapshotter` and their *schema*
+/// is the contract. So the port in
+/// `crates/common/src/validation/volumesnapshot.rs` is of that repo's
+/// `client/config/crd/snapshot.storage.k8s.io_volumesnapshots.yaml` and
+/// `…_volumesnapshotcontents.yaml`: the `required:` lists
+/// (`[source]`, and `[deletionPolicy, driver, source, volumeSnapshotRef]`) and
+/// the `x-kubernetes-validations` CEL rules, whose `message:` strings are
+/// reproduced verbatim. Rusternetes serves both types natively rather than
+/// through the CRD machinery, so nothing else applied the schema and a
+/// snapshot with no `spec.source` at all was written. `volumeSnapshotClassName`
+/// is an `Option` and not a defaulted `String` for the same reason
+/// `PodAffinityTerm.labelSelector` is: the CRD calls absent "use the default
+/// SnapshotClass" and rejects `""` outright, so the two cases differ.
+///
 /// Not every pod field could be defaulted. `PodAffinityTerm.labelSelector` is a
 /// **pointer** upstream and stays an `Option` here, because
 /// `LabelSelectorAsSelector(nil)` is `labels.Nothing()` while
@@ -610,6 +626,7 @@ const AUDITED_MODULES: &[&str] = &[
     "ipaddress.rs",
     "metrics.rs",
     "csi.rs",
+    "volume.rs",
     "networking.rs",
     "node.rs",
     "pod.rs",
