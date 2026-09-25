@@ -521,6 +521,21 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// `DeviceToleration.effect` (legal, "Optional in a toleration", `:1428`) and
 /// `DeviceAllocationConfiguration.source` (`Required`, `:534`).
 ///
+/// `authentication.rs` / `binding.rs` / `endpoints.rs` / `custom_metrics.rs` /
+/// `external_metrics.rs`: the small tail. Three carry an upstream obligation —
+/// `TokenReviewSpec.token`, which upstream answers from the *registry* with a
+/// 400 and a fixed sentence rather than from a validator
+/// (`pkg/registry/authentication/tokenreview/storage.go:79-81`);
+/// `Binding.target.name`, `Required` per `ValidatePodBinding`
+/// (`pkg/apis/core/validation/validation.go:6534`); and `EndpointPort.port`,
+/// whose absent `0` `validateEndpointPort` already rejected (`:8343`) once the
+/// field could reach it.
+///
+/// The other two carry the opposite obligation: `custom.metrics.k8s.io` and
+/// `external.metrics.k8s.io` are read-only aggregated APIs whose types upstream
+/// never creates or validates, so their tests pin the *accept*, as
+/// `ServiceAccount.imagePullSecrets[].name` and `ContainerMetrics.name` do.
+///
 /// Not every pod field could be defaulted. `PodAffinityTerm.labelSelector` is a
 /// **pointer** upstream and stays an `Option` here, because
 /// `LabelSelectorAsSelector(nil)` is `labels.Nothing()` while
@@ -579,10 +594,15 @@ fn every_field_of_an_audited_module_decodes_when_absent() {
 /// audited for #1939. Grows one slice at a time; see rule 5.
 const AUDITED_MODULES: &[&str] = &[
     "admission_webhook.rs",
+    "authentication.rs",
+    "binding.rs",
+    "custom_metrics.rs",
     "crd.rs",
     "deployment.rs",
     "dra.rs",
+    "endpoints.rs",
     "endpointslice.rs",
+    "external_metrics.rs",
     "event.rs",
     "flowcontrol.rs",
     "ingress.rs",

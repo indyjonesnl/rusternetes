@@ -44,6 +44,13 @@ pub struct TokenReviewSpec {
     pub audiences: Option<Vec<String>>,
 
     /// Token is the opaque bearer token.
+    ///
+    /// Upstream answers an absent token from the registry rather than from a
+    /// validator: `TokenREST.Create` returns
+    /// `NewBadRequest("token is required for TokenReview in authentication")`
+    /// (`pkg/registry/authentication/tokenreview/storage.go:79-81`), so the
+    /// field decodes and `create_token_review` reports that message.
+    #[serde(default)]
     pub token: String,
 }
 

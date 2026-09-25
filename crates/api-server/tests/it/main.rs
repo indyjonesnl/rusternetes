@@ -217,6 +217,7 @@ mod service_externalname_transition_test;
 mod service_handler_test;
 mod service_test;
 mod serviceaccount_handler_test;
+mod small_api_decode_when_absent_test;
 mod spdy_test;
 mod ssa_configmap_apply_test;
 mod ssa_secret_apply_test;

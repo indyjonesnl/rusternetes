@@ -15,24 +15,30 @@ pub struct MetricValue {
     /// `describedObject`.
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    #[serde(default)]
     pub described_object: ObjectReference,
+    #[serde(default)]
     pub metric_name: String,
     #[serde(
+        default = "zero_time",
         serialize_with = "crate::types::k8s_time_required::serialize",
         deserialize_with = "crate::types::k8s_time_required::deserialize"
     )]
     pub timestamp: DateTime<Utc>,
     pub window: Option<String>,
+    #[serde(default)]
     pub value: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selector: Option<MetricSelector>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectReference {
+    #[serde(default)]
     pub kind: String,
     pub namespace: Option<String>,
+    #[serde(default)]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
@@ -58,7 +64,16 @@ pub struct MetricValueList {
 
     #[serde(default)]
     pub metadata: ListMeta,
+    #[serde(default)]
     pub items: Vec<MetricValue>,
+}
+
+/// The Go zero `metav1.Time`, which is what an absent `timestamp` decodes to
+/// upstream. These are the response types of a read-only aggregated API —
+/// nothing upstream validates or creates them — so the absent case has to
+/// decode rather than be rejected.
+fn zero_time() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch is a valid timestamp")
 }
 
 #[cfg(test)]

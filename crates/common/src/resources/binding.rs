@@ -46,6 +46,10 @@ pub struct ObjectReference {
     pub kind: Option<String>,
 
     /// Name of the referent
+    ///
+    /// `ValidatePodBinding` answers an absent target name with `Required` at
+    /// `target.name` (`pkg/apis/core/validation/validation.go:6534-6537`).
+    #[serde(default)]
     pub name: String,
 
     /// Namespace of the referent
