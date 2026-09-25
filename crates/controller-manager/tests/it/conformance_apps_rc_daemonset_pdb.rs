@@ -184,14 +184,14 @@ fn make_pdb(
         PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(1)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some({
                     let mut m = HashMap::new();
                     m.insert(selector_key.to_string(), selector_val.to_string());
                     m
                 }),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
     )

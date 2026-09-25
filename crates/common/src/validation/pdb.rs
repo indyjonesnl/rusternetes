@@ -82,11 +82,18 @@ pub fn validate_pod_disruption_budget_spec(
         ));
     }
 
-    errs.extend(validate_label_selector(
-        &spec.selector,
-        LabelSelectorValidationOptions::default(),
-        &fld_path.child("selector"),
-    ));
+    // Upstream hands the pointer straight to `ValidateLabelSelector`, which
+    // returns no errors for a nil selector
+    // (`apimachinery/pkg/apis/meta/v1/validation/validation.go`), called from
+    // `pkg/apis/policy/validation/validation.go::ValidatePodDisruptionBudgetSpec`.
+    // A PDB with no selector is valid; it simply guards no pods.
+    if let Some(selector) = &spec.selector {
+        errs.extend(validate_label_selector(
+            selector,
+            LabelSelectorValidationOptions::default(),
+            &fld_path.child("selector"),
+        ));
+    }
 
     // unhealthyPodEvictionPolicy, when set, must be a known value.
     if let Some(policy) = &spec.unhealthy_pod_eviction_policy {
@@ -215,10 +222,10 @@ mod tests {
         let spec = PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(1)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: None,
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         };
         let mut pdb = PodDisruptionBudget::new("pdb", "default", spec);
@@ -239,10 +246,10 @@ mod tests {
         let spec = PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(1)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: None,
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         };
         let pdb = PodDisruptionBudget::new("pdb", "default", spec);

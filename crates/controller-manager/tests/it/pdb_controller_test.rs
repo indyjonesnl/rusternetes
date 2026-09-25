@@ -155,10 +155,10 @@ async fn test_pdb_calculates_status_with_min_available() {
     let spec = PodDisruptionBudgetSpec {
         min_available: Some(IntOrString::Int(2)),
         max_unavailable: None,
-        selector: LabelSelector {
+        selector: Some(LabelSelector {
             match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
             match_expressions: None,
-        },
+        }),
         unhealthy_pod_eviction_policy: None,
     };
 
@@ -203,10 +203,10 @@ async fn test_pdb_calculates_status_with_max_unavailable() {
     let spec = PodDisruptionBudgetSpec {
         min_available: None,
         max_unavailable: Some(IntOrString::Int(1)),
-        selector: LabelSelector {
+        selector: Some(LabelSelector {
             match_labels: Some(HashMap::from([("app".to_string(), "api".to_string())])),
             match_expressions: None,
-        },
+        }),
         unhealthy_pod_eviction_policy: None,
     };
 
@@ -248,10 +248,10 @@ async fn test_pdb_blocks_disruptions_when_at_minimum() {
     let spec = PodDisruptionBudgetSpec {
         min_available: Some(IntOrString::Int(3)),
         max_unavailable: None,
-        selector: LabelSelector {
+        selector: Some(LabelSelector {
             match_labels: Some(HashMap::from([("app".to_string(), "critical".to_string())])),
             match_expressions: None,
-        },
+        }),
         unhealthy_pod_eviction_policy: None,
     };
 
@@ -295,13 +295,13 @@ async fn test_pdb_respects_label_selector() {
     let spec = PodDisruptionBudgetSpec {
         min_available: Some(IntOrString::Int(2)),
         max_unavailable: None,
-        selector: LabelSelector {
+        selector: Some(LabelSelector {
             match_labels: Some(HashMap::from([
                 ("app".to_string(), "web".to_string()),
                 ("tier".to_string(), "frontend".to_string()),
             ])),
             match_expressions: None,
-        },
+        }),
         unhealthy_pod_eviction_policy: None,
     };
 
@@ -359,10 +359,10 @@ async fn test_pdb_namespace_isolation() {
     let spec = PodDisruptionBudgetSpec {
         min_available: Some(IntOrString::Int(3)),
         max_unavailable: None,
-        selector: LabelSelector {
+        selector: Some(LabelSelector {
             match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
             match_expressions: None,
-        },
+        }),
         unhealthy_pod_eviction_policy: None,
     };
 
@@ -415,10 +415,10 @@ async fn test_pdb_percentage_min_available() {
     let spec = PodDisruptionBudgetSpec {
         min_available: Some(IntOrString::String("80%".to_string())),
         max_unavailable: None,
-        selector: LabelSelector {
+        selector: Some(LabelSelector {
             match_labels: Some(HashMap::from([("app".to_string(), "cache".to_string())])),
             match_expressions: None,
-        },
+        }),
         unhealthy_pod_eviction_policy: None,
     };
 
@@ -460,13 +460,13 @@ async fn test_pdb_percentage_max_unavailable() {
     let spec = PodDisruptionBudgetSpec {
         min_available: None,
         max_unavailable: Some(IntOrString::String("30%".to_string())),
-        selector: LabelSelector {
+        selector: Some(LabelSelector {
             match_labels: Some(HashMap::from([(
                 "component".to_string(),
                 "worker".to_string(),
             )])),
             match_expressions: None,
-        },
+        }),
         unhealthy_pod_eviction_policy: None,
     };
 
@@ -510,10 +510,10 @@ async fn test_pdb_only_counts_healthy_pods() {
     let spec = PodDisruptionBudgetSpec {
         min_available: Some(IntOrString::Int(3)),
         max_unavailable: None,
-        selector: LabelSelector {
+        selector: Some(LabelSelector {
             match_labels: Some(HashMap::from([("app".to_string(), "db".to_string())])),
             match_expressions: None,
-        },
+        }),
         unhealthy_pod_eviction_policy: None,
     };
 

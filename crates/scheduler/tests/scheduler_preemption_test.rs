@@ -149,10 +149,10 @@ fn make_pdb(name: &str, min_available: i32, app_label: &str) -> PodDisruptionBud
         PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(min_available)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(match_labels),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
     )
@@ -537,10 +537,10 @@ async fn preemption_spares_pdb_protected_pod_when_another_victim_suffices() {
         PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(1)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(selector_labels),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
     );

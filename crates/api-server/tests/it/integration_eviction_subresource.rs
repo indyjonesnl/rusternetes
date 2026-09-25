@@ -132,10 +132,10 @@ fn pdb_with_selector(
         spec: PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(min_available)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(match_labels),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
         status: None,

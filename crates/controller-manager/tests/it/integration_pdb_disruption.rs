@@ -267,10 +267,10 @@ async fn test_pdb_with_scale_subresource() {
         PodDisruptionBudgetSpec {
             min_available: None,
             max_unavailable: Some(IntOrString::Int(max_unavailable)),
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(labels.clone()),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
     );
@@ -403,10 +403,10 @@ async fn test_pdb_with_scale_subresource_crd_variant() {
         PodDisruptionBudgetSpec {
             min_available: None,
             max_unavailable: Some(IntOrString::Int(max_unavailable)),
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(labels.clone()),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
     );
@@ -463,11 +463,11 @@ async fn test_empty_selector_v1_targets_all_pods() {
         PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(min_available)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 // empty selector -> matches all pods in the namespace per upstream v1 semantics
                 match_labels: Some(HashMap::new()),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
     );
@@ -510,10 +510,10 @@ async fn test_empty_selector_v1beta1_targets_no_pods() {
         PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(2)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(HashMap::new()),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
     );
@@ -563,10 +563,10 @@ async fn test_selectors_for_pods_without_labels_empty_selector_v1() {
         PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(min_available)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(HashMap::new()),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
     );
@@ -604,14 +604,14 @@ async fn test_selectors_for_pods_without_labels_does_not_exist_v1() {
         PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(min_available)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: None,
                 match_expressions: Some(vec![LabelSelectorRequirement {
                     key: "DoesNotExist".to_string(),
                     operator: "DoesNotExist".to_string(),
                     values: None,
                 }]),
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
     );
@@ -649,14 +649,14 @@ async fn test_selectors_for_pods_without_labels_does_not_exist_v1beta1() {
         PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(1)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: None,
                 match_expressions: Some(vec![LabelSelectorRequirement {
                     key: "DoesNotExist".to_string(),
                     operator: "DoesNotExist".to_string(),
                     values: None,
                 }]),
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
     );
@@ -704,7 +704,7 @@ async fn test_patch_compatibility_selector_round_trip() {
         PodDisruptionBudgetSpec {
             min_available: None,
             max_unavailable: Some(IntOrString::Int(2)),
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(HashMap::from([(
                     "basematch".to_string(),
                     "true".to_string(),
@@ -716,14 +716,14 @@ async fn test_patch_compatibility_selector_round_trip() {
                         values: Some(vec!["true".to_string()]),
                     },
                 ]),
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         },
     );
     put_pdb(&storage, &pdb).await;
 
     let fetched = get_pdb(&storage, ns, "test-pdb").await;
-    let selector = fetched.spec.selector;
+    let selector = fetched.spec.selector.expect("selector present");
     let labels = selector
         .match_labels
         .as_ref()

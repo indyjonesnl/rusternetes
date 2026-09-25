@@ -709,6 +709,7 @@ fn roundtrip_pdb_with_match_expressions() {
     let exprs = pdb
         .spec
         .selector
+        .expect("selector present")
         .match_expressions
         .expect("matchExpressions present");
     assert_eq!(exprs.len(), 1);

@@ -157,11 +157,19 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         // gave empty selectors the opposite meaning to `policy/v1`: an empty
         // selector matches NO pods (whereas v1 treats it as match-all). We
         // detect the apiVersion off the stored TypeMeta and pass it through.
+        // A *null* selector is a third case, separate from both of those: it
+        // matches no pods in either version, because upstream's `getPodsForPdb`
+        // (`pkg/controller/disruption/disruption.go:630`) lists with
+        // `LabelSelectorAsSelector(nil)` = `labels.Nothing()`
+        // (`apimachinery/pkg/apis/meta/v1/helpers.go:37-43`).
         let is_v1beta1 = pdb.type_meta.api_version == "policy/v1beta1";
-        let matching_pods: Vec<Pod> = all_pods
-            .into_iter()
-            .filter(|p| self.pod_matches_selector(p, &pdb.spec.selector, is_v1beta1))
-            .collect();
+        let matching_pods: Vec<Pod> = match &pdb.spec.selector {
+            None => Vec::new(),
+            Some(selector) => all_pods
+                .into_iter()
+                .filter(|p| self.pod_matches_selector(p, selector, is_v1beta1))
+                .collect(),
+        };
 
         // 3. Count healthy pods (Running + Ready).
         let pod_count = matching_pods.len() as i32;
@@ -973,7 +981,7 @@ mod tests {
             spec: PodDisruptionBudgetSpec {
                 min_available: Some(IntOrString::Int(1)),
                 max_unavailable: None,
-                selector: LabelSelector::default(),
+                selector: Some(LabelSelector::default()),
                 unhealthy_pod_eviction_policy: None,
             },
             status: None,
@@ -1175,10 +1183,10 @@ mod tests {
         let spec = PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::Int(3)),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(HashMap::new()),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         };
 
@@ -1195,10 +1203,10 @@ mod tests {
         let spec = PodDisruptionBudgetSpec {
             min_available: Some(IntOrString::String("50%".to_string())),
             max_unavailable: None,
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(HashMap::new()),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         };
 
@@ -1215,10 +1223,10 @@ mod tests {
         let spec = PodDisruptionBudgetSpec {
             min_available: None,
             max_unavailable: Some(IntOrString::Int(2)),
-            selector: LabelSelector {
+            selector: Some(LabelSelector {
                 match_labels: Some(HashMap::new()),
                 match_expressions: None,
-            },
+            }),
             unhealthy_pod_eviction_policy: None,
         };
 

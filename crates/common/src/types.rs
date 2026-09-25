@@ -564,7 +564,15 @@ pub struct LabelSelector {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LabelSelectorRequirement {
+    /// Both `key` and `operator` are plain (non-pointer) Go fields upstream, so
+    /// an absent one decodes to `""` and is answered by validation:
+    /// `ValidateLabelSelectorRequirement`
+    /// (`apimachinery/pkg/apis/meta/v1/validation/validation.go`) sends `key`
+    /// through `ValidateLabelName` and rejects an unknown `operator` with "not
+    /// a valid selector operator".
+    #[serde(default)]
     pub key: String,
+    #[serde(default)]
     pub operator: String, // In, NotIn, Exists, DoesNotExist
     #[serde(skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
