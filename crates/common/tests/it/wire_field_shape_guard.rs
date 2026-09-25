@@ -460,6 +460,14 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// create-time validation at all before these slices: volume sources (a pod
 /// whose only volume was `{"name":"v"}` was a 201) and affinity.
 ///
+/// `csi.rs`: `TokenRequest.audience`, the three `VolumeAttachmentSpec` fields
+/// and `VolumeAttachmentStatus.attached`. `ValidateVolumeAttachmentSpec`
+/// (`pkg/apis/storage/validation/validation.go:165-175`) covers the spec, and
+/// the other two carry no obligation at all — an empty `audience` is legal
+/// (`validateTokenRequests` rejects only duplicates and out-of-range
+/// expirations) and `attached` is a plain bool — so those two are pinned by an
+/// accept, not a rejection.
+///
 /// `ingress.rs` / `ingressclass.rs` / `event.rs` / `metrics.rs` /
 /// `service_account.rs` / `policy.rs`: every field here already had a
 /// validator, so the slice was pure reachability — `HTTPIngressRuleValue.paths`
@@ -543,6 +551,7 @@ const AUDITED_MODULES: &[&str] = &[
     "ingressclass.rs",
     "ipaddress.rs",
     "metrics.rs",
+    "csi.rs",
     "networking.rs",
     "node.rs",
     "pod.rs",
