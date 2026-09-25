@@ -6,14 +6,17 @@
 //! `corevalidation.ValidateCSIDriverName`), `pool` (name segments +
 //! generation/resourceSliceCount bounds), the exactly-one node-selection rule
 //! (`nodeName` via `ValidateNodeName`/`nodeSelector`/`allNodes`/
-//! `perDeviceNodeSelection`), and the `devices` set (size cap + unique
-//! non-empty names). Deep `nodeSelector` term validation and per-device field
-//! validation are tracked in #1442. ObjectMeta is validated separately.
+//! `perDeviceNodeSelection`), the `devices` set (size cap + unique names, each
+//! a DNS-1123 label), each device's `taints` and `consumesCounters`, and the
+//! spec's `sharedCounters`. Deep `nodeSelector` term validation and the
+//! attribute/capacity maps are tracked in #1442. ObjectMeta is validated
+//! separately.
 
+use crate::resources::dra::{CounterSet, Device, DeviceCounterConsumption, DeviceTaint};
 use crate::resources::{ResourceSlice, ResourceSliceSpec};
 use crate::validation::csinode::validate_csi_driver_name;
 use crate::validation::field::{Error, ErrorList, Path};
-use crate::validation::metav1::is_dns1123_subdomain;
+use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain, validate_label_name};
 use std::collections::HashSet;
 
 /// Port of upstream `validateNodeName` (resource/validation): node names use
@@ -27,6 +30,17 @@ fn validate_node_name(name: &str, fld_path: &Path) -> ErrorList {
 }
 
 const POOL_NAME_MAX_LENGTH: usize = 253;
+/// Upstream `resource.DeviceTaintsMaxLength` (`pkg/apis/resource/types.go:614`).
+const DEVICE_TAINTS_MAX_LENGTH: usize = 16;
+/// Upstream `resource.ResourceSliceMaxDeviceCounterConsumptionsPerDevice`
+/// (`pkg/apis/resource/types.go:268`).
+const MAX_COUNTER_CONSUMPTIONS_PER_DEVICE: usize = 2;
+/// Upstream `resource.ResourceSliceMaxCountersPerCounterSet` and
+/// `...PerDeviceCounterConsumption` (`pkg/apis/resource/types.go:263,272`).
+const MAX_COUNTERS_PER_SET: usize = 32;
+/// The effects `validDeviceTaintEffects` holds
+/// (`pkg/apis/resource/validation/validation.go:1389`).
+const DEVICE_TAINT_EFFECTS: &[&str] = &["NoExecute", "NoSchedule", "None"];
 const RESOURCE_SLICE_MAX_DEVICES: usize = 128;
 const RESOURCE_SLICE_MAX_DEVICES_WITH_COUNTERS: usize = 64;
 
@@ -171,14 +185,156 @@ fn validate_resource_slice_spec(spec: &ResourceSliceSpec, fld_path: &Path) -> Er
     let mut seen: HashSet<&str> = HashSet::new();
     for (i, device) in spec.devices.iter().enumerate() {
         let dp = devices_path.index(i);
-        if device.name.is_empty() {
-            errs.push(Error::required(&dp.child("name"), ""));
-        } else if !seen.insert(device.name.as_str()) {
+        if !device.name.is_empty() && !seen.insert(device.name.as_str()) {
             errs.push(Error::duplicate(&dp.child("name"), device.name.clone()));
         }
+        errs.extend(validate_device(device, &dp));
+    }
+
+    // sharedCounters (upstream `validateResourceSliceSpec` runs `validateSet`
+    // over them with `validateCounterSet`, validation.go:754-770).
+    let shared_path = fld_path.child("sharedCounters");
+    let mut seen_sets: HashSet<&str> = HashSet::new();
+    for (i, set) in spec.shared_counters.iter().enumerate() {
+        let sp = shared_path.index(i);
+        if !set.name.is_empty() && !seen_sets.insert(set.name.as_str()) {
+            errs.push(Error::duplicate(&sp.child("name"), set.name.clone()));
+        }
+        errs.extend(validate_counter_set(set, &sp));
     }
 
     errs
+}
+
+/// Port of upstream `validateDevice`
+/// (`pkg/apis/resource/validation/validation.go:801-870`), covering the parts
+/// that need no CEL environment: the name, the taints and the counter
+/// consumptions. The attribute/capacity maps and the per-device node-selection
+/// coupling stay in #1442.
+fn validate_device(device: &Device, fld_path: &Path) -> ErrorList {
+    let mut errs = validate_device_name(&device.name, &fld_path.child("name"));
+
+    let taints_path = fld_path.child("taints");
+    if device.taints.len() > DEVICE_TAINTS_MAX_LENGTH {
+        errs.push(Error::too_many(&taints_path, DEVICE_TAINTS_MAX_LENGTH));
+    }
+    for (i, taint) in device.taints.iter().enumerate() {
+        errs.extend(validate_device_taint(taint, &taints_path.index(i)));
+    }
+
+    let consumes_path = fld_path.child("consumesCounters");
+    if device.consumes_counters.len() > MAX_COUNTER_CONSUMPTIONS_PER_DEVICE {
+        errs.push(Error::too_many(
+            &consumes_path,
+            MAX_COUNTER_CONSUMPTIONS_PER_DEVICE,
+        ));
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (i, consumption) in device.consumes_counters.iter().enumerate() {
+        let cp = consumes_path.index(i);
+        // Upstream keys the set on `counterSet` (validation.go:830-833).
+        if !consumption.counter_set.is_empty() && !seen.insert(consumption.counter_set.as_str()) {
+            errs.push(Error::duplicate(
+                &cp.child("counterSet"),
+                consumption.counter_set.clone(),
+            ));
+        }
+        errs.extend(validate_device_counter_consumption(consumption, &cp));
+    }
+
+    errs
+}
+
+/// Upstream aliases `validateDeviceName` and `validateCounterName` to
+/// `corevalidation.ValidateDNS1123Label`
+/// (`pkg/apis/resource/validation/validation.go:73,76`), which reports an empty
+/// name as an invalid label rather than as `Required`. Rusternetes already
+/// answered a nameless device with `Required`, and a client can act on either,
+/// so the empty case keeps the clearer `Required` and everything else takes
+/// upstream's label check.
+fn validate_device_name(name: &str, fld_path: &Path) -> ErrorList {
+    if name.is_empty() {
+        return vec![Error::required(fld_path, "")];
+    }
+    is_dns1123_label(name)
+        .into_iter()
+        .map(|msg| Error::invalid(fld_path, name.to_string(), msg))
+        .collect()
+}
+
+/// Port of upstream `validateDeviceTaint`
+/// (`pkg/apis/resource/validation/validation.go:1391-1408`). `key` goes through
+/// `ValidateLabelName`, which includes the non-empty check, and `effect` is
+/// required with a closed set of values.
+fn validate_device_taint(taint: &DeviceTaint, fld_path: &Path) -> ErrorList {
+    let mut errs = validate_label_name(&taint.key, &fld_path.child("key"));
+    match &taint.effect {
+        None => errs.push(Error::required(&fld_path.child("effect"), "")),
+        Some(effect) => {
+            let effect = format!("{effect:?}");
+            if !DEVICE_TAINT_EFFECTS.contains(&effect.as_str()) {
+                errs.push(Error::not_supported(
+                    &fld_path.child("effect"),
+                    effect,
+                    DEVICE_TAINT_EFFECTS,
+                ));
+            }
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateDeviceCounterConsumption`
+/// (`pkg/apis/resource/validation/validation.go:871-886`).
+fn validate_device_counter_consumption(
+    consumption: &DeviceCounterConsumption,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs = validate_counter_name(&consumption.counter_set, &fld_path.child("counterSet"));
+    errs.extend(validate_counters(
+        consumption.counters.as_ref().map(|c| c.len()).unwrap_or(0),
+        &fld_path.child("counters"),
+    ));
+    errs
+}
+
+/// Port of upstream `validateCounterSet`
+/// (`pkg/apis/resource/validation/validation.go:771-787`).
+fn validate_counter_set(set: &CounterSet, fld_path: &Path) -> ErrorList {
+    let mut errs = validate_counter_name(&set.name, &fld_path.child("name"));
+    errs.extend(validate_counters(
+        set.counters.as_ref().map(|c| c.len()).unwrap_or(0),
+        &fld_path.child("counters"),
+    ));
+    errs
+}
+
+/// The `counters` half both counter validators share: required, and capped at
+/// upstream's per-set limit. Individual counter *values* need no check —
+/// upstream's `validateDeviceCounter` is "any parsed quantity is valid"
+/// (`pkg/apis/resource/validation/validation.go:1087-1090`), and a
+/// non-quantity fails to decode here.
+fn validate_counters(len: usize, fld_path: &Path) -> ErrorList {
+    if len == 0 {
+        return vec![Error::required(fld_path, "")];
+    }
+    if len > MAX_COUNTERS_PER_SET {
+        return vec![Error::too_many(fld_path, MAX_COUNTERS_PER_SET)];
+    }
+    Vec::new()
+}
+
+/// Upstream `validateCounterName` = `ValidateDNS1123Label`
+/// (`pkg/apis/resource/validation/validation.go:76`), with the explicit
+/// non-empty branch its callers add (`:773`, `:874`).
+fn validate_counter_name(name: &str, fld_path: &Path) -> ErrorList {
+    if name.is_empty() {
+        return vec![Error::required(fld_path, "")];
+    }
+    is_dns1123_label(name)
+        .into_iter()
+        .map(|msg| Error::invalid(fld_path, name.to_string(), msg))
+        .collect()
 }
 
 #[cfg(test)]
