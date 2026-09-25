@@ -199,7 +199,7 @@ fn validate_no_side_effects(side_effects: &SideEffectClass, path: &Path) -> Opti
 
 /// Port of upstream `webhook.ValidateWebhookURL` (forceHttps=true): scheme must
 /// be `https`, host present, no user-info / fragment / query.
-fn validate_webhook_url(url: &str, path: &Path) -> ErrorList {
+pub(crate) fn validate_webhook_url(url: &str, path: &Path) -> ErrorList {
     let mut errs = ErrorList::new();
     const FORM: &str = "; desired format: https://host[/path]";
     let parsed = match ::url::Url::parse(url) {
@@ -253,7 +253,7 @@ fn validate_webhook_url(url: &str, path: &Path) -> ErrorList {
 /// Port of upstream `webhook.ValidateWebhookService`: name/namespace required,
 /// port in 1..=65535, and the path (when set) a valid `/`-rooted URL path whose
 /// non-empty segments are DNS1123 subdomains.
-fn validate_webhook_service(
+pub(crate) fn validate_webhook_service(
     name: &str,
     namespace: &str,
     svc_path: Option<&str>,

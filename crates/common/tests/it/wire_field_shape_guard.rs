@@ -485,6 +485,23 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// ObjectMeta, and `metrics.k8s.io` is a read-only aggregated API — so the
 /// tests pin the *accept*, not a rejection.
 ///
+/// `crd.rs`: sixteen fields, none of which could be defaulted on their own —
+/// `validate_crd` checked a handful of emptiness rules with bare strings and no
+/// field path, so most of what `validateCustomResourceDefinitionSpec`
+/// (`apiextensions-apiserver/pkg/apis/apiextensions/validation/validation.go:353`)
+/// rejects was simply accepted. The slice ported that function, plus
+/// `ValidateCustomResourceDefinitionNames` (`:785`),
+/// `ValidateCustomResourceColumnDefinition` (`:821`),
+/// `ValidateCustomResourceDefinitionSubresources` (`:1525`),
+/// `validateSimpleJSONPath` (`:1568`), `validateCustomResourceConversion`
+/// (`:612`) and `validateConversionReviewVersions` (`:527`), and it runs
+/// `SetDefaults_CustomResourceDefinitionSpec` (`apiextensions/v1/defaults.go:41`)
+/// first, because `names.singular`, `names.listKind` and `conversion.strategy`
+/// are required by the validator precisely because defaulting has filled them.
+/// `CustomResourceConversion.strategy` stays an `Option` for the same reason
+/// `DeviceTaint.effect` does: upstream's is a string type whose `""` is
+/// `Required`, and a closed Rust enum has no member for it.
+///
 /// Not every pod field could be defaulted. `PodAffinityTerm.labelSelector` is a
 /// **pointer** upstream and stays an `Option` here, because
 /// `LabelSelectorAsSelector(nil)` is `labels.Nothing()` while
@@ -543,6 +560,7 @@ fn every_field_of_an_audited_module_decodes_when_absent() {
 /// audited for #1939. Grows one slice at a time; see rule 5.
 const AUDITED_MODULES: &[&str] = &[
     "admission_webhook.rs",
+    "crd.rs",
     "deployment.rs",
     "endpointslice.rs",
     "event.rs",

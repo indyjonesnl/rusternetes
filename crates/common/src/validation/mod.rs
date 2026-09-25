@@ -10,6 +10,7 @@ pub mod authorization;
 pub mod certificatesigningrequest;
 pub mod configmap;
 pub mod controllerrevision;
+pub mod crd;
 pub mod cronjob;
 pub mod csidriver;
 pub mod csinode;

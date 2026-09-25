@@ -331,12 +331,14 @@ pub async fn convert_custom_resources<S: Storage>(
         return Ok(resources);
     }
 
-    // Default strategy is None when spec.conversion is unset.
+    // Default strategy is None when spec.conversion — or its strategy — is
+    // unset, matching `SetDefaults_CustomResourceDefinitionSpec`
+    // (`apiextensions/v1/defaults.go:48-52`).
     let strategy = crd
         .spec
         .conversion
         .as_ref()
-        .map(|c| c.strategy.clone())
+        .and_then(|c| c.strategy.clone())
         .unwrap_or(rusternetes_common::resources::ConversionStrategyType::None);
 
     match strategy {
@@ -440,7 +442,7 @@ mod tests {
                     },
                 ],
                 conversion: Some(CustomResourceConversion {
-                    strategy: ConversionStrategyType::None,
+                    strategy: Some(ConversionStrategyType::None),
                     webhook: None,
                 }),
                 preserve_unknown_fields: None,

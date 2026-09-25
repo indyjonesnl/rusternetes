@@ -137,7 +137,12 @@ pub async fn create_crd(
         }
     }
 
-    // Validate CRD spec
+    // Default before validating: upstream's registry strategy runs
+    // `SetDefaults_CustomResourceDefinitionSpec` on the decoded object before
+    // `Validate` sees it, and `names.singular` / `names.listKind` /
+    // `conversion.strategy` are required by the validator precisely because
+    // defaulting has filled them (`apiextensions/v1/defaults.go:41-53`).
+    rusternetes_common::validation::crd::set_defaults_custom_resource_definition(&mut crd);
     validate_crd(&crd)?;
 
     // Ensure metadata fields
@@ -281,6 +286,8 @@ pub async fn create_crd(
             meta.insert("name".to_string(), serde_json::json!(crd.metadata.name));
         }
     }
+    apply_spec_defaults_to_raw(&mut crd_value, &crd);
+
     // Merge the typed struct's status into the raw JSON value.
     // The original body from the client usually lacks status, but our typed
     // `crd` struct has the Established/NamesAccepted conditions set above.
@@ -511,7 +518,12 @@ pub async fn update_crd(
     )
     .await?;
 
-    // Validate CRD spec
+    // Default before validating: upstream's registry strategy runs
+    // `SetDefaults_CustomResourceDefinitionSpec` on the decoded object before
+    // `Validate` sees it, and `names.singular` / `names.listKind` /
+    // `conversion.strategy` are required by the validator precisely because
+    // defaulting has filled them (`apiextensions/v1/defaults.go:41-53`).
+    rusternetes_common::validation::crd::set_defaults_custom_resource_definition(&mut crd);
     validate_crd(&crd)?;
 
     crd.metadata.name = name.clone();
@@ -607,6 +619,8 @@ pub async fn update_crd(
     let mut raw_value: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| rusternetes_common::Error::Internal(format!("re-parse for storage: {}", e)))?;
 
+    apply_spec_defaults_to_raw(&mut raw_value, &crd);
+
     enrich_updated_crd(&mut raw_value, &crd, old_crd_value.as_ref());
 
     // Reinstate the server-owned metadata a PUT body may omit: uid,
@@ -690,86 +704,66 @@ pub async fn delete_crd(
     }
 }
 
-/// Validate a CustomResourceDefinition
-fn validate_crd(crd: &CustomResourceDefinition) -> Result<()> {
-    // Validate that at least one version is defined
-    if crd.spec.versions.is_empty() {
-        return Err(rusternetes_common::Error::InvalidResource(
-            "CRD must have at least one version".to_string(),
-        ));
+/// Write the defaulted `spec.names` and `spec.conversion` back into the raw
+/// document these handlers persist.
+///
+/// CRDs are stored as the client's original JSON so nested schema fields
+/// survive the typed round-trip, which means defaulting applied to the typed
+/// struct — `names.singular`, `names.listKind` and `conversion.strategy` from
+/// `SetDefaults_CustomResourceDefinitionSpec`
+/// (`apiextensions-apiserver/pkg/apis/apiextensions/v1/defaults.go:41-53`) —
+/// would otherwise be dropped on the floor. Upstream persists the *defaulted*
+/// object, and clients read `names.singular` back (kubectl's singular alias)
+/// and `conversion.strategy` (the conversion path picks `None` from it).
+/// Neither of these two sub-objects carries a JSONSchemaProps, so re-encoding
+/// them from the typed struct is lossless.
+fn apply_spec_defaults_to_raw(raw: &mut serde_json::Value, crd: &CustomResourceDefinition) {
+    let Some(spec) = raw.get_mut("spec").and_then(|s| s.as_object_mut()) else {
+        return;
+    };
+    if let Ok(names) = serde_json::to_value(&crd.spec.names) {
+        spec.insert("names".to_string(), names);
     }
-
-    // Validate that exactly one version is marked as storage
-    let storage_versions: Vec<_> = crd.spec.versions.iter().filter(|v| v.storage).collect();
-
-    if storage_versions.is_empty() {
-        return Err(rusternetes_common::Error::InvalidResource(
-            "CRD must have exactly one storage version".to_string(),
-        ));
-    }
-
-    if storage_versions.len() > 1 {
-        return Err(rusternetes_common::Error::InvalidResource(
-            "CRD can only have one storage version".to_string(),
-        ));
-    }
-
-    // Validate that all served versions either have storage=true or are marked as served
-    for version in &crd.spec.versions {
-        if version.storage && !version.served {
-            warn!(
-                "Version {} is marked as storage but not served, this is unusual",
-                version.name
-            );
+    if let Ok(conversion) = serde_json::to_value(&crd.spec.conversion) {
+        if !conversion.is_null() {
+            spec.insert("conversion".to_string(), conversion);
         }
     }
+}
 
-    // Validate group name is not empty
-    if crd.spec.group.is_empty() {
-        return Err(rusternetes_common::Error::InvalidResource(
-            "CRD group cannot be empty".to_string(),
-        ));
+/// Validate a CustomResourceDefinition.
+///
+/// Delegates the spec to the port of upstream
+/// `validateCustomResourceDefinitionSpec`
+/// (`apiextensions-apiserver/pkg/apis/apiextensions/validation/validation.go:353`)
+/// in `rusternetes_common::validation::crd`, so every rejection carries a field
+/// path and lands in one `Status` with `details.causes` — what used to be a
+/// handful of bare strings, each returning on the first failure.
+///
+/// `set_defaults_custom_resource_definition` must have run first: `names`
+/// `singular`/`listKind` and `conversion.strategy` are required by the
+/// validator and filled by defaulting, exactly as upstream orders them.
+fn validate_crd(crd: &CustomResourceDefinition) -> Result<()> {
+    let errs = rusternetes_common::validation::crd::validate_custom_resource_definition_spec(
+        &crd.spec,
+        &rusternetes_common::validation::field::Path::new("spec"),
+    );
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
     }
 
-    // Validate names
-    if crd.spec.names.plural.is_empty() {
-        return Err(rusternetes_common::Error::InvalidResource(
-            "CRD plural name cannot be empty".to_string(),
-        ));
-    }
-
-    if crd.spec.names.kind.is_empty() {
-        return Err(rusternetes_common::Error::InvalidResource(
-            "CRD kind cannot be empty".to_string(),
-        ));
-    }
-
-    // `spec.scope` is required. Upstream:
-    // `apiextensions-apiserver/pkg/apis/apiextensions/validation/validation.go:364`
-    //
-    //     allErrs = append(allErrs, validateEnumStrings(fldPath.Child("scope"),
-    //         string(spec.Scope), []string{string(apiextensions.ClusterScoped),
-    //         string(apiextensions.NamespaceScoped)}, true)...)
-    //
-    // and `validateEnumStrings` (`:502-515`) answers `field.Required` for the
-    // empty string. `ResourceScope::Unspecified` is that empty string, which is
-    // what an absent `spec.scope` decodes to (#1931).
-    if crd.spec.scope == rusternetes_common::resources::ResourceScope::Unspecified {
-        return Err(rusternetes_common::Error::Invalid(vec![
-            rusternetes_common::validation::field::Error::required(
-                &rusternetes_common::validation::field::Path::new("spec").child("scope"),
-                "",
-            ),
-        ]));
-    }
-
-    // Validate that the CRD name follows the convention: <plural>.<group>
+    // The CRD's name must be `<plural>.<group>`. Upstream enforces this through
+    // the name validation function it hands `ValidateObjectMeta`
+    // (`validation.go:63-70`).
     let expected_name = format!("{}.{}", crd.spec.names.plural, crd.spec.group);
     if crd.metadata.name != expected_name {
-        return Err(rusternetes_common::Error::InvalidResource(format!(
-            "CRD name must be '{}'",
-            expected_name
-        )));
+        return Err(rusternetes_common::Error::Invalid(vec![
+            rusternetes_common::validation::field::Error::invalid(
+                &rusternetes_common::validation::field::Path::new("metadata").child("name"),
+                crd.metadata.name.clone(),
+                format!("must be spec.names.plural+\".\"+spec.group, i.e. {expected_name}"),
+            ),
+        ]));
     }
 
     // Validate every served version's x-kubernetes-validations rules:
