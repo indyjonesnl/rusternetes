@@ -68,5 +68,9 @@ pub struct ObjectReference {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalObjectReference {
+    /// Upstream requires nothing of this: `ValidateServiceAccount`
+    /// (`pkg/apis/core/validation/validation.go`) validates only the object's
+    /// metadata, so `imagePullSecrets: [{}]` is written, not rejected.
+    #[serde(default)]
     pub name: String,
 }

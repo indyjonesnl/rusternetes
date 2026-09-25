@@ -108,6 +108,7 @@ mod hpa_default_minreplicas_test;
 mod hpa_status_validation_test;
 mod hpa_update_validation_test;
 mod immutable_drop_field_test;
+mod ingress_event_decode_when_absent_test;
 mod ingress_handler_test;
 mod ingress_update_validation_test;
 mod ingressclass_handler_test;

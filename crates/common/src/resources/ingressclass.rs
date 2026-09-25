@@ -56,6 +56,10 @@ pub struct IngressClassSpec {
     /// This allows for different "flavors" of Ingress within a cluster.
     /// Must be a valid domain-prefixed path (max 250 characters).
     /// Examples: "acme.io/ingress-controller", "example.com/ingress-controller"
+    ///
+    /// Absent decodes to `""`, which `ValidateIngressClassSpec` reports as
+    /// `Required` (`pkg/apis/networking/validation/validation.go`).
+    #[serde(default)]
     pub controller: String,
 
     /// Parameters is a link to a custom resource containing additional configuration
@@ -77,9 +81,11 @@ pub struct IngressClassParametersReference {
     pub api_group: Option<String>,
 
     /// Kind is the type of resource being referenced
+    #[serde(default)]
     pub kind: String,
 
     /// Name is the name of resource being referenced
+    #[serde(default)]
     pub name: String,
 
     /// Namespace is the namespace of the resource being referenced.
