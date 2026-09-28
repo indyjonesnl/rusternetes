@@ -619,7 +619,7 @@ async fn test_snapshot_workflow() {
                 persistent_volume_claim_name: Some("data-pvc".to_string()),
                 volume_snapshot_content_name: None,
             },
-            volume_snapshot_class_name: "snapshot-class".to_string(),
+            volume_snapshot_class_name: Some("snapshot-class".to_string()),
         },
         status: None,
     };

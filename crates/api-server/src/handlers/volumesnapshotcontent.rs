@@ -30,19 +30,15 @@ pub async fn create_volumesnapshotcontent(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
-    // `deletionPolicy` is required and must be one of Delete/Retain -- the
-    // external-snapshotter CRD declares it `enum: [Delete, Retain]` with
-    // `required: [driver, deletionPolicy]`
-    // (`client/config/crd/snapshot.storage.k8s.io_volumesnapshotcontents.yaml`).
-    // `Unspecified` is the value an absent key decodes to (#1931); without this
-    // check defaulting the field would silently accept the object.
-    if vsc.spec.deletion_policy == rusternetes_common::resources::DeletionPolicy::Unspecified {
-        return Err(rusternetes_common::Error::Invalid(vec![
-            rusternetes_common::validation::field::Error::required(
-                &rusternetes_common::validation::field::Path::new("spec").child("deletionPolicy"),
-                "",
-            ),
-        ]));
+    // The whole of the external-snapshotter CRD's `required:` list and its
+    // `x-kubernetes-validations` CEL rules, not just `deletionPolicy` — see
+    // `crates/common/src/validation/volumesnapshot.rs`. Rusternetes serves this
+    // type natively rather than through the CRD machinery, so nothing else
+    // applies the schema.
+    let errs =
+        rusternetes_common::validation::volumesnapshot::validate_volume_snapshot_content(&vsc);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
     }
 
     // Check authorization (cluster-scoped)
@@ -174,6 +170,20 @@ pub async fn update_volumesnapshotcontent(
     .await?;
 
     vsc.metadata.name = name.clone();
+
+    // The CRD's source handles are `self == oldSelf` immutable, so the update
+    // path needs the stored object.
+    let stored: VolumeSnapshotContent = state
+        .storage
+        .get(&build_key("volumesnapshotcontents", None, &name))
+        .await?;
+    let errs =
+        rusternetes_common::validation::volumesnapshot::validate_volume_snapshot_content_update(
+            &vsc, &stored,
+        );
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
 
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {

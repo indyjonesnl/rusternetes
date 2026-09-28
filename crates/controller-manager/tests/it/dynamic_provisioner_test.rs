@@ -680,7 +680,7 @@ async fn test_restores_pvc_from_snapshot() {
                 resource_version: Some("1".to_string()),
                 field_path: None,
             },
-            volume_snapshot_class_name: "hostpath-snapclass".to_string(),
+            volume_snapshot_class_name: Some("hostpath-snapclass".to_string()),
             deletion_policy: DeletionPolicy::Delete,
             driver: "rusternetes.io/hostpath-snapshotter".to_string(),
         },
@@ -716,7 +716,7 @@ async fn test_restores_pvc_from_snapshot() {
                 persistent_volume_claim_name: Some("original-pvc".to_string()),
                 volume_snapshot_content_name: None,
             },
-            volume_snapshot_class_name: "hostpath-snapclass".to_string(),
+            volume_snapshot_class_name: Some("hostpath-snapclass".to_string()),
         },
         status: Some(VolumeSnapshotStatus {
             bound_volume_snapshot_content_name: Some(
@@ -850,7 +850,7 @@ async fn test_rejects_pvc_restore_from_non_ready_snapshot() {
                 persistent_volume_claim_name: Some("original-pvc".to_string()),
                 volume_snapshot_content_name: None,
             },
-            volume_snapshot_class_name: "hostpath-snapclass".to_string(),
+            volume_snapshot_class_name: Some("hostpath-snapclass".to_string()),
         },
         status: Some(VolumeSnapshotStatus {
             bound_volume_snapshot_content_name: None,

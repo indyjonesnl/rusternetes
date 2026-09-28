@@ -246,6 +246,7 @@ mod vap_validation_test;
 mod volume_integration_test;
 mod volumeattachment_handler_test;
 mod volumeattachment_update_immutable_test;
+mod volumesnapshot_decode_when_absent_test;
 mod volumesnapshot_handler_test;
 mod watch_all_rolebindings_test;
 mod watch_delete_test;
