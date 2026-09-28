@@ -296,6 +296,18 @@ pub async fn create_self_subject_rules_review(
         auth_ctx.user.username, ssrr.spec.namespace
     );
 
+    // Upstream's registry rejects an empty namespace before it authorizes
+    // anything, with a 400 and this exact sentence
+    // (`pkg/registry/authorization/selfsubjectrulesreview/rest.go:70-73`) —
+    // not a 422, because there is no validator on this path. Without the check
+    // an absent `spec.namespace` would enumerate cluster-scoped rules under a
+    // namespace named "".
+    if ssrr.spec.namespace.is_empty() {
+        return Err(rusternetes_common::Error::BadRequest(
+            "no namespace on request".to_string(),
+        ));
+    }
+
     // Creating a SelfSubjectRulesReview is always allowed
     let attrs = RequestAttributes::new(auth_ctx.user.clone(), "create", "selfsubjectrulesreviews")
         .with_api_group("authorization.k8s.io");

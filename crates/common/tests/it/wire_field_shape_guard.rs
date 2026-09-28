@@ -588,6 +588,24 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// object missing one field failed to decode and the controller skipped the
 /// whole item.
 ///
+/// `authorization.rs`: six fields, and the slice that unblocked them (#1951).
+/// `FieldSelectorRequirement.key`/`.operator` and the label equivalents could
+/// not be defaulted while SAR validation stopped at the attribute-pairing
+/// rules, because nothing would then have rejected the empty key — so
+/// `validateResourceAttributes` (`pkg/apis/authorization/validation/
+/// validation.go:108`), `validateFieldSelectorAttributes` (`:120`) and
+/// `validateLabelSelectorAttributes` (`:141`) were ported first, reusing this
+/// repo's `metav1::validate_label_selector_requirement` for the label half.
+/// Both pass `AllowUnknownOperatorInRequirement: true` (`:133`, `:158`), the
+/// skew allowance that lets a newer client's operator through, so an absent
+/// `operator` is deliberately *not* an error. The remaining two are answered
+/// elsewhere than a validator: `SubjectAccessReviewStatus.allowed` is written
+/// by the registry and its Go zero value is the safe `false`, and
+/// `SelfSubjectRulesReviewSpec.namespace` is a registry 400
+/// (`no namespace on request`,
+/// `pkg/registry/authorization/selfsubjectrulesreview/rest.go:70-73`), the same
+/// shape as `TokenReviewSpec.token`.
+///
 /// Not every pod field could be defaulted. `PodAffinityTerm.labelSelector` is a
 /// **pointer** upstream and stays an `Option` here, because
 /// `LabelSelectorAsSelector(nil)` is `labels.Nothing()` while
@@ -646,6 +664,7 @@ fn every_field_of_an_audited_module_decodes_when_absent() {
 /// audited for #1939. Grows one slice at a time; see rule 5.
 const AUDITED_MODULES: &[&str] = &[
     "admission_webhook.rs",
+    "authorization.rs",
     "authentication.rs",
     "autoscaling.rs",
     "binding.rs",

@@ -137,9 +137,20 @@ pub struct FieldSelectorAttributes {
 #[serde(rename_all = "camelCase")]
 pub struct FieldSelectorRequirement {
     /// Key is the field selector key that the requirement applies to.
+    ///
+    /// `ValidateFieldSelectorRequirement` answers an absent key with
+    /// `Required: must be specified`
+    /// (`apimachinery/pkg/apis/meta/v1/validation/validation.go:135-137`).
+    #[serde(default)]
     pub key: String,
 
     /// Operator represents a key's relationship to a set of values.
+    ///
+    /// Absent decodes to `""`, which falls into the validator's default arm.
+    /// A SAR passes `AllowUnknownOperatorInRequirement: true`
+    /// (`pkg/apis/authorization/validation/validation.go:133`) so that arm is
+    /// silent — the skew allowance that lets a newer client's operator through.
+    #[serde(default)]
     pub operator: String,
 
     /// Values is an array of string values.
@@ -165,9 +176,17 @@ pub struct LabelSelectorAttributes {
 #[serde(rename_all = "camelCase")]
 pub struct LabelSelectorRequirement {
     /// Key is the label key that the selector applies to.
+    ///
+    /// `ValidateLabelSelectorRequirement` runs it through `ValidateLabelName`,
+    /// which rejects `""` (`validation.go:92`).
+    #[serde(default)]
     pub key: String,
 
     /// Operator represents a key's relationship to a set of values.
+    ///
+    /// See [`FieldSelectorRequirement::operator`] — the same skew allowance
+    /// applies.
+    #[serde(default)]
     pub operator: String,
 
     /// Values is an array of string values.
@@ -180,6 +199,11 @@ pub struct LabelSelectorRequirement {
 #[serde(rename_all = "camelCase")]
 pub struct SubjectAccessReviewStatus {
     /// Allowed is required. True if the action would be allowed, false otherwise.
+    ///
+    /// Status is written by the registry, never by the client, and Go's zero
+    /// value for an absent key is `false` — the safe answer. There is no
+    /// validator because upstream has none for this field.
+    #[serde(default)]
     pub allowed: bool,
 
     /// Denied is optional. True if the action would be denied, otherwise false.
@@ -297,6 +321,13 @@ fn default_kind_self_subject_rules_review() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct SelfSubjectRulesReviewSpec {
     /// Namespace to evaluate rules for. Required.
+    ///
+    /// Answered by the *registry*, not a validator: upstream's `Create`
+    /// rejects an empty namespace with a 400 and the sentence
+    /// `no namespace on request`
+    /// (`pkg/registry/authorization/selfsubjectrulesreview/rest.go:70-73`),
+    /// the same shape as `TokenReviewSpec.token`.
+    #[serde(default)]
     pub namespace: String,
 }
 
