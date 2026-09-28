@@ -555,6 +555,24 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// `webhookconfiguration.rs` copy (`validate_rule_parts`) rather than growing a
 /// second.
 ///
+/// `certificates.rs`, `componentstatus.rs`, `config_and_secret.rs`,
+/// `controllerrevision.rs`, `coordination.rs`, `namespace.rs`,
+/// `runtimeclass.rs` and `servicecidr.rs` are the audit's *negative* half:
+/// every wire field in them was already either `Option` or defaulted, and the
+/// validator upstream requires was already ported
+/// (`ValidateCertificateSigningRequestCreate`,
+/// `pkg/apis/certificates/validation/validation.go:52`;
+/// `ValidateControllerRevision`, `pkg/apis/apps/validation/validation.go:695`;
+/// `ValidateRuntimeClass`, `pkg/apis/node/validation/validation.go:32`;
+/// `ValidateServiceCIDR`, `pkg/apis/networking/validation/validation.go:643`).
+/// `ValidateLease` (`pkg/apis/coordination/validation/validation.go:29`) and
+/// `ValidateNamespace` (`pkg/apis/core/validation/validation.go:4909`) are
+/// ObjectMeta-only, so for those the pinned behaviour is the *accept*; a
+/// ComponentStatus is read-only and has no create path at all. Listing them
+/// here is what stops a future field from regressing the shape silently —
+/// `crates/api-server/tests/it/core_modules_decode_when_absent_test.rs` is the
+/// behavioural half.
+///
 /// Not every pod field could be defaulted. `PodAffinityTerm.labelSelector` is a
 /// **pointer** upstream and stays an `Option` here, because
 /// `LabelSelectorAsSelector(nil)` is `labels.Nothing()` while
@@ -615,7 +633,15 @@ const AUDITED_MODULES: &[&str] = &[
     "admission_webhook.rs",
     "authentication.rs",
     "binding.rs",
+    "certificates.rs",
+    "componentstatus.rs",
+    "config_and_secret.rs",
+    "controllerrevision.rs",
+    "coordination.rs",
     "custom_metrics.rs",
+    "namespace.rs",
+    "runtimeclass.rs",
+    "servicecidr.rs",
     "crd.rs",
     "deployment.rs",
     "dra.rs",
