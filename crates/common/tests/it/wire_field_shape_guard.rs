@@ -410,21 +410,31 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
     );
 }
 
-/// # Rule 5 — every field of an audited module must decode when absent
+/// # Rule 5 — every field in `resources/` must decode when absent
 ///
-/// Rules 2-4 pick out a shape (`metadata`, an object struct, a condition). The
-/// end state of #1939 is simpler than any of them: **no** field of **any** wire
-/// struct in `resources/` may be required at decode time, because Go has no
-/// required JSON fields anywhere. The measurement on #1939 found 309 such
-/// fields across 186 nested structs, and each one carries an obligation the
-/// guard cannot check — some validator must reject the zero value, or the
-/// object is silently accepted. So the surface is being taken module by module,
-/// and this rule holds the modules already audited.
+/// Rules 2-4 pick out a shape (`metadata`, an object struct, a condition). This
+/// one is simpler than any of them: **no** field of **any** wire struct in
+/// `resources/` may be required at decode time, because Go has no required JSON
+/// fields anywhere. An absent key is the zero value, and *validation* answers
+/// `422 Invalid` with a field path; a bare non-`Option` Rust field answers
+/// serde's `400 BadRequest` instead — no `Status`, no `reason`, no
+/// `details.causes`.
 ///
-/// [`AUDITED_MODULES`] therefore only ever **grows**. It is not an exclusion
-/// list: a module in it is fully covered, and a new required field there fails
-/// this test. When the last module lands, the list goes and the scan runs
-/// unconditionally over `resources/`.
+/// The measurement on #1939 found 309 such fields across 186 nested structs,
+/// each carrying an obligation this guard cannot check: some validator must
+/// reject the zero value, or the object is silently accepted. That is why the
+/// surface was taken one module at a time behind a hand-maintained
+/// `AUDITED_MODULES` list, with the validator and the `#[serde(default)]`
+/// landing in the same commit every time. The last module landed, so the list
+/// is gone and the scan now reads `resources/` directly — a new module is
+/// covered the moment it appears.
+///
+/// The notes below are the record of what each slice had to port, kept because
+/// they are where the non-obvious cases are argued: which fields upstream
+/// answers from a *registry* with a 400 rather than from a validator with a
+/// 422, which must stay `Option` because absent and `""` are genuinely
+/// different values, and which carry no upstream obligation at all so the
+/// pinned behaviour is the accept.
 ///
 /// `admission_webhook.rs`: `name`, `clientConfig`, `sideEffects` and
 /// `admissionReviewVersions` are required upstream by *validation*
@@ -630,14 +640,14 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// turned "match no pod" into "match every pod". The guard skips `Option`
 /// fields, so modelling a pointer correctly satisfies it too.
 #[test]
-fn every_field_of_an_audited_module_decodes_when_absent() {
+fn every_field_in_resources_decodes_when_absent() {
     let mut offenders: Vec<String> = Vec::new();
     let mut checked = 0usize;
 
-    for module in AUDITED_MODULES {
-        let path = common_src().join("resources").join(module);
+    let modules = resource_modules();
+    for path in &modules {
         let src =
-            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let lines: Vec<&str> = src.lines().collect();
 
         for (i, line) in lines.iter().enumerate() {
@@ -661,14 +671,14 @@ fn every_field_of_an_audited_module_decodes_when_absent() {
     }
 
     assert!(
-        checked > 10,
-        "only {checked} fields were examined across {} audited module(s) — the \
-         scan broke and an empty guard passes vacuously",
-        AUDITED_MODULES.len()
+        checked > 500,
+        "only {checked} fields were examined across {} module(s) — the scan \
+         broke and an empty guard passes vacuously",
+        modules.len()
     );
     assert!(
         offenders.is_empty(),
-        "{} field(s) in an audited module are required at decode time, so a body \
+        "{} field(s) in `resources/` are required at decode time, so a body \
          upstream decodes answers 400 BadRequest from serde instead of the 422 \
          Invalid its validator would give. Add `#[serde(default)]`:\n  {}",
         offenders.len(),
@@ -676,47 +686,30 @@ fn every_field_of_an_audited_module_decodes_when_absent() {
     );
 }
 
-/// Modules of `crates/common/src/resources/` whose whole field surface has been
-/// audited for #1939. Grows one slice at a time; see rule 5.
-const AUDITED_MODULES: &[&str] = &[
-    "admission_webhook.rs",
-    "authorization.rs",
-    "authentication.rs",
-    "autoscaling.rs",
-    "binding.rs",
-    "certificates.rs",
-    "componentstatus.rs",
-    "config_and_secret.rs",
-    "controllerrevision.rs",
-    "coordination.rs",
-    "custom_metrics.rs",
-    "namespace.rs",
-    "runtimeclass.rs",
-    "servicecidr.rs",
-    "crd.rs",
-    "deployment.rs",
-    "dra.rs",
-    "endpoints.rs",
-    "endpointslice.rs",
-    "external_metrics.rs",
-    "event.rs",
-    "flowcontrol.rs",
-    "ingress.rs",
-    "ingressclass.rs",
-    "ipaddress.rs",
-    "metrics.rs",
-    "csi.rs",
-    "volume.rs",
-    "networking.rs",
-    "node.rs",
-    "pod.rs",
-    "policy.rs",
-    "rbac.rs",
-    "service.rs",
-    "service_account.rs",
-    "validating_admission_policy.rs",
-    "workloads.rs",
-];
+/// Every module under `crates/common/src/resources/`.
+///
+/// This used to be a hand-maintained `AUDITED_MODULES` list that grew one #1939
+/// slice at a time, because most modules still had fields that could not decode
+/// when absent and an unconditional scan would have been red from the start.
+/// Every module is audited now, so the scan reads the directory instead: a
+/// *new* resource module is covered the moment it lands, with nobody having to
+/// remember to add it — which is the property the list could never have.
+fn resource_modules() -> Vec<std::path::PathBuf> {
+    let dir = common_src().join("resources");
+    let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.expect("readable dir entry").path())
+        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+        .collect();
+    out.sort();
+    assert!(
+        out.len() > 30,
+        "only {} module(s) found under {} — the scan broke",
+        out.len(),
+        dir.display()
+    );
+    out
+}
 
 /// `(first, last)` line of every struct body shaped like a status condition:
 /// it declares a field serialized as `type` and one serialized as `status`.
