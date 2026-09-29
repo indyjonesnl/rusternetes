@@ -505,6 +505,40 @@ pub fn apply_pvc_spec_defaults(
     }
 }
 
+/// `SetDefaults_LimitRangeItem` (pkg/apis/core/v1/defaults.go:360-390), for
+/// every item. Only `Container` items are defaulted: a missing default limit
+/// comes from `max`, a missing default request from the default limit, and
+/// then from `min`.
+pub fn apply_limit_range_defaults(lr: &mut rusternetes_common::resources::LimitRange) {
+    for item in &mut lr.spec.limits {
+        if item.item_type != "Container" {
+            continue;
+        }
+        let default = item.default.get_or_insert_with(Default::default);
+        for (key, value) in item.max.iter().flatten() {
+            default.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        let default_request = item.default_request.get_or_insert_with(Default::default);
+        for (key, value) in default.iter() {
+            default_request
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        for (key, value) in item.min.iter().flatten() {
+            default_request
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        // `json:"default,omitempty"`: an empty map is not serialized.
+        if item.default_request.as_ref().is_some_and(|m| m.is_empty()) {
+            item.default_request = None;
+        }
+        if item.default.as_ref().is_some_and(|m| m.is_empty()) {
+            item.default = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,39 +905,5 @@ mod tests {
         })).unwrap();
         apply_job_defaults(&mut job3);
         assert_eq!(job3.spec.pod_replacement_policy.as_deref(), Some("Failed"));
-    }
-}
-
-/// `SetDefaults_LimitRangeItem` (pkg/apis/core/v1/defaults.go:360-390), for
-/// every item. Only `Container` items are defaulted: a missing default limit
-/// comes from `max`, a missing default request from the default limit, and
-/// then from `min`.
-pub fn apply_limit_range_defaults(lr: &mut rusternetes_common::resources::LimitRange) {
-    for item in &mut lr.spec.limits {
-        if item.item_type != "Container" {
-            continue;
-        }
-        let default = item.default.get_or_insert_with(Default::default);
-        for (key, value) in item.max.iter().flatten() {
-            default.entry(key.clone()).or_insert_with(|| value.clone());
-        }
-        let default_request = item.default_request.get_or_insert_with(Default::default);
-        for (key, value) in default.iter() {
-            default_request
-                .entry(key.clone())
-                .or_insert_with(|| value.clone());
-        }
-        for (key, value) in item.min.iter().flatten() {
-            default_request
-                .entry(key.clone())
-                .or_insert_with(|| value.clone());
-        }
-        // `json:"default,omitempty"`: an empty map is not serialized.
-        if item.default_request.as_ref().is_some_and(|m| m.is_empty()) {
-            item.default_request = None;
-        }
-        if item.default.as_ref().is_some_and(|m| m.is_empty()) {
-            item.default = None;
-        }
     }
 }
