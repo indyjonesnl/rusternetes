@@ -21,8 +21,8 @@ use crate::resources::deployment::{
 };
 use crate::resources::policy::IntOrString;
 use crate::resources::workloads::{
-    DaemonSet, DaemonSetSpec, ReplicaSet, ReplicaSetSpec, ReplicaSetStatus, StatefulSet,
-    StatefulSetSpec, StatefulSetStatus,
+    DaemonSet, DaemonSetSpec, DaemonSetStatus, ReplicaSet, ReplicaSetSpec, ReplicaSetStatus,
+    StatefulSet, StatefulSetSpec, StatefulSetStatus,
 };
 use crate::types::LabelSelector;
 use crate::validation::field::{BadValue, Error, ErrorList, Path};
@@ -1247,10 +1247,138 @@ fn validate_daemonset_spec(spec: &DaemonSetSpec, fld_path: &Path) -> ErrorList {
     errs
 }
 
-/// Validate a new `DaemonSet`. Mirrors upstream `ValidateDaemonSet`.
-/// Run after defaulting (see [`validate_daemonset_spec`]).
+/// Validate a new `DaemonSet`: upstream `ValidateDaemonSet`
+/// (validation.go:371-375), whose `ValidateDaemonSetName` is
+/// `NameIsDNSSubdomain` (:540). Run after defaulting (see
+/// [`validate_daemonset_spec`]).
 pub fn validate_daemonset(ds: &DaemonSet) -> ErrorList {
-    validate_daemonset_spec(&ds.spec, &Path::new("spec"))
+    let mut errs = validate_object_meta(
+        &ds.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_daemonset_spec_with_generation(ds));
+    errs
+}
+
+/// `ValidateDaemonSetSpec` including its `templateGeneration` check
+/// (validation.go:464). The internal field is the v1 annotation, see
+/// [`DaemonSet::template_generation`].
+fn validate_daemonset_spec_with_generation(ds: &DaemonSet) -> ErrorList {
+    let spec_path = Path::new("spec");
+    let mut errs = validate_daemonset_spec(&ds.spec, &spec_path);
+    errs.extend(validate_nonnegative_field(
+        ds.template_generation(),
+        &spec_path.child("templateGeneration"),
+    ));
+    errs
+}
+
+/// Upstream `ValidateDaemonSetUpdate` (validation.go:378-383): the metadata
+/// update, the spec update rules, and the new spec.
+pub fn validate_daemonset_update(new: &DaemonSet, old: &DaemonSet) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
+    errs.extend(validate_daemonset_spec_update(new, old, &Path::new("spec")));
+    errs.extend(validate_daemonset_spec_with_generation(new));
+    errs
+}
+
+/// Upstream `ValidateDaemonSetSpecUpdate` (validation.go:386-406).
+fn validate_daemonset_spec_update(new: &DaemonSet, old: &DaemonSet, fld_path: &Path) -> ErrorList {
+    let mut errs = ErrorList::new();
+    let (new_gen, old_gen) = (new.template_generation(), old.template_generation());
+    let path = fld_path.child("templateGeneration");
+
+    // TemplateGeneration shouldn't be decremented
+    if new_gen < old_gen {
+        errs.push(Error::invalid(&path, new_gen, "must not be decremented"));
+    }
+
+    // TemplateGeneration should be increased when and only when template is changed
+    let template_updated = !crate::equality::semantic_equal(&new.spec.template, &old.spec.template);
+    if new_gen == old_gen && template_updated {
+        errs.push(Error::invalid(
+            &path,
+            new_gen,
+            "must be incremented upon template update",
+        ));
+    } else if new_gen > old_gen && !template_updated {
+        errs.push(Error::invalid(
+            &path,
+            new_gen,
+            "must not be incremented without template update",
+        ));
+    }
+
+    // Spec.Selector is immutable
+    errs.extend(validate_immutable_field(
+        &new.spec.selector,
+        &old.spec.selector,
+        &Path::new("spec").child("selector"),
+    ));
+    errs
+}
+
+/// Upstream `validateDaemonSetStatus` (validation.go:409-424).
+fn validate_daemonset_status(status: &DaemonSetStatus, fld_path: &Path) -> ErrorList {
+    let mut errs = ErrorList::new();
+    for (value, name) in [
+        (
+            i64::from(status.current_number_scheduled),
+            "currentNumberScheduled",
+        ),
+        (i64::from(status.number_misscheduled), "numberMisscheduled"),
+        (
+            i64::from(status.desired_number_scheduled),
+            "desiredNumberScheduled",
+        ),
+        (i64::from(status.number_ready), "numberReady"),
+        (
+            status.observed_generation.unwrap_or(0),
+            "observedGeneration",
+        ),
+        (
+            i64::from(status.updated_number_scheduled.unwrap_or(0)),
+            "updatedNumberScheduled",
+        ),
+        (
+            i64::from(status.number_available.unwrap_or(0)),
+            "numberAvailable",
+        ),
+        (
+            i64::from(status.number_unavailable.unwrap_or(0)),
+            "numberUnavailable",
+        ),
+    ] {
+        errs.extend(validate_nonnegative_field(value, &fld_path.child(name)));
+    }
+    if let Some(collisions) = status.collision_count {
+        errs.extend(validate_nonnegative_field(
+            i64::from(collisions),
+            &fld_path.child("collisionCount"),
+        ));
+    }
+    errs
+}
+
+/// Upstream `ValidateDaemonSetStatusUpdate` (validation.go:427-438).
+pub fn validate_daemonset_status_update(new: &DaemonSet, old: &DaemonSet) -> ErrorList {
+    let empty = DaemonSetStatus::default();
+    let new_status = new.status.as_ref().unwrap_or(&empty);
+    let old_status = old.status.as_ref().unwrap_or(&empty);
+    let mut errs =
+        validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
+    errs.extend(validate_daemonset_status(new_status, &Path::new("status")));
+    if is_decremented(new_status.collision_count, old_status.collision_count) {
+        errs.push(Error::invalid(
+            &Path::new("status").child("collisionCount"),
+            new_status.collision_count.unwrap_or(0),
+            "cannot be decremented",
+        ));
+    }
+    errs
 }
 
 /// Validate a `Deployment` update (`new` replaces `old`): upstream
@@ -1637,7 +1765,7 @@ mod workload_parity_tests {
         rolling_update: serde_json::Value,
     ) -> serde_json::Value {
         serde_json::json!({
-            "metadata": {"name": "ds"},
+            "metadata": {"name": "ds", "namespace": "default"},
             "spec": {
                 "selector": matching_selector(),
                 "updateStrategy": {"type": "RollingUpdate", "rollingUpdate": rolling_update},
@@ -1823,5 +1951,183 @@ mod workload_parity_tests {
             "got: {}",
             agg(&errs)
         );
+    }
+}
+
+/// Ports of upstream `TestValidateDaemonSetUpdate` and
+/// `TestValidateDaemonSetStatusUpdate`
+/// (pkg/apis/apps/validation/validation_test.go:1504-1878, 1879-2341).
+#[cfg(test)]
+mod daemonset_update_tests {
+    use super::*;
+
+    fn ds(template_generation: i64, image: &str, app: &str) -> DaemonSet {
+        let mut ds: DaemonSet = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "abc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "selector": {"matchLabels": {"a": app}},
+                "updateStrategy": {"type": "OnDelete"},
+                "template": {
+                    "metadata": {"labels": {"a": app}},
+                    "spec": {
+                        "restartPolicy": "Always",
+                        "dnsPolicy": "ClusterFirst",
+                        "containers": [{
+                            "name": "c", "image": image,
+                            "imagePullPolicy": "IfNotPresent",
+                            "terminationMessagePolicy": "File"
+                        }]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        ds.set_template_generation(template_generation);
+        ds
+    }
+
+    fn fields(errs: &ErrorList) -> Vec<String> {
+        errs.iter().map(|e| e.field.to_string()).collect()
+    }
+
+    #[test]
+    fn accepted_updates() {
+        // "no change"
+        assert_eq!(
+            fields(&validate_daemonset_update(
+                &ds(1, "i", "b"),
+                &ds(1, "i", "b")
+            )),
+            Vec::<String>::new()
+        );
+        // "change template": the generation moves with it
+        assert_eq!(
+            fields(&validate_daemonset_update(
+                &ds(4, "j", "b"),
+                &ds(3, "i", "b")
+            )),
+            Vec::<String>::new()
+        );
+        // "change update strategy": a non-template spec change keeps it
+        let mut rolling = ds(4, "i", "b");
+        rolling.spec.update_strategy = serde_json::from_value(serde_json::json!({
+            "type": "RollingUpdate", "rollingUpdate": {"maxUnavailable": 1}
+        }))
+        .unwrap();
+        assert_eq!(
+            fields(&validate_daemonset_update(&rolling, &ds(4, "i", "b"))),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn rejected_updates() {
+        for (name, new, old, field) in [
+            (
+                "change selector",
+                ds(2, "i", "c"),
+                ds(1, "i", "b"),
+                "spec.selector",
+            ),
+            (
+                "negative templateGeneration",
+                ds(-1, "i", "b"),
+                ds(-1, "i", "b"),
+                "spec.templateGeneration",
+            ),
+            (
+                "decreased templateGeneration",
+                ds(1, "j", "b"),
+                ds(2, "i", "b"),
+                "spec.templateGeneration",
+            ),
+            (
+                "unchanged templateGeneration upon template update",
+                ds(2, "j", "b"),
+                ds(2, "i", "b"),
+                "spec.templateGeneration",
+            ),
+            (
+                "incremented templateGeneration without template update",
+                ds(3, "i", "b"),
+                ds(2, "i", "b"),
+                "spec.templateGeneration",
+            ),
+        ] {
+            let errs = validate_daemonset_update(&new, &old);
+            assert!(
+                fields(&errs).iter().any(|f| f == field),
+                "{name}: want an error on {field}, got {errs:?}"
+            );
+        }
+    }
+
+    fn status(json: serde_json::Value) -> DaemonSet {
+        let mut ds = ds(1, "i", "b");
+        ds.status = Some(serde_json::from_value(json).unwrap());
+        ds
+    }
+
+    #[test]
+    fn status_update() {
+        let old = status(serde_json::json!({
+            "currentNumberScheduled": 1, "numberMisscheduled": 2,
+            "desiredNumberScheduled": 3, "numberReady": 1, "observedGeneration": 3,
+            "updatedNumberScheduled": 1, "numberAvailable": 1, "numberUnavailable": 2,
+            "collisionCount": 2
+        }));
+        let ok = status(serde_json::json!({
+            "currentNumberScheduled": 1, "numberMisscheduled": 1,
+            "desiredNumberScheduled": 3, "numberReady": 1,
+            "updatedNumberScheduled": 1, "numberAvailable": 1, "numberUnavailable": 2,
+            "collisionCount": 2
+        }));
+        assert_eq!(
+            fields(&validate_daemonset_status_update(&ok, &old)),
+            Vec::<String>::new()
+        );
+
+        // "negative values"
+        let negative = status(serde_json::json!({
+            "currentNumberScheduled": -1, "numberMisscheduled": -1,
+            "desiredNumberScheduled": -3, "numberReady": -1, "observedGeneration": -3,
+            "updatedNumberScheduled": -1, "numberAvailable": -1, "numberUnavailable": -2,
+            "collisionCount": -1
+        }));
+        let got = fields(&validate_daemonset_status_update(&negative, &old));
+        for field in [
+            "status.currentNumberScheduled",
+            "status.numberMisscheduled",
+            "status.desiredNumberScheduled",
+            "status.numberReady",
+            "status.observedGeneration",
+            "status.updatedNumberScheduled",
+            "status.numberAvailable",
+            "status.numberUnavailable",
+            "status.collisionCount",
+        ] {
+            assert!(got.iter().any(|f| f == field), "{field} missing: {got:?}");
+        }
+
+        // A decremented collisionCount (validation.go:431-437).
+        let decremented = status(serde_json::json!({"collisionCount": 1}));
+        let errs = validate_daemonset_status_update(&decremented, &old);
+        assert!(
+            errs.iter()
+                .any(|e| e.field.to_string() == "status.collisionCount"
+                    && e.to_string().contains("cannot be decremented")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_daemonset_name_is_a_dns_subdomain() {
+        let mut named = ds(1, "i", "b");
+        named.metadata.name = "a.b".to_string();
+        assert!(validate_daemonset(&named).is_empty());
+        named.metadata.name = "A_b".to_string();
+        assert!(fields(&validate_daemonset(&named))
+            .iter()
+            .any(|f| f == "metadata.name"));
     }
 }
