@@ -42,6 +42,16 @@ async fn collect_for(api: &TestApiServer, uri: String, window: Duration) -> Vec<
     events
 }
 
+/// Open a watch on the prefix and hold it, so the shared watch cache is
+/// recording the prefix's events before anything is written — as it is in a
+/// running cluster, where informers already watch it. The in-memory backend
+/// cannot backfill a cold prefix (its `watch_since` is future-only), so
+/// without this a replay would have nothing to serve.
+async fn warm(api: &TestApiServer) -> axum::response::Response {
+    api.respond("GET", &format!("{CLAIMS}?watch=true"), None, None)
+        .await
+}
+
 /// Create a claim, then change a label on it. Returns the resourceVersion the
 /// CREATE returned and the one the PATCH returned.
 async fn create_then_modify(api: &TestApiServer) -> (String, String) {
@@ -94,6 +104,7 @@ fn summary(events: &[Value]) -> Vec<(String, Option<String>)> {
 #[tokio::test]
 async fn a_watch_from_the_create_revision_replays_the_modification() {
     let api = TestApiServer::new();
+    let _warm = warm(&api).await;
     let (created_rv, _) = create_then_modify(&api).await;
 
     let events = collect_for(
@@ -115,6 +126,7 @@ async fn a_watch_from_the_create_revision_replays_the_modification() {
 #[tokio::test]
 async fn a_watch_from_the_latest_revision_sends_nothing() {
     let api = TestApiServer::new();
+    let _warm = warm(&api).await;
     let (_, patched_rv) = create_then_modify(&api).await;
 
     let events = collect_for(
