@@ -234,6 +234,24 @@ pub fn is_qualified_name(value: &str) -> Vec<String> {
     errs
 }
 
+/// Upstream `validation.IsRelaxedEnvVarName`
+/// (`staging/src/k8s.io/apimachinery/pkg/util/validation/validation.go:388-403`):
+/// non-empty, and every rune printable ASCII other than `=`. Go's
+/// `unicode.IsPrint` counts the ASCII space, so the accepted range is
+/// `' '..='~'`.
+pub fn is_relaxed_env_var_name(value: &str) -> Vec<String> {
+    const RELAXED_ENV_VAR_NAME_FMT_ERR_MSG: &str =
+        "a valid environment variable name must consist only of printable ASCII characters other than '='";
+    let mut errs = Vec::new();
+    if value.is_empty() {
+        errs.push("environment variable name must be non-empty".to_string());
+    }
+    if value.chars().any(|c| !(' '..='~').contains(&c) || c == '=') {
+        errs.push(RELAXED_ENV_VAR_NAME_FMT_ERR_MSG.to_string());
+    }
+    errs
+}
+
 /// Upstream `content.IsLabelValue`.
 pub fn is_valid_label_value(value: &str) -> Vec<String> {
     let mut errs = Vec::new();
@@ -831,4 +849,45 @@ pub fn validate_field_validation(fld_path: &Path, field_validation: &str) -> Err
         ));
     }
     errs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ported from upstream `TestIsRelaxedEnvVarName`
+    /// (`staging/src/k8s.io/apimachinery/pkg/util/validation/validation_test.go:588-613`).
+    #[test]
+    fn relaxed_env_var_name() {
+        let good = [
+            "-", ":", "_", "+a", ">a", "<a", "a.", "a..", "*a", "%a", "?a", "a:a", "a_a", "aAz",
+            "~a", "|a", "a0a", "a9", "/a", "a ", "#a", "0a", "0 a", "'a", "(a", "@a",
+        ];
+        for v in good {
+            assert!(
+                is_relaxed_env_var_name(v).is_empty(),
+                "expected valid: {v:?}"
+            );
+        }
+        let bad = [
+            "".to_string(),
+            "=".to_string(),
+            "a=".to_string(),
+            "1=a".to_string(),
+            "a=b".to_string(),
+            "#%=&&".to_string(),
+            format!("{}abc", char::from(1u8)),
+            format!("{}abc", char::from_u32(130).unwrap()),
+            "Ç ç".to_string(),
+            "Ä ä".to_string(),
+            "Ñ ñ".to_string(),
+            "Ø ø".to_string(),
+        ];
+        for v in &bad {
+            assert!(
+                !is_relaxed_env_var_name(v).is_empty(),
+                "expected invalid: {v:?}"
+            );
+        }
+    }
 }
