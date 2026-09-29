@@ -205,22 +205,57 @@ impl Storage for MemoryStorage {
             }
         }
 
-        {
-            let data = self.data.read().unwrap();
-            if !data.contains_key(key) {
-                return Err(Error::NotFound(key.to_string()));
+        let mut value_json: serde_json::Value = serde_json::to_value(value)?;
+        let incoming_rv = crate::concurrency::extract_resource_version(
+            value_json
+                .get("metadata")
+                .unwrap_or(&serde_json::Value::Null),
+        );
+
+        // Optimistic concurrency, under ONE lock. Upstream's write is a single
+        // etcd transaction guarded on the key's revision — `OptimisticPut`
+        // (`vendor/go.etcd.io/etcd/client/v3/kubernetes/client.go:83-107`):
+        //
+        // ```go
+        // txn := k.KV.Txn(ctx).If(
+        //     clientv3.Compare(clientv3.ModRevision(key), "=", expectedRevision),
+        // ).Then(
+        //     clientv3.OpPut(key, string(value), clientv3.WithLease(opts.LeaseID)),
+        // )
+        // ```
+        //
+        // and `GuaranteedUpdate` re-reads and retries when `!txnResp.Succeeded`
+        // (`etcd3/store.go:597-616`). Comparing outside the lock that does the
+        // write would let two writers both pass the compare and the later one
+        // silently revert the earlier — which is the whole point of the check,
+        // so the compare and the insert happen under the same write guard here.
+        //
+        // A value carrying no resourceVersion writes unconditionally, matching
+        // `RhinoStorage::update` (`rhino.rs`) and upstream's unconditional
+        // paths.
+        let mut data = self.data.write().unwrap();
+        let Some(stored) = data.get(key) else {
+            return Err(Error::NotFound(key.to_string()));
+        };
+        if let Some(incoming_rv) = incoming_rv.as_deref() {
+            let stored_rv = serde_json::from_str::<serde_json::Value>(stored)
+                .ok()
+                .and_then(|v| {
+                    crate::concurrency::extract_resource_version(
+                        v.get("metadata").unwrap_or(&serde_json::Value::Null),
+                    )
+                });
+            if let Some(stored_rv) = stored_rv.as_deref() {
+                if stored_rv != incoming_rv {
+                    return Err(Error::Conflict(format!(
+                        "resourceVersion mismatch: resource was modified (expected: {incoming_rv}, current: {stored_rv})"
+                    )));
+                }
             }
         }
 
-        let mut value_json: serde_json::Value = serde_json::to_value(value)?;
         self.stamp_revision(&mut value_json)?;
         let serialized = serde_json::to_string(&value_json)?;
-
-        let mut data = self.data.write().unwrap();
-        if !data.contains_key(key) {
-            return Err(Error::NotFound(key.to_string()));
-        }
-
         data.insert(key.to_string(), serialized.clone());
         drop(data); // Release lock before sending event
 

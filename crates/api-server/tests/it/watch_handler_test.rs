@@ -476,7 +476,9 @@ async fn test_watch_resource_version_tracking() {
         immutable: None,
     };
 
-    storage.create(&key, &cm).await.unwrap();
+    // Carry the resourceVersion the store stamped, not the one in the body.
+    let created: ConfigMap = storage.create(&key, &cm).await.unwrap();
+    cm.metadata.resource_version = created.metadata.resource_version;
 
     // Start watching
     let prefix = build_prefix("configmaps", Some(namespace));
@@ -500,6 +502,9 @@ async fn test_watch_resource_version_tracking() {
             .resource_version
             .clone()
             .expect("update must stamp a resourceVersion");
+        // The next write must carry the RV this one produced, as a client
+        // does: the store rejects a superseded one with Conflict.
+        cm.metadata.resource_version = Some(written_rv.clone());
 
         // Verify event has updated resource version
         if let Some(Ok(event)) = watch_stream.next().await {
