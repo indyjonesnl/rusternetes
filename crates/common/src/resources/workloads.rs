@@ -455,7 +455,36 @@ impl DaemonSet {
             status: None,
         }
     }
+
+    /// The internal `spec.templateGeneration`. apps/v1 has no such field: the
+    /// v1 conversion carries it in the [`DEPRECATED_TEMPLATE_GENERATION`]
+    /// annotation (`pkg/apis/apps/v1/conversion.go:83-115`). An absent value is
+    /// 0. Upstream rejects a value that does not parse as an int64 while
+    /// decoding. Here it reads as 0, and the strategy then overwrites it.
+    pub fn template_generation(&self) -> i64 {
+        self.metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(DEPRECATED_TEMPLATE_GENERATION))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Set the internal `spec.templateGeneration`. The v1 conversion writes the
+    /// annotation on every object it serves (`conversion.go:83-91`).
+    pub fn set_template_generation(&mut self, generation: i64) {
+        self.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                DEPRECATED_TEMPLATE_GENERATION.to_string(),
+                generation.to_string(),
+            );
+    }
 }
+
+/// `appsv1.DeprecatedTemplateGeneration` (staging/src/k8s.io/api/apps/v1/types.go).
+pub const DEPRECATED_TEMPLATE_GENERATION: &str = "deprecated.daemonset.template.generation";
 
 /// DaemonSetSpec defines the desired state of a DaemonSet
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -507,7 +536,7 @@ pub struct RollingUpdateDaemonSet {
 }
 
 /// DaemonSetStatus represents the current state of a DaemonSet
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonSetStatus {
     /// Number of nodes that should be running the daemon pod

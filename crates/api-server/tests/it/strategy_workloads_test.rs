@@ -7,15 +7,14 @@
 //!
 //! * **Generation bump on spec change** — PUT with mutated spec increments
 //!   `metadata.generation`; PUT with identical spec keeps it.
-//!   (`Strategy.PrepareForUpdate` in upstream, our
-//!   `handlers::lifecycle::maybe_increment_generation` here.)
+//!   (`Strategy.PrepareForUpdate` in upstream and in each
+//!   `registry::apps::*` strategy here.)
 //! * **Status update isolation** — PUT against the main resource path
 //!   does NOT touch `status`; PUT `/status` does NOT touch `spec`.
 //!   (Upstream `StatusStrategy.PrepareForUpdate` resets the orthogonal field.)
 //! * **Selector immutability** — `spec.selector` is immutable post-create per
-//!   upstream `ValidateXUpdate`. Enforced in our handler chain via
-//!   `handlers::lifecycle::validate_selector_immutable`, which returns 422
-//!   Invalid when `old.spec.selector != new.spec.selector`.
+//!   upstream `ValidateXUpdate`, ported into `validation::apps::validate_*_update`,
+//!   which returns 422 Invalid when `old.spec.selector != new.spec.selector`.
 //! * **Replicas defaulting** — Deployment / StatefulSet default missing
 //!   `spec.replicas` to 1 via `apply_*_defaults`. ReplicaSet defaults to 1
 //!   via serde `default = "default_one_replica"`. DaemonSet has no
@@ -34,9 +33,8 @@
 //!     object's status onto the incoming body before persisting, mirroring
 //!     upstream `Strategy.PrepareForUpdate`. Status mutates only via the
 //!     `/status` subresource.
-//!   * Selector immutability is enforced via
-//!     `handlers::lifecycle::validate_selector_immutable`, called from each
-//!     apps/v1 workload update handler.
+//!   * Selector immutability is enforced by each workload's update
+//!     validator (all four are served through the generic Store now, #1990).
 //!
 //! Convention: in-process Axum router wrapped around `MemoryStorage`; HTTP
 //! verbs driven via `tower::ServiceExt::oneshot`; assertions check BOTH the
