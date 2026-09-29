@@ -65,6 +65,7 @@ mod conformance_status_conditions_proto_test;
 mod conformance_status_proto_test;
 mod conformance_volume_localobjectref_proto_test;
 mod conformance_wide_serialization_sweep_test;
+mod controllerrevision_generic_store_test;
 mod core_modules_decode_when_absent_test;
 mod crd_decode_when_absent_test;
 mod crd_discovery_after_create_test;

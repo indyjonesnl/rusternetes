@@ -1,105 +1,96 @@
+//! ControllerRevision endpoints.
+//!
+//! Writes go through the
+//! generic endpoint handlers and [`crate::registry::generic::Store`] with the
+//! ControllerRevision strategies ([`crate::registry::apps::controllerrevision`]) — upstream's
+//! `pkg/registry/apps/controllerrevision/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::apps::controllerrevision;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::HeaderMap,
+    response::Response,
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::ControllerRevision,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The ControllerRevision `RequestScope`: `apps/v1` `ControllerRevision` served as
+/// `controllerrevisions`, backed by `controllerrevision.NewREST`'s store.
+fn scope(state: &ApiServerState) -> RequestScope<ControllerRevision> {
+    let store = controllerrevision::new_store(state.storage.clone());
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            kind: "ControllerRevision".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            resource: "controllerrevisions".to_string(),
+        },
+        subresource: None,
+        store: Box::new(store),
+        apply: Some(crate::ssa::apply_legacy::<ControllerRevision>),
+        convert_to_internal: None,
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create_controllerrevision(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut cr): DumpingJson<ControllerRevision>,
-) -> Result<(StatusCode, Json<ControllerRevision>)> {
-    info!(
-        "Creating controllerrevision: {} in namespace: {}",
-        cr.metadata.name, namespace
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "controllerrevisions")
-        .with_api_group("apps")
-        .with_namespace(&namespace);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &cr.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Ensure namespace is set from the URL path
-    cr.metadata.namespace = Some(namespace.clone());
-
-    // Validate (upstream apps ValidateControllerRevisionCreate): data mandatory.
-    let errs =
-        rusternetes_common::validation::controllerrevision::validate_controller_revision(&cr);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Enrich metadata with system fields
-    cr.metadata.ensure_uid();
-    cr.metadata.ensure_creation_timestamp();
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ControllerRevision validated successfully (not created)");
-        return Ok((StatusCode::CREATED, Json(cr)));
-    }
-
-    let key = build_key("controllerrevisions", Some(&namespace), &cr.metadata.name);
-    let created = state.storage.create(&key, &cr).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get_controllerrevision(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<ControllerRevision>> {
-    info!(
-        "Getting controllerrevision: {} in namespace: {}",
-        name, namespace
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "controllerrevisions")
-        .with_api_group("apps")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("controllerrevisions", Some(&namespace), &name);
-    let cr = state.storage.get(&key).await?;
-
-    Ok(Json(cr))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn update_controllerrevision(
@@ -107,145 +98,76 @@ pub async fn update_controllerrevision(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut cr): DumpingJson<ControllerRevision>,
-) -> Result<Json<ControllerRevision>> {
-    info!(
-        "Updating controllerrevision: {} in namespace: {}",
-        name, namespace
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "controllerrevisions")
-        .with_api_group("apps")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("controllerrevisions", Some(&namespace), &name),
-        "apps",
-        "controllerrevisions",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    cr.metadata.name = name.clone();
-    cr.metadata.namespace = Some(namespace.clone());
-
-    let key = build_key("controllerrevisions", Some(&namespace), &name);
-
-    // Update validation (upstream ValidateControllerRevisionUpdate): re-run the
-    // create checks and enforce that `data` is immutable.
-    if let Ok(old) = state.storage.get::<ControllerRevision>(&key).await {
-        let errs =
-            rusternetes_common::validation::controllerrevision::validate_controller_revision_update(
-                &cr, &old,
-            );
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ControllerRevision validated successfully (not updated)");
-        return Ok(Json(cr));
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    if let Ok(stored) = state.storage.get::<ControllerRevision>(&key).await {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut cr.metadata,
-            &stored.metadata,
-        );
-    }
-
-    let result = state.storage.update(&key, &cr).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
+pub async fn patch_controllerrevision(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete_controllerrevision(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<ControllerRevision>> {
-    info!(
-        "Deleting controllerrevision: {} in namespace: {}",
-        name, namespace
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "controllerrevisions")
-        .with_api_group("apps")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("controllerrevisions", Some(&namespace), &name);
-
-    // Get the resource for finalizer handling
-    let cr: ControllerRevision = state.storage.get(&key).await?;
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ControllerRevision validated successfully (not deleted)");
-        return Ok(Json(cr));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &cr,
-        &delete_opts,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    if deleted_immediately {
-        Ok(Json(cr))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: ControllerRevision = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+pub async fn deletecollection_controllerrevisions(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn list_controllerrevisions(
@@ -380,82 +302,4 @@ pub async fn list_all_controllerrevisions(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(
-    patch_controllerrevision,
-    ControllerRevision,
-    "controllerrevisions",
-    "apps"
-);
-
-pub async fn deletecollection_controllerrevisions(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection controllerrevisions in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "controllerrevisions")
-        .with_namespace(&namespace)
-        .with_api_group("apps");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ControllerRevision collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all controllerrevisions in the namespace
-    let prefix = build_prefix("controllerrevisions", Some(&namespace));
-    let mut items = state.storage.list::<ControllerRevision>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("controllerrevisions", Some(&namespace), &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} controllerrevisions deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }

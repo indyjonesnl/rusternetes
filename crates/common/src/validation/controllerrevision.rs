@@ -1,30 +1,43 @@
 //! ControllerRevision validation — port of upstream Kubernetes
-//! `pkg/apis/apps/validation/validation.go::ValidateControllerRevisionCreate`
-//! (release-1.35).
-//!
-//! `data` is mandatory and must be a JSON object. ObjectMeta is validated
-//! separately (#1087 / #1277).
+//! `pkg/apis/apps/validation/validation.go:328-367` (release-1.35):
+//! `validateControllerRevision`, `ValidateControllerRevisionCreate` and
+//! `ValidateControllerRevisionUpdate`.
 
 use crate::resources::ControllerRevision;
 use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, validate_immutable_field, validate_nonnegative_field,
+    validate_object_meta, validate_object_meta_update,
+};
 
-/// Validate a `ControllerRevision` on create. Mirrors the `data` check of
-/// upstream `ValidateControllerRevisionCreate`.
+/// Upstream `validateControllerRevision` (validation.go:333-338), with
+/// `ValidateControllerRevisionName = NameIsDNSSubdomain` (:328).
+fn validate_controller_revision_common(cr: &ControllerRevision) -> ErrorList {
+    let mut errs = validate_object_meta(
+        &cr.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_nonnegative_field(
+        cr.revision,
+        &Path::new("revision"),
+    ));
+    errs
+}
+
+/// Validate a `ControllerRevision` on create: upstream
+/// `ValidateControllerRevisionCreate` (validation.go:340-358). `data` is
+/// mandatory and must be a JSON object.
+///
+/// The `error parsing data` branch has no equivalent: a body whose `data` is
+/// not JSON fails to decode before it gets here.
 pub fn validate_controller_revision(cr: &ControllerRevision) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
-
-    // Upstream `validateControllerRevision` (apps validation.go:336):
-    // `ValidateNonnegativeField(revision.Revision, ...)`.
-    if cr.revision < 0 {
-        errs.push(Error::invalid(
-            &Path::new("revision"),
-            cr.revision,
-            "must be greater than or equal to 0",
-        ));
-    }
+    let mut errs = validate_controller_revision_common(cr);
 
     let data_path = Path::new("data");
     match &cr.data {
+        // `"data": null` leaves `RawExtension.Raw` nil, as absence does.
         None | Some(serde_json::Value::Null) => {
             errs.push(Error::required(&data_path, "data is mandatory"));
         }
@@ -39,21 +52,22 @@ pub fn validate_controller_revision(cr: &ControllerRevision) -> ErrorList {
     errs
 }
 
-/// Validate a `ControllerRevision` on update. Mirrors upstream
-/// `ValidateControllerRevisionUpdate`: re-run the create validation and enforce
-/// that `data` is immutable (only `revision` and metadata may change).
+/// Validate a `ControllerRevision` on update: upstream
+/// `ValidateControllerRevisionUpdate` (validation.go:361-367) — the metadata
+/// update, the common checks and an immutable `data`. The create-only `data`
+/// shape check does not re-run.
 pub fn validate_controller_revision_update(
     new: &ControllerRevision,
     old: &ControllerRevision,
 ) -> ErrorList {
-    let mut errs = validate_controller_revision(new);
-    if new.data != old.data {
-        errs.push(Error::invalid(
-            &Path::new("data"),
-            "<data>".to_string(),
-            "field is immutable",
-        ));
-    }
+    let mut errs =
+        validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
+    errs.extend(validate_controller_revision_common(new));
+    errs.extend(validate_immutable_field(
+        &new.data,
+        &old.data,
+        &Path::new("data"),
+    ));
     errs
 }
 
@@ -63,7 +77,7 @@ mod update_tests {
 
     fn cr(rev: i64, data: serde_json::Value) -> ControllerRevision {
         serde_json::from_value(serde_json::json!({
-            "metadata": {"name": "rev1"},
+            "metadata": {"name": "rev1", "namespace": "default", "resourceVersion": "1"},
             "revision": rev,
             "data": data,
         }))
@@ -82,6 +96,46 @@ mod update_tests {
         assert!(
             errs.iter()
                 .any(|e| e.field == "data" && e.detail == "field is immutable"),
+            "{errs:?}"
+        );
+    }
+
+    /// `validateControllerRevision` starts with `ValidateObjectMeta`
+    /// (validation.go:334): a namespaced DNS-subdomain name.
+    #[test]
+    fn metadata_is_validated() {
+        let mut bad = cr(1, serde_json::json!({"k": "v"}));
+        bad.metadata.name = "Not_A_Subdomain".into();
+        assert!(validate_controller_revision(&bad)
+            .iter()
+            .any(|e| e.field == "metadata.name"));
+        let mut unscoped = cr(1, serde_json::json!({"k": "v"}));
+        unscoped.metadata.namespace = None;
+        assert!(validate_controller_revision(&unscoped)
+            .iter()
+            .any(|e| e.field == "metadata.namespace"));
+    }
+
+    /// `ValidateControllerRevisionUpdate` (validation.go:361-367) does not
+    /// re-run the create-only `data` check, and validates the metadata update.
+    #[test]
+    fn update_skips_the_data_shape_check_and_checks_metadata() {
+        let mut old = cr(1, serde_json::Value::Null);
+        old.data = None;
+        let new = old.clone();
+        assert!(validate_controller_revision(&new)
+            .iter()
+            .any(|e| e.field == "data"));
+        assert!(validate_controller_revision_update(&new, &old).is_empty());
+
+        let mut renamespaced = cr(1, serde_json::json!({"k": "v"}));
+        renamespaced.metadata.namespace = Some("other".into());
+        let errs = validate_controller_revision_update(
+            &renamespaced,
+            &cr(1, serde_json::json!({"k": "v"})),
+        );
+        assert!(
+            errs.iter().any(|e| e.field == "metadata.namespace"),
             "{errs:?}"
         );
     }
