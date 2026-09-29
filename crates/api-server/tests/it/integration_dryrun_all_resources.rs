@@ -272,18 +272,23 @@ fn statefulset_stub() -> Value {
 }
 
 fn job_stub() -> Value {
-    // No selector / template labels: the api-server auto-generates a consistent
-    // selector + controller-uid / job-name labels (matching upstream
-    // generateSelector). Pre-setting a stale controller-uid here would conflict
-    // with the generated uid and be rejected by validateGeneratedSelector.
+    // Upstream's stub (test/integration/etcd/data.go:200): a manual selector,
+    // so the object is valid whether it is created through the API or seeded
+    // straight into storage and then PUT. `generateSelector` only runs on
+    // create (pkg/registry/batch/job/strategy.go:94-96), so an update of a
+    // seeded Job without a selector is `spec.selector: Required value`.
     json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {"name": "job1", "namespace": TEST_NS},
         "spec": {
+            "manualSelector": true,
+            "selector": {"matchLabels": {"controller-uid": "uid1"}},
             "template": {
+                "metadata": {"labels": {"controller-uid": "uid1"}},
                 "spec": {
-                    "containers": [{"image": "busybox", "name": "c"}],
+                    "containers": [{"image": "busybox", "name": "container1"}],
+                    "dnsPolicy": "ClusterFirst",
                     "restartPolicy": "Never"
                 }
             }

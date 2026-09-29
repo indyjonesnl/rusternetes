@@ -164,8 +164,11 @@ async fn run_case(case: &Case) -> Vec<String> {
 
     // DELETE — force grace period 0 so kinds with graceful deletion (pods)
     // are removed immediately rather than only marked, yielding a real DELETED.
+    // Background propagation for the same reason: a batch/v1 Job defaults to
+    // orphaning its pods (pkg/registry/batch/job/strategy.go:62-74), which
+    // parks it on the `orphan` finalizer until the garbage collector runs.
     tokio::time::sleep(Duration::from_millis(60)).await;
-    let del_uri = format!("{item}?gracePeriodSeconds=0");
+    let del_uri = format!("{item}?gracePeriodSeconds=0&propagationPolicy=Background");
     let (ds, db) = send(&router, Method::DELETE, &del_uri, None).await;
     if !ds.is_success() {
         problems.push(format!(

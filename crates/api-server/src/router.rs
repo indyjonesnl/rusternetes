@@ -1349,9 +1349,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/batch/v1/namespaces/:namespace/jobs/:name/status",
-            get(handlers::status::get_status)
-                .put(handlers::status::update_status)
-                .patch(handlers::status::update_status),
+            get(handlers::job::get_status)
+                .put(handlers::job::update_status)
+                .patch(handlers::job::patch_status),
         )
         // Jobs (all namespaces)
         .route(
