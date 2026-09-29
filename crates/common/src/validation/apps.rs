@@ -73,6 +73,43 @@ fn template_labels_match_selector(
     errs
 }
 
+/// `metav1.LabelSelectorAsSelector(spec.Selector)` and both of its arms, as
+/// StatefulSet, Deployment and ReplicaSet spell them:
+///
+/// ```go
+/// selector, err := metav1.LabelSelectorAsSelector(spec.Selector)
+/// if err != nil {
+///     allErrs = append(allErrs, field.Invalid(fldPath.Child("selector"), spec.Selector, <detail>))
+/// } else {
+///     // template labels must match the selector
+/// }
+/// ```
+///
+/// (`pkg/apis/apps/validation/validation.go:189-192` with detail `""`,
+/// `:652-657` and `:823-828` with `"invalid label selector"`.) DaemonSet only
+/// gates on `err == nil` (`:446-449`) and adds nothing, so it keeps calling
+/// [`template_labels_match_selector`] directly (#2034).
+fn selector_parses_and_matches_template(
+    selector: &LabelSelector,
+    template_labels: &std::collections::HashMap<String, String>,
+    fld_path: &Path,
+    invalid_detail: &str,
+) -> ErrorList {
+    if crate::types::label_selector_as_selector(Some(selector)).is_err() {
+        let value = serde_json::to_value(selector).unwrap_or(serde_json::Value::Null);
+        return vec![Error::invalid(
+            &fld_path.child("selector"),
+            BadValue::Json(value),
+            invalid_detail,
+        )];
+    }
+    template_labels_match_selector(
+        selector,
+        template_labels,
+        &fld_path.child("template").child("metadata").child("labels"),
+    )
+}
+
 /// Validate a workload pod template's `restartPolicy` / `activeDeadlineSeconds`
 /// constraints shared by StatefulSet, DaemonSet and ReplicaSet. Mirrors upstream
 /// (e.g. `ValidatePodTemplateSpecForReplicaSet` lines 847-852,
@@ -414,10 +451,11 @@ fn validate_deployment_spec(
             .and_then(|m| m.labels.clone())
             .unwrap_or_default();
 
-        errs.extend(template_labels_match_selector(
+        errs.extend(selector_parses_and_matches_template(
             &spec.selector,
             &template_labels,
-            &fld_path.child("template").child("metadata").child("labels"),
+            fld_path,
+            "invalid label selector",
         ));
     }
 
@@ -659,10 +697,11 @@ fn validate_replicaset_spec(spec: &ReplicaSetSpec, fld_path: &Path) -> ErrorList
             .as_ref()
             .and_then(|m| m.labels.clone())
             .unwrap_or_default();
-        errs.extend(template_labels_match_selector(
+        errs.extend(selector_parses_and_matches_template(
             &spec.selector,
             &template_labels,
-            &fld_path.child("template").child("metadata").child("labels"),
+            fld_path,
+            "invalid label selector",
         ));
     }
 
@@ -929,10 +968,11 @@ fn validate_statefulset_spec(
             .as_ref()
             .and_then(|m| m.labels.clone())
             .unwrap_or_default();
-        errs.extend(template_labels_match_selector(
+        errs.extend(selector_parses_and_matches_template(
             &spec.selector,
             &template_labels,
-            &fld_path.child("template").child("metadata").child("labels"),
+            fld_path,
+            "",
         ));
     }
 
@@ -1687,6 +1727,101 @@ mod workload_parity_tests {
             agg(&validate_daemonset(&ds)).contains("empty selector is invalid for daemonset"),
             "got: {}",
             agg(&validate_daemonset(&ds))
+        );
+    }
+
+    // --- an invalid selector (#2034) ------------------------------------------
+    //
+    // When `metav1.LabelSelectorAsSelector` errors, StatefulSet, Deployment and
+    // ReplicaSet push `field.Invalid(fldPath.Child("selector"), spec.Selector,
+    // <detail>)` (`pkg/apis/apps/validation/validation.go:189-191`, `:652-654`,
+    // `:823-825`); DaemonSet only gates its template check on `err == nil`
+    // (`:446-449`) and adds nothing.
+
+    /// A selector whose one expression uses an operator upstream does not know,
+    /// so `LabelSelectorAsSelector` fails on it.
+    fn unknown_operator_selector() -> serde_json::Value {
+        serde_json::json!({
+            "matchLabels": {"app": "x"},
+            "matchExpressions": [{"key": "app", "operator": "Bogus", "values": ["x"]}]
+        })
+    }
+
+    /// The `Invalid` errors on exactly `spec.selector` (not its children).
+    fn selector_invalids(errs: &ErrorList) -> Vec<(String, BadValue)> {
+        errs.iter()
+            .filter(|e| {
+                e.error_type == crate::validation::field::ErrorType::Invalid
+                    && e.field == "spec.selector"
+            })
+            .map(|e| (e.detail.clone(), e.bad_value.clone()))
+            .collect()
+    }
+
+    fn expected_selector_invalid(detail: &str) -> Vec<(String, BadValue)> {
+        let selector: LabelSelector = serde_json::from_value(unknown_operator_selector()).unwrap();
+        let value = serde_json::to_value(selector).unwrap();
+        vec![(detail.to_string(), BadValue::Json(value))]
+    }
+
+    #[test]
+    fn statefulset_invalid_selector_is_field_invalid() {
+        let mut s = base_statefulset(template(Some("Always"), None));
+        s["spec"]["selector"] = unknown_operator_selector();
+        let errs = validate_statefulset(&statefulset(s));
+        assert_eq!(
+            selector_invalids(&errs),
+            expected_selector_invalid(""),
+            "got: {}",
+            agg(&errs)
+        );
+    }
+
+    #[test]
+    fn deployment_invalid_selector_is_field_invalid() {
+        let d = deployment(serde_json::json!({
+            "metadata": {"name": "d"},
+            "spec": {
+                "replicas": 1,
+                "selector": unknown_operator_selector(),
+                "template": template(Some("Always"), None),
+            }
+        }));
+        let errs = validate_deployment(&d);
+        assert_eq!(
+            selector_invalids(&errs),
+            expected_selector_invalid("invalid label selector"),
+            "got: {}",
+            agg(&errs)
+        );
+    }
+
+    #[test]
+    fn replicaset_invalid_selector_is_field_invalid() {
+        let mut r = base_replicaset(template(Some("Always"), None));
+        r["spec"]["selector"] = unknown_operator_selector();
+        let errs = validate_replicaset(&replicaset(r));
+        assert_eq!(
+            selector_invalids(&errs),
+            expected_selector_invalid("invalid label selector"),
+            "got: {}",
+            agg(&errs)
+        );
+    }
+
+    #[test]
+    fn daemonset_invalid_selector_only_skips_the_template_check() {
+        let mut ds = daemonset_with(
+            template(Some("Always"), None),
+            serde_json::json!({"maxUnavailable": 1}),
+        );
+        ds["spec"]["selector"] = unknown_operator_selector();
+        let errs = validate_daemonset(&daemonset(ds));
+        assert_eq!(selector_invalids(&errs), vec![], "got: {}", agg(&errs));
+        assert!(
+            !agg(&errs).contains("does not match template"),
+            "got: {}",
+            agg(&errs)
         );
     }
 }

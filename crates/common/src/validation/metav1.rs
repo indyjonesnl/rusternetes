@@ -379,8 +379,9 @@ pub fn validate_label_selector_requirement(
 /// and `ValidateDaemonSetSpec` (`pkg/apis/apps/validation/validation.go:446`)
 /// simply skip the template-matches-selector check when
 /// `LabelSelectorAsSelector` errors, leaving the operator itself to
-/// [`validate_label_selector`]. (The apps validators additionally push a
-/// `field.Invalid(selector, "")` on that branch — not ported yet.)
+/// [`validate_label_selector`]. StatefulSet, Deployment and ReplicaSet also
+/// push a `field.Invalid` on `selector` there; they parse the selector
+/// themselves (`apps.rs`, `selector_parses_and_matches_template`).
 pub fn label_selector_matches_labels(
     selector: &LabelSelector,
     labels: &HashMap<String, String>,
