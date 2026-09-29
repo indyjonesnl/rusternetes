@@ -13,11 +13,8 @@ contract_suite!(etcd, crate::contract::fixtures::etcd(), revisions: true, snapsh
 contract_suite!(kine, crate::contract::fixtures::kine(), revisions: true, snapshot_paging: true);
 
 // The rhino/SQLite backend the cluster actually runs. Feature-gated, so a
-// default `cargo test -p rusternetes-storage` compiles it out -- and the
-// storage-contract workflow does not build with `--features sqlite` yet,
-// because one row is still red here: a delete of a key that never existed
-// returns Ok instead of NotFound (#2041). Enabling the feature in CI is
-// tracked there.
+// default `cargo test -p rusternetes-storage` compiles it out; CI's nextest
+// job builds with all features and runs it.
 //
 // `snapshot_paging: false` is measured, not assumed: every original object
 // arrives exactly once and in order, but an object created mid-pagination
