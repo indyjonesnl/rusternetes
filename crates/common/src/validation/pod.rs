@@ -43,11 +43,6 @@ use crate::validation::metav1::{
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-/// Upstream `envVarNameFmt` / `envVarNameRegexp`.
-static ENV_VAR_NAME_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[-._a-zA-Z][-._a-zA-Z0-9]*$").expect("env var name regex"));
-const ENV_VAR_NAME_ERR_MSG: &str = "a valid environment variable name must consist of alphabetic characters, digits, '_', '-', or '.', and must not start with a digit";
-
 /// Upstream `configMapKeyFmt` / `configMapKeyRegexp`.
 static CONFIG_MAP_KEY_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^[-._a-zA-Z0-9]+$").expect("config map key regex"));
@@ -1148,7 +1143,8 @@ const APP_ARMOR_PROFILE_TYPES: &[&str] = &["Localhost", "RuntimeDefault", "Uncon
 /// Port of upstream `ValidateEnvFrom`
 /// (`pkg/apis/core/validation/validation.go:2919-2951`) together with
 /// `validateConfigMapEnvSource` (`:2953-2963`) and `validateSecretEnvSource`
-/// (`:2965-2975`): a prefix that is a valid env var name, exactly one of
+/// (`:2965-2975`): a prefix that is a valid relaxed env var name (see
+/// `is_relaxed_env_var_name`; the gate is locked on in 1.35), exactly one of
 /// `configMapRef` / `secretRef`, and a non-empty DNS-subdomain name on
 /// whichever one is set.
 fn validate_env_from(sources: &[EnvFromSource], fld_path: &Path) -> ErrorList {
@@ -1157,7 +1153,7 @@ fn validate_env_from(sources: &[EnvFromSource], fld_path: &Path) -> ErrorList {
         let idx = fld_path.index(i);
 
         if let Some(prefix) = ev.prefix.as_deref().filter(|p| !p.is_empty()) {
-            for msg in is_env_var_name(prefix) {
+            for msg in crate::validation::metav1::is_relaxed_env_var_name(prefix) {
                 errs.push(Error::invalid(
                     &idx.child("prefix"),
                     prefix.to_string(),
@@ -1470,24 +1466,6 @@ fn validate_local_descending_path(target: &str, fld_path: &Path) -> ErrorList {
             target.to_string(),
             "must not contain '..'",
         ));
-    }
-    errs
-}
-
-/// Port of upstream `validation.IsEnvVarName`: the env-var name format plus the
-/// `hasChDirPrefix` guard (must not be `.`/`..` or start with `..`).
-fn is_env_var_name(value: &str) -> Vec<String> {
-    let mut errs = Vec::new();
-    if !ENV_VAR_NAME_RE.is_match(value) {
-        errs.push(format!(
-            "{ENV_VAR_NAME_ERR_MSG} (regex used for validation is '[-._a-zA-Z][-._a-zA-Z0-9]*')"
-        ));
-    }
-    match value {
-        "." => errs.push("must not be '.'".to_string()),
-        ".." => errs.push("must not be '..'".to_string()),
-        v if v.starts_with("..") => errs.push("must not start with '..'".to_string()),
-        _ => {}
     }
     errs
 }
@@ -1816,7 +1794,7 @@ fn validate_env(env: &[EnvVar], fld_path: &Path) -> ErrorList {
         if ev.name.is_empty() {
             errs.push(Error::required(&idx.child("name"), ""));
         } else {
-            for msg in is_env_var_name(&ev.name) {
+            for msg in crate::validation::metav1::is_relaxed_env_var_name(&ev.name) {
                 errs.push(Error::invalid(&idx.child("name"), ev.name.clone(), msg));
             }
         }
