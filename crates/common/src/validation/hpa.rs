@@ -9,6 +9,7 @@
 //! the scale-to-zero guard, and the `behavior` scaling-rules validation.
 
 use crate::quantity::Quantity;
+use crate::resources::autoscaling::Scale;
 use crate::resources::autoscaling::{
     ContainerResourceMetricSource, CrossVersionObjectReference, ExternalMetricSource,
     HPAScalingPolicy, HPAScalingRules, HorizontalPodAutoscaler, HorizontalPodAutoscalerBehavior,
@@ -881,6 +882,24 @@ pub fn validate_horizontal_pod_autoscaler_status_update(
                 "must be greater than or equal to 0",
             ));
         }
+    }
+    errs
+}
+
+/// Upstream `ValidateScale` (pkg/apis/autoscaling/validation/validation.go:
+/// 40-49).
+pub fn validate_scale(scale: &Scale) -> ErrorList {
+    let mut errs = crate::validation::objectmeta::validate_object_meta(
+        &scale.metadata,
+        true,
+        crate::validation::objectmeta::name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    if scale.spec.replicas < 0 {
+        errs.extend(crate::validation::objectmeta::validate_nonnegative_field(
+            i64::from(scale.spec.replicas),
+            &Path::new("spec").child("replicas"),
+        ));
     }
     errs
 }

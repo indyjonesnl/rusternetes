@@ -29,10 +29,12 @@ fn deployment(name: &str) -> Value {
     })
 }
 
-fn scale(replicas: i64) -> Value {
+/// The Scale's name must match the URL's (`checkName`,
+/// endpoints/handlers/rest.go).
+fn scale(name: &str, replicas: i64) -> Value {
     json!({
         "apiVersion": "autoscaling/v1", "kind": "Scale",
-        "metadata": {"name": "x", "namespace": NS},
+        "metadata": {"name": name, "namespace": NS},
         "spec": {"replicas": replicas},
         "status": {"replicas": 0}
     })
@@ -46,7 +48,7 @@ async fn scale_rejects_negative_replicas() {
     assert_eq!(code, StatusCode::CREATED, "deployment create must succeed");
 
     // PUT /scale with negative replicas must be rejected.
-    let (code, body) = state.put(&scale_uri(name), &scale(-1)).await;
+    let (code, body) = state.put(&scale_uri(name), &scale(name, -1)).await;
     assert_eq!(
         code,
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -54,6 +56,6 @@ async fn scale_rejects_negative_replicas() {
     );
 
     // A non-negative scale succeeds.
-    let (code, body) = state.put(&scale_uri(name), &scale(3)).await;
+    let (code, body) = state.put(&scale_uri(name), &scale(name, 3)).await;
     assert_eq!(code, StatusCode::OK, "valid scale must succeed: {body}");
 }

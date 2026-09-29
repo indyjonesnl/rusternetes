@@ -25,7 +25,7 @@ pub use create::create_resource;
 pub use delete::{delete_collection, delete_resource};
 pub use get::get_resource;
 pub use patch::patch_resource;
-pub use rest::RequestScope;
+pub use rest::{negotiate, RequestScope};
 pub use update::update_resource;
 
 #[cfg(test)]
