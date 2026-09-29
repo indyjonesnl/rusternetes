@@ -1377,9 +1377,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/batch/v1/namespaces/:namespace/cronjobs/:name/status",
-            get(handlers::status::get_status)
-                .put(handlers::status::update_status)
-                .patch(handlers::status::update_status),
+            get(handlers::cronjob::get_status)
+                .put(handlers::cronjob::update_status)
+                .patch(handlers::cronjob::patch_status),
         )
         // CronJobs (all namespaces)
         .route(
