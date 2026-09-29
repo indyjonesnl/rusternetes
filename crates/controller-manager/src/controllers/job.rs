@@ -4188,4 +4188,101 @@ mod tests {
         // ready should be 0
         assert_eq!(status.ready, Some(0));
     }
+
+    // --- orphan pods through the running controller (conformance "Job should
+    // delete a job") --------------------------------------------------------
+    //
+    // `DeleteResourceAndWaitForGC` deletes the Job with background propagation
+    // and waits for its pods to be *gone*. The garbage collector deletes them,
+    // but each still carries `batch.kubernetes.io/job-tracking`; with the Job
+    // gone, only the Job controller's orphan path removes it. Upstream reaches
+    // that path from `deleteJob` -> `enqueueLabelSelector`
+    // (`pkg/controller/job/job_controller.go:561-581`) and from the pod event
+    // handlers (`addPod` :344-347, `updatePod` :417-420, `deletePod` :458-466),
+    // all into `handleSingleOrphanPod` (:736-767). Ours existed but only
+    // `reconcile_all` — a test entry point — called it, so in a cluster the
+    // pods kept the finalizer forever: "there are 2 pods left".
+
+    fn job_with_selector(name: &str) -> Job {
+        let mut job = make_job(name, "default", 4, 2);
+        job.spec.selector = Some(rusternetes_common::types::LabelSelector {
+            match_labels: Some(HashMap::from([("job-name".to_string(), name.to_string())])),
+            match_expressions: None,
+        });
+        job
+    }
+
+    async fn wait_until_released(storage: &MemoryStorage, pods: &[&str]) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut held = Vec::new();
+            for name in pods {
+                let pod: Pod = storage
+                    .get(&build_key("pods", Some("default"), name))
+                    .await
+                    .unwrap();
+                if has_job_tracking_finalizer(&pod) {
+                    held.push(name.to_string());
+                }
+            }
+            if held.is_empty() || tokio::time::Instant::now() > deadline {
+                return held;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn run_releases_the_pods_of_a_deleted_job() {
+        let storage = Arc::new(MemoryStorage::new());
+        let job_key = build_key("jobs", Some("default"), "foo");
+        storage
+            .create(&job_key, &job_with_selector("foo"))
+            .await
+            .unwrap();
+        for name in ["foo-a", "foo-b"] {
+            let pod = make_pod(name, "default", Phase::Running, "foo", "job-uid-1");
+            storage
+                .create(&build_key("pods", Some("default"), name), &pod)
+                .await
+                .unwrap();
+        }
+
+        let controller = Arc::new(JobController::new(storage.clone()));
+        let handle = tokio::spawn(controller.run());
+        // Let the controller settle on the live Job before it goes away.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        storage.delete(&job_key).await.unwrap();
+
+        let held = wait_until_released(&storage, &["foo-a", "foo-b"]).await;
+        handle.abort();
+        assert!(
+            held.is_empty(),
+            "pods of the deleted Job still hold the job-tracking finalizer: {held:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_releases_pods_orphaned_before_it_started() {
+        let storage = Arc::new(MemoryStorage::new());
+        // The Job is already gone: only its pods remain.
+        for name in ["bar-a", "bar-b"] {
+            let pod = make_pod(name, "default", Phase::Running, "bar", "job-uid-1");
+            storage
+                .create(&build_key("pods", Some("default"), name), &pod)
+                .await
+                .unwrap();
+        }
+
+        let controller = Arc::new(JobController::new(storage.clone()));
+        let handle = tokio::spawn(controller.run());
+
+        let held = wait_until_released(&storage, &["bar-a", "bar-b"]).await;
+        handle.abort();
+        assert!(
+            held.is_empty(),
+            "orphaned pods still hold the job-tracking finalizer: {held:?}"
+        );
+    }
 }
