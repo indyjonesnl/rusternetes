@@ -1,20 +1,67 @@
+//! DaemonSet endpoints.
+//!
+//! Writes, and the `/status` subresource, go through the
+//! generic endpoint handlers and [`crate::registry::generic::Store`] with the
+//! DaemonSet strategies ([`crate::registry::apps::daemonset`]) — upstream's
+//! `pkg/registry/apps/daemonset/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::apps::daemonset;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::DaemonSet,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The DaemonSet `RequestScope`: `apps/v1` `DaemonSet` served as
+/// `daemonsets` (or its `/status`), backed by `daemonset.NewREST`'s stores.
+fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestScope<DaemonSet> {
+    let store = match subresource {
+        Some(_) => daemonset::new_status_store(state.storage.clone()),
+        None => daemonset::new_store(state.storage.clone()),
+    };
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            kind: "DaemonSet".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            resource: "daemonsets".to_string(),
+        },
+        subresource,
+        store: Box::new(store),
+        apply: Some(crate::ssa::apply_legacy::<DaemonSet>),
+        convert_to_internal: Some(daemonset::convert_to_internal),
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
@@ -22,91 +69,31 @@ pub async fn create(
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
-) -> Result<(StatusCode, Json<DaemonSet>)> {
-    let mut daemonset: DaemonSet = rusternetes_common::dump::decode_request_body(&body)?;
-    info!(
-        "Creating daemonset: {}/{}",
-        namespace, daemonset.metadata.name
-    );
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &daemonset.metadata,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "daemonsets")
-        .with_namespace(&namespace)
-        .with_api_group("apps");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    daemonset.metadata.namespace = Some(namespace.clone());
-    daemonset.metadata.ensure_uid();
-    daemonset.metadata.ensure_creation_timestamp();
-    crate::handlers::lifecycle::set_initial_generation(&mut daemonset.metadata);
-
-    // Apply K8s defaults (SetDefaults_DaemonSet + SetDefaults_PodSpec + SetDefaults_Container)
-    crate::handlers::defaults::apply_daemonset_defaults(&mut daemonset);
-
-    // Field validation (mirrors upstream ValidateDaemonSet). Runs after
-    // defaulting so updateStrategy is populated.
-    {
-        let errs = rusternetes_common::validation::apps::validate_daemonset(&daemonset);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: DaemonSet {}/{} validated successfully (not created)",
-            namespace, daemonset.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(daemonset)));
-    }
-
-    let key = build_key("daemonsets", Some(&namespace), &daemonset.metadata.name);
-    let created = state.storage.create(&key, &daemonset).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<DaemonSet>> {
-    debug!("Getting daemonset: {}/{}", namespace, name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "daemonsets")
-        .with_namespace(&namespace)
-        .with_api_group("apps")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("daemonsets", Some(&namespace), &name);
-    let daemonset = state.storage.get(&key).await?;
-
-    Ok(Json(daemonset))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn update(
@@ -115,201 +102,134 @@ pub async fn update(
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
-) -> Result<Json<DaemonSet>> {
-    let mut daemonset: DaemonSet = rusternetes_common::dump::decode_request_body(&body)?;
-    info!("Updating daemonset: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "daemonsets")
-        .with_namespace(&namespace)
-        .with_api_group("apps")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("daemonsets", Some(&namespace), &name),
-        "apps",
-        "daemonsets",
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    daemonset.metadata.name = name.clone();
-    daemonset.metadata.namespace = Some(namespace.clone());
-    if daemonset.type_meta.kind.is_empty() {
-        daemonset.type_meta.kind = "DaemonSet".to_string();
-    }
-    if daemonset.type_meta.api_version.is_empty() {
-        daemonset.type_meta.api_version = "apps/v1".to_string();
-    }
-
-    // Apply K8s defaults (SetDefaults_DaemonSet + SetDefaults_PodSpec + SetDefaults_Container)
-    crate::handlers::defaults::apply_daemonset_defaults(&mut daemonset);
-
-    let key = build_key("daemonsets", Some(&namespace), &name);
-
-    // Load stored object so we can enforce upstream Strategy.PrepareForUpdate
-    // (status reset + selector immutability) and ValidateDaemonSetUpdate.
-    let old_daemonset: DaemonSet = state.storage.get(&key).await?;
-
-    crate::handlers::lifecycle::check_resource_version(
-        old_daemonset.metadata.resource_version.as_deref(),
-        daemonset.metadata.resource_version.as_deref(),
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
-    )?;
-
-    crate::handlers::lifecycle::validate_selector_immutable(
-        &old_daemonset.spec.selector,
-        &daemonset.spec.selector,
-        "DaemonSet",
-    )?;
-
-    // Full spec validation on update (upstream ValidateDaemonSetUpdate re-runs
-    // ValidateDaemonSetSpec on the new object). Only selector immutability was
-    // checked before, so an otherwise-invalid spec slipped through on update.
-    {
-        let errs = rusternetes_common::validation::apps::validate_daemonset(&daemonset);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // Status only mutates via /status; mirror upstream PrepareForUpdate.
-    daemonset.status = old_daemonset.status.clone();
-
-    // Reinstate the server-owned metadata a PUT body may omit (uid,
-    // creationTimestamp, a pending deletion). A locally-built object — what the
-    // dynamic client's Update() sends — carries none of them, and storing the
-    // blanks orphans every child: the ownerReferences[].uid no longer matches a
-    // live owner, so the garbage collector deletes the children (#1605).
-    // Upstream: registry/rest/update.go::BeforeUpdate (lines 123-146).
-    crate::handlers::lifecycle::inherit_server_owned_metadata(
-        &mut daemonset.metadata,
-        &old_daemonset.metadata,
-    );
-
-    // Increment generation if spec changed
-    let old_value = serde_json::to_value(&old_daemonset)
-        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
-    let new_value = serde_json::to_value(&daemonset)
-        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
-    crate::handlers::lifecycle::maybe_increment_generation(
-        &old_value,
-        &new_value,
-        &mut daemonset.metadata,
-    );
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: DaemonSet {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(daemonset));
-    }
-
-    let result = state.storage.update(&key, &daemonset).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete_daemonset(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<DaemonSet>> {
-    info!("Deleting daemonset: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "daemonsets")
-        .with_namespace(&namespace)
-        .with_api_group("apps")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("daemonsets", Some(&namespace), &name);
-
-    // Get the resource to check if it exists
-    let daemonset: DaemonSet = state.storage.get(&key).await?;
-
-    // Run validating admission webhooks for DELETE (object=nil, oldObject=daemonset).
-    crate::handlers::admission_helper::run_delete_validating_webhooks(
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
         &state,
-        "apps",
-        "v1",
-        "DaemonSet",
-        "daemonsets",
+        &scope(&state, None),
+        &auth_ctx.user,
         Some(&namespace),
         &name,
-        &daemonset,
-        &user_for_webhook,
-        is_dry_run,
+        &params,
+        &body,
     )
-    .await?;
-
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: DaemonSet {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(daemonset));
-    }
-
-    let has_finalizers =
-        crate::handlers::finalizers::handle_delete_with_finalizers_and_propagation(
-            &*state.storage,
-            &key,
-            &daemonset,
-            &delete_opts,
-        )
-        .await?;
-
-    if has_finalizers {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: DaemonSet = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    } else {
-        Ok(Json(daemonset))
-    }
+    .await
 }
 
+pub async fn deletecollection_daemonsets(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// GET `/status`: `StatusREST.Get` is the store's `Get` (storage.go:99-101).
+pub async fn get_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
+}
+
+/// PUT `/status`: `StatusREST.Update` (storage.go:104-108).
+pub async fn update_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// PATCH `/status`: a patch into `StatusREST.Update`.
+pub async fn patch_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
+}
 pub async fn list(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -437,93 +357,4 @@ pub async fn list_all_daemonsets(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(patch, DaemonSet, "daemonsets", "apps");
-
-pub async fn deletecollection_daemonsets(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection daemonsets in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "daemonsets")
-        .with_namespace(&namespace)
-        .with_api_group("apps");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: DaemonSet collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all daemonsets in the namespace
-    let prefix = build_prefix("daemonsets", Some(&namespace));
-    let mut items = state.storage.list::<DaemonSet>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("daemonsets", Some(&namespace), &item.metadata.name);
-
-        // Run validating admission webhooks for DELETE per item.
-        crate::handlers::admission_helper::run_delete_validating_webhooks(
-            &state,
-            "apps",
-            "v1",
-            "DaemonSet",
-            "daemonsets",
-            Some(&namespace),
-            &item.metadata.name,
-            &item,
-            &user_for_webhook,
-            false,
-        )
-        .await?;
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} daemonsets deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }

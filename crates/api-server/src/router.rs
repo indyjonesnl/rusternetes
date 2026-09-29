@@ -1321,15 +1321,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/apps/v1/namespaces/:namespace/daemonsets/:name/status",
-            get(handlers::status::get_status)
-                .put(handlers::status::update_status)
-                .patch(handlers::status::update_status),
-        )
-        .route(
-            "/apis/apps/v1/namespaces/:namespace/daemonsets/:name/scale",
-            get(handlers::scale::get_scale)
-                .put(handlers::scale::update_scale)
-                .patch(handlers::scale::patch_scale),
+            get(handlers::daemonset::get_status)
+                .put(handlers::daemonset::update_status)
+                .patch(handlers::daemonset::patch_status),
         )
         // DaemonSets (all namespaces)
         .route(

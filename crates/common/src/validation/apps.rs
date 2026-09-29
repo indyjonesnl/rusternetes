@@ -1263,7 +1263,7 @@ pub fn validate_daemonset(ds: &DaemonSet) -> ErrorList {
 }
 
 /// `ValidateDaemonSetSpec` including its `templateGeneration` check
-/// (validation.go:464). The internal field is the v1 annotation, see
+/// (validation.go:463). The internal field is the v1 annotation, see
 /// [`DaemonSet::template_generation`].
 fn validate_daemonset_spec_with_generation(ds: &DaemonSet) -> ErrorList {
     let spec_path = Path::new("spec");
@@ -1363,7 +1363,7 @@ fn validate_daemonset_status(status: &DaemonSetStatus, fld_path: &Path) -> Error
     errs
 }
 
-/// Upstream `ValidateDaemonSetStatusUpdate` (validation.go:427-438).
+/// Upstream `ValidateDaemonSetStatusUpdate` (validation.go:426-438).
 pub fn validate_daemonset_status_update(new: &DaemonSet, old: &DaemonSet) -> ErrorList {
     let empty = DaemonSetStatus::default();
     let new_status = new.status.as_ref().unwrap_or(&empty);
@@ -2109,13 +2109,12 @@ mod daemonset_update_tests {
             assert!(got.iter().any(|f| f == field), "{field} missing: {got:?}");
         }
 
-        // A decremented collisionCount (validation.go:431-437).
+        // A decremented collisionCount (validation.go:429-435).
         let decremented = status(serde_json::json!({"collisionCount": 1}));
         let errs = validate_daemonset_status_update(&decremented, &old);
         assert!(
-            errs.iter()
-                .any(|e| e.field.to_string() == "status.collisionCount"
-                    && e.to_string().contains("cannot be decremented")),
+            errs.iter().any(|e| e.field == "status.collisionCount"
+                && e.to_string().contains("cannot be decremented")),
             "{errs:?}"
         );
     }
