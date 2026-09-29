@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::quantity::Quantity;
 use crate::resources::policy::{LimitRange, LimitRangeItem};
 use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
 
 /// Parse a `name -> quantity-string` map into `name -> (raw, Quantity)`,
 /// skipping entries whose quantity doesn't parse (those are rejected at
@@ -235,9 +236,16 @@ fn validate_item(item: &LimitRangeItem, fld_path: &Path) -> ErrorList {
     errs
 }
 
-/// Validate a `LimitRange`. Mirrors upstream `ValidateLimitRange`.
+/// Upstream `ValidateLimitRange` (`pkg/apis/core/validation/validation.go:7514`).
+/// `ValidateLimitRangeName` is `NameIsDNSSubdomain`. The registry uses it for
+/// both create and update (`pkg/registry/core/limitrange/strategy.go`).
 pub fn validate_limit_range(lr: &LimitRange) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
+    let mut errs = validate_object_meta(
+        &lr.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
     let fld_path = Path::new("spec").child("limits");
     let mut seen_types: HashSet<&str> = HashSet::new();
     for (i, item) in lr.spec.limits.iter().enumerate() {

@@ -186,6 +186,7 @@ mod pod_update_immutability_test;
 mod pod_volume_source_validation_test;
 mod poddisruptionbudget_handler_test;
 mod podstatus_lifecycle_test;
+mod podtemplate_limitrange_generic_store_test;
 mod podtemplate_update_validation_test;
 mod policy_decode_when_absent_test;
 mod priorityclass_handler_test;

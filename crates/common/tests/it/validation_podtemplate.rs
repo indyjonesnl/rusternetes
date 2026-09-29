@@ -26,6 +26,7 @@ fn pt(containers: Vec<Container>) -> PodTemplate {
         },
     };
     p.metadata.name = "pt-1".to_string();
+    p.metadata.namespace = Some("default".to_string());
     p
 }
 
