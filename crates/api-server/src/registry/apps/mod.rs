@@ -3,3 +3,4 @@
 
 pub mod deployment;
 pub mod replicaset;
+pub mod statefulset;

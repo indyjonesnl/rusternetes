@@ -22,7 +22,7 @@ use crate::resources::deployment::{
 use crate::resources::policy::IntOrString;
 use crate::resources::workloads::{
     DaemonSet, DaemonSetSpec, ReplicaSet, ReplicaSetSpec, ReplicaSetStatus, StatefulSet,
-    StatefulSetSpec,
+    StatefulSetSpec, StatefulSetStatus,
 };
 use crate::types::LabelSelector;
 use crate::validation::field::{BadValue, Error, ErrorList, Path};
@@ -30,7 +30,7 @@ use crate::validation::metav1::{
     is_dns1123_label, validate_label_selector, LabelSelectorValidationOptions,
 };
 use crate::validation::objectmeta::{
-    name_is_dns_subdomain, validate_immutable_field, validate_nonnegative_field,
+    name_is_dns_label, name_is_dns_subdomain, validate_immutable_field, validate_nonnegative_field,
     validate_object_meta, validate_object_meta_update,
 };
 use crate::validation::podtemplate::validate_pod_template_spec;
@@ -790,7 +790,24 @@ pub fn validate_replicaset_status(status: &ReplicaSetStatus, fld_path: &Path) ->
 /// defaulting (the api-server defaults `podManagementPolicy` and
 /// `updateStrategy`), so the "required when empty" arms match upstream without
 /// rejecting objects that merely relied on defaulting.
-fn validate_statefulset_spec(spec: &StatefulSetSpec, fld_path: &Path) -> ErrorList {
+/// Upstream `StatefulSetValidationOptions` (validation.go:38-45).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatefulSetValidationOptions {
+    /// Allow an invalid DNS-1123 `serviceName`.
+    pub allow_invalid_service_name: bool,
+    /// Skip validating the pod template spec (StatefulSet update).
+    pub skip_validate_pod_template_spec: bool,
+    /// Skip validating the volume claim templates (StatefulSet update).
+    /// `validateVolumeClaimTemplates` is not ported yet (#2000), so nothing
+    /// reads this; it is kept so the update path sets what upstream sets.
+    pub skip_validate_volume_claim_templates: bool,
+}
+
+fn validate_statefulset_spec(
+    spec: &StatefulSetSpec,
+    fld_path: &Path,
+    set_opts: StatefulSetValidationOptions,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     // podManagementPolicy: OrderedReady | Parallel.
@@ -875,8 +892,8 @@ fn validate_statefulset_spec(spec: &StatefulSetSpec, fld_path: &Path) -> ErrorLi
         }
     }
 
-    // serviceName, when set, must be a DNS-1123 label.
-    if !spec.service_name.is_empty() {
+    // serviceName, when set, must be a DNS-1123 label (validation.go:175-177).
+    if !set_opts.allow_invalid_service_name && !spec.service_name.is_empty() {
         for msg in is_dns1123_label(&spec.service_name) {
             errs.push(Error::invalid(
                 &fld_path.child("serviceName"),
@@ -931,19 +948,109 @@ fn validate_statefulset_spec(spec: &StatefulSetSpec, fld_path: &Path) -> ErrorLi
     // `ValidateStatefulSetSpec` calls `ValidatePodTemplateSpec` on it
     // (`pkg/apis/apps/validation/validation.go:214 via ValidatePodTemplateSpecForStatefulSet`), which is what makes
     // `spec.template.spec.containers: Required value` — not a decoder error —
-    // the answer to a workload with no containers (#1939).
-    errs.extend(validate_pod_template_spec(
-        &spec.template,
-        &fld_path.child("template"),
-        false,
+    // the answer to a workload with no containers (#1939). An update skips
+    // it when the stored object's own spec is already invalid (:71-73).
+    if !set_opts.skip_validate_pod_template_spec {
+        errs.extend(validate_pod_template_spec(
+            &spec.template,
+            &fld_path.child("template"),
+            false,
+        ));
+    }
+    errs
+}
+
+/// Validate a new `StatefulSet`: upstream `ValidateStatefulSet`
+/// (validation.go:228-235), whose `ValidateStatefulSetName` is
+/// `NameIsDNSLabel` (:50-55). Run after defaulting (see
+/// [`validate_statefulset_spec`]).
+pub fn validate_statefulset(ss: &StatefulSet) -> ErrorList {
+    let mut errs = validate_object_meta(
+        &ss.metadata,
+        true,
+        name_is_dns_label,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_statefulset_spec(
+        &ss.spec,
+        &Path::new("spec"),
+        StatefulSetValidationOptions::default(),
     ));
     errs
 }
 
-/// Validate a new `StatefulSet`. Mirrors upstream `ValidateStatefulSet`.
-/// Run after defaulting (see [`validate_statefulset_spec`]).
-pub fn validate_statefulset(ss: &StatefulSet) -> ErrorList {
-    validate_statefulset_spec(&ss.spec, &Path::new("spec"))
+/// Upstream `ValidateStatefulSetStatus` (validation.go:275-307).
+pub fn validate_statefulset_status(status: &StatefulSetStatus, fld_path: &Path) -> ErrorList {
+    let replicas = status.replicas;
+    let ready = status.ready_replicas.unwrap_or(0);
+    let current = status.current_replicas.unwrap_or(0);
+    let updated = status.updated_replicas.unwrap_or(0);
+    let available = status.available_replicas.unwrap_or(0);
+
+    let mut errs = validate_nonnegative_field(i64::from(replicas), &fld_path.child("replicas"));
+    for (value, name) in [
+        (ready, "readyReplicas"),
+        (current, "currentReplicas"),
+        (updated, "updatedReplicas"),
+        (available, "availableReplicas"),
+    ] {
+        errs.extend(validate_nonnegative_field(
+            i64::from(value),
+            &fld_path.child(name),
+        ));
+    }
+    if let Some(generation) = status.observed_generation {
+        errs.extend(validate_nonnegative_field(
+            generation,
+            &fld_path.child("observedGeneration"),
+        ));
+    }
+    if let Some(collisions) = status.collision_count {
+        errs.extend(validate_nonnegative_field(
+            i64::from(collisions),
+            &fld_path.child("collisionCount"),
+        ));
+    }
+    let msg = "cannot be greater than status.replicas";
+    for (value, name) in [
+        (ready, "readyReplicas"),
+        (current, "currentReplicas"),
+        (updated, "updatedReplicas"),
+        (available, "availableReplicas"),
+    ] {
+        if value > replicas {
+            errs.push(Error::invalid(&fld_path.child(name), value, msg));
+        }
+    }
+    if available > ready {
+        errs.push(Error::invalid(
+            &fld_path.child("availableReplicas"),
+            available,
+            "cannot be greater than status.readyReplicas",
+        ));
+    }
+    errs
+}
+
+/// Upstream `ValidateStatefulSetStatusUpdate` (validation.go:310-322).
+pub fn validate_statefulset_status_update(new: &StatefulSet, old: &StatefulSet) -> ErrorList {
+    let empty = StatefulSetStatus::default();
+    let new_status = new.status.as_ref().unwrap_or(&empty);
+    let old_status = old.status.as_ref().unwrap_or(&empty);
+    let mut errs = validate_statefulset_status(new_status, &Path::new("status"));
+    errs.extend(validate_object_meta_update(
+        &new.metadata,
+        &old.metadata,
+        &Path::new("metadata"),
+    ));
+    if is_decremented(new_status.collision_count, old_status.collision_count) {
+        errs.push(Error::invalid(
+            &Path::new("status").child("collisionCount"),
+            new_status.collision_count.unwrap_or(0),
+            "cannot be decremented",
+        ));
+    }
+    errs
 }
 
 /// Validate a `DaemonSetSpec`. Mirrors upstream `ValidateDaemonSetSpec`
@@ -1121,28 +1228,38 @@ pub fn validate_deployment_update(new: &Deployment, old: &Deployment) -> ErrorLi
     errs
 }
 
-/// Validate a `StatefulSet` update — the immutability rule from upstream
-/// `ValidateStatefulSetUpdate`. All spec fields except `replicas`, `ordinals`,
-/// `template`, `updateStrategy`, `revisionHistoryLimit`,
-/// `persistentVolumeClaimRetentionPolicy` and `minReadySeconds` are immutable.
-///
-/// Here we check the immutable fields explicitly (`serviceName`,
-/// `podManagementPolicy`, `volumeClaimTemplates`) rather than a whole-spec
-/// deep-equal, so legitimate mutations to the allowed fields never false-trip.
-/// `selector` immutability is enforced by the handler's
-/// `validate_selector_immutable` call.
+/// Upstream `ValidateStatefulSetUpdate` (validation.go:238-272): the
+/// metadata update, the new spec (tolerating an invalid `serviceName` and, if
+/// the stored spec is itself invalid, the pod template), and a `Forbidden`
+/// for any change outside the mutable fields — decided by clearing those
+/// fields and comparing with `Semantic.DeepEqual`.
 pub fn validate_statefulset_update(new: &StatefulSet, old: &StatefulSet) -> ErrorList {
-    // Upstream `ValidateStatefulSetUpdate` first re-validates the whole new spec
-    // via `ValidateStatefulSetSpec` (it deliberately skips `ValidateStatefulSet`
-    // only to avoid revalidating the immutable name). `validate_statefulset` here
-    // already validates the spec alone (no name check), so we reuse it to catch
-    // updates that would otherwise introduce an invalid selector/template/replicas.
-    let mut errs: ErrorList = validate_statefulset(new);
-    let immutable_changed = new.spec.service_name != old.spec.service_name
-        || new.spec.pod_management_policy != old.spec.pod_management_policy
-        || serde_json::to_value(&new.spec.volume_claim_templates).ok()
-            != serde_json::to_value(&old.spec.volume_claim_templates).ok();
-    if immutable_changed {
+    let mut errs =
+        validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
+    let mut set_opts = StatefulSetValidationOptions {
+        allow_invalid_service_name: true,
+        skip_validate_volume_claim_templates: true,
+        ..StatefulSetValidationOptions::default()
+    };
+    if !validate_statefulset_spec(&old.spec, &Path::new("spec"), set_opts).is_empty() {
+        set_opts.skip_validate_pod_template_spec = true;
+    }
+    errs.extend(validate_statefulset_spec(
+        &new.spec,
+        &Path::new("spec"),
+        set_opts,
+    ));
+
+    let mut clone = new.spec.clone();
+    clone.replicas = old.spec.replicas;
+    clone.template = old.spec.template.clone();
+    clone.update_strategy = old.spec.update_strategy.clone();
+    clone.min_ready_seconds = old.spec.min_ready_seconds;
+    clone.ordinals = old.spec.ordinals.clone();
+    clone.revision_history_limit = old.spec.revision_history_limit;
+    clone.persistent_volume_claim_retention_policy =
+        old.spec.persistent_volume_claim_retention_policy.clone();
+    if !crate::equality::semantic_equal(&clone, &old.spec) {
         errs.push(Error::forbidden(
             &Path::new("spec"),
             "updates to statefulset spec for fields other than 'replicas', 'ordinals', 'template', 'updateStrategy', 'revisionHistoryLimit', 'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden",
@@ -1357,7 +1474,7 @@ mod workload_parity_tests {
 
     fn base_statefulset(template: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
-            "metadata": {"name": "s"},
+            "metadata": {"name": "s", "namespace": "default"},
             "spec": {
                 "serviceName": "svc",
                 "selector": matching_selector(),
@@ -1405,7 +1522,7 @@ mod workload_parity_tests {
     #[test]
     fn statefulset_empty_selector_wording() {
         let s = statefulset(serde_json::json!({
-            "metadata": {"name": "s"},
+            "metadata": {"name": "s", "namespace": "default"},
             "spec": {
                 "serviceName": "svc",
                 "selector": {},
