@@ -1,25 +1,37 @@
 use anyhow::{Context, Result};
 use rusternetes_common::resources::service_account::ObjectReference;
+use rusternetes_common::resources::volume::PersistentVolumeClaimPhase;
 use rusternetes_common::resources::volume::VolumeSnapshotContentSource;
 use rusternetes_common::resources::{
-    DeletionPolicy, PersistentVolumeClaim, VolumeSnapshot, VolumeSnapshotClass,
-    VolumeSnapshotContent, VolumeSnapshotContentSpec, VolumeSnapshotContentStatus,
-    VolumeSnapshotStatus,
+    DeletionPolicy, EventSource, EventType, PersistentVolume, PersistentVolumeClaim,
+    VolumeSnapshot, VolumeSnapshotClass, VolumeSnapshotContent, VolumeSnapshotContentSpec,
+    VolumeSnapshotContentStatus, VolumeSnapshotStatus,
 };
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+use rusternetes_storage::{
+    build_key, build_prefix, extract_key, EventRecorder, Storage, WorkQueue,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
+/// `IsDefaultSnapshotClassAnnotation` (external-snapshotter
+/// `pkg/utils/util.go:94`).
+const IS_DEFAULT_SNAPSHOT_CLASS_ANNOTATION: &str =
+    "snapshot.storage.kubernetes.io/is-default-class";
+
 pub struct VolumeSnapshotController<S: Storage> {
     storage: Arc<S>,
+    recorder: EventRecorder<S>,
 }
 
 impl<S: Storage + 'static> VolumeSnapshotController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            recorder: EventRecorder::new(Arc::clone(&storage)),
+            storage,
+        }
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -175,19 +187,31 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
         debug!("Processing VolumeSnapshot {}/{}", namespace, vs_name);
 
         // Get the VolumeSnapshotClass. `volumeSnapshotClassName` is optional in
-        // the external-snapshotter CRD — nil means "use the default
-        // VolumeSnapshotClass for this driver", which needs the source PVC's
-        // provisioner to pick one and is not implemented here (tracked
-        // separately). Until it is, a snapshot with no class named cannot be
-        // provisioned, and saying so beats looking up a class named "".
-        let Some(vsc_name) = vs.spec.volume_snapshot_class_name.as_deref() else {
-            warn!(
-                "VolumeSnapshot {}/{} names no volumeSnapshotClassName and default-class \
-                 selection is not implemented; skipping",
-                namespace, vs_name
-            );
-            return Ok(());
+        // the external-snapshotter CRD: nil means "use the default
+        // VolumeSnapshotClass for this driver", which `SetDefaultSnapshotClass`
+        // resolves from the source PVC's PV
+        // (`pkg/common-controller/snapshot_controller.go:1466-1526`).
+        // `checkAndUpdateSnapshotClass`
+        // (`pkg/common-controller/snapshot_controller_base.go:503-521`) is the
+        // caller: it emits a `SetDefaultSnapshotClassFailed` warning and gives
+        // up on this pass when the lookup fails (#2027).
+        let vsc_name = match vs.spec.volume_snapshot_class_name.as_deref() {
+            Some(name) => name.to_string(),
+            None => match self.set_default_snapshot_class(vs).await {
+                Ok(Some(name)) => name,
+                // Pre-provisioned: the content names its own driver, so there
+                // is no class to find and nothing for this path to do.
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    let message = format!("Failed to set default snapshot class with error {e}");
+                    warn!("VolumeSnapshot {}/{}: {}", namespace, vs_name, message);
+                    self.emit(vs, "SetDefaultSnapshotClassFailed", &message)
+                        .await;
+                    return Err(e);
+                }
+            },
         };
+        let vsc_name = vsc_name.as_str();
         let vsc_key = build_key("volumesnapshotclasses", None, vsc_name);
         let vsc: VolumeSnapshotClass = self
             .storage
@@ -270,6 +294,178 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
         self.update_snapshot_status(vs, &content_name, true).await?;
 
         Ok(())
+    }
+
+    /// `SetDefaultSnapshotClass` (external-snapshotter
+    /// `pkg/common-controller/snapshot_controller.go:1466-1526`).
+    ///
+    /// ```go
+    /// for _, class := range list {
+    ///     if utils.IsVolumeSnapshotClassDefaultAnnotation(class.ObjectMeta) && pvDriver == class.Driver {
+    ///         defaultClasses = append(defaultClasses, class)
+    ///     }
+    /// }
+    /// if len(defaultClasses) == 0 {
+    ///     return nil, snapshot, fmt.Errorf("cannot find default snapshot class")
+    /// }
+    /// if len(defaultClasses) > 1 {
+    ///     return nil, snapshot, fmt.Errorf("%d default snapshot classes were found", len(defaultClasses))
+    /// }
+    /// ```
+    ///
+    /// "Default" is per **CSI driver**, not per cluster, which is why the
+    /// driver has to be resolved from the source PVC's PV first: a cluster may
+    /// carry one default class per driver and they do not conflict.
+    ///
+    /// Upstream then patches `/spec/volumeSnapshotClassName` onto the snapshot,
+    /// so the choice is recorded on the object rather than recomputed every
+    /// pass; this does the same. `Ok(None)` is upstream's pre-provisioned
+    /// no-op.
+    ///
+    /// Not ported: the `IsVolumeGroupSnapshotMember` short-circuit (`:1475`) —
+    /// Rusternetes has no VolumeGroupSnapshot.
+    async fn set_default_snapshot_class(&self, vs: &VolumeSnapshot) -> Result<Option<String>> {
+        if vs.spec.source.volume_snapshot_content_name.is_some() {
+            return Ok(None);
+        }
+
+        let pv_driver = self.pv_driver_from_snapshot(vs).await?;
+
+        let classes: Vec<VolumeSnapshotClass> = self
+            .storage
+            .list(&build_prefix("volumesnapshotclasses", None))
+            .await
+            .context("failed to list VolumeSnapshotClasses")?;
+
+        let defaults: Vec<&VolumeSnapshotClass> = classes
+            .iter()
+            .filter(|class| {
+                class
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(IS_DEFAULT_SNAPSHOT_CLASS_ANNOTATION))
+                    .map(String::as_str)
+                    == Some("true")
+                    && class.driver == pv_driver
+            })
+            .collect();
+
+        match defaults.len() {
+            0 => anyhow::bail!("cannot find default snapshot class"),
+            1 => {}
+            n => anyhow::bail!("{n} default snapshot classes were found"),
+        }
+        let chosen = defaults[0].metadata.name.clone();
+
+        // Upstream's `PatchVolumeSnapshot` with a single `replace` op on
+        // `/spec/volumeSnapshotClassName` (`:1517-1524`).
+        let namespace = vs.metadata.namespace.as_deref().unwrap_or("default");
+        let key = build_key("volumesnapshots", Some(namespace), &vs.metadata.name);
+        let mut patched = vs.clone();
+        patched.spec.volume_snapshot_class_name = Some(chosen.clone());
+        self.storage
+            .update(&key, &patched)
+            .await
+            .with_context(|| format!("failed to record default class on {key}"))?;
+
+        info!(
+            "VolumeSnapshot {}/{}: default VolumeSnapshotClass {} selected for driver {}",
+            namespace, vs.metadata.name, chosen, pv_driver
+        );
+        Ok(Some(chosen))
+    }
+
+    /// `pvDriverFromSnapshot` (`snapshot_controller.go:1394-1408`) together with
+    /// `getVolumeFromVolumeSnapshot` (`:1350-1376`) and
+    /// `getClaimFromVolumeSnapshot` (`:1528-1545`), which it is only ever called
+    /// through. Every error string is upstream's: they reach the user in the
+    /// `SetDefaultSnapshotClassFailed` event.
+    async fn pv_driver_from_snapshot(&self, vs: &VolumeSnapshot) -> Result<String> {
+        let namespace = vs.metadata.namespace.as_deref().unwrap_or("default");
+        let vs_name = &vs.metadata.name;
+
+        let Some(pvc_name) = vs.spec.source.persistent_volume_claim_name.as_deref() else {
+            anyhow::bail!("the snapshot source PVC name is not specified");
+        };
+        if pvc_name.is_empty() {
+            anyhow::bail!("the PVC name is not specified in snapshot {namespace}/{vs_name}");
+        }
+
+        let pvc: PersistentVolumeClaim = self
+            .storage
+            .get(&build_key(
+                "persistentvolumeclaims",
+                Some(namespace),
+                pvc_name,
+            ))
+            .await
+            .with_context(|| format!("failed to retrieve PVC {namespace}/{pvc_name}"))?;
+
+        // `getVolumeFromVolumeSnapshot`: the PVC must be Bound before its PV
+        // can be read (`:1356-1358`).
+        if pvc.status.as_ref().map(|s| s.phase.clone()) != Some(PersistentVolumeClaimPhase::Bound) {
+            anyhow::bail!(
+                "the PVC {pvc_name} is not yet bound to a PV, will not attempt to take a snapshot"
+            );
+        }
+        let pv_name = pvc.spec.volume_name.as_deref().unwrap_or("");
+        let pv: PersistentVolume = self
+            .storage
+            .get(&build_key("persistentvolumes", None, pv_name))
+            .await
+            .with_context(|| format!("failed to retrieve PV {pv_name} from the API server"))?;
+
+        // `isVolumeBoundToClaim` (`:1381-1392`): the binding must hold in both
+        // directions, or the snapshot would be taken of someone else's volume.
+        let claim_ref = pv.spec.claim_ref.as_ref();
+        let bound = claim_ref.is_some_and(|r| {
+            r.name.as_deref() == Some(pvc.metadata.name.as_str())
+                && r.namespace.as_deref() == Some(namespace)
+                && r.uid
+                    .as_deref()
+                    .is_none_or(|uid| uid.is_empty() || uid == pvc.metadata.uid)
+        });
+        if !bound {
+            warn!(
+                "binding between PV {} and PVC {} is broken",
+                pv_name, pvc.metadata.name
+            );
+            anyhow::bail!("claim in dataSource not bound or invalid");
+        }
+
+        // "supports ONLY CSI volumes" (`:1403-1406`).
+        let Some(csi) = pv.spec.csi.as_ref() else {
+            anyhow::bail!(
+                "snapshotting non-CSI volumes is not supported, snapshot:{namespace}/{vs_name}"
+            );
+        };
+        Ok(csi.driver.clone())
+    }
+
+    /// `updateSnapshotErrorStatusWithEvent`'s event half
+    /// (`snapshot_controller_base.go:518`). A failure to record the event is
+    /// logged and dropped: it must not mask the error it describes.
+    async fn emit(&self, vs: &VolumeSnapshot, reason: &str, message: &str) {
+        let involved = ObjectReference {
+            kind: Some("VolumeSnapshot".to_string()),
+            namespace: vs.metadata.namespace.clone(),
+            name: Some(vs.metadata.name.clone()),
+            uid: Some(vs.metadata.uid.clone()),
+            api_version: Some("snapshot.storage.k8s.io/v1".to_string()),
+            ..Default::default()
+        };
+        let source = EventSource {
+            component: "snapshot-controller".to_string(),
+            host: None,
+        };
+        if let Err(e) = self
+            .recorder
+            .event(&involved, &source, EventType::Warning, reason, message)
+            .await
+        {
+            warn!("failed to record {reason} event: {e}");
+        }
     }
 
     fn is_driver_supported(&self, driver: &str) -> bool {
