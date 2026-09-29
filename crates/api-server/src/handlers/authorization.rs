@@ -40,10 +40,7 @@ pub async fn create_subject_access_review(
     // `Error::Internal` -- a 500 -- for the "neither set" one (#1938).
     {
         let errs =
-            rusternetes_common::validation::authorization::validate_subject_access_review_spec(
-                &sar.spec,
-                &rusternetes_common::validation::field::Path::new("spec"),
-            );
+            rusternetes_common::validation::authorization::validate_subject_access_review(&sar);
         if !errs.is_empty() {
             return Err(rusternetes_common::Error::Invalid(errs));
         }
@@ -143,9 +140,8 @@ pub async fn create_self_subject_access_review(
     // caller, so there is no subject to name (#1938).
     {
         let errs =
-            rusternetes_common::validation::authorization::validate_self_subject_access_review_spec(
-                &ssar.spec,
-                &rusternetes_common::validation::field::Path::new("spec"),
+            rusternetes_common::validation::authorization::validate_self_subject_access_review(
+                &ssar,
             );
         if !errs.is_empty() {
             return Err(rusternetes_common::Error::Invalid(errs));
@@ -229,10 +225,22 @@ pub async fn create_local_subject_access_review(
     // scoped: without it this handler answered a question about a *different*
     // namespace than the path, silently rewriting it to the path namespace and
     // reporting `allowed` for a check the client never asked for (#1938).
+    // Upstream's create handler runs
+    // `EnsureObjectNamespaceMatchesRequestNamespace`
+    // (`staging/src/k8s.io/apiserver/pkg/registry/rest/meta.go:47-68`, called
+    // from `endpoints/handlers/create.go:175`) before the registry sees the
+    // object: an absent `metadata.namespace` is defaulted from the path, and
+    // one that contradicts the path is a 400. The validator's `must be empty
+    // except for namespace` rule reads the result, so this has to run first.
+    crate::registry::rest::ensure_object_namespace_matches_request_namespace(
+        Some(&namespace),
+        &mut lsar.metadata,
+    )?;
+
     {
         let errs =
             rusternetes_common::validation::authorization::validate_local_subject_access_review(
-                &lsar.spec, &namespace,
+                &lsar, &namespace,
             );
         if !errs.is_empty() {
             return Err(rusternetes_common::Error::Invalid(errs));

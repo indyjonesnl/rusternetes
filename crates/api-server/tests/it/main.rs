@@ -211,6 +211,7 @@ mod runtimeclass_handler_test;
 mod runtimeclass_router_test;
 mod runtimeclass_servicecidr_update_test;
 mod sar_both_attributes_test;
+mod sar_metadata_must_be_empty_test;
 mod scale_nonnegative_replicas_test;
 mod secret_consumption_test;
 mod secret_handler_test;

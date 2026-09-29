@@ -10,18 +10,22 @@
 //! terminal 422 naming the field, not the 500 the handlers used to raise for
 //! the same input (#1938).
 //!
-//! **Not ported: the `metadata` must-be-empty rule** (`validation.go:65-71`,
-//! `:78-84`, `:92-97`). Upstream compares the whole `ObjectMeta` against the
-//! zero value (with `ManagedFields` cleared) and faults any non-empty field;
-//! the local review exempts `namespace`. Our handlers stamp metadata before
-//! this point, so the check needs the write path reordered first, and it is a
-//! wider behavioural change than the status-code fix this module is for.
+//! The `metadata` must-be-empty rule (`validation.go:65-71`, `:78-84`,
+//! `:92-97`) is ported here too. A review is a virtual object:
+//! `subjectaccessreview.REST.Create`
+//! (`pkg/registry/authorization/subjectaccessreview/rest.go:63-96`) never calls
+//! `rest.BeforeCreate`, so nothing mints a uid or a creation timestamp and the
+//! validator sees exactly what the client sent (#1944).
 
 use crate::resources::authorization::{
     FieldSelectorAttributes, FieldSelectorRequirement, LabelSelectorAttributes,
     LabelSelectorRequirement, ResourceAttributes,
 };
-use crate::resources::{SelfSubjectAccessReviewSpec, SubjectAccessReviewSpec};
+use crate::resources::{
+    LocalSubjectAccessReview, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
+    SubjectAccessReview, SubjectAccessReviewSpec,
+};
+use crate::types::ObjectMeta;
 use crate::validation::field::{BadValue, Error, ErrorList, Path};
 use crate::validation::metav1::{
     validate_label_selector_requirement, LabelSelectorValidationOptions,
@@ -131,10 +135,26 @@ pub fn validate_self_subject_access_review_spec(
 /// was posted to. Without it a caller can post to a namespace they may read and
 /// have the server answer about a different one.
 pub fn validate_local_subject_access_review(
-    spec: &SubjectAccessReviewSpec,
+    review: &LocalSubjectAccessReview,
     namespace: &str,
 ) -> ErrorList {
+    let spec = &review.spec;
     let mut errs = validate_subject_access_review_spec(spec, &Path::new("spec"));
+
+    // Upstream clears `Namespace` as well as `ManagedFields` before comparing,
+    // and says so in the message: by the time the registry runs,
+    // `EnsureObjectNamespaceMatchesRequestNamespace`
+    // (`staging/src/k8s.io/apiserver/pkg/registry/rest/meta.go:47-68`) has
+    // already defaulted `metadata.namespace` from the request path.
+    let mut meta = review.metadata.clone();
+    meta.namespace = None;
+    if let Some(err) = metadata_must_be_empty(
+        &meta,
+        &review.metadata,
+        "must be empty except for namespace",
+    ) {
+        errs.push(err);
+    }
 
     if let Some(resource_attributes) = &spec.resource_attributes {
         let spec_namespace = resource_attributes.namespace.as_deref().unwrap_or("");
@@ -154,6 +174,55 @@ pub fn validate_local_subject_access_review(
         ));
     }
 
+    errs
+}
+
+/// The shared half of the three `metadata` rules (`validation.go:65-71`,
+/// `:78-84`, `:92-97`):
+///
+/// ```go
+/// objectMetaShallowCopy := sar.ObjectMeta
+/// objectMetaShallowCopy.ManagedFields = nil
+/// if !apiequality.Semantic.DeepEqual(metav1.ObjectMeta{}, objectMetaShallowCopy) {
+///     allErrs = append(allErrs, field.Invalid(field.NewPath("metadata"), sar.ObjectMeta, `must be empty`))
+/// }
+/// ```
+///
+/// `compared` is the shallow copy the caller has already blanked the exempt
+/// fields on; `reported` is the untouched metadata, which is what upstream puts
+/// in the error as the offending value.
+fn metadata_must_be_empty(
+    compared: &ObjectMeta,
+    reported: &ObjectMeta,
+    detail: &str,
+) -> Option<Error> {
+    let mut compared = compared.clone();
+    compared.managed_fields = None;
+    if compared == ObjectMeta::default() {
+        return None;
+    }
+    Some(Error::invalid(
+        &Path::new("metadata"),
+        BadValue::Json(serde_json::to_value(reported).unwrap_or_default()),
+        detail,
+    ))
+}
+
+/// `ValidateSubjectAccessReview` (`validation.go:63-72`).
+pub fn validate_subject_access_review(review: &SubjectAccessReview) -> ErrorList {
+    let mut errs = validate_subject_access_review_spec(&review.spec, &Path::new("spec"));
+    if let Some(err) = metadata_must_be_empty(&review.metadata, &review.metadata, "must be empty") {
+        errs.push(err);
+    }
+    errs
+}
+
+/// `ValidateSelfSubjectAccessReview` (`validation.go:74-82`).
+pub fn validate_self_subject_access_review(review: &SelfSubjectAccessReview) -> ErrorList {
+    let mut errs = validate_self_subject_access_review_spec(&review.spec, &Path::new("spec"));
+    if let Some(err) = metadata_must_be_empty(&review.metadata, &review.metadata, "must be empty") {
+        errs.push(err);
+    }
     errs
 }
 
