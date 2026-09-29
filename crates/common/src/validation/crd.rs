@@ -5,14 +5,13 @@
 //! Scope: the structural half of `validateCustomResourceDefinitionSpec`
 //! (`:353`) — group, scope, the version set (unique DNS-1035 names, exactly one
 //! storage version), `ValidateCustomResourceDefinitionNames` (`:785`),
-//! `ValidateCustomResourceColumnDefinition` (`:821`), the `jsonPath`-required
-//! half of `ValidateCustomResourceSelectableFields` (`:856`),
+//! `ValidateCustomResourceColumnDefinition` (`:821`),
+//! `ValidateCustomResourceSelectableFields` (`:847`),
 //! `ValidateCustomResourceDefinitionSubresources` (`:1525`) and
 //! `validateCustomResourceConversion` (`:612`).
 //!
 //! Out of scope here: the structural-schema and CEL rule checks, which
-//! `handlers::cel_validation` already runs, and `ValidFieldPath` resolution of
-//! a selectable field against that schema (it needs the structural schema).
+//! `handlers::cel_validation` already runs.
 //!
 //! Field paths follow upstream, which validates the *internal* type after
 //! converting from `v1` — so a conversion error is reported under
@@ -24,7 +23,7 @@
 use crate::resources::{
     ConversionStrategyType, CustomResourceColumnDefinition, CustomResourceDefinition,
     CustomResourceDefinitionNames, CustomResourceDefinitionSpec, CustomResourceSubresources,
-    ResourceScope,
+    JSONSchemaProps, JSONSchemaPropsOrBool, ResourceScope, SelectableField,
 };
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1035_label, is_dns1123_subdomain};
@@ -44,6 +43,8 @@ const COLUMN_FORMATS: &[&str] = &[
     "int64",
     "password",
 ];
+/// `MaxSelectableFields` (`validation.go:63`).
+const MAX_SELECTABLE_FIELDS: usize = 8;
 /// `acceptedConversionReviewVersions` (`validation.go:560`).
 const ACCEPTED_CONVERSION_REVIEW_VERSIONS: &[&str] = &["v1", "v1beta1"];
 
@@ -67,6 +68,245 @@ pub fn set_defaults_custom_resource_definition(crd: &mut CustomResourceDefinitio
             webhook: None,
         });
     }
+}
+
+/// `validateCustomResourceDefinitionSpecUpdate` (`validation.go:648-664`), the
+/// immutability half — the spec half is
+/// [`validate_custom_resource_definition_spec`], which the caller runs.
+///
+/// ```go
+/// if opts.requireImmutableNames {
+///     allErrs = append(allErrs, genericvalidation.ValidateImmutableField(spec.Scope, oldSpec.Scope, fldPath.Child("scope"))...)
+///     allErrs = append(allErrs, genericvalidation.ValidateImmutableField(spec.Names.Kind, oldSpec.Names.Kind, fldPath.Child("names", "kind"))...)
+/// }
+/// allErrs = append(allErrs, genericvalidation.ValidateImmutableField(spec.Group, oldSpec.Group, fldPath.Child("group"))...)
+/// allErrs = append(allErrs, genericvalidation.ValidateImmutableField(spec.Names.Plural, oldSpec.Names.Plural, fldPath.Child("names", "plural"))...)
+/// ```
+///
+/// `require_immutable_names` is `IsCRDConditionTrue(oldObj, Established)`
+/// (`validation.go:234`): only a CRD the apiserver has already established is
+/// held to its `scope` and `names.kind`, because those are what the storage
+/// layout was built from.
+pub fn validate_custom_resource_definition_spec_update(
+    spec: &CustomResourceDefinitionSpec,
+    old_spec: &CustomResourceDefinitionSpec,
+    require_immutable_names: bool,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    if require_immutable_names {
+        if spec.scope != old_spec.scope {
+            errs.push(immutable(&fld_path.child("scope"), &spec.scope));
+        }
+        if spec.names.kind != old_spec.names.kind {
+            errs.push(immutable(
+                &fld_path.child("names").child("kind"),
+                &spec.names.kind,
+            ));
+        }
+    }
+    if spec.group != old_spec.group {
+        errs.push(immutable(&fld_path.child("group"), &spec.group));
+    }
+    if spec.names.plural != old_spec.names.plural {
+        errs.push(immutable(
+            &fld_path.child("names").child("plural"),
+            &spec.names.plural,
+        ));
+    }
+
+    errs
+}
+
+/// `ValidateImmutableField`
+/// (`staging/src/k8s.io/apimachinery/pkg/api/validation/objectmeta.go`): the
+/// message is always `field is immutable`.
+fn immutable<T: serde::Serialize>(path: &Path, value: &T) -> Error {
+    Error::invalid(
+        path,
+        crate::validation::field::BadValue::Json(serde_json::to_value(value).unwrap_or_default()),
+        "field is immutable",
+    )
+}
+
+/// `ValidateCustomResourceSelectableFields` (`validation.go:847-878`).
+///
+/// Upstream resolves each `jsonPath` against the version's **structural**
+/// schema with `cel.ValidFieldPath(..., WithFieldPathAllowArrayNotation(false))`
+/// and then checks three things the required-and-unique half cannot: that the
+/// path exists, that it does not point into `metadata`, and that its leaf is a
+/// scalar. Uniqueness is on the *resolved* path, so two spellings of the same
+/// field collide.
+///
+/// Deviation, stated deliberately: Rusternetes has no structural-schema
+/// builder, so the path is resolved against the declared `properties` /
+/// `additionalProperties` of the OpenAPI schema as written. A field reachable
+/// only through `allOf`/`anyOf`/`oneOf` — which a structural schema would have
+/// flattened — is reported as invalid here. The rest of the contract, including
+/// every message, is upstream's.
+pub fn validate_custom_resource_selectable_fields(
+    selectable_fields: &[SelectableField],
+    schema: Option<&JSONSchemaProps>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let mut unique: HashSet<String> = HashSet::new();
+
+    for (i, selectable) in selectable_fields.iter().enumerate() {
+        let index_path = fld_path.index(i);
+        let sp = index_path.child("jsonPath");
+        if selectable.json_path.is_empty() {
+            errs.push(Error::required(&sp, ""));
+            continue;
+        }
+        // Without a schema there is nothing to resolve against; upstream always
+        // has one here because `requireOpenAPISchema` has already rejected a
+        // version without it.
+        let Some(schema) = schema else {
+            if !unique.insert(selectable.json_path.clone()) {
+                errs.push(Error::duplicate(&sp, selectable.json_path.clone()));
+            }
+            continue;
+        };
+
+        let (path, found) = match valid_field_path(&selectable.json_path, schema) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                errs.push(Error::invalid(
+                    &sp,
+                    selectable.json_path.clone(),
+                    format!("is an invalid path: {e}"),
+                ));
+                continue;
+            }
+        };
+
+        if path.first().map(String::as_str) == Some("metadata") {
+            errs.push(Error::invalid(
+                &sp,
+                selectable.json_path.clone(),
+                "must not point to fields in metadata",
+            ));
+        }
+        if !allowed_selectable_field_schema(found) {
+            errs.push(Error::invalid(
+                &sp,
+                selectable.json_path.clone(),
+                "must point to a field of type string, boolean or integer. Enum string fields and strings with formats are allowed.",
+            ));
+        }
+        if !unique.insert(path.join(".")) {
+            errs.push(Error::duplicate(&sp, selectable.json_path.clone()));
+        }
+    }
+
+    if unique.len() > MAX_SELECTABLE_FIELDS {
+        errs.push(Error::too_many(fld_path, MAX_SELECTABLE_FIELDS));
+    }
+
+    errs
+}
+
+/// `allowedSelectableFieldSchema` (`validation.go:880-890`).
+fn allowed_selectable_field_schema(schema: &JSONSchemaProps) -> bool {
+    matches!(
+        schema.type_.as_deref(),
+        Some("string") | Some("boolean") | Some("integer")
+    )
+}
+
+/// `cel.ValidFieldPath`
+/// (`staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel/validation.go:557-676`)
+/// with `allowArrayNotation` false, which is how
+/// `ValidateCustomResourceSelectableFields` calls it.
+///
+/// Returns the resolved path segments and the schema of the leaf. Every error
+/// string is upstream's, because a client reads them.
+fn valid_field_path<'a>(
+    json_path: &str,
+    schema: &'a JSONSchemaProps,
+) -> Result<(Vec<String>, &'a JSONSchemaProps), String> {
+    let mut path: Vec<String> = Vec::new();
+    let mut schema = schema;
+    let mut tokens = tokenize_field_path(json_path).into_iter();
+
+    while let Some(token) = tokens.next() {
+        match token.as_str() {
+            // `WithFieldPathAllowArrayNotation(false)` (`:622-624`).
+            "[" => return Err("array notation is not allowed".to_string()),
+            "." => {
+                let Some(name) = tokens.next() else {
+                    return Err("unexpected end of JSON path".to_string());
+                };
+                if schema.properties.is_some() {
+                    let Some(next) = schema.properties.as_ref().and_then(|p| p.get(&name)) else {
+                        return Err("does not refer to a valid field".to_string());
+                    };
+                    path.push(name);
+                    schema = next;
+                } else if let Some(additional) = schema.additional_properties.as_deref() {
+                    // An unnamed key: the leaf is the map's value schema.
+                    let JSONSchemaPropsOrBool::Schema(next) = additional else {
+                        return Err("does not refer to a valid field".to_string());
+                    };
+                    path.push(name);
+                    schema = next;
+                } else {
+                    return Err("does not refer to a valid field".to_string());
+                }
+            }
+            other => return Err(format!("expected [ or . but got: {other}")),
+        }
+    }
+
+    Ok((path, schema))
+}
+
+/// The scanner in `ValidFieldPath` (`validation.go:580-615`): `.`, `[` and `]`
+/// come back as single-character tokens, everything between them as one token.
+/// A single-quoted string is returned whole, delimiters included — which only
+/// matters for the array notation this caller rejects anyway.
+fn tokenize_field_path(json_path: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut escaped = false;
+
+    for ch in json_path.chars() {
+        if in_quote {
+            current.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '\'' {
+                in_quote = false;
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        match ch {
+            '.' | '[' | ']' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                tokens.push(ch.to_string());
+            }
+            '\'' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                in_quote = true;
+                current.push(ch);
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 /// `validateCustomResourceDefinitionSpec` (`validation.go:353`), minus the
@@ -135,18 +375,11 @@ pub fn validate_custom_resource_definition_spec(
             }
         }
         if let Some(fields) = &version.selectable_fields {
-            let fields_path = vp.child("selectableFields");
-            let mut seen_paths: HashSet<&str> = HashSet::new();
-            for (j, selectable) in fields.iter().enumerate() {
-                let sp = fields_path.index(j).child("jsonPath");
-                if selectable.json_path.is_empty() {
-                    errs.push(Error::required(&sp, ""));
-                    continue;
-                }
-                if !seen_paths.insert(selectable.json_path.as_str()) {
-                    errs.push(Error::duplicate(&sp, selectable.json_path.clone()));
-                }
-            }
+            errs.extend(validate_custom_resource_selectable_fields(
+                fields,
+                version.schema.as_ref().map(|s| &s.open_apiv3_schema),
+                &vp.child("selectableFields"),
+            ));
         }
         errs.extend(validate_subresources(
             version.subresources.as_ref(),
