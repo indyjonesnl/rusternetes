@@ -16,6 +16,85 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+/// Compile every `matchConditions[i].expression`.
+///
+/// Upstream reaches this from inside `validateMatchCondition`
+/// (`pkg/apis/admissionregistration/validation/validation.go:989` →
+/// `validateMatchConditionsExpression`, `:1100`), which compiles against a
+/// typed CEL environment and reports the failure as a `field.Invalid` on
+/// `matchConditions[i].expression`. Rusternetes has no typed environment, so
+/// this compiles with the plain `cel` crate and tolerates the errors that come
+/// from the missing declarations rather than from the expression itself.
+///
+/// It is deliberately *not* part of `validate_match_conditions`: that function
+/// lives in `rusternetes-common`, which does not depend on the CEL crate.
+fn compile_match_conditions(
+    conditions: &[rusternetes_common::resources::MatchCondition],
+) -> Result<()> {
+    for (i, condition) in conditions.iter().enumerate() {
+        // Compile the expression — catch panics from the antlr4rust parser,
+        // which panics on some invalid expressions instead of returning Err.
+        let expr_clone = condition.expression.clone();
+        let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cel::Program::compile(&expr_clone)
+        }));
+        let program = match compile_result {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                // Allow "no such key"-class errors: the CEL crate type-checks at
+                // compile time and rejects references to declarations we do not
+                // supply (`object.metadata`), which are valid at admission time.
+                if is_missing_declaration(&e.to_string()) {
+                    continue;
+                }
+                return Err(rusternetes_common::Error::InvalidResource(format!(
+                    "matchConditions[{i}].expression: compilation failed: {e}"
+                )));
+            }
+            Err(_panic) => {
+                return Err(rusternetes_common::Error::InvalidResource(format!(
+                    "matchConditions[{i}].expression: compilation failed: invalid CEL expression '{}'",
+                    condition.expression
+                )));
+            }
+        };
+
+        // The CEL crate's parser accepts some expressions Kubernetes rejects.
+        // Executing with an empty context catches the genuinely invalid ones.
+        let test_ctx = cel::Context::default();
+        let exec_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.execute(&test_ctx)));
+        match exec_result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                if !is_missing_declaration(&e.to_string()) {
+                    return Err(rusternetes_common::Error::InvalidResource(format!(
+                        "matchConditions[{i}].expression: compilation failed: {e}"
+                    )));
+                }
+            }
+            Err(_panic) => {
+                return Err(rusternetes_common::Error::InvalidResource(format!(
+                    "matchConditions[{i}].expression: compilation failed: invalid CEL expression '{}'",
+                    condition.expression
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A CEL error that comes from a declaration this server does not supply,
+/// rather than from the expression being malformed.
+fn is_missing_declaration(err: &str) -> bool {
+    let err = err.to_lowercase();
+    err.contains("no such key")
+        || err.contains("not found")
+        || err.contains("undeclared")
+        || err.contains("undefined")
+        || err.contains("no matching overload")
+}
+
 // ===== ValidatingWebhookConfiguration Handlers =====
 
 pub async fn create_validating_webhook(
@@ -55,101 +134,14 @@ pub async fn create_validating_webhook(
         }
     }
 
-    // Validate matchConditions CEL expressions with type-checking
-    if let Some(webhooks) = &config.webhooks {
-        for webhook in webhooks {
-            if let Some(conditions) = &webhook.match_conditions {
-                for (i, condition) in conditions.iter().enumerate() {
-                    if condition.expression.is_empty() {
-                        return Err(rusternetes_common::Error::InvalidResource(
-                            "matchConditions[].expression must be non-empty".to_string(),
-                        ));
-                    }
-                    if condition.name.is_empty() {
-                        return Err(rusternetes_common::Error::InvalidResource(format!(
-                            "matchConditions[{}].name must be non-empty",
-                            i
-                        )));
-                    }
-                    // Compile the expression — catch panics from antlr4rust parser
-                    // which panics on certain invalid expressions instead of returning Err
-                    let expr_clone = condition.expression.clone();
-                    let compile_result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            cel::Program::compile(&expr_clone)
-                        }));
-                    let program = match compile_result {
-                        Ok(Ok(p)) => p,
-                        Ok(Err(e)) => {
-                            let err_str = format!("{}", e);
-                            let err_lower = err_str.to_lowercase();
-                            // Allow "no such key" errors — the CEL library does
-                            // type-checking at compile time and rejects references
-                            // to undeclared variables like `object.metadata`. These
-                            // are valid K8s matchCondition expressions that will work
-                            // at runtime when the actual object is provided.
-                            if err_lower.contains("no such key")
-                                || err_lower.contains("not found")
-                                || err_lower.contains("undeclared")
-                                || err_lower.contains("undefined")
-                            {
-                                continue;
-                            }
-                            return Err(rusternetes_common::Error::InvalidResource(format!(
-                                "matchConditions[{}].expression: compilation failed: {}",
-                                i, e
-                            )));
-                        }
-                        Err(_panic) => {
-                            return Err(rusternetes_common::Error::InvalidResource(format!(
-                                "matchConditions[{}].expression: compilation failed: invalid CEL expression '{}'",
-                                i, condition.expression
-                            )));
-                        }
-                    };
-
-                    // The cel crate's parser accepts some invalid expressions
-                    // that K8s rejects. Try executing with an empty context as
-                    // an additional validation step — genuinely invalid syntax
-                    // will fail at execution even with no variables.
-                    let test_ctx = cel::Context::default();
-                    let exec_result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            program.execute(&test_ctx)
-                        }));
-                    match exec_result {
-                        Ok(Ok(_)) => {} // Valid expression
-                        Ok(Err(e)) => {
-                            let err_str = format!("{}", e);
-                            let err_lower = err_str.to_lowercase();
-                            // Allow runtime errors from missing variables — those
-                            // are expected since we don't provide the real context
-                            if err_lower.contains("no such key")
-                                || err_lower.contains("not found")
-                                || err_lower.contains("undeclared")
-                                || err_lower.contains("undefined")
-                                || err_lower.contains("no matching overload")
-                            {
-                                // Valid expression, just missing runtime variables
-                            } else {
-                                return Err(rusternetes_common::Error::InvalidResource(format!(
-                                    "matchConditions[{}].expression: compilation failed: {}",
-                                    i, e
-                                )));
-                            }
-                        }
-                        Err(_panic) => {
-                            return Err(rusternetes_common::Error::InvalidResource(format!(
-                                "matchConditions[{}].expression: compilation failed: invalid CEL expression '{}'",
-                                i, condition.expression
-                            )));
-                        }
-                    }
-                }
-            }
-        }
+    // Compile the matchConditions CEL expressions. The shape rules
+    // (`Required`, qualified name, duplicates, the 64 cap) ran above in the
+    // ported validator — upstream reaches the compile step from inside the same
+    // `validateMatchCondition` (`validation.go:989` →
+    // `validateMatchConditionsExpression`, `:1100`).
+    for hook in config.webhooks.iter().flatten() {
+        compile_match_conditions(hook.match_conditions.as_deref().unwrap_or_default())?;
     }
-
     // Enrich metadata with system fields
     config.metadata.ensure_uid();
     config.metadata.ensure_creation_timestamp();
@@ -232,12 +224,28 @@ pub async fn update_validating_webhook(
 
     config.metadata.name = name.clone();
 
-    // Field validation on update (upstream ValidateValidatingWebhookConfigurationUpdate
-    // re-runs the config validator on the new object).
+    // Field validation on update. Upstream
+    // `ValidateValidatingWebhookConfigurationUpdate` (`validation.go:729-740`)
+    // re-runs the config validator on the new object, with
+    // `ignoreMatchConditions` set from the old one: a `matchConditions` list
+    // that is byte-for-byte unchanged is left alone, so an object stored before
+    // a rule existed stays updatable.
+    let stored: ValidatingWebhookConfiguration = state
+        .storage
+        .get(&build_key("validatingwebhookconfigurations", None, &name))
+        .await?;
     {
-        let errs = rusternetes_common::validation::webhookconfiguration::validate_validating_webhook_configuration(&config);
+        let errs = rusternetes_common::validation::webhookconfiguration::validate_validating_webhook_configuration_update(&config, &stored);
         if !errs.is_empty() {
             return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
+    // The CEL compile step is part of the same gated check upstream, so it is
+    // skipped for an unchanged list too.
+    if !rusternetes_common::validation::webhookconfiguration::ignore_validating_webhook_match_conditions(&config, &stored) {
+        for hook in config.webhooks.iter().flatten() {
+            compile_match_conditions(hook.match_conditions.as_deref().unwrap_or_default())?;
         }
     }
 
@@ -416,88 +424,14 @@ pub async fn create_mutating_webhook(
         }
     }
 
-    // Validate matchConditions CEL expressions with type-checking
-    if let Some(webhooks) = &config.webhooks {
-        for webhook in webhooks {
-            if let Some(conditions) = &webhook.match_conditions {
-                for (i, condition) in conditions.iter().enumerate() {
-                    if condition.expression.is_empty() {
-                        return Err(rusternetes_common::Error::InvalidResource(
-                            "matchConditions[].expression must be non-empty".to_string(),
-                        ));
-                    }
-                    if condition.name.is_empty() {
-                        return Err(rusternetes_common::Error::InvalidResource(format!(
-                            "matchConditions[{}].name must be non-empty",
-                            i
-                        )));
-                    }
-                    let expr_clone = condition.expression.clone();
-                    let compile_result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            cel::Program::compile(&expr_clone)
-                        }));
-                    let program = match compile_result {
-                        Ok(Ok(p)) => p,
-                        Ok(Err(e)) => {
-                            let err_str = format!("{}", e);
-                            let err_lower = err_str.to_lowercase();
-                            if err_lower.contains("no such key")
-                                || err_lower.contains("not found")
-                                || err_lower.contains("undeclared")
-                                || err_lower.contains("undefined")
-                            {
-                                continue;
-                            }
-                            return Err(rusternetes_common::Error::InvalidResource(format!(
-                                "matchConditions[{}].expression: compilation failed: {}",
-                                i, e
-                            )));
-                        }
-                        Err(_panic) => {
-                            return Err(rusternetes_common::Error::InvalidResource(format!(
-                                "matchConditions[{}].expression: compilation failed: invalid CEL expression '{}'",
-                                i, condition.expression
-                            )));
-                        }
-                    };
-
-                    // The cel crate's parser accepts some invalid expressions.
-                    // Try executing with empty context as validation.
-                    let test_ctx = cel::Context::default();
-                    let exec_result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            program.execute(&test_ctx)
-                        }));
-                    match exec_result {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => {
-                            let err_str = format!("{}", e);
-                            let err_lower = err_str.to_lowercase();
-                            if !err_lower.contains("no such key")
-                                && !err_lower.contains("not found")
-                                && !err_lower.contains("undeclared")
-                                && !err_lower.contains("undefined")
-                                && !err_lower.contains("no matching overload")
-                            {
-                                return Err(rusternetes_common::Error::InvalidResource(format!(
-                                    "matchConditions[{}].expression: compilation failed: {}",
-                                    i, e
-                                )));
-                            }
-                        }
-                        Err(_panic) => {
-                            return Err(rusternetes_common::Error::InvalidResource(format!(
-                                "matchConditions[{}].expression: compilation failed: invalid CEL expression '{}'",
-                                i, condition.expression
-                            )));
-                        }
-                    }
-                }
-            }
-        }
+    // Compile the matchConditions CEL expressions. The shape rules
+    // (`Required`, qualified name, duplicates, the 64 cap) ran above in the
+    // ported validator — upstream reaches the compile step from inside the same
+    // `validateMatchCondition` (`validation.go:989` →
+    // `validateMatchConditionsExpression`, `:1100`).
+    for hook in config.webhooks.iter().flatten() {
+        compile_match_conditions(hook.match_conditions.as_deref().unwrap_or_default())?;
     }
-
     // Enrich metadata with system fields
     config.metadata.ensure_uid();
     config.metadata.ensure_creation_timestamp();
@@ -576,12 +510,26 @@ pub async fn update_mutating_webhook(
 
     config.metadata.name = name.clone();
 
-    // Field validation on update (upstream ValidateMutatingWebhookConfigurationUpdate
-    // re-runs the config validator on the new object).
+    // Field validation on update. Upstream
+    // `ValidateMutatingWebhookConfigurationUpdate` (`validation.go:742-753`)
+    // re-runs the config validator on the new object, with
+    // `ignoreMatchConditions` set from the old one.
+    let stored: MutatingWebhookConfiguration = state
+        .storage
+        .get(&build_key("mutatingwebhookconfigurations", None, &name))
+        .await?;
     {
-        let errs = rusternetes_common::validation::webhookconfiguration::validate_mutating_webhook_configuration(&config);
+        let errs = rusternetes_common::validation::webhookconfiguration::validate_mutating_webhook_configuration_update(&config, &stored);
         if !errs.is_empty() {
             return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
+    // The CEL compile step is part of the same gated check upstream, so it is
+    // skipped for an unchanged list too.
+    if !rusternetes_common::validation::webhookconfiguration::ignore_mutating_webhook_match_conditions(&config, &stored) {
+        for hook in config.webhooks.iter().flatten() {
+            compile_match_conditions(hook.match_conditions.as_deref().unwrap_or_default())?;
         }
     }
 

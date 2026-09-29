@@ -260,5 +260,6 @@ mod watch_labelselector_create_test;
 mod watch_skips_undeserializable_test;
 mod webhook_config_decodes_when_absent_test;
 mod webhook_config_watch_cabundle_test;
+mod webhook_match_conditions_test;
 mod webhook_timeout_test;
 mod workload_template_decodes_when_absent_test;
