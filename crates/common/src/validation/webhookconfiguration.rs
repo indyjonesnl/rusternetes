@@ -16,14 +16,16 @@
 //! `namespaceSelector`/`objectSelector` label-selector validation are included.
 
 use crate::resources::admission_webhook::{
-    LabelSelector as WebhookLabelSelector, MutatingWebhook, MutatingWebhookConfiguration,
-    RuleWithOperations, SideEffectClass, ValidatingWebhook, ValidatingWebhookConfiguration,
+    LabelSelector as WebhookLabelSelector, MatchCondition, MutatingWebhook,
+    MutatingWebhookConfiguration, RuleWithOperations, SideEffectClass, ValidatingWebhook,
+    ValidatingWebhookConfiguration,
 };
 use crate::resources::WebhookClientConfig;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
     is_dns1035_label, is_dns1123_subdomain, validate_label_selector, LabelSelectorValidationOptions,
 };
+use crate::validation::validating_admission_policy::validate_match_conditions;
 use std::collections::HashSet;
 
 /// Versions of the AdmissionReview object this apiserver accepts. Mirrors
@@ -442,17 +444,97 @@ fn validate_timeout_seconds(timeout: Option<i32>, path: &Path) -> Option<Error> 
     }
 }
 
+/// Upstream `ignoreValidatingWebhookMatchConditions` (`validation.go:605-616`)
+/// and `ignoreMutatingWebhookMatchConditions` (`:592-603`) have identical
+/// bodies: an update may keep a `matchConditions` list that no longer validates,
+/// as long as it is *unchanged*. A list that differs in length or in any entry
+/// is validated again.
+fn match_conditions_unchanged(
+    new_c: &[Option<&Vec<MatchCondition>>],
+    old_c: &[Option<&Vec<MatchCondition>>],
+) -> bool {
+    new_c.len() == old_c.len() && new_c.iter().zip(old_c).all(|(n, o)| n == o)
+}
+
+pub fn ignore_validating_webhook_match_conditions(
+    new_c: &ValidatingWebhookConfiguration,
+    old_c: &ValidatingWebhookConfiguration,
+) -> bool {
+    let new_conditions: Vec<_> = new_c
+        .webhooks
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|h| h.match_conditions.as_ref())
+        .collect();
+    let old_conditions: Vec<_> = old_c
+        .webhooks
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|h| h.match_conditions.as_ref())
+        .collect();
+    match_conditions_unchanged(&new_conditions, &old_conditions)
+}
+
+pub fn ignore_mutating_webhook_match_conditions(
+    new_c: &MutatingWebhookConfiguration,
+    old_c: &MutatingWebhookConfiguration,
+) -> bool {
+    let new_conditions: Vec<_> = new_c
+        .webhooks
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|h| h.match_conditions.as_ref())
+        .collect();
+    let old_conditions: Vec<_> = old_c
+        .webhooks
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|h| h.match_conditions.as_ref())
+        .collect();
+    match_conditions_unchanged(&new_conditions, &old_conditions)
+}
+
 /// Validate a `ValidatingWebhookConfiguration` (create path) — upstream
-/// `ValidateValidatingWebhookConfiguration`.
+/// `ValidateValidatingWebhookConfiguration` (`validation.go:706`), which passes
+/// `ignoreMatchConditions: false`.
 pub fn validate_validating_webhook_configuration(
     cfg: &ValidatingWebhookConfiguration,
+) -> ErrorList {
+    validate_validating_webhook_configuration_opts(cfg, false)
+}
+
+/// Validate a `ValidatingWebhookConfiguration` on update — upstream
+/// `ValidateValidatingWebhookConfigurationUpdate` (`validation.go:729-740`),
+/// which re-runs the create validator on the *new* object with
+/// `ignoreMatchConditions` set from the old one.
+pub fn validate_validating_webhook_configuration_update(
+    new_c: &ValidatingWebhookConfiguration,
+    old_c: &ValidatingWebhookConfiguration,
+) -> ErrorList {
+    validate_validating_webhook_configuration_opts(
+        new_c,
+        ignore_validating_webhook_match_conditions(new_c, old_c),
+    )
+}
+
+fn validate_validating_webhook_configuration_opts(
+    cfg: &ValidatingWebhookConfiguration,
+    ignore_match_conditions: bool,
 ) -> ErrorList {
     let mut errs = ErrorList::new();
     let mut names: HashSet<String> = HashSet::new();
     if let Some(webhooks) = &cfg.webhooks {
         for (i, hook) in webhooks.iter().enumerate() {
             let path = Path::new("webhooks").index(i);
-            errs.extend(validate_validating_webhook(hook, &path));
+            errs.extend(validate_validating_webhook(
+                hook,
+                ignore_match_conditions,
+                &path,
+            ));
             errs.extend(validate_admission_review_versions(
                 &hook.admission_review_versions,
                 &path.child("admissionReviewVersions"),
@@ -466,14 +548,38 @@ pub fn validate_validating_webhook_configuration(
 }
 
 /// Validate a `MutatingWebhookConfiguration` (create path) — upstream
-/// `ValidateMutatingWebhookConfiguration`.
+/// `ValidateMutatingWebhookConfiguration` (`validation.go:711`), which passes
+/// `ignoreMatchConditions: false`.
 pub fn validate_mutating_webhook_configuration(cfg: &MutatingWebhookConfiguration) -> ErrorList {
+    validate_mutating_webhook_configuration_opts(cfg, false)
+}
+
+/// Validate a `MutatingWebhookConfiguration` on update — upstream
+/// `ValidateMutatingWebhookConfigurationUpdate` (`validation.go:742-753`).
+pub fn validate_mutating_webhook_configuration_update(
+    new_c: &MutatingWebhookConfiguration,
+    old_c: &MutatingWebhookConfiguration,
+) -> ErrorList {
+    validate_mutating_webhook_configuration_opts(
+        new_c,
+        ignore_mutating_webhook_match_conditions(new_c, old_c),
+    )
+}
+
+fn validate_mutating_webhook_configuration_opts(
+    cfg: &MutatingWebhookConfiguration,
+    ignore_match_conditions: bool,
+) -> ErrorList {
     let mut errs = ErrorList::new();
     let mut names: HashSet<String> = HashSet::new();
     if let Some(webhooks) = &cfg.webhooks {
         for (i, hook) in webhooks.iter().enumerate() {
             let path = Path::new("webhooks").index(i);
-            errs.extend(validate_mutating_webhook(hook, &path));
+            errs.extend(validate_mutating_webhook(
+                hook,
+                ignore_match_conditions,
+                &path,
+            ));
             errs.extend(validate_admission_review_versions(
                 &hook.admission_review_versions,
                 &path.child("admissionReviewVersions"),
@@ -486,7 +592,11 @@ pub fn validate_mutating_webhook_configuration(cfg: &MutatingWebhookConfiguratio
     errs
 }
 
-fn validate_validating_webhook(hook: &ValidatingWebhook, path: &Path) -> ErrorList {
+fn validate_validating_webhook(
+    hook: &ValidatingWebhook,
+    ignore_match_conditions: bool,
+    path: &Path,
+) -> ErrorList {
     let mut errs = validate_fully_qualified_name(&path.child("name"), &hook.name);
     for (i, rule) in hook.rules.iter().enumerate() {
         errs.extend(validate_rule_with_operations(
@@ -509,10 +619,23 @@ fn validate_validating_webhook(hook: &ValidatingWebhook, path: &Path) -> ErrorLi
         hook.object_selector.as_ref(),
         path,
     ));
+    // Upstream calls the *same* `validateMatchConditions` the policy validator
+    // calls (`validation.go:409` / `:467` / `:800`), so this is that one
+    // function rather than a webhook-local copy.
+    if !ignore_match_conditions {
+        errs.extend(validate_match_conditions(
+            hook.match_conditions.as_deref().unwrap_or_default(),
+            &path.child("matchConditions"),
+        ));
+    }
     errs
 }
 
-fn validate_mutating_webhook(hook: &MutatingWebhook, path: &Path) -> ErrorList {
+fn validate_mutating_webhook(
+    hook: &MutatingWebhook,
+    ignore_match_conditions: bool,
+    path: &Path,
+) -> ErrorList {
     let mut errs = validate_fully_qualified_name(&path.child("name"), &hook.name);
     for (i, rule) in hook.rules.iter().enumerate() {
         errs.extend(validate_rule_with_operations(
@@ -535,6 +658,15 @@ fn validate_mutating_webhook(hook: &MutatingWebhook, path: &Path) -> ErrorList {
         hook.object_selector.as_ref(),
         path,
     ));
+    // Upstream calls the *same* `validateMatchConditions` the policy validator
+    // calls (`validation.go:409` / `:467` / `:800`), so this is that one
+    // function rather than a webhook-local copy.
+    if !ignore_match_conditions {
+        errs.extend(validate_match_conditions(
+            hook.match_conditions.as_deref().unwrap_or_default(),
+            &path.child("matchConditions"),
+        ));
+    }
     errs
 }
 
@@ -617,6 +749,91 @@ mod deep_validation_tests {
         );
         assert!(
             errs.iter().any(|e| e.detail.contains("DNS-1035")),
+            "{errs:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod match_condition_update_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn config(conditions: serde_json::Value) -> ValidatingWebhookConfiguration {
+        serde_json::from_value(json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": { "name": "hook.example.com" },
+            "webhooks": [{
+                "name": "hook.example.com",
+                "clientConfig": { "url": "https://example.com/hook" },
+                "sideEffects": "None",
+                "admissionReviewVersions": ["v1"],
+                "matchConditions": conditions,
+            }],
+        }))
+        .expect("fixture decodes")
+    }
+
+    /// The create path always validates: a duplicate name is an error.
+    #[test]
+    fn a_create_validates_match_conditions() {
+        let bad = config(json!([
+            { "name": "same", "expression": "true" },
+            { "name": "same", "expression": "false" }
+        ]));
+        let errs = validate_validating_webhook_configuration(&bad);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "webhooks[0].matchConditions[1].name"),
+            "{errs:?}"
+        );
+    }
+
+    /// Upstream `ignoreValidatingWebhookMatchConditions` (`validation.go:605`):
+    /// an unchanged list is left alone, so an object stored before the rule
+    /// existed stays updatable.
+    #[test]
+    fn an_update_that_keeps_the_list_is_spared() {
+        let bad = config(json!([
+            { "name": "same", "expression": "true" },
+            { "name": "same", "expression": "false" }
+        ]));
+        let errs = validate_validating_webhook_configuration_update(&bad, &bad);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    /// Changing any entry re-validates the whole list.
+    #[test]
+    fn an_update_that_changes_the_list_is_validated() {
+        let old = config(json!([
+            { "name": "same", "expression": "true" },
+            { "name": "same", "expression": "false" }
+        ]));
+        let new = config(json!([
+            { "name": "same", "expression": "true" },
+            { "name": "same", "expression": "changed" }
+        ]));
+        let errs = validate_validating_webhook_configuration_update(&new, &old);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "webhooks[0].matchConditions[1].name"),
+            "{errs:?}"
+        );
+    }
+
+    /// A list that grows is a change even when every kept entry matches.
+    #[test]
+    fn a_longer_list_is_validated() {
+        let old = config(json!([{ "name": "one", "expression": "true" }]));
+        let new = config(json!([
+            { "name": "one", "expression": "true" },
+            { "name": "one", "expression": "false" }
+        ]));
+        let errs = validate_validating_webhook_configuration_update(&new, &old);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "webhooks[0].matchConditions[1].name"),
             "{errs:?}"
         );
     }
