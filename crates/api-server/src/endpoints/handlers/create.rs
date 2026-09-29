@@ -64,7 +64,9 @@ pub async fn create_resource<T: Object>(
 
     // Mutating admission, then the Store's create with validating admission
     // as its callback (create.go:183-209).
-    let obj = admission.admit(Operation::Create, obj, None).await?;
+    let mut obj = admission.admit(Operation::Create, obj, None).await?;
+    // The dispatcher decodes a webhook's patched object like a request body.
+    scope.convert(&mut obj);
     let validation = CreateValidation {
         admission: &admission,
         authorize_create: false,

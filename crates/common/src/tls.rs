@@ -232,9 +232,173 @@ impl TlsClientConfig {
     }
 }
 
+/// Check that a PEM certificate chain and a PEM private key form a key pair —
+/// Go's `crypto/tls.X509KeyPair` (`src/crypto/tls/tls.go`), which the Secret
+/// strategy calls for `kubernetes.io/tls` secrets. The error text is Go's,
+/// since it reaches clients verbatim as a warning.
+///
+/// Two differences remain. A certificate that does not parse reports Go's
+/// generic `x509: malformed certificate` rather than the specific
+/// `x509.ParseCertificate` error. And a PEM block whose body is not valid
+/// base64 fails the whole input here, where `pem.Decode` skips just that
+/// block.
+pub fn x509_key_pair(cert_pem: &[u8], key_pem: &[u8]) -> std::result::Result<(), String> {
+    use rustls::crypto::aws_lc_rs::default_provider;
+    use rustls::pki_types::{PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer};
+    use rustls::SignatureAlgorithm;
+    use x509_parser::oid_registry::{
+        OID_KEY_TYPE_EC_PUBLIC_KEY, OID_PKCS1_RSAENCRYPTION, OID_SIG_ED25519,
+    };
+
+    // `pem.Decode` loops: CERTIFICATE blocks are the chain, the rest skipped.
+    let mut chain = Vec::new();
+    let mut skipped = Vec::new();
+    for block in pem::parse_many(cert_pem).unwrap_or_default() {
+        if block.tag() == "CERTIFICATE" {
+            chain.push(block.into_contents());
+        } else {
+            skipped.push(block.tag().to_string());
+        }
+    }
+    if chain.is_empty() {
+        if skipped.is_empty() {
+            return Err("tls: failed to find any PEM data in certificate input".to_string());
+        }
+        if skipped.len() == 1 && skipped[0].ends_with("PRIVATE KEY") {
+            return Err("tls: failed to find certificate PEM data in certificate input, but did find a private key; PEM inputs may have been switched".to_string());
+        }
+        return Err(format!(
+            "tls: failed to find \"CERTIFICATE\" PEM block in certificate input after skipping PEM blocks of the following types: [{}]",
+            skipped.join(" ")
+        ));
+    }
+
+    // The first block of type "PRIVATE KEY" or "* PRIVATE KEY".
+    skipped.clear();
+    let mut key_der = None;
+    for block in pem::parse_many(key_pem).unwrap_or_default() {
+        if block.tag() == "PRIVATE KEY" || block.tag().ends_with(" PRIVATE KEY") {
+            key_der = Some(block.into_contents());
+            break;
+        }
+        skipped.push(block.tag().to_string());
+    }
+    let Some(key_der) = key_der else {
+        if skipped.is_empty() {
+            return Err("tls: failed to find any PEM data in key input".to_string());
+        }
+        if skipped.len() == 1 && skipped[0] == "CERTIFICATE" {
+            return Err(
+                "tls: found a certificate rather than a key in the PEM for the private key"
+                    .to_string(),
+            );
+        }
+        return Err(format!(
+            "tls: failed to find PEM block with type ending in \"PRIVATE KEY\" in key input after skipping PEM blocks of the following types: [{}]",
+            skipped.join(" ")
+        ));
+    };
+
+    let (_, leaf) = x509_parser::parse_x509_certificate(&chain[0])
+        .map_err(|_| "x509: malformed certificate".to_string())?;
+
+    // `parsePrivateKey`: PKCS #1, then PKCS #8, then SEC 1, whatever the
+    // block's type says.
+    let provider = default_provider();
+    let candidates: [PrivateKeyDer<'static>; 3] = [
+        PrivatePkcs1KeyDer::from(key_der.clone()).into(),
+        PrivatePkcs8KeyDer::from(key_der.clone()).into(),
+        PrivateSec1KeyDer::from(key_der).into(),
+    ];
+    let key = candidates
+        .into_iter()
+        .find_map(|der| provider.key_provider.load_private_key(der).ok())
+        .ok_or_else(|| "tls: failed to parse private key".to_string())?;
+
+    // The switch on the certificate's public key type.
+    let public_key_oid = &leaf.public_key().algorithm.algorithm;
+    let expected = if *public_key_oid == OID_PKCS1_RSAENCRYPTION {
+        SignatureAlgorithm::RSA
+    } else if *public_key_oid == OID_KEY_TYPE_EC_PUBLIC_KEY {
+        SignatureAlgorithm::ECDSA
+    } else if *public_key_oid == OID_SIG_ED25519 {
+        SignatureAlgorithm::ED25519
+    } else {
+        return Err("tls: unknown public key algorithm".to_string());
+    };
+    if key.algorithm() != expected {
+        return Err("tls: private key type does not match public key type".to_string());
+    }
+    let certified =
+        rustls::sign::CertifiedKey::new(chain.into_iter().map(CertificateDer::from).collect(), key);
+    certified
+        .keys_match()
+        .map_err(|_| "tls: private key does not match public key".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pem_pair(key: &rcgen::KeyPair) -> (String, String) {
+        let cert = CertificateParams::new(vec!["example.com".to_string()])
+            .unwrap()
+            .self_signed(key)
+            .unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    #[test]
+    fn x509_key_pair_accepts_a_matching_pair() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let (cert, key) = pem_pair(&key);
+        assert_eq!(x509_key_pair(cert.as_bytes(), key.as_bytes()), Ok(()));
+    }
+
+    #[test]
+    fn x509_key_pair_rejects_another_key() {
+        let (cert, _) = pem_pair(&rcgen::KeyPair::generate().unwrap());
+        let (_, other) = pem_pair(&rcgen::KeyPair::generate().unwrap());
+        assert_eq!(
+            x509_key_pair(cert.as_bytes(), other.as_bytes()),
+            Err("tls: private key does not match public key".to_string())
+        );
+    }
+
+    #[test]
+    fn x509_key_pair_rejects_another_key_type() {
+        let (cert, _) = pem_pair(&rcgen::KeyPair::generate().unwrap());
+        let ed = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        assert_eq!(
+            x509_key_pair(cert.as_bytes(), ed.serialize_pem().as_bytes()),
+            Err("tls: private key type does not match public key type".to_string())
+        );
+    }
+
+    /// The PEM-scan errors of `X509KeyPair`, in Go's wording.
+    #[test]
+    fn x509_key_pair_pem_errors() {
+        let (cert, key) = pem_pair(&rcgen::KeyPair::generate().unwrap());
+        assert_eq!(
+            x509_key_pair(b"", key.as_bytes()),
+            Err("tls: failed to find any PEM data in certificate input".to_string())
+        );
+        assert_eq!(
+            x509_key_pair(key.as_bytes(), cert.as_bytes()),
+            Err("tls: failed to find certificate PEM data in certificate input, but did find a private key; PEM inputs may have been switched".to_string())
+        );
+        assert_eq!(
+            x509_key_pair(cert.as_bytes(), b"junk"),
+            Err("tls: failed to find any PEM data in key input".to_string())
+        );
+        assert_eq!(
+            x509_key_pair(cert.as_bytes(), cert.as_bytes()),
+            Err(
+                "tls: found a certificate rather than a key in the PEM for the private key"
+                    .to_string()
+            )
+        );
+    }
 
     #[test]
     fn test_generate_self_signed_cert() {

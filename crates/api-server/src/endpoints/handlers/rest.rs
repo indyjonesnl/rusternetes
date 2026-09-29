@@ -39,6 +39,13 @@ pub struct RequestScope<T: Object> {
     pub store: Store<T, StorageBackend>,
     /// Server-side apply, when the resource supports it.
     pub apply: Option<ApplyFn<T>>,
+    /// What decoding a request body does beyond the field mapping: the
+    /// scope's `Defaulter` and the conversion from the served version to the
+    /// internal one. Upstream's codec runs both on every decode, and the
+    /// patcher and the mutating-webhook dispatcher repeat them on the objects
+    /// they build. Our served and internal types are one type, so only the
+    /// behaviour remains — e.g. Secret's `stringData` folded into `data`.
+    pub convert_to_internal: Option<fn(&mut T)>,
 }
 
 impl<T: Object> RequestScope<T> {
@@ -48,6 +55,13 @@ impl<T: Object> RequestScope<T> {
             self.kind.version.clone()
         } else {
             format!("{}/{}", self.kind.group, self.kind.version)
+        }
+    }
+
+    /// Run [`Self::convert_to_internal`] on a freshly built object.
+    pub(super) fn convert(&self, obj: &mut T) {
+        if let Some(convert) = self.convert_to_internal {
+            convert(obj);
         }
     }
 
@@ -131,7 +145,7 @@ pub(super) fn decode<T: Object>(
         }
     }
 
-    let obj: T = match serde_json::from_value(value.clone()) {
+    let mut obj: T = match serde_json::from_value(value.clone()) {
         Ok(obj) => obj,
         // The typed decode of the original bytes fails the same way, and its
         // error quotes the body as the client sent it.
@@ -142,7 +156,10 @@ pub(super) fn decode<T: Object>(
         }
     };
 
+    // Strictness judges the body against the served version's fields, so it
+    // runs before conversion drops any of them.
     let warnings = crate::handlers::validation::validate_strict_fields(params, body, &obj)?;
+    scope.convert(&mut obj);
     Ok((obj, warnings))
 }
 

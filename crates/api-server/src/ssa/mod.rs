@@ -106,9 +106,7 @@ impl ApplyOptions {
 #[derive(Debug)]
 pub enum ApplyOutcome<T> {
     /// The merge succeeded. The contained object is ready for persistence.
-    /// `created` is true when there was no previous object — the caller
-    /// should return HTTP 201; otherwise HTTP 200.
-    Applied { object: Box<T>, created: bool },
+    Applied { object: Box<T> },
 
     /// One or more leaves are owned by other managers and `force` was not
     /// set. The caller should translate this into HTTP 409 with an Apply
@@ -151,9 +149,8 @@ pub fn apply_configmap(
 /// Apply a desired Secret on top of an optional current Secret.
 ///
 /// Thin shim — see [`apply_via_schema`] for the actual algorithm. The
-/// caller is responsible for the post-merge immutability fence (parity
-/// with [`apply_configmap`]'s call sites) and for running
-/// [`Secret::normalize`] which folds `stringData` into `data` for storage.
+/// Secret endpoints convert the result (folding `stringData` into `data`)
+/// and the Secret strategy validates it, as for any other write.
 pub fn apply_secret(
     current: Option<&Secret>,
     desired: &Value,
@@ -353,7 +350,6 @@ where
         .map_err(|e| ApplyError::Internal(format!("decode merged {}: {e}", schema.kind)))?;
     Ok(ApplyOutcome::Applied {
         object: Box::new(object),
-        created: false,
     })
 }
 
@@ -399,7 +395,6 @@ where
         .map_err(|e| ApplyError::Internal(format!("decode applied {}: {e}", schema.kind)))?;
     Ok(ApplyOutcome::Applied {
         object: Box::new(object),
-        created: true,
     })
 }
 

@@ -1,21 +1,31 @@
+//! Secret endpoints.
+//!
+//! Writes go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the Secret strategy
+//! ([`crate::registry::core::secret`]) — upstream's
+//! `pkg/registry/core/secret/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Reads (get, list,
+//! watch) are still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
-    admission::{GroupVersionKind, Operation},
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::{PodSpec, Secret},
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// K8s default file-mode bits for Secret/ConfigMap/DownwardAPI/Projected
 /// volumes when `defaultMode` is omitted by the client. Decimal 420 == 0o644.
@@ -67,108 +77,67 @@ pub fn apply_volume_mode_defaults(spec: &mut PodSpec) {
     }
 }
 
+/// The Secret `RequestScope`: `v1` `Secret` served as `secrets`, backed by
+/// `secret.NewREST`'s store.
+fn scope(state: &ApiServerState) -> RequestScope<Secret> {
+    RequestScope {
+        kind: GroupVersionKind {
+            group: String::new(),
+            version: "v1".to_string(),
+            kind: "Secret".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "secrets".to_string(),
+        },
+        store: crate::registry::core::secret::new_store(state.storage.clone()),
+        apply: Some(crate::ssa::apply_secret),
+        convert_to_internal: Some(crate::registry::core::secret::convert_to_internal),
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut secret): DumpingJson<Secret>,
-) -> Result<(StatusCode, Json<Secret>)> {
-    // Server-side name generation (metadata.generateName) is applied centrally
-    // by generate_name_middleware before this handler runs (#1052), so by here
-    // an unnamed-but-generateName Secret already has a synthesised name.
-    info!(
-        "Creating secret: {} in namespace: {}",
-        secret.metadata.name, namespace
-    );
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &secret.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-    // Validate resource name
-    crate::handlers::validation::validate_resource_name(&secret.metadata.name)?;
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "secrets")
-        .with_api_group("")
-        .with_namespace(&namespace);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Ensure namespace is set from the URL path
-    secret.metadata.namespace = Some(namespace.clone());
-
-    // Enrich metadata with system fields
-    secret.metadata.ensure_uid();
-    secret.metadata.ensure_creation_timestamp();
-
-    // Normalize: convert stringData to base64-encoded data. Upstream validates
-    // the post-conversion Data map only ("We don't validate StringData, as it
-    // was already converted back to Data before validation"), so normalize
-    // first and then run the full ValidateSecret.
-    secret.normalize();
-
-    // Full upstream ValidateSecret: object metadata, data key format
-    // (IsConfigMapKey), the MaxSecretSize (1 MiB) total-size cap, and the
-    // type-specific required-key constraints.
-    {
-        let errs = rusternetes_common::validation::secret::validate_secret(&secret);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    let key = build_key("secrets", Some(&namespace), &secret.metadata.name);
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: Secret {}/{} validated successfully (not created)",
-            namespace, secret.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(secret)));
-    }
-
-    let created = state.storage.create(&key, &secret).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<Secret>> {
-    debug!("Getting secret: {} in namespace: {}", name, namespace);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "secrets")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("secrets", Some(&namespace), &name);
-    let secret = state.storage.get(&key).await?;
-
-    Ok(Json(secret))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn update(
@@ -176,231 +145,76 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut secret): DumpingJson<Secret>,
-) -> Result<Json<Secret>> {
-    info!("Updating secret: {} in namespace: {}", name, namespace);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "secrets")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("secrets", Some(&namespace), &name),
-        "",
-        "secrets",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    secret.metadata.name = name.clone();
-    secret.metadata.namespace = Some(namespace.clone());
-
-    // Normalize: convert stringData to base64-encoded data
-    secret.normalize();
-
-    let key = build_key("secrets", Some(&namespace), &name);
-
-    // Check if existing secret is immutable — only reject data/stringData changes
-    if let Ok(existing) = state.storage.get::<Secret>(&key).await {
-        // Enforce `.type` immutability post-create. Upstream:
-        // `pkg/registry/core/secret/strategy.go::ValidateUpdate` calls
-        // `validation.ValidateSecretUpdate`, which appends
-        // `ValidateImmutableField(newSecret.Type, oldSecret.Type, field.NewPath("type"))`
-        // unconditionally — independent of `Secret.immutable`. The wire error is
-        // `field.Invalid(field.NewPath("type"), newSecret.Type, "field is immutable")`.
-        //
-        // Default the missing-type case to "Opaque" on both sides to mirror
-        // `pkg/apis/core/v1/defaults.go::SetDefaults_Secret`, so an UPDATE body
-        // that omits `.type` (the field is omitempty) compares equal to an
-        // existing secret whose type was server-defaulted to "Opaque" on
-        // create.
-        // Mirror upstream `SetDefaults_Secret`: treat both missing AND empty
-        // string as `Opaque`, so a client that sends `"type": ""` (or omits
-        // the field) on UPDATE matches an existing secret whose type was
-        // server-defaulted or left unset.
-        let old_type = match existing.secret_type.as_deref() {
-            None | Some("") => "Opaque",
-            Some(t) => t,
-        };
-        let new_type = match secret.secret_type.as_deref() {
-            None | Some("") => "Opaque",
-            Some(t) => t,
-        };
-        if old_type != new_type {
-            return Err(rusternetes_common::Error::InvalidResource(format!(
-                "type: Invalid value: \"{new_type}\": field is immutable"
-            )));
-        }
-
-        if existing.immutable == Some(true) {
-            // Compare data and stringData — reject if changed
-            let data_changed = existing.data != secret.data;
-            let string_data_changed = existing.string_data != secret.string_data;
-            // Upstream `ValidateSecretUpdate`: once `immutable` is true it may
-            // only stay true — reject if the new object's `immutable` is `nil`
-            // (dropped) OR `false` (`newSecret.Immutable == nil || !*newSecret.Immutable`).
-            let immutable_changed = secret.immutable != Some(true);
-            if data_changed || string_data_changed || immutable_changed {
-                return Err(rusternetes_common::Error::InvalidResource(format!(
-                    "Secret \"{}\" is immutable",
-                    name
-                )));
-            }
-        }
-    }
-
-    // Re-run the full ValidateSecret on update (upstream ValidateSecretUpdate
-    // ends with `append(allErrs, ValidateSecret(newSecret)...)`): metadata,
-    // data key format, the MaxSecretSize cap, and the type-specific required
-    // keys. Runs after normalize() so keys supplied via stringData count;
-    // catches e.g. a TLS secret losing tls.key on a non-immutable update.
-    //
-    // The update-only immutability rules from ValidateSecretUpdate (immutable
-    // `type`, and the `immutable: true` data/immutable-clear guards) are
-    // enforced above against the stored object; we don't route them through
-    // validate_secret_update here because that function also delegates to
-    // ValidateObjectMetaUpdate, which would impose upstream's
-    // resourceVersion-required gate that this upsert handler does not (yet)
-    // satisfy. Tracked as a follow-up.
-    {
-        let errs = rusternetes_common::validation::secret::validate_secret(&secret);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: Secret {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(secret));
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    if let Ok(stored) = state.storage.get::<Secret>(&key).await {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut secret.metadata,
-            &stored.metadata,
-        );
-    }
-
-    let result = state.storage.update(&key, &secret).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete_secret(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    body: axum::body::Bytes,
-) -> Result<Json<Secret>> {
-    info!("Deleting secret: {} in namespace: {}", name, namespace);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "secrets")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("secrets", Some(&namespace), &name);
-
-    // Get the resource to check if it exists
-    let secret: Secret = state.storage.get(&key).await?;
-
-    // Enforce deleteOptions.preconditions.{resourceVersion,uid} before mutating
-    // anything. Upstream: pkg/registry/generic/registry/store.go::Delete calls
-    // preconditions.Check() before invoking storage.Delete; a mismatch returns
-    // 409 Conflict with reason `Conflict`.
-    crate::handlers::lifecycle::check_delete_preconditions(&body, &secret.metadata, &name)?;
-
-    // Run validating admission webhooks for DELETE (object=nil, oldObject=secret).
-    crate::handlers::admission_helper::run_delete_validating_webhooks(
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
         &state,
-        "",
-        "v1",
-        "Secret",
-        "secrets",
+        &scope(&state),
+        &auth_ctx.user,
         Some(&namespace),
         &name,
-        &secret,
-        &user_for_webhook,
-        is_dry_run,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: Secret {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(secret));
-    }
-
-    let has_finalizers = crate::handlers::finalizers::handle_delete_with_finalizers(
-        &*state.storage,
-        &key,
-        &secret,
-        &delete_opts,
+pub async fn deletecollection_secrets(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
     )
-    .await?;
-
-    if has_finalizers {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: Secret = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    } else {
-        Ok(Json(secret))
-    }
+    .await
 }
 
 pub async fn list(
@@ -530,398 +344,4 @@ pub async fn list_all_secrets(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-// Generic PATCH handler used for all non-SSA patch types (strategic merge,
-// JSON merge, JSON patch). The dispatcher below intercepts SSA before
-// delegating here so this macro still drives all the legacy patch paths.
-crate::patch_handler_namespaced!(patch_legacy, Secret, "secrets", "");
-
-/// Secret PATCH dispatcher.
-///
-/// Branches on `Content-Type`:
-///
-/// - `application/apply-patch+yaml` / `application/apply-patch+json` →
-///   schema-driven SSA via [`crate::ssa::apply_secret`].
-/// - everything else → the legacy [`patch_legacy`] handler (strategic
-///   merge, JSON merge, JSON patch).
-///
-/// ConfigMap and Secret are the two resources wired to the new SSA module
-/// today. Other resources (Pod / Deployment / Service / …) still go through
-/// the legacy top-level-key SSA in `rusternetes_common::server_side_apply`
-/// via the generic patch macro. ConfigMap has since moved onto the generic
-/// Store, where apply is one mechanism of `endpoints::handlers::patch`
-/// (#1990); Secret is next.
-pub async fn patch(
-    state: axum::extract::State<Arc<ApiServerState>>,
-    auth_ctx: axum::Extension<AuthContext>,
-    path: axum::extract::Path<(String, String)>,
-    query: axum::extract::Query<HashMap<String, String>>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<axum::response::Response> {
-    let content_type = headers
-        .get("x-original-content-type")
-        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    if content_type.contains("apply-patch") {
-        return apply_secret_ssa(state, auth_ctx, path, query, &content_type, body).await;
-    }
-
-    // Delegate to the legacy patch handler.
-    let response = patch_legacy(state, auth_ctx, path, query, headers, body).await?;
-    Ok(response.into_response())
-}
-
-/// Server-Side Apply branch for Secret PATCH.
-///
-/// Mirrors the ConfigMap SSA handler this was copied from (since replaced by
-/// the generic Store path, #1990) — the only Secret-specific bits are:
-///
-/// 1. `Secret.type` immutability fence post-create. Upstream
-///    `pkg/registry/core/secret/strategy.go::ValidateUpdate` calls
-///    `apivalidation.ValidateImmutableField(newSecret.Type, oldSecret.Type, …)`
-///    unconditionally — SSA must honour that too, otherwise an applier
-///    could flip `type: Opaque` to `type: kubernetes.io/basic-auth` after
-///    create.
-/// 2. `Secret::normalize()` is called after the merge so the `stringData`
-///    entries the applier supplied are folded into `data` (base64-encoded)
-///    before storage. SSA ownership is tracked against the raw
-///    `/stringData/<key>` paths so the applier can later release them by
-///    re-applying without that key.
-/// 3. The `immutable: true` fence is wider than ConfigMap's — Secret
-///    blocks `data`, `stringData`, and `type` changes once locked.
-async fn apply_secret_ssa(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path((namespace, name)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
-    content_type: &str,
-    body: axum::body::Bytes,
-) -> Result<axum::response::Response> {
-    info!(
-        "SSA apply secret {}/{} (Content-Type: {})",
-        namespace, name, content_type
-    );
-
-    // Save user info for webhooks before RBAC check consumes it.
-    let webhook_user = auth_ctx.user.clone();
-
-    // RBAC: SSA uses the `patch` verb.
-    let attrs = RequestAttributes::new(auth_ctx.user, "patch", "secrets")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // ?fieldManager= is mandatory for SSA; upstream returns 400 when missing.
-    let field_manager = params.get("fieldManager").cloned().ok_or_else(|| {
-        rusternetes_common::Error::BadRequest(
-            "fieldManager query parameter is required for apply-patch requests".to_string(),
-        )
-    })?;
-    let force = params
-        .get("force")
-        .map(|v| rusternetes_common::query::k8s_query_bool(v))
-        .unwrap_or(false);
-    let opts = crate::ssa::ApplyOptions::new(field_manager).with_force(force);
-
-    // Decode the body — apply-patch+yaml or apply-patch+json.
-    let mut desired = crate::ssa::decode_apply_body(content_type, &body)
-        .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
-    // Path-coerce name/namespace so the body cannot rename the object.
-    if let Some(meta) = desired
-        .as_object_mut()
-        .and_then(|o| o.get_mut("metadata"))
-        .and_then(|m| m.as_object_mut())
-    {
-        meta.insert("name".to_string(), serde_json::Value::String(name.clone()));
-        meta.insert(
-            "namespace".to_string(),
-            serde_json::Value::String(namespace.clone()),
-        );
-    }
-
-    let key = build_key("secrets", Some(&namespace), &name);
-
-    // Load current object (if any) for the merge.
-    let current: Option<Secret> = match state.storage.get::<Secret>(&key).await {
-        Ok(s) => Some(s),
-        Err(rusternetes_common::Error::NotFound(_)) => None,
-        Err(e) => return Err(e),
-    };
-
-    let outcome = crate::ssa::apply_secret(current.as_ref(), &desired, &opts)
-        .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
-
-    // Immutability + type-fence checks — both run only when there's an
-    // existing object. They cannot bypass via SSA, otherwise an applier
-    // could mutate immutable Secrets or flip the `type` field.
-    if let (Some(existing), crate::ssa::ApplyOutcome::Applied { ref object, .. }) =
-        (current.as_ref(), &outcome)
-    {
-        // `Secret.type` is immutable post-create per upstream strategy.
-        // Compare the merged object's type against the existing object's
-        // type — if the applier flipped it, reject. We allow the applier
-        // to omit `type` entirely (in which case the merger preserved the
-        // current value).
-        if existing.secret_type != object.secret_type {
-            return Err(rusternetes_common::Error::InvalidResource(format!(
-                "Secret \"{}/{}\" field is immutable: type",
-                namespace, name
-            )));
-        }
-
-        if existing.immutable == Some(true) {
-            // For an immutable Secret, reject any change to `data`,
-            // `stringData`, or the `immutable` flag itself. We compare
-            // both `data` and `stringData` because the merger preserves
-            // them as separate fields until `normalize()` runs below.
-            let data_changed = existing.data != object.data;
-            let string_data_changed = existing.string_data != object.string_data;
-            // Upstream `ValidateSecretUpdate`: reject if the new `immutable` is
-            // `nil` (dropped) OR not true.
-            let immutable_changed = object.immutable != Some(true);
-            if data_changed || string_data_changed || immutable_changed {
-                return Err(rusternetes_common::Error::InvalidResource(format!(
-                    "Secret \"{}/{}\" is immutable",
-                    namespace, name
-                )));
-            }
-        }
-    }
-
-    match outcome {
-        crate::ssa::ApplyOutcome::Applied {
-            object: boxed,
-            created,
-        } => {
-            let mut object: Secret = *boxed;
-            // Ensure path-derived metadata is set even when the merge
-            // started from a brand-new body.
-            object.metadata.name = name.clone();
-            object.metadata.namespace = Some(namespace.clone());
-            if created {
-                object.metadata.ensure_uid();
-                object.metadata.ensure_creation_timestamp();
-            }
-            // Fold stringData into base64-encoded data before storage —
-            // matches `Secret::PrepareForCreate` / `PrepareForUpdate`
-            // semantics in upstream Go where `stringData` is a write-only
-            // convenience that never round-trips to clients.
-            object.normalize();
-
-            let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-            // Run mutating + validating admission webhooks on the
-            // SSA-produced object, mirroring the non-SSA PATCH path.
-            let op = if created {
-                Operation::Create
-            } else {
-                Operation::Update
-            };
-            let gvk = GroupVersionKind {
-                group: "".to_string(),
-                version: "v1".to_string(),
-                kind: "Secret".to_string(),
-            };
-            let s_val = serde_json::to_value(&object).ok();
-            state
-                .webhook_manager
-                .run_validating_admission_policies_ext(
-                    &op,
-                    &gvk,
-                    s_val.as_ref(),
-                    None,
-                    Some("secrets"),
-                    Some(&namespace),
-                )
-                .await?;
-            {
-                let gvr = rusternetes_common::admission::GroupVersionResource {
-                    group: "".to_string(),
-                    version: "v1".to_string(),
-                    resource: "secrets".to_string(),
-                };
-                let user_info = rusternetes_common::admission::UserInfo {
-                    username: webhook_user.username.clone(),
-                    uid: webhook_user.uid.clone(),
-                    groups: webhook_user.groups.clone(),
-                };
-                let (response, mutated_obj) = state
-                    .webhook_manager
-                    .run_mutating_webhooks_with_dryrun(
-                        &op,
-                        &gvk,
-                        &gvr,
-                        Some(&namespace),
-                        &name,
-                        s_val.clone(),
-                        None,
-                        &user_info,
-                        is_dry_run,
-                    )
-                    .await?;
-                if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = &response {
-                    return Err(rusternetes_common::Error::Forbidden(format!(
-                        "admission webhook denied the request: {}",
-                        reason
-                    )));
-                }
-                if let Some(mutated) = mutated_obj {
-                    if let Ok(m) = serde_json::from_value::<Secret>(mutated) {
-                        object = m;
-                    }
-                }
-                if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
-                    .webhook_manager
-                    .run_validating_webhooks_with_dryrun(
-                        &op,
-                        &gvk,
-                        &gvr,
-                        Some(&namespace),
-                        &name,
-                        serde_json::to_value(&object).ok(),
-                        None,
-                        &user_info,
-                        is_dry_run,
-                    )
-                    .await?
-                {
-                    return Err(rusternetes_common::Error::Forbidden(format!(
-                        "admission webhook denied the request: {}",
-                        reason
-                    )));
-                }
-            }
-
-            let saved: Secret = if is_dry_run {
-                object
-            } else if created {
-                state.storage.create::<Secret>(&key, &object).await?
-            } else {
-                state.storage.update::<Secret>(&key, &object).await?
-            };
-            let status = if created {
-                StatusCode::CREATED
-            } else {
-                StatusCode::OK
-            };
-            Ok((status, axum::Json(saved)).into_response())
-        }
-        crate::ssa::ApplyOutcome::Conflicts(conflicts) => {
-            // Mirror upstream: 409 Conflict with reason=Conflict.
-            let detail = conflicts
-                .iter()
-                .map(|c| {
-                    format!(
-                        ".{} is managed by {}",
-                        c.path.replace('/', "."),
-                        c.current_manager
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(rusternetes_common::Error::Conflict(format!(
-                "Apply failed with {} conflict{}: {}",
-                conflicts.len(),
-                if conflicts.len() == 1 { "" } else { "s" },
-                detail
-            )))
-        }
-    }
-}
-
-pub async fn deletecollection_secrets(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection secrets in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "secrets")
-        .with_namespace(&namespace)
-        .with_api_group("");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: Secret collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all secrets in the namespace
-    let prefix = build_prefix("secrets", Some(&namespace));
-    let mut items = state.storage.list::<Secret>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("secrets", Some(&namespace), &item.metadata.name);
-
-        // Run validating admission webhooks for DELETE per item.
-        crate::handlers::admission_helper::run_delete_validating_webhooks(
-            &state,
-            "",
-            "v1",
-            "Secret",
-            "secrets",
-            Some(&namespace),
-            &item.metadata.name,
-            &item,
-            &user_for_webhook,
-            false,
-        )
-        .await?;
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} secrets deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }
