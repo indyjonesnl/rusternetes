@@ -73,6 +73,43 @@ fn template_labels_match_selector(
     errs
 }
 
+/// `metav1.LabelSelectorAsSelector(spec.Selector)` and both of its arms, as
+/// StatefulSet, Deployment and ReplicaSet spell them:
+///
+/// ```go
+/// selector, err := metav1.LabelSelectorAsSelector(spec.Selector)
+/// if err != nil {
+///     allErrs = append(allErrs, field.Invalid(fldPath.Child("selector"), spec.Selector, <detail>))
+/// } else {
+///     // template labels must match the selector
+/// }
+/// ```
+///
+/// (`pkg/apis/apps/validation/validation.go:189-192` with detail `""`,
+/// `:652-657` and `:823-828` with `"invalid label selector"`.) DaemonSet only
+/// gates on `err == nil` (`:446-449`) and adds nothing, so it keeps calling
+/// [`template_labels_match_selector`] directly (#2034).
+fn selector_parses_and_matches_template(
+    selector: &LabelSelector,
+    template_labels: &std::collections::HashMap<String, String>,
+    fld_path: &Path,
+    invalid_detail: &str,
+) -> ErrorList {
+    if crate::types::label_selector_as_selector(Some(selector)).is_err() {
+        let value = serde_json::to_value(selector).unwrap_or(serde_json::Value::Null);
+        return vec![Error::invalid(
+            &fld_path.child("selector"),
+            BadValue::Json(value),
+            invalid_detail,
+        )];
+    }
+    template_labels_match_selector(
+        selector,
+        template_labels,
+        &fld_path.child("template").child("metadata").child("labels"),
+    )
+}
+
 /// Validate a workload pod template's `restartPolicy` / `activeDeadlineSeconds`
 /// constraints shared by StatefulSet, DaemonSet and ReplicaSet. Mirrors upstream
 /// (e.g. `ValidatePodTemplateSpecForReplicaSet` lines 847-852,
@@ -414,10 +451,11 @@ fn validate_deployment_spec(
             .and_then(|m| m.labels.clone())
             .unwrap_or_default();
 
-        errs.extend(template_labels_match_selector(
+        errs.extend(selector_parses_and_matches_template(
             &spec.selector,
             &template_labels,
-            &fld_path.child("template").child("metadata").child("labels"),
+            fld_path,
+            "invalid label selector",
         ));
     }
 
@@ -659,10 +697,11 @@ fn validate_replicaset_spec(spec: &ReplicaSetSpec, fld_path: &Path) -> ErrorList
             .as_ref()
             .and_then(|m| m.labels.clone())
             .unwrap_or_default();
-        errs.extend(template_labels_match_selector(
+        errs.extend(selector_parses_and_matches_template(
             &spec.selector,
             &template_labels,
-            &fld_path.child("template").child("metadata").child("labels"),
+            fld_path,
+            "invalid label selector",
         ));
     }
 
@@ -929,10 +968,11 @@ fn validate_statefulset_spec(
             .as_ref()
             .and_then(|m| m.labels.clone())
             .unwrap_or_default();
-        errs.extend(template_labels_match_selector(
+        errs.extend(selector_parses_and_matches_template(
             &spec.selector,
             &template_labels,
-            &fld_path.child("template").child("metadata").child("labels"),
+            fld_path,
+            "",
         ));
     }
 
