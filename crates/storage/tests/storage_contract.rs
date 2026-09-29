@@ -11,3 +11,9 @@ mod contract;
 contract_suite!(memory, async { crate::contract::fixtures::memory() }, revisions: true, snapshot_paging: false);
 contract_suite!(etcd, crate::contract::fixtures::etcd(), revisions: true, snapshot_paging: true);
 contract_suite!(kine, crate::contract::fixtures::kine(), revisions: true, snapshot_paging: true);
+
+// The rhino/SQLite backend the cluster actually runs. Feature-gated, so a
+// default `cargo test -p rusternetes-storage` compiles it out; the
+// storage-contract workflow builds with `--features sqlite`.
+#[cfg(feature = "sqlite")]
+contract_suite!(rhino_sqlite, crate::contract::fixtures::rhino_sqlite(), revisions: true, snapshot_paging: true);
