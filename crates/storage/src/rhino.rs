@@ -134,6 +134,35 @@ impl<B: Backend> RhinoStorage<B> {
             .map_err(|e| Error::Storage(format!("Failed to get current revision: {}", e)))?;
         self.watch_from_revision(prefix, current_rev + 1).await
     }
+
+    /// List `prefix` at `revision`; 0 means the current revision.
+    async fn list_inner<T>(&self, prefix: &str, revision: i64) -> Result<Vec<T>>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        let (_rev, kvs) = self
+            .backend
+            .list(prefix, "", 0, revision, false)
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to list resources: {}", e)))?;
+
+        let mut results = Vec::with_capacity(kvs.len());
+        for kv in kvs {
+            let json = String::from_utf8(kv.value)
+                .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
+            let json_with_rv = Self::inject_resource_version(&json, kv.mod_revision);
+            match serde_json::from_str::<T>(&json_with_rv) {
+                Ok(value) => results.push(value),
+                Err(e) => {
+                    error!("Failed to deserialize value at {}: {}", kv.key, e);
+                    continue;
+                }
+            }
+        }
+
+        debug!("Listed {} resources with prefix: {}", results.len(), prefix);
+        Ok(results)
+    }
 }
 
 #[async_trait]
@@ -356,28 +385,21 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        let (_rev, kvs) = self
-            .backend
-            .list(prefix, "", 0, 0, false)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to list resources: {}", e)))?;
+        self.list_inner(prefix, 0).await
+    }
 
-        let mut results = Vec::with_capacity(kvs.len());
-        for kv in kvs {
-            let json = String::from_utf8(kv.value)
-                .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
-            let json_with_rv = Self::inject_resource_version(&json, kv.mod_revision);
-            match serde_json::from_str::<T>(&json_with_rv) {
-                Ok(value) => results.push(value),
-                Err(e) => {
-                    error!("Failed to deserialize value at {}: {}", kv.key, e);
-                    continue;
-                }
-            }
-        }
-
-        debug!("Listed {} resources with prefix: {}", results.len(), prefix);
-        Ok(results)
+    // Paged lists pin every continuation to the first page's revision
+    // (upstream `GetList`, `withRev` in `etcd3/store.go`). Without this
+    // override the trait default answered with a live `list`, so an object
+    // created mid-walk leaked into a later page (#2042). The backend's `List`
+    // already takes a revision, as kine's does, and returns `Compacted` below
+    // the compaction floor; that error's text ("has been compacted") routes it
+    // to the resumable 410 in `list_paginated`.
+    async fn list_at_revision<T>(&self, prefix: &str, revision: i64) -> Result<Vec<T>>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        self.list_inner(prefix, revision).await
     }
 
     async fn watch(&self, prefix: &str) -> Result<WatchStream> {
