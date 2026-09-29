@@ -75,4 +75,5 @@ mod ttl_controller_test;
 mod volume_attachment_test;
 mod volume_expansion_test;
 mod volume_snapshot_controller_test;
+mod volume_snapshot_default_class_test;
 mod vpa_controller_test;
