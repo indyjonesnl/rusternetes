@@ -17,6 +17,7 @@
 //! (`validateIndexesFormat`) and the `succeededCount <= totalIndexes`
 //! cross-check (#1344).
 
+use crate::resources::pod::{Affinity, PodSpec};
 use crate::resources::workloads::{
     Job, JobSpec, JobTemplateSpec, PodFailurePolicyRule, SuccessPolicyRule,
 };
@@ -26,7 +27,10 @@ use crate::validation::metav1::{
     is_dns1123_label, is_dns1123_subdomain, is_qualified_name, label_selector_matches_labels,
     validate_label_selector, LabelSelectorValidationOptions,
 };
-use crate::validation::objectmeta::validate_nonnegative_field;
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, validate_immutable_field, validate_nonnegative_field,
+    validate_object_meta, validate_object_meta_update,
+};
 use std::collections::HashSet;
 
 // Upstream `pkg/apis/batch/types.go` label keys (prefix `batch.kubernetes.io/`).
@@ -553,11 +557,32 @@ fn selector_display(sel: &LabelSelector) -> String {
         .unwrap_or_default()
 }
 
-/// Validate a `Job` on create. Mirrors upstream `ValidateJob` (minus ObjectMeta,
-/// which the handler validates via `validate_create_object_meta`). The create
-/// path uses `RequirePrefixedLabels: true`.
-pub fn validate_job(job: &Job) -> ErrorList {
-    let mut errs = validate_generated_selector(job, true);
+/// Upstream `JobValidationOptions` (validation.go:83-91), minus the embedded
+/// `PodValidationOptions`, which the pod-template validators do not take here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JobValidationOptions {
+    /// Allow mutable node affinity, selector and tolerations of the template.
+    pub allow_mutable_scheduling_directives: bool,
+    /// Require the `batch.kubernetes.io/job-name` and
+    /// `batch.kubernetes.io/controller-uid` template labels.
+    pub require_prefixed_labels: bool,
+    /// Allow mutable pod resources.
+    pub allow_mutable_pod_resources: bool,
+}
+
+/// Validate a `Job`: upstream `ValidateJob` (validation.go:151-167).
+/// "Jobs and rcs have the same name validation": `NameIsDNSSubdomain`.
+pub fn validate_job(job: &Job, opts: &JobValidationOptions) -> ErrorList {
+    let mut errs = validate_object_meta(
+        &job.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_generated_selector(
+        job,
+        opts.require_prefixed_labels,
+    ));
     errs.extend(validate_job_spec(&job.spec, &Path::new("spec")));
 
     // Indexed job pods get a `-$INDEX` hostname suffix; the max index is
@@ -581,6 +606,184 @@ pub fn validate_job(job: &Job) -> ErrorList {
     }
 
     errs
+}
+
+/// Upstream `ValidateJobUpdate` (validation.go:609-613).
+pub fn validate_job_update(job: &Job, old_job: &Job, opts: &JobValidationOptions) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&job.metadata, &old_job.metadata, &Path::new("metadata"));
+    errs.extend(validate_job_spec_update(
+        &job.spec,
+        &old_job.spec,
+        &Path::new("spec"),
+        opts,
+    ));
+    errs
+}
+
+/// Upstream `ValidateJobUpdateStatus` (validation.go:616-620): the metadata
+/// update and [`validate_job_status_update`].
+pub fn validate_job_update_status(job: &Job, old_job: &Job) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&job.metadata, &old_job.metadata, &Path::new("metadata"));
+    errs.extend(validate_job_status_update(job, old_job));
+    errs
+}
+
+/// Upstream `ValidateJobSpecUpdate` (validation.go:623-635).
+fn validate_job_spec_update(
+    spec: &JobSpec,
+    old_spec: &JobSpec,
+    fld_path: &Path,
+    opts: &JobValidationOptions,
+) -> ErrorList {
+    let mut errs = validate_job_spec(spec, fld_path);
+    errs.extend(validate_completions(
+        spec,
+        old_spec,
+        &fld_path.child("completions"),
+    ));
+    errs.extend(validate_immutable_field(
+        &spec.selector,
+        &old_spec.selector,
+        &fld_path.child("selector"),
+    ));
+    errs.extend(validate_pod_template_update(spec, old_spec, fld_path, opts));
+    errs.extend(validate_immutable_field(
+        &spec.completion_mode,
+        &old_spec.completion_mode,
+        &fld_path.child("completionMode"),
+    ));
+    errs.extend(validate_immutable_field(
+        &spec.pod_failure_policy,
+        &old_spec.pod_failure_policy,
+        &fld_path.child("podFailurePolicy"),
+    ));
+    errs.extend(validate_immutable_field(
+        &spec.backoff_limit_per_index,
+        &old_spec.backoff_limit_per_index,
+        &fld_path.child("backoffLimitPerIndex"),
+    ));
+    errs.extend(validate_immutable_field(
+        &spec.managed_by,
+        &old_spec.managed_by,
+        &fld_path.child("managedBy"),
+    ));
+    errs.extend(validate_immutable_field(
+        &spec.success_policy,
+        &old_spec.success_policy,
+        &fld_path.child("successPolicy"),
+    ));
+    errs
+}
+
+/// Upstream `validatePodTemplateUpdate` (validation.go:637-676).
+fn validate_pod_template_update(
+    spec: &JobSpec,
+    old_spec: &JobSpec,
+    fld_path: &Path,
+    opts: &JobValidationOptions,
+) -> ErrorList {
+    let template = &spec.template;
+    let mut old_template = old_spec.template.clone();
+    if opts.allow_mutable_scheduling_directives {
+        match (&template.spec.affinity, &mut old_template.spec.affinity) {
+            // Allow the Affinity field to be cleared if the old template had
+            // no affinity directives other than NodeAffinity.
+            (None, Some(old)) => {
+                old.node_affinity = None;
+                if old.pod_affinity.is_none() && old.pod_anti_affinity.is_none() {
+                    old_template.spec.affinity = None;
+                }
+            }
+            // Allow the NodeAffinity field to skip immutability checking.
+            (Some(new), None) => {
+                old_template.spec.affinity = Some(Affinity {
+                    node_affinity: new.node_affinity.clone(),
+                    pod_affinity: None,
+                    pod_anti_affinity: None,
+                });
+            }
+            (Some(new), Some(old)) => old.node_affinity = new.node_affinity.clone(),
+            (None, None) => {}
+        }
+        old_template.spec.node_selector = template.spec.node_selector.clone();
+        old_template.spec.tolerations = template.spec.tolerations.clone();
+        old_template.spec.scheduling_gates = template.spec.scheduling_gates.clone();
+        let new_meta = template.metadata.clone().unwrap_or_default();
+        let old_meta = old_template.metadata.get_or_insert_with(Default::default);
+        old_meta.annotations = new_meta.annotations;
+        old_meta.labels = new_meta.labels;
+    }
+
+    let template_path = fld_path.child("template");
+    let suspended = old_spec.suspend == Some(true);
+    if suspended && opts.allow_mutable_pod_resources {
+        // Only allow container resource updates.
+        validate_pod_resource_updates_only(
+            &template.spec,
+            &old_template.spec,
+            &fld_path.child("template.spec"),
+        )
+    } else {
+        // If the job isn't suspended, then we cannot allow any mutation of
+        // the template.
+        validate_immutable_field(template, &old_template, &template_path)
+    }
+}
+
+/// Upstream `validatePodResourceUpdatesOnly` (validation.go:679-707).
+fn validate_pod_resource_updates_only(
+    new_pod: &PodSpec,
+    old_pod: &PodSpec,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut old_copy = old_pod.clone();
+    if new_pod.containers.len() == old_copy.containers.len() {
+        for (old, new) in old_copy.containers.iter_mut().zip(&new_pod.containers) {
+            if old.name == new.name {
+                old.resources = new.resources.clone();
+            }
+        }
+    }
+    if let (Some(new_init), Some(old_init)) =
+        (&new_pod.init_containers, &mut old_copy.init_containers)
+    {
+        if new_init.len() == old_init.len() {
+            for (old, new) in old_init.iter_mut().zip(new_init) {
+                if old.name == new.name {
+                    old.resources = new.resources.clone();
+                }
+            }
+        }
+    }
+    validate_immutable_field(new_pod, &old_copy, fld_path)
+}
+
+/// Upstream `validateCompletions` (validation.go:902-923): completions is
+/// immutable for a non-indexed Job, and for an Indexed Job may change only in
+/// tandem with parallelism.
+fn validate_completions(spec: &JobSpec, old_spec: &JobSpec, fld_path: &Path) -> ErrorList {
+    let is_indexed_job = spec.completion_mode.as_deref() == Some(INDEXED_COMPLETION);
+    if !is_indexed_job {
+        return validate_immutable_field(&spec.completions, &old_spec.completions, fld_path);
+    }
+    if spec.completions == old_spec.completions {
+        return Vec::new();
+    }
+    // Indexed Jobs cannot set completions to nil. The nil check is already
+    // performed in validateJobSpec.
+    let Some(completions) = spec.completions else {
+        return Vec::new();
+    };
+    if Some(completions) != spec.parallelism {
+        return vec![Error::invalid(
+            fld_path,
+            completions,
+            "can only be modified in tandem with spec.parallelism",
+        )];
+    }
+    Vec::new()
 }
 
 /// Port of upstream `IsDomainPrefixedPath` (structure + host subdomain). The
@@ -988,6 +1191,16 @@ mod success_policy_indexes_tests {
 
 #[cfg(test)]
 mod parity_tests {
+    /// The create path's options: `RequirePrefixedLabels: true`.
+    fn validate_job(job: &Job) -> ErrorList {
+        super::validate_job(
+            job,
+            &JobValidationOptions {
+                require_prefixed_labels: true,
+                ..Default::default()
+            },
+        )
+    }
     use super::*;
     use crate::resources::pod::{Container, PodSpec};
     use crate::resources::workloads::{
@@ -1026,7 +1239,7 @@ mod parity_tests {
             ("batch.kubernetes.io/controller-uid", &uid),
             ("batch.kubernetes.io/job-name", &name),
         ]);
-        let mut meta = ObjectMeta::new(&name);
+        let mut meta = ObjectMeta::new(&name).with_namespace("default");
         meta.uid = uid.clone();
         Job {
             type_meta: TypeMeta {
@@ -1078,6 +1291,151 @@ mod parity_tests {
     }
 
     // --- baseline -----------------------------------------------------------
+
+    /// Cases from upstream `TestValidateJobUpdate`
+    /// (pkg/apis/batch/validation/validation_test.go).
+    mod update {
+        use super::*;
+        use crate::resources::pod::{
+            Affinity, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
+        };
+
+        fn stored() -> Job {
+            let mut job = valid_generated_job();
+            job.metadata.resource_version = Some("1".into());
+            job
+        }
+
+        fn update_errs(new: &Job, old: &Job, opts: JobValidationOptions) -> Vec<String> {
+            validate_job_update(new, old, &opts)
+                .iter()
+                .map(|e| e.field.to_string())
+                .collect()
+        }
+
+        #[test]
+        fn mutable_fields() {
+            let old = stored();
+            let mut new = old.clone();
+            new.spec.parallelism = Some(2);
+            new.spec.active_deadline_seconds = Some(3);
+            new.spec.suspend = Some(true);
+            new.spec.ttl_seconds_after_finished = Some(1);
+            assert_eq!(
+                update_errs(&new, &old, Default::default()),
+                Vec::<String>::new()
+            );
+        }
+
+        #[test]
+        fn immutable_fields() {
+            let old = stored();
+            for (field, mutate) in [
+                (
+                    "spec.completions",
+                    (|j: &mut Job| j.spec.completions = Some(3)) as fn(&mut Job),
+                ),
+                ("spec.completionMode", |j| {
+                    j.spec.completion_mode = Some("Indexed".into());
+                    j.spec.completions = Some(1);
+                }),
+                ("spec.template", |j| {
+                    j.spec.template.spec.containers[0].image = "other".into()
+                }),
+                ("spec.backoffLimitPerIndex", |j| {
+                    j.spec.backoff_limit_per_index = Some(1)
+                }),
+                ("spec.managedBy", |j| {
+                    j.spec.managed_by = Some("example.com/foo".into())
+                }),
+            ] {
+                let mut new = old.clone();
+                mutate(&mut new);
+                let got = update_errs(&new, &old, Default::default());
+                assert!(got.iter().any(|f| f == field), "{field}: {got:?}");
+            }
+        }
+
+        /// `validateCompletions`: an Indexed Job's completions may change in
+        /// tandem with parallelism.
+        #[test]
+        fn indexed_completions_move_with_parallelism() {
+            let mut old = stored();
+            old.spec.completion_mode = Some("Indexed".into());
+            old.spec.completions = Some(2);
+            old.spec.parallelism = Some(2);
+            let mut both = old.clone();
+            both.spec.completions = Some(4);
+            both.spec.parallelism = Some(4);
+            assert_eq!(
+                update_errs(&both, &old, Default::default()),
+                Vec::<String>::new()
+            );
+
+            let mut alone = old.clone();
+            alone.spec.completions = Some(4);
+            let errs = validate_job_update(&alone, &old, &Default::default());
+            assert!(
+                errs.iter().any(|e| e.field == "spec.completions"
+                    && e.detail == "can only be modified in tandem with spec.parallelism"),
+                "{errs:?}"
+            );
+        }
+
+        /// "update node affinity, node selector and tolerations for a
+        /// suspended, not started job": allowed only with
+        /// `AllowMutableSchedulingDirectives`, and only when suspended.
+        #[test]
+        fn scheduling_directives_are_mutable_only_when_allowed() {
+            let mut old = stored();
+            old.spec.suspend = Some(true);
+            let mut new = old.clone();
+            new.spec.template.spec.node_selector =
+                Some(labels(&[("disk", "ssd")]).into_iter().collect());
+            new.spec.template.spec.affinity = Some(Affinity {
+                node_affinity: Some(NodeAffinity {
+                    required_during_scheduling_ignored_during_execution: Some(NodeSelector {
+                        node_selector_terms: vec![NodeSelectorTerm {
+                            match_expressions: Some(vec![NodeSelectorRequirement {
+                                key: "foo".into(),
+                                operator: "In".into(),
+                                values: Some(vec!["bar".into()]),
+                            }]),
+                            match_fields: None,
+                        }],
+                    }),
+                    preferred_during_scheduling_ignored_during_execution: None,
+                }),
+                pod_affinity: None,
+                pod_anti_affinity: None,
+            });
+            let allowed = JobValidationOptions {
+                allow_mutable_scheduling_directives: true,
+                ..Default::default()
+            };
+            assert_eq!(update_errs(&new, &old, allowed), Vec::<String>::new());
+            assert!(update_errs(&new, &old, Default::default())
+                .iter()
+                .any(|f| f == "spec.template"));
+
+            // Scheduling directives only: an image change is still refused.
+            let mut image = new.clone();
+            image.spec.template.spec.containers[0].image = "other".into();
+            assert!(update_errs(&image, &old, allowed)
+                .iter()
+                .any(|f| f == "spec.template"));
+        }
+
+        #[test]
+        fn metadata_update_is_validated() {
+            let old = stored();
+            let mut new = old.clone();
+            new.metadata.namespace = Some("other".into());
+            assert!(update_errs(&new, &old, Default::default())
+                .iter()
+                .any(|f| f == "metadata.namespace"));
+        }
+    }
 
     #[test]
     fn valid_generated_job_passes() {

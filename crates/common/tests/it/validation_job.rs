@@ -3,8 +3,21 @@
 use rusternetes_common::resources::workloads::{Job, JobSpec};
 use rusternetes_common::resources::PodTemplateSpec;
 use rusternetes_common::types::LabelSelector;
+use rusternetes_common::validation::field::ErrorList;
 use rusternetes_common::validation::field::ErrorType;
-use rusternetes_common::validation::job::validate_job;
+use rusternetes_common::validation::job::JobValidationOptions;
+
+/// The create path's options: `RequirePrefixedLabels: true`
+/// (pkg/registry/batch/job/strategy.go `validationOptionsForJob`).
+fn validate_job(job: &Job) -> ErrorList {
+    rusternetes_common::validation::job::validate_job(
+        job,
+        &JobValidationOptions {
+            require_prefixed_labels: true,
+            ..Default::default()
+        },
+    )
+}
 use std::collections::HashMap;
 
 fn template_with_labels(restart_policy: &str, labels: &[(&str, &str)]) -> PodTemplateSpec {
