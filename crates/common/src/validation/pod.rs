@@ -4737,7 +4737,7 @@ mod tests {
     fn env_name_must_be_valid() {
         let env: Vec<EnvVar> = serde_json::from_value(serde_json::json!([
             {"name": "MY_ENV.name-1", "value": "ok"},
-            {"name": "1bad", "value": "x"},
+            {"name": "BAD=NAME", "value": "x"},
             {"name": "", "value": "y"}
         ]))
         .unwrap();
@@ -4754,14 +4754,48 @@ mod tests {
         assert!(!errs.iter().any(|e| e.field.contains("[0]")), "{errs:?}");
     }
 
+    /// `RelaxedEnvironmentVariableValidation` is GA and locked on since 1.34
+    /// (`pkg/features/kube_features.go`, `LockToDefault: true`), so
+    /// `ValidateEnv` and `ValidateEnvFrom` always take their
+    /// `IsRelaxedEnvVarName` branch
+    /// (`pkg/apis/core/validation/validation.go:2769`, `:2924`): any printable
+    /// ASCII other than `=`. The conformance specs "should be consumable as
+    /// environment variable names with various prefixes" (ConfigMap and
+    /// Secret) send exactly these prefixes.
     #[test]
-    fn env_chdir_prefix_rejected() {
-        assert!(is_env_var_name("..").iter().any(|m| m.contains("'..'")));
-        assert!(is_env_var_name("..foo")
-            .iter()
-            .any(|m| m.contains("start with '..'")));
-        assert!(is_env_var_name(".").iter().any(|m| m.contains("'.'")));
-        assert!(is_env_var_name("GOOD.name-1").is_empty());
+    fn env_names_and_prefixes_are_relaxed() {
+        let env: Vec<EnvVar> = serde_json::from_value(serde_json::json!([
+            {"name": "1bad", "value": "x"},
+            {"name": "..", "value": "x"},
+            {"name": "#@!", "value": "x"}
+        ]))
+        .unwrap();
+        let errs = validate_env(&env, &Path::new("env"));
+        assert!(errs.is_empty(), "{errs:?}");
+
+        let env_from: Vec<EnvFromSource> = serde_json::from_value(serde_json::json!([
+            {"prefix": "p-", "configMapRef": {"name": "cm"}},
+            {"prefix": "1-", "configMapRef": {"name": "cm"}},
+            {"prefix": "$_-", "configMapRef": {"name": "cm"}},
+            {"prefix": "p.", "configMapRef": {"name": "cm"}},
+            {"prefix": "#@!", "configMapRef": {"name": "cm"}}
+        ]))
+        .unwrap();
+        let errs = validate_env_from(&env_from, &Path::new("envFrom"));
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn an_env_prefix_with_an_equals_sign_is_invalid() {
+        let env_from: Vec<EnvFromSource> = serde_json::from_value(serde_json::json!([
+            {"prefix": "a=", "configMapRef": {"name": "cm"}}
+        ]))
+        .unwrap();
+        let errs = validate_env_from(&env_from, &Path::new("envFrom"));
+        assert_eq!(
+            errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+            vec!["envFrom[0].prefix: Invalid value: \"a=\": a valid environment variable name must consist only of printable ASCII characters other than '='".to_string()],
+        );
     }
 
     #[test]
