@@ -1,54 +1,63 @@
+//! LimitRange endpoints.
+//!
+//! Writes go through the
+//! generic endpoint handlers and [`crate::registry::generic::Store`] with the
+//! LimitRange strategies ([`crate::registry::core::limitrange`]) — upstream's
+//! `pkg/registry/core/limitrange/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::core::limitrange;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::LimitRange,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 
-/// Port of upstream `SetDefaults_LimitRangeItem` (pkg/apis/core/v1/defaults.go).
-/// For `Container`-type limits: default `Default` from `Max`, then
-/// `DefaultRequest` from `Default`, then `DefaultRequest` from `Min`. This is
-/// what lets a LimitRange that only specifies `max`/`min` still inject limit
-/// and request defaults into admitted pods.
-fn apply_limit_range_defaults(lr: &mut LimitRange) {
-    for item in &mut lr.spec.limits {
-        if item.item_type != "Container" {
-            continue;
-        }
-        // Default <- Max (for keys not already in Default).
-        let default = item.default.get_or_insert_with(HashMap::new);
-        if let Some(max) = &item.max {
-            for (k, v) in max {
-                default.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-        }
-        // DefaultRequest <- Default, then <- Min.
-        let default_snapshot = default.clone();
-        let default_request = item.default_request.get_or_insert_with(HashMap::new);
-        for (k, v) in &default_snapshot {
-            default_request
-                .entry(k.clone())
-                .or_insert_with(|| v.clone());
-        }
-        if let Some(min) = &item.min {
-            for (k, v) in min {
-                default_request
-                    .entry(k.clone())
-                    .or_insert_with(|| v.clone());
-            }
-        }
+/// The LimitRange `RequestScope`: `v1` `LimitRange` served as
+/// `limitranges`, backed by `limitrange.NewREST`'s store.
+fn scope(state: &ApiServerState) -> RequestScope<LimitRange> {
+    let store = limitrange::new_store(state.storage.clone());
+    RequestScope {
+        kind: GroupVersionKind {
+            group: String::new(),
+            version: "v1".to_string(),
+            kind: "LimitRange".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "limitranges".to_string(),
+        },
+        subresource: None,
+        store: Box::new(store),
+        apply: Some(crate::ssa::apply_legacy::<LimitRange>),
+        convert_to_internal: Some(limitrange::convert_to_internal),
     }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
 }
 
 pub async fn create(
@@ -56,92 +65,32 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut limit_range): DumpingJson<LimitRange>,
-) -> Result<(StatusCode, Json<LimitRange>)> {
-    info!(
-        "Creating LimitRange: {} in namespace: {}",
-        limit_range.metadata.name, namespace
-    );
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "limitranges")
-        .with_api_group("")
-        .with_namespace(&namespace);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &limit_range.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Defaulting (SetDefaults_LimitRangeItem) runs before validation upstream.
-    apply_limit_range_defaults(&mut limit_range);
-
-    // Field validation (mirrors upstream ValidateLimitRange).
-    {
-        let errs = rusternetes_common::validation::limitrange::validate_limit_range(&limit_range);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    limit_range.metadata.namespace = Some(namespace.clone());
-
-    // Enrich metadata with system fields
-    limit_range.metadata.ensure_uid();
-    limit_range.metadata.ensure_creation_timestamp();
-
-    let key = build_key("limitranges", Some(&namespace), &limit_range.metadata.name);
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: LimitRange {}/{} validated successfully (not created)",
-            namespace, limit_range.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(limit_range)));
-    }
-
-    let created = state.storage.create(&key, &limit_range).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<LimitRange>> {
-    debug!("Getting LimitRange: {} in namespace: {}", name, namespace);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "limitranges")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("limitranges", Some(&namespace), &name);
-    let limit_range = state.storage.get(&key).await?;
-
-    Ok(Json(limit_range))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn update(
@@ -149,163 +98,76 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut limit_range): DumpingJson<LimitRange>,
-) -> Result<Json<LimitRange>> {
-    info!("Updating LimitRange: {} in namespace: {}", name, namespace);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "limitranges")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("limitranges", Some(&namespace), &name),
-        "",
-        "limitranges",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
-    )
-    .await?;
-
-    limit_range.metadata.name = name.clone();
-    limit_range.metadata.namespace = Some(namespace.clone());
-
-    let key = build_key("limitranges", Some(&namespace), &name);
-
-    // Defaulting (SetDefaults_LimitRangeItem) runs before validation upstream.
-    apply_limit_range_defaults(&mut limit_range);
-
-    // Field validation on update (upstream LimitRange update strategy re-runs
-    // ValidateLimitRange on the new object). The create path validated but the
-    // update path previously persisted PUTs unchecked.
-    {
-        let errs = rusternetes_common::validation::limitrange::validate_limit_range(&limit_range);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: LimitRange {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(limit_range));
-    }
-
-    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
-        &*state.storage,
-        &key,
-        &mut limit_range,
+        &params,
+        &body,
     )
     .await
-    {
-        Ok(updated) => updated,
-        Err(rusternetes_common::Error::NotFound(_)) => {
-            state.storage.create(&key, &limit_range).await?
-        }
-        Err(e) => return Err(e),
-    };
+}
 
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<LimitRange>> {
-    info!("Deleting LimitRange: {} in namespace: {}", name, namespace);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "limitranges")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("limitranges", Some(&namespace), &name);
-
-    // Get the limit range for finalizer handling
-    let limit_range: LimitRange = state.storage.get(&key).await?;
-
-    // Run validating admission webhooks for DELETE (object=nil, oldObject=limit_range).
-    crate::handlers::admission_helper::run_delete_validating_webhooks(
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
         &state,
-        "",
-        "v1",
-        "LimitRange",
-        "limitranges",
+        &scope(&state),
+        &auth_ctx.user,
         Some(&namespace),
         &name,
-        &limit_range,
-        &user_for_webhook,
-        is_dry_run,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: LimitRange {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(limit_range));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &limit_range,
-        &delete_opts,
+pub async fn deletecollection_limitranges(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
     )
-    .await?;
-
-    if deleted_immediately {
-        Ok(Json(limit_range))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: LimitRange = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+    .await
 }
 
 pub async fn list(
@@ -392,172 +254,4 @@ pub async fn list_all(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(patch, LimitRange, "limitranges", "");
-
-pub async fn deletecollection_limitranges(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection limitranges in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "limitranges")
-        .with_namespace(&namespace)
-        .with_api_group("");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: LimitRange collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all limitranges in the namespace
-    let prefix = build_prefix("limitranges", Some(&namespace));
-    let mut items = state.storage.list::<LimitRange>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("limitranges", Some(&namespace), &item.metadata.name);
-
-        // Run validating admission webhooks for DELETE per item.
-        crate::handlers::admission_helper::run_delete_validating_webhooks(
-            &state,
-            "",
-            "v1",
-            "LimitRange",
-            "limitranges",
-            Some(&namespace),
-            &item.metadata.name,
-            &item,
-            &user_for_webhook,
-            false,
-        )
-        .await?;
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} limitranges deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
-}
-
-#[cfg(test)]
-mod default_tests {
-    use super::*;
-
-    fn defaulted(json: serde_json::Value) -> LimitRange {
-        let mut lr: LimitRange = serde_json::from_value(json).unwrap();
-        apply_limit_range_defaults(&mut lr);
-        lr
-    }
-
-    #[test]
-    fn container_default_from_max_then_request_chain() {
-        let lr = defaulted(serde_json::json!({
-            "metadata": {"name": "lr"},
-            "spec": {"limits": [
-                {"type": "Container", "max": {"cpu": "2"}, "min": {"memory": "64Mi"}}
-            ]}
-        }));
-        let item = &lr.spec.limits[0];
-        // Default <- Max
-        assert_eq!(
-            item.default
-                .as_ref()
-                .unwrap()
-                .get("cpu")
-                .map(String::as_str),
-            Some("2")
-        );
-        // DefaultRequest <- Default (cpu) and <- Min (memory)
-        let dr = item.default_request.as_ref().unwrap();
-        assert_eq!(dr.get("cpu").map(String::as_str), Some("2"));
-        assert_eq!(dr.get("memory").map(String::as_str), Some("64Mi"));
-    }
-
-    #[test]
-    fn explicit_default_is_preserved() {
-        let lr = defaulted(serde_json::json!({
-            "metadata": {"name": "lr"},
-            "spec": {"limits": [
-                {"type": "Container", "max": {"cpu": "2"}, "default": {"cpu": "1"}}
-            ]}
-        }));
-        // explicit default cpu=1 not overwritten by max
-        assert_eq!(
-            lr.spec.limits[0]
-                .default
-                .as_ref()
-                .unwrap()
-                .get("cpu")
-                .map(String::as_str),
-            Some("1")
-        );
-        // defaultRequest derived from the explicit default
-        assert_eq!(
-            lr.spec.limits[0]
-                .default_request
-                .as_ref()
-                .unwrap()
-                .get("cpu")
-                .map(String::as_str),
-            Some("1")
-        );
-    }
-
-    #[test]
-    fn non_container_type_untouched() {
-        let lr = defaulted(serde_json::json!({
-            "metadata": {"name": "lr"},
-            "spec": {"limits": [
-                {"type": "Pod", "max": {"cpu": "2"}}
-            ]}
-        }));
-        assert!(
-            lr.spec.limits[0].default.is_none(),
-            "Pod-type limits get no Default defaulting"
-        );
-    }
 }

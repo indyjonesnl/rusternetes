@@ -1,110 +1,96 @@
+//! PodTemplate endpoints.
+//!
+//! Writes go through the
+//! generic endpoint handlers and [`crate::registry::generic::Store`] with the
+//! PodTemplate strategies ([`crate::registry::core::podtemplate`]) — upstream's
+//! `pkg/registry/core/podtemplate/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::core::podtemplate;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::HeaderMap,
+    response::Response,
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::PodTemplate,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The PodTemplate `RequestScope`: `v1` `PodTemplate` served as
+/// `podtemplates`, backed by `podtemplate.NewREST`'s store.
+fn scope(state: &ApiServerState) -> RequestScope<PodTemplate> {
+    let store = podtemplate::new_store(state.storage.clone());
+    RequestScope {
+        kind: GroupVersionKind {
+            group: String::new(),
+            version: "v1".to_string(),
+            kind: "PodTemplate".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "podtemplates".to_string(),
+        },
+        subresource: None,
+        store: Box::new(store),
+        apply: Some(crate::ssa::apply_legacy::<PodTemplate>),
+        convert_to_internal: Some(podtemplate::convert_to_internal),
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create_podtemplate(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut podtemplate): DumpingJson<PodTemplate>,
-) -> Result<(StatusCode, Json<PodTemplate>)> {
-    info!(
-        "Creating podtemplate: {} in namespace: {}",
-        podtemplate.metadata.name, namespace
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "podtemplates")
-        .with_api_group("")
-        .with_namespace(&namespace);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &podtemplate.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Ensure namespace is set from the URL path
-    podtemplate.metadata.namespace = Some(namespace.clone());
-
-    // SetDefaults_PodSpec + SetDefaults_Container on the embedded template.
-    // Upstream defaults on decode, before `strategy.Validate`
-    // (staging/src/k8s.io/apiserver/pkg/registry/rest/create.go:26-28), which
-    // matters because `validateObjectFieldSelector` requires
-    // `fieldRef.apiVersion` that `SetDefaults_ObjectFieldSelector` supplies
-    // (pkg/apis/core/v1/defaults.go).
-    crate::handlers::defaults::apply_pod_template_defaults(&mut podtemplate.template);
-
-    // Validate the embedded template (upstream ValidatePodTemplateSpec): labels,
-    // annotations, and the pod spec.
-    let errs = rusternetes_common::validation::podtemplate::validate_pod_template(&podtemplate);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Enrich metadata with system fields
-    podtemplate.metadata.ensure_uid();
-    podtemplate.metadata.ensure_creation_timestamp();
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: PodTemplate validated successfully (not created)");
-        return Ok((StatusCode::CREATED, Json(podtemplate)));
-    }
-
-    let key = build_key("podtemplates", Some(&namespace), &podtemplate.metadata.name);
-    let created = state.storage.create(&key, &podtemplate).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get_podtemplate(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<PodTemplate>> {
-    debug!("Getting podtemplate: {} in namespace: {}", name, namespace);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "podtemplates")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("podtemplates", Some(&namespace), &name);
-    let podtemplate = state.storage.get(&key).await?;
-
-    Ok(Json(podtemplate))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn update_podtemplate(
@@ -112,139 +98,76 @@ pub async fn update_podtemplate(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut podtemplate): DumpingJson<PodTemplate>,
-) -> Result<Json<PodTemplate>> {
-    info!("Updating podtemplate: {} in namespace: {}", name, namespace);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "podtemplates")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("podtemplates", Some(&namespace), &name),
-        "",
-        "podtemplates",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    podtemplate.metadata.name = name.clone();
-    podtemplate.metadata.namespace = Some(namespace.clone());
-
-    // SetDefaults_PodSpec + SetDefaults_Container on the embedded template.
-    // Upstream defaults on decode, before `strategy.Validate`
-    // (staging/src/k8s.io/apiserver/pkg/registry/rest/create.go:26-28), which
-    // matters because `validateObjectFieldSelector` requires
-    // `fieldRef.apiVersion` that `SetDefaults_ObjectFieldSelector` supplies
-    // (pkg/apis/core/v1/defaults.go).
-    crate::handlers::defaults::apply_pod_template_defaults(&mut podtemplate.template);
-
-    // Field validation on update (upstream ValidatePodTemplateUpdate re-runs
-    // ValidatePodTemplateSpec on the new object). The create path validated but
-    // the update path previously persisted PUTs unchecked.
-    {
-        let errs = rusternetes_common::validation::podtemplate::validate_pod_template(&podtemplate);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: PodTemplate validated successfully (not updated)");
-        return Ok(Json(podtemplate));
-    }
-
-    let key = build_key("podtemplates", Some(&namespace), &name);
-
-    // Try to update first, if not found then create (upsert behavior).
-    // The update inherits the stored object's server-owned metadata first
-    // (upstream registry/rest/update.go::BeforeUpdate, lines 131-146); the
-    // create path is unchanged, since there is nothing to inherit from.
-    let result = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
-        &*state.storage,
-        &key,
-        &mut podtemplate,
+pub async fn patch_podtemplate(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
-    )
-    .await?;
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete_podtemplate(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<PodTemplate>> {
-    info!("Deleting podtemplate: {} in namespace: {}", name, namespace);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "podtemplates")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("podtemplates", Some(&namespace), &name);
-
-    // Get the resource for finalizer handling
-    let podtemplate: PodTemplate = state.storage.get(&key).await?;
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: PodTemplate validated successfully (not deleted)");
-        return Ok(Json(podtemplate));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &podtemplate,
-        &delete_opts,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    if deleted_immediately {
-        Ok(Json(podtemplate))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: PodTemplate = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+pub async fn deletecollection_podtemplates(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn list_podtemplates(
@@ -466,162 +389,4 @@ pub async fn list_all_podtemplates(
     list.metadata.remaining_item_count = paginated.remaining_item_count;
     list.metadata.resource_version = Some(paginated.resource_version);
     Ok(Json(list).into_response())
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(patch_podtemplate, PodTemplate, "podtemplates", "");
-
-#[cfg(test)]
-#[cfg(feature = "integration-tests")] // Disable tests that require full setup
-mod tests {
-    use super::*;
-    use crate::state::ApiServerState;
-    use rusternetes_common::{
-        authz::Authorizer,
-        resources::{PodSpec, PodTemplateSpec},
-        types::ObjectMeta,
-        User,
-    };
-    use rusternetes_storage::memory::MemoryStorage;
-
-    #[tokio::test]
-    async fn test_podtemplate_create() {
-        use rusternetes_common::auth::{BootstrapTokenManager, TokenManager};
-        use rusternetes_common::authz::AlwaysAllowAuthorizer;
-        use rusternetes_common::observability::MetricsRegistry;
-
-        let storage = Arc::new(MemoryStorage::new());
-        let token_manager = Arc::new(TokenManager::new(b"test-key"));
-        let bootstrap_token_manager = Arc::new(BootstrapTokenManager::new());
-        let authorizer = Arc::new(AlwaysAllowAuthorizer);
-        let metrics = Arc::new(MetricsRegistry::new());
-
-        let state = Arc::new(ApiServerState::new(
-            storage,
-            token_manager,
-            bootstrap_token_manager,
-            authorizer,
-            metrics,
-            true, // skip_auth for tests
-            None, // ca_cert_pem
-        ));
-
-        let pod_template_spec = PodTemplateSpec {
-            metadata: Some(ObjectMeta::new("test-pod")),
-            spec: PodSpec {
-                containers: vec![],
-                init_containers: None,
-                volumes: None,
-                restart_policy: Some("Always".to_string()),
-                node_name: None,
-                node_selector: None,
-                service_account_name: None,
-                service_account: None,
-                hostname: None,
-                subdomain: None,
-                host_network: None,
-                host_pid: None,
-                host_ipc: None,
-                affinity: None,
-                tolerations: None,
-                priority: None,
-                priority_class_name: None,
-                automount_service_account_token: None,
-                ephemeral_containers: None,
-                overhead: None,
-                scheduler_name: None,
-                topology_spread_constraints: None,
-                resource_claims: None,
-            },
-        };
-
-        let podtemplate = PodTemplate::new("test-template", "default", pod_template_spec);
-
-        let auth_ctx = AuthContext {
-            user: User::system(),
-        };
-
-        let result = create_podtemplate(
-            State(state),
-            Extension(auth_ctx),
-            Path("default".to_string()),
-            Json(podtemplate.clone()),
-        )
-        .await;
-
-        assert!(result.is_ok());
-        let (status, created) = result.unwrap();
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created.0.metadata.name, "test-template");
-    }
-}
-
-pub async fn deletecollection_podtemplates(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection podtemplates in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "podtemplates")
-        .with_namespace(&namespace)
-        .with_api_group("");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: PodTemplate collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all podtemplates in the namespace
-    let prefix = build_prefix("podtemplates", Some(&namespace));
-    let mut items = state.storage.list::<PodTemplate>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("podtemplates", Some(&namespace), &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} podtemplates deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }

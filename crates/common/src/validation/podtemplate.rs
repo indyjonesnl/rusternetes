@@ -5,18 +5,46 @@
 //! Validates the embedded `template`: its labels, annotations, and the pod spec
 //! (reusing the shared [`validate_pod_spec`], which also forbids ephemeral
 //! containers on create — upstream forbids them in a pod template too).
-//! ObjectMeta of the PodTemplate itself is validated separately (#1087 / #1277).
+//! `ValidatePodTemplate` / `ValidatePodTemplateUpdate`
+//! (`pkg/apis/core/validation/validation.go:6543-6555`) also validate the
+//! PodTemplate's own ObjectMeta.
 
 use crate::resources::workloads::{PodTemplate, PodTemplateSpec};
 use crate::validation::field::{ErrorList, Path};
 use crate::validation::metav1::validate_labels;
-use crate::validation::objectmeta::validate_annotations;
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, validate_annotations, validate_object_meta, validate_object_meta_update,
+};
 use crate::validation::pod::validate_pod_spec;
 
-/// Validate a `PodTemplate` on create. Mirrors upstream `ValidatePodTemplate`
-/// minus the PodTemplate's own ObjectMeta.
+/// Upstream `ValidatePodTemplate` (validation.go:6543-6547). The name is
+/// `ValidatePodName`, which is `NameIsDNSSubdomain`.
 pub fn validate_pod_template(pt: &PodTemplate) -> ErrorList {
-    validate_pod_template_spec(&pt.template, &Path::new("template"), false)
+    let mut errs = validate_object_meta(
+        &pt.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_pod_template_spec(
+        &pt.template,
+        &Path::new("template"),
+        false,
+    ));
+    errs
+}
+
+/// Upstream `ValidatePodTemplateUpdate` (validation.go:6551-6555): the
+/// metadata update rules, and the template validated as on create. Unlike a
+/// workload's, a standalone template is mutable.
+pub fn validate_pod_template_update(pt: &PodTemplate, old: &PodTemplate) -> ErrorList {
+    let mut errs = validate_object_meta_update(&pt.metadata, &old.metadata, &Path::new("metadata"));
+    errs.extend(validate_pod_template_spec(
+        &pt.template,
+        &Path::new("template"),
+        false,
+    ));
+    errs
 }
 
 /// Validate an embedded pod template. Port of upstream
