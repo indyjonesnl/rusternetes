@@ -585,24 +585,9 @@ impl WatchCache {
         }
     }
 
-    /// Subscribe to watch events and replay any historical events since the
-    /// given resourceVersion. Returns (historical_events, live_receiver).
-    /// The caller should send historical events first, then consume the receiver.
-    pub async fn subscribe_from(
-        &self,
-        prefix: &str,
-        since_revision: i64,
-    ) -> (Vec<CachedWatchEvent>, broadcast::Receiver<CachedWatchEvent>) {
-        // Subscribe first to avoid missing events between history query and subscribe
-        let rx = self.subscribe(prefix).await;
-        // Then get historical events
-        let history = self.get_events_since(prefix, since_revision).await;
-        (history, rx)
-    }
-
-    /// Like [`subscribe_from`], but verifies the ring actually COVERS
-    /// `since_revision`. Returns `Err(floor)` when it does not — the ring only
-    /// holds events with revision > floor, so replaying from an older RV would
+    /// Subscribe and replay the ring's events since `since_revision`, first
+    /// verifying the ring actually COVERS `since_revision`. Returns
+    /// `Err(floor)` when it does not — the ring only holds events with revision > floor, so replaying from an older RV would
     /// silently skip whatever was trimmed (or predates the shared watch).
     /// Callers must answer 410 Expired so the client relists — upstream
     /// cacher "too old resource version" semantics.
@@ -671,12 +656,28 @@ pub fn broadcast_to_stream(mut rx: broadcast::Receiver<CachedWatchEvent>) -> Wat
 
 /// Convert historical events + a broadcast receiver into a WatchStream.
 /// Historical events are replayed first (in order), then live events follow.
+///
+/// `since_revision` is the resourceVersion the client asked to watch from.
+/// Upstream's `cacheWatcher.process` only sends a live event when
+/// `event.ResourceVersion > resourceVersion`, where `resourceVersion` starts at
+/// the requested revision and `processInterval` raises it past every replayed
+/// event (`staging/src/k8s.io/apiserver/pkg/storage/cacher/cache_watcher.go`,
+/// `processInterval` / `process`). Seeding from the history alone is not
+/// enough: when the shared watcher has not yet ingested a write the client
+/// already saw, history is empty and that write would arrive live as if new.
 pub fn broadcast_to_stream_with_history(
     history: Vec<CachedWatchEvent>,
     mut rx: broadcast::Receiver<CachedWatchEvent>,
+    since_revision: i64,
 ) -> WatchStream {
-    // Track the highest revision we replayed so we can deduplicate
-    let max_history_rev = history.iter().map(|e| e.revision).max().unwrap_or(0);
+    // Highest revision the client already has: the one it asked to watch
+    // from, raised past everything replayed below.
+    let max_history_rev = history
+        .iter()
+        .map(|e| e.revision)
+        .max()
+        .unwrap_or(0)
+        .max(since_revision);
 
     let stream = async_stream::stream! {
         // Replay historical events first

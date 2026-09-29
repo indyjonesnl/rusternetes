@@ -278,6 +278,83 @@ fn opens_with_current_state(send_initial_events: Option<bool>, requested_rv: Opt
     }
 }
 
+/// Open the live half of a watch: replay from the requested resourceVersion
+/// when there is one, otherwise subscribe from now.
+///
+/// Ported from `watchCache.getAllEventsSinceLocked`
+/// (`staging/src/k8s.io/apiserver/pkg/storage/cacher/watch_cache.go:878-913`),
+/// which every watch goes through upstream: a specific resourceVersion is
+/// answered from the event ring, and one below the ring's floor is
+/// `errors.NewResourceExpired("too old resource version: %d (%d)")`. The
+/// `Err` arm is that expiry, already built as the streamed ERROR envelope the
+/// handler must return as-is (see `build_watch_error_response`).
+///
+/// rv=0 and rv=1 mean "list current state" and are never replayed — early
+/// revisions may have been compacted (the `rv=1` divergence is documented on
+/// `opens_with_current_state`). Timestamp-like values far beyond the head are
+/// also not replayed.
+async fn open_watch_stream(
+    state: &ApiServerState,
+    prefix: &str,
+    requested_rv: Option<&str>,
+) -> Result<std::result::Result<rusternetes_storage::WatchStream, Response>> {
+    let current_rev = state.storage.current_revision().await.unwrap_or(1);
+    let replay_revision = requested_rv
+        .filter(|rv| !rv.is_empty() && *rv != "0" && *rv != "1")
+        .and_then(|rv| rv.parse::<i64>().ok())
+        .filter(|&rv| rv > 0 && rv <= current_rev + 1000);
+
+    let Some(since_rev) = replay_revision else {
+        let rx = state.watch_cache.subscribe(prefix).await;
+        return Ok(Ok(crate::watch_cache::broadcast_to_stream(rx)));
+    };
+
+    // A compacted revision is an in-stream ERROR envelope (HTTP 200 +
+    // `{type:"ERROR", object:Status{Code:410, Reason:"Expired"}}`), not an
+    // HTTP 410: by the time `cacher.Watch` can report the failure,
+    // `endpoints/handlers/watch.go::serveWatch` has already written the 200
+    // and chunked headers. Pinned by `watch_event_envelope_test.rs::
+    // watch_envelope_error_carries_status`.
+    if state
+        .storage
+        .is_revision_compacted(since_rev)
+        .await
+        .unwrap_or(false)
+    {
+        return build_watch_error_response(resource_expired_status(since_rev, current_rev))
+            .map(Err);
+    }
+
+    // ALWAYS through the shared per-prefix watch cache, never a per-client
+    // storage watch. Upstream serves every watch from the cacher (ONE storage
+    // watch per resource, fanned out in memory). Per-client
+    // `watch_from_revision` streams to the rhino/SQLite backend proved able to
+    // stall silently under write bursts, blinding one informer at a time with
+    // no error for either side to react to (#1165). The shared cache loop has
+    // supervised reconnect-with-replay, so a backend hiccup heals for every
+    // subscriber at once.
+    match state
+        .watch_cache
+        .subscribe_from_checked(prefix, since_rev)
+        .await
+    {
+        Ok((history, rx)) => {
+            debug!(
+                "Serving watch from cache ring: {} history events since rev {} for prefix {}",
+                history.len(),
+                since_rev,
+                prefix
+            );
+            Ok(Ok(crate::watch_cache::broadcast_to_stream_with_history(
+                history, rx, since_rev,
+            )))
+        }
+        Err(floor) => {
+            build_watch_error_response(resource_expired_status(since_rev, floor)).map(Err)
+        }
+    }
+}
+
 /// Generic watch handler for namespaced resources.
 pub async fn watch_namespaced<T>(
     state: Arc<ApiServerState>,
@@ -394,76 +471,9 @@ where
     let (bookmark_kind, bookmark_api_version) =
         bookmark_gvk.unwrap_or_else(|| resource_type_to_kind_and_version(resource_type, api_group));
 
-    // Determine if we have a specific non-zero resourceVersion to replay from.
-    // rv=0 and rv=1 are treated as "list current state" — don't replay from etcd
-    // history because early revisions may have been compacted.
-    // Also filter out timestamp-based RVs (> 1 billion) which would cause etcd errors.
-    let current_rev = state.storage.current_revision().await.unwrap_or(1);
-    let replay_revision = requested_rv
-        .as_deref()
-        .filter(|rv| !rv.is_empty() && *rv != "0" && *rv != "1")
-        .and_then(|rv| rv.parse::<i64>().ok())
-        .filter(|&rv| rv > 0 && rv <= current_rev + 1000);
-
-    // If the requested resourceVersion has been compacted, emit a streamed
-    // ERROR envelope (HTTP 200 + `{type:"ERROR", object:Status{Code:410,
-    // Reason:"Expired"}}`) instead of returning HTTP 410 Gone.
-    //
-    // Upstream parity: `staging/src/k8s.io/apiserver/pkg/storage/cacher/
-    // cacher.go::Watch` returns `errs.NewResourceExpired(...)` when the
-    // requested RV is below the cacher's earliest available revision. For
-    // `?watch=true`, `endpoints/handlers/watch.go::serveWatch` has already
-    // written the 200 status + chunked headers by the time `cacher.Watch`
-    // can report the failure, so the only way to deliver it is an in-stream
-    // `watch.Event{Type: Error, Object: NewResourceExpired(...).Status()}`
-    // frame. Mirroring this is required by the watch-envelope conformance
-    // contract (`tests/watch_event_envelope_test.rs::
-    // watch_envelope_error_carries_status`).
-    if let Some(since_rev) = replay_revision {
-        if state
-            .storage
-            .is_revision_compacted(since_rev)
-            .await
-            .unwrap_or(false)
-        {
-            return build_watch_error_response(resource_expired_status(since_rev, current_rev));
-        }
-    }
-
-    // Subscribe to watch events — ALWAYS through the shared per-prefix watch
-    // cache, never a per-client storage watch. Upstream serves every watch
-    // from the cacher (ONE storage watch per resource, fanned out in memory;
-    // staging/src/k8s.io/apiserver/pkg/storage/cacher). Per-client
-    // `watch_from_revision` streams to the rhino/SQLite backend proved able to
-    // stall silently under write bursts — open but delivering nothing — which
-    // blinded exactly one informer at a time (the KCM endpointslice tracker
-    // wedge, #1165) with no error for either side to react to. The shared
-    // cache loop has supervised reconnect-with-replay, so a backend hiccup
-    // heals for every subscriber at once. If the requested resourceVersion
-    // predates the cache ring's coverage, reply 410 Expired so the client
-    // relists — upstream "too old resource version" semantics.
-    let watch_stream = if let Some(since_rev) = replay_revision {
-        match state
-            .watch_cache
-            .subscribe_from_checked(&prefix, since_rev)
-            .await
-        {
-            Ok((history, rx)) => {
-                debug!(
-                    "Serving watch from cache ring: {} history events since rev {} for prefix {}",
-                    history.len(),
-                    since_rev,
-                    prefix
-                );
-                crate::watch_cache::broadcast_to_stream_with_history(history, rx)
-            }
-            Err(floor) => {
-                return build_watch_error_response(resource_expired_status(since_rev, floor));
-            }
-        }
-    } else {
-        let rx = state.watch_cache.subscribe(&prefix).await;
-        crate::watch_cache::broadcast_to_stream(rx)
+    let watch_stream = match open_watch_stream(&state, &prefix, requested_rv.as_deref()).await? {
+        Ok(stream) => stream,
+        Err(expired) => return Ok(expired),
     };
 
     // List existing resources to send as initial ADDED events.
@@ -1012,64 +1022,9 @@ where
     let (bookmark_kind, bookmark_api_version) =
         bookmark_gvk.unwrap_or_else(|| resource_type_to_kind_and_version(resource_type, api_group));
 
-    // Determine if we have a specific non-zero resourceVersion to replay from.
-    // rv=0 and rv=1 are treated as "list current state" — don't replay from etcd
-    // history because early revisions may have been compacted.
-    // Also filter out timestamp-based RVs (> 1 billion) which would cause etcd errors.
-    let current_rev = state.storage.current_revision().await.unwrap_or(1);
-    let replay_revision = requested_rv
-        .as_deref()
-        .filter(|rv| !rv.is_empty() && *rv != "0" && *rv != "1")
-        .and_then(|rv| rv.parse::<i64>().ok())
-        .filter(|&rv| rv > 0 && rv <= current_rev + 1000);
-
-    // Compacted-RV → streamed ERROR envelope. See `watch_namespaced` for the
-    // detailed upstream rationale; same contract for cluster-scoped watches.
-    if let Some(since_rev) = replay_revision {
-        if state
-            .storage
-            .is_revision_compacted(since_rev)
-            .await
-            .unwrap_or(false)
-        {
-            return build_watch_error_response(resource_expired_status(since_rev, current_rev));
-        }
-    }
-
-    // Subscribe to watch events — ALWAYS through the shared per-prefix watch
-    // cache, never a per-client storage watch. Upstream serves every watch
-    // from the cacher (ONE storage watch per resource, fanned out in memory;
-    // staging/src/k8s.io/apiserver/pkg/storage/cacher). Per-client
-    // `watch_from_revision` streams to the rhino/SQLite backend proved able to
-    // stall silently under write bursts — open but delivering nothing — which
-    // blinded exactly one informer at a time (the KCM endpointslice tracker
-    // wedge, #1165) with no error for either side to react to. The shared
-    // cache loop has supervised reconnect-with-replay, so a backend hiccup
-    // heals for every subscriber at once. If the requested resourceVersion
-    // predates the cache ring's coverage, reply 410 Expired so the client
-    // relists — upstream "too old resource version" semantics.
-    let watch_stream = if let Some(since_rev) = replay_revision {
-        match state
-            .watch_cache
-            .subscribe_from_checked(&prefix, since_rev)
-            .await
-        {
-            Ok((history, rx)) => {
-                debug!(
-                    "Serving watch from cache ring: {} history events since rev {} for prefix {}",
-                    history.len(),
-                    since_rev,
-                    prefix
-                );
-                crate::watch_cache::broadcast_to_stream_with_history(history, rx)
-            }
-            Err(floor) => {
-                return build_watch_error_response(resource_expired_status(since_rev, floor));
-            }
-        }
-    } else {
-        let rx = state.watch_cache.subscribe(&prefix).await;
-        crate::watch_cache::broadcast_to_stream(rx)
+    let watch_stream = match open_watch_stream(&state, &prefix, requested_rv.as_deref()).await? {
+        Ok(stream) => stream,
+        Err(expired) => return Ok(expired),
     };
 
     // List existing resources to send as initial ADDED events.
@@ -2823,37 +2778,15 @@ pub async fn watch_cluster_scoped_json(
 
     let prefix = build_prefix(resource_type, None);
 
-    // Use history-aware subscription when a specific resourceVersion is requested.
-    // This replays MODIFIED events from the watch cache history, which is critical
-    // for CRD Established condition delivery — the Go informer ignores duplicate
-    // ADDED events but processes MODIFIED events from history replay.
+    // A specific resourceVersion replays MODIFIED events from the watch
+    // cache ring, which is critical for CRD Established condition delivery —
+    // the Go informer ignores a duplicate ADDED but processes a MODIFIED.
     let requested_rv = params.resource_version.clone();
-    let (watch_stream, existing_resources) = if let Some(ref rv_str) = requested_rv {
-        if let Ok(rv) = rv_str.parse::<i64>() {
-            if rv > 1 {
-                // Specific RV: replay history from that revision
-                let (history, rx) = state.watch_cache.subscribe_from(&prefix, rv).await;
-                let stream = crate::watch_cache::broadcast_to_stream_with_history(history, rx);
-                // Don't send initial ADDED events — history replay delivers MODIFIED events
-                (stream, Vec::new())
-            } else {
-                let rx = state.watch_cache.subscribe(&prefix).await;
-                let stream = crate::watch_cache::broadcast_to_stream(rx);
-                let resources: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
-                (stream, resources)
-            }
-        } else {
-            let rx = state.watch_cache.subscribe(&prefix).await;
-            let stream = crate::watch_cache::broadcast_to_stream(rx);
-            let resources: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
-            (stream, resources)
-        }
-    } else {
-        let rx = state.watch_cache.subscribe(&prefix).await;
-        let stream = crate::watch_cache::broadcast_to_stream(rx);
-        let resources: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
-        (stream, resources)
+    let watch_stream = match open_watch_stream(&state, &prefix, requested_rv.as_deref()).await? {
+        Ok(stream) => stream,
+        Err(expired) => return Ok(expired),
     };
+    let existing_resources: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
 
     let current_rev = state.storage.current_revision().await.unwrap_or(1);
     let current_rev_str = current_rev.to_string();
@@ -3045,8 +2978,11 @@ pub async fn watch_namespaced_json(
     }
 
     let prefix = build_prefix(resource_type, Some(&namespace));
-    let watch_rx = state.watch_cache.subscribe(&prefix).await;
-    let watch_stream = crate::watch_cache::broadcast_to_stream(watch_rx);
+    let requested_rv = params.resource_version.clone();
+    let watch_stream = match open_watch_stream(&state, &prefix, requested_rv.as_deref()).await? {
+        Ok(stream) => stream,
+        Err(expired) => return Ok(expired),
+    };
     let existing_resources: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
     let current_rev = state.storage.current_revision().await.unwrap_or(1);
     let current_rev_str = current_rev.to_string();
@@ -3063,21 +2999,12 @@ pub async fn watch_namespaced_json(
     let timeout_duration = Some(Duration::from_secs(
         params.timeout_seconds.unwrap_or(300).min(300),
     ));
-    let _requested_rv = params.resource_version.clone();
     let (bookmark_kind, bookmark_api_version) =
         resource_type_to_kind_and_version(resource_type, api_group);
 
-    // Always send initial events for namespaced JSON watches UNLESS the client
-    // explicitly said `sendInitialEvents=false`, which upstream honours
-    // unconditionally (`watch_cache.go:878-913`).
-    //
-    // The unconditional snapshot compensates for a gap this path still has:
-    // unlike `watch_namespaced_inner` it never replays, so a client watching a
-    // custom resource from a specific resourceVersion (the one its CREATE
-    // returned) would otherwise miss the MODIFIED that already happened — the
-    // CRD `Established=True` condition being the case that matters. Tracked
-    // separately; until the replay lands, only the explicit `false` is honoured.
-    let should_send_initial = send_initial_events != Some(false);
+    // A specific resourceVersion (> 1) is served by the replay above.
+    let should_send_initial =
+        opens_with_current_state(send_initial_events, requested_rv.as_deref());
 
     tokio::spawn(async move {
         let mut latest_resource_version: Option<String> = Some(current_rev_str);
