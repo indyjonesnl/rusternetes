@@ -524,14 +524,25 @@ pub async fn update_crd(
     // `conversion.strategy` are required by the validator precisely because
     // defaulting has filled them (`apiextensions/v1/defaults.go:41-53`).
     rusternetes_common::validation::crd::set_defaults_custom_resource_definition(&mut crd);
-    validate_crd(&crd)?;
 
     crd.metadata.name = name.clone();
 
-    // Get old object for webhook old_object field
+    // Get old object — for the webhook `oldObject` field, and for
+    // `ValidateCustomResourceDefinitionUpdate`'s immutability rules, which read
+    // the stored spec (`validation.go:648-664`).
     let key = build_key("customresourcedefinitions", None, &name);
     let old_crd_value: Option<serde_json::Value> =
         state.storage.get::<serde_json::Value>(&key).await.ok();
+
+    match old_crd_value
+        .as_ref()
+        .and_then(|v| serde_json::from_value::<CustomResourceDefinition>(v.clone()).ok())
+    {
+        Some(old) => validate_crd_update(&crd, &old)?,
+        // `reject_create_on_update` above guarantees the object exists; a body
+        // we cannot decode as a CRD leaves only the create-time rules.
+        None => validate_crd(&crd)?,
+    }
 
     // Run admission webhooks for CRD update
     let gvk = GroupVersionKind {
@@ -744,17 +755,15 @@ fn apply_spec_defaults_to_raw(raw: &mut serde_json::Value, crd: &CustomResourceD
 /// `singular`/`listKind` and `conversion.strategy` are required by the
 /// validator and filled by defaulting, exactly as upstream orders them.
 fn validate_crd(crd: &CustomResourceDefinition) -> Result<()> {
-    let errs = rusternetes_common::validation::crd::validate_custom_resource_definition_spec(
-        &crd.spec,
-        &rusternetes_common::validation::field::Path::new("spec"),
-    );
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
+    validate_crd_spec_and_rules(crd)?;
 
     // The CRD's name must be `<plural>.<group>`. Upstream enforces this through
     // the name validation function it hands `ValidateObjectMeta`
-    // (`validation.go:63-70`).
+    // (`validation.go:63-70`, `:100`) — on **create** only. The update
+    // validator calls `ValidateObjectMetaUpdate` instead (`:251`), which has no
+    // name function, because `metadata.name` cannot change on an update anyway.
+    // Running it there turned every immutability rejection into a confusing
+    // `metadata.name` error (#2020).
     let expected_name = format!("{}.{}", crd.spec.names.plural, crd.spec.group);
     if crd.metadata.name != expected_name {
         return Err(rusternetes_common::Error::Invalid(vec![
@@ -765,12 +774,118 @@ fn validate_crd(crd: &CustomResourceDefinition) -> Result<()> {
             ),
         ]));
     }
+    Ok(())
+}
+
+/// Everything `ValidateCustomResourceDefinition` and
+/// `ValidateCustomResourceDefinitionUpdate` share: the spec rules and the CEL
+/// rule checks.
+fn validate_crd_spec_and_rules(crd: &CustomResourceDefinition) -> Result<()> {
+    let errs = rusternetes_common::validation::crd::validate_custom_resource_definition_spec(
+        &crd.spec,
+        &rusternetes_common::validation::field::Path::new("spec"),
+    );
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
 
     // Validate every served version's x-kubernetes-validations rules:
     // syntax check, unknown-property check, and estimated-cost check.
     // K8s rejects CRD creation when any rule is malformed.
     crate::handlers::cel_validation::validate_crd_versions(crd)?;
 
+    Ok(())
+}
+
+/// `IsCRDConditionTrue(oldObj, Established)` (`validation.go:234`), which is
+/// what upstream keys `requireImmutableNames` off.
+fn is_established(crd: &CustomResourceDefinition) -> bool {
+    crd.status
+        .as_ref()
+        .and_then(|st| st.conditions.as_ref())
+        .is_some_and(|conditions| {
+            conditions
+                .iter()
+                .any(|c| c.type_ == "Established" && c.status == "True")
+        })
+}
+
+/// `ValidateCustomResourceDefinitionUpdate` (`validation.go:230-250`): the
+/// create-time spec validation plus the immutability rules, which need the
+/// stored object.
+///
+/// Upstream has a single `Store.Update` behind PUT, PATCH and apply
+/// (`registry/generic/registry/store.go`), reached through the CRD strategy's
+/// `ValidateUpdate`
+/// (`apiextensions-apiserver/pkg/registry/customresourcedefinition/strategy.go`),
+/// so all three verbs run this. A rule that only guards PUT is not a rule
+/// (#2020).
+fn validate_crd_update(
+    crd: &CustomResourceDefinition,
+    old: &CustomResourceDefinition,
+) -> Result<()> {
+    validate_crd_spec_and_rules(crd)?;
+
+    let errs = rusternetes_common::validation::crd::validate_custom_resource_definition_spec_update(
+        &crd.spec,
+        &old.spec,
+        is_established(old),
+        &rusternetes_common::validation::field::Path::new("spec"),
+    );
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+    Ok(())
+}
+
+/// Default and validate a CRD document that a PATCH (or an apply) produced,
+/// then write the defaults back into the raw JSON we store.
+///
+/// The three values `SetDefaults_CustomResourceDefinitionSpec`
+/// (`apiextensions/v1/defaults.go:41-53`) fills are simple scalars, so they can
+/// go back into the merged document; the rest of it stays raw, because a typed
+/// round-trip loses nested schema fields.
+fn default_and_validate_patched_crd(
+    merged: &mut serde_json::Value,
+    old: &CustomResourceDefinition,
+) -> Result<()> {
+    let mut crd: CustomResourceDefinition =
+        serde_json::from_value(merged.clone()).map_err(|e| {
+            rusternetes_common::Error::InvalidResource(format!("Patched CRD is not valid: {}", e))
+        })?;
+    rusternetes_common::validation::crd::set_defaults_custom_resource_definition(&mut crd);
+    validate_crd_update(&crd, old)?;
+
+    let Some(spec) = merged.get_mut("spec").and_then(|s| s.as_object_mut()) else {
+        return Ok(());
+    };
+    let names = spec.entry("names").or_insert_with(|| serde_json::json!({}));
+    if let Some(names) = names.as_object_mut() {
+        for (key, value) in [
+            ("singular", crd.spec.names.singular.as_deref()),
+            ("listKind", crd.spec.names.list_kind.as_deref()),
+        ] {
+            let missing = names
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty();
+            if missing {
+                if let Some(value) = value {
+                    names.insert(key.to_string(), serde_json::json!(value));
+                }
+            }
+        }
+    }
+    if !spec.contains_key("conversion") {
+        if let Some(conversion) = &crd.spec.conversion {
+            spec.insert(
+                "conversion".to_string(),
+                serde_json::to_value(conversion)
+                    .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -851,6 +966,15 @@ pub async fn patch_crd(
 
             match result {
                 rusternetes_common::server_side_apply::ApplyResult::Success(mut applied_json) => {
+                    // Upstream's apply path is the same `Store.Update` as PUT,
+                    // so the merged document is defaulted and validated before
+                    // it is stored (#2020).
+                    if let Some(old) = current_json.as_ref().and_then(|v| {
+                        serde_json::from_value::<CustomResourceDefinition>(v.clone()).ok()
+                    }) {
+                        default_and_validate_patched_crd(&mut applied_json, &old)?;
+                    }
+
                     // Set the last-applied-configuration annotation
                     if let Some(metadata) = applied_json.get_mut("metadata") {
                         if let Some(obj) = metadata.as_object_mut() {
@@ -941,12 +1065,24 @@ pub async fn patch_crd(
         }
     }
 
-    // Validate that the patched JSON can still be parsed as a CRD (catch structural errors)
-    // but do NOT use the typed struct for storage — store the raw JSON directly.
-    let _validate: CustomResourceDefinition = serde_json::from_value(patched_json.clone())
-        .map_err(|e| {
-            rusternetes_common::Error::InvalidResource(format!("Patched CRD is not valid: {}", e))
-        })?;
+    // Default and validate the merged document. Upstream has one `Store.Update`
+    // behind PUT, PATCH and apply, so a PATCH runs
+    // `ValidateCustomResourceDefinitionUpdate` exactly as a PUT does; guarding
+    // only PUT let a patch install any spec the create path rejects (#2020).
+    // The typed value is for validation only — the raw JSON is what gets
+    // stored, because a typed round-trip loses nested schema fields.
+    match serde_json::from_value::<CustomResourceDefinition>(current_json.clone()) {
+        Ok(old) => default_and_validate_patched_crd(&mut patched_json, &old)?,
+        Err(_) => {
+            let _validate: CustomResourceDefinition = serde_json::from_value(patched_json.clone())
+                .map_err(|e| {
+                    rusternetes_common::Error::InvalidResource(format!(
+                        "Patched CRD is not valid: {}",
+                        e
+                    ))
+                })?;
+        }
+    }
 
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);

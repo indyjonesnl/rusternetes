@@ -71,6 +71,7 @@ mod crd_discovery_after_create_test;
 mod crd_items_schema_unwrap_test;
 mod crd_openapi_publish_test;
 mod crd_openapi_v2_test;
+mod crd_patch_validation_test;
 mod crd_status_watch_test;
 mod crd_watch_version_conversion_test;
 mod cri_ws_attach_proxy_test;

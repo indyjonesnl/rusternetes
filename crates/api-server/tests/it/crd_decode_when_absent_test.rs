@@ -283,7 +283,18 @@ async fn a_fully_populated_crd_is_written() {
         },
         "versions": [{
             "name": "v1", "served": true, "storage": true,
-            "schema": { "openAPIV3Schema": { "type": "object" } },
+            // `selectableFields[].jsonPath` is resolved against this schema
+            // (`ValidateCustomResourceSelectableFields`, `validation.go:856`),
+            // so `.spec.color` has to be declared in it.
+            "schema": { "openAPIV3Schema": {
+                "type": "object",
+                "properties": {
+                    "spec": {
+                        "type": "object",
+                        "properties": { "color": { "type": "string" } }
+                    }
+                }
+            } },
             "subresources": {
                 "status": {},
                 "scale": {
