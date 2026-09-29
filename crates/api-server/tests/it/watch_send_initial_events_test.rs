@@ -237,11 +237,7 @@ async fn run_case(case: &Case) -> Vec<String> {
         uri.push_str(&format!("&sendInitialEvents={b}"));
     }
 
-    let handle = tokio::spawn(collect_for(
-        api.clone(),
-        uri,
-        Duration::from_millis(1_500),
-    ));
+    let handle = tokio::spawn(collect_for(api.clone(), uri, Duration::from_millis(1_500)));
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     for name in ["cm4", "cm5"] {

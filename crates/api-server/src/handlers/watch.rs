@@ -246,6 +246,38 @@ async fn deserialize_converted<T: DeserializeOwned>(
     }
 }
 
+/// Does this watch open with a snapshot of the current state, delivered as one
+/// synthetic `ADDED` per object before the live stream?
+///
+/// Ported from `watchCache.getAllEventsSinceLocked`
+/// (`staging/src/k8s.io/apiserver/pkg/storage/cacher/watch_cache.go:878-913`).
+/// `ListOptions.SendInitialEvents` is a `*bool` upstream and all three states
+/// mean different things:
+///
+/// * `true` — snapshot the store whatever the resourceVersion is
+///   (`return w.getIntervalFromStoreLocked(key, matchesSingle)`, first branch).
+/// * absent — snapshot only at `resourceVersion=0`/unset, "to keep backward
+///   compatibility ... return the current state and only then start watching
+///   from that point".
+/// * `false` — never snapshot; at `resourceVersion=0` upstream rewrites the
+///   revision to `w.resourceVersion`, i.e. "start watching from ~now". This is
+///   the only way a client can ask for a watch that does not replay the world,
+///   and `unwrap_or(false)` on the query parameter made it unaskable.
+///
+/// Divergence: upstream answers `resourceVersion=1` from the ring (`oldest` is
+/// `listResourceVersion + 1`, so a fresh cache replays every create), and its
+/// matrix expects initial events there even with `sendInitialEvents=false`.
+/// This server excludes `rv=1` from replay — early revisions may be compacted —
+/// so the store snapshot stands in for that replay and produces the same
+/// envelopes.
+fn opens_with_current_state(send_initial_events: Option<bool>, requested_rv: Option<&str>) -> bool {
+    match send_initial_events {
+        Some(true) => true,
+        Some(false) => requested_rv == Some("1"),
+        None => matches!(requested_rv, None | Some("") | Some("0") | Some("1")),
+    }
+}
+
 /// Generic watch handler for namespaced resources.
 pub async fn watch_namespaced<T>(
     state: Arc<ApiServerState>,
@@ -342,7 +374,12 @@ where
 
     // Extract parameters
     let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
-    let send_initial_events = params.send_initial_events.unwrap_or(false);
+    // `sendInitialEvents` is three-way — see `opens_with_current_state`.
+    // `watchlist` is upstream's `*opts.SendInitialEvents` being true, the
+    // half of `isListWatchRequest` (`cacher.go:1241-1243`) that does not
+    // depend on `allowWatchBookmarks`.
+    let send_initial_events = params.send_initial_events;
+    let watchlist = send_initial_events == Some(true);
     // Watch timeout: honor client-requested timeout, capped at 10 minutes.
     // K8s default --min-request-timeout is 1800s (30 min). Conformance tests
     // request 350-572s timeouts. Capping below the client's request causes
@@ -473,14 +510,10 @@ where
     // the background task use send().await to guarantee delivery.
     let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<String, std::io::Error>>(256);
 
-    // Determine whether to send initial ADDED events:
-    // - If sendInitialEvents=true: always send
-    // - If resourceVersion is "0", "1", or absent: send initial events
-    // - If resourceVersion is a specific value (> 1): skip initial events (etcd watch replay handles it)
-    let should_send_initial = send_initial_events
-        || requested_rv.as_deref() == Some("0")
-        || requested_rv.as_deref() == Some("1")
-        || requested_rv.is_none();
+    // Determine whether to send initial ADDED events. A specific
+    // resourceVersion (> 1) is served by the replay above instead.
+    let should_send_initial =
+        opens_with_current_state(send_initial_events, requested_rv.as_deref());
 
     // PRE-BUFFER initial events BEFORE returning the Response.
     // K8s sends headers + first events synchronously (watch.go:237-282).
@@ -518,7 +551,7 @@ where
     }
 
     // Send initial-events-end bookmark if sendInitialEvents was requested
-    if send_initial_events {
+    if watchlist && allow_bookmarks {
         let rv = initial_latest_rv
             .clone()
             .unwrap_or_else(|| current_rev_str.clone());
@@ -786,7 +819,7 @@ where
                             futures::future::pending::<()>().await
                         }
                     } => {
-                        if allow_bookmarks || send_initial_events {
+                        if allow_bookmarks || watchlist {
                             if let Some(ref rv) = latest_resource_version {
                                 debug!("Sending bookmark with resourceVersion: {}", rv);
                                 let bookmark = BookmarkObject {
@@ -823,7 +856,7 @@ where
                 Err(_) => {
                     info!("Watch stream timeout after {:?}", timeout_dur);
                     // Send final bookmark before closing if bookmarks are enabled
-                    if allow_bookmarks || send_initial_events {
+                    if allow_bookmarks || watchlist {
                         if let Some(ref rv) = latest_resource_version {
                             let bookmark = BookmarkObject {
                                 kind: Some(bookmark_kind.clone()),
@@ -959,7 +992,12 @@ where
 
     // Extract parameters
     let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
-    let send_initial_events = params.send_initial_events.unwrap_or(false);
+    // `sendInitialEvents` is three-way — see `opens_with_current_state`.
+    // `watchlist` is upstream's `*opts.SendInitialEvents` being true, the
+    // half of `isListWatchRequest` (`cacher.go:1241-1243`) that does not
+    // depend on `allowWatchBookmarks`.
+    let send_initial_events = params.send_initial_events;
+    let watchlist = send_initial_events == Some(true);
     // Watch timeout: honor client-requested timeout, capped at 10 minutes.
     // K8s default --min-request-timeout is 1800s (30 min). Conformance tests
     // request 350-572s timeouts. Capping below the client's request causes
@@ -1076,9 +1114,10 @@ where
     // guarantee delivery under HTTP/2 back-pressure.
     let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<String, std::io::Error>>(256);
 
-    // Determine whether to send initial ADDED events
+    // Determine whether to send initial ADDED events. A specific
+    // resourceVersion (> 1) is served by the replay above instead.
     let should_send_initial =
-        send_initial_events || requested_rv.as_deref() == Some("0") || requested_rv.is_none();
+        opens_with_current_state(send_initial_events, requested_rv.as_deref());
 
     // Spawn task to convert watch events to HTTP response
     tokio::spawn(async move {
@@ -1164,7 +1203,7 @@ where
         // events to signal "initial list is complete". The bookmark must have the
         // annotation "k8s.io/initial-events-end": "true" — client-go checks for
         // this specific annotation to know initial sync is done.
-        if send_initial_events {
+        if watchlist && allow_bookmarks {
             // MUST send initial-events-end bookmark — client hangs without it.
             // Use latest resourceVersion from initial resources, or "0" as fallback.
             let rv = latest_resource_version
@@ -1380,7 +1419,7 @@ where
                             futures::future::pending::<()>().await
                         }
                     } => {
-                        if allow_bookmarks || send_initial_events {
+                        if allow_bookmarks || watchlist {
                             if let Some(ref rv) = latest_resource_version {
                                 debug!("Sending bookmark with resourceVersion: {}", rv);
                                 let bookmark = BookmarkObject {
@@ -1417,7 +1456,7 @@ where
                 Err(_) => {
                     info!("Watch stream timeout after {:?}", timeout_dur);
                     // Send final bookmark before closing if bookmarks are enabled
-                    if allow_bookmarks || send_initial_events {
+                    if allow_bookmarks || watchlist {
                         if let Some(ref rv) = latest_resource_version {
                             let bookmark = BookmarkObject {
                                 kind: Some(bookmark_kind.clone()),
@@ -2822,7 +2861,12 @@ pub async fn watch_cluster_scoped_json(
     let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<String, std::io::Error>>(256);
 
     let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
-    let send_initial_events = params.send_initial_events.unwrap_or(false);
+    // `sendInitialEvents` is three-way — see `opens_with_current_state`.
+    // `watchlist` is upstream's `*opts.SendInitialEvents` being true, the
+    // half of `isListWatchRequest` (`cacher.go:1241-1243`) that does not
+    // depend on `allowWatchBookmarks`.
+    let send_initial_events = params.send_initial_events;
+    let watchlist = send_initial_events == Some(true);
     let timeout_duration = Some(Duration::from_secs(
         params.timeout_seconds.unwrap_or(300).min(300),
     ));
@@ -2830,7 +2874,7 @@ pub async fn watch_cluster_scoped_json(
         resource_type_to_kind_and_version(resource_type, api_group);
 
     let should_send_initial =
-        send_initial_events || requested_rv.as_deref() == Some("0") || requested_rv.is_none();
+        opens_with_current_state(send_initial_events, requested_rv.as_deref());
 
     tokio::spawn(async move {
         let mut latest_resource_version: Option<String> = Some(current_rev_str);
@@ -2852,7 +2896,7 @@ pub async fn watch_cluster_scoped_json(
             }
         }
 
-        if send_initial_events {
+        if watchlist && allow_bookmarks {
             if let Some(ref rv) = latest_resource_version {
                 let bookmark = serde_json::json!({
                     "type": "BOOKMARK",
@@ -2873,7 +2917,7 @@ pub async fn watch_cluster_scoped_json(
             }
         }
 
-        let mut bookmark_interval = if allow_bookmarks || send_initial_events {
+        let mut bookmark_interval = if allow_bookmarks || watchlist {
             Some(interval(Duration::from_secs(5)))
         } else {
             None
@@ -3010,7 +3054,12 @@ pub async fn watch_namespaced_json(
     let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<String, std::io::Error>>(256);
 
     let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
-    let send_initial_events = params.send_initial_events.unwrap_or(false);
+    // `sendInitialEvents` is three-way — see `opens_with_current_state`.
+    // `watchlist` is upstream's `*opts.SendInitialEvents` being true, the
+    // half of `isListWatchRequest` (`cacher.go:1241-1243`) that does not
+    // depend on `allowWatchBookmarks`.
+    let send_initial_events = params.send_initial_events;
+    let watchlist = send_initial_events == Some(true);
     let timeout_duration = Some(Duration::from_secs(
         params.timeout_seconds.unwrap_or(300).min(300),
     ));
@@ -3018,12 +3067,17 @@ pub async fn watch_namespaced_json(
     let (bookmark_kind, bookmark_api_version) =
         resource_type_to_kind_and_version(resource_type, api_group);
 
-    // Always send initial events for namespaced JSON watches.
-    // When the client watches with a specific resourceVersion (from a CREATE),
-    // our broadcast subscription only gets future events, missing the MODIFIED
-    // event that already happened. Sending current state as ADDED ensures the
-    // client sees the latest status (e.g. CRD Established=True condition).
-    let should_send_initial = true;
+    // Always send initial events for namespaced JSON watches UNLESS the client
+    // explicitly said `sendInitialEvents=false`, which upstream honours
+    // unconditionally (`watch_cache.go:878-913`).
+    //
+    // The unconditional snapshot compensates for a gap this path still has:
+    // unlike `watch_namespaced_inner` it never replays, so a client watching a
+    // custom resource from a specific resourceVersion (the one its CREATE
+    // returned) would otherwise miss the MODIFIED that already happened — the
+    // CRD `Established=True` condition being the case that matters. Tracked
+    // separately; until the replay lands, only the explicit `false` is honoured.
+    let should_send_initial = send_initial_events != Some(false);
 
     tokio::spawn(async move {
         let mut latest_resource_version: Option<String> = Some(current_rev_str);
@@ -3045,7 +3099,7 @@ pub async fn watch_namespaced_json(
             }
         }
 
-        if send_initial_events {
+        if watchlist && allow_bookmarks {
             if let Some(ref rv) = latest_resource_version {
                 let bookmark = serde_json::json!({
                     "type": "BOOKMARK",
@@ -3066,7 +3120,7 @@ pub async fn watch_namespaced_json(
             }
         }
 
-        let mut bookmark_interval = if allow_bookmarks || send_initial_events {
+        let mut bookmark_interval = if allow_bookmarks || watchlist {
             Some(interval(Duration::from_secs(5)))
         } else {
             None
