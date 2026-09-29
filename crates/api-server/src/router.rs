@@ -2318,8 +2318,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         // ControllerRevisions (all namespaces)
         .route(
             "/apis/apps/v1/controllerrevisions",
-            get(handlers::controllerrevision::list_all_controllerrevisions)
-            .delete(handlers::controllerrevision::deletecollection_controllerrevisions),
+            get(handlers::controllerrevision::list_all_controllerrevisions),
         )
         // Authentication API - authentication.k8s.io/v1
         .route(
