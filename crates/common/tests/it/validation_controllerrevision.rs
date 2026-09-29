@@ -13,6 +13,7 @@ fn cr(data: Option<serde_json::Value>) -> ControllerRevision {
         revision: 1,
     };
     c.metadata.name = "rev-1".to_string();
+    c.metadata.namespace = Some("default".to_string());
     c
 }
 
