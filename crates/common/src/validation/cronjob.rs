@@ -1,22 +1,26 @@
 //! CronJob validation — port of upstream Kubernetes
-//! `pkg/apis/batch/validation/validation.go` (release-1.35).
+//! `pkg/apis/batch/validation/validation.go:756-873` (release-1.35).
 //!
-//! Covers `ValidateCronJobCreate` / `validateCronJobSpec`: schedule (required +
-//! cron-syntax + no inline TZ), `startingDeadlineSeconds` ≥ 0, `timeZone` naming
-//! rules, `concurrencyPolicy` enum, the embedded `jobTemplate`
-//! (`ValidateJobTemplateSpec`), the history-limit non-negativity checks, and the
-//! 52-character name cap (the controller appends an 11-char `-$TIMESTAMP`
-//! suffix when creating Jobs).
+//! `ValidateCronJobCreate` and `ValidateCronJobUpdate`, both over
+//! `validateCronJobSpec`: schedule (required, cron syntax, inline TZ),
+//! `startingDeadlineSeconds` ≥ 0, `timeZone` naming rules, `concurrencyPolicy`
+//! enum, the embedded `jobTemplate` (`ValidateJobTemplateSpec`), and the
+//! history-limit non-negativity checks. Create also caps the name at 52
+//! characters (the controller appends an 11-char `-$TIMESTAMP` suffix when
+//! creating Jobs); update does not, so older CronJobs stay editable.
 //!
 //! `timeZone` is fully validated: the IANA naming-character rules, the `Local`
 //! rejection, and the tz-DB existence check (upstream `time.LoadLocation`),
 //! resolved via `chrono_tz` — the same lookup the CronJob controller schedules
 //! with, so a zone accepted at create is also schedulable.
 
-use crate::resources::CronJob;
+use crate::resources::{CronJob, CronJobSpec};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::job::validate_job_template_spec;
-use crate::validation::objectmeta::validate_nonnegative_field;
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, validate_nonnegative_field, validate_object_meta,
+    validate_object_meta_update,
+};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -43,14 +47,27 @@ fn parse_schedule(schedule: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Port of upstream `validateScheduleFormat` for the create path (`allowTZ=false`).
-fn validate_schedule_format(schedule: &str, fld_path: &Path) -> ErrorList {
+/// Port of upstream `validateScheduleFormat` (validation.go:833-848). An
+/// inline TZ is allowed only when the old schedule already had one, and never
+/// together with `timeZone`.
+fn validate_schedule_format(
+    schedule: &str,
+    allow_tz_in_schedule: bool,
+    time_zone: Option<&str>,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if let Err(e) = parse_schedule(schedule) {
         errs.push(Error::invalid(fld_path, schedule.to_string(), e));
     }
-    // On create, an inline TZ (`TZ=`/`CRON_TZ=`) is never allowed.
-    if schedule.contains("TZ") {
+    let has_tz = schedule.contains("TZ");
+    if allow_tz_in_schedule && has_tz && time_zone.is_some() {
+        errs.push(Error::invalid(
+            fld_path,
+            schedule.to_string(),
+            "cannot use both timeZone field and TZ or CRON_TZ in schedule",
+        ));
+    } else if !allow_tz_in_schedule && has_tz {
         errs.push(Error::invalid(
             fld_path,
             schedule.to_string(),
@@ -109,70 +126,96 @@ fn validate_time_zone(time_zone: Option<&str>, fld_path: &Path) -> ErrorList {
     errs
 }
 
-/// Validate a `CronJob` on create. Mirrors upstream `ValidateCronJobCreate`
-/// (minus ObjectMeta, which the handler validates separately).
-pub fn validate_cron_job(cj: &CronJob) -> ErrorList {
-    let spec_path = Path::new("spec");
+/// Upstream `validateConcurrencyPolicy` (validation.go:818-831). The field is
+/// defaulted to `Allow`, so an empty one is a client clearing it.
+fn validate_concurrency_policy(policy: Option<&str>, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
-    let spec = &cj.spec;
+    match policy.unwrap_or("") {
+        ALLOW_CONCURRENT | FORBID_CONCURRENT | REPLACE_CONCURRENT => {}
+        "" => errs.push(Error::required(fld_path, "")),
+        other => errs.push(Error::not_supported(
+            fld_path,
+            other.to_string(),
+            &[ALLOW_CONCURRENT, FORBID_CONCURRENT, REPLACE_CONCURRENT],
+        )),
+    }
+    errs
+}
 
-    // schedule
+/// Upstream `validateCronJobSpec` (validation.go:782-816). `old_spec` is the
+/// stored spec on update: it decides whether an inline TZ is tolerated, and an
+/// unchanged `timeZone` is not revalidated.
+fn validate_cron_job_spec(
+    spec: &CronJobSpec,
+    old_spec: Option<&CronJobSpec>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
     if spec.schedule.is_empty() {
-        errs.push(Error::required(&spec_path.child("schedule"), ""));
+        errs.push(Error::required(&fld_path.child("schedule"), ""));
     } else {
+        let allow_tz_in_schedule = old_spec.is_some_and(|old| old.schedule.contains("TZ"));
         errs.extend(validate_schedule_format(
             &spec.schedule,
-            &spec_path.child("schedule"),
+            allow_tz_in_schedule,
+            spec.time_zone.as_deref(),
+            &fld_path.child("schedule"),
         ));
     }
 
-    // startingDeadlineSeconds
     if let Some(sds) = spec.starting_deadline_seconds {
         errs.extend(validate_nonnegative_field(
             sds,
-            &spec_path.child("startingDeadlineSeconds"),
+            &fld_path.child("startingDeadlineSeconds"),
         ));
     }
 
-    // timeZone
-    errs.extend(validate_time_zone(
-        spec.time_zone.as_deref(),
-        &spec_path.child("timeZone"),
-    ));
-
-    // concurrencyPolicy (defaulted to Allow by the handler; validate when set)
-    if let Some(cp) = &spec.concurrency_policy {
-        if cp != ALLOW_CONCURRENT && cp != FORBID_CONCURRENT && cp != REPLACE_CONCURRENT {
-            errs.push(Error::not_supported(
-                &spec_path.child("concurrencyPolicy"),
-                cp.clone(),
-                &[ALLOW_CONCURRENT, FORBID_CONCURRENT, REPLACE_CONCURRENT],
-            ));
-        }
+    if old_spec.is_none_or(|old| old.time_zone != spec.time_zone) {
+        errs.extend(validate_time_zone(
+            spec.time_zone.as_deref(),
+            &fld_path.child("timeZone"),
+        ));
     }
 
-    // jobTemplate
+    errs.extend(validate_concurrency_policy(
+        spec.concurrency_policy.as_deref(),
+        &fld_path.child("concurrencyPolicy"),
+    ));
     errs.extend(validate_job_template_spec(
         &spec.job_template,
-        &spec_path.child("jobTemplate"),
+        &fld_path.child("jobTemplate"),
     ));
 
-    // history limits (zero is valid)
+    // Zero is a valid history limit.
     if let Some(s) = spec.successful_jobs_history_limit {
         errs.extend(validate_nonnegative_field(
             s as i64,
-            &spec_path.child("successfulJobsHistoryLimit"),
+            &fld_path.child("successfulJobsHistoryLimit"),
         ));
     }
     if let Some(f) = spec.failed_jobs_history_limit {
         errs.extend(validate_nonnegative_field(
             f as i64,
-            &spec_path.child("failedJobsHistoryLimit"),
+            &fld_path.child("failedJobsHistoryLimit"),
         ));
     }
 
-    // Name length: the controller appends an 11-char `-$TIMESTAMP` suffix, and
-    // the resulting Job name must stay within the 63-char DNS-1035 label limit.
+    errs
+}
+
+/// Upstream `ValidateCronJobCreate` (validation.go:757-770). "CronJobs and
+/// rcs have the same name validation": `NameIsDNSSubdomain`.
+pub fn validate_cron_job_create(cj: &CronJob) -> ErrorList {
+    let mut errs = validate_object_meta(
+        &cj.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_cron_job_spec(&cj.spec, None, &Path::new("spec")));
+    // DNS1035LabelMaxLength - 11: the Job name the controller derives must
+    // stay within 63 characters.
     if cj.metadata.name.len() > 52 {
         errs.push(Error::invalid(
             &Path::new("metadata").child("name"),
@@ -180,7 +223,18 @@ pub fn validate_cron_job(cj: &CronJob) -> ErrorList {
             "must be no more than 52 characters",
         ));
     }
+    errs
+}
 
+/// Upstream `ValidateCronJobUpdate` (validation.go:772-780). The 52-character
+/// name cap is skipped so older CronJobs can still be updated and deleted.
+pub fn validate_cron_job_update(cj: &CronJob, old: &CronJob) -> ErrorList {
+    let mut errs = validate_object_meta_update(&cj.metadata, &old.metadata, &Path::new("metadata"));
+    errs.extend(validate_cron_job_spec(
+        &cj.spec,
+        Some(&old.spec),
+        &Path::new("spec"),
+    ));
     errs
 }
 
@@ -235,6 +289,136 @@ mod time_zone_tests {
         let errs = check(Some("../etc"));
         assert!(
             errs.iter().any(|d| d.contains("unknown time zone")),
+            "{errs:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::{validate_cron_job_create, validate_cron_job_update};
+    use crate::resources::CronJob;
+
+    fn cron_job(name: &str) -> CronJob {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "batch/v1", "kind": "CronJob",
+            "metadata": {"name": name, "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "schedule": "*/5 * * * *",
+                "concurrencyPolicy": "Allow",
+                "jobTemplate": {"spec": {"template": {"spec": {
+                    "containers": [{"name": "c", "image": "i",
+                                    "imagePullPolicy": "IfNotPresent",
+                                    "terminationMessagePolicy": "File"}],
+                    "restartPolicy": "OnFailure",
+                    "dnsPolicy": "ClusterFirst"
+                }}}}
+            }
+        }))
+        .unwrap()
+    }
+
+    fn fields(errs: &[crate::validation::field::Error]) -> Vec<String> {
+        errs.iter()
+            .map(|e| format!("{}: {}", e.field, e.detail))
+            .collect()
+    }
+
+    /// validation_test.go `TestValidateCronJobSpec`: a name over 52 characters
+    /// fails create, but an update of an existing one is allowed.
+    #[test]
+    fn the_name_cap_is_create_only() {
+        let long = "a".repeat(53);
+        let old = cron_job(&long);
+        let errs = validate_cron_job_create(&old);
+        assert!(
+            fields(&errs)
+                .iter()
+                .any(|e| e.contains("must be no more than 52 characters")),
+            "{errs:?}"
+        );
+        let mut new = old.clone();
+        new.spec.suspend = Some(true);
+        let errs = validate_cron_job_update(&new, &old);
+        assert!(errs.is_empty(), "{:?}", fields(&errs));
+    }
+
+    #[test]
+    fn create_validates_object_meta() {
+        let mut cj = cron_job("c");
+        cj.metadata.namespace = None;
+        let errs = validate_cron_job_create(&cj);
+        assert!(
+            fields(&errs)
+                .iter()
+                .any(|e| e.starts_with("metadata.namespace")),
+            "{errs:?}"
+        );
+    }
+
+    /// `validateScheduleFormat` (validation.go:833-848): an inline TZ the old
+    /// schedule already had is tolerated, unless combined with `timeZone`.
+    #[test]
+    fn an_inline_tz_is_grandfathered_on_update() {
+        let mut old = cron_job("c");
+        old.spec.schedule = "CRON_TZ=UTC 0 * * * *".into();
+        assert!(!validate_cron_job_create(&old).is_empty());
+
+        let mut new = old.clone();
+        new.spec.suspend = Some(true);
+        let errs = validate_cron_job_update(&new, &old);
+        assert!(
+            !fields(&errs).iter().any(|e| e.contains("TZ")),
+            "{:?}",
+            fields(&errs)
+        );
+
+        new.spec.time_zone = Some("UTC".into());
+        let errs = validate_cron_job_update(&new, &old);
+        assert!(
+            fields(&errs)
+                .iter()
+                .any(|e| e.contains("cannot use both timeZone field and TZ or CRON_TZ")),
+            "{:?}",
+            fields(&errs)
+        );
+
+        let plain = cron_job("c");
+        let mut added = plain.clone();
+        added.spec.schedule = "TZ=UTC 0 * * * *".into();
+        let errs = validate_cron_job_update(&added, &plain);
+        assert!(
+            fields(&errs)
+                .iter()
+                .any(|e| e.contains("use timeZone field instead")),
+            "{:?}",
+            fields(&errs)
+        );
+    }
+
+    /// validation.go:797-799: an unchanged `timeZone` is not revalidated.
+    #[test]
+    fn an_unchanged_time_zone_is_not_revalidated() {
+        let mut old = cron_job("c");
+        old.spec.time_zone = Some("Not/AZone".into());
+        let mut new = old.clone();
+        new.spec.suspend = Some(true);
+        assert!(validate_cron_job_update(&new, &old).is_empty());
+        new.spec.time_zone = Some("Also/NotAZone".into());
+        assert!(!validate_cron_job_update(&new, &old).is_empty());
+    }
+
+    /// `validateConcurrencyPolicy` (validation.go:818-831).
+    #[test]
+    fn a_cleared_concurrency_policy_is_required() {
+        let old = cron_job("c");
+        let mut new = old.clone();
+        new.spec.concurrency_policy = None;
+        let errs = validate_cron_job_update(&new, &old);
+        assert!(
+            fields(&errs)
+                .iter()
+                .any(|e| e.starts_with("spec.concurrencyPolicy")),
             "{errs:?}"
         );
     }

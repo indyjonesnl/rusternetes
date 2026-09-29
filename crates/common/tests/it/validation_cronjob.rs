@@ -2,7 +2,7 @@
 
 use rusternetes_common::resources::workloads::{CronJob, CronJobSpec, JobSpec, JobTemplateSpec};
 use rusternetes_common::resources::PodTemplateSpec;
-use rusternetes_common::validation::cronjob::validate_cron_job;
+use rusternetes_common::validation::cronjob::validate_cron_job_create as validate_cron_job;
 
 fn job_template() -> JobTemplateSpec {
     let mut t = PodTemplateSpec::default();

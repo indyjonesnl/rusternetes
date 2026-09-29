@@ -58,7 +58,7 @@ pub async fn create(
     // Validate the (defaulted) CronJob spec, mirroring upstream batch
     // ValidateCronJobCreate: schedule syntax, concurrencyPolicy, timeZone,
     // jobTemplate, history limits, and the 52-char name cap.
-    let errs = rusternetes_common::validation::cronjob::validate_cron_job(&cronjob);
+    let errs = rusternetes_common::validation::cronjob::validate_cron_job_create(&cronjob);
     if !errs.is_empty() {
         return Err(rusternetes_common::Error::Invalid(errs));
     }
