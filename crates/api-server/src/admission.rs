@@ -135,6 +135,44 @@ fn pod_matches_quota_scopes(pod: &Pod, quota: &ResourceQuota) -> bool {
     true
 }
 
+/// One lock per namespace, serialising pod quota admission within it.
+static QUOTA_NAMESPACE_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Serialise pod quota admission in `namespace`: hold the returned guard from
+/// before the quota check until the pod has been written.
+///
+/// Upstream never evaluates two requests of one namespace at once.
+/// `quotaEvaluator.addWork` queues each request under its namespace and
+/// `getWork` marks the namespace `inProgress`, parking later arrivals in
+/// `dirtyWork` until `completeWork` (`staging/src/k8s.io/apiserver/pkg/
+/// admission/plugin/resourcequota/controller.go:688-735`); each admitted
+/// request's usage is written to `status.used` before the next is checked
+/// (`checkQuotas`, :228-401).
+///
+/// Here usage is a live recount of stored pods (see
+/// [`check_resource_quota_with_old`]), so an admitted request is only visible
+/// to the next one once its pod is persisted — which is why the guard must
+/// span the storage write, not just the check. Without it, a ReplicationController
+/// slow-start batch's concurrent creates each saw the same usage and were all
+/// admitted past `hard`.
+///
+/// Single api-server only: upstream's cross-apiserver safety is the optimistic
+/// `UpdateStatus` on the quota, which this in-process lock does not replace.
+pub async fn lock_namespace_quota(namespace: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut locks = QUOTA_NAMESPACE_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Drop namespaces nobody is admitting in, so the map stays bounded by
+        // the number of namespaces with an admission in flight.
+        locks.retain(|ns, l| ns == namespace || Arc::strong_count(l) > 1);
+        locks.entry(namespace.to_string()).or_default().clone()
+    };
+    lock.lock_owned().await
+}
+
 /// Check if pod creation would exceed ResourceQuota limits.
 ///
 /// Delegates to [`check_resource_quota_with_old`] with `old_pod = None`

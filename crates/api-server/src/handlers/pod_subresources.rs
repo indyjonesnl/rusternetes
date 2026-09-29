@@ -1812,6 +1812,8 @@ pub async fn resize_pod(
     // resize strategy's call into noderestriction admission.
     check_node_declared_features_for_resize(state.storage.as_ref(), &current, &projected).await?;
 
+    // Held until the resize is stored — see `lock_namespace_quota`.
+    let _quota_guard = crate::admission::lock_namespace_quota(&namespace).await;
     match crate::admission::check_resource_quota_with_old(
         &state.storage,
         &namespace,

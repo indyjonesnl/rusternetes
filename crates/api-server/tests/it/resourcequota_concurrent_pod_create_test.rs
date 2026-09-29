@@ -60,10 +60,7 @@ async fn concurrent_pod_creates_are_admitted_one_at_a_time_against_quota() {
     }
 
     let admitted = results.iter().filter(|(s, _)| s.is_success()).count();
-    let forbidden = results
-        .iter()
-        .filter(|(s, _)| s.as_u16() == 403)
-        .count();
+    let forbidden = results.iter().filter(|(s, _)| s.as_u16() == 403).count();
     assert_eq!(
         admitted, 2,
         "a quota of pods=2 admitted {admitted} of 8 concurrent creates: {results:?}"

@@ -491,6 +491,8 @@ pub async fn create(
     // Check ResourceQuota — K8s does this atomically in the admission plugin.
     // check_resource_quota checks quota limits AND atomically increments usage.
     // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/resourcequota/controller.go
+    // Held until the pod is stored — see `lock_namespace_quota`.
+    let _quota_guard = crate::admission::lock_namespace_quota(&namespace).await;
     match crate::admission::check_resource_quota(&state.storage, &namespace, &pod).await {
         Ok(true) => {
             info!(
@@ -1059,7 +1061,10 @@ pub async fn update(
     // even though the stale pod row is still in storage.
     // Only when the quota SCOPE changed — see `pod_quota_scope_changed`.
     // K8s ref: pkg/quota/v1/evaluator/core/pods.go:179-199 (`podEvaluator.Handles`)
+    // Held until the pod is stored — see `lock_namespace_quota`.
+    let mut _quota_guard = None;
     if pod_quota_scope_changed(&old_pod, &pod) {
+        _quota_guard = Some(crate::admission::lock_namespace_quota(&namespace).await);
         match crate::admission::check_resource_quota_with_old(
             &state.storage,
             &namespace,
@@ -1849,7 +1854,10 @@ pub async fn patch(
     // must be rejected, but only a patch that moves the pod between quota
     // scopes can change what it contributes — see `pod_quota_scope_changed`.
     // K8s ref: pkg/quota/v1/evaluator/core/pods.go:179-199 (`podEvaluator.Handles`)
+    // Held until the pod is stored — see `lock_namespace_quota`.
+    let mut _quota_guard = None;
     if pod_quota_scope_changed(&current_pod, &patched_pod) {
+        _quota_guard = Some(crate::admission::lock_namespace_quota(&namespace).await);
         match crate::admission::check_resource_quota_with_old(
             &state.storage,
             &namespace,
