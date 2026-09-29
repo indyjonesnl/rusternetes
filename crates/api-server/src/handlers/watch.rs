@@ -1672,6 +1672,81 @@ pub fn watch_modified_event_type<T: Serialize + HasMetadata>(
     }
 }
 
+/// A raw JSON object seen through [`HasMetadata`], so the JSON watch paths
+/// share the typed paths' selector transitions ([`watch_added_matches`],
+/// [`watch_modified_event_type`]) instead of carrying a third copy.
+struct JsonWatchObject {
+    value: serde_json::Value,
+    meta: ObjectMeta,
+}
+
+impl Serialize for JsonWatchObject {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
+
+impl HasMetadata for JsonWatchObject {
+    fn metadata(&self) -> &ObjectMeta {
+        &self.meta
+    }
+    fn metadata_mut(&mut self) -> &mut ObjectMeta {
+        &mut self.meta
+    }
+}
+
+/// Filter one JSON watch event through the label and field selectors.
+///
+/// Upstream runs every watch through the cacher's predicate,
+/// `filterWithAttrsAndPrefixFunction`
+/// (`staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher.go:1201-1209`),
+/// and `cacheWatcher.convertToWatchEvent` (`cache_watcher.go:374-395`) turns a
+/// change that moves an object into the selector into `ADDED` and out of it
+/// into `DELETED`. `None` suppresses the event (#2044).
+fn json_watch_event(
+    event_type: &'static str,
+    value: serde_json::Value,
+    label_selector: &Option<String>,
+    field_selector: &Option<String>,
+    excluded: &mut std::collections::HashSet<String>,
+) -> Option<(&'static str, serde_json::Value)> {
+    let unfiltered = |s: &Option<String>| s.as_deref().is_none_or(str::is_empty);
+    if unfiltered(label_selector) && unfiltered(field_selector) {
+        return Some((event_type, value));
+    }
+    let meta = value
+        .get("metadata")
+        .cloned()
+        .and_then(|m| serde_json::from_value::<ObjectMeta>(m).ok())
+        .unwrap_or_default();
+    let object = JsonWatchObject { value, meta };
+    let event_type = match event_type {
+        "ADDED" => watch_added_matches(&object, label_selector, field_selector, excluded)
+            .then_some("ADDED")?,
+        "MODIFIED" => {
+            match watch_modified_event_type(&object, label_selector, field_selector, excluded)? {
+                WatchEventType::Added => "ADDED",
+                WatchEventType::Deleted => "DELETED",
+                _ => "MODIFIED",
+            }
+        }
+        _ => {
+            // A deletion reaches only watchers whose selector held the object.
+            if !(matches_label_selector(object.metadata(), label_selector)
+                && matches_field_selector(&object, field_selector))
+            {
+                return None;
+            }
+            excluded.remove(&object.meta.name);
+            event_type
+        }
+    };
+    Some((event_type, object.value))
+}
+
 /// Construct a fallback DELETE event JSON when typed deserialization fails.
 ///
 /// When etcd's prev_kv is absent (compaction) or the stored JSON doesn't match
@@ -2809,16 +2884,31 @@ pub async fn watch_cluster_scoped_json(
     let should_send_initial =
         opens_with_current_state(send_initial_events, requested_rv.as_deref());
 
+    let label_selector = params.label_selector.clone();
+    let field_selector = params.field_selector.clone();
+
     tokio::spawn(async move {
         let mut latest_resource_version: Option<String> = Some(current_rev_str);
+        // Names currently outside the selector, so a change that moves one
+        // in or out surfaces as ADDED / DELETED (see `json_watch_event`).
+        let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         if should_send_initial {
             for object in existing_resources {
                 if let Some(rv) = json_resource_version(&object) {
                     latest_resource_version = Some(rv);
                 }
+                let Some((event_type, object)) = json_watch_event(
+                    "ADDED",
+                    object,
+                    &label_selector,
+                    &field_selector,
+                    &mut excluded,
+                ) else {
+                    continue;
+                };
                 let k8s_event = serde_json::json!({
-                    "type": "ADDED",
+                    "type": event_type,
                     "object": object
                 });
                 if let Ok(json) = serde_json::to_string(&k8s_event) {
@@ -2875,6 +2965,15 @@ pub async fn watch_cluster_scoped_json(
                                     if let Some(rv) = json_resource_version(&object) {
                                         latest_resource_version = Some(rv);
                                     }
+                                    let Some((event_type, object)) = json_watch_event(
+                                        event_type,
+                                        object,
+                                        &label_selector,
+                                        &field_selector,
+                                        &mut excluded,
+                                    ) else {
+                                        continue;
+                                    };
                                     let k8s_event = serde_json::json!({
                                         "type": event_type,
                                         "object": object
@@ -3006,16 +3105,31 @@ pub async fn watch_namespaced_json(
     let should_send_initial =
         opens_with_current_state(send_initial_events, requested_rv.as_deref());
 
+    let label_selector = params.label_selector.clone();
+    let field_selector = params.field_selector.clone();
+
     tokio::spawn(async move {
         let mut latest_resource_version: Option<String> = Some(current_rev_str);
+        // Names currently outside the selector, so a change that moves one
+        // in or out surfaces as ADDED / DELETED (see `json_watch_event`).
+        let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         if should_send_initial {
             for object in existing_resources {
                 if let Some(rv) = json_resource_version(&object) {
                     latest_resource_version = Some(rv);
                 }
+                let Some((event_type, object)) = json_watch_event(
+                    "ADDED",
+                    object,
+                    &label_selector,
+                    &field_selector,
+                    &mut excluded,
+                ) else {
+                    continue;
+                };
                 let k8s_event = serde_json::json!({
-                    "type": "ADDED",
+                    "type": event_type,
                     "object": object
                 });
                 if let Ok(json) = serde_json::to_string(&k8s_event) {
@@ -3072,6 +3186,15 @@ pub async fn watch_namespaced_json(
                                     if let Some(rv) = json_resource_version(&object) {
                                         latest_resource_version = Some(rv);
                                     }
+                                    let Some((event_type, object)) = json_watch_event(
+                                        event_type,
+                                        object,
+                                        &label_selector,
+                                        &field_selector,
+                                        &mut excluded,
+                                    ) else {
+                                        continue;
+                                    };
                                     let k8s_event = serde_json::json!({
                                         "type": event_type,
                                         "object": object
