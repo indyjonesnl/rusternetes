@@ -4,7 +4,7 @@
 //! (`pkg/apis/core/validation/validation.go`, release-1.35).
 
 use rusternetes_common::resources::endpoints::Endpoints;
-use rusternetes_common::validation::endpoints::validate_endpoints;
+use rusternetes_common::validation::endpoints::validate_endpoints_create;
 use rusternetes_common::validation::field::{Error, ErrorType};
 use serde_json::json;
 
@@ -24,7 +24,7 @@ fn has(errs: &[Error], field: &str, ty: ErrorType) -> bool {
 
 #[test]
 fn valid_endpoints_pass() {
-    let errs = validate_endpoints(&ep(json!([{
+    let errs = validate_endpoints_create(&ep(json!([{
         "addresses": [{"ip": "10.0.0.1"}],
         "ports": [{"name": "http", "port": 80, "protocol": "TCP"}]
     }])));
@@ -33,7 +33,7 @@ fn valid_endpoints_pass() {
 
 #[test]
 fn empty_subset_rejected() {
-    let errs = validate_endpoints(&ep(json!([{"ports": [{"port": 80}]}])));
+    let errs = validate_endpoints_create(&ep(json!([{"ports": [{"port": 80}]}])));
     assert!(
         has(&errs, "subsets[0]", ErrorType::Required),
         "got: {errs:?}"
@@ -42,7 +42,7 @@ fn empty_subset_rejected() {
 
 #[test]
 fn invalid_ip_rejected() {
-    let errs = validate_endpoints(&ep(json!([{"addresses": [{"ip": "nope"}]}])));
+    let errs = validate_endpoints_create(&ep(json!([{"addresses": [{"ip": "nope"}]}])));
     assert!(
         has(&errs, "subsets[0].addresses[0].ip", ErrorType::Invalid),
         "got: {errs:?}"
@@ -51,7 +51,7 @@ fn invalid_ip_rejected() {
 
 #[test]
 fn loopback_ip_rejected() {
-    let errs = validate_endpoints(&ep(json!([{"addresses": [{"ip": "127.0.0.1"}]}])));
+    let errs = validate_endpoints_create(&ep(json!([{"addresses": [{"ip": "127.0.0.1"}]}])));
     assert!(
         has(&errs, "subsets[0].addresses[0].ip", ErrorType::Invalid),
         "got: {errs:?}"
@@ -60,7 +60,7 @@ fn loopback_ip_rejected() {
 
 #[test]
 fn unspecified_ip_rejected() {
-    let errs = validate_endpoints(&ep(json!([{"addresses": [{"ip": "0.0.0.0"}]}])));
+    let errs = validate_endpoints_create(&ep(json!([{"addresses": [{"ip": "0.0.0.0"}]}])));
     assert!(
         has(&errs, "subsets[0].addresses[0].ip", ErrorType::Invalid),
         "got: {errs:?}"
@@ -69,7 +69,7 @@ fn unspecified_ip_rejected() {
 
 #[test]
 fn link_local_ip_rejected() {
-    let errs = validate_endpoints(&ep(json!([{"addresses": [{"ip": "169.254.1.1"}]}])));
+    let errs = validate_endpoints_create(&ep(json!([{"addresses": [{"ip": "169.254.1.1"}]}])));
     assert!(
         has(&errs, "subsets[0].addresses[0].ip", ErrorType::Invalid),
         "got: {errs:?}"
@@ -78,7 +78,7 @@ fn link_local_ip_rejected() {
 
 #[test]
 fn multi_port_requires_name() {
-    let errs = validate_endpoints(&ep(json!([{
+    let errs = validate_endpoints_create(&ep(json!([{
         "addresses": [{"ip": "10.0.0.1"}],
         "ports": [{"port": 80}, {"port": 443}]
     }])));
@@ -90,7 +90,7 @@ fn multi_port_requires_name() {
 
 #[test]
 fn bad_port_protocol_rejected() {
-    let errs = validate_endpoints(&ep(json!([{
+    let errs = validate_endpoints_create(&ep(json!([{
         "addresses": [{"ip": "10.0.0.1"}],
         "ports": [{"port": 80, "protocol": "ICMP"}]
     }])));
