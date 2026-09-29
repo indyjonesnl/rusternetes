@@ -87,7 +87,12 @@ impl RestUpdateStrategy<CronJob> for Strategy {
 
     /// `WarningsOnUpdate` (strategy.go:152-163). The field path in the TZ
     /// warning is upstream's, `spec.spec.schedule`, verbatim.
-    fn warnings_on_update(&self, _ctx: &RequestContext, obj: &CronJob, old: &CronJob) -> Vec<String> {
+    fn warnings_on_update(
+        &self,
+        _ctx: &RequestContext,
+        obj: &CronJob,
+        old: &CronJob,
+    ) -> Vec<String> {
         let mut warnings = Vec::new();
         if obj.metadata.generation != old.metadata.generation {
             warnings.extend(warnings_for_job_spec(

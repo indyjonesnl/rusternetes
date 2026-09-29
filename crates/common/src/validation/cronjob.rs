@@ -35,8 +35,30 @@ static VALID_TZ_CHARS: Lazy<Regex> =
 /// Parse a Kubernetes 5-field cron schedule using the same normalization the
 /// CronJob controller applies (`?`→`*`, pad to the `cron` crate's 7-field form),
 /// so create-time validation accepts exactly what the controller will run.
+///
+/// A leading `TZ=<zone>` / `CRON_TZ=<zone>` is stripped and its zone resolved
+/// first, as `robfig/cron/v3` `Parser.Parse` does (parser.go:95-103), so a
+/// grandfathered inline-TZ schedule parses. With no space after the prefix
+/// upstream's slice panics, which `ParseCronScheduleWithPanicRecovery`
+/// (pkg/util/parsers/parsers.go:59-69) turns into an error.
 fn parse_schedule(schedule: &str) -> Result<(), String> {
-    let normalized = schedule.replace('?', "*");
+    let mut spec = schedule;
+    if spec.starts_with("TZ=") || spec.starts_with("CRON_TZ=") {
+        let Some(i) = spec.find(' ') else {
+            return Err(format!(
+                "invalid schedule format: slice bounds out of range in {spec:?}"
+            ));
+        };
+        let eq = spec.find('=').unwrap_or(0);
+        let loc = &spec[eq + 1..i];
+        if loc.parse::<chrono_tz::Tz>().is_err() {
+            return Err(format!(
+                "provided bad location {loc}: unknown time zone {loc}"
+            ));
+        }
+        spec = spec[i..].trim();
+    }
+    let normalized = spec.replace('?', "*");
     let normalized = match normalized.split_whitespace().count() {
         5 => format!("0 {} *", normalized),
         6 => format!("0 {}", normalized),
@@ -291,6 +313,20 @@ mod time_zone_tests {
             errs.iter().any(|d| d.contains("unknown time zone")),
             "{errs:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod parse_schedule_tests {
+    use super::parse_schedule;
+
+    #[test]
+    fn an_inline_tz_prefix_is_stripped() {
+        assert!(parse_schedule("CRON_TZ=UTC */5 * * * *").is_ok());
+        assert!(parse_schedule("TZ=Europe/Amsterdam 0 3 * * *").is_ok());
+        let err = parse_schedule("TZ=Not/AZone 0 3 * * *").unwrap_err();
+        assert!(err.starts_with("provided bad location Not/AZone"), "{err}");
+        assert!(parse_schedule("TZ=UTC").is_err());
     }
 }
 
