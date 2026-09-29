@@ -517,23 +517,45 @@ async fn job_with_backoff_limit_per_index_should_retry_individual_indexes() {
         .await
         .unwrap();
 
-    // Mark first pod (index 0) as failed twice
-    for pod in &pods[..1] {
-        for _attempt in 0..2 {
-            let mut failed_pod = pod.clone();
-            failed_pod.status = Some(PodStatus {
-                phase: Some(Phase::Failed),
-                ..Default::default()
-            });
-            let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-            storage.update(&pod_key, &failed_pod).await.unwrap();
+    // Fail the first pod's index twice. Each attempt fails whichever pod
+    // currently holds that index, freshly read, as the kubelet does: after the
+    // first failure the controller has replaced or touched the pod, so the
+    // listed snapshot is stale and the store rejects a write built from it.
+    const INDEX: &str = "batch.kubernetes.io/job-completion-index";
+    let index = pods[0]
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(INDEX))
+        .cloned()
+        .expect("indexed pod carries a completion index");
+    for _attempt in 0..2 {
+        let current: Vec<Pod> = storage
+            .list(&format!("/registry/pods/{}/", namespace))
+            .await
+            .unwrap();
+        let Some(pod) = current.into_iter().find(|p| {
+            p.metadata.annotations.as_ref().and_then(|a| a.get(INDEX)) == Some(&index)
+                && !matches!(
+                    p.status.as_ref().and_then(|s| s.phase.as_ref()),
+                    Some(Phase::Failed)
+                )
+        }) else {
+            break;
+        };
+        let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
+        let mut failed_pod: Pod = storage.get(&pod_key).await.unwrap();
+        failed_pod.status = Some(PodStatus {
+            phase: Some(Phase::Failed),
+            ..Default::default()
+        });
+        storage.update(&pod_key, &failed_pod).await.unwrap();
 
-            // Simulate kubelet cleanup
-            simulate_kubelet_cleanup(&storage, namespace).await;
+        // Simulate kubelet cleanup
+        simulate_kubelet_cleanup(&storage, namespace).await;
 
-            // Reconcile to create replacement
-            controller.reconcile_all().await.unwrap();
-        }
+        // Reconcile to create replacement
+        controller.reconcile_all().await.unwrap();
     }
 
     // After backoffLimitPerIndex failures, the index should be marked as failed
