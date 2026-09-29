@@ -32,6 +32,7 @@ pub struct Admission<'a> {
     pub state: &'a ApiServerState,
     pub kind: &'a GroupVersionKind,
     pub resource: &'a GroupVersionResource,
+    pub subresource: Option<&'a str>,
     pub namespace: Option<&'a str>,
     pub user: &'a UserInfo,
     pub dry_run: bool,
@@ -46,6 +47,16 @@ fn to_value<T: Object>(obj: &T) -> Result<serde_json::Value> {
 }
 
 impl Admission<'_> {
+    /// The resource the plugins match against: `<resource>/<subresource>` on
+    /// a subresource, as the webhook rules spell it (rules.go:95-115).
+    fn request_resource(&self) -> GroupVersionResource {
+        let mut gvr = self.resource.clone();
+        if let Some(subresource) = self.subresource {
+            gvr.resource = format!("{}/{subresource}", gvr.resource);
+        }
+        gvr
+    }
+
     fn user_info(&self) -> admission::UserInfo {
         admission::UserInfo {
             username: self.user.username.clone(),
@@ -63,7 +74,7 @@ impl Admission<'_> {
             .run_mutating_webhooks_with_dryrun(
                 &op,
                 self.kind,
-                self.resource,
+                &self.request_resource(),
                 self.namespace,
                 &name,
                 Some(to_value(&obj)?),
@@ -107,7 +118,7 @@ impl Admission<'_> {
                 self.kind,
                 obj.as_ref(),
                 old.as_ref(),
-                Some(&self.resource.resource),
+                Some(&self.request_resource().resource),
                 self.namespace,
             )
             .await?;
@@ -118,7 +129,7 @@ impl Admission<'_> {
             .run_validating_webhooks_with_dryrun(
                 &op,
                 self.kind,
-                self.resource,
+                &self.request_resource(),
                 self.namespace,
                 &name,
                 obj,
@@ -152,6 +163,7 @@ impl<T: Object> ValidateObject<T> for CreateValidation<'_> {
                 a.user,
                 "create",
                 a.resource,
+                a.subresource,
                 a.namespace,
                 Some(&obj.metadata().name),
             )

@@ -74,6 +74,7 @@ pub async fn delete_resource<T: Object>(
         user,
         "delete",
         &scope.resource,
+        scope.subresource,
         namespace,
         Some(name),
     )
@@ -85,6 +86,7 @@ pub async fn delete_resource<T: Object>(
         state,
         kind: &scope.kind,
         resource: &scope.resource,
+        subresource: scope.subresource,
         namespace,
         user,
         dry_run: is_dry_run(options.dry_run.as_deref()),
@@ -129,6 +131,7 @@ pub async fn delete_collection<T: Object>(
         user,
         "deletecollection",
         &scope.resource,
+        scope.subresource,
         namespace,
         None,
     )
@@ -145,6 +148,7 @@ pub async fn delete_collection<T: Object>(
         state,
         kind: &scope.kind,
         resource: &scope.resource,
+        subresource: scope.subresource,
         namespace,
         user,
         dry_run: is_dry_run(options.dry_run.as_deref()),

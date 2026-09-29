@@ -35,6 +35,8 @@ pub struct RequestScope<T: Object> {
     pub kind: GroupVersionKind,
     /// `Resource`: the GroupVersionResource served.
     pub resource: GroupVersionResource,
+    /// `Subresource`: e.g. `status`, or `None` for the resource itself.
+    pub subresource: Option<&'static str>,
     /// The `rest.Storage` behind the endpoints.
     pub store: Store<T, StorageBackend>,
     /// Server-side apply, when the resource supports it.
@@ -77,11 +79,15 @@ pub(super) async fn authorize(
     user: &UserInfo,
     verb: &str,
     resource: &GroupVersionResource,
+    subresource: Option<&str>,
     namespace: Option<&str>,
     name: Option<&str>,
 ) -> Result<()> {
     let mut attrs = RequestAttributes::new(user.clone(), verb, resource.resource.clone())
         .with_api_group(resource.group.clone());
+    if let Some(subresource) = subresource {
+        attrs = attrs.with_subresource(subresource);
+    }
     if let Some(ns) = namespace {
         attrs = attrs.with_namespace(ns);
     }

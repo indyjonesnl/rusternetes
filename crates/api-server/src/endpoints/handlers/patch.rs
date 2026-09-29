@@ -57,7 +57,16 @@ pub async fn patch_resource<T: Object>(
     content_type: &str,
     body: &[u8],
 ) -> Result<Response> {
-    authorize(state, user, "patch", &scope.resource, namespace, Some(name)).await?;
+    authorize(
+        state,
+        user,
+        "patch",
+        &scope.resource,
+        scope.subresource,
+        namespace,
+        Some(name),
+    )
+    .await?;
 
     // patch.go:78-89: drop "; charset=...", then require a supported type.
     let content_type = match content_type.find(';') {
@@ -106,13 +115,18 @@ pub async fn patch_resource<T: Object>(
             }
         }
     };
-    let force_allow_create = matches!(mechanism, Mechanism::Apply { .. });
+    // A subresource's REST passes `forceAllowCreate = false` to the Store
+    // whatever the patch type: "subresources should never allow create on
+    // update" (apps/deployment/storage/storage.go:156-160).
+    let force_allow_create =
+        matches!(mechanism, Mechanism::Apply { .. }) && scope.subresource.is_none();
 
     let ctx = RequestContext::new(namespace);
     let admission = Admission {
         state,
         kind: &scope.kind,
         resource: &scope.resource,
+        subresource: scope.subresource,
         namespace,
         user,
         dry_run,

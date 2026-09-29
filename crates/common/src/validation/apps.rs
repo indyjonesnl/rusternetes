@@ -1,10 +1,12 @@
 //! Deployment field validation — port of upstream Kubernetes
 //! `pkg/apis/apps/validation/validation.go` (release-1.35).
 //!
-//! Two public entry points:
-//! * [`validate_deployment`] — create-path validation (all fields).
-//! * [`validate_deployment_update`] — update-path validation (immutability +
-//!   create checks on the new object).
+//! Deployment entry points, as the strategies in
+//! `pkg/registry/apps/deployment/strategy.go` call them:
+//! * [`validate_deployment`] — `ValidateDeployment`, on create.
+//! * [`validate_deployment_update`] — `ValidateDeploymentUpdate`.
+//! * [`validate_deployment_status_update`] — `ValidateDeploymentStatusUpdate`,
+//!   on `/status`.
 //!
 //! Mirrors upstream structure: validators return [`ErrorList`] and *accumulate*
 //! every problem rather than short-circuiting on the first failure. Field paths
@@ -14,7 +16,9 @@
 //! Upstream:
 //! <https://github.com/kubernetes/kubernetes/blob/release-1.35/pkg/apis/apps/validation/validation.go>
 
-use crate::resources::deployment::{Deployment, DeploymentStrategy, RollingUpdateDeployment};
+use crate::resources::deployment::{
+    Deployment, DeploymentStatus, DeploymentStrategy, RollingUpdateDeployment,
+};
 use crate::resources::policy::IntOrString;
 use crate::resources::workloads::{
     DaemonSet, DaemonSetSpec, ReplicaSet, ReplicaSetSpec, StatefulSet, StatefulSetSpec,
@@ -23,6 +27,10 @@ use crate::types::LabelSelector;
 use crate::validation::field::{BadValue, Error, ErrorList, Path};
 use crate::validation::metav1::{
     is_dns1123_label, validate_label_selector, LabelSelectorValidationOptions,
+};
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, validate_immutable_field, validate_nonnegative_field,
+    validate_object_meta, validate_object_meta_update,
 };
 use crate::validation::podtemplate::validate_pod_template_spec;
 
@@ -479,16 +487,120 @@ fn validate_deployment_spec(
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Validate a new `Deployment`. Mirrors upstream `ValidateDeployment`.
+/// Validate a new `Deployment`: upstream `ValidateDeployment`
+/// (validation.go:733-737), with `ValidateDeploymentName =
+/// NameIsDNSSubdomain`.
 ///
 /// Returns an empty `ErrorList` if the object is valid. Each entry in a
 /// non-empty list corresponds to one invalid field.
 pub fn validate_deployment(d: &Deployment) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
-
-    // spec is effectively required (the struct always has one, but validate it)
+    let mut errs = validate_object_meta(
+        &d.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
     errs.extend(validate_deployment_spec(&d.spec, &Path::new("spec")));
+    errs
+}
 
+/// Upstream `ValidateDeploymentStatus` (validation.go:678-706).
+pub fn validate_deployment_status(status: &DeploymentStatus, fld_path: &Path) -> ErrorList {
+    let replicas = status.replicas.unwrap_or(0);
+    let updated = status.updated_replicas.unwrap_or(0);
+    let ready = status.ready_replicas.unwrap_or(0);
+    let available = status.available_replicas.unwrap_or(0);
+    let unavailable = status.unavailable_replicas.unwrap_or(0);
+
+    let mut errs = validate_nonnegative_field(
+        status.observed_generation.unwrap_or(0),
+        &fld_path.child("observedGeneration"),
+    );
+    errs.extend(validate_nonnegative_field(
+        i64::from(replicas),
+        &fld_path.child("replicas"),
+    ));
+    errs.extend(validate_nonnegative_field(
+        i64::from(updated),
+        &fld_path.child("updatedReplicas"),
+    ));
+    errs.extend(validate_nonnegative_field(
+        i64::from(ready),
+        &fld_path.child("readyReplicas"),
+    ));
+    errs.extend(validate_nonnegative_field(
+        i64::from(available),
+        &fld_path.child("availableReplicas"),
+    ));
+    errs.extend(validate_nonnegative_field(
+        i64::from(unavailable),
+        &fld_path.child("unavailableReplicas"),
+    ));
+    if let Some(terminating) = status.terminating_replicas {
+        errs.extend(validate_nonnegative_field(
+            i64::from(terminating),
+            &fld_path.child("terminatingReplicas"),
+        ));
+    }
+    if let Some(collisions) = status.collision_count {
+        errs.extend(validate_nonnegative_field(
+            i64::from(collisions),
+            &fld_path.child("collisionCount"),
+        ));
+    }
+    let msg = "cannot be greater than status.replicas";
+    if updated > replicas {
+        errs.push(Error::invalid(
+            &fld_path.child("updatedReplicas"),
+            updated,
+            msg,
+        ));
+    }
+    if ready > replicas {
+        errs.push(Error::invalid(&fld_path.child("readyReplicas"), ready, msg));
+    }
+    if available > replicas {
+        errs.push(Error::invalid(
+            &fld_path.child("availableReplicas"),
+            available,
+            msg,
+        ));
+    }
+    if available > ready {
+        errs.push(Error::invalid(
+            &fld_path.child("availableReplicas"),
+            available,
+            "cannot be greater than readyReplicas",
+        ));
+    }
+    errs
+}
+
+/// Upstream `IsDecremented` (core/validation/validation.go:8717-8725).
+fn is_decremented(update: Option<i32>, old: Option<i32>) -> bool {
+    match (update, old) {
+        (None, Some(_)) => true,
+        (Some(u), Some(o)) => u < o,
+        _ => false,
+    }
+}
+
+/// Upstream `ValidateDeploymentStatusUpdate` (validation.go:718-730).
+pub fn validate_deployment_status_update(new: &Deployment, old: &Deployment) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
+    let fld_path = Path::new("status");
+    let empty = DeploymentStatus::default();
+    let new_status = new.status.as_ref().unwrap_or(&empty);
+    let old_status = old.status.as_ref().unwrap_or(&empty);
+    errs.extend(validate_deployment_status(new_status, &fld_path));
+    if is_decremented(new_status.collision_count, old_status.collision_count) {
+        errs.push(Error::invalid(
+            &fld_path.child("collisionCount"),
+            new_status.collision_count.unwrap_or(0),
+            "cannot be decremented",
+        ));
+    }
     errs
 }
 
@@ -900,27 +1012,18 @@ pub fn validate_daemonset(ds: &DaemonSet) -> ErrorList {
     validate_daemonset_spec(&ds.spec, &Path::new("spec"))
 }
 
-/// Validate a `Deployment` update (`new` replaces `old`). Mirrors upstream
-/// `ValidateDeploymentUpdate`.
-///
-/// Checks:
-/// 1. selector is immutable (already enforced by the handler but re-checked
-///    here for completeness / testing).
-/// 2. All create-side constraints on the new object.
+/// Validate a `Deployment` update (`new` replaces `old`): upstream
+/// `ValidateDeploymentUpdate` (validation.go:709-714) — the metadata update,
+/// the new spec, and the immutable selector.
 pub fn validate_deployment_update(new: &Deployment, old: &Deployment) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
-
-    // selector is immutable
-    if new.spec.selector != old.spec.selector {
-        errs.push(Error::forbidden(
-            &Path::new("spec").child("selector"),
-            "field is immutable",
-        ));
-    }
-
-    // Full spec validation on the new object
+    let mut errs =
+        validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
     errs.extend(validate_deployment_spec(&new.spec, &Path::new("spec")));
-
+    errs.extend(validate_immutable_field(
+        &new.spec.selector,
+        &old.spec.selector,
+        &Path::new("spec").child("selector"),
+    ));
     errs
 }
 
@@ -1051,7 +1154,12 @@ mod workload_parity_tests {
     }
 
     fn deployment(json: serde_json::Value) -> Deployment {
-        serde_json::from_value(json).unwrap()
+        let mut d: Deployment = serde_json::from_value(json).unwrap();
+        // `ValidateObjectMeta` requires the namespace of a namespaced object.
+        d.metadata
+            .namespace
+            .get_or_insert_with(|| "default".to_string());
+        d
     }
     fn statefulset(json: serde_json::Value) -> StatefulSet {
         serde_json::from_value(json).unwrap()
