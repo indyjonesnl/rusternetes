@@ -960,11 +960,11 @@ pub struct JobTemplateSpec {
 }
 
 /// CronJobStatus represents the current state of a CronJob
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CronJobStatus {
-    /// List of currently running jobs
-    #[serde(default)]
+    /// List of currently running jobs (`json:"active,omitempty"`)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active: Vec<crate::resources::service_account::ObjectReference>,
 
     /// Last time the job was scheduled

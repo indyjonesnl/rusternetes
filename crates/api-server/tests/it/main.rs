@@ -77,6 +77,7 @@ mod crd_status_watch_test;
 mod crd_watch_version_conversion_test;
 mod cri_ws_attach_proxy_test;
 mod cri_ws_exec_proxy_test;
+mod cronjob_generic_store_test;
 mod cronjob_handler_test;
 mod csidriver_handler_test;
 mod csidriver_update_immutable_test;

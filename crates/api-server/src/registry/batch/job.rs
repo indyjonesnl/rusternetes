@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rusternetes_common::deletion::DeleteOptions;
 use rusternetes_common::equality::semantic_equal;
-use rusternetes_common::resources::{Job, JobStatus};
+use rusternetes_common::resources::{Job, JobSpec, JobStatus};
 use rusternetes_common::types::LabelSelector;
 use rusternetes_common::validation::field::ErrorList;
 use rusternetes_common::validation::job::{
@@ -113,14 +113,14 @@ fn validation_options_for_job(old: Option<&Job>) -> JobValidationOptions {
 }
 
 /// `WarningsForJobSpec` (pkg/api/job/warnings.go:35-51), minus
-/// `GetWarningsForPodTemplate` (#1996).
-fn warnings_for_job_spec(job: &Job) -> Vec<String> {
-    let spec = &job.spec;
+/// `GetWarningsForPodTemplate` (#1996). `path` is where the spec sits: `spec`
+/// for a Job, `spec.jobTemplate.spec` for a CronJob.
+pub(crate) fn warnings_for_job_spec(path: &str, spec: &JobSpec) -> Vec<String> {
     if spec.completion_mode.as_deref() == Some("Indexed")
         && spec.completions.unwrap_or(0) > COMPLETIONS_SOFT_LIMIT
         && spec.parallelism.unwrap_or(0) > PARALLELISM_SOFT_LIMIT_FOR_UNLIMITED_COMPLETIONS
     {
-        return vec!["spec: In Indexed Jobs with a number of completions higher than 10^5 and a parallelism higher than 10^4, Kubernetes might not be able to track completedIndexes when a big number of indexes fail".to_string()];
+        return vec![format!("{path}: In Indexed Jobs with a number of completions higher than 10^5 and a parallelism higher than 10^4, Kubernetes might not be able to track completedIndexes when a big number of indexes fail")];
     }
     Vec::new()
 }
@@ -157,7 +157,7 @@ impl RestCreateStrategy<Job> for Strategy {
                 msgs.join(" ")
             ));
         }
-        warnings.extend(warnings_for_job_spec(obj));
+        warnings.extend(warnings_for_job_spec("spec", &obj.spec));
         warnings
     }
 }
@@ -188,7 +188,7 @@ impl RestUpdateStrategy<Job> for Strategy {
     /// `WarningsOnUpdate` (strategy.go:308-316): only a spec change warns.
     fn warnings_on_update(&self, _ctx: &RequestContext, obj: &Job, old: &Job) -> Vec<String> {
         if obj.metadata.generation != old.metadata.generation {
-            return warnings_for_job_spec(obj);
+            return warnings_for_job_spec("spec", &obj.spec);
         }
         Vec::new()
     }
@@ -477,9 +477,9 @@ mod tests {
         job.spec.completion_mode = Some("Indexed".into());
         job.spec.completions = Some(COMPLETIONS_SOFT_LIMIT + 1);
         job.spec.parallelism = Some(PARALLELISM_SOFT_LIMIT_FOR_UNLIMITED_COMPLETIONS + 1);
-        assert_eq!(warnings_for_job_spec(&job).len(), 1);
+        assert_eq!(warnings_for_job_spec("spec", &job.spec).len(), 1);
         job.spec.parallelism = Some(PARALLELISM_SOFT_LIMIT_FOR_UNLIMITED_COMPLETIONS);
-        assert!(warnings_for_job_spec(&job).is_empty());
+        assert!(warnings_for_job_spec("spec", &job.spec).is_empty());
     }
 
     #[test]
