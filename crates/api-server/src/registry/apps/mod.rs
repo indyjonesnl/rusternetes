@@ -2,3 +2,4 @@
 //! `pkg/registry/apps/<resource>/`.
 
 pub mod deployment;
+pub mod replicaset;

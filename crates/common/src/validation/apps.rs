@@ -21,7 +21,8 @@ use crate::resources::deployment::{
 };
 use crate::resources::policy::IntOrString;
 use crate::resources::workloads::{
-    DaemonSet, DaemonSetSpec, ReplicaSet, ReplicaSetSpec, StatefulSet, StatefulSetSpec,
+    DaemonSet, DaemonSetSpec, ReplicaSet, ReplicaSetSpec, ReplicaSetStatus, StatefulSet,
+    StatefulSetSpec,
 };
 use crate::types::LabelSelector;
 use crate::validation::field::{BadValue, Error, ErrorList, Path};
@@ -686,9 +687,102 @@ fn validate_replicaset_spec(spec: &ReplicaSetSpec, fld_path: &Path) -> ErrorList
     errs
 }
 
-/// Validate a new `ReplicaSet`. Mirrors upstream `ValidateReplicaSet`.
+/// Validate a new `ReplicaSet`: upstream `ValidateReplicaSet`
+/// (validation.go:756-760), with `ValidateReplicaSetName =
+/// NameIsDNSSubdomain`.
 pub fn validate_replicaset(rs: &ReplicaSet) -> ErrorList {
-    validate_replicaset_spec(&rs.spec, &Path::new("spec"))
+    let mut errs = validate_object_meta(
+        &rs.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_replicaset_spec(&rs.spec, &Path::new("spec")));
+    errs
+}
+
+/// Upstream `ValidateReplicaSetUpdate` (validation.go:763-769): the metadata
+/// update, the new spec, and the immutable selector.
+pub fn validate_replicaset_update(new: &ReplicaSet, old: &ReplicaSet) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
+    errs.extend(validate_replicaset_spec(&new.spec, &Path::new("spec")));
+    errs.extend(validate_immutable_field(
+        &new.spec.selector,
+        &old.spec.selector,
+        &Path::new("spec").child("selector"),
+    ));
+    errs
+}
+
+/// Upstream `ValidateReplicaSetStatusUpdate` (validation.go:772-777).
+pub fn validate_replicaset_status_update(new: &ReplicaSet, old: &ReplicaSet) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
+    let empty = ReplicaSetStatus::default();
+    errs.extend(validate_replicaset_status(
+        new.status.as_ref().unwrap_or(&empty),
+        &Path::new("status"),
+    ));
+    errs
+}
+
+/// Upstream `ValidateReplicaSetStatus` (validation.go:780-804).
+pub fn validate_replicaset_status(status: &ReplicaSetStatus, fld_path: &Path) -> ErrorList {
+    let replicas = status.replicas;
+    let fully_labeled = status.fully_labeled_replicas.unwrap_or(0);
+    let ready = status.ready_replicas;
+    let available = status.available_replicas;
+
+    let mut errs = validate_nonnegative_field(i64::from(replicas), &fld_path.child("replicas"));
+    errs.extend(validate_nonnegative_field(
+        i64::from(fully_labeled),
+        &fld_path.child("fullyLabeledReplicas"),
+    ));
+    errs.extend(validate_nonnegative_field(
+        i64::from(ready),
+        &fld_path.child("readyReplicas"),
+    ));
+    errs.extend(validate_nonnegative_field(
+        i64::from(available),
+        &fld_path.child("availableReplicas"),
+    ));
+    errs.extend(validate_nonnegative_field(
+        status.observed_generation.unwrap_or(0),
+        &fld_path.child("observedGeneration"),
+    ));
+    if let Some(terminating) = status.terminating_replicas {
+        errs.extend(validate_nonnegative_field(
+            i64::from(terminating),
+            &fld_path.child("terminatingReplicas"),
+        ));
+    }
+    let msg = "cannot be greater than status.replicas";
+    if fully_labeled > replicas {
+        errs.push(Error::invalid(
+            &fld_path.child("fullyLabeledReplicas"),
+            fully_labeled,
+            msg,
+        ));
+    }
+    if ready > replicas {
+        errs.push(Error::invalid(&fld_path.child("readyReplicas"), ready, msg));
+    }
+    if available > replicas {
+        errs.push(Error::invalid(
+            &fld_path.child("availableReplicas"),
+            available,
+            msg,
+        ));
+    }
+    if available > ready {
+        errs.push(Error::invalid(
+            &fld_path.child("availableReplicas"),
+            available,
+            "cannot be greater than readyReplicas",
+        ));
+    }
+    errs
 }
 
 /// Validate a `StatefulSetSpec`. Mirrors upstream `ValidateStatefulSetSpec`
@@ -1331,7 +1425,7 @@ mod workload_parity_tests {
 
     fn base_replicaset(template: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
-            "metadata": {"name": "r"},
+            "metadata": {"name": "r", "namespace": "default"},
             "spec": {"replicas": 1, "selector": matching_selector(), "template": template}
         })
     }
