@@ -296,3 +296,135 @@ pub async fn run_test_list_paging<S: Storage>(storage: &S, expects_snapshot: boo
         );
     }
 }
+
+/// Ported from `RunTestGuaranteedUpdateWithConflict`
+/// (`staging/src/k8s.io/apiserver/pkg/storage/testing/store_tests.go:3633-3676`).
+///
+/// Upstream drives two `GuaranteedUpdate`s that overlap in time from the same
+/// starting revision, and asserts the second one's mutation function runs
+/// **twice**:
+///
+/// ```go
+/// if updateCount != 2 {
+///     t.Errorf("Should have conflict and called update func twice")
+/// }
+/// ```
+///
+/// The second call runs again only because its first compare-and-swap lost and
+/// it re-read. `GuaranteedUpdate` is built on top of the CAS primitive, which
+/// here is `Storage::update` keyed on `metadata.resourceVersion`, so the same
+/// property states as: **two updates carrying the same resourceVersion must
+/// never both succeed.** One wins; the other is `Error::Conflict`.
+///
+/// This is the *sequential* row: the second update starts after the first has
+/// committed, so only the stored revision has moved on. Any backend that
+/// compares at all catches it. The overlapping row — the one that finds a
+/// compare which is not atomic with the write — is
+/// `run_test_concurrent_update_is_atomic`.
+pub async fn run_test_update_with_conflict<S: Storage>(storage: &S) {
+    // Row 1: sequential.
+    let key = pod_key("test-ns", "conflict-seq");
+    storage
+        .create::<Value>(&key, &pod("test-ns", "conflict-seq"))
+        .await
+        .expect("create failed");
+    let base: Value = storage.get(&key).await.expect("get failed");
+
+    let mut first = base.clone();
+    first["metadata"]["labels"] = serde_json::json!({ "writer": "first" });
+    storage
+        .update::<Value>(&key, &first)
+        .await
+        .expect("an update from a freshly-read object must succeed");
+
+    let mut second = base.clone();
+    second["metadata"]["labels"] = serde_json::json!({ "writer": "second" });
+    let err = storage
+        .update::<Value>(&key, &second)
+        .await
+        .expect_err("an update from a superseded resourceVersion must be rejected");
+    assert!(
+        matches!(err, rusternetes_common::Error::Conflict(_)),
+        "expected Conflict for a superseded resourceVersion, got {err:?}"
+    );
+}
+
+/// Row 2 of `RunTestGuaranteedUpdateWithConflict`: the writers *overlap*.
+///
+/// Upstream's version is a two-goroutine interleaving pinned with
+/// `secondToEnter` / `firstToFinish` so the second `GuaranteedUpdate` is
+/// guaranteed to be inside its mutation when the first commits. We cannot pin
+/// the interleaving from outside the `Storage` trait, so this runs many rounds
+/// of several writers on a multi-threaded runtime and asserts the invariant
+/// every round: of N updates that all carry the same starting resourceVersion,
+/// exactly one succeeds.
+///
+/// A backend that reads the current revision, compares it, and only then writes
+/// — with the read and the write in separate transactions — lets every writer
+/// pass the comparison before any of them writes. Each then reports success,
+/// and the last write silently reverts the others. That is what the sequential
+/// row cannot see: there, the only writer has already committed.
+///
+/// This is the storage-layer half of #1840: a `/status` write built from a
+/// snapshot taken microseconds earlier restores that snapshot's `spec` over a
+/// spec the client just changed, and the conflict that should have stopped it
+/// is never raised.
+pub async fn run_test_concurrent_update_is_atomic<S>(storage: std::sync::Arc<S>)
+where
+    S: Storage + Send + Sync + 'static,
+{
+    const ROUNDS: usize = 40;
+    const WRITERS: usize = 4;
+
+    for round in 0..ROUNDS {
+        let name = format!("race-{round}");
+        let key = pod_key("test-ns", &name);
+        storage
+            .create::<Value>(&key, &pod("test-ns", &name))
+            .await
+            .expect("create failed");
+        let base: Value = storage.get(&key).await.expect("get failed");
+
+        let mut handles = Vec::with_capacity(WRITERS);
+        for writer in 0..WRITERS {
+            let storage = std::sync::Arc::clone(&storage);
+            let key = key.clone();
+            let mut object = base.clone();
+            object["metadata"]["labels"] = serde_json::json!({ "writer": writer.to_string() });
+            handles.push(tokio::spawn(async move {
+                storage.update::<Value>(&key, &object).await
+            }));
+        }
+
+        let mut winners = Vec::new();
+        let mut losers = Vec::new();
+        for (writer, handle) in handles.into_iter().enumerate() {
+            match handle.await.expect("writer task panicked") {
+                Ok(_) => winners.push(writer),
+                Err(e) => losers.push((writer, e)),
+            }
+        }
+
+        assert_eq!(
+            winners.len(),
+            1,
+            "round {round}: {} of {WRITERS} updates from the same resourceVersion \
+             succeeded, expected exactly 1 (winners: {winners:?})",
+            winners.len()
+        );
+        for (writer, e) in &losers {
+            assert!(
+                matches!(e, rusternetes_common::Error::Conflict(_)),
+                "round {round}: writer {writer} must lose with Conflict, got {e:?}"
+            );
+        }
+
+        // The survivor is the winner's object, whole.
+        let stored: Value = storage.get(&key).await.expect("get after race failed");
+        assert_eq!(
+            stored["metadata"]["labels"]["writer"],
+            winners[0].to_string(),
+            "round {round}: the stored object is not the winning writer's"
+        );
+    }
+}

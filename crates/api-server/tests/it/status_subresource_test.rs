@@ -297,8 +297,8 @@ async fn test_resource_version_increments() {
         "phase": "Running",
         "podIP": "10.0.0.5"
     });
-    updated["metadata"]["resourceVersion"] = json!((original_version + 1).to_string());
-
+    // Send the resourceVersion that was read, as a client does. The store
+    // stamps the next one itself and rejects a forged one with Conflict.
     storage.update(&key, &updated).await.unwrap();
 
     let new_resource: Value = storage.get(&key).await.unwrap();

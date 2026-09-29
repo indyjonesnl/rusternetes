@@ -563,6 +563,9 @@ async fn events_v1_should_fetch_patch_delete_list() {
         "count": 2,
         "lastObservedTime": "2017-09-19T13:49:11.000000Z",
     });
+    // The update below is built from this GET, so keep the resourceVersion it
+    // carried before the comparison strips it.
+    let live_rv = event["metadata"]["resourceVersion"].clone();
     strip_control_plane_fields(&mut test_event);
     strip_control_plane_fields(&mut event);
     assert_eq!(
@@ -582,11 +585,10 @@ async fn events_v1_should_fetch_patch_delete_list() {
     {
         meta.remove("managedFields");
         // Strict events.k8s.io/v1 update validation (ValidateObjectMetaUpdate)
-        // rejects an update whose metadata.resourceVersion is empty. A real
-        // etcd backend stamps an RV that GET round-trips; the in-process
-        // MemoryStorage test backend does not synthesize one, so set it
-        // explicitly to mirror what a live backend returns.
-        meta.insert("resourceVersion".to_string(), json!("1"));
+        // rejects an update whose metadata.resourceVersion is empty, and the
+        // store rejects a superseded one. Upstream's e2e Updates the object it
+        // just got (events.go:170-176), so send the RV that GET returned.
+        meta.insert("resourceVersion".to_string(), live_rv);
     }
     let (status, _updated) =
         put_json(&state, &format!("{ns_path}/{event_name}"), &update_event).await;

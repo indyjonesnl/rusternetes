@@ -87,6 +87,26 @@ macro_rules! contract_suite {
                 };
                 store::run_test_list_paging(&fixture.storage, $snapshot).await;
             }
+
+            #[tokio::test]
+            async fn update_with_conflict() {
+                let Some(fixture) = $setup.await else {
+                    return;
+                };
+                store::run_test_update_with_conflict(&fixture.storage).await;
+            }
+
+            // Multi-threaded on purpose: the invariant under test is what
+            // happens when two writers are genuinely inside `update` at the
+            // same time, which a current-thread runtime cannot produce.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn concurrent_update_is_atomic() {
+                let Some(fixture) = $setup.await else {
+                    return;
+                };
+                store::run_test_concurrent_update_is_atomic(std::sync::Arc::new(fixture.storage))
+                    .await;
+            }
         }
     };
 }

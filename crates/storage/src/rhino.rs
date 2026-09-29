@@ -323,7 +323,15 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
             .await
             .map_err(|e| Error::Storage(format!("Failed to delete resource: {}", e)))?;
 
-        if !succeeded {
+        // kine's `Delete` reports a key that never existed as
+        // `(rev, nil, true)` and one already deleted as `(rev, nil, false)`
+        // (`pkg/logstructured/logstructured.go`). Both are NotFound upstream:
+        // `conditionalDelete` reads the key via `getState(..., ignoreNotFound:
+        // false)`, which returns `storage.NewKeyNotFoundError(key, 0)` when the
+        // kv is nil (`staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go`).
+        // A successful delete always carries the prior kv, so a missing one
+        // means there was nothing to delete (#2041).
+        if !succeeded || prev_kv.is_none() {
             return Err(Error::NotFound(key.to_string()));
         }
 

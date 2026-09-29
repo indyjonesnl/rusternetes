@@ -129,3 +129,27 @@ pub async fn kine() -> Option<Fixture<EtcdStorage>> {
         Err(e) => panic!("failed to start kine container: {e}"),
     }
 }
+
+/// The embedded rhino/SQLite backend — the one `compose.sqlite.yml` and every
+/// conformance run actually use. No container: it is an in-process library over
+/// a temp-dir database.
+///
+/// etcd and kine cover the wire protocol, and neither covers this code path.
+#[cfg(feature = "sqlite")]
+pub async fn rhino_sqlite() -> Option<Fixture<rusternetes_storage::RhinoStorage>> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir
+        .path()
+        .join("contract.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    // The directory must outlive the backend; the suite drops the fixture at
+    // the end of each test and the temp dir goes with the process.
+    std::mem::forget(dir);
+    Some(Fixture {
+        storage: rusternetes_storage::RhinoStorage::new(&path)
+            .await
+            .expect("rhino sqlite backend"),
+        _container: None,
+    })
+}
