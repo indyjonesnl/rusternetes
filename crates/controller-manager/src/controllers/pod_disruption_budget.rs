@@ -537,95 +537,41 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         true
     }
 
-    /// Check if a pod matches the PDB selector.
+    /// Whether `pod` is selected by the PDB's selector.
     ///
-    /// Mirrors upstream `apimachinery/pkg/apis/meta/v1.LabelSelectorAsSelector`
-    /// + `labels.Selector.Matches`:
+    /// One matcher, not a copy: `label_selector_as_selector`
+    /// (`apimachinery/pkg/apis/meta/v1/helpers.go:36-72`) + `Selector::matches`.
+    /// A present-but-empty selector is `labels.Everything()` and matches every
+    /// pod, including one with no labels at all —
+    /// `TestSelectorsForPodsWithoutLabels` pins that for `policy/v1`.
     ///
-    ///   * An empty selector (`matchLabels` and `matchExpressions` both
-    ///     empty/absent) matches everything — including pods with no labels at
-    ///     all. `TestSelectorsForPodsWithoutLabels` pins this contract for the
-    ///     current `policy/v1` API. The deprecated `policy/v1beta1` API had
-    ///     the inverse meaning (empty selector matched NO pods) and upstream
-    ///     `TestEmptySelector` keeps that compat shim alive — set
-    ///     `empty_selector_matches_nothing = true` for v1beta1 PDBs.
-    ///   * `matchLabels` entries are AND-combined and treated as exact-match.
-    ///   * `matchExpressions` entries are AND-combined; operator semantics:
-    ///       - `In`           — key present AND pod's value in `values`.
-    ///       - `NotIn`        — key absent OR pod's value not in `values`.
-    ///       - `Exists`       — key present.
-    ///       - `DoesNotExist` — key absent (matches label-less pods).
+    /// `empty_selector_matches_nothing` is the `policy/v1beta1` compat rule
+    /// (`staging/src/k8s.io/api/policy/v1beta1/types.go:33-37`: "An empty
+    /// selector ({}) also selects no pods, which differs from standard
+    /// behavior"). Upstream implements it by *conversion* rather than by a
+    /// controller flag — `Convert_v1beta1_PodDisruptionBudget_To_policy_PodDisruptionBudget`
+    /// (`pkg/apis/policy/v1beta1/conversion.go:26-47`) swaps an empty v1beta1
+    /// selector for `NonV1beta1MatchNoneSelector`, a non-empty selector that
+    /// never matches (`pkg/apis/policy/helper.go:27-37`) — so its controller
+    /// has one rule. Rusternetes serves only `policy/v1`, so there is no
+    /// conversion boundary to hook and the rule stays here, keyed off the
+    /// stored `apiVersion`.
     fn pod_matches_selector(
         &self,
         pod: &Pod,
         selector: &LabelSelector,
         empty_selector_matches_nothing: bool,
     ) -> bool {
-        let pod_labels = pod.metadata.labels.as_ref();
-
-        let match_labels_empty = selector
-            .match_labels
-            .as_ref()
-            .map(|m| m.is_empty())
-            .unwrap_or(true);
-        let match_expressions_empty = selector
-            .match_expressions
-            .as_ref()
-            .map(|m| m.is_empty())
-            .unwrap_or(true);
-
-        // Empty selector: v1 matches every pod, v1beta1 matches none.
-        if match_labels_empty && match_expressions_empty {
-            return !empty_selector_matches_nothing;
+        let Ok(selector) = rusternetes_common::types::label_selector_as_selector(Some(selector))
+        else {
+            // An invalid operator: upstream's `getPodsForPdb` propagates the
+            // error and the sync fails, so no pod is counted.
+            return false;
+        };
+        if selector.is_everything() && empty_selector_matches_nothing {
+            return false;
         }
-
-        if let Some(match_labels) = &selector.match_labels {
-            for (key, value) in match_labels {
-                let got = pod_labels.and_then(|l| l.get(key));
-                if got != Some(value) {
-                    return false;
-                }
-            }
-        }
-
-        if let Some(match_expressions) = &selector.match_expressions {
-            for req in match_expressions {
-                let pod_value = pod_labels.and_then(|l| l.get(&req.key));
-                let matched = match req.operator.as_str() {
-                    "In" => match pod_value {
-                        Some(v) => req
-                            .values
-                            .as_ref()
-                            .map(|vals| vals.iter().any(|x| x == v))
-                            .unwrap_or(false),
-                        None => false,
-                    },
-                    "NotIn" => match pod_value {
-                        Some(v) => req
-                            .values
-                            .as_ref()
-                            .map(|vals| !vals.iter().any(|x| x == v))
-                            .unwrap_or(true),
-                        None => true,
-                    },
-                    "Exists" => pod_value.is_some(),
-                    "DoesNotExist" => pod_value.is_none(),
-                    other => {
-                        debug!(
-                            "unknown LabelSelector operator `{other}` on PDB selector \
-                             (key={}); treating as non-match",
-                            req.key
-                        );
-                        false
-                    }
-                };
-                if !matched {
-                    return false;
-                }
-            }
-        }
-
-        true
+        selector.matches(pod.metadata.labels.as_ref())
     }
 }
 

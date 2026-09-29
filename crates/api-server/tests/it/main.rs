@@ -94,6 +94,7 @@ mod dra_finalizers_test;
 mod dra_test;
 mod e2e_inprocess_smoke_test;
 mod e2e_workflow_test;
+mod empty_selector_matches_everything_test;
 mod endpoints_default_protocol_test;
 mod endpoints_handler_test;
 mod endpoints_lease_update_validation_test;

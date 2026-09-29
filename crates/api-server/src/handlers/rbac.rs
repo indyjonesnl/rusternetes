@@ -18,9 +18,12 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 /// Test whether `labels` satisfies a `types::LabelSelector` (matchLabels +
-/// matchExpressions). Delegates to [`LabelSelector::matches_labels`], whose
-/// "empty selector matches nothing" semantics mirror the ClusterRole
-/// aggregation controller's skip-empty-selectors behaviour.
+/// matchExpressions). Delegates to [`LabelSelector::matches_labels`], i.e.
+/// `LabelSelectorAsSelector` + `Matches`, which is what the ClusterRole
+/// aggregation controller does
+/// (`pkg/controller/clusterroleaggregation/clusterroleaggregation_controller.go:104-108`).
+/// It has no skip-empty-selectors behaviour: an aggregation rule with an empty
+/// (`{}`) selector selects every ClusterRole (#2012).
 fn label_selector_matches(selector: &LabelSelector, labels: &HashMap<String, String>) -> bool {
     selector.matches_labels(labels)
 }

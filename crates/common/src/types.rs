@@ -580,57 +580,130 @@ pub struct LabelSelectorRequirement {
     pub values: Option<Vec<String>>,
 }
 
-impl LabelSelector {
-    /// Whether `labels` satisfies this selector (both `matchLabels` and
-    /// `matchExpressions`). Mirrors upstream
-    /// `apimachinery/pkg/apis/meta/v1.LabelSelectorAsSelector` +
-    /// `Selector.Matches`.
-    ///
-    /// An *empty* selector (no `matchLabels` and no `matchExpressions`) matches
-    /// nothing here. This mirrors the call sites that treat an empty selector as
-    /// "does not apply" — e.g. eviction's PDB lookup and the ClusterRole
-    /// aggregation controller both skip empty selectors rather than selecting
-    /// everything (upstream's `selector.Empty()` guard).
-    pub fn matches_labels(&self, labels: &HashMap<String, String>) -> bool {
-        let has_match_labels = self.match_labels.as_ref().is_some_and(|m| !m.is_empty());
-        let has_match_exprs = self
-            .match_expressions
-            .as_ref()
-            .is_some_and(|e| !e.is_empty());
-        if !has_match_labels && !has_match_exprs {
-            return false;
-        }
+/// The three answers of `LabelSelectorAsSelector`
+/// (`staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/helpers.go:36-72`).
+///
+/// ```go
+/// func LabelSelectorAsSelector(ps *LabelSelector) (labels.Selector, error) {
+///     if ps == nil {
+///         return labels.Nothing(), nil
+///     }
+///     if len(ps.MatchLabels)+len(ps.MatchExpressions) == 0 {
+///         return labels.Everything(), nil
+///     }
+///     ...
+/// }
+/// ```
+///
+/// The distinction between the first two is load-bearing and easy to collapse:
+/// an **absent** selector matches nothing, an **empty** (`{}`) one matches
+/// everything. `policy/v1` says so in the API itself — "A null selector will
+/// match no pods, while an empty ({}) selector will select all pods within the
+/// namespace" (`staging/src/k8s.io/api/policy/v1/types.go:36-42`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Selector {
+    /// `labels.Nothing()` — the selector was absent.
+    Nothing,
+    /// `labels.Everything()` — the selector was present and empty.
+    Everything,
+    /// One requirement per `matchLabels` entry and per `matchExpressions`
+    /// entry, AND-combined. Every operator here is one of the four upstream
+    /// knows; an unknown one is an error from `label_selector_as_selector`, not
+    /// a requirement that never matches.
+    Requirements(LabelSelector),
+}
 
-        if let Some(match_labels) = &self.match_labels {
+impl Selector {
+    /// `labels.Selector.Matches`.
+    pub fn matches(&self, labels: Option<&HashMap<String, String>>) -> bool {
+        let selector = match self {
+            Selector::Nothing => return false,
+            Selector::Everything => return true,
+            Selector::Requirements(selector) => selector,
+        };
+
+        if let Some(match_labels) = &selector.match_labels {
             for (k, v) in match_labels {
-                if labels.get(k) != Some(v) {
+                if labels.and_then(|l| l.get(k)) != Some(v) {
                     return false;
                 }
             }
         }
 
-        if let Some(exprs) = &self.match_expressions {
-            for req in exprs {
-                let present = labels.contains_key(&req.key);
-                let matched =
-                    match req.operator.as_str() {
-                        "In" => req.values.as_ref().is_some_and(|vals| {
-                            labels.get(&req.key).is_some_and(|v| vals.contains(v))
-                        }),
-                        "NotIn" => !req.values.as_ref().is_some_and(|vals| {
-                            labels.get(&req.key).is_some_and(|v| vals.contains(v))
-                        }),
-                        "Exists" => present,
-                        "DoesNotExist" => !present,
-                        _ => false,
-                    };
-                if !matched {
-                    return false;
-                }
+        for req in selector.match_expressions.iter().flatten() {
+            let value = labels.and_then(|l| l.get(&req.key));
+            let in_values =
+                value.is_some_and(|v| req.values.as_ref().is_some_and(|values| values.contains(v)));
+            let matched = match req.operator.as_str() {
+                "In" => in_values,
+                "NotIn" => !in_values,
+                "Exists" => value.is_some(),
+                "DoesNotExist" => value.is_none(),
+                // Unreachable: `label_selector_as_selector` rejects it.
+                _ => false,
+            };
+            if !matched {
+                return false;
             }
         }
 
         true
+    }
+
+    /// Whether this is `labels.Everything()` — the `{}` selector.
+    pub fn is_everything(&self) -> bool {
+        matches!(self, Selector::Everything)
+    }
+}
+
+/// `LabelSelectorAsSelector` (`helpers.go:36-72`).
+///
+/// The error is upstream's `"%q is not a valid label selector operator"`. What
+/// a caller does with it is upstream's business and differs per call site:
+/// eviction skips the object ("This object has an invalid selector, it does not
+/// match the pod", `pkg/registry/core/pod/storage/eviction.go:498-502`), the
+/// ClusterRole aggregation controller fails the sync
+/// (`pkg/controller/clusterroleaggregation/clusterroleaggregation_controller.go:104-107`),
+/// and the workload validators skip the template-matches-selector check
+/// (`if err == nil && !selector.Matches(...)`).
+pub fn label_selector_as_selector(selector: Option<&LabelSelector>) -> Result<Selector, String> {
+    let Some(selector) = selector else {
+        return Ok(Selector::Nothing);
+    };
+    let match_labels = selector.match_labels.as_ref().map_or(0, HashMap::len);
+    let match_expressions = selector.match_expressions.as_ref().map_or(0, Vec::len);
+    if match_labels + match_expressions == 0 {
+        return Ok(Selector::Everything);
+    }
+    for req in selector.match_expressions.iter().flatten() {
+        if !matches!(
+            req.operator.as_str(),
+            "In" | "NotIn" | "Exists" | "DoesNotExist"
+        ) {
+            return Err(format!(
+                "{:?} is not a valid label selector operator",
+                req.operator
+            ));
+        }
+    }
+    Ok(Selector::Requirements(selector.clone()))
+}
+
+impl LabelSelector {
+    /// Whether `labels` satisfies this selector, for a caller that treats an
+    /// invalid operator as "does not match" — which is what upstream's eviction
+    /// path does. Equivalent to
+    /// `LabelSelectorAsSelector(&self)` followed by `Matches`.
+    ///
+    /// An **empty** selector matches everything. It used to match nothing here,
+    /// justified by a "`selector.Empty()` guard" in eviction and in the
+    /// ClusterRole aggregation controller that release-1.35 does not have
+    /// (#2012): both read the selector through `LabelSelectorAsSelector` and
+    /// neither tests it for emptiness.
+    pub fn matches_labels(&self, labels: &HashMap<String, String>) -> bool {
+        label_selector_as_selector(Some(self))
+            .map(|selector| selector.matches(Some(labels)))
+            .unwrap_or(false)
     }
 }
 
@@ -1160,10 +1233,47 @@ mod tests {
             .collect()
     }
 
+    /// The three answers of `LabelSelectorAsSelector` (`helpers.go:36-42`).
+    /// Absent is `labels.Nothing()`; `{}` is `labels.Everything()`. Collapsing
+    /// the two made a `{}` selector match nothing, which is what #2012 was.
     #[test]
-    fn matches_labels_empty_selector_matches_nothing() {
-        assert!(!LabelSelector::default().matches_labels(&labels(&[("a", "b")])));
-        assert!(!sel(serde_json::json!({})).matches_labels(&labels(&[("a", "b")])));
+    fn an_absent_selector_matches_nothing_and_an_empty_one_matches_everything() {
+        assert_eq!(label_selector_as_selector(None), Ok(Selector::Nothing));
+        assert!(!Selector::Nothing.matches(Some(&labels(&[("a", "b")]))));
+
+        for empty in [LabelSelector::default(), sel(serde_json::json!({}))] {
+            assert_eq!(
+                label_selector_as_selector(Some(&empty)),
+                Ok(Selector::Everything)
+            );
+            assert!(empty.matches_labels(&labels(&[("a", "b")])));
+            // Including a pod with no labels at all.
+            assert!(empty.matches_labels(&HashMap::new()));
+        }
+
+        // A selector whose maps are present but empty is still `{}`.
+        let explicitly_empty = sel(serde_json::json!({
+            "matchLabels": {}, "matchExpressions": []
+        }));
+        assert_eq!(
+            label_selector_as_selector(Some(&explicitly_empty)),
+            Ok(Selector::Everything)
+        );
+    }
+
+    /// Upstream returns `"%q is not a valid label selector operator"` rather
+    /// than a requirement that never matches, and each caller decides what that
+    /// means. `matches_labels` is the "does not match" reading.
+    #[test]
+    fn an_unknown_operator_is_an_error_not_a_silent_non_match() {
+        let s = sel(serde_json::json!({
+            "matchExpressions": [{"key": "a", "operator": "Greater", "values": ["1"]}]
+        }));
+        assert_eq!(
+            label_selector_as_selector(Some(&s)),
+            Err("\"Greater\" is not a valid label selector operator".to_string())
+        );
+        assert!(!s.matches_labels(&labels(&[("a", "b")])));
     }
 
     #[test]

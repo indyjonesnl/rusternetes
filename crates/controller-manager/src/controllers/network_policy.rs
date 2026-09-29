@@ -1,6 +1,7 @@
 use anyhow::Result;
 use rusternetes_common::resources::{NetworkPolicy, Pod};
 use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -386,68 +387,23 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
         Ok(matching_pods)
     }
 
-    /// Check if a pod matches a label selector
+    /// Whether `pod` is selected by a NetworkPolicy selector.
+    ///
+    /// One matcher, not a copy: `label_selector_as_selector`
+    /// (`apimachinery/pkg/apis/meta/v1/helpers.go:36-72`) + `Selector::matches`.
+    /// An empty `podSelector` selects every pod in the namespace, which is what
+    /// `networking/v1`'s own doc says, and it does so including pods with no
+    /// labels — the hand-rolled version answered a label-less pod from
+    /// `matchLabels` alone and ignored `matchExpressions` entirely, so a
+    /// `DoesNotExist` term never selected one (#2012).
     fn pod_matches_selector(
         &self,
         pod: &Pod,
         selector: &rusternetes_common::types::LabelSelector,
     ) -> bool {
-        let pod_labels = match &pod.metadata.labels {
-            Some(labels) => labels,
-            None => {
-                // Empty selector matches all pods, including those without labels
-                return selector.match_labels.is_none()
-                    || selector.match_labels.as_ref().unwrap().is_empty();
-            }
-        };
-
-        // Check matchLabels
-        if let Some(match_labels) = &selector.match_labels {
-            for (key, value) in match_labels {
-                match pod_labels.get(key) {
-                    Some(v) if v == value => continue,
-                    _ => return false,
-                }
-            }
-        }
-
-        // Check matchExpressions
-        if let Some(match_expressions) = &selector.match_expressions {
-            for expr in match_expressions {
-                if !self.pod_matches_expression(pod_labels, expr) {
-                    return false;
-                }
-            }
-        }
-
-        true
-    }
-
-    /// Check if pod labels match a label selector expression
-    fn pod_matches_expression(
-        &self,
-        pod_labels: &HashMap<String, String>,
-        expr: &rusternetes_common::types::LabelSelectorRequirement,
-    ) -> bool {
-        let label_value = pod_labels.get(&expr.key);
-        let empty_vec = vec![];
-
-        match expr.operator.as_str() {
-            "In" => {
-                let values = expr.values.as_ref().unwrap_or(&empty_vec);
-                label_value.map(|v| values.contains(v)).unwrap_or(false)
-            }
-            "NotIn" => {
-                let values = expr.values.as_ref().unwrap_or(&empty_vec);
-                label_value.map(|v| !values.contains(v)).unwrap_or(true)
-            }
-            "Exists" => label_value.is_some(),
-            "DoesNotExist" => label_value.is_none(),
-            _ => {
-                warn!("Unknown label selector operator: {}", expr.operator);
-                false
-            }
-        }
+        rusternetes_common::types::label_selector_as_selector(Some(selector))
+            .map(|selector| selector.matches(pod.metadata.labels.as_ref()))
+            .unwrap_or(false)
     }
 }
 
@@ -608,44 +564,119 @@ mod tests {
         assert!(controller.pod_matches_selector(&pod, &selector));
     }
 
+    fn bare_pod() -> Pod {
+        Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("test-pod"),
+            spec: None,
+            status: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_pod_matches_expression() {
         let storage = Arc::new(MemoryStorage::new());
         let controller = NetworkPolicyController::new(storage);
 
-        let mut pod_labels = HashMap::new();
-        pod_labels.insert("env".to_string(), "prod".to_string());
+        let mut pod = bare_pod();
+        pod.metadata.labels = Some(HashMap::from([("env".to_string(), "prod".to_string())]));
 
-        // Test "In" operator
-        let expr_in = LabelSelectorRequirement {
-            key: "env".to_string(),
-            operator: "In".to_string(),
-            values: Some(vec!["prod".to_string(), "staging".to_string()]),
+        let selector = |req: LabelSelectorRequirement| LabelSelector {
+            match_labels: None,
+            match_expressions: Some(vec![req]),
         };
-        assert!(controller.pod_matches_expression(&pod_labels, &expr_in));
 
-        // Test "NotIn" operator
-        let expr_not_in = LabelSelectorRequirement {
-            key: "env".to_string(),
-            operator: "NotIn".to_string(),
-            values: Some(vec!["dev".to_string()]),
-        };
-        assert!(controller.pod_matches_expression(&pod_labels, &expr_not_in));
+        for (label, req) in [
+            (
+                "In",
+                LabelSelectorRequirement {
+                    key: "env".to_string(),
+                    operator: "In".to_string(),
+                    values: Some(vec!["prod".to_string(), "staging".to_string()]),
+                },
+            ),
+            (
+                "NotIn",
+                LabelSelectorRequirement {
+                    key: "env".to_string(),
+                    operator: "NotIn".to_string(),
+                    values: Some(vec!["dev".to_string()]),
+                },
+            ),
+            (
+                "Exists",
+                LabelSelectorRequirement {
+                    key: "env".to_string(),
+                    operator: "Exists".to_string(),
+                    values: None,
+                },
+            ),
+            (
+                "DoesNotExist",
+                LabelSelectorRequirement {
+                    key: "nonexistent".to_string(),
+                    operator: "DoesNotExist".to_string(),
+                    values: None,
+                },
+            ),
+        ] {
+            assert!(
+                controller.pod_matches_selector(&pod, &selector(req)),
+                "{label} must select the pod"
+            );
+        }
+    }
 
-        // Test "Exists" operator
-        let expr_exists = LabelSelectorRequirement {
-            key: "env".to_string(),
-            operator: "Exists".to_string(),
-            values: None,
-        };
-        assert!(controller.pod_matches_expression(&pod_labels, &expr_exists));
+    /// A pod with no labels at all is still put through `matchExpressions`.
+    /// The hand-rolled matcher answered it from `matchLabels` alone, so a
+    /// `DoesNotExist` term — which such a pod satisfies by definition — never
+    /// selected it (#2012).
+    #[tokio::test]
+    async fn a_pod_with_no_labels_is_still_matched_against_expressions() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = NetworkPolicyController::new(storage);
+        let pod = bare_pod();
 
-        // Test "DoesNotExist" operator
-        let expr_not_exists = LabelSelectorRequirement {
-            key: "nonexistent".to_string(),
-            operator: "DoesNotExist".to_string(),
-            values: None,
+        let does_not_exist = LabelSelector {
+            match_labels: None,
+            match_expressions: Some(vec![LabelSelectorRequirement {
+                key: "env".to_string(),
+                operator: "DoesNotExist".to_string(),
+                values: None,
+            }]),
         };
-        assert!(controller.pod_matches_expression(&pod_labels, &expr_not_exists));
+        assert!(controller.pod_matches_selector(&pod, &does_not_exist));
+
+        let exists = LabelSelector {
+            match_labels: None,
+            match_expressions: Some(vec![LabelSelectorRequirement {
+                key: "env".to_string(),
+                operator: "Exists".to_string(),
+                values: None,
+            }]),
+        };
+        assert!(!controller.pod_matches_selector(&pod, &exists));
+    }
+
+    /// An empty (`{}`) `podSelector` selects every pod in the namespace,
+    /// including one with no labels — `LabelSelectorAsSelector` answers
+    /// `labels.Everything()` for it (`helpers.go:40-42`).
+    #[tokio::test]
+    async fn an_empty_pod_selector_selects_every_pod() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = NetworkPolicyController::new(storage);
+
+        let empty = LabelSelector {
+            match_labels: None,
+            match_expressions: None,
+        };
+        assert!(controller.pod_matches_selector(&bare_pod(), &empty));
+
+        let mut labelled = bare_pod();
+        labelled.metadata.labels = Some(HashMap::from([("a".to_string(), "b".to_string())]));
+        assert!(controller.pod_matches_selector(&labelled, &empty));
     }
 }
