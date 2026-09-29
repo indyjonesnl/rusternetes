@@ -798,7 +798,7 @@ pub struct SuccessPolicyRule {
 }
 
 /// JobStatus represents the current state of a Job
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct JobStatus {
     /// Number of actively running pods

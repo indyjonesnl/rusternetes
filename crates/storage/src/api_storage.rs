@@ -247,8 +247,18 @@ fn unmapped(rt: &str) -> Error {
 /// does a graceful (soft) delete that just stamps `deletionTimestamp`. Sending
 /// grace=0 keeps the Api backend's `delete` consistent with the others — see
 /// the call site in `ApiStorage::delete` for the full regression context.
+///
+/// `propagationPolicy=Background` keeps the hard-delete contract for owners
+/// too: every other backend removes the key and leaves the dependents to the
+/// garbage collector. Without it, an owner whose strategy defaults to
+/// `OrphanDependents` (a batch/v1 Job, pkg/registry/batch/job/strategy.go:62-74)
+/// would orphan its pods. Upstream's controllers pass the policy explicitly
+/// for the same reason (pkg/controller/cronjob/injection.go:108-109).
 fn force_delete_query() -> Vec<(String, String)> {
-    vec![("gracePeriodSeconds".to_string(), "0".to_string())]
+    vec![
+        ("gracePeriodSeconds".to_string(), "0".to_string()),
+        ("propagationPolicy".to_string(), "Background".to_string()),
+    ]
 }
 
 /// Query params for a GRACEFUL delete: none. The api-server then applies its
@@ -853,6 +863,18 @@ mod tests {
         assert!(
             q.iter().any(|(k, v)| k == "gracePeriodSeconds" && v == "0"),
             "ApiStorage::delete must send gracePeriodSeconds=0 for a hard delete, got {q:?}"
+        );
+    }
+
+    /// A hard delete leaves the dependents to the garbage collector, as the
+    /// other backends do, whatever the owner's default policy.
+    #[test]
+    fn delete_propagates_in_the_background() {
+        let q = force_delete_query();
+        assert!(
+            q.iter()
+                .any(|(k, v)| k == "propagationPolicy" && v == "Background"),
+            "ApiStorage::delete must not leave propagation to the owner's default, got {q:?}"
         );
     }
 

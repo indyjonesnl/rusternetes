@@ -135,6 +135,7 @@ mod integration_serviceaccount_token;
 mod integration_watch_rv_test;
 mod intorstring_roundtrip_test;
 mod job_defaults_test;
+mod job_generic_store_test;
 mod job_handler_test;
 mod job_status_monotonic_counters_test;
 mod json_watch_selectors_test;
