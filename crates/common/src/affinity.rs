@@ -207,51 +207,19 @@ fn get_node_field<'a>(node: &'a Node, field: &str) -> Option<&'a str> {
 }
 
 /// Match a label selector against a set of labels.
+///
+/// One matcher, not a second copy: this is
+/// [`crate::types::label_selector_as_selector`] + `Selector::matches`. The
+/// caller has already decided what an *absent* selector means, so a present-but
+/// -empty one reaches here and matches everything, per
+/// `LabelSelectorAsSelector` (`helpers.go:36-42`).
 pub fn match_selector(
     selector: &crate::types::LabelSelector,
     labels: &Option<std::collections::HashMap<String, String>>,
 ) -> bool {
-    // Check matchLabels
-    if let Some(ref match_labels) = selector.match_labels {
-        let pod_labels = match labels {
-            Some(l) => l,
-            None => return match_labels.is_empty(),
-        };
-
-        for (key, value) in match_labels {
-            if pod_labels.get(key) != Some(value) {
-                return false;
-            }
-        }
-    }
-
-    // Check matchExpressions
-    if let Some(ref match_expressions) = selector.match_expressions {
-        let pod_labels = labels.as_ref();
-
-        for expr in match_expressions {
-            let label_value = pod_labels.and_then(|l| l.get(&expr.key));
-            let values = expr.values.as_deref().unwrap_or(&[]);
-
-            let matches = match expr.operator.as_str() {
-                "In" => label_value
-                    .map(|v| values.contains(&v.as_str().to_string()))
-                    .unwrap_or(false),
-                "NotIn" => !label_value
-                    .map(|v| values.contains(&v.as_str().to_string()))
-                    .unwrap_or(false),
-                "Exists" => label_value.is_some(),
-                "DoesNotExist" => label_value.is_none(),
-                _ => false,
-            };
-
-            if !matches {
-                return false;
-            }
-        }
-    }
-
-    true
+    crate::types::label_selector_as_selector(Some(selector))
+        .map(|selector| selector.matches(labels.as_ref()))
+        .unwrap_or(false)
 }
 
 /// Check if a pod affinity term is satisfied by the candidate `node`.

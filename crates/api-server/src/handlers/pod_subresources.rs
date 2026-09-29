@@ -1158,8 +1158,11 @@ pub async fn create_eviction(
 
         for pdb in &pdbs {
             // Full label-selector match (matchLabels + matchExpressions).
-            // Upstream eviction skips PDBs whose selector is empty or does not
-            // match the pod (`selector.Empty() || !selector.Matches(...)`).
+            // Upstream reads the selector through `LabelSelectorAsSelector` and
+            // skips the PDB only when that errors or does not match
+            // (`pkg/registry/core/pod/storage/eviction.go:498-505`). There is no
+            // `selector.Empty()` guard: an absent selector matches no pods, an
+            // empty (`{}`) one matches every pod in the namespace (#2012).
             if !pdb
                 .spec
                 .selector

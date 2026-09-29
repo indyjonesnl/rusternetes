@@ -367,39 +367,27 @@ pub fn validate_label_selector_requirement(
     errs
 }
 
-/// Evaluate a `LabelSelector` against a label set — the full `matchLabels` +
-/// `matchExpressions` semantics of `metav1.LabelSelectorAsSelector().Matches()`.
-/// An unrecognized operator is treated as matching here; its invalidity is
-/// reported separately by [`validate_label_selector`].
+/// Evaluate a `LabelSelector` against a label set, for a validator.
+///
+/// One matcher, not a second copy: this is
+/// [`crate::types::label_selector_as_selector`] + `Selector::matches`, so an
+/// empty (`{}`) selector matches everything here exactly as it does everywhere
+/// else (#2012).
+///
+/// An invalid operator answers `true`, which is upstream's `err == nil &&`
+/// gate: `validateJobSpec` (`pkg/apis/batch/validation/validation.go:182-187`)
+/// and `ValidateDaemonSetSpec` (`pkg/apis/apps/validation/validation.go:446`)
+/// simply skip the template-matches-selector check when
+/// `LabelSelectorAsSelector` errors, leaving the operator itself to
+/// [`validate_label_selector`]. (The apps validators additionally push a
+/// `field.Invalid(selector, "")` on that branch — not ported yet.)
 pub fn label_selector_matches_labels(
     selector: &LabelSelector,
     labels: &HashMap<String, String>,
 ) -> bool {
-    if let Some(match_labels) = &selector.match_labels {
-        for (k, v) in match_labels {
-            if labels.get(k) != Some(v) {
-                return false;
-            }
-        }
-    }
-    if let Some(exprs) = &selector.match_expressions {
-        for req in exprs {
-            let present = labels.get(&req.key);
-            let value_in_set =
-                present.is_some_and(|val| req.values.as_ref().is_some_and(|vs| vs.contains(val)));
-            let matches = match req.operator.as_str() {
-                "In" => value_in_set,
-                "NotIn" => !value_in_set,
-                "Exists" => present.is_some(),
-                "DoesNotExist" => present.is_none(),
-                _ => true, // unknown operator: reported by validate_label_selector
-            };
-            if !matches {
-                return false;
-            }
-        }
-    }
-    true
+    crate::types::label_selector_as_selector(Some(selector))
+        .map(|selector| selector.matches(Some(labels)))
+        .unwrap_or(true)
 }
 
 /// Allowed dry-run values. Upstream lives in
