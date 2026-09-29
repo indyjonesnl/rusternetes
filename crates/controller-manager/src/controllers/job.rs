@@ -547,8 +547,11 @@ impl<S: Storage + 'static> JobController<S> {
         });
 
         loop {
-            // Initial full reconciliation
+            // Initial full reconciliation. The orphan sweep is the counterpart
+            // of the pod informer's initial list, whose `addPod` calls route
+            // every orphan still holding the finalizer to `enqueueOrphanPod`.
             self.enqueue_all(&queue).await;
+            self.reconcile_orphan_pods().await;
 
             // Watch for changes to Jobs AND Pods
             let prefix = "/registry/jobs/";
@@ -588,6 +591,11 @@ impl<S: Storage + 'static> JobController<S> {
                     event = watch.next() => {
                         match event {
                             Some(Ok(ev)) => {
+                                if let rusternetes_storage::WatchEvent::Deleted(_, prev) = &ev {
+                                    if let Ok(job) = serde_json::from_str::<Job>(prev) {
+                                        self.release_orphans_of_deleted_job(&job).await;
+                                    }
+                                }
                                 let key = extract_key(&ev);
                                 queue.add(key).await;
                             }
@@ -692,6 +700,10 @@ impl<S: Storage + 'static> JobController<S> {
                         }
                     }
                 }
+                // `addPod` / `updatePod`: a pod still holding the finalizer
+                // with no live, counting Job to remove it is an orphan
+                // (`job_controller.go:344-347`, `:417-420`).
+                self.release_if_orphan(&pod).await;
             }
             Err(_) => {
                 // Pod deleted — enqueue all Jobs in this namespace
@@ -743,60 +755,100 @@ impl<S: Storage + 'static> JobController<S> {
         let Ok(pods) = self.storage.list::<Pod>("/registry/pods/").await else {
             return;
         };
-        for pod in pods.iter().filter(|p| has_job_tracking_finalizer(p)) {
-            let Some(namespace) = pod.metadata.namespace.as_deref() else {
-                continue;
-            };
-            let owner = pod
-                .metadata
-                .owner_references
-                .as_ref()
-                .and_then(|refs| refs.iter().find(|r| r.controller == Some(true)));
+        for pod in &pods {
+            self.release_if_orphan(pod).await;
+        }
+    }
 
-            if let Some(owner) = owner {
-                // A pod controlled by something that is not a batch/v1 Job is
-                // not ours to strip.
-                if owner.kind != "Job" || owner.api_version != "batch/v1" {
-                    continue;
-                }
-                let job_key = build_key("jobs", Some(namespace), &owner.name);
-                if let Ok(job) = self.storage.get::<Job>(&job_key).await {
-                    if job.metadata.uid == owner.uid {
-                        // Managed by an external controller: not ours either.
-                        if job
-                            .spec
-                            .managed_by
-                            .as_deref()
-                            .is_some_and(|m| m != "kubernetes.io/job-controller")
-                        {
-                            continue;
-                        }
-                        // The Job is alive and still counting. Leave it alone.
-                        if !job_is_finished(&job) {
-                            continue;
-                        }
+    /// `deleteJob` -> `enqueueLabelSelector` (`job_controller.go:561-581`):
+    /// once a Job is gone, sweep the pods its selector matched, since the
+    /// deletion itself produces no pod event to reach them by.
+    async fn release_orphans_of_deleted_job(&self, job: &Job) {
+        let Some(namespace) = job.metadata.namespace.as_deref() else {
+            return;
+        };
+        let Some(selector) = job.spec.selector.as_ref() else {
+            return;
+        };
+        let Ok(selector) = rusternetes_common::types::label_selector_as_selector(Some(selector))
+        else {
+            return;
+        };
+        let Ok(pods) = self
+            .storage
+            .list::<Pod>(&build_prefix("pods", Some(namespace)))
+            .await
+        else {
+            return;
+        };
+        for pod in pods
+            .iter()
+            .filter(|p| selector.matches(p.metadata.labels.as_ref()))
+        {
+            self.release_if_orphan(pod).await;
+        }
+    }
+
+    /// Port of `handleSingleOrphanPod` (`job_controller.go:736-767`): strip the
+    /// tracking finalizer unless the pod is controlled by something that is not
+    /// a batch/v1 Job, or by a live Job that is still counting (or is managed
+    /// by an external controller).
+    async fn release_if_orphan(&self, pod: &Pod) {
+        if !has_job_tracking_finalizer(pod) {
+            return;
+        }
+        let Some(namespace) = pod.metadata.namespace.as_deref() else {
+            return;
+        };
+        let owner = pod
+            .metadata
+            .owner_references
+            .as_ref()
+            .and_then(|refs| refs.iter().find(|r| r.controller == Some(true)));
+
+        if let Some(owner) = owner {
+            // A pod controlled by something that is not a batch/v1 Job is
+            // not ours to strip.
+            if owner.kind != "Job" || owner.api_version != "batch/v1" {
+                return;
+            }
+            let job_key = build_key("jobs", Some(namespace), &owner.name);
+            if let Ok(job) = self.storage.get::<Job>(&job_key).await {
+                if job.metadata.uid == owner.uid {
+                    // Managed by an external controller: not ours either.
+                    if job
+                        .spec
+                        .managed_by
+                        .as_deref()
+                        .is_some_and(|m| m != "kubernetes.io/job-controller")
+                    {
+                        return;
+                    }
+                    // The Job is alive and still counting. Leave it alone.
+                    if !job_is_finished(&job) {
+                        return;
                     }
                 }
             }
+        }
 
-            let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-            let Ok(mut fresh) = self.storage.get::<Pod>(&pod_key).await else {
-                continue;
-            };
-            if !remove_tracking_finalizer(&mut fresh) {
-                continue;
-            }
-            if let Err(e) = self.storage.update(&pod_key, &fresh).await {
-                warn!(
-                    "Failed to release orphan pod {}/{} from the job-tracking finalizer: {}",
-                    namespace, fresh.metadata.name, e
-                );
-            } else {
-                debug!(
-                    "Released orphan pod {}/{} from the job-tracking finalizer",
-                    namespace, fresh.metadata.name
-                );
-            }
+        let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
+        let Ok(mut fresh) = self.storage.get::<Pod>(&pod_key).await else {
+            return;
+        };
+        if !remove_tracking_finalizer(&mut fresh) {
+            return;
+        }
+        if let Err(e) = self.storage.update(&pod_key, &fresh).await {
+            warn!(
+                "Failed to release orphan pod {}/{} from the job-tracking finalizer: {}",
+                namespace, fresh.metadata.name, e
+            );
+        } else {
+            debug!(
+                "Released orphan pod {}/{} from the job-tracking finalizer",
+                namespace, fresh.metadata.name
+            );
         }
     }
 
