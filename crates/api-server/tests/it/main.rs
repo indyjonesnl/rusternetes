@@ -266,6 +266,7 @@ mod watch_event_envelope_test;
 mod watch_event_proto_envelope_test;
 mod watch_handler_test;
 mod watch_labelselector_create_test;
+mod watch_namespaced_json_replay_test;
 mod watch_send_initial_events_test;
 mod watch_skips_undeserializable_test;
 mod webhook_config_decodes_when_absent_test;
