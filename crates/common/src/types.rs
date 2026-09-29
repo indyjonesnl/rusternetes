@@ -346,8 +346,14 @@ pub struct ObjectMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
 
-    /// UID is a unique identifier for the resource (auto-generated if not provided)
-    #[serde(default = "generate_uid", skip_serializing_if = "String::is_empty")]
+    /// UID is a unique identifier for the resource. The decoder leaves it
+    /// empty: upstream mints it in the registry, in `FillObjectMetaSystemFields`
+    /// (`staging/src/k8s.io/apiserver/pkg/registry/rest/create.go`), which
+    /// `registry::generic::store` ports as `fill_object_meta_system_fields`.
+    /// A virtual object that never reaches a store — a SubjectAccessReview, a
+    /// TokenReview — therefore keeps an empty uid, which is what lets
+    /// `validate_subject_access_review`'s `must be empty` rule work.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub uid: String,
 
     /// Generation is a sequence number representing a specific generation of the desired state
@@ -399,10 +405,6 @@ pub struct ObjectMeta {
     /// OwnerReferences are references to objects that own this object
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_references: Option<Vec<OwnerReference>>,
-}
-
-fn generate_uid() -> String {
-    String::new()
 }
 
 impl ObjectMeta {
