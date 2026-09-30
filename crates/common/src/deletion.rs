@@ -43,7 +43,7 @@ pub struct DeleteOptions {
     pub ignore_store_read_error_with_cluster_breaking_potential: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preconditions {
     /// UID must match

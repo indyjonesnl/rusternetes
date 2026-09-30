@@ -41,7 +41,7 @@ pub struct NamespaceSpec {
     pub finalizers: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NamespaceStatus {
     /// Phase is the current lifecycle phase of the namespace

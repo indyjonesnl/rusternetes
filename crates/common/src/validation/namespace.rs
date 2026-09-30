@@ -1,44 +1,75 @@
 //! Namespace validation — port of upstream Kubernetes
-//! `pkg/apis/core/validation/validation.go::ValidateNamespace` (release-1.35).
-//!
-//! Validates `spec.finalizers` (the legacy namespace finalizer list, distinct
-//! from `metadata.finalizers`): each must be a qualified name, and an
-//! unqualified (no `/`) name must be one of the standard finalizers. ObjectMeta
-//! is validated separately (#1087 / #1277).
+//! `pkg/apis/core/validation/validation.go` (release-1.35):
+//! `ValidateNamespace`, `ValidateNamespaceUpdate`,
+//! `ValidateNamespaceStatusUpdate` and `ValidateNamespaceFinalizeUpdate`.
 
 use crate::resources::Namespace;
 use crate::types::Phase;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::is_qualified_name;
+use crate::validation::objectmeta::{
+    validate_namespace_name, validate_object_meta, validate_object_meta_update,
+};
 
 /// Standard finalizer names (`pkg/apis/core/helper.standardFinalizers`):
 /// `kubernetes` + the metav1 orphan / foreground-deletion finalizers.
 const STANDARD_FINALIZERS: [&str; 3] = ["kubernetes", "orphan", "foregroundDeletion"];
 
-/// Validate a `Namespace` on create. Mirrors upstream `ValidateNamespace` minus
-/// ObjectMeta — the `spec.finalizers` checks (`validateFinalizerName` +
-/// `validateKubeFinalizerName`).
-pub fn validate_namespace(ns: &Namespace) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
-    let path = Path::new("spec").child("finalizers");
+/// `validateFinalizerName` (validation.go:8177-8181): apimachinery's
+/// `ValidateFinalizerName` (a qualified name) and `validateKubeFinalizerName`
+/// (:8184-8193: an unqualified name must be a standard finalizer).
+fn validate_finalizer_name(f: &str, path: &Path) -> ErrorList {
+    let mut errs: ErrorList = is_qualified_name(f)
+        .into_iter()
+        .map(|msg| Error::invalid(path, f.to_string(), msg))
+        .collect();
+    if f.split('/').count() == 1 && !STANDARD_FINALIZERS.contains(&f) {
+        errs.push(Error::invalid(
+            path,
+            f.to_string(),
+            "name is neither a standard finalizer name nor is it fully qualified",
+        ));
+    }
+    errs
+}
 
-    let Some(spec) = &ns.spec else {
-        return errs;
-    };
-    let Some(finalizers) = &spec.finalizers else {
-        return errs;
-    };
-    for f in finalizers {
-        for msg in is_qualified_name(f) {
-            errs.push(Error::invalid(&path, f.clone(), msg));
-        }
-        if !f.contains('/') && !STANDARD_FINALIZERS.contains(&f.as_str()) {
-            errs.push(Error::invalid(
-                &path,
-                f.clone(),
-                "name is neither a standard finalizer name nor is it fully qualified",
-            ));
-        }
+fn spec_finalizers(ns: &Namespace) -> &[String] {
+    ns.spec
+        .as_ref()
+        .and_then(|s| s.finalizers.as_deref())
+        .unwrap_or_default()
+}
+
+/// `ValidateNamespace` (validation.go:8168-8174). Upstream passes the
+/// unindexed `spec.finalizers` path here.
+pub fn validate_namespace(ns: &Namespace) -> ErrorList {
+    let mut errs = validate_object_meta(
+        &ns.metadata,
+        false,
+        validate_namespace_name,
+        &Path::new("metadata"),
+    );
+    let path = Path::new("spec").child("finalizers");
+    for f in spec_finalizers(ns) {
+        errs.extend(validate_finalizer_name(f, &path));
+    }
+    errs
+}
+
+/// `ValidateNamespaceUpdate` (validation.go:8196-8199).
+pub fn validate_namespace_update(new: &Namespace, old: &Namespace) -> ErrorList {
+    validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"))
+}
+
+/// `ValidateNamespaceFinalizeUpdate` (validation.go:8217-8226): the
+/// `/finalize` subresource may change `spec.finalizers`, each of which must
+/// be a valid finalizer name.
+pub fn validate_namespace_finalize_update(new: &Namespace, old: &Namespace) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
+    let path = Path::new("spec").child("finalizers");
+    for (i, f) in spec_finalizers(new).iter().enumerate() {
+        errs.extend(validate_finalizer_name(f, &path.index(i)));
     }
     errs
 }
@@ -57,20 +88,12 @@ fn phase_str(phase: Option<&Phase>) -> String {
     }
 }
 
-/// Validate a `Namespace` status update. Port of upstream
-/// `ValidateNamespaceStatusUpdate` (release-1.35,
-/// `pkg/apis/core/validation/validation.go`, lines 8202-8215).
-///
-/// The phase must be consistent with the deletion timestamp:
-///   - when `deletionTimestamp` is empty, the phase may only be `Active`;
-///   - when `deletionTimestamp` is set, the phase may only be `Terminating`.
-///
-/// ObjectMeta-update validation (the upstream `ValidateObjectMetaUpdate` call)
-/// is handled separately and is not duplicated here. `old` is accepted for
-/// signature parity with upstream even though the phase rule only inspects
-/// `new`.
-pub fn validate_namespace_status_update(new: &Namespace, _old: &Namespace) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
+/// `ValidateNamespaceStatusUpdate` (validation.go:8202-8215): ObjectMeta
+/// update, and a phase consistent with the deletion timestamp — `Active`
+/// while `deletionTimestamp` is empty, `Terminating` once it is set.
+pub fn validate_namespace_status_update(new: &Namespace, old: &Namespace) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
     // Upstream uses field.NewPath("status", "Phase") — note the capitalised
     // "Phase" segment; preserve it verbatim for error-wording parity.
     let path = Path::new("status").child("Phase");
@@ -104,6 +127,7 @@ mod tests {
 
     fn ns_with(phase: Option<Phase>, deleting: bool) -> Namespace {
         let mut ns = Namespace::new("test");
+        ns.metadata.resource_version = Some("1".to_string());
         ns.status = Some(NamespaceStatus {
             phase,
             conditions: None,

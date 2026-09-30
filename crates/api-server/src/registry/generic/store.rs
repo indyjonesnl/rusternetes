@@ -401,6 +401,59 @@ impl<T: Object, S: Storage> Store<T, S> {
         }
     }
 
+    /// `Storage.GuaranteedUpdate` of the stored object with a plain mutation,
+    /// the delete validation run on the object read first — for a REST
+    /// wrapper whose `Delete` writes around the strategies, as the Namespace
+    /// `REST.Delete` does (pkg/registry/core/namespace/storage/storage.go:
+    /// 180-245). Errors come back interpreted as by `InterpretGetError` and
+    /// `InterpretUpdateError`.
+    pub(crate) async fn guaranteed_update_for_delete(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        preconditions: Option<&Preconditions>,
+        dry_run: bool,
+        delete_validation: Option<&dyn ValidateObject<T>>,
+        mutate: &(dyn Fn(&mut T) + Send + Sync),
+    ) -> Result<T> {
+        struct Mutate<'a, T> {
+            ctx: &'a RequestContext,
+            validation: Option<&'a dyn ValidateObject<T>>,
+            mutate: &'a (dyn Fn(&mut T) + Send + Sync),
+        }
+        #[async_trait]
+        impl<T: Object> TryUpdate<T> for Mutate<'_, T> {
+            async fn try_update(
+                &mut self,
+                existing: Option<&T>,
+            ) -> std::result::Result<T, Abort<T>> {
+                let mut obj = existing
+                    .cloned()
+                    .expect("guaranteed_update reads with ignore_not_found = false");
+                if let Some(v) = self.validation {
+                    v.validate(self.ctx, &obj).await?;
+                }
+                (self.mutate)(&mut obj);
+                Ok(obj)
+            }
+        }
+
+        let key = self.key_func(ctx, name)?;
+        let mut attempt = Mutate {
+            ctx,
+            validation: delete_validation,
+            mutate,
+        };
+        match self
+            .guaranteed_update(&key, name, false, preconditions, dry_run, &mut attempt)
+            .await
+        {
+            Ok(obj) => Ok(obj),
+            Err(Abort::Api(err)) => Err(self.interpret_update_error(err, name)),
+            Err(_) => unreachable!("the mutation never aborts"),
+        }
+    }
+
     /// `Storage.Delete` with preconditions and a validation callback
     /// (`etcd3/store.go` `conditionalDelete`, and `DryRunnableStorage.Delete`,
     /// dryrun.go:49-60).

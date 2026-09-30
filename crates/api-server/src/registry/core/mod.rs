@@ -4,6 +4,7 @@
 pub mod configmap;
 pub mod endpoint;
 pub mod limitrange;
+pub mod namespace;
 pub mod node;
 pub mod persistentvolume;
 pub mod persistentvolumeclaim;

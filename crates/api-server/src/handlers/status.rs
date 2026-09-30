@@ -23,22 +23,9 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 /// Run resource-type-specific status validation before persisting a status
-/// update. Currently covers Namespace and ValidatingAdmissionPolicy.
+/// update. Currently covers ValidatingAdmissionPolicy.
 fn validate_status_subresource(resource_type: &str, resource: &Value) -> Result<()> {
-    if resource_type == "namespaces" {
-        let ns: rusternetes_common::resources::Namespace = serde_json::from_value(resource.clone())
-            .map_err(|e| {
-                rusternetes_common::Error::InvalidResource(format!("invalid Namespace: {e}"))
-            })?;
-        // The merged resource carries metadata/spec from the stored object, so
-        // it is both the "new" and (for the phase-vs-deletionTimestamp rule)
-        // the only object the check needs.
-        let errs =
-            rusternetes_common::validation::namespace::validate_namespace_status_update(&ns, &ns);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    } else if resource_type == "validatingadmissionpolicies" {
+    if resource_type == "validatingadmissionpolicies" {
         // Upstream ValidateValidatingAdmissionPolicyStatusUpdate
         // (pkg/apis/admissionregistration/validation/validation.go:1247) runs
         // only on the new object — typeChecking's expressionWarnings and the

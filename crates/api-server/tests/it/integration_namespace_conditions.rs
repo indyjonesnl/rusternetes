@@ -34,10 +34,8 @@
 //! - `TestNamespaceLabels` exercises PR kubernetes/kubernetes#96968 — the
 //!   namespace registry must auto-attach the
 //!   `kubernetes.io/metadata.name=<name>` label on every create (including
-//!   `generateName` flows). Our `handlers::namespace::create` does not yet
-//!   set this label; it also does not resolve `generateName` into a `name`.
-//!
-//! These tests will go GREEN as those gaps close.
+//!   `generateName` flows). The namespace strategy's `Canonicalize`
+//!   (`registry::core::namespace`) sets it once `generateName` resolves.
 
 // Upstream Go test names are preserved verbatim (`TestNamespaceCondition`,
 // `TestNamespaceLabels`) so the file mirrors the source 1:1 — `cargo test`

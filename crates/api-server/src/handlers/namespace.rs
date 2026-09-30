@@ -1,267 +1,97 @@
+//! Namespace endpoints.
+//!
+//! Writes, `/status` and `/finalize` go through the generic endpoint handlers
+//! with the Namespace storage ([`crate::registry::core::namespace`]) —
+//! upstream's `pkg/registry/core/namespace/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Namespaces serve no
+//! DeleteCollection (the REST does not implement `rest.CollectionDeleter`).
+//! Lists and watches are still served here directly.
+//!
+//! Creating a namespace has no side effects here: the ServiceAccounts
+//! controller creates `default` (pkg/controller/serviceaccount/
+//! serviceaccounts_controller.go) and the root-CA publisher creates
+//! `kube-root-ca.crt` (pkg/controller/certificates/rootcacertpublisher).
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::core::namespace;
 use crate::{handlers::watch, middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::HeaderMap,
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
-    auth::ServiceAccountClaims,
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
-    resources::{Namespace, Secret, ServiceAccount},
+    resources::Namespace,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::debug;
 
-// Removed - using HashMap<String, String> for query params
-
-/// Ensure the `kubernetes` lifecycle finalizer is present in **spec.finalizers**.
-///
-/// Upstream `namespaceStrategy.PrepareForCreate`
-/// (pkg/registry/core/namespace/strategy.go) stores this finalizer in
-/// `NamespaceSpec.Finalizers`, NOT `metadata.finalizers`. The namespace
-/// controller's `finalized()` check is `len(namespace.Spec.Finalizers) == 0`
-/// (pkg/controller/namespace/deletion/namespaced_resources_deleter.go). If the
-/// finalizer lives in `metadata.finalizers`, the controller sees an empty
-/// `spec.finalizers`, treats every namespace as already finalized, and returns
-/// early — never deleting namespace content, never running ordered pod-first
-/// deletion, and never setting deletion conditions. That breaks the
-/// OrderedNamespaceDeletion conformance test and leaks namespaces `Terminating`
-/// forever (the api-server keeps them because `metadata.finalizers` is set, but
-/// the controller's spec-based Finalize call never clears it).
-pub(crate) fn ensure_kubernetes_finalizer(ns: &mut Namespace) {
-    let spec = ns.spec.get_or_insert_with(Default::default);
-    let finalizers = spec.finalizers.get_or_insert_with(Vec::new);
-    if !finalizers.iter().any(|f| f == "kubernetes") {
-        finalizers.push("kubernetes".to_string());
+/// The Namespace `RequestScope`: `v1` `Namespace` served as `namespaces` (or
+/// its `/status` or `/finalize`), backed by `namespace.NewREST`'s storage.
+fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestScope<Namespace> {
+    let store: Box<dyn crate::registry::rest::RestStorage<Namespace>> = match subresource {
+        Some("status") => Box::new(namespace::new_status_store(state.storage.clone())),
+        Some(_) => Box::new(namespace::new_finalize_store(state.storage.clone())),
+        None => Box::new(namespace::new_rest(state.storage.clone())),
+    };
+    RequestScope {
+        kind: GroupVersionKind {
+            group: String::new(),
+            version: "v1".to_string(),
+            kind: "Namespace".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "namespaces".to_string(),
+        },
+        subresource,
+        store,
+        apply: Some(crate::ssa::apply_legacy::<Namespace>),
+        convert_to_internal: Some(namespace::convert_to_internal),
     }
 }
 
-/// True when a `Terminating` namespace has no finalizers left blocking removal.
-///
-/// Mirrors upstream `ShouldDeleteNamespaceDuringUpdate` (spec.finalizers empty)
-/// combined with the generic `metadata.finalizers` guard. The namespace
-/// controller drains `spec.finalizers` via the `/finalize` subresource once all
-/// content is gone; at that point (with no metadata finalizers either) the
-/// object is removed from storage.
-pub(crate) fn namespace_fully_finalized(ns: &Namespace) -> bool {
-    if ns.metadata.deletion_timestamp.is_none() {
-        return false;
-    }
-    let spec_empty = ns
-        .spec
-        .as_ref()
-        .and_then(|s| s.finalizers.as_ref())
-        .is_none_or(|f| f.is_empty());
-    let meta_empty = ns.metadata.finalizers.as_ref().is_none_or(|f| f.is_empty());
-    spec_empty && meta_empty
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
 }
 
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut namespace): DumpingJson<Namespace>,
-) -> Result<(StatusCode, Json<Namespace>)> {
-    info!("Creating namespace: {}", namespace.metadata.name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "namespaces").with_api_group("");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &namespace.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
         None,
-        crate::handlers::validation::NameKind::DnsLabel,
-    )?;
-
-    // Validate spec.finalizers (upstream ValidateNamespace).
-    let errs = rusternetes_common::validation::namespace::validate_namespace(&namespace);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Enrich metadata with system fields. `ensure_uid()` also resolves
-    // `generateName` -> `metadata.name` (via `ensure_name()`).
-    namespace.metadata.ensure_uid();
-    namespace.metadata.ensure_creation_timestamp();
-
-    // Auto-attach the `kubernetes.io/metadata.name=<name>` label.
-    // Required by upstream PR kubernetes/kubernetes#96968: every namespace
-    // must carry this label so cluster-scoped selectors (e.g. NetworkPolicies)
-    // can target a namespace by name without relying on user-set labels.
-    // Mirrors the constant `corev1.LabelMetadataName` and the registry-level
-    // mutator that stamps it on every create.
-    {
-        let ns_name = namespace.metadata.name.clone();
-        let labels = namespace.metadata.labels.get_or_insert_with(HashMap::new);
-        labels.insert("kubernetes.io/metadata.name".to_string(), ns_name);
-    }
-
-    // Ensure namespace has Active status (always set phase even if status exists but phase is None)
-    match &mut namespace.status {
-        None => {
-            namespace.status = Some(rusternetes_common::resources::NamespaceStatus {
-                phase: Some(rusternetes_common::types::Phase::Active),
-                conditions: None,
-            });
-        }
-        Some(status) if status.phase.is_none() => {
-            status.phase = Some(rusternetes_common::types::Phase::Active);
-        }
-        _ => {}
-    }
-
-    // Add the `kubernetes` lifecycle finalizer to spec.finalizers (upstream
-    // namespaceStrategy.PrepareForCreate). See `ensure_kubernetes_finalizer`.
-    ensure_kubernetes_finalizer(&mut namespace);
-
-    // Ensure kind/apiVersion
-    namespace.type_meta.kind = "Namespace".to_string();
-    namespace.type_meta.api_version = "v1".to_string();
-
-    let key = build_key("namespaces", None, &namespace.metadata.name);
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: Namespace {} validated successfully (not created)",
-            namespace.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(namespace)));
-    }
-
-    let created = state.storage.create(&key, &namespace).await?;
-
-    // Automatically create default ServiceAccount in the new namespace
-    let ns_name = created.metadata.name.clone();
-    info!("Creating default ServiceAccount for namespace: {}", ns_name);
-
-    match create_default_service_account(&state, &ns_name).await {
-        Ok(_) => {
-            info!(
-                "Successfully created default ServiceAccount for namespace: {}",
-                ns_name
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Failed to create default ServiceAccount for namespace {}: {}",
-                ns_name,
-                e
-            );
-            // Don't fail namespace creation if default SA creation fails
-        }
-    }
-
-    // Create kube-root-ca.crt ConfigMap (required by Kubernetes conformance).
-    // Best-effort: try the well-known filesystem cert paths, then fall back to
-    // `state.ca_cert_pem` (only populated when TLS is enabled). If neither is
-    // present — e.g. a non-TLS deployment — the cert is empty and ConfigMap
-    // creation is skipped below.
-    let ca_cert = match tokio::fs::read_to_string("/etc/kubernetes/pki/ca.crt").await {
-        Ok(s) => s,
-        Err(_) => match tokio::fs::read_to_string("/etc/kubernetes/pki/api-server.crt").await {
-            Ok(s) => s,
-            Err(_) => match tokio::fs::read_to_string("/root/.rusternetes/certs/ca.crt").await {
-                Ok(s) => s,
-                Err(_) => state.ca_cert_pem.clone().unwrap_or_default(),
-            },
-        },
-    };
-
-    info!(
-        "kube-root-ca.crt for namespace {}: cert_len={}, ns_name={}",
-        ns_name,
-        ca_cert.len(),
-        namespace.metadata.name
-    );
-
-    if !ca_cert.is_empty() {
-        let ca_cm = rusternetes_common::resources::ConfigMap {
-            type_meta: rusternetes_common::types::TypeMeta {
-                kind: "ConfigMap".to_string(),
-                api_version: "v1".to_string(),
-            },
-            metadata: rusternetes_common::types::ObjectMeta::new("kube-root-ca.crt")
-                .with_namespace(ns_name.clone()),
-            data: Some(std::collections::HashMap::from([(
-                "ca.crt".to_string(),
-                ca_cert,
-            )])),
-            binary_data: None,
-            immutable: None,
-        };
-        let cm_key = build_key("configmaps", Some(&ns_name), "kube-root-ca.crt");
-        match state.storage.create(&cm_key, &ca_cm).await {
-            Ok(_) => info!("Created kube-root-ca.crt in namespace {}", ns_name),
-            Err(e) => warn!(
-                "Failed to create kube-root-ca.crt in namespace {}: {}",
-                ns_name, e
-            ),
-        }
-    } else {
-        warn!(
-            "CA cert is empty, skipping kube-root-ca.crt for namespace {}",
-            ns_name
-        );
-    }
-
-    // kube-system/extension-apiserver-authentication and its reader Role are
-    // not namespace-create side effects: the ClusterAuthenticationTrust
-    // controller and the bootstrap RBAC policy own them (see
-    // `bootstrap::spawn_cluster_authentication_trust_controller`).
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
-) -> Result<Json<Namespace>> {
-    debug!("Getting namespace: {}", name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "namespaces")
-        .with_api_group("")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("namespaces", None, &name);
-    let mut namespace: Namespace = state.storage.get(&key).await?;
-
-    // Ensure status is present (old namespaces may not have it)
-    if namespace.status.is_none() {
-        namespace.status = Some(rusternetes_common::resources::NamespaceStatus {
-            phase: Some(rusternetes_common::types::Phase::Active),
-            conditions: None,
-        });
-    }
-    namespace.type_meta.kind = "Namespace".to_string();
-    namespace.type_meta.api_version = "v1".to_string();
-
-    Ok(Json(namespace))
+) -> Result<Response> {
+    endpoints::get_resource(&state, &scope(&state, None), &auth_ctx.user, None, &name).await
 }
 
 pub async fn update(
@@ -269,166 +99,39 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut namespace): DumpingJson<Namespace>,
-) -> Result<Json<Namespace>> {
-    info!("Updating namespace: {}", name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "namespaces")
-        .with_api_group("")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("namespaces", None, &name),
-        "",
-        "namespaces",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        None,
         &name,
+        &params,
+        &body,
     )
-    .await?;
-
-    namespace.metadata.name = name.clone();
-
-    let key = build_key("namespaces", None, &name);
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: Namespace {} validated successfully (not updated)",
-            name
-        );
-        return Ok(Json(namespace));
-    }
-
-    // Preserve spec.finalizers from the stored object (upstream
-    // namespaceStrategy.PrepareForUpdate resets Spec.Finalizers to the old
-    // value — the lifecycle finalizer list is only mutable via the /finalize
-    // subresource, never a plain update). Without this a client PUT that omits
-    // spec.finalizers would silently drop the `kubernetes` finalizer and cause
-    // premature namespace removal.
-    if let Ok(old) = state.storage.get::<Namespace>(&key).await {
-        namespace.spec = old.spec;
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    if let Ok(stored) = state.storage.get::<Namespace>(&key).await {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut namespace.metadata,
-            &stored.metadata,
-        );
-    }
-
-    let result = state.storage.update(&key, &namespace).await?;
-
-    // Namespace finalization removal — mirrors upstream
-    // `ShouldDeleteNamespaceDuringUpdate`
-    // (pkg/registry/core/namespace/storage/storage.go): once the finalizer
-    // list drains AND the namespace is Terminating, the object is removed from
-    // storage. See `namespace_fully_finalized`.
-    if namespace_fully_finalized(&result) {
-        match state.storage.delete(&key).await {
-            Ok(_) => info!(
-                "Namespace {} finalized (finalizers drained) — removed from storage",
-                name
-            ),
-            Err(e) => warn!("Failed to remove finalized namespace {}: {}", name, e),
-        }
-    }
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
-    )
-    .await?;
-
-    Ok(Json(result))
+    .await
 }
 
-/// PUT `/api/v1/namespaces/:name/finalize`.
-///
-/// The `/finalize` subresource is how the namespace controller completes
-/// deletion (`nsClient.Finalize` in
-/// pkg/controller/namespace/deletion/namespaced_resources_deleter.go). It sends
-/// the namespace with the `kubernetes` finalizer removed from
-/// `spec.finalizers`; the api-server persists the new `spec.finalizers` and, if
-/// the list is now empty and the namespace is Terminating, removes it from
-/// storage. Unlike a plain update this endpoint is *allowed* to mutate
-/// `spec.finalizers` (upstream `namespaceFinalizeStrategy`).
-pub async fn finalize(
+pub async fn patch(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(body): DumpingJson<Namespace>,
-) -> Result<Json<Namespace>> {
-    info!("Finalizing namespace: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "namespaces")
-        .with_api_group("")
-        .with_subresource("finalize")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("namespaces", None, &name);
-    let mut namespace: Namespace = state.storage.get(&key).await?;
-
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!(
-            "Dry-run: Namespace {} finalize validated (not applied)",
-            name
-        );
-        return Ok(Json(namespace));
-    }
-
-    // Apply the request's spec.finalizers verbatim (the controller has already
-    // stripped its finalizer token). Status is owned by the /status subresource,
-    // so only spec.finalizers is taken from the finalize body.
-    namespace.spec = body.spec;
-
-    let result = state.storage.update(&key, &namespace).await?;
-
-    if namespace_fully_finalized(&result) {
-        match state.storage.delete(&key).await {
-            Ok(_) => info!(
-                "Namespace {} finalized (spec.finalizers drained) — removed from storage",
-                name
-            ),
-            Err(e) => warn!("Failed to remove finalized namespace {}: {}", name, e),
-        }
-    }
-
-    Ok(Json(result))
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
 }
 
 pub async fn delete_ns(
@@ -436,191 +139,96 @@ pub async fn delete_ns(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Namespace>> {
-    info!("Deleting namespace: {}", name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "namespaces")
-        .with_api_group("")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("namespaces", None, &name);
-
-    // Get the namespace to check for finalizers
-    let mut namespace: Namespace = state.storage.get(&key).await?;
-
-    // Run validating admission webhooks for DELETE (object=nil, oldObject=namespace).
-    crate::handlers::admission_helper::run_delete_validating_webhooks(
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
         &state,
-        "",
-        "v1",
-        "Namespace",
-        "namespaces",
+        &scope(&state, None),
+        &auth_ctx.user,
         None,
         &name,
-        &namespace,
-        &user_for_webhook,
-        is_dry_run,
+        &params,
+        &body,
     )
-    .await?;
-
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: Namespace {} validated successfully (not deleted)",
-            name
-        );
-        return Ok(Json(namespace));
-    }
-
-    // Set namespace phase to Terminating and add deletionTimestamp
-    // (Kubernetes sets Terminating phase before cascade-deleting resources)
-    if let Some(ref mut status) = namespace.status {
-        status.phase = Some(rusternetes_common::types::Phase::Terminating);
-    } else {
-        namespace.status = Some(rusternetes_common::resources::NamespaceStatus {
-            phase: Some(rusternetes_common::types::Phase::Terminating),
-            conditions: None,
-        });
-    }
-    if namespace.metadata.deletion_timestamp.is_none() {
-        namespace.metadata.deletion_timestamp = Some(chrono::Utc::now());
-    }
-    // Save the Terminating state
-    let _ = state.storage.update(&key, &namespace).await;
-
-    // Don't cascade-delete synchronously. Return the Terminating namespace
-    // immediately and let the namespace controller handle cleanup asynchronously.
-    // This matches real K8s behavior where DELETE returns quickly and the
-    // namespace controller observes the deletionTimestamp and does cleanup.
-    //
-    // The `kubernetes` lifecycle finalizer lives in spec.finalizers (set at
-    // create time) so a normal namespace stays in storage until the controller
-    // finishes content deletion and calls /finalize. If a namespace somehow has
-    // no finalizers at all, upstream removes it immediately on delete.
-    if namespace_fully_finalized(&namespace) {
-        match state.storage.delete(&key).await {
-            Ok(_) => info!("Namespace {} deleted (no finalizers)", name),
-            Err(e) => warn!("Failed to delete finalizer-less namespace {}: {}", name, e),
-        }
-        return Ok(Json(namespace));
-    }
-
-    info!("Namespace {} marked for deletion (Terminating)", name);
-    // Return the namespace in Terminating state
-    let updated: Namespace = state.storage.get(&key).await.unwrap_or(namespace);
-    Ok(Json(updated))
+    .await
 }
 
-/// Cascade delete all resources in a namespace
-/// This ensures proper cleanup when a namespace is deleted
-#[allow(dead_code)]
-async fn cascade_delete_namespace_resources(
-    storage: &rusternetes_storage::StorageBackend,
-    namespace: &str,
-) -> Result<()> {
-    use serde_json::Value;
-    use tracing::warn;
+/// GET `/status`: `StatusREST.Get` is the store's `Get` (storage/storage.go:322-325).
+pub async fn get_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+    )
+    .await
+}
 
-    // List of resource types that are namespace-scoped and should be deleted
-    // Order matters: delete child resources before parent resources
-    // Delete controllers FIRST so they don't recreate pods during cleanup.
-    // Then delete pods last.
-    let resource_types = vec![
-        // 1. Delete controllers first (they recreate pods if deleted after pods)
-        "cronjobs",
-        "jobs",
-        "deployments",
-        "statefulsets",
-        "daemonsets",
-        "replicasets",
-        "replicationcontrollers",
-        // 2. Delete pods (now safe since controllers are gone)
-        "pods",
-        // 3. Delete supporting resources
-        "services",
-        "endpoints",
-        "endpointslices",
-        "configmaps",
-        "secrets",
-        "serviceaccounts",
-        "persistentvolumeclaims",
-        "ingresses",
-        "networkpolicies",
-        "poddisruptionbudgets",
-        "resourcequotas",
-        "limitranges",
-        "horizontalpodautoscalers",
-        "controllerrevisions",
-        "podtemplates",
-        "resourceclaims",
-        "volumesnapshots",
-        "leases",
-        "rolebindings",
-        "roles",
-        "events",
-    ];
+/// PUT `/status`: `StatusREST.Update` (storage/storage.go:327-332).
+pub async fn update_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
 
-    let mut total_deleted = 0;
-    for resource_type in resource_types {
-        let prefix = build_prefix(resource_type, Some(namespace));
+/// PATCH `/status`: a patch into `StatusREST.Update`.
+pub async fn patch_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
+}
 
-        // List all resources with this prefix, then delete each one
-        match storage.list::<Value>(&prefix).await {
-            Ok(resources) => {
-                let count = resources.len();
-                for resource in resources {
-                    // Extract the resource name from the metadata
-                    if let Some(metadata) = resource.get("metadata") {
-                        if let Some(name) = metadata.get("name").and_then(|n| n.as_str()) {
-                            let key = build_key(resource_type, Some(namespace), name);
-                            match storage.delete(&key).await {
-                                Ok(_) => {
-                                    total_deleted += 1;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to delete {} {}/{}: {}",
-                                        resource_type, namespace, name, e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                if count > 0 {
-                    info!(
-                        "Deleted {} {} resources in namespace {}",
-                        count, resource_type, namespace
-                    );
-                }
-            }
-            Err(e) => {
-                // Log warning but continue - resource type might not exist or have no resources
-                warn!(
-                    "Failed to list {} in namespace {}: {}",
-                    resource_type, namespace, e
-                );
-            }
-        }
-    }
-
-    info!(
-        "Cascade deletion completed for namespace {}: {} resources deleted",
-        namespace, total_deleted
-    );
-    Ok(())
+/// PUT `/finalize`: `FinalizeREST.Update` (storage/storage.go:353-358).
+pub async fn finalize(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, Some("finalize")),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn list(
@@ -686,245 +294,4 @@ pub async fn list(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-/// Helper function to create the default ServiceAccount in a namespace
-/// This replicates what Kubernetes does automatically when a namespace is created
-async fn create_default_service_account(
-    state: &Arc<ApiServerState>,
-    namespace: &str,
-) -> Result<()> {
-    let sa_name = "default";
-
-    // Create default ServiceAccount
-    let mut service_account = ServiceAccount::new(sa_name, namespace);
-    service_account.metadata.ensure_uid();
-    service_account.metadata.ensure_creation_timestamp();
-
-    let sa_key = build_key("serviceaccounts", Some(namespace), sa_name);
-    let created_sa = state.storage.create(&sa_key, &service_account).await?;
-
-    // Generate ServiceAccount token and store it in a Secret
-    let sa_uid = created_sa.metadata.uid.clone();
-
-    // Generate JWT token (valid for 10 years - Kubernetes default for static tokens)
-    let claims = ServiceAccountClaims::new(
-        sa_name.to_string(),
-        namespace.to_string(),
-        sa_uid.clone(),
-        87600, // 10 years in hours
-    );
-
-    let token = state.token_manager.generate_token(claims)?;
-
-    // Create Secret to store the token
-    let secret_name = format!("{}-token", sa_name);
-    let mut string_data = HashMap::new();
-    string_data.insert("token".to_string(), token);
-    string_data.insert("namespace".to_string(), namespace.to_string());
-
-    let mut secret =
-        Secret::new(&secret_name, namespace).with_type("kubernetes.io/service-account-token");
-
-    // Add labels and annotations
-    secret.metadata.labels = Some({
-        let mut labels = HashMap::new();
-        labels.insert(
-            "kubernetes.io/service-account.name".to_string(),
-            sa_name.to_string(),
-        );
-        labels
-    });
-    secret.metadata.annotations = Some({
-        let mut annotations = HashMap::new();
-        annotations.insert("kubernetes.io/service-account.uid".to_string(), sa_uid);
-        annotations
-    });
-    secret.string_data = Some(string_data);
-
-    // Normalize: convert stringData to base64-encoded data before storing
-    secret.normalize();
-
-    // Store the secret
-    let secret_key = build_key("secrets", Some(namespace), &secret_name);
-    state.storage.create(&secret_key, &secret).await?;
-
-    info!(
-        "Created default ServiceAccount and token secret in namespace: {}",
-        namespace
-    );
-    Ok(())
-}
-
-// Use the macro to create a PATCH handler for cluster-scoped namespace
-crate::patch_handler_cluster!(patch, Namespace, "namespaces", "");
-
-pub async fn deletecollection_namespaces(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!("DeleteCollection namespaces with params: {:?}", params);
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs =
-        RequestAttributes::new(auth_ctx.user, "deletecollection", "namespaces").with_api_group("");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: Namespace collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all namespaces
-    let prefix = build_prefix("namespaces", None);
-    let mut items = state.storage.list::<Namespace>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("namespaces", None, &item.metadata.name);
-
-        // Run validating admission webhooks for DELETE per item.
-        crate::handlers::admission_helper::run_delete_validating_webhooks(
-            &state,
-            "",
-            "v1",
-            "Namespace",
-            "namespaces",
-            None,
-            &item.metadata.name,
-            &item,
-            &user_for_webhook,
-            false,
-        )
-        .await?;
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} namespaces deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_common::resources::Namespace;
-
-    // Regression: the `kubernetes` lifecycle finalizer MUST land in
-    // spec.finalizers, not metadata.finalizers. The namespace controller's
-    // finalized() check is `len(spec.Finalizers)==0`; a metadata-placed
-    // finalizer makes it skip all content deletion (breaks
-    // OrderedNamespaceDeletion + leaks Terminating namespaces).
-    #[test]
-    fn kubernetes_finalizer_goes_in_spec_not_metadata() {
-        let mut ns = Namespace::new("t");
-        ns.spec = None;
-        ns.metadata.finalizers = None;
-
-        ensure_kubernetes_finalizer(&mut ns);
-
-        let spec_finalizers = ns
-            .spec
-            .as_ref()
-            .and_then(|s| s.finalizers.as_ref())
-            .expect("spec.finalizers set");
-        assert!(
-            spec_finalizers.iter().any(|f| f == "kubernetes"),
-            "kubernetes finalizer must be in spec.finalizers, got {spec_finalizers:?}"
-        );
-        assert!(
-            ns.metadata
-                .finalizers
-                .as_ref()
-                .is_none_or(|f| !f.iter().any(|x| x == "kubernetes")),
-            "kubernetes finalizer must NOT be placed in metadata.finalizers"
-        );
-    }
-
-    #[test]
-    fn ensure_kubernetes_finalizer_is_idempotent() {
-        let mut ns = Namespace::new("t");
-        ensure_kubernetes_finalizer(&mut ns);
-        ensure_kubernetes_finalizer(&mut ns);
-        let f = ns.spec.unwrap().finalizers.unwrap();
-        assert_eq!(f.iter().filter(|x| *x == "kubernetes").count(), 1);
-    }
-
-    // A freshly-created (non-terminating) namespace is never "fully finalized".
-    #[test]
-    fn not_finalized_without_deletion_timestamp() {
-        let mut ns = Namespace::new("t");
-        ensure_kubernetes_finalizer(&mut ns);
-        assert!(!namespace_fully_finalized(&ns));
-    }
-
-    // Terminating + spec.finalizers still holding `kubernetes` => keep it.
-    #[test]
-    fn not_finalized_while_spec_finalizer_remains() {
-        let mut ns = Namespace::new("t");
-        ensure_kubernetes_finalizer(&mut ns);
-        ns.metadata.deletion_timestamp = Some(chrono::Utc::now());
-        assert!(!namespace_fully_finalized(&ns));
-    }
-
-    // Terminating + spec.finalizers drained by the controller's /finalize call
-    // + no metadata finalizers => remove from storage.
-    #[test]
-    fn finalized_when_all_finalizers_drained() {
-        let mut ns = Namespace::new("t");
-        ns.metadata.deletion_timestamp = Some(chrono::Utc::now());
-        ns.spec = Some(rusternetes_common::resources::NamespaceSpec {
-            finalizers: Some(vec![]),
-        });
-        ns.metadata.finalizers = None;
-        assert!(namespace_fully_finalized(&ns));
-    }
-
-    // A lingering metadata finalizer still blocks removal even when
-    // spec.finalizers is empty.
-    #[test]
-    fn not_finalized_while_metadata_finalizer_remains() {
-        let mut ns = Namespace::new("t");
-        ns.metadata.deletion_timestamp = Some(chrono::Utc::now());
-        ns.spec = Some(rusternetes_common::resources::NamespaceSpec {
-            finalizers: Some(vec![]),
-        });
-        ns.metadata.finalizers = Some(vec!["example.com/keep".to_string()]);
-        assert!(!namespace_fully_finalized(&ns));
-    }
 }
