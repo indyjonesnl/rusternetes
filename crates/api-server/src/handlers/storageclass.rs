@@ -1,101 +1,147 @@
+//! StorageClass endpoints.
+//!
+//! Writes go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the StorageClass strategy
+//! ([`crate::registry::storage::storageclass`]) — upstream's
+//! `pkg/registry/storage/storageclass/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::storage::storageclass;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::StorageClass,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The StorageClass `RequestScope`: `storage.k8s.io/v1` `StorageClass` served as
+/// `storageclasses`, backed by `storageclass.NewREST`.
+fn scope(state: &ApiServerState) -> RequestScope<StorageClass> {
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "storage.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "StorageClass".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "storage.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "storageclasses".to_string(),
+        },
+        subresource: None,
+        store: Box::new(storageclass::new_store(state.storage.clone())),
+        apply: Some(crate::ssa::apply_legacy::<StorageClass>),
+        convert_to_internal: Some(storageclass::convert_to_internal),
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create_storageclass(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut sc): DumpingJson<StorageClass>,
-) -> Result<(StatusCode, Json<StorageClass>)> {
-    info!("Creating StorageClass: {}", sc.metadata.name);
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &sc.metadata,
-        None,
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Check authorization (cluster-scoped)
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "storageclasses")
-        .with_api_group("storage.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    sc.metadata.ensure_uid();
-    sc.metadata.ensure_creation_timestamp();
-
-    // SetDefaults_StorageClass: reclaimPolicy → Delete, volumeBindingMode →
-    // Immediate when unset (upstream pkg/apis/storage/v1/defaults.go).
-    if sc.reclaim_policy.is_none() {
-        sc.reclaim_policy =
-            Some(rusternetes_common::resources::volume::PersistentVolumeReclaimPolicy::Delete);
-    }
-    if sc.volume_binding_mode.is_none() {
-        sc.volume_binding_mode =
-            Some(rusternetes_common::resources::volume::VolumeBindingMode::Immediate);
-    }
-
-    // Validate the (defaulted) StorageClass — upstream ValidateStorageClass.
-    let errs = rusternetes_common::validation::storageclass::validate_storage_class(&sc);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: StorageClass validated successfully (not created)");
-        return Ok((StatusCode::CREATED, Json(sc)));
-    }
-
-    let key = build_key("storageclasses", None, &sc.metadata.name);
-    let created = state.storage.create(&key, &sc).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(&state, &scope(&state), &auth_ctx.user, None, &params, &body).await
 }
 
 pub async fn get_storageclass(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
-) -> Result<Json<StorageClass>> {
-    debug!("Getting StorageClass: {}", name);
+) -> Result<Response> {
+    endpoints::get_resource(&state, &scope(&state), &auth_ctx.user, None, &name).await
+}
 
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "storageclasses")
-        .with_api_group("storage.k8s.io")
-        .with_name(&name);
+pub async fn update_storageclass(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
 
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
+pub async fn patch_storageclass(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
+}
 
-    let key = build_key("storageclasses", None, &name);
-    let sc = state.storage.get(&key).await?;
+pub async fn delete_storageclass(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
 
-    Ok(Json(sc))
+pub async fn deletecollection_storageclasses(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(&state, &scope(&state), &auth_ctx.user, None, &params, &body).await
 }
 
 pub async fn list_storageclasses(
@@ -137,220 +183,4 @@ pub async fn list_storageclasses(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-pub async fn update_storageclass(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path(name): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut sc): DumpingJson<StorageClass>,
-) -> Result<Json<StorageClass>> {
-    info!("Updating StorageClass: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "storageclasses")
-        .with_api_group("storage.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("storageclasses", None, &name),
-        "storage.k8s.io",
-        "storageclasses",
-        &name,
-    )
-    .await?;
-
-    sc.metadata.name = name.clone();
-
-    // SetDefaults_StorageClass on the incoming object so an omitted-but-defaulted
-    // field isn't read as a forbidden change against the stored (defaulted) one.
-    if sc.reclaim_policy.is_none() {
-        sc.reclaim_policy =
-            Some(rusternetes_common::resources::volume::PersistentVolumeReclaimPolicy::Delete);
-    }
-    if sc.volume_binding_mode.is_none() {
-        sc.volume_binding_mode =
-            Some(rusternetes_common::resources::volume::VolumeBindingMode::Immediate);
-    }
-
-    let key = build_key("storageclasses", None, &name);
-
-    // Enforce update immutability (upstream ValidateStorageClassUpdate):
-    // parameters / provisioner / reclaimPolicy / volumeBindingMode are immutable.
-    if let Ok(existing) = state.storage.get::<StorageClass>(&key).await {
-        let errs = rusternetes_common::validation::storageclass::validate_storage_class_update(
-            &sc, &existing,
-        );
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: StorageClass validated successfully (not updated)");
-        return Ok(Json(sc));
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    if let Ok(stored) = state.storage.get::<StorageClass>(&key).await {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut sc.metadata,
-            &stored.metadata,
-        );
-    }
-    let updated = state.storage.update(&key, &sc).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &updated,
-    )
-    .await?;
-
-    Ok(Json(updated))
-}
-
-pub async fn delete_storageclass(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(name): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<StorageClass>> {
-    info!("Deleting StorageClass: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "storageclasses")
-        .with_api_group("storage.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("storageclasses", None, &name);
-
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Get the resource for finalizer handling
-    let resource: StorageClass = state.storage.get(&key).await?;
-
-    if is_dry_run {
-        info!("Dry-run: StorageClass validated successfully (not deleted)");
-        return Ok(Json(resource));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &resource,
-        &delete_opts,
-    )
-    .await?;
-
-    if deleted_immediately {
-        Ok(Json(resource))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: StorageClass = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_cluster!(
-    patch_storageclass,
-    StorageClass,
-    "storageclasses",
-    "storage.k8s.io"
-);
-
-pub async fn deletecollection_storageclasses(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!("DeleteCollection storageclasses with params: {:?}", params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "storageclasses")
-        .with_api_group("storage.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: StorageClass collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all storageclasses
-    let prefix = build_prefix("storageclasses", None);
-    let mut items = state.storage.list::<StorageClass>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("storageclasses", None, &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} storageclasses deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }
