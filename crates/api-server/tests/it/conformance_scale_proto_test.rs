@@ -35,8 +35,9 @@
 //! depending on a real apiserver.
 
 use axum::http::{header, StatusCode};
-use rusternetes_api_server::{handlers::scale::Scale, protobuf::ProtoRegistry};
+use rusternetes_api_server::protobuf::ProtoRegistry;
 use rusternetes_common::protobuf::decode_unknown_raw;
+use rusternetes_common::resources::Scale;
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
 use rusternetes_test_support::harness::TestApiServer;
 use serde_json::json;
@@ -367,8 +368,8 @@ async fn get_scale_with_json_accept_returns_json() {
         &body[..body.len().min(4)],
     );
     let scale: Scale = serde_json::from_slice(&body).expect("JSON body must deserialize as Scale");
-    assert_eq!(scale.api_version, "autoscaling/v1");
-    assert_eq!(scale.kind, "Scale");
+    assert_eq!(scale.type_meta.api_version, "autoscaling/v1");
+    assert_eq!(scale.type_meta.kind, "Scale");
     assert_eq!(scale.spec.replicas, 2);
 }
 

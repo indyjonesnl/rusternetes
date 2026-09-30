@@ -66,7 +66,6 @@ pub mod resourceclaimtemplate;
 pub mod resourcequota;
 pub mod resourceslice;
 pub mod runtimeclass;
-pub mod scale;
 pub mod secret;
 pub mod service;
 pub mod service_account;

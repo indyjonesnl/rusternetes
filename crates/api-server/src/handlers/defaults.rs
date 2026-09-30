@@ -539,6 +539,32 @@ pub fn apply_limit_range_defaults(lr: &mut rusternetes_common::resources::LimitR
     }
 }
 
+/// `SetDefaults_ReplicationController` (pkg/apis/core/v1/defaults.go:50-65),
+/// the declarative `replicas` default of 1, and the pod template's defaults.
+/// An absent selector and absent labels come from the template's labels.
+pub fn apply_replicationcontroller_defaults(
+    rc: &mut rusternetes_common::resources::ReplicationController,
+) {
+    if rc.spec.replicas.is_none() {
+        rc.spec.replicas = Some(1);
+    }
+    let template_labels = rc
+        .spec
+        .template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.labels.clone());
+    if let Some(labels) = template_labels {
+        if rc.spec.selector.as_ref().is_none_or(|s| s.is_empty()) {
+            rc.spec.selector = Some(labels.clone());
+        }
+        if rc.metadata.labels.as_ref().is_none_or(|l| l.is_empty()) {
+            rc.metadata.labels = Some(labels);
+        }
+    }
+    apply_pod_template_defaults(&mut rc.spec.template);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -210,6 +210,7 @@ mod rbac_handler_test;
 mod rc_default_replicas_test;
 mod replicaset_generic_store_test;
 mod replicaset_handler_test;
+mod replicationcontroller_generic_store_test;
 mod replicationcontroller_handler_test;
 mod replicationcontroller_post_e2e_test;
 mod require_create_name_router_test;
