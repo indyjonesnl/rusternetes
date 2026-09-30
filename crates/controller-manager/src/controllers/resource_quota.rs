@@ -627,22 +627,31 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
             usage.insert("count/services".to_string(), services.len().to_string());
             usage.insert("services".to_string(), services.len().to_string());
 
-            // Count NodePort-consuming services. Upstream
-            // `pkg/quota/v1/evaluator/core/services.go` counts the node-port slot for:
-            //   * Service type=NodePort       — always
-            //   * Service type=LoadBalancer   — only when allocateLoadBalancerNodePorts
-            //                                   is nil or true; an explicit `false`
-            //                                   means the LB has no node ports to count.
-            let nodeport_count = services
+            // Node ports, counted per port as upstream `serviceEvaluator.Usage`
+            // does (`pkg/quota/v1/evaluator/core/services.go:117-147`): every
+            // port of a NodePort Service, and of a LoadBalancer unless
+            // `allocateLoadBalancerNodePorts` is false, when only the ports
+            // with an explicit node port count (`portsWithNodePorts`).
+            let nodeport_count: usize = services
                 .iter()
-                .filter(|s| match s.spec.service_type {
-                    Some(rusternetes_common::resources::ServiceType::NodePort) => true,
-                    Some(rusternetes_common::resources::ServiceType::LoadBalancer) => {
-                        s.spec.allocate_load_balancer_node_ports.unwrap_or(true)
+                .map(|s| match s.spec.service_type {
+                    Some(rusternetes_common::resources::ServiceType::NodePort) => {
+                        s.spec.ports.len()
                     }
-                    _ => false,
+                    Some(rusternetes_common::resources::ServiceType::LoadBalancer) => {
+                        if s.spec.allocate_load_balancer_node_ports == Some(false) {
+                            s.spec
+                                .ports
+                                .iter()
+                                .filter(|p| p.node_port.is_some_and(|n| n != 0))
+                                .count()
+                        } else {
+                            s.spec.ports.len()
+                        }
+                    }
+                    _ => 0,
                 })
-                .count();
+                .sum();
             usage.insert("services.nodeports".to_string(), nodeport_count.to_string());
 
             // Count LoadBalancer services
@@ -714,7 +723,44 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
             usage.insert("count/resourcequotas".to_string(), rqs.len().to_string());
         }
 
+        // Any other `count/<resource>[.<group>]`: the object-count evaluator
+        // quota admission falls back to for a resource without its own
+        // (`generic.NewObjectCountEvaluator`, apiserver/pkg/quota/v1/generic/
+        // evaluator.go:325-340, used by plugin/resourcequota/controller.go:
+        // 667-674). Its usage is one per object in the namespace.
+        for key in hard_keys {
+            let Some(name) = key.strip_prefix("count/") else {
+                continue;
+            };
+            if usage.contains_key(key) {
+                continue;
+            }
+            let n = self.count_objects(namespace, name).await;
+            usage.insert(key.clone(), n.to_string());
+        }
+
         Ok(usage)
+    }
+
+    /// The number of `<resource>[.<group>]` objects in `namespace`. A
+    /// built-in resource is stored under its resource name, a custom
+    /// resource under `<group with _>_<plural>`
+    /// (`crates/api-server/src/handlers/custom_resource.rs`); only one of
+    /// the two prefixes holds anything.
+    async fn count_objects(&self, namespace: &str, name: &str) -> usize {
+        let (resource, group) = name.split_once('.').unwrap_or((name, ""));
+        let mut prefixes = vec![build_prefix(resource, Some(namespace))];
+        if !group.is_empty() {
+            let custom = format!("{}_{}", group.replace('.', "_"), resource);
+            prefixes.push(build_prefix(&custom, Some(namespace)));
+        }
+        let mut n = 0;
+        for prefix in prefixes {
+            let items: Vec<serde_json::Value> =
+                self.storage.list(&prefix).await.unwrap_or_default();
+            n += items.len();
+        }
+        n
     }
 }
 
@@ -1447,5 +1493,81 @@ mod tests {
         let ev = next_aux_event(&mut aux, "Pod").await;
         assert!(ev.is_some(), "a live stream's event must be delivered");
         assert!(aux.is_some(), "a live stream must stay enabled");
+    }
+
+    /// `serviceEvaluator.Usage` (pkg/quota/v1/evaluator/core/services.go:
+    /// 117-147): `services.nodeports` counts ports, not Services, and a
+    /// LoadBalancer without node-port allocation counts only its explicit
+    /// node ports.
+    #[tokio::test]
+    async fn node_ports_are_counted_per_port() {
+        let storage = Arc::new(MemoryStorage::new());
+        for (name, spec) in [
+            (
+                "np",
+                serde_json::json!({"type": "NodePort",
+                                   "ports": [{"port": 80}, {"port": 81}]}),
+            ),
+            (
+                "lb",
+                serde_json::json!({"type": "LoadBalancer",
+                                   "allocateLoadBalancerNodePorts": false,
+                                   "ports": [{"port": 80, "nodePort": 30001},
+                                             {"port": 81}]}),
+            ),
+            ("cip", serde_json::json!({"ports": [{"port": 80}]})),
+        ] {
+            let svc: Service = serde_json::from_value(serde_json::json!({
+                "metadata": {"name": name, "namespace": "test-ns"}, "spec": spec
+            }))
+            .unwrap();
+            storage
+                .create(&format!("/registry/services/test-ns/{name}"), &svc)
+                .await
+                .unwrap();
+        }
+        let controller = ResourceQuotaController::new(storage);
+        let usage = controller
+            .calculate_usage("test-ns", &[], None, &["services.nodeports".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(usage["services.nodeports"], "3");
+        assert_eq!(usage["services.loadbalancers"], "1");
+    }
+
+    /// Quota admission charges any `count/<resource>[.<group>]` through the
+    /// object-count evaluator, so the controller reports its usage too, or
+    /// admission rejects with `status unknown for quota`.
+    #[tokio::test]
+    async fn object_counts_are_computed_for_any_resource() {
+        let storage = Arc::new(MemoryStorage::new());
+        for (key, name) in [
+            ("/registry/deployments/test-ns/a", "a"),
+            ("/registry/deployments/test-ns/b", "b"),
+            ("/registry/deployments/other/c", "c"),
+            ("/registry/example_com_widgets/test-ns/w", "w"),
+        ] {
+            storage
+                .create(key, &serde_json::json!({"metadata": {"name": name}}))
+                .await
+                .unwrap();
+        }
+        let controller = ResourceQuotaController::new(storage);
+        let usage = controller
+            .calculate_usage(
+                "test-ns",
+                &[],
+                None,
+                &[
+                    "count/deployments.apps".to_string(),
+                    "count/widgets.example.com".to_string(),
+                    "count/jobs.batch".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(usage["count/deployments.apps"], "2");
+        assert_eq!(usage["count/widgets.example.com"], "1");
+        assert_eq!(usage["count/jobs.batch"], "0");
     }
 }
