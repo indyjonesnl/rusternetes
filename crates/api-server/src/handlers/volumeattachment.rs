@@ -1,90 +1,95 @@
+//! VolumeAttachment endpoints.
+//!
+//! Writes go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the VolumeAttachment strategy
+//! ([`crate::registry::storage::volumeattachment`]) — upstream's
+//! `pkg/registry/storage/volumeattachment/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::storage::volumeattachment;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::HeaderMap,
+    response::Response,
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::VolumeAttachment,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The VolumeAttachment `RequestScope`: `storage.k8s.io/v1` `VolumeAttachment` served as
+/// `volumeattachments`, backed by `volumeattachment.NewREST`.
+fn scope(
+    state: &ApiServerState,
+    subresource: Option<&'static str>,
+) -> RequestScope<VolumeAttachment> {
+    let (store, status_store) = volumeattachment::new_stores(state.storage.clone());
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "storage.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "VolumeAttachment".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "storage.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "volumeattachments".to_string(),
+        },
+        subresource,
+        store: Box::new(if subresource.is_some() {
+            status_store
+        } else {
+            store
+        }),
+        apply: Some(crate::ssa::apply_legacy::<VolumeAttachment>),
+        convert_to_internal: None,
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create_volumeattachment(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut va): DumpingJson<VolumeAttachment>,
-) -> Result<(StatusCode, Json<VolumeAttachment>)> {
-    info!("Creating VolumeAttachment: {}", va.metadata.name);
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &va.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
         None,
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Validate spec (upstream storage ValidateVolumeAttachment): attacher,
-    // source exactly-one, nodeName.
-    let errs = rusternetes_common::validation::volumeattachment::validate_volume_attachment(&va);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Check authorization (cluster-scoped)
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "volumeattachments")
-        .with_api_group("storage.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    va.metadata.ensure_uid();
-    va.metadata.ensure_creation_timestamp();
-
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: VolumeAttachment validated successfully (not created)");
-        return Ok((StatusCode::CREATED, Json(va)));
-    }
-
-    let key = build_key("volumeattachments", None, &va.metadata.name);
-    let created = state.storage.create(&key, &va).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get_volumeattachment(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
-) -> Result<Json<VolumeAttachment>> {
-    debug!("Getting VolumeAttachment: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "volumeattachments")
-        .with_api_group("storage.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("volumeattachments", None, &name);
-    let va = state.storage.get(&key).await?;
-
-    Ok(Json(va))
+) -> Result<Response> {
+    endpoints::get_resource(&state, &scope(&state, None), &auth_ctx.user, None, &name).await
 }
 
 pub async fn list_volumeattachments(
@@ -133,245 +138,131 @@ pub async fn update_volumeattachment(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut va): DumpingJson<VolumeAttachment>,
-) -> Result<Json<VolumeAttachment>> {
-    info!("Updating VolumeAttachment: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "volumeattachments")
-        .with_api_group("storage.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("volumeattachments", None, &name),
-        "storage.k8s.io",
-        "volumeattachments",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        None,
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    va.metadata.name = name.clone();
-
-    let key = build_key("volumeattachments", None, &name);
-
-    // Spec is read-only on update (upstream ValidateVolumeAttachmentUpdate).
-    if let Ok(old) = state
-        .storage
-        .get::<rusternetes_common::resources::VolumeAttachment>(&key)
-        .await
-    {
-        let errs =
-            rusternetes_common::validation::volumeattachment::validate_volume_attachment_update(
-                &va, &old,
-            );
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: VolumeAttachment validated successfully (not updated)");
-        return Ok(Json(va));
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    if let Ok(stored) = state.storage.get::<VolumeAttachment>(&key).await {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut va.metadata,
-            &stored.metadata,
-        );
-    }
-    let updated = state.storage.update(&key, &va).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &updated,
+pub async fn patch_volumeattachment(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    Ok(Json(updated))
+    .await
 }
 
 pub async fn delete_volumeattachment(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<VolumeAttachment>> {
-    info!("Deleting VolumeAttachment: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "volumeattachments")
-        .with_api_group("storage.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("volumeattachments", None, &name);
-
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Get the resource for finalizer handling
-    let resource: VolumeAttachment = state.storage.get(&key).await?;
-
-    if is_dry_run {
-        info!("Dry-run: VolumeAttachment validated successfully (not deleted)");
-        return Ok(Json(resource));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &resource,
-        &delete_opts,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
     )
-    .await?;
-
-    if deleted_immediately {
-        Ok(Json(resource))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: VolumeAttachment = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+    .await
 }
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_cluster!(
-    patch_volumeattachment,
-    VolumeAttachment,
-    "volumeattachments",
-    "storage.k8s.io"
-);
 
 pub async fn deletecollection_volumeattachments(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection volumeattachments with params: {:?}",
-        params
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "volumeattachments")
-        .with_api_group("storage.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: VolumeAttachment collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all volumeattachments
-    let prefix = build_prefix("volumeattachments", None);
-    let mut items = state.storage.list::<VolumeAttachment>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("volumeattachments", None, &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} volumeattachments deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &params,
+        &body,
+    )
+    .await
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_common::{
-        resources::{VolumeAttachmentSource, VolumeAttachmentSpec},
-        types::{ObjectMeta, TypeMeta},
-    };
+/// GET `/status`: `StatusREST.Get` is the store's `Get`.
+pub async fn get_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+    )
+    .await
+}
 
-    fn create_test_volume_attachment(name: &str) -> VolumeAttachment {
-        VolumeAttachment {
-            type_meta: TypeMeta {
-                kind: "VolumeAttachment".to_string(),
-                api_version: "storage.k8s.io/v1".to_string(),
-            },
-            metadata: ObjectMeta::new(name),
-            spec: VolumeAttachmentSpec {
-                attacher: "test-driver".to_string(),
-                node_name: "node1".to_string(),
-                source: VolumeAttachmentSource {
-                    persistent_volume_name: Some("pv-123".to_string()),
-                    inline_volume_spec: None,
-                },
-            },
-            status: None,
-        }
-    }
+/// PUT `/status`: `StatusREST.Update`.
+pub async fn update_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
 
-    #[tokio::test]
-    async fn test_volumeattachment_serialization() {
-        let va = create_test_volume_attachment("test-va");
-        let json = serde_json::to_string(&va).unwrap();
-        let deserialized: VolumeAttachment = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.metadata.name, "test-va");
-    }
+/// PATCH `/status`: a patch into `StatusREST.Update`.
+pub async fn patch_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
 }

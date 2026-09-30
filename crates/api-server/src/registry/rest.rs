@@ -215,6 +215,18 @@ pub fn wipe_object_meta_system_fields(meta: &mut ObjectMeta) {
     meta.deletion_grace_period_seconds = None;
 }
 
+/// `metav1.ResetObjectMetaForStatus`
+/// (apimachinery/pkg/apis/meta/v1/helpers.go:265-276): a status update keeps
+/// the stored metadata the client cannot change through it.
+pub fn reset_object_meta_for_status(meta: &mut ObjectMeta, existing: &ObjectMeta) {
+    meta.deletion_timestamp = existing.deletion_timestamp;
+    meta.generation = existing.generation;
+    meta.labels = existing.labels.clone();
+    meta.annotations = existing.annotations.clone();
+    meta.finalizers = existing.finalizers.clone();
+    meta.owner_references = existing.owner_references.clone();
+}
+
 /// `FillObjectMetaSystemFields` (rest/meta.go:39-42).
 ///
 /// Upstream's `metav1.Time` serializes at second precision, so the timestamp

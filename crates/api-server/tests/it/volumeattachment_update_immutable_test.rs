@@ -27,12 +27,17 @@ fn va(name: &str, attacher: &str) -> Value {
 async fn volumeattachment_spec_immutable_on_update() {
     let state = TestApiServer::new();
     let name = "va1";
-    let (code, _) = state.post(uri(), &va(name, "csi-driver")).await;
+    let (code, created) = state.post(uri(), &va(name, "csi-driver")).await;
     assert_eq!(code, StatusCode::CREATED);
+    let rv = created["metadata"]["resourceVersion"].clone();
+    let with_rv = |mut v: Value| {
+        v["metadata"]["resourceVersion"] = rv.clone();
+        v
+    };
     let item = format!("{}/{name}", uri());
 
     // Changing the spec (attacher) is rejected.
-    let (code, _) = state.put(&item, &va(name, "other-driver")).await;
+    let (code, _) = state.put(&item, &with_rv(va(name, "other-driver"))).await;
     assert_eq!(
         code,
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -40,6 +45,6 @@ async fn volumeattachment_spec_immutable_on_update() {
     );
 
     // An unchanged-spec update succeeds.
-    let (code, _) = state.put(&item, &va(name, "csi-driver")).await;
+    let (code, _) = state.put(&item, &with_rv(va(name, "csi-driver"))).await;
     assert_eq!(code, StatusCode::OK, "unchanged-spec update must succeed");
 }
