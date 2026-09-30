@@ -3,4 +3,5 @@
 
 pub mod alloc;
 pub mod allocator;
+pub mod ipallocator;
 pub mod portallocator;

@@ -44,7 +44,7 @@ async fn collect(router: TestApiServer, uri: String, max: usize, deadline: Durat
     let mut buf = String::new();
     let mut events = Vec::new();
     let run = async {
-        while events.len() < max {
+        loop {
             match stream.next().await {
                 Some(Ok(bytes)) => {
                     buf.push_str(&String::from_utf8_lossy(&bytes));
@@ -56,7 +56,10 @@ async fn collect(router: TestApiServer, uri: String, max: usize, deadline: Durat
                         }
                         if let Ok(v) = serde_json::from_str::<Value>(&line) {
                             events.push(v);
-                            if events.len() >= max {
+                            // Only the test object's events count: an
+                            // initial list replays what the server seeded
+                            // (the `kubernetes` ServiceCIDR, say).
+                            if types_for_obj(&events).len() >= max {
                                 return;
                             }
                         }

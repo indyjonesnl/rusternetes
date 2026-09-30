@@ -1,7 +1,7 @@
 use crate::admission_webhook::AdmissionWebhookManager;
-use crate::ip_allocator::ClusterIPAllocator;
 use crate::prometheus_client::PrometheusClient;
 use crate::registry::core::service::allocator::{storage::Etcd, AllocationBitmap};
+use crate::registry::core::service::ipallocator::cidr::MetaAllocator;
 use crate::registry::core::service::portallocator::{
     PortAllocator, DEFAULT_SERVICE_NODE_PORT_RANGE,
 };
@@ -20,7 +20,9 @@ pub struct ApiServerState {
     pub authorizer: Arc<dyn Authorizer>,
     pub metrics: Arc<MetricsRegistry>,
     pub skip_auth: bool,
-    pub ip_allocator: Arc<ClusterIPAllocator>,
+    /// The ClusterIP allocator of the primary (IPv4) family: IPAddress
+    /// objects out of the ServiceCIDRs.
+    pub cluster_ip_allocator: Arc<MetaAllocator<StorageBackend>>,
     /// The service NodePort allocator, persisted as the
     /// `/registry/ranges/servicenodeports` RangeAllocation.
     pub node_port_allocator: Arc<PortAllocator>,
@@ -64,6 +66,10 @@ impl ApiServerState {
                 .expect("the NodePort allocator factory cannot fail"),
         );
 
+        // `NewMetaAllocator` for the primary family (storage_core.go:
+        // 397-403); `--service-cluster-ip-range` is IPv4 here.
+        let cluster_ip_allocator = Arc::new(MetaAllocator::new(storage.clone(), false));
+
         Self {
             storage,
             token_manager,
@@ -71,7 +77,7 @@ impl ApiServerState {
             authorizer,
             metrics,
             skip_auth,
-            ip_allocator: Arc::new(ClusterIPAllocator::new()),
+            cluster_ip_allocator,
             node_port_allocator,
             node_port_registry,
             webhook_manager,

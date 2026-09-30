@@ -1,6 +1,10 @@
-//! The NodePort half of `pkg/registry/core/service/storage/alloc.go`: how a
-//! Service create or update claims and frees node ports through a
-//! [`PortAllocationOperation`].
+//! `pkg/registry/core/service/storage/alloc.go`: how a Service create or
+//! update claims and frees node ports through a [`PortAllocationOperation`]
+//! and ClusterIPs through the [`MetaAllocator`].
+//!
+//! Only the primary family is allocated: this api-server configures one
+//! (IPv4) ClusterIP allocator, and `initIPFamilyFields`' dual-stack handling
+//! moves over with the Service strategy (#2077).
 //!
 //! Every entry point hands back the operation. The caller commits it once the
 //! Service is persisted (`callbackTransaction.commit`, alloc.go:485-491) and
@@ -11,7 +15,11 @@ use std::sync::Arc;
 use rusternetes_common::resources::{Service, ServiceExternalTrafficPolicy, ServiceType};
 use rusternetes_common::validation::field;
 use rusternetes_common::{Error, Result};
+use rusternetes_storage::Storage;
+use std::net::IpAddr;
 
+use super::ipallocator::cidr::MetaAllocator;
+use super::ipallocator::IpError;
 use super::portallocator::operation::PortAllocationOperation;
 use super::portallocator::{PortAllocator, PortError};
 use crate::registry::rest::internal_error;
@@ -320,6 +328,216 @@ pub async fn settle<T>(mut op: PortAllocationOperation, result: &Result<T>) {
         op.commit().await;
     }
     op.finish().await;
+}
+
+// ---------------------------------------------------------------------------
+// ClusterIPs
+// ---------------------------------------------------------------------------
+
+/// The ClusterIP half of a `callbackTransaction` (alloc.go:305-338,
+/// 628-675): what to release if the write fails, and what to release once
+/// it succeeds.
+pub struct ClusterIpTxn<S: Storage> {
+    pa: Arc<MetaAllocator<S>>,
+    allocated: Vec<IpAddr>,
+    release_on_commit: Vec<IpAddr>,
+    dry_run: bool,
+}
+
+impl<S: Storage> ClusterIpTxn<S> {
+    fn new(pa: &Arc<MetaAllocator<S>>, dry_run: bool) -> Self {
+        Self {
+            pa: pa.clone(),
+            allocated: Vec::new(),
+            release_on_commit: Vec::new(),
+            dry_run,
+        }
+    }
+
+    async fn release_all(&self, ips: &[IpAddr]) {
+        for ip in ips {
+            if let Err(e) = self.pa.release(*ip, false).await {
+                tracing::error!("failed to release ClusterIP {ip}: {e}");
+            }
+        }
+    }
+
+    /// `commit`: release what the update gave up.
+    pub async fn commit(self) {
+        if !self.dry_run {
+            self.release_all(&self.release_on_commit).await;
+        }
+    }
+
+    /// `revert`: release what this request allocated.
+    pub async fn revert(self) {
+        if !self.dry_run {
+            self.release_all(&self.allocated).await;
+        }
+    }
+}
+
+fn is_headless(service: &Service) -> bool {
+    service.spec.cluster_ip.as_deref() == Some("None")
+        || service
+            .spec
+            .cluster_ips
+            .as_ref()
+            .and_then(|ips| ips.first())
+            .is_some_and(|ip| ip == "None")
+}
+
+/// `spec.clusterIPs`, falling back to `spec.clusterIP` for an object that
+/// predates keeping the two in step.
+fn cluster_ips(service: &Service) -> Vec<String> {
+    match &service.spec.cluster_ips {
+        Some(ips) if !ips.is_empty() => ips.clone(),
+        _ => service
+            .spec
+            .cluster_ip
+            .clone()
+            .into_iter()
+            .filter(|ip| !ip.is_empty())
+            .collect(),
+    }
+}
+
+fn invalid_cluster_ips(service: &Service, detail: String) -> Error {
+    let path = field::Path::new("spec").child("clusterIPs");
+    Error::Invalid(vec![field::Error::invalid(
+        &path,
+        cluster_ips(service),
+        detail,
+    )])
+}
+
+/// `allocClusterIPs` + `allocIPs` (alloc.go:340-451) for the primary
+/// family: a named address is claimed, an empty one allocated.
+async fn alloc_cluster_ips<S: Storage>(
+    txn: &mut ClusterIpTxn<S>,
+    service: &mut Service,
+) -> Result<()> {
+    // ExternalName and headless Services get no ClusterIPs.
+    if matches!(service.spec.service_type, Some(ServiceType::ExternalName)) || is_headless(service)
+    {
+        return Ok(());
+    }
+    let requested = cluster_ips(service).into_iter().next().unwrap_or_default();
+    let pa = txn.pa.clone();
+    let ip = if requested.is_empty() {
+        match pa.allocate_next_service(Some(service), txn.dry_run).await {
+            Ok(ip) => ip,
+            Err(IpError::Full) => {
+                return Err(internal_error(format!(
+                    "failed to allocate a serviceIP: {}",
+                    IpError::Full
+                )))
+            }
+            Err(e) => {
+                return Err(invalid_cluster_ips(
+                    service,
+                    format!("failed to allocate IP: {e}"),
+                ))
+            }
+        }
+    } else {
+        let ip: IpAddr = requested
+            .parse()
+            .map_err(|_| internal_error(format!("failed to parse service IP {requested:?}")))?;
+        pa.allocate_service(Some(service), ip, txn.dry_run)
+            .await
+            .map_err(|e| {
+                invalid_cluster_ips(service, format!("failed to allocate IP {requested}: {e}"))
+            })?;
+        ip
+    };
+    txn.allocated.push(ip);
+    service.spec.cluster_ip = Some(ip.to_string());
+    match service.spec.cluster_ips.as_mut() {
+        Some(ips) if !ips.is_empty() => ips[0] = ip.to_string(),
+        _ => service.spec.cluster_ips = Some(vec![ip.to_string()]),
+    }
+    Ok(())
+}
+
+/// `txnAllocClusterIPs` (alloc.go:305-338).
+pub async fn txn_alloc_cluster_ips<S: Storage>(
+    pa: &Arc<MetaAllocator<S>>,
+    service: &mut Service,
+    dry_run: bool,
+) -> Result<ClusterIpTxn<S>> {
+    let mut txn = ClusterIpTxn::new(pa, dry_run);
+    alloc_cluster_ips(&mut txn, service).await?;
+    Ok(txn)
+}
+
+/// `txnUpdateClusterIPs` + `updateClusterIPs` (alloc.go:628-752), cases A
+/// (from ExternalName: allocate) and B (to ExternalName: release on
+/// commit). Cases C and D are dual-stack upgrades and downgrades.
+pub async fn txn_update_cluster_ips<S: Storage>(
+    pa: &Arc<MetaAllocator<S>>,
+    service: &mut Service,
+    old_service: &Service,
+    dry_run: bool,
+) -> Result<ClusterIpTxn<S>> {
+    let mut txn = ClusterIpTxn::new(pa, dry_run);
+    let was_external = matches!(
+        old_service.spec.service_type,
+        Some(ServiceType::ExternalName)
+    );
+    let is_external = matches!(service.spec.service_type, Some(ServiceType::ExternalName));
+    // CASE A.
+    if was_external && !is_external {
+        alloc_cluster_ips(&mut txn, service).await?;
+        return Ok(txn);
+    }
+    // Headless: no ClusterIP to manage.
+    if is_headless(old_service) {
+        return Ok(txn);
+    }
+    // CASE B.
+    if !was_external && is_external {
+        txn.release_on_commit = cluster_ips(old_service)
+            .iter()
+            .filter_map(|ip| ip.parse().ok())
+            .collect();
+    }
+    Ok(txn)
+}
+
+/// The ClusterIP half of `releaseAllocatedResources` (`releaseClusterIPs`,
+/// alloc.go:910-930), run once a Service is gone.
+pub async fn release_cluster_ips<S: Storage>(pa: &MetaAllocator<S>, service: &Service) {
+    if matches!(service.spec.service_type, Some(ServiceType::ExternalName)) || is_headless(service)
+    {
+        return;
+    }
+    for ip in cluster_ips(service) {
+        let Ok(addr) = ip.parse::<IpAddr>() else {
+            continue;
+        };
+        if let Err(e) = pa.release(addr, false).await {
+            tracing::error!(
+                "Error releasing service {} ClusterIP {ip}: {e}",
+                service.metadata.name
+            );
+        }
+    }
+}
+
+/// Settle both halves against the storage write (`metaTransaction`,
+/// alloc.go:65-100): commit on success, revert otherwise.
+pub async fn settle_all<S: Storage, T>(
+    ips: ClusterIpTxn<S>,
+    ports: PortAllocationOperation,
+    result: &Result<T>,
+) {
+    if result.is_ok() {
+        ips.commit().await;
+    } else {
+        ips.revert().await;
+    }
+    settle(ports, result).await;
 }
 
 #[cfg(test)]

@@ -239,6 +239,7 @@ mod secret_consumption_test;
 mod secret_generic_store_test;
 mod secret_handler_test;
 mod secret_update_type_validation_test;
+mod service_cluster_ip_allocation_test;
 mod service_externalname_transition_test;
 mod service_handler_test;
 mod service_node_port_allocation_test;

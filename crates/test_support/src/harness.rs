@@ -287,6 +287,20 @@ impl TestApiServerBuilder {
         let state =
             ApiServerState::new(backend, token_manager, authorizer, metrics, self.skip_auth)
                 .with_ca_cert(self.ca_cert_pem);
+        // The `kubernetes` ServiceCIDR the ClusterIP allocator draws from:
+        // the api-server seeds it before serving (default_servicecidr
+        // controller `Start`), and the sync only touches storage.
+        let mut cidr_controller =
+            rusternetes_api_server::bootstrap::DefaultServiceCIDRController::new(
+                state.storage.clone(),
+                rusternetes_api_server::bootstrap::DEFAULT_SERVICE_CIDRS
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect(),
+            );
+        futures::FutureExt::now_or_never(cidr_controller.sync())
+            .expect("the default ServiceCIDR sync on MemoryStorage completes without waiting")
+            .expect("the default ServiceCIDR sync succeeds");
         // The api-server is not ready before its first NodePort repair pass
         // has initialised the allocation snapshot. On empty in-memory storage
         // that pass never waits, so it completes on its first poll.
