@@ -2,16 +2,21 @@
 //! `pkg/apis/core/validation/validation.go::validateEndpointSubsets`
 //! (release-1.35).
 //!
-//! Scope: each subset must carry addresses (the endpoint IPs must be valid and
-//! non-special) and well-formed ports. The hostname/nodeName/targetRef detail is
-//! left as a follow-up.
+//! `ValidateEndpointsCreate` / `ValidateEndpointsUpdate`
+//! (`validation.go:8229-8261`): ObjectMeta, then the subsets. Each subset must
+//! carry addresses (the endpoint IPs must be valid and non-special) and
+//! well-formed ports.
 
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use crate::resources::endpoints::{EndpointPort, Endpoints};
+use crate::equality::semantic_equal;
+use crate::resources::endpoints::{EndpointAddress, EndpointPort, Endpoints};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::is_dns1123_label;
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
+};
 
 /// Mirrors upstream `ValidateEndpointIP`: a valid IP that is not unspecified,
 /// loopback, or link-local.
@@ -51,6 +56,33 @@ fn validate_endpoint_ip(ip: &str, fld_path: &Path) -> ErrorList {
             "may not be in the link-local range (169.254.0.0/16, fe80::/10)",
         ));
     }
+    errs
+}
+
+/// Upstream `validateEndpointAddress` (validation.go:8288-8302): the IP, a
+/// DNS-label hostname, and a DNS-subdomain nodeName (`ValidateNodeName` is
+/// `NameIsDNSSubdomain`).
+fn validate_endpoint_address(address: &EndpointAddress, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if let Some(hostname) = address.hostname.as_deref().filter(|h| !h.is_empty()) {
+        for msg in is_dns1123_label(hostname) {
+            errs.push(Error::invalid(
+                &fld_path.child("hostname"),
+                hostname.to_string(),
+                msg,
+            ));
+        }
+    }
+    if let Some(node_name) = &address.node_name {
+        for msg in name_is_dns_subdomain(node_name, false) {
+            errs.push(Error::invalid(
+                &fld_path.child("nodeName"),
+                node_name.clone(),
+                msg,
+            ));
+        }
+    }
+    errs.extend(validate_endpoint_ip(&address.ip, &fld_path.child("ip")));
     errs
 }
 
@@ -99,11 +131,9 @@ fn validate_port(port: &EndpointPort, require_name: bool, fld_path: &Path) -> Er
     errs
 }
 
-/// Validate an `Endpoints` object. Mirrors the core of upstream `ValidateEndpoints`.
-pub fn validate_endpoints(endpoints: &Endpoints) -> ErrorList {
+/// Upstream `validateEndpointSubsets` (validation.go:8263-8286).
+fn validate_endpoint_subsets(endpoints: &Endpoints, subsets_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
-    let subsets_path = Path::new("subsets");
-
     for (i, ss) in endpoints.subsets.iter().enumerate() {
         let idx = subsets_path.index(i);
         let addrs = ss.addresses.as_deref().unwrap_or(&[]);
@@ -115,15 +145,15 @@ pub fn validate_endpoints(endpoints: &Endpoints) -> ErrorList {
             ));
         }
         for (j, a) in addrs.iter().enumerate() {
-            errs.extend(validate_endpoint_ip(
-                &a.ip,
-                &idx.child("addresses").index(j).child("ip"),
+            errs.extend(validate_endpoint_address(
+                a,
+                &idx.child("addresses").index(j),
             ));
         }
         for (j, a) in not_ready.iter().enumerate() {
-            errs.extend(validate_endpoint_ip(
-                &a.ip,
-                &idx.child("notReadyAddresses").index(j).child("ip"),
+            errs.extend(validate_endpoint_address(
+                a,
+                &idx.child("notReadyAddresses").index(j),
             ));
         }
         if let Some(ports) = &ss.ports {
@@ -133,7 +163,39 @@ pub fn validate_endpoints(endpoints: &Endpoints) -> ErrorList {
             }
         }
     }
+    errs
+}
 
+/// Upstream `ValidateEndpoints` (validation.go:8229-8246). `ValidateEndpointsName`
+/// is `NameIsDNSSubdomain`, and `ValidateEndpointsSpecificAnnotations` checks
+/// nothing. On update, subset errors are dropped when the subsets did not
+/// change, "since apparently older versions of Kubernetes considered the data
+/// valid".
+pub fn validate_endpoints(endpoints: &Endpoints, old: Option<&Endpoints>) -> ErrorList {
+    let mut errs = validate_object_meta(
+        &endpoints.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    let subset_errs = validate_endpoint_subsets(endpoints, &Path::new("subsets"));
+    let unchanged = old.is_some_and(|old| semantic_equal(&old.subsets, &endpoints.subsets));
+    if !unchanged {
+        errs.extend(subset_errs);
+    }
+    errs
+}
+
+/// Upstream `ValidateEndpointsCreate` (validation.go:8249-8251).
+pub fn validate_endpoints_create(endpoints: &Endpoints) -> ErrorList {
+    validate_endpoints(endpoints, None)
+}
+
+/// Upstream `ValidateEndpointsUpdate` (validation.go:8257-8261).
+pub fn validate_endpoints_update(endpoints: &Endpoints, old: &Endpoints) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&endpoints.metadata, &old.metadata, &Path::new("metadata"));
+    errs.extend(validate_endpoints(endpoints, Some(old)));
     errs
 }
 
@@ -161,7 +223,7 @@ mod port_tests {
     // exercised with an explicit "" (the String unset sentinel).
     #[test]
     fn empty_protocol_is_required() {
-        let errs = validate_endpoints(&ep(serde_json::json!([{
+        let errs = validate_endpoints_create(&ep(serde_json::json!([{
             "addresses": [{"ip": "10.0.0.1"}],
             "ports": [{"port": 80, "protocol": ""}]
         }])));
@@ -173,7 +235,7 @@ mod port_tests {
 
     #[test]
     fn tcp_protocol_passes() {
-        let errs = validate_endpoints(&ep(serde_json::json!([{
+        let errs = validate_endpoints_create(&ep(serde_json::json!([{
             "addresses": [{"ip": "10.0.0.1"}],
             "ports": [{"port": 80, "protocol": "TCP"}]
         }])));
@@ -189,7 +251,7 @@ mod port_tests {
     // NOT the 15-char IANA_SVC_NAME rule (validation.go:8341).
     #[test]
     fn long_dns_label_port_name_passes() {
-        let errs = validate_endpoints(&ep(serde_json::json!([{
+        let errs = validate_endpoints_create(&ep(serde_json::json!([{
             "addresses": [{"ip": "10.0.0.1"}],
             "ports": [{"name": "tcp-prometheus-servicemonitor", "port": 80, "protocol": "TCP"}]
         }])));
@@ -201,7 +263,7 @@ mod port_tests {
 
     #[test]
     fn uppercase_port_name_rejected_as_invalid_label() {
-        let errs = validate_endpoints(&ep(serde_json::json!([{
+        let errs = validate_endpoints_create(&ep(serde_json::json!([{
             "addresses": [{"ip": "10.0.0.1"}],
             "ports": [{"name": "HTTP", "port": 80, "protocol": "TCP"}]
         }])));
@@ -209,5 +271,58 @@ mod port_tests {
             has(&errs, "subsets[0].ports[0].name", ErrorType::Invalid),
             "{errs:?}"
         );
+    }
+
+    /// validation.go:8233-8243: an update that leaves invalid subsets as they
+    /// were is accepted; one that changes them is validated.
+    #[test]
+    fn unchanged_invalid_subsets_pass_an_update() {
+        let mut old = ep(serde_json::json!([{"addresses": [{"ip": "127.0.0.1"}]}]));
+        old.metadata.resource_version = Some("1".into());
+        assert!(!validate_endpoints_create(&old).is_empty());
+
+        let mut labelled = old.clone();
+        labelled.metadata.labels = Some([("l".to_string(), "v".to_string())].into());
+        let errs = validate_endpoints_update(&labelled, &old);
+        assert!(errs.is_empty(), "{errs:?}");
+
+        let mut changed = old.clone();
+        changed.subsets[0].addresses.as_mut().unwrap()[0].ip = "127.0.0.2".into();
+        assert!(has(
+            &validate_endpoints_update(&changed, &old),
+            "subsets[0].addresses[0].ip",
+            ErrorType::Invalid
+        ));
+    }
+
+    #[test]
+    fn create_validates_object_meta() {
+        let mut e = ep(serde_json::json!([]));
+        e.metadata.name = "Bad_Name".into();
+        assert!(validate_endpoints_create(&e)
+            .iter()
+            .any(|e| e.field == "metadata.name"));
+    }
+
+    /// validation.go:8291-8299.
+    #[test]
+    fn hostname_and_node_name_are_validated() {
+        let errs = validate_endpoints_create(&ep(serde_json::json!([{
+            "addresses": [{"ip": "10.0.0.1", "hostname": "Bad.Host", "nodeName": "Bad_Node"}]
+        }])));
+        assert!(has(
+            &errs,
+            "subsets[0].addresses[0].hostname",
+            ErrorType::Invalid
+        ));
+        assert!(has(
+            &errs,
+            "subsets[0].addresses[0].nodeName",
+            ErrorType::Invalid
+        ));
+        let errs = validate_endpoints_create(&ep(serde_json::json!([{
+            "addresses": [{"ip": "10.0.0.1", "hostname": "web-0", "nodeName": "node-1.example"}]
+        }])));
+        assert!(errs.is_empty(), "{errs:?}");
     }
 }
