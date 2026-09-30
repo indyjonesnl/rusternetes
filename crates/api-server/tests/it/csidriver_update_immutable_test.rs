@@ -21,12 +21,18 @@ fn csidriver(name: &str, attach_required: bool) -> Value {
 async fn csidriver_attach_required_immutable() {
     let state = TestApiServer::new();
     let name = "csi.example.com";
-    let (code, _) = state.post(uri(), &csidriver(name, true)).await;
+    let (code, created) = state.post(uri(), &csidriver(name, true)).await;
     assert_eq!(code, StatusCode::CREATED, "create must succeed");
+    // No AllowUnconditionalUpdate: a PUT carries the stored resourceVersion.
+    let rv = created["metadata"]["resourceVersion"].clone();
+    let with_rv = |mut v: Value| {
+        v["metadata"]["resourceVersion"] = rv.clone();
+        v
+    };
     let item = format!("{}/{name}", uri());
 
     // Changing attachRequired is rejected.
-    let (code, body) = state.put(&item, &csidriver(name, false)).await;
+    let (code, body) = state.put(&item, &with_rv(csidriver(name, false))).await;
     assert_eq!(
         code,
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -34,6 +40,6 @@ async fn csidriver_attach_required_immutable() {
     );
 
     // Unchanged update succeeds.
-    let (code, _) = state.put(&item, &csidriver(name, true)).await;
+    let (code, _) = state.put(&item, &with_rv(csidriver(name, true))).await;
     assert_eq!(code, StatusCode::OK, "unchanged update must succeed");
 }

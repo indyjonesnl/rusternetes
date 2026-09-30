@@ -2116,9 +2116,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/storage.k8s.io/v1/volumeattachments/:name/status",
-            get(handlers::status::get_cluster_status)
-                .put(handlers::status::update_cluster_status)
-                .patch(handlers::status::update_cluster_status),
+            get(handlers::volumeattachment::get_status)
+                .put(handlers::volumeattachment::update_status)
+                .patch(handlers::volumeattachment::patch_status),
         )
         // Storage v1 API - VolumeAttributesClasses (cluster-scoped)
         .route(

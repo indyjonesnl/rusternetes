@@ -11,6 +11,7 @@
 //! ObjectMeta is validated separately. CSI is a non-negotiable contract.
 
 use crate::resources::csi::{VolumeAttachment, VolumeAttachmentStatus, VolumeError};
+use crate::validation::csinode::validate_csi_driver_name;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::is_dns1123_subdomain;
 use crate::validation::persistentvolume::validate_persistent_volume_spec;
@@ -20,26 +21,33 @@ const MAX_ATTACHED_VOLUME_METADATA_SIZE: usize = 256 * (1 << 10);
 /// `maxVolumeErrorMessageSize` — 1024 (upstream validation.go:45).
 const MAX_VOLUME_ERROR_MESSAGE_SIZE: usize = 1024;
 
-/// Validate a `VolumeAttachment` on create. Mirrors upstream
-/// `validateVolumeAttachmentSpec` (minus inline PV spec + status).
+/// `ValidateVolumeAttachmentV1` (validation.go:150-160): the checks only
+/// newly created v1 attachments get — a valid CSI driver name for the
+/// attacher and a valid PV name.
+pub fn validate_volume_attachment_v1(va: &VolumeAttachment) -> ErrorList {
+    let mut errs = validate_csi_driver_name(&va.spec.attacher, &Path::new("spec.attacher"));
+    if let Some(pv) = &va.spec.source.persistent_volume_name {
+        for msg in is_dns1123_subdomain(pv) {
+            errs.push(Error::invalid(
+                &Path::new("spec.source.persistentVolumeName"),
+                pv.clone(),
+                msg,
+            ));
+        }
+    }
+    errs
+}
+
+/// Validate a `VolumeAttachment`. Mirrors upstream `ValidateVolumeAttachment`
+/// minus ObjectMeta (validateVolumeAttachmentSpec + status).
 pub fn validate_volume_attachment(va: &VolumeAttachment) -> ErrorList {
     let spec = &va.spec;
     let spec_path = Path::new("spec");
     let mut errs: ErrorList = Vec::new();
 
-    // attacher — required (validateAttacher) plus, on v1, a valid CSI driver
-    // name: a DNS-subdomain ≤63 chars (ValidateVolumeAttachmentV1 :151,
-    // ValidateCSIDriverName). Upstream lowercases before the DNS check.
-    let attacher_path = spec_path.child("attacher");
+    // attacher — required (validateAttacher, validation.go:174-180).
     if spec.attacher.is_empty() {
-        errs.push(Error::required(&attacher_path, ""));
-    } else {
-        if spec.attacher.len() > 63 {
-            errs.push(Error::too_long(&attacher_path, 63));
-        }
-        for msg in is_dns1123_subdomain(&spec.attacher.to_lowercase()) {
-            errs.push(Error::invalid(&attacher_path, spec.attacher.clone(), msg));
-        }
+        errs.push(Error::required(&spec_path.child("attacher"), ""));
     }
 
     // source — exactly one of inlineVolumeSpec / persistentVolumeName.
@@ -76,22 +84,6 @@ pub fn validate_volume_attachment(va: &VolumeAttachment) -> ErrorList {
             ));
         }
         _ => {}
-    }
-
-    // persistentVolumeName — a valid PV name (DNS-subdomain). v1-only check
-    // (ValidateVolumeAttachmentV1 :153-158, ValidatePersistentVolumeName =
-    // NameIsDNSSubdomain). Runs whenever the field is present (non-empty case;
-    // the empty case is already flagged Required above).
-    if let Some(pv) = &source.persistent_volume_name {
-        if !pv.is_empty() {
-            for msg in is_dns1123_subdomain(pv) {
-                errs.push(Error::invalid(
-                    &source_path.child("persistentVolumeName"),
-                    pv.clone(),
-                    msg,
-                ));
-            }
-        }
     }
 
     // nodeName — a DNS-subdomain node name (also rejects empty).
@@ -172,22 +164,27 @@ fn validate_volume_error(e: &VolumeError, fld_path: &Path) -> ErrorList {
     errs
 }
 
-/// Validate a VolumeAttachment update — upstream `ValidateVolumeAttachmentUpdate`
-/// (pkg/apis/storage/validation): the spec is read-only (immutable), plus full
-/// re-validation of the new object.
+/// `ValidateVolumeAttachmentUpdate` (validation.go:253-262): the create
+/// validation (without the v1-only extras), and the spec is read-only.
 pub fn validate_volume_attachment_update(
     new_va: &VolumeAttachment,
     old_va: &VolumeAttachment,
 ) -> ErrorList {
     let mut errs = validate_volume_attachment(new_va);
-    if serde_json::to_value(&new_va.spec).ok() != serde_json::to_value(&old_va.spec).ok() {
-        errs.push(Error::invalid(
-            &Path::new("spec"),
-            "<spec>".to_string(),
-            "field is immutable",
-        ));
-    }
+    errs.extend(validate_immutable_spec(new_va, old_va));
     errs
+}
+
+fn validate_immutable_spec(new_va: &VolumeAttachment, old_va: &VolumeAttachment) -> ErrorList {
+    let new_spec = serde_json::to_value(&new_va.spec).unwrap_or_default();
+    if new_spec == serde_json::to_value(&old_va.spec).unwrap_or_default() {
+        return Vec::new();
+    }
+    vec![Error::invalid(
+        &Path::new("spec"),
+        new_spec,
+        "field is immutable",
+    )]
 }
 
 #[cfg(test)]
@@ -349,10 +346,10 @@ mod parity_tests {
 
     fn errs(json: serde_json::Value) -> Vec<String> {
         let va: VolumeAttachment = serde_json::from_value(json).unwrap();
-        validate_volume_attachment(&va)
-            .into_iter()
-            .map(|e| e.to_string())
-            .collect()
+        // A create runs `ValidateVolumeAttachment` then `ValidateVolumeAttachmentV1`.
+        let mut all = validate_volume_attachment(&va);
+        all.extend(validate_volume_attachment_v1(&va));
+        all.into_iter().map(|e| e.to_string()).collect()
     }
 
     /// Base PV-name source: a fully valid VA we mutate per test.

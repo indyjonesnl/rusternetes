@@ -12,6 +12,7 @@
 
 use crate::resources::csi::CSIDriver;
 use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::objectmeta::validate_immutable_field;
 use std::collections::HashSet;
 
 // Upstream `validateTokenRequests` bounds.
@@ -42,6 +43,12 @@ pub fn validate_csi_driver(driver: &CSIDriver) -> ErrorList {
     // (validation.go:453 / 493-500).
     if spec.storage_capacity.is_none() {
         errs.push(Error::required(&spec_path.child("storageCapacity"), ""));
+    }
+
+    // seLinuxMount is required while SELinuxMountReadWriteOncePod is on
+    // (GA, default on in 1.35) — validateSELinuxMount (validation.go:566-573).
+    if spec.se_linux_mount.is_none() {
+        errs.push(Error::required(&spec_path.child("seLinuxMount"), ""));
     }
 
     // nodeAllocatableUpdatePeriodSeconds must be >= 10 when set —
@@ -102,27 +109,23 @@ pub fn validate_csi_driver(driver: &CSIDriver) -> ErrorList {
     errs
 }
 
-/// Validate a CSIDriver update — upstream `ValidateCSIDriverUpdate`
-/// (pkg/apis/storage/validation): `attachRequired` and `volumeLifecycleModes`
-/// are immutable, plus full re-validation of the new object.
+/// `ValidateCSIDriverUpdate` (validation.go:435-444): the spec is validated
+/// again, and `attachRequired` and `volumeLifecycleModes` are immutable.
+/// The immutable path for `attachRequired` is upstream's
+/// `spec.attachedRequired` (sic).
 pub fn validate_csi_driver_update(new_d: &CSIDriver, old_d: &CSIDriver) -> ErrorList {
     let mut errs = validate_csi_driver(new_d);
-    if new_d.spec.attach_required != old_d.spec.attach_required {
-        errs.push(Error::invalid(
-            &Path::new("spec").child("attachRequired"),
-            "<changed>".to_string(),
-            "field is immutable",
-        ));
-    }
-    if serde_json::to_value(&new_d.spec.volume_lifecycle_modes).ok()
-        != serde_json::to_value(&old_d.spec.volume_lifecycle_modes).ok()
-    {
-        errs.push(Error::invalid(
-            &Path::new("spec").child("volumeLifecycleModes"),
-            "<changed>".to_string(),
-            "field is immutable",
-        ));
-    }
+    let spec_path = Path::new("spec");
+    errs.extend(validate_immutable_field(
+        &new_d.spec.attach_required,
+        &old_d.spec.attach_required,
+        &spec_path.child("attachedRequired"),
+    ));
+    errs.extend(validate_immutable_field(
+        &new_d.spec.volume_lifecycle_modes,
+        &old_d.spec.volume_lifecycle_modes,
+        &spec_path.child("volumeLifecycleModes"),
+    ));
     errs
 }
 
@@ -140,6 +143,7 @@ mod tests {
             attach_required: Some(true),
             pod_info_on_mount: Some(false),
             storage_capacity: Some(true),
+            se_linux_mount: Some(false),
             node_allocatable_update_period_seconds: None,
             service_account_token_in_secrets: None,
             ..Default::default()

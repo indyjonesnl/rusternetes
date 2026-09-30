@@ -24,6 +24,7 @@ fn defaulted_spec() -> CSIDriverSpec {
         attach_required: Some(true),
         pod_info_on_mount: Some(false),
         storage_capacity: Some(false),
+        se_linux_mount: Some(false),
         ..Default::default()
     }
 }
