@@ -23,6 +23,9 @@ use crate::resources::volume::{
 use crate::validation::csinode::validate_csi_driver_name;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
+};
 use crate::validation::pod::{validate_nfs_volume_source, validate_node_selector};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -520,9 +523,71 @@ pub fn validate_persistent_volume_spec(
     errs
 }
 
-/// Validate a new `PersistentVolume`. Mirrors upstream `ValidatePersistentVolume`.
+/// `api.MountOptionAnnotation` (pkg/apis/core/types.go:348).
+const MOUNT_OPTION_ANNOTATION: &str = "volume.beta.kubernetes.io/mount-options";
+
+/// Upstream `ValidatePersistentVolume` (validation.go:2262-2267): ObjectMeta
+/// (cluster-scoped; `ValidatePersistentVolumeName` is `NameIsDNSSubdomain`)
+/// and the spec. The PV strategy adds [`validate_persistent_volume_plugin`].
 pub fn validate_persistent_volume(pv: &PersistentVolume) -> ErrorList {
-    validate_persistent_volume_spec(&pv.spec, &pv.metadata.name, false, &Path::new("spec"))
+    let mut errs = validate_object_meta(
+        &pv.metadata,
+        false,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_persistent_volume_spec(
+        &pv.spec,
+        &pv.metadata.name,
+        false,
+        &Path::new("spec"),
+    ));
+    errs
+}
+
+/// Upstream `volumevalidation.ValidatePersistentVolume`
+/// (pkg/volume/validation/pv_validation.go:30-59): the mount-options
+/// annotation is forbidden unless the volume type supports mount options.
+/// Of the sources modelled here, NFS and iSCSI do.
+pub fn validate_persistent_volume_plugin(pv: &PersistentVolume) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if pv.spec.nfs.is_some() || pv.spec.iscsi.is_some() {
+        return errs;
+    }
+    let annotated = pv
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(MOUNT_OPTION_ANNOTATION));
+    if annotated {
+        errs.push(Error::forbidden(
+            &Path::new("metadata")
+                .child("annotations")
+                .key(MOUNT_OPTION_ANNOTATION),
+            "may not specify mount options for this volume type",
+        ));
+    }
+    errs
+}
+
+/// Upstream `ValidatePersistentVolumeStatusUpdate` (validation.go:2309-2315):
+/// the ObjectMeta update and a required `resourceVersion`.
+pub fn validate_persistent_volume_status_update(
+    new: &PersistentVolume,
+    old: &PersistentVolume,
+) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
+    if new
+        .metadata
+        .resource_version
+        .as_deref()
+        .unwrap_or("")
+        .is_empty()
+    {
+        errs.push(Error::required(&Path::new("resourceVersion"), ""));
+    }
+    errs
 }
 
 /// JSON view of just the volume-source union of a `PersistentVolumeSpec`

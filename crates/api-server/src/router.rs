@@ -1486,9 +1486,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/persistentvolumes/:name/status",
-            get(handlers::status::get_cluster_status)
-                .put(handlers::status::update_cluster_status)
-                .patch(handlers::status::update_cluster_status),
+            get(handlers::persistentvolume::get_status)
+                .put(handlers::persistentvolume::update_status)
+                .patch(handlers::persistentvolume::patch_status),
         )
         // Watch persistentvolumes (cluster-scoped)
         .route(
