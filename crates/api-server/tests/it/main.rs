@@ -262,6 +262,7 @@ mod status_field_error_shape_test;
 mod status_no_storage_key_leak_test;
 mod status_subresource_apigroup_rbac_test;
 mod status_subresource_test;
+mod storage_classes_store_test;
 mod storage_topology_decode_test;
 mod storageclass_handler_test;
 mod strategy_batch_test;

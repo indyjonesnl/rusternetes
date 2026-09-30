@@ -164,6 +164,24 @@ pub fn validate_storage_class(sc: &StorageClass) -> ErrorList {
     errs
 }
 
+/// `GetWarningsForStorageClass` (pkg/api/storage/util.go:27-42): a warning
+/// per deprecated node label used as an `allowedTopologies` key.
+pub fn get_warnings_for_storage_class(sc: &StorageClass) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (i, topo) in sc.allowed_topologies.iter().flatten().enumerate() {
+        for (j, expr) in topo.match_label_expressions.iter().flatten().enumerate() {
+            if let Some(msg) =
+                crate::validation::runtimeclass::get_node_label_deprecated_message(&expr.key)
+            {
+                warnings.push(format!(
+                    "allowedTopologies[{i}].matchLabelExpressions[{j}].key: {msg}"
+                ));
+            }
+        }
+    }
+    warnings
+}
+
 /// Validate a `StorageClass` update. Mirrors upstream `ValidateStorageClassUpdate`
 /// (minus ObjectMeta): `parameters`, `provisioner`, `reclaimPolicy` and
 /// `volumeBindingMode` are immutable (only `allowVolumeExpansion` may change).

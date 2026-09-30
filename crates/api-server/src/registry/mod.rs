@@ -30,3 +30,4 @@ pub mod policy;
 pub mod rest;
 pub mod scale;
 pub mod scheduling;
+pub mod storage;
