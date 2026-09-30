@@ -1086,9 +1086,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/namespaces/:namespace/services/:name/status",
-            get(handlers::status::get_status)
-                .put(handlers::status::update_status)
-                .patch(handlers::status::update_status),
+            get(handlers::service::get_status)
+                .put(handlers::service::update_status)
+                .patch(handlers::service::patch_status),
         )
         .route(
             "/api/v1/namespaces/:namespace/services/:name/proxy",

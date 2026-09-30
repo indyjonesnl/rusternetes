@@ -309,7 +309,7 @@ pub fn inherit_server_owned_metadata_json(
 /// }
 /// ```
 ///
-/// It returns `true` for nine resources in the whole tree, listed below with
+/// It returns `true` for ten resources in the whole tree, listed below with
 /// the strategy file that opts in. Everything else — ConfigMap, Secret, Pod,
 /// Deployment, Service, … — answers 404.
 ///
@@ -340,12 +340,14 @@ pub fn allow_create_on_update(group: &str, resource: &str) -> bool {
             | ("events.k8s.io", "events")
             // pkg/registry/core/endpoint/strategy.go:70
             | ("", "endpoints")
+            // pkg/registry/core/service/strategy.go (`svcStrategy`)
+            | ("", "services")
     )
 }
 
 /// The `existingResourceVersion == 0` gate from `Store.Update`: answer
 /// `NotFound` for a PUT to an object that does not exist, unless the resource
-/// is one of the nine in [`allow_create_on_update`].
+/// is one of the ten in [`allow_create_on_update`].
 ///
 /// Call it right after authorization and **before validation**, which is where
 /// upstream answers: the check sits at the top of `GuaranteedUpdate`'s

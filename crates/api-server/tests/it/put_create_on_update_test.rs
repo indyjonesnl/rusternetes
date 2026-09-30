@@ -13,7 +13,7 @@
 //! }
 //! ```
 //!
-//! `AllowCreateOnUpdate()` returns `true` for nine resources in the whole
+//! `AllowCreateOnUpdate()` returns `true` for ten resources in the whole
 //! upstream tree. Rusternetes had it the other way round: thirty update
 //! handlers carried an `Err(NotFound) => storage.create(...)` fallback, so any
 //! PUT created the object with server-assigned metadata the client never asked
@@ -26,7 +26,7 @@ use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The nine upstream strategies whose `AllowCreateOnUpdate()` returns `true`,
+/// The ten upstream strategies whose `AllowCreateOnUpdate()` returns `true`,
 /// as `(group, resource)`. Mirrors `handlers::lifecycle::allow_create_on_update`
 /// — deliberately restated here rather than imported, so a change to the table
 /// has to be made twice and cannot be waved through as "the test follows the
@@ -44,6 +44,9 @@ const CREATE_ON_UPDATE: &[(&str, &str)] = &[
     // inherits the core Event strategy's AllowCreateOnUpdate.
     ("events.k8s.io", "events"),
     ("", "endpoints"),
+    // pkg/registry/core/service/strategy.go: `svcStrategy`, which
+    // `serviceStatusStrategy` embeds, so `/status` creates too.
+    ("", "services"),
 ];
 
 type Gvr = (String, String, String);
@@ -164,8 +167,10 @@ async fn a_put_to_a_missing_object_is_not_a_create() {
         if allowed {
             // A probe body the resource cannot decode never reaches the
             // existence check, in either direction.
+            // A create its create validation rejects (a Service needs
+            // ports) still got past the existence check.
             assert!(
-                (200..300).contains(&code) || is_decode_failure(&answer),
+                (200..300).contains(&code) || is_decode_failure(&answer) || is_invalid(&answer),
                 "{id} opts into create-on-update upstream but answered {code}: {answer}"
             );
             continue;
@@ -183,7 +188,7 @@ async fn a_put_to_a_missing_object_is_not_a_create() {
         "{} resource(s) created an object on PUT to a name that does not \
          exist. Upstream answers NotFound unless the strategy's \
          AllowCreateOnUpdate() is true (store.go:646-650), which holds for \
-         nine resources -- none of these.\n\nOffenders:\n  {}",
+         ten resources -- none of these.\n\nOffenders:\n  {}",
         created.len(),
         created.join("\n  ")
     );
@@ -202,6 +207,11 @@ async fn a_put_to_a_missing_object_is_not_a_create() {
          decode the probe body) -- too few for this sweep to mean anything",
         undecodable.len()
     );
+}
+
+/// A 422 from validation: the request reached the create path.
+fn is_invalid(answer: &Value) -> bool {
+    answer["reason"] == json!("Invalid") && !is_decode_failure(answer)
 }
 
 /// Distinguish "the body never decoded" from "the object was validated".
@@ -243,7 +253,7 @@ async fn put_to_a_missing_configmap_is_a_notfound_status() {
     assert_eq!(status.as_u16(), 404, "the rejected PUT still created it");
 }
 
-/// Lease is one of the nine: `pkg/registry/coordination/lease/strategy.go:84`.
+/// Lease is one of the ten: `pkg/registry/coordination/lease/strategy.go:84`.
 #[tokio::test]
 async fn a_lease_is_still_created_on_update() {
     let api = TestApiServer::new();
@@ -273,7 +283,7 @@ async fn a_lease_is_still_created_on_update() {
 /// The sweep above can only judge a resource whose probe body decodes, and
 /// thirty-seven currently cannot (#1931). This guard covers the rest: every
 /// update handler must consult the create-on-update table, either by calling
-/// `reject_create_on_update` or -- for one of the nine that opt in -- by
+/// `reject_create_on_update` or -- for one of the ten that opt in -- by
 /// keeping an explicit create fallback that names the rule.
 ///
 /// Keyed on mechanism, not on a list of handler names: a name list is the
@@ -332,7 +342,7 @@ async fn every_update_handler_consults_the_create_on_update_table() {
     // scan — its update path is `Store.Update`, whose create-on-update gate
     // `configmap_generic_store_test` pins — so the floor falls with them.
     assert!(
-        checked >= 49,
+        checked >= 48,
         "guard scanned only {checked} update handlers that can create -- the \
          parser stopped matching, which would make this test vacuously green"
     );
@@ -343,7 +353,7 @@ async fn every_update_handler_consults_the_create_on_update_table() {
          strategy's AllowCreateOnUpdate() is true \
          (registry/generic/registry/store.go:646-650). Call \
          `lifecycle::reject_create_on_update(...)` after authorization, or -- \
-         for one of the nine that opt in -- keep the create fallback and say \
+         for one of the ten that opt in -- keep the create fallback and say \
          so.\n\nOffenders:\n  {}",
         offenders.len(),
         offenders.join("\n  ")
@@ -446,9 +456,9 @@ async fn updatable_subresources(s: &TestApiServer) -> BTreeMap<Gvr, (bool, Strin
 
 /// A PUT to `<resource>/<subresource>` of a name that does not exist is a 404.
 ///
-/// None of the nine `AllowCreateOnUpdate()` strategies has a writable
-/// subresource, so this direction has no opt-in half: every entry must answer
-/// NotFound.
+/// Of the ten `AllowCreateOnUpdate()` strategies only Service has a
+/// writable subresource: `serviceStatusStrategy` embeds `svcStrategy`, so
+/// its `/status` opts in too. Every other entry must answer NotFound.
 #[tokio::test]
 async fn a_put_to_a_missing_objects_subresource_is_not_a_create() {
     let api = TestApiServer::new();
@@ -518,6 +528,18 @@ async fn a_put_to_a_missing_objects_subresource_is_not_a_create() {
             .await;
         let code = status.as_u16();
         let id = format!("{api_version} {path}");
+        // A subresource of a create-on-update resource shares its strategy's
+        // gate (`serviceStatusStrategy` embeds `svcStrategy`).
+        if CREATE_ON_UPDATE
+            .iter()
+            .any(|(g, r)| g == group && *r == resource)
+        {
+            assert!(
+                (200..300).contains(&code) || is_decode_failure(&answer) || is_invalid(&answer),
+                "{id} opts into create-on-update upstream but answered {code}: {answer}"
+            );
+            continue;
+        }
         match code {
             404 => missing_404 += 1,
             200..=299 => created.push(format!("{id} -> {code}")),

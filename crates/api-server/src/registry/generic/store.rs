@@ -99,14 +99,18 @@ pub trait BeginCreate<T>: Send + Sync {
 
 /// `BeginUpdateFunc` (store.go:71-72), the `Store.BeginUpdate` hook
 /// (store.go:186-191): runs inside each update attempt, before the update
-/// strategy, with the stored object.
+/// strategy, with the stored object. Upstream hands it the attempt's own
+/// decoded copy of the stored object, which the hook may default and the
+/// update strategy then sees (e.g. `defaultOnReadService(oldSvc)`,
+/// pkg/registry/core/service/storage/storage.go:392-397), so `old` is
+/// mutable here too.
 #[async_trait]
 pub trait BeginUpdate<T>: Send + Sync {
     async fn begin_update(
         &self,
         ctx: &RequestContext,
         obj: &mut T,
-        old: &T,
+        old: &mut T,
         options: &UpdateOptions,
     ) -> Result<Box<dyn Finish>>;
 }
@@ -1152,10 +1156,11 @@ impl<T: Object, S: Storage> TryUpdate<T> for UpdateAttempt<'_, T, S> {
         let Some(hook) = &self.store.begin_update else {
             return self.update_existing(obj, existing).await;
         };
+        let mut existing = existing.clone();
         let finish = hook
-            .begin_update(self.ctx, &mut obj, existing, self.options)
+            .begin_update(self.ctx, &mut obj, &mut existing, self.options)
             .await?;
-        let result = self.update_existing(obj, existing).await;
+        let result = self.update_existing(obj, &existing).await;
         // The attempt's outcome is known: commit or revert
         // (store.go:740-750, 783-787). Upstream commits here, before the
         // write itself.

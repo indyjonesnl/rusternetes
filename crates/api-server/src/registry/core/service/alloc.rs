@@ -16,10 +16,10 @@ use std::sync::Arc;
 use rusternetes_common::resources::{
     IPFamily, IPFamilyPolicy, Service, ServiceExternalTrafficPolicy, ServiceType,
 };
+use rusternetes_common::validation::field;
 use rusternetes_common::validation::service::{
     parse_ip_sloppy, validate_service_cluster_ips_related_fields,
 };
-use rusternetes_common::validation::field;
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::Storage;
 use std::net::IpAddr;
@@ -416,7 +416,9 @@ fn is_matching_prefer_dual_stack_cluster_ip_fields(
     }
     if !matches!(
         service.spec.service_type,
-        Some(ServiceType::ClusterIP) | Some(ServiceType::NodePort) | Some(ServiceType::LoadBalancer)
+        Some(ServiceType::ClusterIP)
+            | Some(ServiceType::NodePort)
+            | Some(ServiceType::LoadBalancer)
     ) {
         return false;
     }
@@ -524,7 +526,11 @@ pub fn init_ip_family_fields(service: &mut Service, old: Option<&Service>) -> Re
         if i >= spec_ip_families(service).len() {
             match family_of(ip) {
                 Some(fam) if CONFIGURED_IP_FAMILIES.contains(&fam) => {
-                    service.spec.ip_families.get_or_insert_with(Vec::new).push(fam);
+                    service
+                        .spec
+                        .ip_families
+                        .get_or_insert_with(Vec::new)
+                        .push(fam);
                 }
                 fam => {
                     let name = match fam {
