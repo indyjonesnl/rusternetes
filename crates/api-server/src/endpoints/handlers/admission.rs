@@ -16,14 +16,15 @@
 //!
 //! The in-tree plugins ahead of them run first, in `AllOrderedPlugins` order
 //! (plugins.go:69-100), for the resources on this path that they handle:
-//! LimitRanger and DefaultStorageClass, for PersistentVolumeClaims.
+//! LimitRanger and DefaultStorageClass, for PersistentVolumeClaims, and
+//! Priority, for PriorityClasses.
 
 use async_trait::async_trait;
 use rusternetes_common::admission::{
     self, AdmissionResponse, GroupVersionKind, GroupVersionResource, Operation,
 };
 use rusternetes_common::auth::UserInfo;
-use rusternetes_common::resources::PersistentVolumeClaim;
+use rusternetes_common::resources::{PersistentVolumeClaim, PriorityClass};
 use rusternetes_common::{Error, Result};
 
 use super::rest::{authorize, RequestScope};
@@ -89,11 +90,12 @@ impl Admission<'_> {
     }
 
     /// `admission.NewForbidden` (apiserver/pkg/admission/errors.go):
-    /// `<resource> "<name>" is forbidden: <err>`.
+    /// `<resource> "<name>" is forbidden: <err>`, the resource being
+    /// `a.GetResource().GroupResource()`.
     fn forbidden(&self, name: &str, err: impl std::fmt::Display) -> Error {
         Error::Forbidden(format!(
             "{} \"{name}\" is forbidden: {err}",
-            self.resource.resource
+            GroupResource::new(&self.resource.group, &self.resource.resource)
         ))
     }
 
@@ -122,6 +124,9 @@ impl Admission<'_> {
         obj: Option<&T>,
         old: Option<&T>,
     ) -> Result<()> {
+        // `Priority` sits ahead of `LimitRanger` in `AllOrderedPlugins`
+        // (plugins.go:69-100).
+        self.validate_priority(op, obj).await?;
         let (Some(obj), Some(namespace)) = (obj, self.namespace) else {
             return Ok(());
         };
@@ -139,6 +144,40 @@ impl Admission<'_> {
             Ok(Some(err)) => Err(self.forbidden(&pvc.metadata.name, err)),
             Err(e) => Err(self.forbidden(&pvc.metadata.name, e)),
         }
+    }
+
+    /// `Priority.Validate` (plugin/pkg/admission/priority/admission.go:116-133)
+    /// for PriorityClasses: `validatePriorityClass` (:156-176) lets at most
+    /// one class be `globalDefault`.
+    async fn validate_priority<T: Object>(&self, op: &Operation, obj: Option<&T>) -> Result<()> {
+        let Some(obj) = obj else {
+            return Ok(());
+        };
+        if self.subresource.is_some()
+            || self.resource.group != "scheduling.k8s.io"
+            || self.resource.resource != "priorityclasses"
+            || !matches!(op, Operation::Create | Operation::Update)
+        {
+            return Ok(());
+        }
+        let pc: PriorityClass = recast(obj)?;
+        if pc.global_default != Some(true) {
+            return Ok(());
+        }
+        let Some(dpc) = crate::admission::get_default_priority_class(&self.state.storage).await?
+        else {
+            return Ok(());
+        };
+        if *op == Operation::Create || dpc.metadata.name != pc.metadata.name {
+            return Err(self.forbidden(
+                &pc.metadata.name,
+                format!(
+                    "PriorityClass {} is already marked as default. Only one default can exist",
+                    dpc.metadata.name
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// The mutating plugins: `MutationInterface.Admit`.

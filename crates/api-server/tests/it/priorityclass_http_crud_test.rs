@@ -125,10 +125,13 @@ async fn priority_class_full_http_crud_lifecycle() {
     assert_eq!(body["description"], "patched tier");
     assert_eq!(body["value"], 1000, "patch must not touch immutable value");
 
-    // DELETE — returns 200 OK with the deleted object.
+    // DELETE — returns 200 OK with a Success Status: the PriorityClass store
+    // does not set `ReturnDeletedObject`
+    // (pkg/registry/scheduling/priorityclass/storage/storage.go:40-55).
     let (status, body) = delete_json(&state, &item_uri).await;
     assert_eq!(status, StatusCode::OK, "DELETE body: {body}");
-    assert_eq!(body["metadata"]["name"], name);
+    assert_eq!(body["kind"], "Status", "{body}");
+    assert_eq!(body["details"]["name"], name, "{body}");
 
     // GET after delete — gone.
     let (status, _body) = get_json(&state, &item_uri).await;

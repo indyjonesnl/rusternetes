@@ -1163,6 +1163,25 @@ impl PodSecurityAdmission {
     }
 }
 
+/// `Priority.getDefaultPriorityClass`
+/// (plugin/pkg/admission/priority/admission.go:268-285): the class marked
+/// `globalDefault`. If a race left more than one, the lowest value wins.
+pub async fn get_default_priority_class<S: Storage>(
+    storage: &Arc<S>,
+) -> rusternetes_common::Result<Option<rusternetes_common::resources::PriorityClass>> {
+    let prefix = rusternetes_storage::build_prefix("priorityclasses", None);
+    let list = storage
+        .list::<rusternetes_common::resources::PriorityClass>(&prefix)
+        .await?;
+    let mut default: Option<rusternetes_common::resources::PriorityClass> = None;
+    for pc in list {
+        if pc.global_default == Some(true) && default.as_ref().is_none_or(|d| d.value > pc.value) {
+            default = Some(pc);
+        }
+    }
+    Ok(default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

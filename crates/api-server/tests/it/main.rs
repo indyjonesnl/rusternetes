@@ -198,6 +198,7 @@ mod podtemplate_update_validation_test;
 mod policy_decode_when_absent_test;
 mod priorityclass_handler_test;
 mod priorityclass_http_crud_test;
+mod priorityclass_store_test;
 mod projected_defaultmode_test;
 mod proto_encoder_wire_format_test;
 mod protobuf_roundtrip_fuzz;
