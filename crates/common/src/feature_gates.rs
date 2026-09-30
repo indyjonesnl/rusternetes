@@ -96,6 +96,21 @@ pub enum Feature {
     /// Beta but off-by-default in v1.35 (`kube_features.go:1515-1518`), so the
     /// default is `false`.
     MaxUnavailableStatefulSet,
+
+    /// Upstream: `pkg/features/kube_features.go::DRADeviceTaints` (1.33 Alpha, off in v1.35).
+    DRADeviceTaints,
+
+    /// Upstream: `pkg/features/kube_features.go::DRAPartitionableDevices` (1.33 Alpha, off in v1.35).
+    DRAPartitionableDevices,
+
+    /// Upstream: `pkg/features/kube_features.go::DRADeviceBindingConditions` (1.34 Alpha, off in v1.35).
+    DRADeviceBindingConditions,
+
+    /// Upstream: `pkg/features/kube_features.go::DRAConsumableCapacity` (1.34 Alpha, off in v1.35).
+    DRAConsumableCapacity,
+
+    /// Upstream: `pkg/features/kube_features.go::DRAResourceClaimDeviceStatus` (1.33 Beta, on in v1.35).
+    DRAResourceClaimDeviceStatus,
 }
 
 impl Feature {
@@ -110,6 +125,11 @@ impl Feature {
             Feature::SELinuxMount => 5,
             Feature::SELinuxChangePolicy => 6,
             Feature::MaxUnavailableStatefulSet => 7,
+            Feature::DRADeviceTaints => 8,
+            Feature::DRAPartitionableDevices => 9,
+            Feature::DRADeviceBindingConditions => 10,
+            Feature::DRAConsumableCapacity => 11,
+            Feature::DRAResourceClaimDeviceStatus => 12,
         }
     }
 
@@ -132,6 +152,16 @@ impl Feature {
             Feature::SELinuxChangePolicy => true,
             // Beta but off-by-default in v1.35.
             Feature::MaxUnavailableStatefulSet => false,
+            // 1.33 Alpha, off (kube_features.go:1227-1266).
+            Feature::DRADeviceTaints => false,
+            // 1.33 Alpha, off (kube_features.go:1227-1266).
+            Feature::DRAPartitionableDevices => false,
+            // 1.34 Alpha, off (kube_features.go:1227-1266).
+            Feature::DRADeviceBindingConditions => false,
+            // 1.34 Alpha, off (kube_features.go:1227-1266).
+            Feature::DRAConsumableCapacity => false,
+            // 1.33 Beta, on (kube_features.go:1227-1266).
+            Feature::DRAResourceClaimDeviceStatus => true,
         }
     }
 }
@@ -156,6 +186,11 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::SELinuxMount,
     Feature::SELinuxChangePolicy,
     Feature::MaxUnavailableStatefulSet,
+    Feature::DRADeviceTaints,
+    Feature::DRAPartitionableDevices,
+    Feature::DRADeviceBindingConditions,
+    Feature::DRAConsumableCapacity,
+    Feature::DRAResourceClaimDeviceStatus,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -178,6 +213,11 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::SELinuxMount.default_enabled()),
     AtomicBool::new(Feature::SELinuxChangePolicy.default_enabled()),
     AtomicBool::new(Feature::MaxUnavailableStatefulSet.default_enabled()),
+    AtomicBool::new(Feature::DRADeviceTaints.default_enabled()),
+    AtomicBool::new(Feature::DRAPartitionableDevices.default_enabled()),
+    AtomicBool::new(Feature::DRADeviceBindingConditions.default_enabled()),
+    AtomicBool::new(Feature::DRAConsumableCapacity.default_enabled()),
+    AtomicBool::new(Feature::DRAResourceClaimDeviceStatus.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.

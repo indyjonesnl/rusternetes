@@ -14,6 +14,7 @@
 //! (`= ValidateDNS1123Label`, `:73`), `validateDeviceTaint` (`:1391`) and
 //! `validateDeviceCounterConsumption` (`:871`).
 
+use rusternetes_common::feature_gates::{self, Feature};
 use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
@@ -110,7 +111,13 @@ fn cases() -> Vec<(&'static str, Value, &'static str)> {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn every_bad_resource_slice_answers_422_with_a_field_path() {
+    // Taints and counters are behind alpha gates, which are off by default in
+    // 1.35: `dropDisabledFields` (resourceslice/strategy.go) clears them
+    // before validation. These cases validate those fields, so turn them on.
+    let _taints = feature_gates::with_feature(Feature::DRADeviceTaints, true);
+    let _counters = feature_gates::with_feature(Feature::DRAPartitionableDevices, true);
     let api = TestApiServer::new();
 
     for (i, (label, slice_spec, expected)) in cases().into_iter().enumerate() {
