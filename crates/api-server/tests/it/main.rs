@@ -310,3 +310,5 @@ mod webhook_config_watch_cabundle_test;
 mod webhook_match_conditions_test;
 mod webhook_timeout_test;
 mod workload_template_decodes_when_absent_test;
+
+mod networking_store_test;
