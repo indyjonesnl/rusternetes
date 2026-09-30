@@ -9,10 +9,11 @@
 //! backend does not). [`Store::guaranteed_update`] builds the upstream loop out
 //! of those two calls.
 //!
-//! Not yet ported, and added with the first resource that needs them:
-//! `BeginCreate`/`AfterCreate`/`BeginUpdate`/`AfterUpdate`/`AfterDelete`/
-//! `Decorator` hooks, TTLs, `ResetFieldsStrategy`, managed-fields timestamp
-//! handling, and the `RetryGenerateName` retry loop.
+//! The `BeginCreate`, `BeginUpdate`, `AfterDelete` and `Decorator` hooks are
+//! ported; `AfterCreate` and `AfterUpdate` are not, as no in-tree registry
+//! sets them. Not yet ported, and added with the first resource that needs
+//! them: TTLs, `ResetFieldsStrategy`, managed-fields timestamp handling, and
+//! the `RetryGenerateName` retry loop.
 
 use std::sync::Arc;
 
@@ -75,6 +76,52 @@ pub type ShouldDeleteDuringUpdateFn<T> = fn(&T, &T) -> bool;
 /// Store decodes from storage. See [`Store::decode_defaulter`].
 pub type DecodeDefaulterFn<T> = fn(&mut T);
 
+/// `FinishFunc` (store.go:59-60): what a Begin hook returns to complete its
+/// operation, told whether the operation succeeded.
+#[async_trait]
+pub trait Finish: Send {
+    async fn finish(self: Box<Self>, success: bool);
+}
+
+/// `BeginCreateFunc` (store.go:65-66), the `Store.BeginCreate` hook
+/// (store.go:174-179): runs before the create strategy, and returns the
+/// commit/revert function called once the write succeeded or failed. If it
+/// fails, the create fails and nothing is called.
+#[async_trait]
+pub trait BeginCreate<T>: Send + Sync {
+    async fn begin_create(
+        &self,
+        ctx: &RequestContext,
+        obj: &mut T,
+        options: &CreateOptions,
+    ) -> Result<Box<dyn Finish>>;
+}
+
+/// `BeginUpdateFunc` (store.go:71-72), the `Store.BeginUpdate` hook
+/// (store.go:186-191): runs inside each update attempt, before the update
+/// strategy, with the stored object.
+#[async_trait]
+pub trait BeginUpdate<T>: Send + Sync {
+    async fn begin_update(
+        &self,
+        ctx: &RequestContext,
+        obj: &mut T,
+        old: &T,
+        options: &UpdateOptions,
+    ) -> Result<Box<dyn Finish>>;
+}
+
+/// `AfterDeleteFunc` (store.go:62-63), the `Store.AfterDelete` hook
+/// (store.go:198-200): runs once an object is removed from storage.
+#[async_trait]
+pub trait AfterDelete<T>: Send + Sync {
+    async fn after_delete(&self, obj: &T, options: &DeleteOptions);
+}
+
+/// `Store.Decorator` (store.go:164-170): an exit hook on every object the
+/// Store returns, for values that are not stored.
+pub type DecoratorFn<T> = Arc<dyn Fn(&mut T) + Send + Sync>;
+
 /// `genericregistry.Store`, reduced to the fields a resource sets today.
 pub struct Store<T: Object, S: Storage> {
     pub storage: Arc<S>,
@@ -102,6 +149,14 @@ pub struct Store<T: Object, S: Storage> {
     /// existed, or written around the API, comes back defaulted — which the
     /// strategies' update validation relies on when it compares old and new.
     pub decode_defaulter: Option<DecodeDefaulterFn<T>>,
+    /// `Decorator`.
+    pub decorator: Option<DecoratorFn<T>>,
+    /// `BeginCreate`.
+    pub begin_create: Option<Arc<dyn BeginCreate<T>>>,
+    /// `BeginUpdate`.
+    pub begin_update: Option<Arc<dyn BeginUpdate<T>>>,
+    /// `AfterDelete`.
+    pub after_delete: Option<Arc<dyn AfterDelete<T>>>,
 }
 
 impl<T: Object, S: Storage> Clone for Store<T, S> {
@@ -117,6 +172,10 @@ impl<T: Object, S: Storage> Clone for Store<T, S> {
             return_deleted_object: self.return_deleted_object,
             should_delete_during_update: self.should_delete_during_update,
             decode_defaulter: self.decode_defaulter,
+            decorator: self.decorator.clone(),
+            begin_create: self.begin_create.clone(),
+            begin_update: self.begin_update.clone(),
+            after_delete: self.after_delete.clone(),
         }
     }
 }
@@ -177,6 +236,10 @@ impl<T: Object, S: Storage> Store<T, S> {
             return_deleted_object: false,
             should_delete_during_update: None,
             decode_defaulter: None,
+            decorator: None,
+            begin_create: None,
+            begin_update: None,
+            after_delete: None,
         }
     }
 
@@ -185,6 +248,14 @@ impl<T: Object, S: Storage> Store<T, S> {
     pub fn with_decode_defaulter(mut self, defaulter: DecodeDefaulterFn<T>) -> Self {
         self.decode_defaulter = Some(defaulter);
         self
+    }
+
+    /// An object as the Store returns it: run through the `Decorator`.
+    fn decorated(&self, mut obj: T) -> T {
+        if let Some(decorate) = &self.decorator {
+            decorate(&mut obj);
+        }
+        obj
     }
 
     /// An object as the storage codec decodes it.
@@ -492,7 +563,7 @@ impl<T: Object, S: Storage> Store<T, S> {
         self.storage
             .get(&key)
             .await
-            .map(|obj| self.decoded(obj))
+            .map(|obj| self.decorated(self.decoded(obj)))
             .map_err(|e| self.interpret_get_error(e, name))
     }
 
@@ -521,6 +592,31 @@ impl<T: Object, S: Storage> Store<T, S> {
             }
         }
 
+        let Some(hook) = &self.begin_create else {
+            return self
+                .create_prepared(ctx, obj, create_validation, options)
+                .await
+                .map(|out| self.decorated(out));
+        };
+        let finish = hook.begin_create(ctx, &mut obj, options).await?;
+        let result = self
+            .create_prepared(ctx, obj, create_validation, options)
+            .await;
+        // The operation's outcome is known: commit or revert (store.go:489-499,
+        // 545-549).
+        finish.finish(result.is_ok()).await;
+        result.map(|out| self.decorated(out))
+    }
+
+    /// The part of `Store.create` between the `BeginCreate` hook and the
+    /// `FinishFunc` (store.go:501-543).
+    async fn create_prepared(
+        &self,
+        ctx: &RequestContext,
+        mut obj: T,
+        create_validation: Option<&dyn ValidateObject<T>>,
+        options: &CreateOptions,
+    ) -> Result<T> {
         before_create(self.create_strategy.as_ref(), ctx, &mut obj)?;
 
         // At this point the object is fully formed: run the validators the
@@ -593,6 +689,7 @@ impl<T: Object, S: Storage> Store<T, S> {
             ctx,
             name,
             obj_info,
+            options,
             allow_create,
             create_validation,
             update_validation,
@@ -616,7 +713,7 @@ impl<T: Object, S: Storage> Store<T, S> {
         } = attempt;
 
         match outcome {
-            Ok(out) => Ok((out, creating)),
+            Ok(out) => Ok((self.decorated(out), creating)),
             Err(Abort::EmptiedFinalizers(obj)) => {
                 // `newDeleteOptionsFromUpdateOptions` (store.go:836-844).
                 let delete_options = DeleteOptions {
@@ -669,10 +766,16 @@ impl<T: Object, S: Storage> Store<T, S> {
         {
             // Clients expect the updated object from a successful PUT, not
             // the Status `finalizeDelete` would build.
-            Ok(_) => Ok(obj),
+            Ok(deleted) => {
+                self.finalize_delete(deleted, true, options).await;
+                Ok(obj)
+            }
             // Deletion is racy: several updates may each remove the last
             // finalizer.
-            Err(Error::NotFound(_)) => Ok(obj),
+            Err(Error::NotFound(_)) => {
+                self.finalize_delete(obj.clone(), true, options).await;
+                Ok(obj)
+            }
             Err(e) => Err(self.interpret_delete_error(e, name)),
         }
     }
@@ -709,7 +812,7 @@ impl<T: Object, S: Storage> Store<T, S> {
         // Finalizers cannot be changed through DeleteOptions once a deletion
         // is pending.
         if decision.graceful_pending {
-            return Ok((self.finalize_delete(obj), false));
+            return Ok((self.finalize_delete(obj, false, &options).await, false));
         }
 
         let pending_finalizers = obj
@@ -786,11 +889,12 @@ impl<T: Object, S: Storage> Store<T, S> {
             )
             .await
         {
-            Ok(deleted) => Ok((self.finalize_delete(deleted), true)),
+            Ok(deleted) => Ok((self.finalize_delete(deleted, true, &options).await, true)),
             Err(Error::NotFound(_)) if ignore_not_found && last_existing.is_some() => {
                 // Another component won a graceless-delete race; the last
                 // state seen is the best approximation of what was deleted.
-                Ok((self.finalize_delete(last_existing.unwrap()), true))
+                let last = last_existing.unwrap();
+                Ok((self.finalize_delete(last, true, &options).await, true))
             }
             Err(e) => Err(self.interpret_delete_error(e, name)),
         }
@@ -859,9 +963,9 @@ impl<T: Object, S: Storage> Store<T, S> {
                     last_existing,
                 })
             }
-            Err(Abort::AlreadyDeleting) => {
-                Ok(GracefulOutcome::Finalized(self.finalize_delete(input)))
-            }
+            Err(Abort::AlreadyDeleting) => Ok(GracefulOutcome::Finalized(
+                self.finalize_delete(input, true, options).await,
+            )),
             Err(Abort::Api(err)) => Err(self.interpret_update_error(err, name)),
             Err(Abort::EmptiedFinalizers(_)) => {
                 unreachable!("the delete callback never empties finalizers")
@@ -946,10 +1050,21 @@ impl<T: Object, S: Storage> Store<T, S> {
         Ok(items)
     }
 
-    /// `finalizeDelete` (store.go:1386-1411).
-    fn finalize_delete(&self, obj: T) -> Deleted<T> {
+    /// `finalizeDelete` (store.go:1384-1411): run the `AfterDelete` hook when
+    /// `run_hooks` is set, and build the response.
+    async fn finalize_delete(
+        &self,
+        obj: T,
+        run_hooks: bool,
+        options: &DeleteOptions,
+    ) -> Deleted<T> {
+        if run_hooks {
+            if let Some(hook) = &self.after_delete {
+                hook.after_delete(&obj, options).await;
+            }
+        }
         if self.return_deleted_object {
-            return Deleted::Object(obj);
+            return Deleted::Object(self.decorated(obj));
         }
         let meta = obj.metadata();
         Deleted::Status(StatusDetails {
@@ -970,6 +1085,7 @@ struct UpdateAttempt<'a, T: Object, S: Storage> {
     ctx: &'a RequestContext,
     name: &'a str,
     obj_info: &'a dyn UpdatedObjectInfo<T>,
+    options: &'a UpdateOptions,
     allow_create: bool,
     create_validation: Option<&'a dyn ValidateObject<T>>,
     update_validation: Option<&'a dyn ValidateObjectUpdate<T>>,
@@ -999,13 +1115,22 @@ impl<T: Object, S: Storage> TryUpdate<T> for UpdateAttempt<'_, T, S> {
         let Some(existing) = existing else {
             // Create on update.
             fill_object_meta_system_fields(obj.metadata_mut());
-            self.creating = true;
-            self.creating_obj = Some(obj.clone());
-            before_create(self.store.create_strategy.as_ref(), self.ctx, &mut obj)?;
-            if let Some(v) = self.create_validation {
-                v.validate(self.ctx, &obj).await?;
+            // `newCreateOptionsFromUpdateOptions` (store.go:826-834).
+            let create_options = CreateOptions {
+                dry_run: self.options.dry_run,
+            };
+            let finish = match &self.store.begin_create {
+                Some(hook) => Some(
+                    hook.begin_create(self.ctx, &mut obj, &create_options)
+                        .await?,
+                ),
+                None => None,
+            };
+            let result = self.create_on_update(obj).await;
+            if let Some(finish) = finish {
+                finish.finish(result.is_ok()).await;
             }
-            return Ok(obj);
+            return result;
         };
 
         self.creating = false;
@@ -1024,6 +1149,37 @@ impl<T: Object, S: Storage> TryUpdate<T> for UpdateAttempt<'_, T, S> {
             ));
         }
 
+        let Some(hook) = &self.store.begin_update else {
+            return self.update_existing(obj, existing).await;
+        };
+        let finish = hook
+            .begin_update(self.ctx, &mut obj, existing, self.options)
+            .await?;
+        let result = self.update_existing(obj, existing).await;
+        // The attempt's outcome is known: commit or revert
+        // (store.go:740-750, 783-787). Upstream commits here, before the
+        // write itself.
+        finish.finish(result.is_ok()).await;
+        result
+    }
+}
+
+impl<T: Object, S: Storage> UpdateAttempt<'_, T, S> {
+    /// The create-on-update part of the attempt between `BeginCreate` and its
+    /// `FinishFunc` (store.go:690-705).
+    async fn create_on_update(&mut self, mut obj: T) -> std::result::Result<T, Abort<T>> {
+        self.creating = true;
+        self.creating_obj = Some(obj.clone());
+        before_create(self.store.create_strategy.as_ref(), self.ctx, &mut obj)?;
+        if let Some(v) = self.create_validation {
+            v.validate(self.ctx, &obj).await?;
+        }
+        Ok(obj)
+    }
+
+    /// The update part of the attempt between `BeginUpdate` and its
+    /// `FinishFunc` (store.go:752-781).
+    async fn update_existing(&self, mut obj: T, existing: &T) -> std::result::Result<T, Abort<T>> {
         before_update(
             self.store.update_strategy.as_ref(),
             self.ctx,

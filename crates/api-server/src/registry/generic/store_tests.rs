@@ -854,3 +854,323 @@ fn key_func_requires_a_namespace_and_a_valid_name() {
     assert_eq!(err.to_string(), "Bad request: Name parameter required.");
     assert!(registry.key_func(&ctx(), "..").is_err());
 }
+
+// -- Hooks ------------------------------------------------------------------
+
+/// The `milestones` / `mile` recorder of the upstream hook tests.
+#[derive(Clone, Default)]
+struct Milestones(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl Milestones {
+    fn mile(&self, s: impl Into<String>) {
+        self.0.lock().unwrap().push(s.into());
+    }
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+struct RecordFinish(Milestones, &'static str);
+#[async_trait]
+impl Finish for RecordFinish {
+    async fn finish(self: Box<Self>, success: bool) {
+        self.0.mile(format!("{}({success})", self.1));
+    }
+}
+
+/// Records every hook, annotates the object in the Begin hooks, and fails
+/// them when `fail_begin` is set.
+#[derive(Clone, Default)]
+struct Hooks {
+    milestones: Milestones,
+    fail_begin: bool,
+}
+
+fn set_ann(obj: &mut ConfigMap, key: &str) {
+    obj.metadata
+        .annotations
+        .get_or_insert_with(Default::default)
+        .insert(key.to_string(), "true".to_string());
+}
+
+#[async_trait]
+impl BeginCreate<ConfigMap> for Hooks {
+    async fn begin_create(
+        &self,
+        _: &RequestContext,
+        obj: &mut ConfigMap,
+        _: &CreateOptions,
+    ) -> Result<Box<dyn Finish>> {
+        self.milestones.mile("BeginCreate");
+        set_ann(obj, "BeginCreateWasCalled");
+        if self.fail_begin {
+            return Err(Error::Internal("begin".to_string()));
+        }
+        Ok(Box::new(RecordFinish(
+            self.milestones.clone(),
+            "FinishCreate",
+        )))
+    }
+}
+
+#[async_trait]
+impl BeginUpdate<ConfigMap> for Hooks {
+    async fn begin_update(
+        &self,
+        _: &RequestContext,
+        obj: &mut ConfigMap,
+        _: &ConfigMap,
+        _: &UpdateOptions,
+    ) -> Result<Box<dyn Finish>> {
+        self.milestones.mile("BeginUpdate");
+        set_ann(obj, "BeginUpdateWasCalled");
+        if self.fail_begin {
+            return Err(Error::Internal("begin".to_string()));
+        }
+        Ok(Box::new(RecordFinish(
+            self.milestones.clone(),
+            "FinishUpdate",
+        )))
+    }
+}
+
+#[async_trait]
+impl AfterDelete<ConfigMap> for Hooks {
+    async fn after_delete(&self, obj: &ConfigMap, _: &DeleteOptions) {
+        self.milestones
+            .mile(format!("AfterDelete({})", obj.metadata.name));
+    }
+}
+
+fn hooked(strategy: TestStrategy, hooks: &Hooks) -> Store<ConfigMap, MemoryStorage> {
+    let mut registry = store(strategy);
+    let decorated = hooks.milestones.clone();
+    registry.decorator = Some(Arc::new(move |obj: &mut ConfigMap| {
+        decorated.mile("Decorator");
+        set_ann(obj, "DecoratorWasCalled");
+    }));
+    registry.begin_create = Some(Arc::new(hooks.clone()));
+    registry.begin_update = Some(Arc::new(hooks.clone()));
+    registry.after_delete = Some(Arc::new(hooks.clone()));
+    registry
+}
+
+fn annotated(obj: &ConfigMap, key: &str) -> bool {
+    obj.metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(key))
+}
+
+/// `TestStoreCreateHooks` (store_test.go:595-740): BeginCreate may mutate
+/// the object, its FinishFunc runs before the Decorator on success, and runs
+/// with `false` when the create fails after it. A failing BeginCreate stops
+/// the create with no FinishFunc. (Upstream forces the failure with a TTL
+/// error; create admission fails at the same point.)
+#[tokio::test]
+async fn create_hooks_run_in_order() {
+    // success ordering + mutations
+    let hooks = Hooks::default();
+    let registry = hooked(TestStrategy::default(), &hooks);
+    let out = create(&registry, cm("foo")).await;
+    assert_eq!(
+        hooks.milestones.take(),
+        ["BeginCreate", "FinishCreate(true)", "Decorator"]
+    );
+    assert!(annotated(&out, "BeginCreateWasCalled"), "{out:?}");
+    assert!(annotated(&out, "DecoratorWasCalled"), "{out:?}");
+    // The Decorator's value is not stored.
+    let stored: ConfigMap = registry
+        .storage
+        .get(&registry.key_func(&ctx(), "foo").unwrap())
+        .await
+        .unwrap();
+    assert!(annotated(&stored, "BeginCreateWasCalled"));
+    assert!(!annotated(&stored, "DecoratorWasCalled"));
+
+    // fail ordering
+    let err = registry
+        .create(&ctx(), cm("bar"), Some(&Deny), &CreateOptions::default())
+        .await;
+    assert!(err.is_err());
+    assert_eq!(
+        hooks.milestones.take(),
+        ["BeginCreate", "FinishCreate(false)"]
+    );
+
+    // fail BeginCreate ordering
+    let hooks = Hooks {
+        fail_begin: true,
+        ..Default::default()
+    };
+    let registry = hooked(TestStrategy::default(), &hooks);
+    let err = registry
+        .create(&ctx(), cm("foo"), None, &CreateOptions::default())
+        .await;
+    assert!(err.is_err());
+    assert_eq!(hooks.milestones.take(), ["BeginCreate"]);
+    assert!(registry.get(&ctx(), "foo").await.is_err());
+}
+
+/// `TestStoreUpdateHooks` (store_test.go:903-1038) and the fail half of
+/// `TestStoreUpdateHooksInnerRetry` (:1180-1280): an update runs BeginUpdate
+/// and not BeginCreate, finishes before the Decorator, and finishes with
+/// `false` when the attempt fails after it.
+#[tokio::test]
+async fn update_hooks_run_in_order() {
+    let hooks = Hooks::default();
+    let registry = hooked(TestStrategy::default(), &hooks);
+    let created = create(&registry, cm("foo")).await;
+    hooks.milestones.take();
+
+    let (out, created_now) = update(&registry, with_node(created.clone(), "other"))
+        .await
+        .unwrap();
+    assert!(!created_now);
+    assert_eq!(
+        hooks.milestones.take(),
+        ["BeginUpdate", "FinishUpdate(true)", "Decorator"]
+    );
+    assert!(annotated(&out, "BeginUpdateWasCalled"), "{out:?}");
+
+    // fail ordering
+    let err = registry
+        .update(
+            &ctx(),
+            "foo",
+            &info(with_node(out.clone(), "third")),
+            None,
+            Some(&Deny),
+            false,
+            &UpdateOptions::default(),
+        )
+        .await;
+    assert!(err.is_err());
+    assert_eq!(
+        hooks.milestones.take(),
+        ["BeginUpdate", "FinishUpdate(false)"]
+    );
+
+    // fail BeginUpdate ordering
+    let hooks = Hooks {
+        fail_begin: true,
+        milestones: hooks.milestones.clone(),
+    };
+    let mut registry = registry;
+    registry.begin_update = Some(Arc::new(hooks.clone()));
+    assert!(update(&registry, with_node(out, "fourth")).await.is_err());
+    assert_eq!(hooks.milestones.take(), ["BeginUpdate"]);
+}
+
+/// `TestStoreCreateOnUpdateHooks` (store_test.go:1040-1178): a create on
+/// update runs BeginCreate, not BeginUpdate.
+#[tokio::test]
+async fn create_on_update_runs_the_create_hooks() {
+    let hooks = Hooks::default();
+    let registry = hooked(
+        TestStrategy {
+            allow_create_on_update: true,
+            ..Default::default()
+        },
+        &hooks,
+    );
+    let (out, created_now) = update(&registry, cm("foo")).await.unwrap();
+    assert!(created_now);
+    assert_eq!(
+        hooks.milestones.take(),
+        ["BeginCreate", "FinishCreate(true)", "Decorator"]
+    );
+    assert!(annotated(&out, "BeginCreateWasCalled"), "{out:?}");
+
+    let err = registry
+        .update(
+            &ctx(),
+            "bar",
+            &info(cm("bar")),
+            Some(&Deny),
+            None,
+            false,
+            &UpdateOptions::default(),
+        )
+        .await;
+    assert!(err.is_err());
+    assert_eq!(
+        hooks.milestones.take(),
+        ["BeginCreate", "FinishCreate(false)"]
+    );
+}
+
+/// `finalizeDelete` (store.go:1384-1411) runs AfterDelete once the object is
+/// gone — on DELETE and on the update that drains its last finalizer
+/// (`deleteWithoutFinalizers`, :588-613) — but not for a DELETE that finds a
+/// deletion already pending (:1154-1158). The returned deleted object is
+/// decorated.
+#[tokio::test]
+async fn after_delete_runs_when_the_object_is_removed() {
+    let hooks = Hooks::default();
+    let mut registry = hooked(TestStrategy::default(), &hooks);
+    registry.return_deleted_object = true;
+
+    create(&registry, cm("foo")).await;
+    hooks.milestones.take();
+    let (deleted, removed) = registry
+        .delete(&ctx(), "foo", None, zero_delete_options())
+        .await
+        .unwrap();
+    assert!(removed);
+    let Deleted::Object(obj) = deleted else {
+        panic!("ReturnDeletedObject returns the object");
+    };
+    assert!(annotated(&obj, "DecoratorWasCalled"));
+    assert_eq!(hooks.milestones.take(), ["AfterDelete(foo)", "Decorator"]);
+
+    // Held by a finalizer: the DELETE marks it, and no hook runs.
+    let mut held = cm("held");
+    held.metadata.finalizers = Some(vec!["example.com/hold".to_string()]);
+    create(&registry, held).await;
+    hooks.milestones.take();
+    let (_, removed) = registry
+        .delete(&ctx(), "held", None, zero_delete_options())
+        .await
+        .unwrap();
+    assert!(!removed);
+    assert!(!hooks
+        .milestones
+        .take()
+        .iter()
+        .any(|m| m.starts_with("AfterDelete")));
+
+    // A second DELETE finds the deletion pending: no hook.
+    registry
+        .delete(&ctx(), "held", None, zero_delete_options())
+        .await
+        .unwrap();
+    assert!(!hooks
+        .milestones
+        .take()
+        .iter()
+        .any(|m| m.starts_with("AfterDelete")));
+
+    // The update that drains the finalizer removes it and runs the hook.
+    let mut current = registry.get(&ctx(), "held").await.unwrap();
+    hooks.milestones.take();
+    current.metadata.finalizers = None;
+    update(&registry, current).await.unwrap();
+    assert!(hooks
+        .milestones
+        .take()
+        .contains(&"AfterDelete(held)".to_string()));
+    assert!(registry.get(&ctx(), "held").await.is_err());
+}
+
+/// `Store.Get` (store.go:847-860) decorates what it returns.
+#[tokio::test]
+async fn get_is_decorated() {
+    let hooks = Hooks::default();
+    let registry = hooked(TestStrategy::default(), &hooks);
+    create(&registry, cm("foo")).await;
+    hooks.milestones.take();
+    let out = registry.get(&ctx(), "foo").await.unwrap();
+    assert!(annotated(&out, "DecoratorWasCalled"));
+    assert_eq!(hooks.milestones.take(), ["Decorator"]);
+}
