@@ -326,6 +326,25 @@ fn terminal_phase_requires_termination(pod: &Pod) -> bool {
     restart_policy != "Always" || deadline_exceeded_terminal(pod.status.as_ref())
 }
 
+/// Set `status.allocatable` from `status.capacity`, the `Set Allocatable`
+/// step of `MachineInfo` (pkg/kubelet/nodestatus/setters.go:292-316): drop an
+/// extended resource capacity no longer lists, then copy every capacity entry.
+/// This kubelet reserves nothing (no `--system-reserved`/`--kube-reserved`),
+/// so `nodeAllocatableReservationFunc` is empty and each value copies as is.
+/// Returns whether allocatable changed.
+pub(crate) fn sync_allocatable_with_capacity(
+    status: &mut rusternetes_common::resources::NodeStatus,
+) -> bool {
+    let capacity = status.capacity.clone().unwrap_or_default();
+    let allocatable = status.allocatable.get_or_insert_with(HashMap::new);
+    let before = allocatable.clone();
+    allocatable.retain(|k, _| {
+        capacity.contains_key(k) || !rusternetes_common::quota::is_extended_resource_name(k)
+    });
+    allocatable.extend(capacity);
+    *allocatable != before
+}
+
 /// The node's advertised capacity/allocatable. Single source of truth so the
 /// NodeStatus the kubelet posts and the values used to default resourceFieldRef
 /// LIMITS never drift — both the env-var path (via
@@ -1340,10 +1359,18 @@ impl Kubelet {
             }
         }
 
+        // Allocatable follows capacity on every sync, extended resources
+        // included (nodestatus/setters.go MachineInfo, :292-316). A client
+        // that adds an extended resource to `status.capacity` relies on this
+        // to see it become schedulable.
+        let mut needs_write = node
+            .status
+            .as_mut()
+            .is_some_and(sync_allocatable_with_capacity);
+
         // Update heartbeat and ensure Ready=True.
         // Only write to storage if the heartbeat is stale (>10s old) or status changed.
         // This prevents rv churn that causes PATCH conflicts for external node updates.
-        let mut needs_write = false;
 
         // Re-ensure the kubelet endpoint port on EVERY heartbeat, not only at
         // registration. `status.daemonEndpoints.kubeletEndpoint.Port` is read by
@@ -5912,6 +5939,48 @@ mod taint_eviction_tests {
 #[cfg(test)]
 mod tests {
     use super::Kubelet;
+
+    fn resources(pairs: &[(&str, &str)]) -> Option<std::collections::HashMap<String, String>> {
+        Some(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    /// `TestMachineInfo` "extended resources not present in capacity are
+    /// removed from allocatable" (nodestatus/setters_test.go:785-812), and an
+    /// extended resource added to capacity becomes allocatable.
+    #[test]
+    fn allocatable_follows_capacity() {
+        let mut status = rusternetes_common::resources::NodeStatus {
+            capacity: resources(&[("cpu", "2"), ("pods", "110")]),
+            allocatable: resources(&[("example.com/extended", "1"), ("cpu", "1")]),
+            ..Default::default()
+        };
+        assert!(super::sync_allocatable_with_capacity(&mut status));
+        assert_eq!(
+            status.allocatable,
+            resources(&[("cpu", "2"), ("pods", "110")])
+        );
+        assert!(!super::sync_allocatable_with_capacity(&mut status));
+
+        status
+            .capacity
+            .as_mut()
+            .unwrap()
+            .insert("scheduling.k8s.io/foo".into(), "5".into());
+        assert!(super::sync_allocatable_with_capacity(&mut status));
+        assert_eq!(
+            status.allocatable,
+            resources(&[
+                ("cpu", "2"),
+                ("pods", "110"),
+                ("scheduling.k8s.io/foo", "5")
+            ])
+        );
+    }
     use rusternetes_common::resources::pod::{PodCondition, PodSpec};
     use rusternetes_common::resources::{
         Container, ContainerState, ContainerStatus, Pod, PodStatus,

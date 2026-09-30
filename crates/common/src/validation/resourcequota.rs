@@ -125,7 +125,11 @@ fn validate_resource_quota_resource_name(name: &str, fld_path: &Path) -> ErrorLi
 /// Port of upstream `ValidateResourceQuantityValue`: the quantity is a valid,
 /// non-negative quantity, and — for integer-only resources — a whole integer
 /// (`MilliValue() % 1000 == 0`).
-fn validate_resource_quantity_value(name: &str, value: &str, fld_path: &Path) -> ErrorList {
+pub(crate) fn validate_resource_quantity_value(
+    name: &str,
+    value: &str,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     match Quantity::parse(value) {
         Err(_) => {

@@ -5,7 +5,7 @@ use serde_json::json;
 fn node(spec: serde_json::Value) -> Node {
     serde_json::from_value(json!({
         "apiVersion": "v1", "kind": "Node",
-        "metadata": {"name": "n1"},
+        "metadata": {"name": "n1", "resourceVersion": "1"},
         "spec": spec
     }))
     .unwrap()

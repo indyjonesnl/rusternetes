@@ -1192,9 +1192,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/nodes/:name/status",
-            get(handlers::status::get_cluster_status)
-                .put(handlers::status::update_cluster_status)
-                .patch(handlers::status::update_cluster_status),
+            get(handlers::node::get_status)
+                .put(handlers::node::update_status)
+                .patch(handlers::node::patch_status),
         )
         .route(
             "/api/v1/nodes/:name/proxy/*path",
