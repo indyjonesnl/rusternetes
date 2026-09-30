@@ -324,8 +324,10 @@ async fn test_update_demo_create_and_stop_rc() {
         "fetched RC name must match"
     );
 
-    // DELETE the RC.
-    let status = delete_resource(&router, &rc_uri).await;
+    // DELETE the RC. `kubectl delete` cascades in the background by default
+    // (kubectl/pkg/cmd/delete/delete_flags.go:134-140); without a policy a v1
+    // RC would orphan and wait on the garbage collector's `orphan` finalizer.
+    let status = delete_resource(&router, &format!("{rc_uri}?propagationPolicy=Background")).await;
     assert!(status == 200, "DELETE must succeed; got {status}");
 
     // GET the RC — must now be 404.
@@ -380,9 +382,11 @@ async fn test_update_demo_scale_rc() {
         status, 200,
         "PATCH scale to 0 must return 200; body={scaled}"
     );
+    // `replicas` is `omitempty` (api/autoscaling/v1/types.go:145), so a
+    // zero is absent.
     assert_eq!(
-        scaled["spec"]["replicas"].as_i64(),
-        Some(0),
+        scaled["spec"]["replicas"].as_i64().unwrap_or(0),
+        0,
         "scale.spec.replicas must be 0 after scale-down; got {scaled}"
     );
 
