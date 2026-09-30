@@ -1,7 +1,7 @@
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection
 use chrono::Utc;
 use rusternetes_common::{
-    quantity::parse_resource_value,
+    quantity::{parse_resource_value, Quantity},
     quota,
     resources::{LimitRange, Pod, ResourceQuota, ServiceAccount},
     types::ResourceRequirements,
@@ -564,66 +564,100 @@ pub fn apply_limit_range_with(
     Ok(true)
 }
 
-/// Apply LimitRange `type: PersistentVolumeClaim` constraints to a PVC.
-///
-/// Validates the PVC's `spec.resources.requests.storage` against the
-/// `min`/`max` of every `type: PersistentVolumeClaim` item in the namespace's
-/// LimitRanges. Returns `Ok(false)` when the request is out of range.
-///
-/// Upstream: `PersistentVolumeClaimValidateLimitFunc` in
-/// `plugin/pkg/admission/limitranger/admission.go`.
-pub async fn apply_limit_range_to_pvc<S: Storage>(
-    storage: &Arc<S>,
-    namespace: &str,
-    pvc: &mut rusternetes_common::resources::PersistentVolumeClaim,
-) -> anyhow::Result<bool> {
-    let limit_prefix = format!("/registry/limitranges/{}/", namespace);
-    let limit_ranges: Vec<LimitRange> = storage.list(&limit_prefix).await?;
-    if limit_ranges.is_empty() {
-        return Ok(true);
-    }
+/// `requestLimitEnforcedValues` (limitranger/admission.go:295-306): compare in
+/// milli-units.
+fn exceeds(observed: &Quantity, enforced: &Quantity) -> std::cmp::Ordering {
+    observed.milli_value().cmp(&enforced.milli_value())
+}
 
-    let requests = match &pvc.spec.resources.requests {
-        Some(r) => r,
-        None => return Ok(true),
+/// Port of `PersistentVolumeClaimValidateLimitFunc`
+/// (plugin/pkg/admission/limitranger/admission.go:451-473): every
+/// `type: PersistentVolumeClaim` item's `min` (`minConstraint`, :309-324, with
+/// no limits) and `max` (`maxRequestConstraint`, :328-339) against the
+/// claim's requests. Returns the errors `utilerrors.NewAggregate` would
+/// aggregate. Keys are walked sorted where Go's map order is random.
+pub fn persistent_volume_claim_validate_limit(
+    limit_range: &LimitRange,
+    pvc: &rusternetes_common::resources::PersistentVolumeClaim,
+) -> Vec<String> {
+    let empty = HashMap::new();
+    let requests = pvc.spec.resources.requests.as_ref().unwrap_or(&empty);
+    // Strategy validation has already rejected an unparseable quantity.
+    let request = |name: &str| requests.get(name).and_then(|v| Quantity::parse(v).ok());
+    let sorted = |m: &Option<HashMap<String, String>>| {
+        let mut entries: Vec<(String, String)> = m
+            .iter()
+            .flatten()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        entries.sort();
+        entries
     };
-    let storage_req = match requests.get("storage") {
-        Some(s) => s,
-        None => return Ok(true),
-    };
-    let requested = parse_memory_to_bytes(storage_req)?;
-
-    for limit_range in &limit_ranges {
-        for limit_item in &limit_range.spec.limits {
-            if limit_item.item_type != "PersistentVolumeClaim" {
+    let mut errs = Vec::new();
+    for limit in &limit_range.spec.limits {
+        let limit_type = limit.item_type.as_str();
+        if limit_type != "PersistentVolumeClaim" {
+            continue;
+        }
+        for (k, v) in sorted(&limit.min) {
+            let Ok(enforced) = Quantity::parse(&v) else {
                 continue;
+            };
+            match request(&k) {
+                None => errs.push(format!(
+                    "minimum {k} usage per {limit_type} is {enforced}.  No request is specified"
+                )),
+                Some(req) if exceeds(&req, &enforced).is_lt() => errs.push(format!(
+                    "minimum {k} usage per {limit_type} is {enforced}, but request is {req}"
+                )),
+                _ => {}
             }
-            if let Some(min) = &limit_item.min {
-                if let Some(min_storage) = min.get("storage") {
-                    if requested < parse_memory_to_bytes(min_storage)? {
-                        warn!(
-                            "PVC {} storage request {} below LimitRange minimum {}",
-                            pvc.metadata.name, storage_req, min_storage
-                        );
-                        return Ok(false);
-                    }
-                }
-            }
-            if let Some(max) = &limit_item.max {
-                if let Some(max_storage) = max.get("storage") {
-                    if requested > parse_memory_to_bytes(max_storage)? {
-                        warn!(
-                            "PVC {} storage request {} exceeds LimitRange maximum {}",
-                            pvc.metadata.name, storage_req, max_storage
-                        );
-                        return Ok(false);
-                    }
-                }
+        }
+        for (k, v) in sorted(&limit.max) {
+            let Ok(enforced) = Quantity::parse(&v) else {
+                continue;
+            };
+            match request(&k) {
+                None => errs.push(format!(
+                    "maximum {k} usage per {limit_type} is {enforced}.  No request is specified"
+                )),
+                Some(req) if exceeds(&req, &enforced).is_gt() => errs.push(format!(
+                    "maximum {k} usage per {limit_type} is {enforced}, but request is {req}"
+                )),
+                _ => {}
             }
         }
     }
+    errs
+}
 
-    Ok(true)
+/// `utilerrors.NewAggregate(errs).Error()`
+/// (apimachinery/pkg/util/errors/errors.go): one error alone, several in
+/// brackets.
+fn aggregate(errs: &[String]) -> String {
+    match errs {
+        [one] => one.clone(),
+        many => format!("[{}]", many.join(", ")),
+    }
+}
+
+/// `LimitRanger.Validate` for a PersistentVolumeClaim
+/// (limitranger/admission.go:116-156): each LimitRange in the namespace, the
+/// first to fail rejecting the claim. Returns that failure's message.
+pub async fn limit_ranger_validate_pvc<S: Storage>(
+    storage: &Arc<S>,
+    namespace: &str,
+    pvc: &rusternetes_common::resources::PersistentVolumeClaim,
+) -> anyhow::Result<Option<String>> {
+    let limit_prefix = format!("/registry/limitranges/{}/", namespace);
+    let limit_ranges: Vec<LimitRange> = storage.list(&limit_prefix).await?;
+    for limit_range in &limit_ranges {
+        let errs = persistent_volume_claim_validate_limit(limit_range, pvc);
+        if !errs.is_empty() {
+            return Ok(Some(aggregate(&errs)));
+        }
+    }
+    Ok(None)
 }
 
 fn validate_min_resources(
@@ -795,57 +829,58 @@ fn parse_memory_to_bytes(memory: &str) -> anyhow::Result<i64> {
     Ok(parse_resource_value(memory, "memory")?)
 }
 
-/// DefaultStorageClass admission controller - sets default storage class for PVCs
-/// This is a built-in admission controller that:
-/// 1. If a PVC doesn't specify storageClassName, sets it to the default StorageClass
-/// 2. Finds the default StorageClass by checking for the annotation:
-///    storageclass.kubernetes.io/is-default-class: "true"
+/// `DefaultStorageClass` admission (plugin/pkg/admission/storage/storageclass/
+/// setdefault/admission.go, `Admit`): a claim that asks for no class
+/// (`helper.PersistentVolumeClaimHasClass`: neither `storageClassName` nor the
+/// beta annotation) gets the default class, if there is one.
 pub async fn set_default_storage_class<S: Storage>(
     storage: &Arc<S>,
     pvc: &mut rusternetes_common::resources::PersistentVolumeClaim,
 ) -> anyhow::Result<()> {
-    // Check if storageClassName is already set
-    if pvc.spec.storage_class_name.is_some() {
-        info!(
-            "PVC {}/{} already has storageClassName set",
-            pvc.metadata.namespace.as_deref().unwrap_or("default"),
-            pvc.metadata.name
-        );
+    let has_beta_annotation = pvc
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key("volume.beta.kubernetes.io/storage-class"));
+    if pvc.spec.storage_class_name.is_some() || has_beta_annotation {
         return Ok(());
     }
-
-    // Find default storage class
-    let sc_prefix = "/registry/storageclasses/";
     let storage_classes: Vec<rusternetes_common::resources::StorageClass> =
-        storage.list(sc_prefix).await?;
-
-    // Look for the default storage class (marked with annotation)
-    for sc in storage_classes {
-        if let Some(annotations) = &sc.metadata.annotations {
-            if annotations.get("storageclass.kubernetes.io/is-default-class")
-                == Some(&"true".to_string())
-                || annotations.get("storageclass.beta.kubernetes.io/is-default-class")
-                    == Some(&"true".to_string())
-            {
-                info!(
-                    "Setting default storage class '{}' for PVC {}/{}",
-                    sc.metadata.name,
-                    pvc.metadata.namespace.as_deref().unwrap_or("default"),
-                    pvc.metadata.name
-                );
-                pvc.spec.storage_class_name = Some(sc.metadata.name.clone());
-                return Ok(());
-            }
-        }
+        storage.list("/registry/storageclasses/").await?;
+    if let Some(default) = get_default_class(storage_classes) {
+        info!(
+            "Setting default storage class '{}' for PVC {}/{}",
+            default.metadata.name,
+            pvc.metadata.namespace.as_deref().unwrap_or_default(),
+            pvc.metadata.name
+        );
+        pvc.spec.storage_class_name = Some(default.metadata.name);
     }
-
-    info!(
-        "No default storage class found for PVC {}/{}",
-        pvc.metadata.namespace.as_deref().unwrap_or("default"),
-        pvc.metadata.name
-    );
-
     Ok(())
+}
+
+/// `GetDefaultClass` (pkg/volume/util/storageclass.go:40-71): of the classes
+/// annotated default (`IsDefaultAnnotation`, :76-85), the newest, then the
+/// first by name.
+fn get_default_class(
+    classes: Vec<rusternetes_common::resources::StorageClass>,
+) -> Option<rusternetes_common::resources::StorageClass> {
+    let is_default = |sc: &rusternetes_common::resources::StorageClass| {
+        sc.metadata.annotations.as_ref().is_some_and(|a| {
+            a.get("storageclass.kubernetes.io/is-default-class")
+                .is_some_and(|v| v == "true")
+                || a.get("storageclass.beta.kubernetes.io/is-default-class")
+                    .is_some_and(|v| v == "true")
+        })
+    };
+    let mut defaults: Vec<_> = classes.into_iter().filter(is_default).collect();
+    defaults.sort_by(|a, b| {
+        b.metadata
+            .creation_timestamp
+            .cmp(&a.metadata.creation_timestamp)
+            .then_with(|| a.metadata.name.cmp(&b.metadata.name))
+    });
+    defaults.into_iter().next()
 }
 
 /// ServiceAccount admission controller - injects service account token volumes into pods

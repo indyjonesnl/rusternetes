@@ -410,7 +410,7 @@ async fn test_default_storage_class_beta_annotation() {
 // controller. These mirror test/e2e/apimachinery/limit_range.go (release-1.35).
 // ===========================================================================
 
-use rusternetes_api_server::admission::{apply_limit_range_to_pvc, apply_limit_range_with};
+use rusternetes_api_server::admission::{apply_limit_range_with, limit_ranger_validate_pvc};
 use rusternetes_common::resources::volume::ResourceRequirements as PvcResourceRequirements;
 use rusternetes_common::types::ResourceRequirements as PodResourceRequirements;
 
@@ -572,7 +572,8 @@ async fn limitrange_ratio_rejects_high_ratio_pods() {
 }
 
 /// 4. PVC storage min/max: a `type: PersistentVolumeClaim` item bounds the
-/// PVC's `resources.requests.storage`.
+/// PVC's `resources.requests.storage`, with upstream's `minConstraint` /
+/// `maxRequestConstraint` messages (limitranger/admission.go:309-339).
 #[tokio::test]
 async fn limitrange_pvc_storage_min_max_enforced() {
     let storage = Arc::new(MemoryStorage::new());
@@ -598,29 +599,35 @@ async fn limitrange_pvc_storage_min_max_enforced() {
     make_pvc(&storage, "too-big", "100Gi").await;
 
     let small_key = build_key("persistentvolumeclaims", Some(LR_NS), "too-small");
-    let mut too_small: PersistentVolumeClaim = storage.get(&small_key).await.unwrap();
-    assert!(
-        !apply_limit_range_to_pvc(&storage, LR_NS, &mut too_small)
+    let too_small: PersistentVolumeClaim = storage.get(&small_key).await.unwrap();
+    assert_eq!(
+        limit_ranger_validate_pvc(&storage, LR_NS, &too_small)
             .await
-            .expect("apply"),
+            .expect("validate")
+            .as_deref(),
+        Some("minimum storage usage per PersistentVolumeClaim is 1Gi, but request is 500Mi"),
         "500Mi below min 1Gi must be rejected",
     );
 
     let ok_key = build_key("persistentvolumeclaims", Some(LR_NS), "ok");
-    let mut ok: PersistentVolumeClaim = storage.get(&ok_key).await.unwrap();
-    assert!(
-        apply_limit_range_to_pvc(&storage, LR_NS, &mut ok)
+    let ok: PersistentVolumeClaim = storage.get(&ok_key).await.unwrap();
+    assert_eq!(
+        limit_ranger_validate_pvc(&storage, LR_NS, &ok)
             .await
-            .expect("apply"),
+            .expect("validate")
+            .as_deref(),
+        None,
         "5Gi within [1Gi,10Gi] must be admitted",
     );
 
     let big_key = build_key("persistentvolumeclaims", Some(LR_NS), "too-big");
-    let mut too_big: PersistentVolumeClaim = storage.get(&big_key).await.unwrap();
-    assert!(
-        !apply_limit_range_to_pvc(&storage, LR_NS, &mut too_big)
+    let too_big: PersistentVolumeClaim = storage.get(&big_key).await.unwrap();
+    assert_eq!(
+        limit_ranger_validate_pvc(&storage, LR_NS, &too_big)
             .await
-            .expect("apply"),
+            .expect("validate")
+            .as_deref(),
+        Some("maximum storage usage per PersistentVolumeClaim is 10Gi, but request is 100Gi"),
         "100Gi above max 10Gi must be rejected",
     );
 }

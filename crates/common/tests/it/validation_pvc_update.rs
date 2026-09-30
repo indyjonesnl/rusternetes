@@ -14,7 +14,12 @@ fn pvc(storage: &str, mode: Option<PersistentVolumeMode>) -> PersistentVolumeCla
     requests.insert("storage".to_string(), storage.to_string());
     PersistentVolumeClaim {
         type_meta: Default::default(),
-        metadata: Default::default(),
+        // `ValidatePersistentVolumeClaim` now checks ObjectMeta too.
+        metadata: rusternetes_common::types::ObjectMeta {
+            name: "c".into(),
+            namespace: Some("default".into()),
+            ..Default::default()
+        },
         spec: PersistentVolumeClaimSpec {
             // A real update target satisfies the create-time spec rules, which
             // `validate_persistent_volume_claim_update` re-runs (upstream

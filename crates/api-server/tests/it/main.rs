@@ -168,6 +168,7 @@ mod patch_strategic_merge_semantics_test;
 mod pdb_patch_compatibility_test;
 mod persistentvolume_generic_store_test;
 mod persistentvolume_handler_test;
+mod persistentvolumeclaim_generic_store_test;
 mod persistentvolumeclaim_handler_test;
 mod plc_update_validation_test;
 mod pod_affinity_validation_test;

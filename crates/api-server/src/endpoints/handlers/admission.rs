@@ -12,12 +12,17 @@
 //! Of those plugins Rusternetes implements the two webhook plugins and
 //! ValidatingAdmissionPolicy. MutatingAdmissionPolicy is not implemented, and
 //! ResourceQuota admission is not wired to the resources on this path.
+//!
+//! The in-tree plugins ahead of them run first, in `AllOrderedPlugins` order
+//! (plugins.go:69-100), for the resources on this path that they handle:
+//! LimitRanger and DefaultStorageClass, for PersistentVolumeClaims.
 
 use async_trait::async_trait;
 use rusternetes_common::admission::{
     self, AdmissionResponse, GroupVersionKind, GroupVersionResource, Operation,
 };
 use rusternetes_common::auth::UserInfo;
+use rusternetes_common::resources::PersistentVolumeClaim;
 use rusternetes_common::{Error, Result};
 
 use super::rest::{authorize, RequestScope};
@@ -46,6 +51,14 @@ fn to_value<T: Object>(obj: &T) -> Result<serde_json::Value> {
     serde_json::to_value(obj).map_err(|e| Error::Internal(e.to_string()))
 }
 
+/// The object as another type — the typed view an in-tree plugin works on,
+/// as upstream's plugins type-assert `a.GetObject()`.
+fn recast<A: serde::Serialize, B: serde::de::DeserializeOwned>(obj: &A) -> Result<B> {
+    serde_json::to_value(obj)
+        .and_then(serde_json::from_value)
+        .map_err(|e| Error::Internal(e.to_string()))
+}
+
 impl Admission<'_> {
     /// The resource the plugins match against: `<resource>/<subresource>` on
     /// a subresource, as the webhook rules spell it (rules.go:95-115).
@@ -65,8 +78,70 @@ impl Admission<'_> {
         }
     }
 
+    /// Whether the request is for the core-group `resource` itself, not a
+    /// subresource of it.
+    fn is_core(&self, resource: &str) -> bool {
+        self.resource.group.is_empty()
+            && self.resource.resource == resource
+            && self.subresource.is_none()
+    }
+
+    /// `admission.NewForbidden` (apiserver/pkg/admission/errors.go):
+    /// `<resource> "<name>" is forbidden: <err>`.
+    fn forbidden(&self, name: &str, err: impl std::fmt::Display) -> Error {
+        Error::Forbidden(format!(
+            "{} \"{name}\" is forbidden: {err}",
+            self.resource.resource
+        ))
+    }
+
+    /// The in-tree mutating plugins. `DefaultStorageClass`
+    /// (plugin/pkg/admission/storage/storageclass/setdefault/admission.go)
+    /// handles only CREATE of a PersistentVolumeClaim. LimitRanger's `Admit`
+    /// mutates only pods.
+    async fn admit_in_tree<T: Object>(&self, op: &Operation, obj: T) -> Result<T> {
+        if *op != Operation::Create || !self.is_core("persistentvolumeclaims") {
+            return Ok(obj);
+        }
+        let mut pvc: PersistentVolumeClaim = recast(&obj)?;
+        crate::admission::set_default_storage_class(&self.state.storage, &mut pvc)
+            .await
+            .map_err(|e| self.forbidden(&pvc.metadata.name, e))?;
+        recast(&pvc)
+    }
+
+    /// The in-tree validating plugins. `LimitRanger.Validate`
+    /// (plugin/pkg/admission/limitranger/admission.go:116-156) checks a
+    /// PersistentVolumeClaim's requests on CREATE and UPDATE, except when the
+    /// old object is being deleted.
+    async fn validate_in_tree<T: Object>(
+        &self,
+        op: &Operation,
+        obj: Option<&T>,
+        old: Option<&T>,
+    ) -> Result<()> {
+        let (Some(obj), Some(namespace)) = (obj, self.namespace) else {
+            return Ok(());
+        };
+        if !matches!(op, Operation::Create | Operation::Update)
+            || !self.is_core("persistentvolumeclaims")
+            || old.is_some_and(|o| o.metadata().deletion_timestamp.is_some())
+        {
+            return Ok(());
+        }
+        let pvc: PersistentVolumeClaim = recast(obj)?;
+        match crate::admission::limit_ranger_validate_pvc(&self.state.storage, namespace, &pvc)
+            .await
+        {
+            Ok(None) => Ok(()),
+            Ok(Some(err)) => Err(self.forbidden(&pvc.metadata.name, err)),
+            Err(e) => Err(self.forbidden(&pvc.metadata.name, e)),
+        }
+    }
+
     /// The mutating plugins: `MutationInterface.Admit`.
     pub async fn admit<T: Object>(&self, op: Operation, obj: T, old: Option<&T>) -> Result<T> {
+        let obj = self.admit_in_tree(&op, obj).await?;
         let name = obj.metadata().name.clone();
         let (response, mutated) = self
             .state
@@ -104,6 +179,7 @@ impl Admission<'_> {
         obj: Option<&T>,
         old: Option<&T>,
     ) -> Result<()> {
+        self.validate_in_tree(&op, obj, old).await?;
         let name = obj
             .or(old)
             .map(|o| o.metadata().name.clone())
