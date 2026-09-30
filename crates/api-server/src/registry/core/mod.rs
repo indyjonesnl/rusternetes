@@ -6,4 +6,5 @@ pub mod endpoint;
 pub mod limitrange;
 pub mod podtemplate;
 pub mod replicationcontroller;
+pub mod resourcequota;
 pub mod secret;

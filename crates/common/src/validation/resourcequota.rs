@@ -13,6 +13,9 @@ use crate::quantity::Quantity;
 use crate::resources::policy::{ResourceQuota, ResourceQuotaSpec};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::is_qualified_name;
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
+};
 use std::collections::HashMap;
 
 /// The standard ResourceQuota scopes (upstream `IsStandardResourceQuotaScope`).
@@ -295,16 +298,51 @@ fn validate_scope_selector(spec: &ResourceQuotaSpec, fld_path: &Path) -> ErrorLi
     errs
 }
 
-/// Validate a new `ResourceQuota`. Mirrors upstream `ValidateResourceQuota`.
+/// Upstream `ValidateResourceQuota` (validation.go:8068-8075): ObjectMeta
+/// (`ValidateResourceQuotaName` is `NameIsDNSSubdomain`), the spec and the
+/// status.
 pub fn validate_resource_quota(rq: &ResourceQuota) -> ErrorList {
-    validate_resource_quota_spec(&rq.spec, &Path::new("spec"))
+    let mut errs = validate_object_meta(
+        &rq.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_resource_quota_spec(&rq.spec, &Path::new("spec")));
+    errs.extend(validate_resource_quota_status(rq, &Path::new("status")));
+    errs
 }
 
-/// Validate a ResourceQuota update — upstream `ValidateResourceQuotaUpdate`
-/// (pkg/apis/core/validation): re-validate the spec, and `spec.scopes` is
-/// immutable (compared as a set).
+/// Upstream `ValidateResourceQuotaStatus` (validation.go:8077-8094).
+fn validate_resource_quota_status(rq: &ResourceQuota, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if let Some(status) = &rq.status {
+        if let Some(hard) = &status.hard {
+            errs.extend(validate_resource_quota_resources(
+                hard,
+                &fld_path.child("hard"),
+            ));
+        }
+        if let Some(used) = &status.used {
+            errs.extend(validate_resource_quota_resources(
+                used,
+                &fld_path.child("used"),
+            ));
+        }
+    }
+    errs
+}
+
+/// Upstream `ValidateResourceQuotaUpdate` (validation.go:8125-8144): the
+/// ObjectMeta update, the spec, and `spec.scopes` is immutable (compared as a
+/// set).
 pub fn validate_resource_quota_update(new_rq: &ResourceQuota, old_rq: &ResourceQuota) -> ErrorList {
-    let mut errs = validate_resource_quota_spec(&new_rq.spec, &Path::new("spec"));
+    let mut errs =
+        validate_object_meta_update(&new_rq.metadata, &old_rq.metadata, &Path::new("metadata"));
+    errs.extend(validate_resource_quota_spec(
+        &new_rq.spec,
+        &Path::new("spec"),
+    ));
 
     let new_scopes: std::collections::HashSet<&String> =
         new_rq.spec.scopes.iter().flatten().collect();
@@ -322,18 +360,16 @@ pub fn validate_resource_quota_update(new_rq: &ResourceQuota, old_rq: &ResourceQ
     errs
 }
 
-/// Validate a ResourceQuota status update — upstream
-/// `ValidateResourceQuotaStatusUpdate` (pkg/apis/core/validation): the new
-/// object must carry a `resourceVersion`, and every `status.hard` / `status.used`
-/// entry must pass the same resource-name and quantity-value checks as the spec.
-///
-/// (ObjectMeta-update validation is performed by the caller / object-meta
-/// validator; this mirrors only the status-specific rules.)
+/// Upstream `ValidateResourceQuotaStatusUpdate` (validation.go:8147-8165):
+/// the ObjectMeta update, a required `resourceVersion`, and every
+/// `status.hard` / `status.used` entry passes the spec's resource-name and
+/// quantity-value checks.
 pub fn validate_resource_quota_status_update(
     new_rq: &ResourceQuota,
-    _old_rq: &ResourceQuota,
+    old_rq: &ResourceQuota,
 ) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
+    let mut errs =
+        validate_object_meta_update(&new_rq.metadata, &old_rq.metadata, &Path::new("metadata"));
 
     if new_rq
         .metadata
@@ -345,22 +381,7 @@ pub fn validate_resource_quota_status_update(
         errs.push(Error::required(&Path::new("resourceVersion"), ""));
     }
 
-    if let Some(status) = &new_rq.status {
-        let status_path = Path::new("status");
-        if let Some(hard) = &status.hard {
-            errs.extend(validate_resource_quota_resources(
-                hard,
-                &status_path.child("hard"),
-            ));
-        }
-        if let Some(used) = &status.used {
-            errs.extend(validate_resource_quota_resources(
-                used,
-                &status_path.child("used"),
-            ));
-        }
-    }
-
+    errs.extend(validate_resource_quota_status(new_rq, &Path::new("status")));
     errs
 }
 

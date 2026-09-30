@@ -25,7 +25,7 @@ use tracing::{debug, info};
 /// Run resource-type-specific status validation before persisting a status
 /// update. Currently covers Node `/status` (upstream `ValidateNodeUpdate`
 /// status-field checks: addresses, declaredFeatures, capacity/allocatable),
-/// Namespace, ResourceQuota and ValidatingAdmissionPolicy.
+/// Namespace and ValidatingAdmissionPolicy.
 fn validate_status_subresource(resource_type: &str, resource: &Value) -> Result<()> {
     if resource_type == "nodes" {
         let node: rusternetes_common::resources::Node = serde_json::from_value(resource.clone())
@@ -46,29 +46,6 @@ fn validate_status_subresource(resource_type: &str, resource: &Value) -> Result<
         // the only object the check needs.
         let errs =
             rusternetes_common::validation::namespace::validate_namespace_status_update(&ns, &ns);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    } else if resource_type == "resourcequotas" {
-        let rq: rusternetes_common::resources::ResourceQuota =
-            serde_json::from_value(resource.clone()).map_err(|e| {
-                rusternetes_common::Error::InvalidResource(format!("invalid ResourceQuota: {e}"))
-            })?;
-        // Upstream ValidateResourceQuotaStatusUpdate = ValidateObjectMetaUpdate
-        // (resourceVersion-required) + status hard/used name+quantity checks. In
-        // rusternetes the optimistic-concurrency gate is enforced at the storage
-        // layer (the /status handler injects the stored resourceVersion and
-        // retries on Conflict), not by re-checking it here — and controllers
-        // write status straight through storage. So drop the resourceVersion
-        // Required error and keep the substantive status quantity validation
-        // (#1484). `old` is unused by the validator.
-        let errs: rusternetes_common::validation::field::ErrorList =
-            rusternetes_common::validation::resourcequota::validate_resource_quota_status_update(
-                &rq, &rq,
-            )
-            .into_iter()
-            .filter(|e| e.field != "resourceVersion")
-            .collect();
         if !errs.is_empty() {
             return Err(rusternetes_common::Error::Invalid(errs));
         }
@@ -469,8 +446,8 @@ pub async fn update_status(
         }
         // Validate the merged status object (resourceVersion now present). The
         // json-patch branch above already does this; the PUT / merge-patch path
-        // previously skipped it, so e.g. a ResourceQuota /status with an
-        // unparseable used/hard quantity was persisted unchecked (#1484).
+        // previously skipped it, so e.g. a status with an invalid field was
+        // persisted unchecked (#1484).
         validate_status_subresource(&resource_type, &updated_resource)?;
         match state.storage.update(&key, &updated_resource).await {
             Ok(v) => break v,

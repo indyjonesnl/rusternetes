@@ -573,10 +573,11 @@ async fn namespace_get_unknown_returns_not_found() {
 /// on.
 /// Sonobuoy (Round 160): PASS
 ///
-/// The handler must seed `status.hard` from spec and initialize
-/// `status.used` to "0" for every tracked resource key.
+/// `PrepareForCreate` (pkg/registry/core/resourcequota/strategy.go:60-63)
+/// clears status on create; the quota controller then seeds `status.hard`
+/// from spec and `status.used` to "0" for every tracked resource key.
 #[tokio::test]
-async fn resource_quota_create_seeds_status_used_to_zero() {
+async fn resource_quota_status_is_calculated_by_the_controller() {
     let (router, mem) = spawn_router();
     // The handler needs the namespace path param, but the underlying
     // storage doesn't enforce that the namespace exists for resourcequotas
@@ -599,9 +600,22 @@ async fn resource_quota_create_seeds_status_used_to_zero() {
     )
     .await;
     assert_eq!(status, 201, "create quota must return 201: body={}", body);
+    assert_eq!(body["status"], json!({}), "create clears status: {body}");
+
+    ResourceQuotaController::new(mem.clone())
+        .reconcile_one("default", "test-quota")
+        .await
+        .unwrap();
+    let (_, body) = send_json(
+        router.clone(),
+        "GET",
+        "/api/v1/namespaces/default/resourcequotas/test-quota",
+        None,
+    )
+    .await;
     let used = body["status"]["used"]
         .as_object()
-        .expect("status.used populated by handler");
+        .expect("status.used populated by the controller");
     for key in ["pods", "requests.cpu", "requests.memory", "configmaps"] {
         assert_eq!(
             used.get(key).and_then(|v| v.as_str()),
@@ -616,7 +630,7 @@ async fn resource_quota_create_seeds_status_used_to_zero() {
         .expect("status.hard mirrors spec.hard");
     assert_eq!(hard.get("pods").and_then(|v| v.as_str()), Some("5"));
 
-    // The assertions above cover the create-time seed. Upstream's case goes
+    // The assertions above cover the zero seed. Upstream's case goes
     // further: `newTestResourceQuota` puts `resourcequotas: 1` in hard
     // (resource_quota.go:2159) and `waitForResourceQuota` then requires
     // `used[resourcequotas]` to reach `c + 1` (resource_quota.go:100-102) —

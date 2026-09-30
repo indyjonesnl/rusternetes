@@ -86,7 +86,7 @@ pub struct ScopedResourceSelectorRequirement {
 }
 
 /// ResourceQuotaStatus defines the enforced hard limits and observed use
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceQuotaStatus {
     /// Hard is the set of enforced hard limits for each named resource
