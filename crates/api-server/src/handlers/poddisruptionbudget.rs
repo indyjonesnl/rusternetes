@@ -1,107 +1,104 @@
+//! PodDisruptionBudget endpoints.
+//!
+//! Writes, and the `/status` subresource, go through the generic endpoint
+//! handlers and [`crate::registry::generic::Store`] with the
+//! PodDisruptionBudget strategies
+//! ([`crate::registry::policy::poddisruptionbudget`]) — upstream's
+//! `pkg/registry/policy/poddisruptionbudget/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::policy::poddisruptionbudget;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::PodDisruptionBudget,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The PodDisruptionBudget `RequestScope`: `policy/v1`
+/// `PodDisruptionBudget` served as `poddisruptionbudgets` (or its `/status`),
+/// backed by `poddisruptionbudget.NewREST`'s stores.
+fn scope(
+    state: &ApiServerState,
+    subresource: Option<&'static str>,
+) -> RequestScope<PodDisruptionBudget> {
+    let store = match subresource {
+        Some(_) => poddisruptionbudget::new_status_store(state.storage.clone()),
+        None => poddisruptionbudget::new_store(state.storage.clone()),
+    };
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "policy".to_string(),
+            version: "v1".to_string(),
+            kind: "PodDisruptionBudget".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "policy".to_string(),
+            version: "v1".to_string(),
+            resource: "poddisruptionbudgets".to_string(),
+        },
+        subresource,
+        store: Box::new(store),
+        apply: Some(crate::ssa::apply_legacy::<PodDisruptionBudget>),
+        convert_to_internal: Some(poddisruptionbudget::convert_to_internal),
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut pdb): DumpingJson<PodDisruptionBudget>,
-) -> Result<(StatusCode, Json<PodDisruptionBudget>)> {
-    info!(
-        "Creating poddisruptionbudget: {}/{}",
-        namespace, pdb.metadata.name
-    );
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "poddisruptionbudgets")
-        .with_namespace(&namespace)
-        .with_api_group("policy");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &pdb.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Field validation (mirrors upstream ValidatePodDisruptionBudget).
-    {
-        let errs = rusternetes_common::validation::pdb::validate_pod_disruption_budget(&pdb);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    pdb.metadata.namespace = Some(namespace.clone());
-    pdb.metadata.ensure_uid();
-    pdb.metadata.ensure_creation_timestamp();
-
-    let key = build_key("poddisruptionbudgets", Some(&namespace), &pdb.metadata.name);
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: PodDisruptionBudget {}/{} validated successfully (not created)",
-            namespace, pdb.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(pdb)));
-    }
-
-    let created = state.storage.create(&key, &pdb).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<PodDisruptionBudget>> {
-    debug!("Getting poddisruptionbudget: {}/{}", namespace, name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "poddisruptionbudgets")
-        .with_namespace(&namespace)
-        .with_api_group("policy")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("poddisruptionbudgets", Some(&namespace), &name);
-    let pdb = state.storage.get(&key).await?;
-
-    Ok(Json(pdb))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn update(
@@ -109,138 +106,134 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut pdb): DumpingJson<PodDisruptionBudget>,
-) -> Result<Json<PodDisruptionBudget>> {
-    info!("Updating poddisruptionbudget: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "poddisruptionbudgets")
-        .with_namespace(&namespace)
-        .with_api_group("policy")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("poddisruptionbudgets", Some(&namespace), &name),
-        "policy",
-        "poddisruptionbudgets",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    pdb.metadata.name = name.clone();
-    pdb.metadata.namespace = Some(namespace.clone());
-
-    let key = build_key("poddisruptionbudgets", Some(&namespace), &name);
-
-    // Field validation on update (upstream PDB update strategy re-runs
-    // ValidatePodDisruptionBudget on the new object — no spec immutability).
-    // The create path validated but the update path previously persisted PUTs
-    // unchecked.
-    {
-        let errs = rusternetes_common::validation::pdb::validate_pod_disruption_budget(&pdb);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: PodDisruptionBudget {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(pdb));
-    }
-
-    let result = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
-        &*state.storage,
-        &key,
-        &mut pdb,
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
-    )
-    .await?;
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<PodDisruptionBudget>> {
-    info!("Deleting poddisruptionbudget: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "poddisruptionbudgets")
-        .with_namespace(&namespace)
-        .with_api_group("policy")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("poddisruptionbudgets", Some(&namespace), &name);
-
-    // Get the PDB for finalizer handling
-    let pdb: PodDisruptionBudget = state.storage.get(&key).await?;
-
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: PodDisruptionBudget {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(pdb));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &pdb,
-        &delete_opts,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    if deleted_immediately {
-        Ok(Json(pdb))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: PodDisruptionBudget = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+pub async fn deletecollection_poddisruptionbudgets(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// GET `/status`: `StatusREST.Get` is the store's `Get` (storage.go:84-87).
+pub async fn get_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
+}
+
+/// PUT `/status`: `StatusREST.Update` (storage.go:89-94).
+pub async fn update_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// PATCH `/status`: a patch into `StatusREST.Update`.
+pub async fn patch_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
 }
 
 pub async fn list(
@@ -372,178 +365,9 @@ pub async fn list_all(
     Ok(Json(list).into_response())
 }
 
-// Status subresource handlers
-pub async fn get_status(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<PodDisruptionBudget>> {
-    debug!("Getting poddisruptionbudget status: {}/{}", namespace, name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "poddisruptionbudgets/status")
-        .with_namespace(&namespace)
-        .with_api_group("policy")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("poddisruptionbudgets", Some(&namespace), &name);
-    let pdb = state.storage.get(&key).await?;
-
-    Ok(Json(pdb))
-}
-
-pub async fn update_status(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path((namespace, name)): Path<(String, String)>,
-    DumpingJson(pdb): DumpingJson<PodDisruptionBudget>,
-) -> Result<Json<PodDisruptionBudget>> {
-    info!(
-        "Updating poddisruptionbudget status: {}/{}",
-        namespace, name
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "poddisruptionbudgets/status")
-        .with_namespace(&namespace)
-        .with_api_group("policy")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("poddisruptionbudgets", Some(&namespace), &name);
-
-    // Upstream serves a subresource from the same `genericregistry.Store` as
-    // its parent, with only the strategy swapped, so `Store.Update`'s
-    // create-on-update gate applies to a status write exactly as it does to a
-    // spec write (`registry/generic/registry/store.go:646-650`): the object has
-    // to exist first, and the check runs before any validator (#1932).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &key,
-        "policy",
-        "poddisruptionbudgets",
-        &name,
-    )
-    .await?;
-
-    // Get existing PDB to preserve spec
-    let mut existing: PodDisruptionBudget = state.storage.get(&key).await?;
-    let old = existing.clone();
-
-    // Update only the status field
-    existing.status = pdb.status;
-
-    // Field validation on the status subresource (mirrors upstream
-    // ValidatePodDisruptionBudgetStatusUpdate): condition list + non-negative
-    // disruption counters.
-    {
-        let errs =
-            rusternetes_common::validation::pdb::validate_pod_disruption_budget_status_update(
-                &existing, &old,
-            );
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    let updated = state.storage.update(&key, &existing).await?;
-
-    Ok(Json(updated))
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(patch, PodDisruptionBudget, "poddisruptionbudgets", "policy");
-
-pub async fn deletecollection_poddisruptionbudgets(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection poddisruptionbudgets in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "poddisruptionbudgets")
-        .with_namespace(&namespace)
-        .with_api_group("policy");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: PodDisruptionBudget collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all poddisruptionbudgets in the namespace
-    let prefix = build_prefix("poddisruptionbudgets", Some(&namespace));
-    let mut items = state.storage.list::<PodDisruptionBudget>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key(
-            "poddisruptionbudgets",
-            Some(&namespace),
-            &item.metadata.name,
-        );
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} poddisruptionbudgets deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use rusternetes_common::resources::PodDisruptionBudget;
     use rusternetes_common::resources::{IntOrString, PodDisruptionBudgetSpec};
     use rusternetes_common::types::LabelSelector;
     use std::collections::HashMap;

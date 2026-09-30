@@ -1971,7 +1971,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             "/apis/policy/v1/namespaces/:namespace/poddisruptionbudgets/:name/status",
             get(handlers::poddisruptionbudget::get_status)
                 .put(handlers::poddisruptionbudget::update_status)
-                .patch(handlers::status::update_status),
+                .patch(handlers::poddisruptionbudget::patch_status),
         )
         // PodDisruptionBudgets (all namespaces)
         .route(

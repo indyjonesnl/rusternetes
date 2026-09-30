@@ -24,5 +24,6 @@ pub mod batch;
 pub mod core;
 pub mod generic;
 pub mod names;
+pub mod policy;
 pub mod rest;
 pub mod scale;

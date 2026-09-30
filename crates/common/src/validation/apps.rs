@@ -252,7 +252,10 @@ fn int_or_percent_display(v: &IntOrString) -> BadValue {
 /// Returns `(is_zero, errors)`, where `is_zero` comes from
 /// `int_or_percent_value` so it matches upstream's `getIntOrPercentValue` even
 /// for a value whose format was just rejected.
-fn validate_positive_int_or_percent(v: &IntOrString, fld_path: &Path) -> (bool, ErrorList) {
+pub(crate) fn validate_positive_int_or_percent(
+    v: &IntOrString,
+    fld_path: &Path,
+) -> (bool, ErrorList) {
     let mut errs: ErrorList = Vec::new();
     match v {
         IntOrString::String(s) => {
@@ -281,7 +284,7 @@ fn validate_positive_int_or_percent(v: &IntOrString, fld_path: &Path) -> (bool, 
 /// (`pkg/apis/apps/validation/validation.go:583-591`): only a *valid* percent
 /// string is bounded, and only above 100. Integers and malformed strings are
 /// left to `ValidatePositiveIntOrPercent`.
-fn is_not_more_than_100_percent(v: &IntOrString, fld_path: &Path) -> ErrorList {
+pub(crate) fn is_not_more_than_100_percent(v: &IntOrString, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if let Some(val) = percent_value(v) {
         if val > 100 {
