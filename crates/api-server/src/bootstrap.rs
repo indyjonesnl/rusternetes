@@ -850,6 +850,74 @@ pub async fn start_default_servicecidr_controller(
 }
 
 // ---------------------------------------------------------------------------
+// Service NodePort repair
+// ---------------------------------------------------------------------------
+
+/// How long startup waits for the first successful repair pass before it
+/// gives up (storage_core.go:535-539).
+const INITIAL_REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One NodePort repair pass over `state`'s allocator — what the
+/// `start-service-ip-repair-controllers` post-start hook waits for before
+/// the api-server reports ready. Until it has run, the allocation snapshot
+/// may not exist and no NodePort can be allocated
+/// (allocator/storage/storage.go:154-157).
+// Used by the test harness (test_support), not by the binary.
+#[allow(dead_code)]
+pub async fn repair_service_node_ports_once(
+    state: &crate::state::ApiServerState,
+) -> rusternetes_common::Result<()> {
+    use crate::registry::core::service::portallocator::repair::Repair;
+    Repair::new(
+        state.storage.clone(),
+        state.node_port_allocator.port_range(),
+        state.node_port_registry.clone(),
+    )
+    .run_once()
+    .await
+}
+
+/// The NodePort half of the `start-service-ip-repair-controllers` post-start
+/// hook (pkg/registry/core/rest/storage_core.go:504-540): run
+/// `portallocator/controller.Repair` every `REPAIR_INTERVAL` (`RunUntil`,
+/// repair.go:75-87), and fail startup if the first pass does not succeed
+/// within a minute.
+pub async fn start_service_node_ports_repair(
+    state: &crate::state::ApiServerState,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    use crate::registry::core::service::portallocator::repair::{Repair, REPAIR_INTERVAL};
+    let mut repair = Repair::new(
+        state.storage.clone(),
+        state.node_port_allocator.port_range(),
+        state.node_port_registry.clone(),
+    );
+    let (first_success, first) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let mut first_success = Some(first_success);
+        loop {
+            match repair.run_once().await {
+                Ok(()) => {
+                    if let Some(tx) = first_success.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                Err(e) => warn!("service NodePort repair: {e}"),
+            }
+            tokio::time::sleep(REPAIR_INTERVAL).await;
+        }
+    });
+    match tokio::time::timeout(INITIAL_REPAIR_TIMEOUT, first).await {
+        Ok(Ok(())) => Ok(handle),
+        _ => {
+            handle.abort();
+            Err(anyhow::anyhow!(
+                "unable to perform initial IP and Port allocation check"
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ClusterAuthenticationTrust controller
 // ---------------------------------------------------------------------------
 

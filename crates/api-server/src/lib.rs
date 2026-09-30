@@ -327,6 +327,9 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         .with_prometheus_client(prom_client),
     );
 
+    // The NodePort repair loop; startup waits for its first pass.
+    bootstrap::start_service_node_ports_repair(&state).await?;
+
     // Pre-allocate ClusterIPs
     {
         let existing_services: Vec<rusternetes_common::resources::Service> =

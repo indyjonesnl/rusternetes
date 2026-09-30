@@ -27,6 +27,7 @@ pub mod networking;
 pub mod node;
 pub mod pod;
 pub mod policy;
+pub mod rangeallocation;
 pub mod rbac;
 pub mod runtimeclass;
 pub mod serde_helpers;

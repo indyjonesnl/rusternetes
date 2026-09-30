@@ -287,6 +287,14 @@ impl TestApiServerBuilder {
         let state =
             ApiServerState::new(backend, token_manager, authorizer, metrics, self.skip_auth)
                 .with_ca_cert(self.ca_cert_pem);
+        // The api-server is not ready before its first NodePort repair pass
+        // has initialised the allocation snapshot. On empty in-memory storage
+        // that pass never waits, so it completes on its first poll.
+        futures::FutureExt::now_or_never(
+            rusternetes_api_server::bootstrap::repair_service_node_ports_once(&state),
+        )
+        .expect("the initial NodePort repair on MemoryStorage completes without waiting")
+        .expect("the initial NodePort repair succeeds");
         TestApiServer::from_parts(mem, state)
     }
 }

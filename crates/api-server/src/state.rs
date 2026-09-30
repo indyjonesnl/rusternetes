@@ -1,6 +1,10 @@
 use crate::admission_webhook::AdmissionWebhookManager;
 use crate::ip_allocator::ClusterIPAllocator;
 use crate::prometheus_client::PrometheusClient;
+use crate::registry::core::service::allocator::{storage::Etcd, AllocationBitmap};
+use crate::registry::core::service::portallocator::{
+    PortAllocator, DEFAULT_SERVICE_NODE_PORT_RANGE,
+};
 use crate::watch_cache::WatchCache;
 use rusternetes_common::auth::{BootstrapTokenManager, TokenManager};
 use rusternetes_common::authz::Authorizer;
@@ -17,6 +21,12 @@ pub struct ApiServerState {
     pub metrics: Arc<MetricsRegistry>,
     pub skip_auth: bool,
     pub ip_allocator: Arc<ClusterIPAllocator>,
+    /// The service NodePort allocator, persisted as the
+    /// `/registry/ranges/servicenodeports` RangeAllocation.
+    pub node_port_allocator: Arc<PortAllocator>,
+    /// The same storage-backed allocator as the repair loop's
+    /// `RangeRegistry`.
+    pub node_port_registry: Arc<Etcd<StorageBackend>>,
     pub webhook_manager: Arc<AdmissionWebhookManager<StorageBackend>>,
     pub watch_cache: Arc<WatchCache>,
     pub ca_cert_pem: Option<String>,
@@ -37,6 +47,23 @@ impl ApiServerState {
         // zero (#1089).
         watch_cache.spawn_idle_gc();
 
+        // `newServiceIPAllocators` (pkg/registry/core/rest/storage_core.go:
+        // 484-495): one bitmap with the static-band offset, persisted under
+        // `/ranges/servicenodeports`, shared with the repair loop.
+        let pr = DEFAULT_SERVICE_NODE_PORT_RANGE;
+        let offset = crate::registry::core::service::portallocator::calculate_range_offset(pr);
+        let node_port_registry = Arc::new(Etcd::new(
+            AllocationBitmap::with_offset(pr.size, pr.to_string(), offset),
+            storage.clone(),
+            "/registry/ranges/servicenodeports",
+            "servicenodeportallocations",
+        ));
+        let backing = node_port_registry.clone();
+        let node_port_allocator = Arc::new(
+            PortAllocator::new(pr, Box::new(move |_, _, _| Ok(Box::new(backing))))
+                .expect("the NodePort allocator factory cannot fail"),
+        );
+
         Self {
             storage,
             token_manager,
@@ -45,6 +72,8 @@ impl ApiServerState {
             metrics,
             skip_auth,
             ip_allocator: Arc::new(ClusterIPAllocator::new()),
+            node_port_allocator,
+            node_port_registry,
             webhook_manager,
             watch_cache,
             ca_cert_pem: None,

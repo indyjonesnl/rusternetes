@@ -307,6 +307,9 @@ async fn main() -> Result<()> {
             .with_prometheus_client(prometheus_client),
     );
 
+    // The NodePort repair loop; startup waits for its first pass.
+    bootstrap::start_service_node_ports_repair(&state).await?;
+
     // Pre-allocate ClusterIPs from existing services to prevent collisions after restart
     {
         let existing_services: Vec<rusternetes_common::resources::Service> =

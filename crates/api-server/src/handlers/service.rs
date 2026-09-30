@@ -1,3 +1,4 @@
+use crate::registry::core::service::alloc;
 use crate::{handlers::watch::WatchParams, middleware::AuthContext, state::ApiServerState};
 use axum::{
     body::Bytes,
@@ -16,17 +17,6 @@ use rusternetes_storage::{build_key, build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
-
-/// Allocate a random NodePort in the range 30000-32767
-fn allocate_node_port() -> u16 {
-    use std::time::SystemTime;
-    let seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    // Simple pseudo-random in range 30000-32767 (2768 ports)
-    30000 + (seed % 2768) as u16
-}
 
 /// Apply K8s session-affinity defaulting to a service spec.
 ///
@@ -302,23 +292,6 @@ pub async fn create(
         }
     }
 
-    // Auto-assign NodePort for NodePort and LoadBalancer services
-    if matches!(
-        service.spec.service_type,
-        Some(ServiceType::NodePort) | Some(ServiceType::LoadBalancer)
-    ) {
-        for port in &mut service.spec.ports {
-            if port.node_port.is_none() || port.node_port == Some(0) {
-                let node_port = allocate_node_port();
-                info!(
-                    "Allocated NodePort {} for service {}/{} port {:?}",
-                    node_port, namespace, service.metadata.name, port.port
-                );
-                port.node_port = Some(node_port);
-            }
-        }
-    }
-
     // Populate clusterIPs from clusterIP for consistency (K8s always returns both)
     if let Some(ref cip) = service.spec.cluster_ip {
         if cip != "None" && !cip.is_empty() && service.spec.cluster_ips.is_none() {
@@ -422,8 +395,15 @@ pub async fn create(
         }
     }
 
+    // Claim node ports (upstream beginCreate -> txnAllocNodePorts,
+    // pkg/registry/core/service/storage/storage.go + alloc.go:481). A dry run
+    // checks the requested ports without claiming them.
+    let node_port_op =
+        alloc::txn_alloc_node_ports(&state.node_port_allocator, &mut service, is_dry_run).await?;
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
+        alloc::settle(node_port_op, &Ok(())).await;
         info!(
             "Dry-run: Service {}/{} validated successfully (not created)",
             namespace, service.metadata.name
@@ -431,9 +411,10 @@ pub async fn create(
         return Ok((StatusCode::CREATED, Json(service)));
     }
 
-    let created = state.storage.create(&key, &service).await?;
+    let created = state.storage.create(&key, &service).await;
+    alloc::settle(node_port_op, &created).await;
 
-    Ok((StatusCode::CREATED, Json(created)))
+    Ok((StatusCode::CREATED, Json(created?)))
 }
 
 pub async fn get(
@@ -596,17 +577,6 @@ pub async fn update(
             service.spec.cluster_ip = old_service.spec.cluster_ip.clone();
             service.spec.cluster_ips = old_service.spec.cluster_ips.clone();
         }
-        // Allocate NodePorts for NodePort/LoadBalancer services
-        if matches!(
-            service.spec.service_type,
-            Some(ServiceType::NodePort) | Some(ServiceType::LoadBalancer)
-        ) {
-            for port in &mut service.spec.ports {
-                if port.node_port.is_none() || port.node_port == Some(0) {
-                    port.node_port = Some(allocate_node_port());
-                }
-            }
-        }
     }
 
     // Field-level validation on update — same rules as create.
@@ -647,8 +617,19 @@ pub async fn update(
         &mut service.metadata,
     );
 
+    // Claim and free node ports (upstream beginUpdate -> txnUpdateNodePorts,
+    // alloc.go:754).
+    let node_port_op = alloc::txn_update_node_ports(
+        &state.node_port_allocator,
+        &mut service,
+        &old_service,
+        is_dry_run,
+    )
+    .await?;
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
+        alloc::settle(node_port_op, &Ok(())).await;
         info!(
             "Dry-run: Service {}/{} validated successfully (not updated)",
             namespace, name
@@ -656,7 +637,9 @@ pub async fn update(
         return Ok(Json(service));
     }
 
-    let updated = state.storage.update(&key, &service).await?;
+    let updated = state.storage.update(&key, &service).await;
+    alloc::settle(node_port_op, &updated).await;
+    let updated = updated?;
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
     // finalizer off an object already pending deletion removes it as part of
@@ -735,6 +718,8 @@ pub async fn delete_service(
     .await?;
 
     if deleted_immediately {
+        // Upstream afterDelete -> releaseAllocatedResources (alloc.go:886).
+        alloc::release_node_ports(&state.node_port_allocator, &service).await;
         if let Some(cluster_ip) = &service.spec.cluster_ip {
             state.ip_allocator.release(cluster_ip);
             info!(
@@ -898,6 +883,11 @@ pub async fn patch(
     body: axum::body::Bytes,
 ) -> rusternetes_common::Result<Json<Service>> {
     let (namespace, name) = path.0.clone();
+    let key = rusternetes_storage::build_key("services", Some(&namespace), &name);
+    // The merge below writes before this handler sees the result, so the node
+    // ports are reconciled against the pre-patch object afterwards.
+    let old_service: Option<Service> = state.storage.get(&key).await.ok();
+    let is_dry_run = crate::handlers::dryrun::is_dry_run(&query.0);
     let result = crate::handlers::generic_patch::patch_namespaced_resource::<Service>(
         state.clone(),
         auth_ctx,
@@ -912,7 +902,6 @@ pub async fn patch(
 
     // Post-patch: handle service type transitions
     let mut service = result.0;
-    let key = rusternetes_storage::build_key("services", Some(&namespace), &name);
     let mut needs_update = false;
 
     // Re-default ServicePort.targetPort / protocol after the merge. generic_patch
@@ -948,24 +937,32 @@ pub async fn patch(
                 needs_update = true;
             }
         }
-        // Allocate NodePorts for NodePort/LoadBalancer services
-        if matches!(
-            service.spec.service_type,
-            Some(ServiceType::NodePort) | Some(ServiceType::LoadBalancer)
-        ) {
-            for port in &mut service.spec.ports {
-                if port.node_port.is_none() || port.node_port == Some(0) {
-                    port.node_port = Some(allocate_node_port());
-                    needs_update = true;
-                }
-            }
-        }
     }
 
-    if needs_update {
-        let saved: Service = state.storage.update(&key, &service).await?;
-        return Ok(Json(saved));
+    // Claim and free node ports against the pre-patch object (upstream
+    // beginUpdate -> txnUpdateNodePorts, alloc.go:754). A dry-run patch wrote
+    // nothing and claims nothing.
+    let Some(old_service) = old_service else {
+        return Ok(Json(service));
+    };
+    let before = serde_json::to_value(&service.spec).ok();
+    let node_port_op = alloc::txn_update_node_ports(
+        &state.node_port_allocator,
+        &mut service,
+        &old_service,
+        is_dry_run,
+    )
+    .await?;
+    if before != serde_json::to_value(&service.spec).ok() {
+        needs_update = true;
     }
+
+    if needs_update && !is_dry_run {
+        let saved = state.storage.update(&key, &service).await;
+        alloc::settle(node_port_op, &saved).await;
+        return Ok(Json(saved?));
+    }
+    alloc::settle(node_port_op, &Ok(())).await;
     Ok(Json(service))
 }
 
@@ -1044,6 +1041,7 @@ pub async fn deletecollection_services(
         };
 
         if deleted_immediately {
+            alloc::release_node_ports(&state.node_port_allocator, &item).await;
             deleted_count += 1;
         }
     }
