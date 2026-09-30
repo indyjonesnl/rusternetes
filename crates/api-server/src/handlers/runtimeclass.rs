@@ -1,100 +1,79 @@
+//! RuntimeClass endpoints.
+//!
+//! Writes go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the RuntimeClass strategy
+//! ([`crate::registry::node::runtimeclass`]) — upstream's
+//! `pkg/registry/node/runtimeclass/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::node::runtimeclass;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
-    Extension, Json,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
+    Extension,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::RuntimeClass,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The RuntimeClass `RequestScope`: `node.k8s.io/v1` `RuntimeClass` served
+/// as `runtimeclasses`, backed by `runtimeclass.NewREST`.
+fn scope(state: &ApiServerState) -> RequestScope<RuntimeClass> {
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "node.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "RuntimeClass".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "node.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "runtimeclasses".to_string(),
+        },
+        subresource: None,
+        store: Box::new(runtimeclass::new_store(state.storage.clone())),
+        apply: Some(crate::ssa::apply_legacy::<RuntimeClass>),
+        convert_to_internal: None,
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create_runtimeclass(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut runtime_class): DumpingJson<RuntimeClass>,
-) -> Result<(StatusCode, Json<RuntimeClass>)> {
-    info!("Creating RuntimeClass: {}", runtime_class.metadata.name);
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &runtime_class.metadata,
-        None,
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Validate the RuntimeClass (upstream node ValidateRuntimeClass): handler
-    // DNS label, overhead.podFixed quantities, scheduling selector/tolerations.
-    let errs = rusternetes_common::validation::runtimeclass::validate_runtime_class(&runtime_class);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "runtimeclasses")
-        .with_api_group("node.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Enrich metadata with system fields
-    runtime_class.metadata.ensure_uid();
-    runtime_class.metadata.ensure_creation_timestamp();
-
-    let key = build_key("runtimeclasses", None, &runtime_class.metadata.name);
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: RuntimeClass {} validated successfully (not created)",
-            runtime_class.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(runtime_class)));
-    }
-
-    let created = state.storage.create(&key, &runtime_class).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(&state, &scope(&state), &auth_ctx.user, None, &params, &body).await
 }
 
 pub async fn get_runtimeclass(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
-) -> Result<Json<RuntimeClass>> {
-    debug!("Getting RuntimeClass: {}", name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "runtimeclasses")
-        .with_api_group("node.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("runtimeclasses", None, &name);
-    let runtime_class = state.storage.get(&key).await?;
-
-    Ok(Json(runtime_class))
+) -> Result<Response> {
+    endpoints::get_resource(&state, &scope(&state), &auth_ctx.user, None, &name).await
 }
 
 pub async fn update_runtimeclass(
@@ -102,150 +81,67 @@ pub async fn update_runtimeclass(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut runtime_class): DumpingJson<RuntimeClass>,
-) -> Result<Json<RuntimeClass>> {
-    info!("Updating RuntimeClass: {}", name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "runtimeclasses")
-        .with_api_group("node.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("runtimeclasses", None, &name),
-        "node.k8s.io",
-        "runtimeclasses",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        None,
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    runtime_class.metadata.name = name.clone();
-
-    let key = build_key("runtimeclasses", None, &name);
-
-    // Immutability on update (upstream ValidateRuntimeClassUpdate): handler is
-    // immutable. Validates before the dry-run short-circuit.
-    if let Ok(old) = state
-        .storage
-        .get::<rusternetes_common::resources::RuntimeClass>(&key)
-        .await
-    {
-        let errs = rusternetes_common::validation::runtimeclass::validate_runtime_class_update(
-            &runtime_class,
-            &old,
-        );
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: RuntimeClass {} validated successfully (not updated)",
-            name
-        );
-        return Ok(Json(runtime_class));
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    if let Ok(stored) = state.storage.get::<RuntimeClass>(&key).await {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut runtime_class.metadata,
-            &stored.metadata,
-        );
-    }
-
-    let result = state.storage.update(&key, &runtime_class).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
+pub async fn patch_runtimeclass(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete_runtimeclass(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<RuntimeClass>> {
-    info!("Deleting RuntimeClass: {}", name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "runtimeclasses")
-        .with_api_group("node.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("runtimeclasses", None, &name);
-
-    // Get the runtime class for finalizer handling
-    let runtime_class: RuntimeClass = state.storage.get(&key).await?;
-
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: RuntimeClass {} validated successfully (not deleted)",
-            name
-        );
-        return Ok(Json(runtime_class));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &runtime_class,
-        &delete_opts,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    if deleted_immediately {
-        Ok(Json(runtime_class))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: RuntimeClass = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+pub async fn deletecollection_runtimeclasses(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(&state, &scope(&state), &auth_ctx.user, None, &params, &body).await
 }
 
 pub async fn list_runtimeclasses(
@@ -310,77 +206,4 @@ pub async fn list_runtimeclasses(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(axum::Json(list).into_response())
-}
-
-// Use the macro to create a PATCH handler for cluster-scoped RuntimeClass
-crate::patch_handler_cluster!(
-    patch_runtimeclass,
-    RuntimeClass,
-    "runtimeclasses",
-    "node.k8s.io"
-);
-
-pub async fn deletecollection_runtimeclasses(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!("DeleteCollection runtimeclasses with params: {:?}", params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "runtimeclasses")
-        .with_api_group("node.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: RuntimeClass collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all runtimeclasses
-    let prefix = build_prefix("runtimeclasses", None);
-    let mut items = state.storage.list::<RuntimeClass>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("runtimeclasses", None, &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} runtimeclasses deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }

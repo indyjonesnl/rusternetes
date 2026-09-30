@@ -24,19 +24,28 @@ async fn runtimeclass_handler_immutable() {
     let (code, _) = state.post(rc_uri(), &rc(name, "runc")).await;
     assert_eq!(code, StatusCode::CREATED);
     let item = format!("{}/{name}", rc_uri());
+    // RuntimeClass refuses unconditional updates
+    // (pkg/registry/node/runtimeclass/strategy.go `AllowUnconditionalUpdate`),
+    // so each PUT carries the stored resourceVersion.
+    let (_, stored) = state.get(&item).await;
+    let with_rv = |mut v: Value| {
+        v["metadata"]["resourceVersion"] = stored["metadata"]["resourceVersion"].clone();
+        v
+    };
 
-    let (code, _) = state.put(&item, &rc(name, "gvisor")).await;
+    let (code, body) = state.put(&item, &with_rv(rc(name, "gvisor"))).await;
     assert_eq!(
         code,
         StatusCode::UNPROCESSABLE_ENTITY,
         "handler change must be rejected"
     );
+    assert_eq!(body["details"]["causes"][0]["field"], "handler", "{body}");
 
-    let (code, _) = state.put(&item, &rc(name, "runc")).await;
+    let (code, body) = state.put(&item, &with_rv(rc(name, "runc"))).await;
     assert_eq!(
         code,
         StatusCode::OK,
-        "unchanged handler update must succeed"
+        "unchanged handler update must succeed: {body}"
     );
 }
 

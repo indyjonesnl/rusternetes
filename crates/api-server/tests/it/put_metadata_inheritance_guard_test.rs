@@ -445,6 +445,12 @@ async fn put_omitting_uid_does_not_blank_it() {
             .to_string();
         assert!(!uid_before.is_empty(), "{label}: create assigned no uid");
 
+        // The PUT omits the uid but carries the stored resourceVersion, as a
+        // client's read-modify-write does: resources whose strategy refuses
+        // unconditional updates (RuntimeClass) reject a PUT without one
+        // (registry/generic/registry/store.go:727-733).
+        let mut body = body.clone();
+        body["metadata"]["resourceVersion"] = created["metadata"]["resourceVersion"].clone();
         let (status, _, updated) = state
             .send_raw(
                 "PUT",
