@@ -168,10 +168,12 @@ async fn test_service_strategy_cluster_ip_immutable_change() {
     );
 }
 
-/// Updating a service to clear the assigned ClusterIP (set to "") must be
-/// rejected — upstream `ValidateServiceUpdate` flags this as immutable.
+/// An update that clears the assigned ClusterIP (both fields empty) is a
+/// resubmission that omits an allocated value: upstream `patchAllocatedValues`
+/// (pkg/registry/core/service/storage/storage.go:589-600) restores it from
+/// the stored object, so the update succeeds and the IP is kept.
 #[tokio::test]
-async fn test_service_strategy_cluster_ip_immutable_clear() {
+async fn test_service_strategy_cluster_ip_cleared_is_restored() {
     let (mem, router) = spawn_router();
 
     let body = cluster_ip_body("immut2");
@@ -181,17 +183,12 @@ async fn test_service_strategy_cluster_ip_immutable_clear() {
 
     let mut updated = created.clone();
     updated["spec"]["clusterIP"] = json!("");
-    // clusterIPs left intact would also be a contradiction; drop it too.
     updated["spec"]["clusterIPs"] = json!([]);
 
     let (status, body) = update_service(router, "immut2", &updated).await;
-    assert!(
-        status >= 400,
-        "expected error when clearing clusterIP; got {} body={}",
-        status,
-        body
-    );
-    // Even if the API returned an error, storage MUST still hold the original.
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(body["spec"]["clusterIP"], json!(original_ip));
+    assert_eq!(body["spec"]["clusterIPs"], json!([original_ip]));
     let persisted = stored(&mem, "immut2").await.expect("persisted");
     assert_eq!(persisted["spec"]["clusterIP"], json!(original_ip));
 }
@@ -251,19 +248,23 @@ async fn test_service_strategy_ip_family_defaults_single_stack() {
     assert_eq!(persisted["spec"]["ipFamilies"], json!(["IPv4"]));
 }
 
-/// An explicit RequireDualStack request must round-trip through the handler
-/// unchanged.
+/// RequireDualStack on a single-stack cluster is rejected by
+/// `initIPFamilyFields` (pkg/registry/core/service/storage/alloc.go:250-256):
+/// this api-server allocates from one (IPv4) family.
 #[tokio::test]
-async fn test_service_strategy_ip_family_explicit_require_dual_stack() {
+async fn test_service_strategy_ip_family_require_dual_stack_rejected() {
     let (_mem, router) = spawn_router();
     let mut body = cluster_ip_body("ipfam2");
     body["spec"]["ipFamilyPolicy"] = json!("RequireDualStack");
     body["spec"]["ipFamilies"] = json!(["IPv4", "IPv6"]);
 
     let (status, response) = create_service(router, &body).await;
-    assert!((200..300).contains(&status), "got {status}");
-    assert_eq!(response["spec"]["ipFamilyPolicy"], "RequireDualStack");
-    assert_eq!(response["spec"]["ipFamilies"], json!(["IPv4", "IPv6"]));
+    assert_eq!(status, 422, "{response}");
+    let msg = response["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("this cluster is not configured for dual-stack services"),
+        "{msg}"
+    );
 }
 
 /// ExternalName services are not assigned ClusterIPs and must not get

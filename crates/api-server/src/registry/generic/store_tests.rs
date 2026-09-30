@@ -919,7 +919,7 @@ impl BeginUpdate<ConfigMap> for Hooks {
         &self,
         _: &RequestContext,
         obj: &mut ConfigMap,
-        _: &ConfigMap,
+        _: &mut ConfigMap,
         _: &UpdateOptions,
     ) -> Result<Box<dyn Finish>> {
         self.milestones.mile("BeginUpdate");

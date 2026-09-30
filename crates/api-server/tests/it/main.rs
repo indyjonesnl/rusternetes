@@ -244,6 +244,7 @@ mod service_cluster_ip_allocation_test;
 mod service_externalname_transition_test;
 mod service_handler_test;
 mod service_node_port_allocation_test;
+mod service_store_test;
 mod service_test;
 mod serviceaccount_handler_test;
 mod small_api_decode_when_absent_test;

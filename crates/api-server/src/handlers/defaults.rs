@@ -565,6 +565,84 @@ pub fn apply_replicationcontroller_defaults(
     apply_pod_template_defaults(&mut rc.spec.template);
 }
 
+/// `v1.DefaultClientIPServiceAffinitySeconds` (api/core/v1/types.go).
+const DEFAULT_CLIENT_IP_SERVICE_AFFINITY_SECONDS: i32 = 10800;
+
+/// `SetDefaults_Service` (pkg/apis/core/v1/defaults.go:106-162).
+pub fn apply_service_defaults(svc: &mut rusternetes_common::resources::Service) {
+    use rusternetes_common::resources::{
+        ClientIPConfig, ServiceExternalTrafficPolicy, ServiceInternalTrafficPolicy, ServiceType,
+        SessionAffinityConfig,
+    };
+    let spec = &mut svc.spec;
+    if spec.session_affinity.as_deref().unwrap_or("").is_empty() {
+        spec.session_affinity = Some("None".to_string());
+    }
+    if spec.session_affinity.as_deref() == Some("None") {
+        spec.session_affinity_config = None;
+    }
+    if spec.session_affinity.as_deref() == Some("ClientIP") {
+        let has_timeout = spec
+            .session_affinity_config
+            .as_ref()
+            .and_then(|c| c.client_ip.as_ref())
+            .is_some_and(|c| c.timeout_seconds.is_some());
+        if !has_timeout {
+            spec.session_affinity_config = Some(SessionAffinityConfig {
+                client_ip: Some(ClientIPConfig {
+                    timeout_seconds: Some(DEFAULT_CLIENT_IP_SERVICE_AFFINITY_SECONDS),
+                }),
+            });
+        }
+    }
+    if spec.service_type.is_none() {
+        spec.service_type = Some(ServiceType::ClusterIP);
+    }
+    for sp in &mut spec.ports {
+        if sp.protocol.is_empty() {
+            sp.protocol = "TCP".to_string();
+        }
+        let unset = match &sp.target_port {
+            None => true,
+            Some(IntOrString::Int(0)) => true,
+            Some(IntOrString::String(s)) => s.is_empty(),
+            _ => false,
+        };
+        if unset {
+            sp.target_port = Some(IntOrString::Int(i32::from(sp.port)));
+        }
+    }
+    if rusternetes_common::validation::service::externally_accessible(svc)
+        && svc.spec.external_traffic_policy.is_none()
+    {
+        svc.spec.external_traffic_policy = Some(ServiceExternalTrafficPolicy::Cluster);
+    }
+    let spec = &mut svc.spec;
+    if spec.internal_traffic_policy.is_none()
+        && matches!(
+            spec.service_type,
+            Some(ServiceType::NodePort | ServiceType::LoadBalancer | ServiceType::ClusterIP)
+        )
+    {
+        spec.internal_traffic_policy = Some(ServiceInternalTrafficPolicy::Cluster);
+    }
+    if matches!(spec.service_type, Some(ServiceType::LoadBalancer)) {
+        if spec.allocate_load_balancer_node_ports.is_none() {
+            spec.allocate_load_balancer_node_ports = Some(true);
+        }
+        let ingress = svc
+            .status
+            .as_mut()
+            .and_then(|s| s.load_balancer.as_mut())
+            .map(|lb| lb.ingress.iter_mut());
+        for ing in ingress.into_iter().flatten() {
+            if ing.ip.as_deref().is_some_and(|ip| !ip.is_empty()) && ing.ip_mode.is_none() {
+                ing.ip_mode = Some("VIP".to_string());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

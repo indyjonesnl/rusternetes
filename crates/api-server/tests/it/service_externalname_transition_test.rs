@@ -1,6 +1,8 @@
 //! Transitioning a Service from `ExternalName` to `ClusterIP` via a full PUT
-//! that leaves `spec.externalName` populated must succeed — upstream drops
-//! externalName on non-ExternalName types rather than rejecting it.
+//! that leaves `spec.externalName` populated must succeed. Upstream validates
+//! `externalName` only for the ExternalName type (validation.go
+//! `validateService`) and keeps the stale value, warning that it is ignored
+//! (`GetWarningsForService`, pkg/api/service/warnings.go:74-76).
 //!
 //! Reproduces `[sig-network] DNS should provide DNS for ExternalName services`
 //! (dns.go:406), which flips the Service type with a GET-modify-PUT that does
@@ -61,13 +63,12 @@ async fn externalname_to_clusterip_full_put_clears_externalname() {
         updated.pointer("/spec/type").and_then(|v| v.as_str()),
         Some("ClusterIP")
     );
-    assert!(
+    assert_eq!(
         updated
             .pointer("/spec/externalName")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .is_empty(),
-        "externalName must be cleared on a non-ExternalName service; got {updated}"
+            .and_then(|v| v.as_str()),
+        Some("foo.example.com"),
+        "upstream keeps an ignored externalName; got {updated}"
     );
     let cip = updated
         .pointer("/spec/clusterIP")
