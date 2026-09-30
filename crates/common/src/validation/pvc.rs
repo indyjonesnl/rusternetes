@@ -20,9 +20,13 @@ use crate::types::{
 };
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
-    is_dns1123_subdomain, validate_label_selector, LabelSelectorValidationOptions,
+    is_dns1123_subdomain, is_qualified_name, validate_label_selector,
+    LabelSelectorValidationOptions,
 };
-use crate::validation::objectmeta::validate_namespace_name;
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, validate_namespace_name, validate_object_meta,
+    validate_object_meta_update,
+};
 
 /// Convert the PVC-spec `volume::LabelSelector` to the structurally-identical
 /// `types::LabelSelector` that `validate_label_selector` consumes.
@@ -266,10 +270,123 @@ pub fn validate_persistent_volume_claim_spec(
     errs
 }
 
-/// Validate a new `PersistentVolumeClaim`. Mirrors upstream
-/// `ValidatePersistentVolumeClaim`.
+/// Upstream `ValidatePersistentVolumeClaim` (validation.go:2397-2401):
+/// ObjectMeta (`ValidatePersistentVolumeName`, `NameIsDNSSubdomain`) and the
+/// spec.
 pub fn validate_persistent_volume_claim(pvc: &PersistentVolumeClaim) -> ErrorList {
-    validate_persistent_volume_claim_spec(&pvc.spec, &Path::new("spec"))
+    let mut errs = validate_object_meta(
+        &pvc.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_persistent_volume_claim_spec(
+        &pvc.spec,
+        &Path::new("spec"),
+    ));
+    errs
+}
+
+/// `resizeStatusSet` (validation.go:2666-2670).
+const RESIZE_STATUSES: &[&str] = &[
+    "ControllerResizeInProgress",
+    "ControllerResizeInfeasible",
+    "NodeResizePending",
+    "NodeResizeInProgress",
+    "NodeResizeInfeasible",
+];
+
+/// `validatePersistentVolumeClaimResourceKey` (validation.go:2648-2664): a
+/// qualified name, and a native resource name must be `storage`.
+fn validate_persistent_volume_claim_resource_key(value: &str, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = is_qualified_name(value)
+        .into_iter()
+        .map(|msg| Error::invalid(fld_path, value.to_string(), msg))
+        .collect();
+    if !errs.is_empty() {
+        return errs;
+    }
+    // `helper.IsNativeResource` (pkg/apis/core/helper/helpers.go:198-201).
+    let native = !value.contains('/') || value.contains("kubernetes.io/");
+    if native && value != "storage" {
+        errs.push(Error::not_supported(
+            fld_path,
+            value.to_string(),
+            &["storage"],
+        ));
+    }
+    errs
+}
+
+/// `validateBasicResource` (validation.go:7810-7815).
+fn validate_basic_resource(quantity: &str, fld_path: &Path) -> ErrorList {
+    match Quantity::parse(quantity) {
+        Ok(q) if q.is_negative() => vec![Error::invalid(
+            fld_path,
+            q.value() as i64,
+            "must be a valid resource quantity",
+        )],
+        _ => Vec::new(),
+    }
+}
+
+/// Upstream `ValidatePersistentVolumeClaimStatusUpdate`
+/// (validation.go:2673-2714), with `EnableRecoverFromExpansionFailure` on:
+/// RecoverVolumeExpansionFailure is GA and locked on in 1.35
+/// (pkg/features/kube_features.go:1680-1684).
+pub fn validate_persistent_volume_claim_status_update(
+    new_pvc: &PersistentVolumeClaim,
+    old_pvc: &PersistentVolumeClaim,
+) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&new_pvc.metadata, &old_pvc.metadata, &Path::new("metadata"));
+    if new_pvc
+        .metadata
+        .resource_version
+        .as_deref()
+        .unwrap_or("")
+        .is_empty()
+    {
+        errs.push(Error::required(&Path::new("resourceVersion"), ""));
+    }
+    if new_pvc.spec.access_modes.is_empty() {
+        // Upstream spells this path `Spec.accessModes`, capitalised.
+        errs.push(Error::required(&Path::new("Spec").child("accessModes"), ""));
+    }
+    let Some(status) = &new_pvc.status else {
+        return errs;
+    };
+    let cap_path = Path::new("status").child("capacity");
+    for (r, qty) in status.capacity.iter().flatten() {
+        errs.extend(validate_basic_resource(qty, &cap_path.key(r.clone())));
+    }
+    let resize_path = Path::new("status").child("allocatedResourceStatuses");
+    for (k, v) in status.allocated_resource_statuses.iter().flatten() {
+        errs.extend(validate_persistent_volume_claim_resource_key(
+            k,
+            &resize_path,
+        ));
+        if !RESIZE_STATUSES.contains(&v.as_str()) {
+            // Upstream reports the key, not the value, as the bad value.
+            errs.push(Error::not_supported(
+                &resize_path,
+                k.clone(),
+                RESIZE_STATUSES,
+            ));
+        }
+    }
+    let alloc_path = Path::new("status").child("allocatedResources");
+    for (r, qty) in status.allocated_resources.iter().flatten() {
+        let key_errs = validate_persistent_volume_claim_resource_key(r, &alloc_path);
+        if !key_errs.is_empty() {
+            errs.extend(key_errs);
+            continue;
+        }
+        // `ValidateResourceQuantityValue(storage, …)` after it only adds the
+        // non-negative check `validateBasicResource` already made.
+        errs.extend(validate_basic_resource(qty, &alloc_path.key(r.clone())));
+    }
+    errs
 }
 
 /// Validate a `PersistentVolumeClaim` update. Ports the conformance-relevant

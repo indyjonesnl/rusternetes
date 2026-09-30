@@ -1,158 +1,243 @@
+//! PersistentVolumeClaim endpoints.
+//!
+//! Writes, and the `/status` subresource, go through the
+//! generic endpoint handlers and [`crate::registry::generic::Store`] with the
+//! PersistentVolumeClaim strategies
+//! ([`crate::registry::core::persistentvolumeclaim`]) — upstream's
+//! `pkg/registry/core/persistentvolumeclaim/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::core::persistentvolumeclaim;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::PersistentVolumeClaim,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The PersistentVolumeClaim `RequestScope`: `v1` `PersistentVolumeClaim`
+/// served as `persistentvolumeclaims` (or its `/status`), backed by
+/// `persistentvolumeclaim.NewREST`'s stores.
+fn scope(
+    state: &ApiServerState,
+    subresource: Option<&'static str>,
+) -> RequestScope<PersistentVolumeClaim> {
+    let store: Box<dyn crate::registry::rest::RestStorage<PersistentVolumeClaim>> =
+        match subresource {
+            Some(_) => Box::new(persistentvolumeclaim::new_status_store(
+                state.storage.clone(),
+            )),
+            None => Box::new(persistentvolumeclaim::new_store(state.storage.clone())),
+        };
+    RequestScope {
+        kind: GroupVersionKind {
+            group: String::new(),
+            version: "v1".to_string(),
+            kind: "PersistentVolumeClaim".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "persistentvolumeclaims".to_string(),
+        },
+        subresource,
+        store,
+        apply: Some(crate::ssa::apply_legacy::<PersistentVolumeClaim>),
+        convert_to_internal: Some(persistentvolumeclaim::convert_to_internal),
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create_pvc(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut pvc): DumpingJson<PersistentVolumeClaim>,
-) -> Result<(StatusCode, Json<PersistentVolumeClaim>)> {
-    info!(
-        "Creating PersistentVolumeClaim: {}/{}",
-        namespace, pvc.metadata.name
-    );
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "persistentvolumeclaims")
-        .with_namespace(&namespace)
-        .with_api_group("");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &pvc.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Defaulting runs before validation, as upstream does it: the codec
-    // defaults on decode and `BeforeCreate` then calls `PrepareForCreate`
-    // before `strategy.Validate`
-    // (staging/src/k8s.io/apiserver/pkg/registry/rest/create.go:26-28).
-    //
-    // No PVC create validator reads a defaulted field today, so this is
-    // behaviour-neutral right now. It is the same latent trap that took the
-    // cert-manager smoke red for four nights (#1956): Deployment's inversion
-    // was equally harmless until `validateObjectFieldSelector` started
-    // requiring `fieldRef.apiVersion`, which defaulting supplies.
-    //
-    // SetDefaults_PersistentVolumeClaimSpec: volumeMode defaults to Filesystem.
-    crate::handlers::defaults::apply_pvc_spec_defaults(&mut pvc.spec);
-
-    // Field validation (mirrors upstream ValidatePersistentVolumeClaim).
-    {
-        let errs = rusternetes_common::validation::pvc::validate_persistent_volume_claim(&pvc);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    pvc.metadata.namespace = Some(namespace.clone());
-
-    // Apply DefaultStorageClass admission (sets default storage class if not specified)
-    if let Err(e) = crate::admission::set_default_storage_class(&state.storage, &mut pvc).await {
-        tracing::warn!(
-            "Error applying DefaultStorageClass admission for PVC {}/{}: {}",
-            namespace,
-            pvc.metadata.name,
-            e
-        );
-        // Continue anyway - don't fail PVC creation if default storage class can't be set
-    }
-
-    // LimitRange admission — reject PVCs whose storage request falls outside
-    // the namespace's `type: PersistentVolumeClaim` min/max bounds.
-    match crate::admission::apply_limit_range_to_pvc(&state.storage, &namespace, &mut pvc).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(rusternetes_common::Error::Forbidden(format!(
-                "PVC {}/{} violates a LimitRange constraint",
-                namespace, pvc.metadata.name
-            )));
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Error applying LimitRange admission for PVC {}/{}: {}",
-                namespace,
-                pvc.metadata.name,
-                e
-            );
-            // Continue on storage hiccup rather than blocking PVC creation.
-        }
-    }
-
-    pvc.metadata.ensure_uid();
-    pvc.metadata.ensure_creation_timestamp();
-
-    let key = build_key(
-        "persistentvolumeclaims",
-        Some(&namespace),
-        &pvc.metadata.name,
-    );
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: PersistentVolumeClaim {}/{} validated successfully (not created)",
-            namespace, pvc.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(pvc)));
-    }
-
-    let created = state.storage.create(&key, &pvc).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get_pvc(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<PersistentVolumeClaim>> {
-    debug!("Getting PersistentVolumeClaim: {}/{}", namespace, name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "persistentvolumeclaims")
-        .with_namespace(&namespace)
-        .with_api_group("")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("persistentvolumeclaims", Some(&namespace), &name);
-    let pvc = state.storage.get(&key).await?;
-
-    Ok(Json(pvc))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
+pub async fn update_pvc(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
+
+pub async fn patch_pvc(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
+}
+
+pub async fn delete_pvc(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
+
+pub async fn deletecollection_persistentvolumeclaims(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// GET `/status`: `StatusREST.Get` is the store's `Get` (storage.go:138-140).
+pub async fn get_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
+}
+
+/// PUT `/status`: `StatusREST.Update` (storage.go:143-147).
+pub async fn update_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// PATCH `/status`: a patch into `StatusREST.Update`.
+pub async fn patch_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
+}
 pub async fn list_pvcs(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -280,278 +365,4 @@ pub async fn list_all_pvcs(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-pub async fn update_pvc(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path((namespace, name)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut pvc): DumpingJson<PersistentVolumeClaim>,
-) -> Result<Json<PersistentVolumeClaim>> {
-    info!("Updating PersistentVolumeClaim: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "persistentvolumeclaims")
-        .with_namespace(&namespace)
-        .with_api_group("")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("persistentvolumeclaims", Some(&namespace), &name),
-        "",
-        "persistentvolumeclaims",
-        &name,
-    )
-    .await?;
-
-    pvc.metadata.name = name.clone();
-    pvc.metadata.namespace = Some(namespace.clone());
-
-    // SetDefaults_PersistentVolumeClaimSpec runs on update too; default
-    // volumeMode before the immutability check so an update that omits it
-    // (→ Filesystem) is not falsely rejected against a defaulted old value.
-    crate::handlers::defaults::apply_pvc_spec_defaults(&mut pvc.spec);
-
-    let key = build_key("persistentvolumeclaims", Some(&namespace), &name);
-
-    // Enforce update immutability (upstream ValidatePersistentVolumeClaimUpdate):
-    // volumeMode immutable + storage request may not shrink.
-    if let Ok(mut existing) = state
-        .storage
-        .get::<rusternetes_common::resources::PersistentVolumeClaim>(&key)
-        .await
-    {
-        // Default the stored object the same way as the incoming one before the
-        // immutability comparison. The new PVC is defaulted above, so a stored
-        // object that predates volumeMode defaulting would otherwise look like a
-        // forbidden volumeMode change (None → "Filesystem"). Defaulting is
-        // idempotent, matching upstream's defaulted-new-vs-defaulted-old compare.
-        crate::handlers::defaults::apply_pvc_spec_defaults(&mut existing.spec);
-        let errs = rusternetes_common::validation::pvc::validate_persistent_volume_claim_update(
-            &pvc, &existing,
-        );
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: PersistentVolumeClaim {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(pvc));
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    if let Ok(stored) = state.storage.get::<PersistentVolumeClaim>(&key).await {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut pvc.metadata,
-            &stored.metadata,
-        );
-    }
-    let updated = state.storage.update(&key, &pvc).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &updated,
-    )
-    .await?;
-
-    Ok(Json(updated))
-}
-
-pub async fn delete_pvc(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path((namespace, name)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<PersistentVolumeClaim>> {
-    info!("Deleting PersistentVolumeClaim: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "persistentvolumeclaims")
-        .with_namespace(&namespace)
-        .with_api_group("")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("persistentvolumeclaims", Some(&namespace), &name);
-
-    // Get the resource to check if it exists
-    let pvc: PersistentVolumeClaim = state.storage.get(&key).await?;
-
-    // Run validating admission webhooks for DELETE (object=nil, oldObject=pvc).
-    crate::handlers::admission_helper::run_delete_validating_webhooks(
-        &state,
-        "",
-        "v1",
-        "PersistentVolumeClaim",
-        "persistentvolumeclaims",
-        Some(&namespace),
-        &name,
-        &pvc,
-        &user_for_webhook,
-        is_dry_run,
-    )
-    .await?;
-
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: PersistentVolumeClaim {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(pvc));
-    }
-
-    let has_finalizers = crate::handlers::finalizers::handle_delete_with_finalizers(
-        &*state.storage,
-        &key,
-        &pvc,
-        &delete_opts,
-    )
-    .await?;
-
-    if has_finalizers {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: PersistentVolumeClaim = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    } else {
-        Ok(Json(pvc))
-    }
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(
-    patch_pvc,
-    PersistentVolumeClaim,
-    "persistentvolumeclaims",
-    ""
-);
-
-pub async fn deletecollection_persistentvolumeclaims(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection persistentvolumeclaims in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "persistentvolumeclaims")
-        .with_namespace(&namespace)
-        .with_api_group("");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: PersistentVolumeClaim collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all persistentvolumeclaims in the namespace
-    let prefix = build_prefix("persistentvolumeclaims", Some(&namespace));
-    let mut items = state.storage.list::<PersistentVolumeClaim>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key(
-            "persistentvolumeclaims",
-            Some(&namespace),
-            &item.metadata.name,
-        );
-
-        // Run validating admission webhooks for DELETE per item.
-        crate::handlers::admission_helper::run_delete_validating_webhooks(
-            &state,
-            "",
-            "v1",
-            "PersistentVolumeClaim",
-            "persistentvolumeclaims",
-            Some(&namespace),
-            &item.metadata.name,
-            &item,
-            &user_for_webhook,
-            false,
-        )
-        .await?;
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} persistentvolumeclaims deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }

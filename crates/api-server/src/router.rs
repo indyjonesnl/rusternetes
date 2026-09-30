@@ -1511,15 +1511,14 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/namespaces/:namespace/persistentvolumeclaims/:name/status",
-            get(handlers::status::get_status)
-                .put(handlers::status::update_status)
-                .patch(handlers::status::update_status),
+            get(handlers::persistentvolumeclaim::get_status)
+                .put(handlers::persistentvolumeclaim::update_status)
+                .patch(handlers::persistentvolumeclaim::patch_status),
         )
         // PersistentVolumeClaims (all namespaces)
         .route(
             "/api/v1/persistentvolumeclaims",
-            get(handlers::persistentvolumeclaim::list_all_pvcs)
-            .delete(handlers::persistentvolumeclaim::deletecollection_persistentvolumeclaims),
+            get(handlers::persistentvolumeclaim::list_all_pvcs),
         )
         // Watch persistentvolumeclaims in a namespace
         .route(

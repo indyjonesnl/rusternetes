@@ -403,7 +403,7 @@ pub struct TypedObjectReference {
     pub namespace: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistentVolumeClaimStatus {
     #[serde(default)]
