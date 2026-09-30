@@ -1,3 +1,5 @@
+pub mod resourcequota;
+
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection
 use chrono::Utc;
 use rusternetes_common::{

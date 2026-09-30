@@ -9,9 +9,10 @@
 //! `AdmissionToValidateObjectUpdateFunc` / `AdmissionToValidateObjectDeleteFunc`
 //! (registry/rest/rest.go) and runs on the fully formed object.
 //!
-//! Of those plugins Rusternetes implements the two webhook plugins and
-//! ValidatingAdmissionPolicy. MutatingAdmissionPolicy is not implemented, and
-//! ResourceQuota admission is not wired to the resources on this path.
+//! Of those plugins Rusternetes implements the two webhook plugins,
+//! ValidatingAdmissionPolicy and ResourceQuota
+//! ([`crate::admission::resourcequota`]). MutatingAdmissionPolicy is not
+//! implemented.
 //!
 //! The in-tree plugins ahead of them run first, in `AllOrderedPlugins` order
 //! (plugins.go:69-100), for the resources on this path that they handle:
@@ -26,8 +27,9 @@ use rusternetes_common::resources::PersistentVolumeClaim;
 use rusternetes_common::{Error, Result};
 
 use super::rest::{authorize, RequestScope};
+use crate::admission::resourcequota;
 use crate::registry::rest::{
-    Object, RequestContext, TransformFunc, ValidateObject, ValidateObjectUpdate,
+    GroupResource, Object, RequestContext, TransformFunc, ValidateObject, ValidateObjectUpdate,
 };
 use crate::state::ApiServerState;
 
@@ -208,8 +210,8 @@ impl Admission<'_> {
                 &self.request_resource(),
                 self.namespace,
                 &name,
-                obj,
-                old,
+                obj.clone(),
+                old.clone(),
                 &self.user_info(),
                 self.dry_run,
             )
@@ -217,7 +219,41 @@ impl Admission<'_> {
         {
             return Err(denied(&reason));
         }
-        Ok(())
+
+        self.validate_quota(op, &name, obj.as_ref(), old.as_ref())
+            .await
+    }
+
+    /// `QuotaAdmission.Validate` (apiserver/pkg/admission/plugin/
+    /// resourcequota/admission.go:158-165), last in the chain.
+    async fn validate_quota(
+        &self,
+        op: Operation,
+        name: &str,
+        obj: Option<&serde_json::Value>,
+        old: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let (Some(namespace), Some(obj)) = (self.namespace, obj) else {
+            return Ok(());
+        };
+        if resourcequota::is_namespace_creation(&op, &self.kind.group, &self.kind.kind) {
+            return Ok(());
+        }
+        let gr = GroupResource::new(&self.resource.group, &self.resource.resource);
+        let Some(evaluator) = resourcequota::evaluator::evaluator_for(&gr) else {
+            return Ok(());
+        };
+        let attrs = resourcequota::Attributes {
+            operation: op,
+            namespace,
+            subresource: self.subresource,
+            object: obj,
+            old_object: old,
+            dry_run: self.dry_run,
+        };
+        resourcequota::evaluate(&*self.state.storage, &*evaluator, &attrs)
+            .await
+            .map_err(|e| resourcequota::to_api_error(e, &gr, name))
     }
 }
 
