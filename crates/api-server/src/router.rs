@@ -2285,21 +2285,20 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/namespaces/:namespace/replicationcontrollers/:name/status",
-            get(handlers::status::get_status)
-                .put(handlers::status::update_status)
-                .patch(handlers::status::update_status),
+            get(handlers::replicationcontroller::get_status)
+                .put(handlers::replicationcontroller::update_status)
+                .patch(handlers::replicationcontroller::patch_status),
         )
         .route(
             "/api/v1/namespaces/:namespace/replicationcontrollers/:name/scale",
-            get(handlers::scale::get_scale)
-                .put(handlers::scale::update_scale)
-                .patch(handlers::scale::patch_scale),
+            get(handlers::replicationcontroller::get_scale)
+                .put(handlers::replicationcontroller::update_scale)
+                .patch(handlers::replicationcontroller::patch_scale),
         )
         // ReplicationControllers (all namespaces)
         .route(
             "/api/v1/replicationcontrollers",
-            get(handlers::replicationcontroller::list_all_replicationcontrollers)
-            .delete(handlers::replicationcontroller::deletecollection_replicationcontrollers),
+            get(handlers::replicationcontroller::list_all_replicationcontrollers),
         )
         // Apps v1 API - ControllerRevisions (namespace-scoped)
         .route(

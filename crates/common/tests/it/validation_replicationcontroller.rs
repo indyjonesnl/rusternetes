@@ -28,7 +28,7 @@ fn valid_rc_passes() {
     let errs = validate_replication_controller(&rc(json!({
         "replicas": 3,
         "selector": {"app": "web"},
-        "template": {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": []}}
+        "template": {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": [{"name": "c", "image": "nginx", "imagePullPolicy": "IfNotPresent", "terminationMessagePolicy": "File"}]}}
     })));
     assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 }
@@ -125,7 +125,7 @@ fn always_restart_policy_ok() {
         "selector": {"app": "web"},
         "template": {
             "metadata": {"labels": {"app": "web"}},
-            "spec": {"containers": [], "restartPolicy": "Always"}
+            "spec": {"containers": [{"name": "c", "image": "nginx", "imagePullPolicy": "IfNotPresent", "terminationMessagePolicy": "File"}], "restartPolicy": "Always"}
         }
     })));
     assert!(errs.is_empty(), "unexpected errors: {errs:?}");

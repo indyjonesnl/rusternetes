@@ -6,8 +6,15 @@
 //! `selector` from the template labels), matching upstream where validation
 //! sees the defaulted object.
 
-use crate::resources::workloads::ReplicationControllerSpec;
+use crate::resources::workloads::{
+    ReplicationController, ReplicationControllerSpec, ReplicationControllerStatus,
+};
 use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, validate_nonnegative_field, validate_object_meta,
+    validate_object_meta_update,
+};
+use crate::validation::podtemplate::validate_pod_template_spec;
 
 /// Validate a `ReplicationControllerSpec`. Mirrors upstream
 /// `ValidateReplicationControllerSpec`: non-negative `replicas` /
@@ -71,6 +78,14 @@ pub fn validate_replication_controller_spec(
         }
     }
 
+    // `ValidatePodTemplateSpecForRC` (validation.go:7026-7050) validates the
+    // template as a pod template, and then holds it to the RC rules.
+    errs.extend(validate_pod_template_spec(
+        &spec.template,
+        &fld_path.child("template"),
+        false,
+    ));
+
     // Upstream `ValidatePodTemplateSpecForRC` (validation.go:7041-7046): the RC
     // pod template must use `restartPolicy: Always`, and `activeDeadlineSeconds`
     // is forbidden.
@@ -97,10 +112,99 @@ pub fn validate_replication_controller_spec(
     errs
 }
 
-/// Validate a new `ReplicationController`. Mirrors upstream
-/// `ValidateReplicationController`. Run after defaulting.
-pub fn validate_replication_controller(
-    rc: &crate::resources::workloads::ReplicationController,
+/// Upstream `ValidateReplicationController` (validation.go:6969-6977). The
+/// name rule is `LongName`, a DNS subdomain. Run after defaulting.
+pub fn validate_replication_controller(rc: &ReplicationController) -> ErrorList {
+    let mut errs = validate_object_meta(
+        &rc.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_replication_controller_spec(
+        &rc.spec,
+        &Path::new("spec"),
+    ));
+    errs
+}
+
+/// Upstream `ValidateReplicationControllerUpdate` (validation.go:6979-6984).
+pub fn validate_replication_controller_update(
+    rc: &ReplicationController,
+    old: &ReplicationController,
 ) -> ErrorList {
-    validate_replication_controller_spec(&rc.spec, &Path::new("spec"))
+    let mut errs = validate_object_meta_update(&rc.metadata, &old.metadata, &Path::new("metadata"));
+    errs.extend(validate_replication_controller_spec(
+        &rc.spec,
+        &Path::new("spec"),
+    ));
+    errs
+}
+
+/// Upstream `ValidateReplicationControllerStatusUpdate` (validation.go:6986-6990).
+pub fn validate_replication_controller_status_update(
+    rc: &ReplicationController,
+    old: &ReplicationController,
+) -> ErrorList {
+    let mut errs = validate_object_meta_update(&rc.metadata, &old.metadata, &Path::new("metadata"));
+    let default = ReplicationControllerStatus::default();
+    errs.extend(validate_replication_controller_status(
+        rc.status.as_ref().unwrap_or(&default),
+        &Path::new("status"),
+    ));
+    errs
+}
+
+/// Upstream `ValidateReplicationControllerStatus` (validation.go:6992-7014).
+fn validate_replication_controller_status(
+    status: &ReplicationControllerStatus,
+    path: &Path,
+) -> ErrorList {
+    let replicas = status.replicas;
+    let fully_labeled = status.fully_labeled_replicas.unwrap_or(0);
+    let ready = status.ready_replicas.unwrap_or(0);
+    let available = status.available_replicas.unwrap_or(0);
+    let mut errs = validate_nonnegative_field(replicas as i64, &path.child("replicas"));
+    errs.extend(validate_nonnegative_field(
+        fully_labeled as i64,
+        &path.child("fullyLabeledReplicas"),
+    ));
+    errs.extend(validate_nonnegative_field(
+        ready as i64,
+        &path.child("readyReplicas"),
+    ));
+    errs.extend(validate_nonnegative_field(
+        available as i64,
+        &path.child("availableReplicas"),
+    ));
+    errs.extend(validate_nonnegative_field(
+        status.observed_generation.unwrap_or(0),
+        &path.child("observedGeneration"),
+    ));
+    let msg = "cannot be greater than status.replicas";
+    if fully_labeled > replicas {
+        errs.push(Error::invalid(
+            &path.child("fullyLabeledReplicas"),
+            fully_labeled,
+            msg,
+        ));
+    }
+    if ready > replicas {
+        errs.push(Error::invalid(&path.child("readyReplicas"), ready, msg));
+    }
+    if available > replicas {
+        errs.push(Error::invalid(
+            &path.child("availableReplicas"),
+            available,
+            msg,
+        ));
+    }
+    if available > ready {
+        errs.push(Error::invalid(
+            &path.child("availableReplicas"),
+            available,
+            "cannot be greater than readyReplicas",
+        ));
+    }
+    errs
 }
