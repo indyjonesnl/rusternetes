@@ -10,11 +10,21 @@
 use crate::resources::csi::{CSINode, CSINodeDriver};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1123_subdomain, is_qualified_name};
-use crate::validation::objectmeta::validate_nonnegative_field;
+use crate::validation::objectmeta::{validate_immutable_field, validate_nonnegative_field};
 use std::collections::HashSet;
 
 const CSI_DRIVER_NAME_MAX_LENGTH: usize = 63;
+/// `csiNodeIDMaxLength` / `csiNodeIDLongerMaxLength`
+/// (pkg/apis/storage/validation/validation.go).
 const CSI_NODE_ID_MAX_LENGTH: usize = 192;
+const CSI_NODE_ID_LONGER_MAX_LENGTH: usize = 256;
+
+/// `CSINodeValidationOptions` (validation.go:51-54). The CSINode strategy
+/// always sets `AllowLongNodeID`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CsiNodeValidationOptions {
+    pub allow_long_node_id: bool,
+}
 
 /// Port of upstream `ValidateCSIDriverName`: required, ≤63 chars, and a
 /// DNS-1123 subdomain when lowercased (caseless). Shared with ResourceSlice
@@ -39,6 +49,7 @@ fn validate_csi_node_driver(
     driver: &CSINodeDriver,
     seen_names: &mut HashSet<String>,
     fld_path: &Path,
+    opts: CsiNodeValidationOptions,
 ) -> ErrorList {
     let mut errs = validate_csi_driver_name(&driver.name, &fld_path.child("name"));
 
@@ -47,11 +58,16 @@ fn validate_csi_node_driver(
     if driver.node_id.is_empty() {
         errs.push(Error::required(&node_id_path, ""));
     }
-    if driver.node_id.len() > CSI_NODE_ID_MAX_LENGTH {
+    let max_length = if opts.allow_long_node_id {
+        CSI_NODE_ID_LONGER_MAX_LENGTH
+    } else {
+        CSI_NODE_ID_MAX_LENGTH
+    };
+    if driver.node_id.len() > max_length {
         errs.push(Error::invalid(
             &node_id_path,
             driver.node_id.clone(),
-            format!("must be {} characters or less", CSI_NODE_ID_MAX_LENGTH),
+            format!("must be {max_length} characters or less"),
         ));
     }
 
@@ -95,7 +111,7 @@ fn validate_csi_node_driver(
 
 /// Validate a `CSINode` on create. Mirrors upstream `ValidateCSINode` minus
 /// ObjectMeta.
-pub fn validate_csi_node(node: &CSINode) -> ErrorList {
+pub fn validate_csi_node(node: &CSINode, opts: CsiNodeValidationOptions) -> ErrorList {
     let drivers_path = Path::new("spec").child("drivers");
     let mut errs: ErrorList = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
@@ -104,20 +120,23 @@ pub fn validate_csi_node(node: &CSINode) -> ErrorList {
             driver,
             &mut seen_names,
             &drivers_path.index(i),
+            opts,
         ));
     }
     errs
 }
 
-/// Validate a `CSINode` on update. Mirrors upstream `ValidateCSINodeUpdate`:
-/// runs the create validation, then enforces that any driver entry present in
-/// both old and new (matched by name) is immutable. New drivers may be added.
-///
-/// Upstream gates mutating `allocatable` behind the alpha
-/// `MutableCSINodeAllocatableCount` feature gate (off by default), so the
-/// default behaviour treats the whole driver entry as immutable.
-pub fn validate_csi_node_update(new: &CSINode, old: &CSINode) -> ErrorList {
-    let mut errs = validate_csi_node(new);
+/// `ValidateCSINodeUpdate` (validation.go:313-339): the create validation,
+/// then any driver present in both old and new (matched by name) is
+/// immutable. `MutableCSINodeAllocatableCount` is on by default in 1.35
+/// (pkg/features/kube_features.go), so `allocatable` is excluded from the
+/// comparison; the bad value is the driver itself.
+pub fn validate_csi_node_update(
+    new: &CSINode,
+    old: &CSINode,
+    opts: CsiNodeValidationOptions,
+) -> ErrorList {
+    let mut errs = validate_csi_node(new, opts);
     let drivers_path = Path::new("spec").child("drivers");
 
     for old_driver in &old.spec.drivers {
@@ -125,15 +144,15 @@ pub fn validate_csi_node_update(new: &CSINode, old: &CSINode) -> ErrorList {
             if old_driver.name != new_driver.name {
                 continue;
             }
-            let differs =
-                serde_json::to_value(new_driver).ok() != serde_json::to_value(old_driver).ok();
-            if differs {
-                errs.push(Error::invalid(
-                    &drivers_path,
-                    new_driver.name.clone(),
-                    "field is immutable".to_string(),
-                ));
-            }
+            let mut old_copy = old_driver.clone();
+            let mut new_copy = new_driver.clone();
+            old_copy.allocatable = None;
+            new_copy.allocatable = None;
+            errs.extend(validate_immutable_field(
+                &new_copy,
+                &old_copy,
+                &drivers_path,
+            ));
         }
     }
     errs
@@ -143,6 +162,10 @@ pub fn validate_csi_node_update(new: &CSINode, old: &CSINode) -> ErrorList {
 mod tests {
     use super::*;
     use crate::resources::csi::{CSINodeSpec, VolumeNodeResources};
+
+    const LONG: CsiNodeValidationOptions = CsiNodeValidationOptions {
+        allow_long_node_id: true,
+    };
 
     fn node(drivers: Vec<CSINodeDriver>) -> CSINode {
         CSINode {
@@ -165,28 +188,28 @@ mod tests {
     fn unchanged_driver_passes() {
         let old = node(vec![driver("csi.example.com", "node-1")]);
         let new = node(vec![driver("csi.example.com", "node-1")]);
-        assert!(validate_csi_node_update(&new, &old).is_empty());
+        assert!(validate_csi_node_update(&new, &old, LONG).is_empty());
     }
 
     #[test]
     fn mutating_existing_driver_node_id_is_immutable() {
         let old = node(vec![driver("csi.example.com", "node-1")]);
         let new = node(vec![driver("csi.example.com", "node-2")]);
-        let errs = validate_csi_node_update(&new, &old);
+        let errs = validate_csi_node_update(&new, &old, LONG);
         assert!(
             errs.iter().any(|e| e.detail == "field is immutable"),
             "expected immutability error, got {errs:?}"
         );
     }
 
+    /// `MutableCSINodeAllocatableCount` (default on): `allocatable` may change.
     #[test]
-    fn mutating_existing_driver_allocatable_is_immutable() {
+    fn mutating_existing_driver_allocatable_is_allowed() {
         let old = node(vec![driver("csi.example.com", "node-1")]);
         let mut d = driver("csi.example.com", "node-1");
         d.allocatable = Some(VolumeNodeResources { count: Some(10) });
         let new = node(vec![d]);
-        let errs = validate_csi_node_update(&new, &old);
-        assert!(errs.iter().any(|e| e.detail == "field is immutable"));
+        assert!(validate_csi_node_update(&new, &old, LONG).is_empty());
     }
 
     #[test]
@@ -196,6 +219,6 @@ mod tests {
             driver("csi.example.com", "node-1"),
             driver("other.example.com", "node-1"),
         ]);
-        assert!(validate_csi_node_update(&new, &old).is_empty());
+        assert!(validate_csi_node_update(&new, &old, LONG).is_empty());
     }
 }

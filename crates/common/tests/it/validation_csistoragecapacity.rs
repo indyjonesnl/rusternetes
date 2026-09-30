@@ -2,7 +2,16 @@
 
 use rusternetes_common::resources::csi::CSIStorageCapacity;
 use rusternetes_common::resources::volume::{LabelSelector, LabelSelectorRequirement};
-use rusternetes_common::validation::csistoragecapacity::validate_csi_storage_capacity;
+use rusternetes_common::validation::csistoragecapacity::{self, CsiStorageCapacityValidateOptions};
+
+fn validate_csi_storage_capacity(
+    c: &CSIStorageCapacity,
+) -> rusternetes_common::validation::field::ErrorList {
+    csistoragecapacity::validate_csi_storage_capacity(
+        c,
+        CsiStorageCapacityValidateOptions::default(),
+    )
+}
 
 fn csc(sc_name: &str, capacity: Option<&str>) -> CSIStorageCapacity {
     let mut c = CSIStorageCapacity {

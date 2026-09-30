@@ -3,7 +3,7 @@
 use rusternetes_common::resources::csi::{
     CSINode, CSINodeDriver, CSINodeSpec, VolumeNodeResources,
 };
-use rusternetes_common::validation::csinode::validate_csi_node;
+use rusternetes_common::validation::csinode::{self, CsiNodeValidationOptions};
 use rusternetes_common::validation::field::ErrorType;
 
 fn driver(name: &str, node_id: &str) -> CSINodeDriver {
@@ -61,6 +61,23 @@ fn missing_node_id_rejected() {
     assert!(errs
         .iter()
         .any(|e| e.field == "spec.drivers[0].nodeID" && e.error_type == ErrorType::Required));
+}
+
+fn validate_csi_node(n: &CSINode) -> rusternetes_common::validation::field::ErrorList {
+    csinode::validate_csi_node(n, CsiNodeValidationOptions::default())
+}
+
+/// `AllowLongNodeID` raises the limit from 192 to 256 (validation.go:365-375).
+#[test]
+fn long_node_id_option_allows_up_to_256() {
+    let opts = CsiNodeValidationOptions {
+        allow_long_node_id: true,
+    };
+    let ok = node(vec![driver("csi.example.com", &"a".repeat(256))]);
+    assert!(csinode::validate_csi_node(&ok, opts).is_empty());
+    let long = node(vec![driver("csi.example.com", &"a".repeat(257))]);
+    let errs = csinode::validate_csi_node(&long, opts);
+    assert_eq!(errs[0].detail, "must be 256 characters or less");
 }
 
 #[test]
