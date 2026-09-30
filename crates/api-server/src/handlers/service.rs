@@ -233,63 +233,8 @@ pub async fn create(
         // Non-ExternalName types must not carry externalName — drop it (upstream
         // dropServiceDisabledFields) rather than rejecting a stray value.
         service.spec.external_name = None;
-        // Only allocate ClusterIP for ClusterIP, NodePort, and LoadBalancer services
-        if matches!(
-            service_type,
-            ServiceType::ClusterIP | ServiceType::NodePort | ServiceType::LoadBalancer
-        ) {
-            // If ClusterIP is not specified, allocate one
-            // "None" means headless service - don't allocate
-            if service.spec.cluster_ip.as_deref() == Some("None") {
-                // Headless service — keep ClusterIP as "None", no allocation
-            } else if service.spec.cluster_ip.is_none()
-                || service.spec.cluster_ip.as_deref() == Some("")
-            {
-                if let Some(allocated_ip) = state.ip_allocator.allocate() {
-                    info!(
-                        "Allocated ClusterIP {} for service {}/{}",
-                        allocated_ip, namespace, service.metadata.name
-                    );
-                    service.spec.cluster_ip = Some(allocated_ip);
-                } else {
-                    return Err(rusternetes_common::Error::Internal(
-                        "Failed to allocate ClusterIP: no IPs available".to_string(),
-                    ));
-                }
-            } else {
-                // User specified a ClusterIP, try to allocate it
-                let requested_ip = service.spec.cluster_ip.clone().unwrap();
-                if !state.ip_allocator.allocate_specific(requested_ip.clone()) {
-                    // Check if this service already exists with the same IP
-                    // (re-creation after restart). If so, allow it.
-                    let existing_key =
-                        build_key("services", Some(&namespace), &service.metadata.name);
-                    if let Ok(existing) = state.storage.get::<Service>(&existing_key).await {
-                        if existing.spec.cluster_ip.as_deref() == Some(&requested_ip) {
-                            info!(
-                                "ClusterIP {} already allocated for existing service {}/{}, reusing",
-                                requested_ip, namespace, service.metadata.name
-                            );
-                        } else {
-                            return Err(rusternetes_common::Error::InvalidResource(format!(
-                                "ClusterIP {} is already allocated or invalid",
-                                requested_ip
-                            )));
-                        }
-                    } else {
-                        return Err(rusternetes_common::Error::InvalidResource(format!(
-                            "ClusterIP {} is already allocated or invalid",
-                            requested_ip
-                        )));
-                    }
-                } else {
-                    info!(
-                        "Allocated specific ClusterIP {} for service {}/{}",
-                        requested_ip, namespace, service.metadata.name
-                    );
-                }
-            }
-        }
+        // The ClusterIP itself is allocated just before the write, with the
+        // node ports, so a request rejected before then claims nothing.
     }
 
     // Populate clusterIPs from clusterIP for consistency (K8s always returns both)
@@ -395,15 +340,25 @@ pub async fn create(
         }
     }
 
-    // Claim node ports (upstream beginCreate -> txnAllocNodePorts,
-    // pkg/registry/core/service/storage/storage.go + alloc.go:481). A dry run
-    // checks the requested ports without claiming them.
+    // Claim the ClusterIP, then the node ports (upstream beginCreate ->
+    // allocateCreate, pkg/registry/core/service/storage/alloc.go:65-100). A
+    // dry run checks the requested values without claiming them.
+    let ip_txn =
+        alloc::txn_alloc_cluster_ips(&state.cluster_ip_allocator, &mut service, is_dry_run).await?;
     let node_port_op =
-        alloc::txn_alloc_node_ports(&state.node_port_allocator, &mut service, is_dry_run).await?;
+        match alloc::txn_alloc_node_ports(&state.node_port_allocator, &mut service, is_dry_run)
+            .await
+        {
+            Ok(op) => op,
+            Err(e) => {
+                ip_txn.revert().await;
+                return Err(e);
+            }
+        };
 
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
-        alloc::settle(node_port_op, &Ok(())).await;
+        alloc::settle_all(ip_txn, node_port_op, &Ok(())).await;
         info!(
             "Dry-run: Service {}/{} validated successfully (not created)",
             namespace, service.metadata.name
@@ -412,7 +367,7 @@ pub async fn create(
     }
 
     let created = state.storage.create(&key, &service).await;
-    alloc::settle(node_port_op, &created).await;
+    alloc::settle_all(ip_txn, node_port_op, &created).await;
 
     Ok((StatusCode::CREATED, Json(created?)))
 }
@@ -562,12 +517,9 @@ pub async fn update(
             .cluster_ip
             .as_ref()
             .is_none_or(|ip| ip.is_empty());
-        if needs_ip && old_was_external_name {
-            if let Some(ip) = state.ip_allocator.allocate() {
-                service.spec.cluster_ip = Some(ip.clone());
-                service.spec.cluster_ips = Some(vec![ip]);
-            }
-        } else if needs_ip {
+        // From ExternalName the ClusterIP is allocated just before the
+        // write (txn_update_cluster_ips, case A).
+        if needs_ip && !old_was_external_name {
             // Old service had a ClusterIP (handled by the immutability fence
             // above), or this is some other inconsistent state. Restore the
             // stored ClusterIP rather than allocating a new one. The
@@ -617,19 +569,33 @@ pub async fn update(
         &mut service.metadata,
     );
 
-    // Claim and free node ports (upstream beginUpdate -> txnUpdateNodePorts,
-    // alloc.go:754).
-    let node_port_op = alloc::txn_update_node_ports(
-        &state.node_port_allocator,
+    // Claim and free the ClusterIP, then the node ports (upstream
+    // beginUpdate -> allocateUpdate, alloc.go:591-626).
+    let ip_txn = alloc::txn_update_cluster_ips(
+        &state.cluster_ip_allocator,
         &mut service,
         &old_service,
         is_dry_run,
     )
     .await?;
+    let node_port_op = match alloc::txn_update_node_ports(
+        &state.node_port_allocator,
+        &mut service,
+        &old_service,
+        is_dry_run,
+    )
+    .await
+    {
+        Ok(op) => op,
+        Err(e) => {
+            ip_txn.revert().await;
+            return Err(e);
+        }
+    };
 
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
-        alloc::settle(node_port_op, &Ok(())).await;
+        alloc::settle_all(ip_txn, node_port_op, &Ok(())).await;
         info!(
             "Dry-run: Service {}/{} validated successfully (not updated)",
             namespace, name
@@ -638,7 +604,7 @@ pub async fn update(
     }
 
     let updated = state.storage.update(&key, &service).await;
-    alloc::settle(node_port_op, &updated).await;
+    alloc::settle_all(ip_txn, node_port_op, &updated).await;
     let updated = updated?;
 
     // Upstream ShouldDeleteDuringUpdate: an update that drains the last
@@ -720,13 +686,7 @@ pub async fn delete_service(
     if deleted_immediately {
         // Upstream afterDelete -> releaseAllocatedResources (alloc.go:886).
         alloc::release_node_ports(&state.node_port_allocator, &service).await;
-        if let Some(cluster_ip) = &service.spec.cluster_ip {
-            state.ip_allocator.release(cluster_ip);
-            info!(
-                "Released ClusterIP {} from service {}/{}",
-                cluster_ip, namespace, name
-            );
-        }
+        alloc::release_cluster_ips(&state.cluster_ip_allocator, &service).await;
         Ok(Json(service))
     } else {
         // Resource has finalizers, re-read to get updated version with deletionTimestamp
@@ -884,8 +844,9 @@ pub async fn patch(
 ) -> rusternetes_common::Result<Json<Service>> {
     let (namespace, name) = path.0.clone();
     let key = rusternetes_storage::build_key("services", Some(&namespace), &name);
-    // The merge below writes before this handler sees the result, so the node
-    // ports are reconciled against the pre-patch object afterwards.
+    // The merge below writes before this handler sees the result, so the
+    // ClusterIP and node ports are reconciled against the pre-patch object
+    // afterwards.
     let old_service: Option<Service> = state.storage.get(&key).await.ok();
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&query.0);
     let result = crate::handlers::generic_patch::patch_namespaced_resource::<Service>(
@@ -923,46 +884,63 @@ pub async fn patch(
             }
             needs_update = true;
         }
-    } else {
-        // Changing FROM ExternalName (or new service) — allocate ClusterIP if needed
-        let needs_ip = service
-            .spec
-            .cluster_ip
-            .as_ref()
-            .is_none_or(|ip| ip.is_empty());
-        if needs_ip {
-            if let Some(ip) = state.ip_allocator.allocate() {
-                service.spec.cluster_ip = Some(ip.clone());
-                service.spec.cluster_ips = Some(vec![ip]);
-                needs_update = true;
-            }
-        }
     }
 
-    // Claim and free node ports against the pre-patch object (upstream
-    // beginUpdate -> txnUpdateNodePorts, alloc.go:754). A dry-run patch wrote
-    // nothing and claims nothing.
+    // Claim and free the ClusterIP and node ports against the pre-patch
+    // object (upstream beginUpdate -> allocateUpdate, alloc.go:591-626). A
+    // dry-run patch wrote nothing and claims nothing.
     let Some(old_service) = old_service else {
         return Ok(Json(service));
     };
+    let old_was_external_name = matches!(
+        old_service.spec.service_type,
+        Some(ServiceType::ExternalName)
+    );
+    let needs_ip = service
+        .spec
+        .cluster_ip
+        .as_ref()
+        .is_none_or(|ip| ip.is_empty());
+    if needs_ip
+        && !old_was_external_name
+        && !matches!(service.spec.service_type, Some(ServiceType::ExternalName))
+    {
+        // A patch that drops the immutable ClusterIP keeps the stored one.
+        service.spec.cluster_ip = old_service.spec.cluster_ip.clone();
+        service.spec.cluster_ips = old_service.spec.cluster_ips.clone();
+    }
     let before = serde_json::to_value(&service.spec).ok();
-    let node_port_op = alloc::txn_update_node_ports(
-        &state.node_port_allocator,
+    let ip_txn = alloc::txn_update_cluster_ips(
+        &state.cluster_ip_allocator,
         &mut service,
         &old_service,
         is_dry_run,
     )
     .await?;
+    let node_port_op = match alloc::txn_update_node_ports(
+        &state.node_port_allocator,
+        &mut service,
+        &old_service,
+        is_dry_run,
+    )
+    .await
+    {
+        Ok(op) => op,
+        Err(e) => {
+            ip_txn.revert().await;
+            return Err(e);
+        }
+    };
     if before != serde_json::to_value(&service.spec).ok() {
         needs_update = true;
     }
 
     if needs_update && !is_dry_run {
         let saved = state.storage.update(&key, &service).await;
-        alloc::settle(node_port_op, &saved).await;
+        alloc::settle_all(ip_txn, node_port_op, &saved).await;
         return Ok(Json(saved?));
     }
-    alloc::settle(node_port_op, &Ok(())).await;
+    alloc::settle_all(ip_txn, node_port_op, &Ok(())).await;
     Ok(Json(service))
 }
 
@@ -1042,6 +1020,7 @@ pub async fn deletecollection_services(
 
         if deleted_immediately {
             alloc::release_node_ports(&state.node_port_allocator, &item).await;
+            alloc::release_cluster_ips(&state.cluster_ip_allocator, &item).await;
             deleted_count += 1;
         }
     }

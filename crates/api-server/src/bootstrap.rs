@@ -532,8 +532,9 @@ const DEFAULT_SERVICE_CIDR_CONTROLLER: &str = "kubernetes-service-cidr-controlle
 
 /// The service range this api-server allocates ClusterIPs from — upstream's
 /// `--service-cluster-ip-range`, which this api-server does not expose as a
-/// flag. Must stay in step with [`crate::ip_allocator::ClusterIPAllocator::new`]
-/// and [`KUBERNETES_SERVICE_IP`] (the range's first address).
+/// flag. The `kubernetes` ServiceCIDR is seeded from it, and ClusterIPs are
+/// allocated from the ServiceCIDRs. Must stay in step with
+/// [`KUBERNETES_SERVICE_IP`] (the range's first address).
 pub const DEFAULT_SERVICE_CIDRS: &[&str] = &["10.96.0.0/12"];
 
 /// Upstream's controller interval (`default_servicecidr_controller.go:61`,
@@ -877,39 +878,92 @@ pub async fn repair_service_node_ports_once(
     .await
 }
 
-/// The NodePort half of the `start-service-ip-repair-controllers` post-start
-/// hook (pkg/registry/core/rest/storage_core.go:504-540): run
-/// `portallocator/controller.Repair` every `REPAIR_INTERVAL` (`RunUntil`,
-/// repair.go:75-87), and fail startup if the first pass does not succeed
-/// within a minute.
-pub async fn start_service_node_ports_repair(
+/// One ClusterIP repair pass (`RepairIPAddress.runOnce`), for the test
+/// harness: it creates the IPAddresses of Services stored without one.
+// Used by the test harness (test_support), not by the binary.
+#[allow(dead_code)]
+pub async fn repair_service_cluster_ips_once(
     state: &crate::state::ApiServerState,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    use crate::registry::core::service::portallocator::repair::{Repair, REPAIR_INTERVAL};
-    let mut repair = Repair::new(
-        state.storage.clone(),
-        state.node_port_allocator.port_range(),
-        state.node_port_registry.clone(),
-    );
+) -> rusternetes_common::Result<()> {
+    use crate::registry::core::service::ipallocator::repair::RepairIpAddress;
+    RepairIpAddress::new(state.storage.clone()).run_once().await
+}
+
+/// Run `pass` now and every `REPAIR_INTERVAL` after, signalling the first
+/// success (the `onFirstSuccess` callback of both `RunUntil`s).
+fn spawn_repair_loop<F, Fut>(
+    name: &'static str,
+    mut pass: F,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<()>,
+)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = rusternetes_common::Result<()>> + Send,
+{
+    use crate::registry::core::service::portallocator::repair::REPAIR_INTERVAL;
     let (first_success, first) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         let mut first_success = Some(first_success);
         loop {
-            match repair.run_once().await {
+            match pass().await {
                 Ok(()) => {
                     if let Some(tx) = first_success.take() {
                         let _ = tx.send(());
                     }
                 }
-                Err(e) => warn!("service NodePort repair: {e}"),
+                Err(e) => warn!("{name}: {e}"),
             }
             tokio::time::sleep(REPAIR_INTERVAL).await;
         }
     });
-    match tokio::time::timeout(INITIAL_REPAIR_TIMEOUT, first).await {
-        Ok(Ok(())) => Ok(handle),
+    (handle, first)
+}
+
+/// The `start-service-ip-repair-controllers` post-start hook
+/// (pkg/registry/core/rest/storage_core.go:504-540): run the ClusterIP
+/// repair (`RepairIPAddress`, storage_core.go:142-148) and the NodePort
+/// repair (`portallocator/controller.Repair`, :128) every
+/// `REPAIR_INTERVAL`, and fail startup unless both first passes succeed
+/// within one minute.
+pub async fn start_service_ip_repair_controllers(
+    state: &crate::state::ApiServerState,
+) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+    use crate::registry::core::service::ipallocator::repair::RepairIpAddress;
+    use crate::registry::core::service::portallocator::repair::Repair;
+
+    let ip_repair = Arc::new(RepairIpAddress::new(state.storage.clone()));
+    let (ip_handle, ip_first) = spawn_repair_loop("service ClusterIP repair", move || {
+        let ip_repair = ip_repair.clone();
+        async move {
+            // Wait for the default ServiceCIDR (repairip.go:196-206).
+            while !ip_repair.default_service_cidr_exists().await {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            ip_repair.run_once().await
+        }
+    });
+
+    let port_repair = Arc::new(tokio::sync::Mutex::new(Repair::new(
+        state.storage.clone(),
+        state.node_port_allocator.port_range(),
+        state.node_port_registry.clone(),
+    )));
+    let (port_handle, port_first) = spawn_repair_loop("service NodePort repair", move || {
+        let port_repair = port_repair.clone();
+        async move { port_repair.lock().await.run_once().await }
+    });
+
+    let both = async {
+        let (a, b) = tokio::join!(ip_first, port_first);
+        a.is_ok() && b.is_ok()
+    };
+    match tokio::time::timeout(INITIAL_REPAIR_TIMEOUT, both).await {
+        Ok(true) => Ok(vec![ip_handle, port_handle]),
         _ => {
-            handle.abort();
+            ip_handle.abort();
+            port_handle.abort();
             Err(anyhow::anyhow!(
                 "unable to perform initial IP and Port allocation check"
             ))

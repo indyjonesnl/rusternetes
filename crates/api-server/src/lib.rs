@@ -10,7 +10,6 @@ pub mod endpoints;
 pub mod flow_control;
 pub mod gnostic;
 pub mod handlers;
-pub mod ip_allocator;
 pub use rusternetes_middleware as middleware;
 pub mod openapi;
 pub mod patch;
@@ -41,7 +40,7 @@ use rusternetes_storage::{Storage, StorageBackend};
 use state::ApiServerState;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Resolve the cluster **CA** certificate PEM that gets embedded as `ca.crt` in
 /// ServiceAccount token secrets and `kube-root-ca.crt` ConfigMaps.
@@ -327,31 +326,10 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         .with_prometheus_client(prom_client),
     );
 
-    // The NodePort repair loop; startup waits for its first pass.
-    bootstrap::start_service_node_ports_repair(&state).await?;
-
-    // Pre-allocate ClusterIPs
-    {
-        let existing_services: Vec<rusternetes_common::resources::Service> =
-            Storage::list(state.storage.as_ref(), "/registry/services/")
-                .await
-                .unwrap_or_default();
-        for svc in &existing_services {
-            if let Some(ref ip) = svc.spec.cluster_ip {
-                if ip != "None" && !ip.is_empty() {
-                    state.ip_allocator.mark_allocated(ip.clone());
-                    debug!(
-                        "Pre-allocated ClusterIP {} for existing service {}",
-                        ip, svc.metadata.name
-                    );
-                }
-            }
-        }
-        info!(
-            "Pre-allocated {} ClusterIPs from existing services",
-            existing_services.len()
-        );
-    }
+    // The ClusterIP and NodePort repair loops; startup waits for their
+    // first passes. The ClusterIP repair also creates the IPAddress of
+    // every Service stored without one.
+    bootstrap::start_service_ip_repair_controllers(&state).await?;
 
     let app = router::build_router(state, config.console_dir.as_deref());
 
