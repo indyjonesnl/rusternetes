@@ -1,132 +1,80 @@
+//! PriorityClass endpoints.
+//!
+//! Writes go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the PriorityClass strategy
+//! ([`crate::registry::scheduling::priorityclass`]) — upstream's
+//! `pkg/registry/scheduling/priorityclass/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. The one-default rule
+//! is the Priority admission plugin, which runs in the Store's validating
+//! admission. Lists and watches are still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::scheduling::priorityclass;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::PriorityClass,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 
-/// Find an existing PriorityClass marked `globalDefault: true`, if any.
-///
-/// Mirrors the upstream priority admission plugin's `getDefaultPriorityClass`
-/// (plugin/pkg/admission/priority/admission.go): when more than one default
-/// exists (race), the one with the lowest `value` wins. Returns the name of
-/// the chosen default.
-async fn find_default_priority_class(state: &Arc<ApiServerState>) -> Result<Option<String>> {
-    let prefix = build_prefix("priorityclasses", None);
-    let existing = state.storage.list::<PriorityClass>(&prefix).await?;
-    let mut default: Option<&PriorityClass> = None;
-    for pc in &existing {
-        if pc.global_default == Some(true) {
-            match default {
-                Some(cur) if cur.value <= pc.value => {}
-                _ => default = Some(pc),
-            }
-        }
+/// The PriorityClass `RequestScope`: `scheduling.k8s.io/v1` `PriorityClass`
+/// served as `priorityclasses`, backed by `priorityclass.NewREST`.
+fn scope(state: &ApiServerState) -> RequestScope<PriorityClass> {
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "scheduling.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "PriorityClass".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "scheduling.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "priorityclasses".to_string(),
+        },
+        subresource: None,
+        store: Box::new(priorityclass::new_rest(state.storage.clone())),
+        apply: Some(crate::ssa::apply_legacy::<PriorityClass>),
+        convert_to_internal: Some(priorityclass::convert_to_internal),
     }
-    Ok(default.map(|pc| pc.metadata.name.clone()))
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
 }
 
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut priority_class): DumpingJson<PriorityClass>,
-) -> Result<(StatusCode, Json<PriorityClass>)> {
-    info!("Creating PriorityClass: {}", priority_class.metadata.name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "priorityclasses")
-        .with_api_group("scheduling.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &priority_class.metadata,
-        None,
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Validate the PriorityClass (upstream scheduling ValidatePriorityClass):
-    // system-prefix reservation, user-priority cap, preemptionPolicy enum.
-    let errs =
-        rusternetes_common::validation::priorityclass::validate_priority_class(&priority_class);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Enrich metadata with system fields
-    priority_class.metadata.ensure_uid();
-    priority_class.metadata.ensure_creation_timestamp();
-
-    // At most one PriorityClass may be globalDefault (upstream priority
-    // admission plugin). On create, any existing default conflicts.
-    if priority_class.global_default == Some(true) {
-        if let Some(existing_default) = find_default_priority_class(&state).await? {
-            return Err(rusternetes_common::Error::Forbidden(format!(
-                "PriorityClass {existing_default} is already marked as default. Only one default can exist"
-            )));
-        }
-    }
-
-    let key = build_key("priorityclasses", None, &priority_class.metadata.name);
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: PriorityClass {} validated successfully (not created)",
-            priority_class.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(priority_class)));
-    }
-
-    let created = state.storage.create(&key, &priority_class).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(&state, &scope(&state), &auth_ctx.user, None, &params, &body).await
 }
 
 pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
-) -> Result<Json<PriorityClass>> {
-    debug!("Getting PriorityClass: {}", name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "priorityclasses")
-        .with_api_group("scheduling.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("priorityclasses", None, &name);
-    let priority_class = state.storage.get(&key).await?;
-
-    Ok(Json(priority_class))
+) -> Result<Response> {
+    endpoints::get_resource(&state, &scope(&state), &auth_ctx.user, None, &name).await
 }
 
 pub async fn update(
@@ -134,158 +82,67 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut priority_class): DumpingJson<PriorityClass>,
-) -> Result<Json<PriorityClass>> {
-    info!("Updating PriorityClass: {}", name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "priorityclasses")
-        .with_api_group("scheduling.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("priorityclasses", None, &name),
-        "scheduling.k8s.io",
-        "priorityclasses",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        None,
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    priority_class.metadata.name = name.clone();
-
-    let key = build_key("priorityclasses", None, &name);
-
-    // Update validation (upstream ValidatePriorityClassUpdate): value and
-    // preemptionPolicy are immutable.
-    if let Ok(existing) = state.storage.get::<PriorityClass>(&key).await {
-        let errs = rusternetes_common::validation::priorityclass::validate_priority_class_update(
-            &priority_class,
-            &existing,
-        );
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // At most one PriorityClass may be globalDefault (upstream priority
-    // admission plugin). On update, a different existing default conflicts;
-    // re-marking the same class is allowed.
-    if priority_class.global_default == Some(true) {
-        if let Some(existing_default) = find_default_priority_class(&state).await? {
-            if existing_default != name {
-                return Err(rusternetes_common::Error::Forbidden(format!(
-                    "PriorityClass {existing_default} is already marked as default. Only one default can exist"
-                )));
-            }
-        }
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: PriorityClass {} validated successfully (not updated)",
-            name
-        );
-        return Ok(Json(priority_class));
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    if let Ok(stored) = state.storage.get::<PriorityClass>(&key).await {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut priority_class.metadata,
-            &stored.metadata,
-        );
-    }
-    let result = state.storage.update(&key, &priority_class).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<PriorityClass>> {
-    info!("Deleting PriorityClass: {}", name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "priorityclasses")
-        .with_api_group("scheduling.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("priorityclasses", None, &name);
-
-    // Get the priority class for finalizer handling
-    let priority_class: PriorityClass = state.storage.get(&key).await?;
-
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: PriorityClass {} validated successfully (not deleted)",
-            name
-        );
-        return Ok(Json(priority_class));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &priority_class,
-        &delete_opts,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    if deleted_immediately {
-        Ok(Json(priority_class))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: PriorityClass = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+pub async fn deletecollection_priorityclasses(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(&state, &scope(&state), &auth_ctx.user, None, &params, &body).await
 }
 
 pub async fn list(
@@ -332,118 +189,4 @@ pub async fn list(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-// Use the macro to create a PATCH handler
-pub async fn patch(
-    state: axum::extract::State<std::sync::Arc<crate::state::ApiServerState>>,
-    auth_ctx: axum::Extension<crate::middleware::AuthContext>,
-    path: axum::extract::Path<String>,
-    query: axum::extract::Query<std::collections::HashMap<String, String>>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> rusternetes_common::Result<axum::Json<PriorityClass>> {
-    let name = path.0.clone();
-    // Get existing value before patch to check immutability
-    let key = build_key("priorityclasses", None, &name);
-    let existing_pc = state.storage.get::<PriorityClass>(&key).await.ok();
-    let existing_value = existing_pc.as_ref().map(|pc| pc.value);
-
-    // Apply the patch to compute the result without writing yet.
-    // We need to check immutability BEFORE persisting.
-    let result = crate::handlers::generic_patch::patch_cluster_resource::<PriorityClass>(
-        state.clone(),
-        auth_ctx,
-        axum::extract::Path(name.clone()),
-        query,
-        headers,
-        body,
-        "priorityclasses",
-        "scheduling.k8s.io",
-    )
-    .await?;
-
-    // Validate immutable field wasn't changed — if it was, revert by
-    // writing back the original value (using the new resource version)
-    if let Some(old_value) = existing_value {
-        if result.0.value != old_value {
-            // Revert: restore original PriorityClass with the new resource version
-            // so the update succeeds (the old resource version is stale)
-            if let Some(mut original) = existing_pc {
-                original.metadata.resource_version = result.0.metadata.resource_version.clone();
-                let _ = state.storage.update(&key, &original).await;
-            }
-            return Err(rusternetes_common::Error::InvalidResource(format!(
-                "PriorityClass.value: Invalid value: \"{}\": field is immutable",
-                result.0.value
-            )));
-        }
-    }
-
-    Ok(result)
-}
-
-pub async fn deletecollection_priorityclasses(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!("DeleteCollection priorityclasses with params: {:?}", params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "priorityclasses")
-        .with_api_group("scheduling.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: PriorityClass collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all priorityclasses
-    let prefix = build_prefix("priorityclasses", None);
-    let mut items = state.storage.list::<PriorityClass>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("priorityclasses", None, &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} priorityclasses deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }
