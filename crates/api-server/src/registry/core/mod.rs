@@ -12,3 +12,4 @@ pub mod podtemplate;
 pub mod replicationcontroller;
 pub mod resourcequota;
 pub mod secret;
+pub mod service;

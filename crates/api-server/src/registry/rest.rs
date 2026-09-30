@@ -272,7 +272,7 @@ pub fn expected_namespace_for_scope(
     }
 }
 
-fn internal_error(msg: impl std::fmt::Display) -> Error {
+pub(crate) fn internal_error(msg: impl std::fmt::Display) -> Error {
     // `errors.NewInternalError(err)` (apimachinery/pkg/api/errors/errors.go:387).
     Error::Internal(format!("Internal error occurred: {msg}"))
 }

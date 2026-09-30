@@ -23,6 +23,7 @@ axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 bytes = { version = "1.5", optional = true }
 tokio = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -33,4 +34,5 @@ apiserver-harness = [
     "dep:tower",
     "dep:bytes",
     "dep:tokio",
+    "dep:futures",
 ]
