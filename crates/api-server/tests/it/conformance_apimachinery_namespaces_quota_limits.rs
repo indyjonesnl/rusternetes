@@ -432,36 +432,6 @@ async fn namespace_list_by_label_selector_returns_only_matches() {
     assert_eq!(names, ["ns-rq-lifecycle"], "exactly one list MUST be found");
 }
 
-/// [sig-api-machinery] Namespaces creating namespaces should auto-create the
-/// default ServiceAccount [Conformance]
-///
-/// Upstream: no conformance case. The `default` ServiceAccount is seeded by
-/// upstream's ServiceAccount controller, and the conformance suite relies on it
-/// rather than asserting it — `k8s.io/kubernetes/test/e2e/auth/service_accounts.go`
-/// consumes it throughout.
-/// Mirror audit (#1749, 2026-08-26): not a conformance case; label removed.
-/// `WaitForServiceAccountInNamespace` (every conformance test relies on it).
-/// Sonobuoy (Round 160): PASS
-#[tokio::test]
-async fn namespace_create_auto_provisions_default_service_account() {
-    let (router, mem) = spawn_router();
-    let (status, _) = send_json(
-        router,
-        "POST",
-        "/api/v1/namespaces",
-        Some(&ns_body("ns-sa-test")),
-    )
-    .await;
-    assert_eq!(status, 201);
-
-    // Direct storage check — the namespace handler must have created the
-    // default ServiceAccount object as part of the create handler.
-    let sa_key = build_key("serviceaccounts", Some("ns-sa-test"), "default");
-    let sa: Value = mem.get(&sa_key).await.expect("default SA must exist");
-    assert_eq!(sa["metadata"]["name"], "default");
-    assert_eq!(sa["metadata"]["namespace"], "ns-sa-test");
-}
-
 /// [sig-api-machinery] Namespaces server-side finalize entrypoint
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/namespace.go:404
@@ -521,7 +491,9 @@ async fn namespace_finalize_subresource_removes_finalizer() {
     // PUT the namespace back with empty finalizers (simulating the namespace
     // controller calling `/finalize` after cleanup). The lifecycle finalizer
     // lives in spec.finalizers (upstream namespaceStrategy.PrepareForCreate).
-    let mut finalized = created.clone();
+    // Upstream GETs the namespace before each Finalize (namespace.go:442), so
+    // the write carries the current resourceVersion.
+    let mut finalized = added.clone();
     finalized["spec"]["finalizers"] = json!([]);
     let (status, body) = send_json(
         router,

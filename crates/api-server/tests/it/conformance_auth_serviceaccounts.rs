@@ -78,23 +78,6 @@ fn spawn_state() -> (TestApiServer, Arc<MemoryStorage>) {
     (api, mem)
 }
 
-/// Build a state with a fake CA cert so the namespace handler creates the
-/// `kube-root-ca.crt` ConfigMap. In production the cert comes from a TLS
-/// cert file on disk; in unit tests we inject it via the harness builder.
-fn spawn_state_with_ca_cert() -> (TestApiServer, Arc<MemoryStorage>) {
-    // A self-signed PEM stub — not a real certificate, but non-empty so the
-    // namespace handler creates kube-root-ca.crt with a ca.crt key.
-    let fake_ca = "-----BEGIN CERTIFICATE-----\n\
-                   MIIBpTCCAU+gAwIBAgIUConformanceTestCA\n\
-                   -----END CERTIFICATE-----\n";
-    let api = TestApiServer::builder()
-        .secret(TOKEN_SECRET)
-        .ca_cert_pem(fake_ca)
-        .build();
-    let mem = api.storage.clone();
-    (api, mem)
-}
-
 async fn post_json(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
     let (status, value) = state.post(uri, body).await;
     (status.as_u16(), value)
@@ -467,83 +450,9 @@ async fn service_account_automount_field_is_mutable_via_patch() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// [sig-auth] ServiceAccounts should guarantee kube-root-ca.crt exist in
-// any namespace [Conformance]
-//
-// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:
-//   "should guarantee kube-root-ca.crt exist in any namespace"
-// Sonobuoy (batch-64, 2026-05-28): PASS
-//
-// When a namespace is created the API server must auto-create a ConfigMap
-// named `kube-root-ca.crt` in that namespace containing a `ca.crt` key.
-// ---------------------------------------------------------------------------
-
-/// After creating a namespace the `kube-root-ca.crt` ConfigMap must exist
-/// with a `ca.crt` data key (may be empty in the test environment where no
-/// real CA is configured, but the ConfigMap itself must be present).
-///
-/// [sig-auth] ServiceAccounts should guarantee kube-root-ca.crt exist in any
-/// namespace [Conformance]
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/service_accounts.go:775-833
-/// Sonobuoy (batch-64, 2026-05-28): PASS
-/// Mirror audit (#1749, 2026-08-25): re-derived from the upstream body.
-///
-/// The upstream Description block lists three requirements, and the body
-/// asserts all three in sequence:
-///   1. created automatically — mirrored here
-///   2. recreated if deleted — `kube_root_ca_crt_is_recreated_after_deletion`
-///   3. reconciled if modified —
-///      `kube_root_ca_crt_is_reconciled_after_modification`
-///
-/// (2) and (3) belong to `NamespaceController::reconcile_namespace`, the port
-/// of `pkg/controller/certificates/rootcacertpublisher/publisher.go`
-/// `syncNamespace()`, so they live in
-/// `crates/controller-manager/tests/it/namespace_controller_test.rs`. Before
-/// the #1749 audit neither had a counterpart anywhere, and this file carried
-/// two mirrors of requirement (1) — the second a strict subset of the first.
-#[tokio::test]
-async fn kube_root_ca_crt_configmap_exists_in_new_namespace() {
-    // Use the CA-cert-aware state so the namespace handler creates the
-    // kube-root-ca.crt ConfigMap (it is skipped when ca_cert_pem is None
-    // and no TLS cert file is present on the host).
-    let (state, _) = spawn_state_with_ca_cert();
-    let ns = "kube-root-ca-test";
-
-    // Create the namespace via the REST API.
-    let ns_body = json!({
-        "apiVersion": "v1",
-        "kind": "Namespace",
-        "metadata": {"name": ns}
-    });
-    let (status, body) = post_json(state.clone(), "/api/v1/namespaces", &ns_body).await;
-    assert_eq!(status, 201, "create namespace: {body}");
-
-    // The ConfigMap `kube-root-ca.crt` must be automatically present.
-    let (status, cm) = get_json(
-        state.clone(),
-        &format!("/api/v1/namespaces/{ns}/configmaps/kube-root-ca.crt"),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "kube-root-ca.crt ConfigMap must exist in namespace {ns}: {cm}"
-    );
-    assert_eq!(
-        cm["metadata"]["name"], "kube-root-ca.crt",
-        "ConfigMap name mismatch: {cm}"
-    );
-    // Upstream's poll only accepts the ConfigMap once `data["ca.crt"]` exists
-    // and is non-empty (service_accounts.go:826-830).
-    let ca = cm["data"]["ca.crt"]
-        .as_str()
-        .unwrap_or_else(|| panic!("kube-root-ca.crt must contain a 'ca.crt' key: {cm}"));
-    assert!(
-        !ca.is_empty(),
-        "kube-root-ca.crt 'ca.crt' must be non-empty: {cm}"
-    );
-}
+// [sig-auth] ServiceAccounts should guarantee kube-root-ca.crt exist in any
+// namespace [Conformance] is the root-CA publisher's, not the api-server's:
+// see `crates/controller-manager/tests/it/namespace_controller_test.rs`.
 
 // ---------------------------------------------------------------------------
 // [sig-auth] ServiceAccounts should mount projected service account token

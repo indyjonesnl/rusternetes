@@ -645,12 +645,11 @@ async fn test_namespace_rbac_isolation() {
 //   2. Recreated if deleted
 //   3. Reconciled if modified
 //
-// (1) is the api-server's namespace-create path and is mirrored by
-// `kube_root_ca_crt_configmap_exists_in_new_namespace` in
-// `crates/api-server/tests/it/conformance_auth_serviceaccounts.rs`. (2) and (3)
-// belong to `NamespaceController::reconcile_namespace`, and had no counterpart
-// anywhere until the #1749 mirror audit — the recreate-on-delete and
-// reconcile-on-modify branches were implemented but never asserted.
+// All three belong to `NamespaceController::reconcile_namespace`: upstream's
+// api-server creates nothing when a namespace is created
+// (pkg/registry/core/namespace/strategy.go `PrepareForCreate`), and the
+// publisher's namespace handler creates the ConfigMap (publisher.go:74-77,
+// `namespaceAdded`).
 // ---------------------------------------------------------------------------
 
 /// A cluster CA PEM stub. Only its non-emptiness matters: the controller skips
@@ -677,6 +676,28 @@ fn active_ns(name: &str) -> Namespace {
             conditions: None,
         }),
     }
+}
+
+/// Upstream step 1: "Created automatically" — the first sync of a new
+/// namespace publishes the cluster CA (service_accounts.go:776-786).
+#[tokio::test]
+async fn kube_root_ca_crt_is_created_in_a_new_namespace() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller =
+        NamespaceController::new(storage.clone()).with_ca_cert(Some(TEST_CA_PEM.to_string()));
+
+    let ns = "root-ca-create";
+    storage
+        .create(&build_key("namespaces", None, ns), &active_ns(ns))
+        .await
+        .unwrap();
+
+    controller.reconcile_all().await.unwrap();
+    let cm: serde_json::Value = storage
+        .get(&build_key("configmaps", Some(ns), "kube-root-ca.crt"))
+        .await
+        .expect("kube-root-ca.crt must be created in a new namespace");
+    assert_eq!(cm["data"]["ca.crt"], TEST_CA_PEM, "{cm}");
 }
 
 /// Upstream step 2: "Recreated if deleted".

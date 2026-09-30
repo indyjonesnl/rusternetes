@@ -958,8 +958,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     let mut protected_routes = Router::new()
         // Core v1 API
         .route("/api/v1/namespaces", get(handlers::namespace::list)
-            .post(handlers::namespace::create)
-            .delete(handlers::namespace::deletecollection_namespaces))
+            .post(handlers::namespace::create))
         .route(
             "/api/v1/namespaces/:name",
             get(handlers::namespace::get)
@@ -969,9 +968,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/namespaces/:name/status",
-            get(handlers::status::get_cluster_status)
-                .put(handlers::status::update_cluster_status)
-                .patch(handlers::status::update_cluster_status),
+            get(handlers::namespace::get_status)
+                .put(handlers::namespace::update_status)
+                .patch(handlers::namespace::patch_status),
         )
         .route(
             "/api/v1/namespaces/:name/finalize",

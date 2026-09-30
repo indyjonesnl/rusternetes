@@ -142,11 +142,12 @@ async fn create_namespace(state: &TestApiServer, name: &str) -> (StatusCode, Val
 ///    different UID. Upstream message:
 ///    "Expected different UID with recreated serviceaccount."
 ///
-/// Step 2 is satisfied by the synchronous default-SA creation in
-/// `crates/api-server/src/handlers/namespace.rs`. Step 4 is driven by the
-/// production `ServiceAccountController::reconcile_all` loop (same code
-/// path the controller-manager runs in production) spawned as a tokio task
-/// inside the test. Mirrors upstream — controller does the work, test polls.
+/// Steps 2 and 4 are driven by the production
+/// `ServiceAccountController::reconcile_all` loop (same code path the
+/// controller-manager runs in production) spawned as a tokio task inside the
+/// test. Mirrors upstream — the controller does the work and the test polls
+/// (`getServiceAccount(..., shouldWait=true)`, service_account_test.go:432-450);
+/// the api-server creates nothing on namespace create.
 #[tokio::test]
 async fn test_service_account_auto_create() {
     let state = spawn_state();
@@ -179,12 +180,21 @@ async fn test_service_account_auto_create() {
         "POST /api/v1/namespaces must return 201: {body}"
     );
 
-    // (2) The `default` ServiceAccount must exist in the new namespace.
-    let (status, default_sa) = get_json(
-        &state,
-        &format!("/api/v1/namespaces/{ns}/serviceaccounts/default"),
-    )
-    .await;
+    // (2) The `default` ServiceAccount must appear in the new namespace.
+    let mut found = None;
+    for _ in 0..40 {
+        let got = get_json(
+            &state,
+            &format!("/api/v1/namespaces/{ns}/serviceaccounts/default"),
+        )
+        .await;
+        if got.0 != StatusCode::NOT_FOUND {
+            found = Some(got);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (status, default_sa) = found.expect("controller did not create default SA within 2s");
     assert_eq!(
         status,
         StatusCode::OK,
