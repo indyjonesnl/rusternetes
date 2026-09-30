@@ -76,6 +76,12 @@ async fn lease_update_rejects_invalid_spec() {
         "invalid leaseDurationSeconds must be rejected"
     );
 
-    let (code, _) = state.put(&item, &lease(name, Some(60))).await;
-    assert_eq!(code, StatusCode::OK, "valid update must succeed");
+    // Leases refuse unconditional updates
+    // (pkg/registry/coordination/lease/strategy.go `AllowUnconditionalUpdate`),
+    // so the valid PUT carries the stored resourceVersion.
+    let (_, stored) = state.get(&item).await;
+    let mut valid = lease(name, Some(60));
+    valid["metadata"]["resourceVersion"] = stored["metadata"]["resourceVersion"].clone();
+    let (code, body) = state.put(&item, &valid).await;
+    assert_eq!(code, StatusCode::OK, "valid update must succeed: {body}");
 }
