@@ -260,6 +260,21 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     // only when the persisted CIDRs match this api-server's configuration.
     bootstrap::start_default_servicecidr_controller(storage.clone()).await;
 
+    // kube-system/extension-apiserver-authentication, kept by the
+    // apiserver-side ClusterAuthenticationTrust controller (upstream
+    // `pkg/controlplane/controller/clusterauthenticationtrust`).
+    if let Err(e) =
+        bootstrap::bootstrap_extension_apiserver_authentication_rbac(storage.clone()).await
+    {
+        warn!(
+            "Failed to bootstrap extension-apiserver-authentication RBAC: {e}. Continuing anyway."
+        );
+    }
+    bootstrap::spawn_cluster_authentication_trust_controller(
+        storage.clone(),
+        bootstrap::cluster_authentication_info(ca_cert_pem.as_deref()),
+    );
+
     // Create default StorageClass (like k3s/kind ship with a default)
     {
         let sc_key = rusternetes_storage::build_key("storageclasses", None, "standard");
