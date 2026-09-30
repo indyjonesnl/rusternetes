@@ -342,6 +342,8 @@ pub fn allow_create_on_update(group: &str, resource: &str) -> bool {
             | ("", "endpoints")
             // pkg/registry/core/service/strategy.go (`svcStrategy`)
             | ("", "services")
+            // pkg/registry/node/runtimeclass/strategy.go
+            | ("node.k8s.io", "runtimeclasses")
     )
 }
 

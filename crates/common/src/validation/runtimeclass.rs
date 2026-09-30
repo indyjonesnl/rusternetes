@@ -278,6 +278,64 @@ pub fn validate_runtime_class_update(new_rc: &RuntimeClass, old_rc: &RuntimeClas
     errs
 }
 
+/// `deprecatedNodeLabels` (pkg/api/node/util.go:29-38).
+const DEPRECATED_NODE_LABELS: &[(&str, &str)] = &[
+    (
+        "beta.kubernetes.io/arch",
+        r#"deprecated since v1.14; use "kubernetes.io/arch" instead"#,
+    ),
+    (
+        "beta.kubernetes.io/os",
+        r#"deprecated since v1.14; use "kubernetes.io/os" instead"#,
+    ),
+    (
+        "failure-domain.beta.kubernetes.io/region",
+        r#"deprecated since v1.17; use "topology.kubernetes.io/region" instead"#,
+    ),
+    (
+        "failure-domain.beta.kubernetes.io/zone",
+        r#"deprecated since v1.17; use "topology.kubernetes.io/zone" instead"#,
+    ),
+    (
+        "beta.kubernetes.io/instance-type",
+        r#"deprecated since v1.17; use "node.kubernetes.io/instance-type" instead"#,
+    ),
+    ("app.kubernetes.io/created-by", "deprecated since v1.9"),
+    (
+        "scheduler.alpha.kubernetes.io/preferAvoidPods",
+        "deprecated since v1.22; use Taints and Tolerations instead",
+    ),
+    (
+        "node-role.kubernetes.io/master",
+        r#"use "node-role.kubernetes.io/control-plane" instead"#,
+    ),
+];
+
+/// `GetNodeLabelDeprecatedMessage` (pkg/api/node/util.go:40-45).
+pub fn get_node_label_deprecated_message(key: &str) -> Option<&'static str> {
+    DEPRECATED_NODE_LABELS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, msg)| *msg)
+}
+
+/// `GetWarningsForRuntimeClass` (pkg/api/node/util.go:47-60): a warning per
+/// deprecated node label in `scheduling.nodeSelector`.
+pub fn get_warnings_for_runtime_class(rc: &RuntimeClass) -> Vec<String> {
+    let Some(node_selector) = rc
+        .scheduling
+        .as_ref()
+        .and_then(|s| s.node_selector.as_ref())
+    else {
+        return Vec::new();
+    };
+    node_selector
+        .keys()
+        .filter_map(|key| get_node_label_deprecated_message(key))
+        .map(|msg| format!("scheduling.nodeSelector: {msg}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

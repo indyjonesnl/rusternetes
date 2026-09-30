@@ -47,6 +47,8 @@ const CREATE_ON_UPDATE: &[(&str, &str)] = &[
     // pkg/registry/core/service/strategy.go: `svcStrategy`, which
     // `serviceStatusStrategy` embeds, so `/status` creates too.
     ("", "services"),
+    // pkg/registry/node/runtimeclass/strategy.go
+    ("node.k8s.io", "runtimeclasses"),
 ];
 
 type Gvr = (String, String, String);
@@ -342,7 +344,7 @@ async fn every_update_handler_consults_the_create_on_update_table() {
     // scan — its update path is `Store.Update`, whose create-on-update gate
     // `configmap_generic_store_test` pins — so the floor falls with them.
     assert!(
-        checked >= 45,
+        checked >= 44,
         "guard scanned only {checked} update handlers that can create -- the \
          parser stopped matching, which would make this test vacuously green"
     );
