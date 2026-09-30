@@ -1552,9 +1552,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/networking.k8s.io/v1/namespaces/:namespace/ingresses/:name/status",
-            get(handlers::status::get_status)
-                .put(handlers::status::update_status)
-                .patch(handlers::status::update_status),
+            get(handlers::ingress::get_status)
+                .put(handlers::ingress::update_status)
+                .patch(handlers::ingress::patch_status),
         )
         // Ingresses (all namespaces)
         .route(

@@ -1,21 +1,27 @@
-//! Ingress validation — port of upstream Kubernetes
-//! `pkg/apis/networking/validation/validation.go::ValidateIngressSpec`
-//! (release-1.35).
-//!
-//! Scope: the load-bearing field checks — rules-or-defaultBackend, host
-//! (DNS, not IP, with wildcard support), HTTP paths (required, pathType,
-//! absolute path, invalid sequences/suffixes), backends (exactly one of
-//! service/resource; service name + port), `spec.tls` (host (wildcard) DNS
-//! names + secretName), and `spec.ingressClassName` (DNS-1123 subdomain).
+//! Ingress validators ported from Kubernetes release-1.35
+//! `pkg/apis/networking/validation/validation.go:293-553,592-622,670-744`.
+//! Feature gates follow the upstream defaults: relaxed service names and strict
+//! legacy IP validation are disabled (`pkg/features/kube_features.go:1708,1844`).
 
-use std::net::IpAddr;
-use std::str::FromStr;
+use std::net::{IpAddr, Ipv4Addr};
 
-use crate::resources::ingress::{HTTPIngressPath, Ingress, IngressBackend, IngressSpec};
+use crate::resources::ingress::{
+    HTTPIngressPath, Ingress, IngressBackend, IngressLoadBalancerStatus, IngressRule, IngressSpec,
+};
 use crate::validation::field::{Error, ErrorList, Path};
-use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
+use crate::validation::metav1::{is_dns1035_label, is_dns1123_label, is_dns1123_subdomain};
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, name_is_path_segment, validate_object_meta, validate_object_meta_update,
+};
 use once_cell::sync::Lazy;
 use regex::Regex;
+
+#[derive(Clone, Copy, Default)]
+struct IngressValidationOptions {
+    allow_invalid_secret_name: bool,
+    allow_invalid_wildcard_host_rule: bool,
+    allow_relaxed_service_name_validation: bool,
+}
 
 const DNS1123_SUBDOMAIN_MAX_LENGTH: usize = 253;
 
@@ -47,278 +53,517 @@ fn is_wildcard_dns1123_subdomain(value: &str) -> Vec<String> {
     errs
 }
 
-/// Port of upstream `validateIngressTLS`: each `tls[].hosts[]` entry is a
-/// (wildcard) DNS-1123 subdomain, and `secretName` (when set) is a DNS-1123
-/// subdomain.
-fn validate_ingress_tls(spec: &IngressSpec, fld_path: &Path) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
-    let Some(tls) = spec.tls.as_ref() else {
-        return errs;
-    };
-    for (ti, itls) in tls.iter().enumerate() {
+/// `netutils.ParseIPSloppy`, including leading zeros in embedded IPv4 tails.
+/// Upstream vendor/k8s.io/utils/internal/third_party/forked/golang/net/ip.go:42.
+pub(crate) fn parse_ip_sloppy(value: &str) -> Option<IpAddr> {
+    if let Ok(ip) = value.parse() {
+        return Some(ip);
+    }
+    let (prefix, dotted) = value
+        .rsplit_once(':')
+        .map_or((None, value), |(prefix, tail)| (Some(prefix), tail));
+    let mut parts = dotted.split('.');
+    let mut octets = [0; 4];
+    for octet in &mut octets {
+        let part = parts.next()?;
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *octet = part
+            .bytes()
+            .try_fold(0u8, |n, b| n.checked_mul(10)?.checked_add(b - b'0'))?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    let ipv4 = Ipv4Addr::from(octets);
+    match prefix {
+        Some(prefix) => format!("{prefix}:{ipv4}").parse().ok(),
+        None => Some(IpAddr::V4(ipv4)),
+    }
+}
+
+fn validate_ingress_tls_with_options(
+    spec: &IngressSpec,
+    fld_path: &Path,
+    opts: IngressValidationOptions,
+) -> ErrorList {
+    let mut errs = Vec::new();
+    for (ti, tls) in spec.tls.iter().flatten().enumerate() {
         let tls_path = fld_path.index(ti);
-        if let Some(hosts) = &itls.hosts {
-            for (hi, host) in hosts.iter().enumerate() {
-                let host_path = tls_path.child("hosts").index(hi);
-                let msgs = if host.contains('*') {
-                    is_wildcard_dns1123_subdomain(host)
-                } else {
-                    is_dns1123_subdomain(host)
-                };
-                for msg in msgs {
-                    errs.push(Error::invalid(&host_path, host.clone(), msg));
-                }
+        for (hi, host) in tls.hosts.iter().flatten().enumerate() {
+            let messages = if host.contains('*') {
+                is_wildcard_dns1123_subdomain(host)
+            } else {
+                is_dns1123_subdomain(host)
+            };
+            for message in messages {
+                errs.push(Error::invalid(
+                    &tls_path.child("hosts").index(hi),
+                    host.clone(),
+                    message,
+                ));
             }
         }
-        if let Some(secret) = itls.secret_name.as_deref().filter(|s| !s.is_empty()) {
-            for msg in is_dns1123_subdomain(secret) {
-                errs.push(Error::invalid(
-                    &tls_path.child("secretName"),
-                    secret.to_string(),
-                    msg,
-                ));
+        if !opts.allow_invalid_secret_name {
+            if let Some(secret) = tls.secret_name.as_deref().filter(|s| !s.is_empty()) {
+                for message in is_dns1123_subdomain(secret) {
+                    errs.push(Error::invalid(
+                        &tls_path.child("secretName"),
+                        secret.to_string(),
+                        message,
+                    ));
+                }
             }
         }
     }
     errs
 }
 
-/// Upstream `IsValidPortName`: IANA_SVC_NAME (DNS-1123 label ≤15 chars with a
-/// letter).
-fn is_valid_port_name(s: &str) -> bool {
-    s.len() <= 15 && is_dns1123_label(s).is_empty() && s.chars().any(|c| c.is_ascii_alphabetic())
+#[cfg(test)]
+fn validate_ingress_tls(spec: &IngressSpec, fld_path: &Path) -> ErrorList {
+    validate_ingress_tls_with_options(spec, fld_path, IngressValidationOptions::default())
 }
 
-/// Validate an `IngressBackend`. Mirrors upstream `validateIngressBackend`.
-fn validate_backend(backend: &IngressBackend, fld_path: &Path) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
-    let has_service = backend.service.is_some();
-    let has_resource = backend.resource.is_some();
+/// Upstream staging/src/k8s.io/apimachinery/pkg/util/validation/validation.go:321.
+fn port_name_errors(port: &str) -> Vec<&'static str> {
+    let mut errs = Vec::new();
+    if port.len() > 15 {
+        errs.push("must be no more than 15 characters");
+    }
+    if port.is_empty()
+        || !port
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        errs.push("must contain only alpha-numeric characters (a-z, 0-9), and hyphens (-)");
+    }
+    if !port.bytes().any(|b| b.is_ascii_lowercase()) {
+        errs.push("must contain at least one letter (a-z)");
+    }
+    if port.contains("--") {
+        errs.push("must not contain consecutive hyphens");
+    }
+    if port.starts_with('-') || port.ends_with('-') {
+        errs.push("must not begin or end with a hyphen");
+    }
+    errs
+}
 
-    match (has_service, has_resource) {
-        (true, true) => {
-            errs.push(Error::invalid(
-                fld_path,
-                String::new(),
-                "cannot set both resource and service backends",
-            ));
-        }
-        (false, false) => {
-            // A backend must reference something.
-            errs.push(Error::required(
-                fld_path,
-                "must specify a service or resource",
-            ));
-        }
-        (true, false) => {
-            let svc = backend.service.as_ref().unwrap();
-            if svc.name.is_empty() {
+fn validate_backend(
+    backend: &IngressBackend,
+    fld_path: &Path,
+    opts: IngressValidationOptions,
+) -> ErrorList {
+    let mut errs = Vec::new();
+    match (&backend.service, &backend.resource) {
+        (Some(_), Some(_)) => errs.push(Error::invalid(
+            fld_path,
+            "",
+            "cannot set both resource and service backends",
+        )),
+        (None, None) => errs.push(Error::invalid(
+            fld_path,
+            "",
+            "resource or service backend is required",
+        )),
+        (Some(service), None) => {
+            if service.name.is_empty() {
                 errs.push(Error::required(
                     &fld_path.child("service").child("name"),
                     "",
                 ));
             } else {
-                for msg in is_dns1123_label(&svc.name) {
+                let messages = if opts.allow_relaxed_service_name_validation {
+                    is_dns1123_label(&service.name)
+                } else {
+                    is_dns1035_label(&service.name)
+                };
+                for message in messages {
                     errs.push(Error::invalid(
                         &fld_path.child("service").child("name"),
-                        svc.name.clone(),
-                        msg,
+                        service.name.clone(),
+                        message,
                     ));
                 }
             }
-            match &svc.port {
-                None => errs.push(Error::required(
-                    &fld_path.child("service").child("port"),
-                    "must specify a port name or number",
-                )),
-                Some(port) => {
-                    let has_name = port.name.as_deref().is_some_and(|n| !n.is_empty());
-                    let has_number = port.number.is_some_and(|n| n != 0);
-                    if has_name && has_number {
-                        errs.push(Error::invalid(
-                            fld_path,
-                            String::new(),
-                            "cannot set both port name & port number",
-                        ));
-                    } else if has_name {
-                        if !is_valid_port_name(port.name.as_deref().unwrap()) {
-                            errs.push(Error::invalid(
-                                &fld_path.child("service").child("port").child("name"),
-                                port.name.clone().unwrap(),
-                                "must be an IANA_SVC_NAME",
-                            ));
-                        }
-                    } else if has_number {
-                        let n = port.number.unwrap();
-                        if !(1..=65535).contains(&n) {
-                            errs.push(Error::invalid(
-                                &fld_path.child("service").child("port").child("number"),
-                                n,
-                                "must be between 1 and 65535, inclusive",
-                            ));
-                        }
-                    } else {
-                        errs.push(Error::required(
-                            &fld_path.child("service").child("port"),
-                            "must specify a port name or number",
-                        ));
-                    }
+            let name = service
+                .port
+                .as_ref()
+                .and_then(|port| port.name.as_deref())
+                .unwrap_or("");
+            let number = service
+                .port
+                .as_ref()
+                .and_then(|port| port.number)
+                .unwrap_or(0);
+            if !name.is_empty() && number != 0 {
+                errs.push(Error::invalid(
+                    fld_path,
+                    "",
+                    "cannot set both port name & port number",
+                ));
+            } else if !name.is_empty() {
+                for message in port_name_errors(name) {
+                    errs.push(Error::invalid(
+                        &fld_path.child("service").child("port").child("name"),
+                        name.to_string(),
+                        message,
+                    ));
                 }
+            } else if number != 0 {
+                if !(1..=65535).contains(&number) {
+                    errs.push(Error::invalid(
+                        &fld_path.child("service").child("port").child("number"),
+                        number,
+                        "must be between 1 and 65535, inclusive",
+                    ));
+                }
+            } else {
+                errs.push(Error::required(fld_path, "port name or number is required"));
             }
         }
-        (false, true) => {
-            let res = backend.resource.as_ref().unwrap();
-            if res.kind.is_empty() {
-                errs.push(Error::required(
-                    &fld_path.child("resource").child("kind"),
-                    "",
-                ));
+        (None, Some(resource)) => {
+            let path = fld_path.child("resource");
+            if let Some(group) = &resource.api_group {
+                for message in is_dns1123_subdomain(group) {
+                    errs.push(Error::invalid(
+                        &path.child("apiGroup"),
+                        group.clone(),
+                        message,
+                    ));
+                }
             }
-            if res.name.is_empty() {
-                errs.push(Error::required(
-                    &fld_path.child("resource").child("name"),
-                    "",
-                ));
+            for (field, value) in [("kind", &resource.kind), ("name", &resource.name)] {
+                if value.is_empty() {
+                    errs.push(Error::required(&path.child(field), ""));
+                } else {
+                    for message in name_is_path_segment(value, false) {
+                        errs.push(Error::invalid(&path.child(field), value.clone(), message));
+                    }
+                }
             }
         }
     }
     errs
 }
 
-/// Validate a single HTTP path. Mirrors upstream `validateHTTPIngressPath`.
-fn validate_http_path(path: &HTTPIngressPath, fld_path: &Path) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
-    match path.path_type.as_str() {
-        "" => {
-            errs.push(Error::required(
-                &fld_path.child("pathType"),
-                "pathType must be specified",
-            ));
-        }
+fn validate_http_path(
+    path: &HTTPIngressPath,
+    fld_path: &Path,
+    opts: IngressValidationOptions,
+) -> ErrorList {
+    let Some(path_type) = path.path_type.as_deref() else {
+        return vec![Error::required(
+            &fld_path.child("pathType"),
+            "pathType must be specified",
+        )];
+    };
+    let mut errs = Vec::new();
+    let value = path.path.as_deref().unwrap_or("");
+    match path_type {
         "Exact" | "Prefix" => {
-            let p = path.path.as_deref().unwrap_or("");
-            if !p.starts_with('/') {
+            if !value.starts_with('/') {
                 errs.push(Error::invalid(
                     &fld_path.child("path"),
-                    p.to_string(),
+                    value.to_string(),
                     "must be an absolute path",
                 ));
             }
-            if !p.is_empty() {
-                for seq in INVALID_PATH_SEQUENCES {
-                    if p.contains(seq) {
+            if !value.is_empty() {
+                for sequence in INVALID_PATH_SEQUENCES {
+                    if value.contains(sequence) {
                         errs.push(Error::invalid(
                             &fld_path.child("path"),
-                            p.to_string(),
-                            format!("must not contain '{seq}'"),
+                            value.to_string(),
+                            format!("must not contain '{sequence}'"),
                         ));
                     }
                 }
-                for suff in INVALID_PATH_SUFFIXES {
-                    if p.ends_with(suff) {
+                for suffix in INVALID_PATH_SUFFIXES {
+                    if value.ends_with(suffix) {
                         errs.push(Error::invalid(
                             &fld_path.child("path"),
-                            p.to_string(),
-                            format!("cannot end with '{suff}'"),
+                            value.to_string(),
+                            format!("cannot end with '{suffix}'"),
                         ));
                     }
                 }
             }
         }
         "ImplementationSpecific" => {
-            if let Some(p) = path.path.as_deref() {
-                if !p.is_empty() && !p.starts_with('/') {
-                    errs.push(Error::invalid(
-                        &fld_path.child("path"),
-                        p.to_string(),
-                        "must be an absolute path",
-                    ));
-                }
+            if !value.is_empty() && !value.starts_with('/') {
+                errs.push(Error::invalid(
+                    &fld_path.child("path"),
+                    value.to_string(),
+                    "must be an absolute path",
+                ));
             }
         }
         other => errs.push(Error::not_supported(
             &fld_path.child("pathType"),
             other.to_string(),
-            &["Exact", "Prefix", "ImplementationSpecific"],
+            &["Exact", "ImplementationSpecific", "Prefix"],
         )),
     }
-    errs.extend(validate_backend(&path.backend, &fld_path.child("backend")));
+    errs.extend(validate_backend(
+        &path.backend,
+        &fld_path.child("backend"),
+        opts,
+    ));
     errs
 }
 
-/// Validate an `IngressSpec`. Mirrors upstream `ValidateIngressSpec`.
-pub fn validate_ingress_spec(spec: &IngressSpec, fld_path: &Path) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
+fn validate_rule_value(
+    rule: &IngressRule,
+    fld_path: &Path,
+    opts: IngressValidationOptions,
+) -> ErrorList {
+    let mut errs = Vec::new();
+    if let Some(http) = &rule.http {
+        let paths = fld_path.child("http").child("paths");
+        if http.paths.is_empty() {
+            errs.push(Error::required(&paths, ""));
+        }
+        for (i, path) in http.paths.iter().enumerate() {
+            errs.extend(validate_http_path(path, &paths.index(i), opts));
+        }
+    }
+    errs
+}
 
+fn validate_ingress_spec_with_options(
+    spec: &IngressSpec,
+    fld_path: &Path,
+    opts: IngressValidationOptions,
+) -> ErrorList {
+    let mut errs = Vec::new();
     let rules = spec.rules.as_deref().unwrap_or(&[]);
     if rules.is_empty() && spec.default_backend.is_none() {
         errs.push(Error::invalid(
             fld_path,
-            String::new(),
+            serde_json::json!(spec.rules),
             "either `defaultBackend` or `rules` must be specified",
         ));
     }
-
-    if let Some(db) = &spec.default_backend {
-        errs.extend(validate_backend(db, &fld_path.child("defaultBackend")));
+    if let Some(backend) = &spec.default_backend {
+        errs.extend(validate_backend(
+            backend,
+            &fld_path.child("defaultBackend"),
+            opts,
+        ));
     }
-
-    errs.extend(validate_ingress_tls(spec, &fld_path.child("tls")));
-
-    // spec.ingressClassName, when set, must be a DNS-1123 subdomain. Upstream
-    // `ValidateIngressClassName = apimachineryvalidation.NameIsDNSSubdomain`
-    // (prefix=false), which is exactly `IsDNS1123Subdomain`.
-    if let Some(class_name) = &spec.ingress_class_name {
-        for msg in is_dns1123_subdomain(class_name) {
+    for (i, rule) in rules.iter().enumerate() {
+        let rule_path = fld_path.child("rules").index(i);
+        let host = rule.host.as_deref().unwrap_or("");
+        let wildcard = host.contains('*');
+        if !host.is_empty() {
+            if parse_ip_sloppy(host).is_some() {
+                errs.push(Error::invalid(
+                    &rule_path.child("host"),
+                    host.to_string(),
+                    "must be a DNS name, not an IP address",
+                ));
+            }
+            let messages = if wildcard {
+                is_wildcard_dns1123_subdomain(host)
+            } else {
+                is_dns1123_subdomain(host)
+            };
+            for message in messages {
+                errs.push(Error::invalid(
+                    &rule_path.child("host"),
+                    host.to_string(),
+                    message,
+                ));
+            }
+        }
+        if !wildcard || !opts.allow_invalid_wildcard_host_rule {
+            errs.extend(validate_rule_value(rule, &rule_path, opts));
+        }
+    }
+    errs.extend(validate_ingress_tls_with_options(
+        spec,
+        &fld_path.child("tls"),
+        opts,
+    ));
+    if let Some(class) = &spec.ingress_class_name {
+        for message in is_dns1123_subdomain(class) {
             errs.push(Error::invalid(
                 &fld_path.child("ingressClassName"),
-                class_name.clone(),
-                msg,
+                class.clone(),
+                message,
             ));
         }
     }
-
-    for (i, rule) in rules.iter().enumerate() {
-        let rule_path = fld_path.child("rules").index(i);
-        if let Some(host) = &rule.host {
-            if !host.is_empty() {
-                if IpAddr::from_str(host).is_ok() {
-                    errs.push(Error::invalid(
-                        &rule_path.child("host"),
-                        host.clone(),
-                        "must be a DNS name, not an IP address",
-                    ));
-                }
-                let msgs = if host.contains('*') {
-                    is_wildcard_dns1123_subdomain(host)
-                } else {
-                    is_dns1123_subdomain(host)
-                };
-                for msg in msgs {
-                    errs.push(Error::invalid(&rule_path.child("host"), host.clone(), msg));
-                }
-            }
-        }
-        if let Some(http) = &rule.http {
-            let http_path = rule_path.child("http");
-            if http.paths.is_empty() {
-                errs.push(Error::required(&http_path.child("paths"), ""));
-            }
-            for (j, p) in http.paths.iter().enumerate() {
-                errs.extend(validate_http_path(p, &http_path.child("paths").index(j)));
-            }
-        }
-    }
-
     errs
 }
 
-/// Validate a new `Ingress`. Mirrors upstream `ValidateIngress`.
-pub fn validate_ingress(ing: &Ingress) -> ErrorList {
-    match &ing.spec {
-        Some(spec) => validate_ingress_spec(spec, &Path::new("spec")),
-        None => Vec::new(),
+/// Validate the spec with upstream default feature gates.
+pub fn validate_ingress_spec(spec: &IngressSpec, fld_path: &Path) -> ErrorList {
+    validate_ingress_spec_with_options(spec, fld_path, IngressValidationOptions::default())
+}
+
+fn validate_ingress_with_options(ingress: &Ingress, opts: IngressValidationOptions) -> ErrorList {
+    let mut errs = validate_object_meta(
+        &ingress.metadata,
+        true,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    if let Some(spec) = &ingress.spec {
+        errs.extend(validate_ingress_spec_with_options(
+            spec,
+            &Path::new("spec"),
+            opts,
+        ));
+    } else {
+        // Upstream Spec is a value, so an omitted spec has no rules or backend.
+        errs.push(Error::invalid(
+            &Path::new("spec"),
+            serde_json::Value::Null,
+            "either `defaultBackend` or `rules` must be specified",
+        ));
     }
+    errs
+}
+
+/// Upstream ValidateIngressCreate, including the create-only class check.
+pub fn validate_ingress_create(ingress: &Ingress) -> ErrorList {
+    let mut errs = validate_ingress_with_options(ingress, IngressValidationOptions::default());
+    let annotation = ingress
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get("kubernetes.io/ingress.class"));
+    let class = ingress
+        .spec
+        .as_ref()
+        .and_then(|s| s.ingress_class_name.as_ref());
+    if let (Some(annotation), Some(class)) = (annotation, class) {
+        if annotation != class {
+            errs.push(Error::invalid(
+                &Path::new("annotations").child("kubernetes.io/ingress.class"),
+                annotation.clone(),
+                "must match `ingressClassName` when both are specified",
+            ));
+        }
+    }
+    errs
+}
+
+/// Compatibility entry point for validating a newly created Ingress.
+pub fn validate_ingress(ingress: &Ingress) -> ErrorList {
+    validate_ingress_create(ingress)
+}
+
+/// Upstream ValidateIngressUpdate and the old-object compatibility gates
+/// (`validation.go:318-327,670-744`). Each gate applies to the entire new spec.
+pub fn validate_ingress_update(ingress: &Ingress, old_ingress: &Ingress) -> ErrorList {
+    let mut errs = validate_object_meta_update(
+        &ingress.metadata,
+        &old_ingress.metadata,
+        &Path::new("metadata"),
+    );
+    let mut opts = IngressValidationOptions::default();
+    if let Some(old) = &old_ingress.spec {
+        opts.allow_invalid_secret_name = old.tls.iter().flatten().any(|tls| {
+            tls.secret_name
+                .as_deref()
+                .is_some_and(|name| !name.is_empty() && !is_dns1123_subdomain(name).is_empty())
+        });
+        opts.allow_invalid_wildcard_host_rule = old.rules.iter().flatten().any(|rule| {
+            rule.host.as_deref().is_some_and(|host| host.contains('*'))
+                && !validate_rule_value(rule, &Path::new(""), IngressValidationOptions::default())
+                    .is_empty()
+        });
+        let backends = old.default_backend.iter().chain(
+            old.rules
+                .iter()
+                .flatten()
+                .filter_map(|r| r.http.as_ref())
+                .flat_map(|http| http.paths.iter().map(|p| &p.backend)),
+        );
+        opts.allow_relaxed_service_name_validation =
+            backends.filter_map(|b| b.service.as_ref()).any(|service| {
+                is_dns1123_label(&service.name).is_empty()
+                    && !is_dns1035_label(&service.name).is_empty()
+            });
+    }
+    errs.extend(validate_ingress_with_options(ingress, opts));
+    errs
+}
+
+/// Upstream ValidateIngressLoadBalancerStatus (`validation.go:389-416`).
+/// Ports are deliberately unconstrained upstream. Legacy IP validation follows
+/// the disabled StrictIPCIDRValidation default and accepts exact old values.
+pub fn validate_ingress_load_balancer_status(
+    status: &IngressLoadBalancerStatus,
+    old_status: Option<&IngressLoadBalancerStatus>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs = Vec::new();
+    for (i, ingress) in status.ingress.iter().flatten().enumerate() {
+        let path = fld_path.child("ingress").index(i);
+        if let Some(ip) = ingress.ip.as_deref().filter(|ip| !ip.is_empty()) {
+            let unchanged = old_status
+                .into_iter()
+                .flat_map(|s| s.ingress.iter().flatten())
+                .any(|old| old.ip.as_deref() == Some(ip));
+            if !unchanged && parse_ip_sloppy(ip).is_none() {
+                let mut error = Error::invalid(
+                    &path.child("ip"),
+                    ip.to_string(),
+                    "must be a valid IP address, (e.g. 10.9.8.7 or 2001:db8::ffff)",
+                );
+                error.origin = "format=ip-sloppy".to_string();
+                errs.push(error);
+            }
+        }
+        if let Some(host) = ingress.hostname.as_deref().filter(|host| !host.is_empty()) {
+            for message in is_dns1123_subdomain(host) {
+                errs.push(Error::invalid(
+                    &path.child("hostname"),
+                    host.to_string(),
+                    message,
+                ));
+            }
+            if parse_ip_sloppy(host).is_some() {
+                errs.push(Error::invalid(
+                    &path.child("hostname"),
+                    host.to_string(),
+                    "must be a DNS name, not an IP address",
+                ));
+            }
+        }
+    }
+    errs
+}
+
+/// Upstream ValidateIngressStatusUpdate (`validation.go:381-385`): metadata
+/// update checks and load-balancer validation, without spec validation.
+pub fn validate_ingress_status_update(ingress: &Ingress, old_ingress: &Ingress) -> ErrorList {
+    let mut errs = validate_object_meta_update(
+        &ingress.metadata,
+        &old_ingress.metadata,
+        &Path::new("metadata"),
+    );
+    if let Some(status) = ingress
+        .status
+        .as_ref()
+        .and_then(|s| s.load_balancer.as_ref())
+    {
+        let old = old_ingress
+            .status
+            .as_ref()
+            .and_then(|s| s.load_balancer.as_ref());
+        errs.extend(validate_ingress_load_balancer_status(
+            status,
+            old,
+            &Path::new("status").child("loadBalancer"),
+        ));
+    }
+    errs
 }
 
 #[cfg(test)]

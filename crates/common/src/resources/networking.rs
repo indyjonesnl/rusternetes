@@ -3,7 +3,7 @@ use crate::types::{LabelSelector, ObjectMeta, TypeMeta};
 use serde::{Deserialize, Serialize};
 
 /// NetworkPolicy describes what network traffic is allowed for a set of Pods
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicy {
     #[serde(flatten)]
@@ -34,7 +34,7 @@ impl NetworkPolicy {
 }
 
 /// NetworkPolicySpec provides the specification of a NetworkPolicy
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicySpec {
     /// Selects the pods to which this NetworkPolicy applies
@@ -55,7 +55,7 @@ pub struct NetworkPolicySpec {
 }
 
 /// NetworkPolicyIngressRule describes a particular set of traffic that is allowed to the pods
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyIngressRule {
     /// List of ports which should be made accessible
@@ -68,7 +68,7 @@ pub struct NetworkPolicyIngressRule {
 }
 
 /// NetworkPolicyEgressRule describes a particular set of traffic that is allowed out of pods
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyEgressRule {
     /// List of destination ports for outgoing traffic
@@ -84,12 +84,21 @@ fn default_protocol() -> String {
     "TCP".to_string()
 }
 
+// A nil *Protocol defaults to TCP; a pointer to an empty protocol stays empty.
+// pkg/apis/networking/v1/defaults.go:30-35.
+fn deserialize_protocol<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_else(default_protocol))
+}
+
 /// NetworkPolicyPort describes a port to allow traffic on
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyPort {
     /// The protocol (TCP, UDP, SCTP)
-    #[serde(default = "default_protocol")]
+    #[serde(
+        default = "default_protocol",
+        deserialize_with = "deserialize_protocol"
+    )]
     pub protocol: String,
 
     /// The port on the given protocol
@@ -102,7 +111,7 @@ pub struct NetworkPolicyPort {
 }
 
 /// NetworkPolicyPeer describes a peer to allow traffic from/to
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyPeer {
     /// Selects pods
@@ -119,7 +128,7 @@ pub struct NetworkPolicyPeer {
 }
 
 /// IPBlock describes a particular CIDR range
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct IPBlock {
     /// CIDR is a string representing the IP Block

@@ -107,10 +107,10 @@ pub struct HTTPIngressPath {
     /// PathType determines the interpretation of the Path matching
     /// Exact, Prefix, or ImplementationSpecific
     /// A pointer upstream whose absence `validateHTTPIngressPath` reports as
-    /// `Required(pathType, "pathType must be specified")`; the empty string
-    /// takes the same branch here.
+    /// `Required(pathType, "pathType must be specified")`; a present empty
+    /// string is NotSupported (validation.go:468-503).
     #[serde(alias = "pathType", default)]
-    pub path_type: String,
+    pub path_type: Option<String>,
 
     /// Backend defines the referenced service endpoint. A value upstream, and
     /// `validateHTTPIngressPath` always runs `validateIngressBackend` over it,
@@ -261,7 +261,7 @@ mod tests {
 
         let path = HTTPIngressPath {
             path: Some("/".to_string()),
-            path_type: "Prefix".to_string(),
+            path_type: Some("Prefix".to_string()),
             backend,
         };
 

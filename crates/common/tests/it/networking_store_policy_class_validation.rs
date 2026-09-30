@@ -5,7 +5,7 @@
 use rusternetes_common::resources::{ingressclass::IngressClass, networking::NetworkPolicy};
 use rusternetes_common::validation::{
     ingressclass::{validate_ingress_class, validate_ingress_class_update},
-    networkpolicy::validate_network_policy,
+    networkpolicy::{validate_network_policy, validate_network_policy_update},
 };
 use serde_json::{json, Value};
 
@@ -231,5 +231,120 @@ fn ingress_class_parameters_table() {
     ] {
         let errors = validate_ingress_class(&class("foo.co/bar", parameters.clone()));
         assert_eq!(errors.is_empty(), valid, "{parameters}: {errors:?}");
+    }
+}
+
+#[test]
+fn network_policy_update_selector_compatibility() {
+    // validation.go:195: only invalid old spec.podSelector enables compatibility,
+    // which then applies to expression values in ALL selectors, never their keys.
+    let invalid_selector =
+        json!({"matchExpressions": [{"key": "app", "operator": "In", "values": ["bad$value"]}]});
+    let valid_old = policy(json!({"podSelector": {}}));
+    let invalid_old = policy(json!({"podSelector": invalid_selector}));
+    let invalid_new = policy(json!({
+        "podSelector": invalid_selector,
+        "ingress": [{"from": [{"namespaceSelector": invalid_selector}]}]
+    }));
+    assert!(validate_network_policy_update(&invalid_new, &invalid_old).is_empty());
+    assert!(!validate_network_policy_update(&invalid_new, &valid_old).is_empty());
+    assert!(!validate_network_policy(&invalid_new).is_empty());
+
+    let old_peer_only = policy(
+        json!({"podSelector": {}, "ingress": [{"from": [{"podSelector": invalid_selector}]}]}),
+    );
+    assert!(!validate_network_policy_update(&old_peer_only, &old_peer_only).is_empty());
+    let bad_key = policy(
+        json!({"podSelector": {"matchExpressions": [{"key": "bad$key", "operator": "In", "values": ["bad$value"]}]}}),
+    );
+    assert!(!validate_network_policy_update(&bad_key, &invalid_old).is_empty());
+    let bad_match_label = policy(json!({"podSelector": {"matchLabels": {"app": "bad$value"}}}));
+    assert!(!validate_network_policy_update(&bad_match_label, &invalid_old).is_empty());
+}
+
+#[test]
+fn network_policy_update_metadata_and_combined_passes() {
+    let old = policy(json!({"podSelector": {}}));
+    let changed_spec = policy(json!({"podSelector": {"matchLabels": {"app": "changed"}}}));
+    assert!(validate_network_policy_update(&changed_spec, &old).is_empty());
+    for field in ["name", "namespace", "resourceVersion"] {
+        let mut new = old.clone();
+        match field {
+            "name" => new.metadata.name = "renamed".into(),
+            "namespace" => new.metadata.namespace = Some("another".into()),
+            _ => new.metadata.resource_version = None,
+        }
+        assert!(validate_network_policy_update(&new, &old)
+            .iter()
+            .any(|e| e.field == format!("metadata.{field}")));
+    }
+    let invalid_port = policy(json!({"podSelector": {}, "ingress": [{"ports": [{"port": 0}]}]}));
+    let errors = validate_network_policy_update(&invalid_port, &old);
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|e| e.field == "spec.ingress[0].ports[0].port")
+            .count(),
+        2
+    );
+
+    // strategy.go:86-90 runs create validation before update's old-CIDR allowlist.
+    let invalid_cidr = policy(
+        json!({"podSelector": {}, "ingress": [{"from": [{"ipBlock": {"cidr": "unparseable"}}]}]}),
+    );
+    let errors = validate_network_policy_update(&invalid_cidr, &invalid_cidr);
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|e| e.field == "spec.ingress[0].from[0].ipBlock.cidr")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn network_policy_mapped_cidr_mask_semantics() {
+    // ValidateIPBlock compares original Mask.Size values after net.IPNet.Contains
+    // normalizes mapped IPv6 addresses. IPv4 /8 and mapped /104 have equal address
+    // ranges but different mask sizes, so this legacy combination is accepted.
+    for (cidr, except, valid) in [
+        ("10.0.0.0/8", "::ffff:10.0.0.0/104", true),
+        ("::ffff:10.0.0.0/104", "10.1.0.0/16", false),
+        ("::ffff:010.0.0.0/104", "::ffff:10.1.0.0/112", true),
+        ("10.0.0.0/+8", "10.1.0.0/16", false),
+    ] {
+        let object = policy(
+            json!({"podSelector": {}, "ingress": [{"from": [{"ipBlock": {"cidr": cidr, "except": [except]}}]}]}),
+        );
+        let errors = validate_network_policy(&object);
+        assert_eq!(
+            errors.is_empty(),
+            valid,
+            "{cidr} except {except}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn network_policy_port_error_details_match_upstream() {
+    for (name, expected) in [
+        ("http--alt", vec!["must not contain consecutive hyphens"]),
+        ("123", vec!["must contain at least one letter (a-z)"]),
+        (
+            "-HTTP-",
+            vec![
+                "must contain only alpha-numeric characters (a-z, 0-9), and hyphens (-)",
+                "must contain at least one letter (a-z)",
+                "must not begin or end with a hyphen",
+            ],
+        ),
+    ] {
+        let object = policy(json!({"podSelector": {}, "ingress": [{"ports": [{"port": name}]}]}));
+        let errors = validate_network_policy(&object);
+        assert_eq!(
+            errors.iter().map(|e| e.detail.as_str()).collect::<Vec<_>>(),
+            expected,
+            "{name}: {errors:?}"
+        );
     }
 }

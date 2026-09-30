@@ -30,6 +30,7 @@ pub mod discovery;
 pub mod flowcontrol;
 pub mod generic;
 pub mod names;
+pub mod networking;
 pub mod node;
 pub mod policy;
 pub mod rbac;

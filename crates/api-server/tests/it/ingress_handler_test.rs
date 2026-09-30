@@ -32,7 +32,7 @@ fn create_test_ingress(name: &str, namespace: &str) -> Ingress {
                 http: Some(HTTPIngressRuleValue {
                     paths: vec![HTTPIngressPath {
                         path: Some("/".to_string()),
-                        path_type: "Prefix".to_string(),
+                        path_type: Some("Prefix".to_string()),
                         backend: IngressBackend {
                             service: Some(IngressServiceBackend {
                                 name: "test-service".to_string(),
@@ -92,7 +92,7 @@ async fn test_ingress_update() {
                 http: Some(HTTPIngressRuleValue {
                     paths: vec![HTTPIngressPath {
                         path: Some("/api".to_string()),
-                        path_type: "Prefix".to_string(),
+                        path_type: Some("Prefix".to_string()),
                         backend: IngressBackend {
                             service: Some(IngressServiceBackend {
                                 name: "api-service".to_string(),
@@ -292,7 +292,7 @@ async fn test_ingress_with_multiple_paths() {
                     paths: vec![
                         HTTPIngressPath {
                             path: Some("/api".to_string()),
-                            path_type: "Prefix".to_string(),
+                            path_type: Some("Prefix".to_string()),
                             backend: IngressBackend {
                                 service: Some(IngressServiceBackend {
                                     name: "api-service".to_string(),
@@ -306,7 +306,7 @@ async fn test_ingress_with_multiple_paths() {
                         },
                         HTTPIngressPath {
                             path: Some("/web".to_string()),
-                            path_type: "Prefix".to_string(),
+                            path_type: Some("Prefix".to_string()),
                             backend: IngressBackend {
                                 service: Some(IngressServiceBackend {
                                     name: "web-service".to_string(),
@@ -366,7 +366,7 @@ async fn test_ingress_with_exact_path_type() {
                 http: Some(HTTPIngressRuleValue {
                     paths: vec![HTTPIngressPath {
                         path: Some("/exact".to_string()),
-                        path_type: "Exact".to_string(),
+                        path_type: Some("Exact".to_string()),
                         backend: IngressBackend {
                             service: Some(IngressServiceBackend {
                                 name: "exact-service".to_string(),
@@ -393,7 +393,9 @@ async fn test_ingress_with_exact_path_type() {
             .as_ref()
             .unwrap()
             .paths[0]
-            .path_type,
+            .path_type
+            .as_deref()
+            .unwrap(),
         "Exact"
     );
 
@@ -425,7 +427,7 @@ async fn test_ingress_with_named_port() {
                 http: Some(HTTPIngressRuleValue {
                     paths: vec![HTTPIngressPath {
                         path: Some("/".to_string()),
-                        path_type: "Prefix".to_string(),
+                        path_type: Some("Prefix".to_string()),
                         backend: IngressBackend {
                             service: Some(IngressServiceBackend {
                                 name: "test-service".to_string(),
@@ -641,7 +643,7 @@ async fn test_ingress_with_wildcard_host() {
                 http: Some(HTTPIngressRuleValue {
                     paths: vec![HTTPIngressPath {
                         path: Some("/".to_string()),
-                        path_type: "Prefix".to_string(),
+                        path_type: Some("Prefix".to_string()),
                         backend: IngressBackend {
                             service: Some(IngressServiceBackend {
                                 name: "wildcard-service".to_string(),

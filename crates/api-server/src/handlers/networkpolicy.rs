@@ -1,54 +1,48 @@
+//! Generic Store endpoints for NetworkPolicy; list/watch retain their existing implementation.
+//! Port of pkg/registry/networking/networkpolicy/storage/storage.go and apiserver endpoints/handlers.
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::NetworkPolicy,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tracing::{debug, info};
-
-/// SetDefaults_NetworkPolicy (pkg/apis/networking/v1/defaults.go): a policy
-/// that omits `policyTypes` implies "Ingress" (plus "Egress" when egress rules
-/// are present), and each `NetworkPolicyPort.protocol` defaults to TCP. Runs on
-/// both create and update before validation.
-fn apply_networkpolicy_defaults(np: &mut rusternetes_common::resources::NetworkPolicy) {
-    let spec = &mut np.spec;
-    if spec.policy_types.as_ref().is_none_or(|t| t.is_empty()) {
-        let mut types = vec!["Ingress".to_string()];
-        if spec.egress.as_ref().is_some_and(|e| !e.is_empty()) {
-            types.push("Egress".to_string());
-        }
-        spec.policy_types = Some(types);
+use rusternetes_storage::{build_prefix, Storage};
+use std::{collections::HashMap, sync::Arc};
+use tracing::debug;
+fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestScope<NetworkPolicy> {
+    let store = crate::registry::networking::networkpolicy::new_store(state.storage.clone());
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "networking.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "NetworkPolicy".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "networking.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "networkpolicies".to_string(),
+        },
+        subresource,
+        store: Box::new(store),
+        apply: Some(crate::ssa::apply_legacy::<NetworkPolicy>),
+        convert_to_internal: Some(crate::registry::networking::networkpolicy::convert_to_internal),
     }
-    let default_port_protocols =
-        |ports: &mut Option<Vec<rusternetes_common::resources::NetworkPolicyPort>>| {
-            if let Some(ports) = ports {
-                for p in ports.iter_mut() {
-                    if p.protocol.is_empty() {
-                        p.protocol = "TCP".to_string();
-                    }
-                }
-            }
-        };
-    if let Some(ingress) = spec.ingress.as_mut() {
-        for rule in ingress.iter_mut() {
-            default_port_protocols(&mut rule.ports);
-        }
-    }
-    if let Some(egress) = spec.egress.as_mut() {
-        for rule in egress.iter_mut() {
-            default_port_protocols(&mut rule.ports);
-        }
-    }
+}
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
 }
 
 pub async fn create(
@@ -56,94 +50,32 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut network_policy): DumpingJson<NetworkPolicy>,
-) -> Result<(StatusCode, Json<NetworkPolicy>)> {
-    info!(
-        "Creating networkpolicy: {}/{}",
-        namespace, network_policy.metadata.name
-    );
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "networkpolicies")
-        .with_namespace(&namespace)
-        .with_api_group("networking.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &network_policy.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // SetDefaults_NetworkPolicy: derive policyTypes + default port protocols
-    // before validation.
-    apply_networkpolicy_defaults(&mut network_policy);
-
-    // Field validation (mirrors upstream ValidateNetworkPolicy).
-    {
-        let errs =
-            rusternetes_common::validation::networkpolicy::validate_network_policy(&network_policy);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    network_policy.metadata.namespace = Some(namespace.clone());
-    network_policy.metadata.ensure_uid();
-    network_policy.metadata.ensure_creation_timestamp();
-
-    let key = build_key(
-        "networkpolicies",
-        Some(&namespace),
-        &network_policy.metadata.name,
-    );
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: NetworkPolicy {}/{} validated successfully (not created)",
-            namespace, network_policy.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(network_policy)));
-    }
-
-    let created = state.storage.create(&key, &network_policy).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<NetworkPolicy>> {
-    debug!("Getting networkpolicy: {}/{}", namespace, name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "networkpolicies")
-        .with_namespace(&namespace)
-        .with_api_group("networking.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("networkpolicies", Some(&namespace), &name);
-    let network_policy = state.storage.get(&key).await?;
-
-    Ok(Json(network_policy))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn update(
@@ -151,155 +83,76 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut network_policy): DumpingJson<NetworkPolicy>,
-) -> Result<Json<NetworkPolicy>> {
-    info!("Updating networkpolicy: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "networkpolicies")
-        .with_namespace(&namespace)
-        .with_api_group("networking.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("networkpolicies", Some(&namespace), &name),
-        "networking.k8s.io",
-        "networkpolicies",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    network_policy.metadata.name = name.clone();
-    network_policy.metadata.namespace = Some(namespace.clone());
-
-    // SetDefaults_NetworkPolicy runs on update too (derive policyTypes + default
-    // port protocols) before validation.
-    apply_networkpolicy_defaults(&mut network_policy);
-
-    let key = build_key("networkpolicies", Some(&namespace), &name);
-
-    // Field validation on update (mirrors upstream ValidateNetworkPolicyUpdate,
-    // which re-runs ValidateNetworkPolicySpec on the new object). The create
-    // path validated but the update path previously persisted PUTs unchecked.
-    {
-        let errs =
-            rusternetes_common::validation::networkpolicy::validate_network_policy(&network_policy);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: NetworkPolicy {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(network_policy));
-    }
-
-    let result = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
-        &*state.storage,
-        &key,
-        &mut network_policy,
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
-    )
-    .await?;
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete_networkpolicy(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<NetworkPolicy>> {
-    info!("Deleting networkpolicy: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "networkpolicies")
-        .with_namespace(&namespace)
-        .with_api_group("networking.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("networkpolicies", Some(&namespace), &name);
-
-    // Get the resource to check if it exists
-    let networkpolicy: NetworkPolicy = state.storage.get(&key).await?;
-
-    // Run validating admission webhooks for DELETE (object=nil, oldObject=networkpolicy).
-    crate::handlers::admission_helper::run_delete_validating_webhooks(
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
         &state,
-        "networking.k8s.io",
-        "v1",
-        "NetworkPolicy",
-        "networkpolicies",
+        &scope(&state, None),
+        &auth_ctx.user,
         Some(&namespace),
         &name,
-        &networkpolicy,
-        &user_for_webhook,
-        is_dry_run,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: NetworkPolicy {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(networkpolicy));
-    }
-
-    let has_finalizers = crate::handlers::finalizers::handle_delete_with_finalizers(
-        &*state.storage,
-        &key,
-        &networkpolicy,
-        &delete_opts,
+pub async fn deletecollection_networkpolicies(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
     )
-    .await?;
-
-    if has_finalizers {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: NetworkPolicy = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    } else {
-        Ok(Json(networkpolicy))
-    }
+    .await
 }
 
 pub async fn list(
@@ -371,7 +224,6 @@ pub async fn list(
     Ok(Json(list).into_response())
 }
 
-/// List all networkpolicies across all namespaces
 pub async fn list_all_networkpolicies(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -437,92 +289,4 @@ pub async fn list_all_networkpolicies(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-crate::patch_handler_namespaced!(patch, NetworkPolicy, "networkpolicies", "networking.k8s.io");
-
-pub async fn deletecollection_networkpolicies(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection networkpolicies in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "networkpolicies")
-        .with_namespace(&namespace)
-        .with_api_group("networking.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: NetworkPolicy collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all networkpolicies in the namespace
-    let prefix = build_prefix("networkpolicies", Some(&namespace));
-    let mut items = state.storage.list::<NetworkPolicy>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("networkpolicies", Some(&namespace), &item.metadata.name);
-
-        // Run validating admission webhooks for DELETE per item.
-        crate::handlers::admission_helper::run_delete_validating_webhooks(
-            &state,
-            "networking.k8s.io",
-            "v1",
-            "NetworkPolicy",
-            "networkpolicies",
-            Some(&namespace),
-            &item.metadata.name,
-            &item,
-            &user_for_webhook,
-            false,
-        )
-        .await?;
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} networkpolicies deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }

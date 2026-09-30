@@ -273,7 +273,7 @@ async fn networking_patch_validates_spec_and_preserves_rejected_objects() {
             ING,
             ingress("invalid-patch"),
             json!({"spec": {"defaultBackend": {"service": {"port": {"number": 0}}}}}),
-            "spec.defaultBackend.service.port",
+            "spec.defaultBackend",
         ),
         (
             CLASS,
@@ -547,5 +547,299 @@ async fn networking_list_and_watch_keep_name_and_label_selectors() {
         .expect("watch must replay the selected object");
         assert_eq!(event["type"], "ADDED", "{event}");
         assert_eq!(event["object"]["metadata"]["name"], "selected", "{event}");
+    }
+}
+
+/// SetDefaults_NetworkPolicyPort defaults nil, not an explicit empty string;
+/// SetDefaults_NetworkPolicy defaults an empty policyTypes slice too
+/// (pkg/apis/networking/v1/defaults.go:30-45).
+#[tokio::test]
+async fn networkpolicy_null_protocol_defaults_but_empty_protocol_is_invalid() {
+    let api = TestApiServer::new();
+    let mut body = policy("nullable");
+    body["spec"]["policyTypes"] = json!([]);
+    body["spec"]["ingress"][0]["ports"][0]["protocol"] = Value::Null;
+    let created = create(&api, POLICY, &body).await;
+    assert_eq!(created["spec"]["policyTypes"], json!(["Ingress", "Egress"]));
+    assert_eq!(created["spec"]["ingress"][0]["ports"][0]["protocol"], "TCP");
+    let uri = format!("{POLICY}/nullable");
+    let (status, out) = api
+        .patch(
+            &uri,
+            &json!({"spec": {
+                "policyTypes": [], "ingress": [{"ports": [{"protocol": null, "port": 81}]}]
+            }}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["spec"]["policyTypes"], json!(["Ingress", "Egress"]));
+    assert_eq!(out["spec"]["ingress"][0]["ports"][0]["protocol"], "TCP");
+
+    body["metadata"]["name"] = json!("empty-protocol");
+    body["spec"]["ingress"][0]["ports"][0]["protocol"] = json!("");
+    let (status, out) = api.post(POLICY, &body).await;
+    assert_invalid(status, &out, "spec.ingress[0].ports[0].protocol");
+    let (status, out) = api
+        .patch(
+            &uri,
+            &json!({"spec": {
+                "ingress": [{"ports": [{"protocol": "", "port": 81}]}]
+            }}),
+        )
+        .await;
+    assert_invalid(status, &out, "spec.ingress[0].ports[0].protocol");
+    let (status, out) = api.get(&uri).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["spec"]["ingress"][0]["ports"][0]["protocol"], "TCP");
+}
+
+/// NetworkPolicy uses reflect.DeepEqual (networkpolicy/strategy.go:60),
+/// while Ingress uses Semantic.DeepEqual (ingress/strategy.go:89). Only the
+/// latter treats nil and empty slices as equal.
+#[tokio::test]
+async fn networking_generation_respects_resource_specific_slice_equality() {
+    let api = TestApiServer::new();
+    let mut body = policy("slice-equality");
+    body["spec"].as_object_mut().unwrap().remove("ingress");
+    let created = create(&api, POLICY, &body).await;
+    assert_eq!(created["metadata"]["generation"], 1);
+    let (status, out) = api
+        .patch(
+            &format!("{POLICY}/slice-equality"),
+            &json!({"spec": {"ingress": []}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["metadata"]["generation"], 2,
+        "nil -> empty changes NetworkPolicy spec: {out}"
+    );
+
+    let created = create(&api, ING, &ingress("slice-equality")).await;
+    assert_eq!(created["metadata"]["generation"], 1);
+    let (status, out) = api
+        .patch(
+            &format!("{ING}/slice-equality"),
+            &json!({"spec": {"rules": [], "tls": []}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["metadata"]["generation"], 1,
+        "nil -> empty is semantically equal for Ingress: {out}"
+    );
+}
+
+async fn send_with_warnings(
+    api: &TestApiServer,
+    method: &str,
+    uri: &str,
+    body: &Value,
+) -> (StatusCode, Vec<String>, Value) {
+    let content_type = if method == "PATCH" {
+        "application/merge-patch+json"
+    } else {
+        "application/json"
+    };
+    let (status, headers, _, out) = api
+        .send_full(
+            method,
+            uri,
+            Some(content_type),
+            None,
+            Some(serde_json::to_vec(body).unwrap()),
+        )
+        .await;
+    let warnings = headers
+        .get_all("warning")
+        .iter()
+        .map(|value| value.to_str().unwrap().to_owned())
+        .collect();
+    (status, warnings, out)
+}
+
+/// networkPolicyWarnings visits ingress and egress on create and update
+/// (networkpolicy/strategy.go:73-74,94-95,103-129). Warning kinds come from
+/// apimachinery/pkg/util/validation/ip.go:GetWarningsForCIDR:211-257.
+#[tokio::test]
+async fn networkpolicy_nonstandard_cidrs_warn_on_create_and_update() {
+    let api = TestApiServer::new();
+    for (name, cidr, warning_kind) in [
+        (
+            "leading-zero",
+            "010.000.000.000/8",
+            "non-standard CIDR value",
+        ),
+        ("mapped", "::ffff:10.0.0.0/104", "non-standard CIDR value"),
+        ("host-bits", "10.0.0.1/8", "is ambiguous in this context"),
+    ] {
+        let mut body = policy(name);
+        body["spec"]["ingress"] = json!([{"from": [{"ipBlock": {"cidr": cidr}}]}]);
+        body["spec"]["egress"] = json!([{"to": [{"ipBlock": {"cidr": cidr}}]}]);
+        let (status, warnings, out) = send_with_warnings(&api, "POST", POLICY, &body).await;
+        assert_eq!(status, StatusCode::CREATED, "{out}");
+        for field in [
+            "spec.ingress[0].from[0].ipBlock.cidr:",
+            "spec.egress[0].to[0].ipBlock.cidr:",
+        ] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(field) && w.contains(warning_kind)),
+                "{warnings:?}"
+            );
+        }
+        let (status, warnings, out) =
+            send_with_warnings(&api, "PUT", &format!("{POLICY}/{name}"), &body).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("spec.egress[0].to[0].ipBlock.cidr:")
+                    && w.contains(warning_kind)),
+            "{warnings:?}"
+        );
+    }
+}
+
+/// ingress/strategy.go:175-186 passes each IP's entry path to warnings;
+/// strategy_test.go:141-151 checks a leading-zero IP. Warning text comes
+/// from apimachinery/pkg/util/validation/ip.go:GetWarningsForIP:105-131.
+#[tokio::test]
+async fn ingress_status_nonstandard_ip_warns_for_put_and_patch() {
+    let api = TestApiServer::new();
+    let created = create(&api, ING, &ingress("ip-warning")).await;
+    let uri = format!("{ING}/ip-warning/status");
+    for (method, ip) in [("PUT", "192.000.002.001"), ("PATCH", "::ffff:192.0.2.1")] {
+        let mut body = created.clone();
+        body["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resourceVersion");
+        body["status"] = json!({"loadBalancer": {"ingress": [{"ip": ip}]}});
+        let (status, warnings, out) = send_with_warnings(&api, method, &uri, &body).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["status"]["loadBalancer"]["ingress"][0]["ip"], ip);
+        assert!(
+            warnings.iter().any(|w| w
+                .contains("status.loadBalancer.ingress[0]: non-standard IP address")
+                && w.contains("192.0.2.1")),
+            "{warnings:?}"
+        );
+    }
+}
+
+/// Annotation/class consistency is create-only: networking/validation/
+/// validation.go:300-314 rejects mismatch, ValidateIngressUpdate:318-327
+/// deliberately calls validateIngress without that extra create check.
+#[tokio::test]
+async fn ingress_class_annotation_mismatch_is_rejected_only_on_create() {
+    let api = TestApiServer::new();
+    let mut body = ingress("class-mismatch");
+    body["metadata"]["annotations"] = json!({"kubernetes.io/ingress.class": "legacy"});
+    body["spec"]["ingressClassName"] = json!("modern");
+    let (status, out) = api.post(ING, &body).await;
+    assert_invalid(status, &out, "annotations[kubernetes.io/ingress.class]");
+
+    body["spec"]["ingressClassName"] = json!("legacy");
+    create(&api, ING, &body).await;
+    let uri = format!("{ING}/class-mismatch");
+    body["spec"]["ingressClassName"] = json!("modern");
+    let (status, out) = api.put(&uri, &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["spec"]["ingressClassName"], "modern");
+    let (status, out) = api
+        .patch(
+            &uri,
+            &json!({"metadata": {"annotations": {"kubernetes.io/ingress.class": "other"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["metadata"]["annotations"]["kubernetes.io/ingress.class"],
+        "other"
+    );
+}
+
+/// Ingress PrepareForUpdate compares internal Go specs semantically
+/// (ingress/strategy.go:80-91). Host, secretName and service port name are
+/// non-pointer strings (pkg/apis/networking/types.go), so omitted and empty
+/// are the same zero value and must not trigger a generation bump.
+#[tokio::test]
+async fn ingress_explicit_empty_scalar_strings_do_not_bump_generation() {
+    let api = TestApiServer::new();
+    let mut body = ingress("empty-strings");
+    body["spec"]["rules"] = json!([{"http": {"paths": [{
+        "path": "/", "pathType": "Prefix",
+        "backend": {"service": {"name": "web", "port": {"number": 80}}}
+    }]}}]);
+    body["spec"]["tls"] = json!([{}]);
+    let created = create(&api, ING, &body).await;
+    assert_eq!(created["metadata"]["generation"], 1);
+    body["spec"]["rules"][0]["host"] = json!("");
+    body["spec"]["tls"][0]["secretName"] = json!("");
+    body["spec"]["defaultBackend"]["service"]["port"]["name"] = json!("");
+    let (status, out) = api.put(&format!("{ING}/empty-strings"), &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["metadata"]["generation"], 1,
+        "Go zero strings do not change the spec: {out}"
+    );
+}
+
+/// Go JSON null leaves non-pointer values at zero. NetworkPolicy's zero spec
+/// is valid (networking/validation/validation.go:137-185); Ingress zero paths,
+/// backend and service name reach field validation (:457-465,507-550).
+#[tokio::test]
+async fn networking_json_null_uses_go_zero_values_before_validation() {
+    let api = TestApiServer::new();
+    for (name, spec) in [
+        ("null-spec", Value::Null),
+        ("null-selector", json!({"podSelector": null})),
+    ] {
+        let mut body = policy(name);
+        body["spec"] = spec;
+        let out = create(&api, POLICY, &body).await;
+        assert_eq!(out["spec"]["policyTypes"], json!(["Ingress"]), "{out}");
+    }
+    for (name, http, field) in [
+        (
+            "null-paths",
+            json!({"paths": null}),
+            "spec.rules[0].http.paths",
+        ),
+        (
+            "null-backend",
+            json!({"paths": [{"path": "/", "pathType": "Prefix", "backend": null}]}),
+            "spec.rules[0].http.paths[0].backend",
+        ),
+        (
+            "null-service-name",
+            json!({"paths": [{"path": "/", "pathType": "Prefix", "backend": {"service": {"name": null, "port": {"number": 80}}}}]}),
+            "spec.rules[0].http.paths[0].backend.service.name",
+        ),
+    ] {
+        let mut body = ingress(name);
+        body["spec"]["rules"] = json!([{"http": http}]);
+        let (status, out) = api.post(ING, &body).await;
+        assert_invalid(status, &out, field);
+    }
+    // IngressPortStatus uses value fields, without a networking/v1 defaulter;
+    // ValidateIngressLoadBalancerStatus (:389-420) validates IP/hostname only.
+    create(&api, ING, &ingress("null-status-port")).await;
+    for port in [json!({"port": 80}), json!({"port": null, "protocol": null})] {
+        let expected_port = port["port"].as_i64().unwrap_or(0);
+        let (status, out) = api
+            .patch(
+                &format!("{ING}/null-status-port/status"),
+                &json!({
+                    "status": {"loadBalancer": {"ingress": [{"ip": "192.0.2.1", "ports": [port]}]}}
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let port = &out["status"]["loadBalancer"]["ingress"][0]["ports"][0];
+        assert_eq!(port["protocol"], "", "{out}");
+        assert_eq!(port["port"], expected_port, "{out}");
     }
 }
