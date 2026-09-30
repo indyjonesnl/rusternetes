@@ -1,100 +1,95 @@
+//! Lease endpoints.
+//!
+//! Writes go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the Lease strategy
+//! ([`crate::registry::coordination::lease`]) — upstream's
+//! `pkg/registry/coordination/lease/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::coordination::lease;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::Lease,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The Lease `RequestScope`: `coordination.k8s.io/v1` `Lease` served as
+/// `leases`, backed by `lease.NewREST`.
+fn scope(state: &ApiServerState) -> RequestScope<Lease> {
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "coordination.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "Lease".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "coordination.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "leases".to_string(),
+        },
+        subresource: None,
+        store: Box::new(lease::new_store(state.storage.clone())),
+        apply: Some(crate::ssa::apply_legacy::<Lease>),
+        convert_to_internal: None,
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut lease): DumpingJson<Lease>,
-) -> Result<(StatusCode, Json<Lease>)> {
-    info!("Creating lease: {}/{}", namespace, lease.metadata.name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "leases")
-        .with_namespace(&namespace)
-        .with_api_group("coordination.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &lease.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Validate spec (upstream coordination ValidateLeaseSpec).
-    let errs = rusternetes_common::validation::lease::validate_lease(&lease);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    lease.metadata.namespace = Some(namespace.clone());
-    lease.metadata.ensure_uid();
-    lease.metadata.ensure_creation_timestamp();
-
-    let key = build_key("leases", Some(&namespace), &lease.metadata.name);
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: Lease {}/{} validated successfully (not created)",
-            namespace, lease.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(lease)));
-    }
-
-    let created = state.storage.create(&key, &lease).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<Lease>> {
-    debug!("Getting lease: {}/{}", namespace, name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "leases")
-        .with_namespace(&namespace)
-        .with_api_group("coordination.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("leases", Some(&namespace), &name);
-    let lease = state.storage.get(&key).await?;
-
-    Ok(Json(lease))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn update(
@@ -102,140 +97,76 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut lease): DumpingJson<Lease>,
-) -> Result<Json<Lease>> {
-    debug!("Updating lease: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "leases")
-        .with_namespace(&namespace)
-        .with_api_group("coordination.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("leases", Some(&namespace), &name),
-        "coordination.k8s.io",
-        "leases",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
-    )
-    .await?;
-
-    lease.metadata.name = name.clone();
-    lease.metadata.namespace = Some(namespace.clone());
-
-    let key = build_key("leases", Some(&namespace), &name);
-
-    // Field validation on update (upstream ValidateLeaseUpdate re-runs
-    // ValidateLeaseSpec on the new object). The create path validated but the
-    // update path previously persisted PUTs unchecked.
-    {
-        let errs = rusternetes_common::validation::lease::validate_lease(&lease);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: Lease {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(lease));
-    }
-
-    let result = match crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
-        &*state.storage,
-        &key,
-        &mut lease,
+        &params,
+        &body,
     )
     .await
-    {
-        Ok(updated) => updated,
-        Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &lease).await?,
-        Err(e) => return Err(e),
-    };
+}
 
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete_lease(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Lease>> {
-    info!("Deleting lease: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "leases")
-        .with_namespace(&namespace)
-        .with_api_group("coordination.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("leases", Some(&namespace), &name);
-
-    // Get the lease for finalizer handling
-    let lease: Lease = state.storage.get(&key).await?;
-
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: Lease {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(lease));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &lease,
-        &delete_opts,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    if deleted_immediately {
-        Ok(Json(lease))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: Lease = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+pub async fn deletecollection_leases(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn list(
@@ -365,76 +296,4 @@ pub async fn list_all_leases(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-crate::patch_handler_namespaced!(patch, Lease, "leases", "coordination.k8s.io");
-
-pub async fn deletecollection_leases(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection leases in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "leases")
-        .with_namespace(&namespace)
-        .with_api_group("coordination.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: Lease collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all leases in the namespace
-    let prefix = build_prefix("leases", Some(&namespace));
-    let mut items = state.storage.list::<Lease>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("leases", Some(&namespace), &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} leases deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }

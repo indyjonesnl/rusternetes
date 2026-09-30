@@ -40,7 +40,10 @@ pub fn validate_lease(lease: &Lease) -> ErrorList {
     }
 
     if let Some(strategy) = &spec.strategy {
-        let sp = spec_path.child("strategy");
+        // `ValidateCoordinatedLeaseStrategy` is handed `spec.strategy` and
+        // reports on its `Child("strategy")` (validation.go), so the path
+        // upstream emits is `spec.strategy.strategy`.
+        let sp = spec_path.child("strategy").child("strategy");
         // Single-segment names must be Kubernetes-defined; a "/"-qualified name
         // must be a valid qualified name.
         if strategy.contains('/') {

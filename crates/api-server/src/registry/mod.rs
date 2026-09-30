@@ -21,6 +21,7 @@
 
 pub mod apps;
 pub mod batch;
+pub mod coordination;
 pub mod core;
 pub mod generic;
 pub mod names;

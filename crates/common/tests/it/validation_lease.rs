@@ -67,6 +67,9 @@ fn valid_builtin_strategy_ok() {
     assert!(validate_lease(&lease(Some(s))).is_empty());
 }
 
+/// `ValidateCoordinatedLeaseStrategy` reports on `fldPath.Child("strategy")`
+/// of the `spec.strategy` path it is given
+/// (pkg/apis/coordination/validation/validation.go).
 #[test]
 fn unknown_builtin_strategy_rejected() {
     let mut s = spec();
@@ -74,7 +77,7 @@ fn unknown_builtin_strategy_rejected() {
     let errs = validate_lease(&lease(Some(s)));
     assert!(errs
         .iter()
-        .any(|e| e.field == "spec.strategy" && e.error_type == ErrorType::NotSupported));
+        .any(|e| e.field == "spec.strategy.strategy" && e.error_type == ErrorType::NotSupported));
 }
 
 #[test]
@@ -88,7 +91,10 @@ fn qualified_strategy_ok() {
 fn invalid_qualified_strategy_rejected() {
     let mut s = spec();
     s.strategy = Some("bad prefix/name".to_string());
-    assert!(has(&validate_lease(&lease(Some(s))), "spec.strategy"));
+    assert!(has(
+        &validate_lease(&lease(Some(s))),
+        "spec.strategy.strategy"
+    ));
 }
 
 #[test]

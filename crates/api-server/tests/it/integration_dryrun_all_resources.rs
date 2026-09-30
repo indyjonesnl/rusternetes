@@ -584,8 +584,12 @@ async fn test_dry_run_update_does_not_persist() {
         .await;
         let before = snapshot(&mem, &key).await.expect("seeded object missing");
 
-        // Mirror upstream `obj.SetAnnotations({"update": "true"})`.
+        // Mirror upstream `DryRunUpdateTest` (test/integration/dryrun/dryrun_test.go:148-157):
+        // it updates the object it just read, resourceVersion included, and
+        // sets `obj.SetAnnotations({"update": "true"})`. Resources that refuse
+        // unconditional updates (Lease, RuntimeClass, PDB) require the RV.
         let mut updated = seeded.clone();
+        updated["metadata"]["resourceVersion"] = before["metadata"]["resourceVersion"].clone();
         updated["metadata"]["annotations"] = json!({"update": "true"});
 
         let uri = format!("{}?dryRun=All", case.item_uri);
