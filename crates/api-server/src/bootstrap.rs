@@ -849,6 +849,266 @@ pub async fn start_default_servicecidr_controller(
     })
 }
 
+// ---------------------------------------------------------------------------
+// ClusterAuthenticationTrust controller
+// ---------------------------------------------------------------------------
+
+/// Upstream's resync: `wait.PollImmediateUntil(1*time.Minute, ...)`
+/// (cluster_authentication_trust_controller.go:470-476).
+const CLUSTER_AUTHENTICATION_TRUST_RESYNC: Duration = Duration::from_secs(60);
+
+/// The CA bundle this api-server publishes, resolved the way the Namespace
+/// create handler resolved it before this controller existed: the
+/// well-known filesystem paths, then the serving CA.
+fn resolve_cluster_ca(ca_cert_pem: Option<&str>) -> Option<String> {
+    [
+        "/etc/kubernetes/pki/ca.crt",
+        "/etc/kubernetes/pki/api-server.crt",
+        "/root/.rusternetes/certs/ca.crt",
+    ]
+    .iter()
+    .find_map(|p| std::fs::read_to_string(p).ok())
+    .or_else(|| ca_cert_pem.map(str::to_string))
+    .filter(|ca| !ca.is_empty())
+}
+
+/// This api-server's `ClusterAuthenticationInfo`
+/// (pkg/controlplane/apiserver/config.go:71). Upstream fills it from
+/// `--client-ca-file` and the `--requestheader-*` flags, which this
+/// api-server does not take yet (#1577). Until it does, the effective
+/// configuration is published: the cluster CA for both client and front
+/// proxy, and the identity headers the aggregator proxy sends
+/// (`handlers::generic::build_proxy_headers`).
+pub fn cluster_authentication_info(
+    ca_cert_pem: Option<&str>,
+) -> rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo {
+    let ca = resolve_cluster_ca(ca_cert_pem);
+    rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo {
+        client_ca: ca.clone(),
+        request_header_username_headers: Some(vec!["X-Remote-User".to_string()]),
+        request_header_uid_headers: None,
+        request_header_group_headers: Some(vec!["X-Remote-Group".to_string()]),
+        request_header_extra_header_prefixes: Some(vec!["X-Remote-Extra-".to_string()]),
+        request_header_allowed_names: Some(Vec::new()),
+        request_header_ca: ca,
+    }
+}
+
+/// `createNamespaceIfNeeded` (cluster_authentication_trust_controller.go:181-197).
+/// Upstream creates through the API; this writes the object the Namespace
+/// strategy would have stored (phase Active, the `kubernetes` finalizer, the
+/// `kubernetes.io/metadata.name` label).
+async fn create_namespace_if_needed(storage: &StorageBackend, ns: &str) -> Result<()> {
+    use rusternetes_common::resources::Namespace;
+    let key = rusternetes_storage::build_key("namespaces", None, ns);
+    if storage.get::<Namespace>(&key).await.is_ok() {
+        return Ok(());
+    }
+    let namespace = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+            "name": ns,
+            "uid": uuid::Uuid::new_v4().to_string(),
+            "creationTimestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "labels": {"kubernetes.io/metadata.name": ns}
+        },
+        "spec": {"finalizers": ["kubernetes"]},
+        "status": {"phase": "Active"}
+    });
+    match storage.create(&key, &namespace).await {
+        Ok(_) | Err(rusternetes_common::Error::AlreadyExists(_)) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `syncConfigMap` (cluster_authentication_trust_controller.go:140-179) with
+/// `writeConfigMap` (:199-220): update, or create when absent.
+pub async fn sync_cluster_authentication_trust(
+    storage: &StorageBackend,
+    required: &rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo,
+) -> Result<()> {
+    use rusternetes_common::clusterauthenticationtrust::{
+        sync_config_map_data, CONFIG_MAP_NAME, CONFIG_MAP_NAMESPACE,
+    };
+    use rusternetes_common::resources::ConfigMap;
+
+    let key =
+        rusternetes_storage::build_key("configmaps", Some(CONFIG_MAP_NAMESPACE), CONFIG_MAP_NAME);
+    let existing = match storage.get::<ConfigMap>(&key).await {
+        Ok(cm) => Some(cm),
+        Err(rusternetes_common::Error::NotFound(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let existing_data = existing
+        .as_ref()
+        .map(|cm| cm.data.clone().unwrap_or_default());
+    // `RemoteRequestHeaderUID` is beta and on by default (kube_features.go:2059-2062).
+    let Some(data) = sync_config_map_data(
+        existing_data.as_ref(),
+        required,
+        true,
+        chrono::Utc::now().timestamp(),
+    )
+    .map_err(|e| anyhow::anyhow!("{CONFIG_MAP_NAMESPACE}/{CONFIG_MAP_NAME}: {e}"))?
+    else {
+        return Ok(());
+    };
+    info!("writing updated authentication info to {CONFIG_MAP_NAMESPACE} configmaps/{CONFIG_MAP_NAME}");
+    create_namespace_if_needed(storage, CONFIG_MAP_NAMESPACE).await?;
+    match existing {
+        Some(mut cm) => {
+            cm.data = Some(data);
+            storage.update(&key, &cm).await?;
+        }
+        None => {
+            let mut cm = ConfigMap {
+                type_meta: rusternetes_common::types::TypeMeta {
+                    kind: "ConfigMap".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: rusternetes_common::types::ObjectMeta::new(CONFIG_MAP_NAME)
+                    .with_namespace(CONFIG_MAP_NAMESPACE.to_string()),
+                data: Some(data),
+                binary_data: None,
+                immutable: None,
+            };
+            cm.metadata.ensure_uid();
+            cm.metadata.ensure_creation_timestamp();
+            storage.create(&key, &cm).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The ClusterAuthenticationTrust controller, which kube-apiserver runs as
+/// the `start-cluster-authentication-info-controller` post-start hook
+/// (pkg/controlplane/apiserver/server.go:248-282): keep
+/// `kube-system/extension-apiserver-authentication` holding how aggregated
+/// api-servers should authenticate this one. It syncs at once, on every
+/// add or delete of that ConfigMap (:117-135), and every minute (:470-476).
+pub fn spawn_cluster_authentication_trust_controller(
+    storage: Arc<StorageBackend>,
+    required: rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo,
+) -> tokio::task::JoinHandle<()> {
+    use futures::StreamExt;
+    use rusternetes_common::clusterauthenticationtrust::{CONFIG_MAP_NAME, CONFIG_MAP_NAMESPACE};
+    use rusternetes_storage::WatchEvent;
+
+    tokio::spawn(async move {
+        let key = rusternetes_storage::build_key(
+            "configmaps",
+            Some(CONFIG_MAP_NAMESPACE),
+            CONFIG_MAP_NAME,
+        );
+        let mut ticker = tokio::time::interval(CLUSTER_AUTHENTICATION_TRUST_RESYNC);
+        let mut watch = None;
+        loop {
+            if watch.is_none() {
+                watch = storage.watch(&key).await.ok();
+            }
+            let event = async {
+                match watch.as_mut() {
+                    Some(w) => w.next().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                _ = ticker.tick() => {}
+                ev = event => match ev {
+                    Some(Ok(WatchEvent::Added(k, _) | WatchEvent::Deleted(k, _))) if k == key => {}
+                    Some(Ok(_)) => continue,
+                    // A broken watch is re-established on the next pass.
+                    Some(Err(_)) | None => {
+                        watch = None;
+                        continue;
+                    }
+                },
+            }
+            if let Err(e) = sync_cluster_authentication_trust(storage.as_ref(), &required).await {
+                warn!("cluster_authentication_trust_controller: {e}");
+            }
+        }
+    })
+}
+
+/// The `kube-system` Role and RoleBinding of upstream's bootstrap namespace
+/// policy that concern `extension-apiserver-authentication`
+/// (plugin/pkg/auth/authorizer/rbac/bootstrappolicy/namespace_policy.go:75-82,
+/// 124-126): read access to the ConfigMap, granted to the controller-manager
+/// and the scheduler. `EnsureRBACPolicy` (pkg/registry/rbac/rest/
+/// storage_rbac.go:269-331) creates each, creating the namespace first
+/// (`tryEnsureNamespace`, component-helpers/auth/rbac/reconciliation/
+/// namespace.go:31-45). Only the create half is ported, and only these two
+/// objects; the rest of the bootstrap policy is #1753.
+pub async fn bootstrap_extension_apiserver_authentication_rbac(
+    storage: Arc<StorageBackend>,
+) -> Result<()> {
+    use rusternetes_common::clusterauthenticationtrust::{CONFIG_MAP_NAME, CONFIG_MAP_NAMESPACE};
+
+    const ROLE: &str = "extension-apiserver-authentication-reader";
+    const BINDING: &str = "system::extension-apiserver-authentication-reader";
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let objects = [
+        (
+            rusternetes_storage::build_key("roles", Some(CONFIG_MAP_NAMESPACE), ROLE),
+            serde_json::json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "Role",
+                "metadata": {
+                    "name": ROLE,
+                    "namespace": CONFIG_MAP_NAMESPACE,
+                    "uid": uuid::Uuid::new_v4().to_string(),
+                    "creationTimestamp": now,
+                    "labels": {"kubernetes.io/bootstrapping": "rbac-defaults"},
+                    "annotations": {"rbac.authorization.kubernetes.io/autoupdate": "true"}
+                },
+                "rules": [{
+                    "apiGroups": [""],
+                    "resources": ["configmaps"],
+                    "resourceNames": [CONFIG_MAP_NAME],
+                    "verbs": ["get", "list", "watch"]
+                }]
+            }),
+        ),
+        (
+            rusternetes_storage::build_key("rolebindings", Some(CONFIG_MAP_NAMESPACE), BINDING),
+            serde_json::json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "RoleBinding",
+                "metadata": {
+                    "name": BINDING,
+                    "namespace": CONFIG_MAP_NAMESPACE,
+                    "uid": uuid::Uuid::new_v4().to_string(),
+                    "creationTimestamp": now,
+                    "labels": {"kubernetes.io/bootstrapping": "rbac-defaults"},
+                    "annotations": {"rbac.authorization.kubernetes.io/autoupdate": "true"}
+                },
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "Role",
+                    "name": ROLE
+                },
+                "subjects": [
+                    {"apiGroup": "rbac.authorization.k8s.io", "kind": "User", "name": "system:kube-controller-manager"},
+                    {"apiGroup": "rbac.authorization.k8s.io", "kind": "User", "name": "system:kube-scheduler"}
+                ]
+            }),
+        ),
+    ];
+    create_namespace_if_needed(storage.as_ref(), CONFIG_MAP_NAMESPACE).await?;
+    for (key, obj) in objects {
+        if storage.get::<serde_json::Value>(&key).await.is_ok() {
+            continue;
+        }
+        match storage.create(&key, &obj).await {
+            Ok(_) | Err(rusternetes_common::Error::AlreadyExists(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
