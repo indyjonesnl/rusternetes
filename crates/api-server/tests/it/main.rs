@@ -80,6 +80,7 @@ mod cri_ws_attach_proxy_test;
 mod cri_ws_exec_proxy_test;
 mod cronjob_generic_store_test;
 mod cronjob_handler_test;
+mod csi_store_test;
 mod csidriver_handler_test;
 mod csidriver_update_immutable_test;
 mod csinode_handler_test;

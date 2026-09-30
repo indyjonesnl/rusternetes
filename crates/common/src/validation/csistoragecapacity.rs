@@ -14,6 +14,7 @@ use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
     is_dns1123_subdomain, validate_label_selector, LabelSelectorValidationOptions,
 };
+use crate::validation::runtimeclass::get_node_label_deprecated_message;
 
 /// The `nodeTopology` field uses the `volume` crate's structurally-identical
 /// `LabelSelector`; convert it to the `types` one the metav1 validator expects.
@@ -32,15 +33,77 @@ fn to_types_selector(sel: &VolumeLabelSelector) -> LabelSelector {
     }
 }
 
-/// Validate a `CSIStorageCapacity` on create. Mirrors upstream
-/// `ValidateCSIStorageCapacity` minus ObjectMeta.
-pub fn validate_csi_storage_capacity(csc: &CSIStorageCapacity) -> ErrorList {
+/// `CSIStorageCapacityValidateOptions` (validation.go:590-592).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CsiStorageCapacityValidateOptions {
+    pub allow_invalid_label_value_in_selector: bool,
+}
+
+/// `hasInvalidLabelValueInLabelSelector`
+/// (pkg/registry/storage/csistoragecapacity/strategy.go:95-98).
+pub fn has_invalid_label_value_in_label_selector(csc: &CSIStorageCapacity) -> bool {
+    csc.node_topology.as_ref().is_some_and(|t| {
+        !validate_label_selector(
+            &to_types_selector(t),
+            LabelSelectorValidationOptions::default(),
+            &Path::new("nodeTopology"),
+        )
+        .is_empty()
+    })
+}
+
+/// `GetWarningsForNodeSelector` (pkg/api/node/util.go:64-92): a warning per
+/// deprecated node label in `matchExpressions` keys and `matchLabels` keys.
+pub fn get_warnings_for_node_selector(
+    selector: &VolumeLabelSelector,
+    fld_path: &Path,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (i, expr) in selector.match_expressions.iter().flatten().enumerate() {
+        if let Some(msg) = get_node_label_deprecated_message(&expr.key) {
+            warnings.push(format!(
+                "{}: {} is {}",
+                fld_path.child("matchExpressions").index(i).child("key"),
+                expr.key,
+                msg
+            ));
+        }
+    }
+    for label in selector.match_labels.iter().flat_map(|m| m.keys()) {
+        if let Some(msg) = get_node_label_deprecated_message(label) {
+            warnings.push(format!(
+                "{}: {}",
+                fld_path.child("matchLabels").child(label),
+                msg
+            ));
+        }
+    }
+    warnings
+}
+
+/// `GetWarningsForCSIStorageCapacity` (pkg/api/storage/util.go:44-49).
+pub fn get_warnings_for_csi_storage_capacity(csc: &CSIStorageCapacity) -> Vec<String> {
+    csc.node_topology
+        .as_ref()
+        .map(|t| get_warnings_for_node_selector(t, &Path::new("nodeTopology")))
+        .unwrap_or_default()
+}
+
+/// Validate a `CSIStorageCapacity`. Mirrors upstream
+/// `ValidateCSIStorageCapacity` (validation.go:595-606) minus ObjectMeta.
+pub fn validate_csi_storage_capacity(
+    csc: &CSIStorageCapacity,
+    opts: CsiStorageCapacityValidateOptions,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     if let Some(topology) = &csc.node_topology {
         errs.extend(validate_label_selector(
             &to_types_selector(topology),
-            LabelSelectorValidationOptions::default(),
+            LabelSelectorValidationOptions {
+                allow_invalid_label_value_in_selector: opts.allow_invalid_label_value_in_selector,
+                ..Default::default()
+            },
             &Path::new("nodeTopology"),
         ));
     }
@@ -88,7 +151,7 @@ pub fn validate_csi_storage_capacity_update(
     {
         errs.push(Error::invalid(
             &Path::new("nodeTopology"),
-            "<node topology>".to_string(),
+            serde_json::to_value(&new_csc.node_topology).unwrap_or_default(),
             "field is immutable",
         ));
     }

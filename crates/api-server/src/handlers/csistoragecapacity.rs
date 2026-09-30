@@ -1,101 +1,95 @@
+//! CSIStorageCapacity endpoints.
+//!
+//! Writes go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the CSIStorageCapacity strategy
+//! ([`crate::registry::storage::csistoragecapacity`]) — upstream's
+//! `pkg/registry/storage/csistoragecapacity/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::storage::csistoragecapacity;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::HeaderMap,
+    response::Response,
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::CSIStorageCapacity,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The CSIStorageCapacity `RequestScope`: `storage.k8s.io/v1` `CSIStorageCapacity` served as
+/// `csistoragecapacities`, backed by `csistoragecapacity.NewREST`.
+fn scope(state: &ApiServerState) -> RequestScope<CSIStorageCapacity> {
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "storage.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "CSIStorageCapacity".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "storage.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "csistoragecapacities".to_string(),
+        },
+        subresource: None,
+        store: Box::new(csistoragecapacity::new_store(state.storage.clone())),
+        apply: Some(crate::ssa::apply_legacy::<CSIStorageCapacity>),
+        convert_to_internal: None,
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create_csistoragecapacity(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut csc): DumpingJson<CSIStorageCapacity>,
-) -> Result<(StatusCode, Json<CSIStorageCapacity>)> {
-    info!(
-        "Creating CSIStorageCapacity: {} in namespace: {}",
-        csc.metadata.name, namespace
-    );
-
-    // Check authorization (namespaced)
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "csistoragecapacities")
-        .with_api_group("storage.k8s.io")
-        .with_namespace(&namespace);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &csc.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    csc.metadata.namespace = Some(namespace.clone());
-    csc.metadata.ensure_uid();
-    csc.metadata.ensure_creation_timestamp();
-
-    // Validate spec (upstream storage ValidateCSIStorageCapacity): nodeTopology
-    // selector, storageClassName, capacity quantity.
-    let errs =
-        rusternetes_common::validation::csistoragecapacity::validate_csi_storage_capacity(&csc);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: CSIStorageCapacity validated successfully (not created)");
-        return Ok((StatusCode::CREATED, Json(csc)));
-    }
-
-    let key = build_key("csistoragecapacities", Some(&namespace), &csc.metadata.name);
-    let created = state.storage.create(&key, &csc).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get_csistoragecapacity(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<CSIStorageCapacity>> {
-    info!(
-        "Getting CSIStorageCapacity: {} in namespace: {}",
-        name, namespace
-    );
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "csistoragecapacities")
-        .with_api_group("storage.k8s.io")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("csistoragecapacities", Some(&namespace), &name);
-    let csc = state.storage.get(&key).await?;
-
-    Ok(Json(csc))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn list_csistoragecapacities(
@@ -233,248 +227,74 @@ pub async fn update_csistoragecapacity(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut csc): DumpingJson<CSIStorageCapacity>,
-) -> Result<Json<CSIStorageCapacity>> {
-    info!(
-        "Updating CSIStorageCapacity: {} in namespace: {}",
-        name, namespace
-    );
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "csistoragecapacities")
-        .with_api_group("storage.k8s.io")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("csistoragecapacities", Some(&namespace), &name),
-        "storage.k8s.io",
-        "csistoragecapacities",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    csc.metadata.name = name.clone();
-    csc.metadata.namespace = Some(namespace.clone());
-
-    let key = build_key("csistoragecapacities", Some(&namespace), &name);
-
-    // Immutability validation (upstream ValidateCSIStorageCapacityUpdate):
-    // nodeTopology and storageClassName are immutable.
-    {
-        let old_csc: CSIStorageCapacity = state.storage.get(&key).await?;
-        let errs = rusternetes_common::validation::csistoragecapacity::validate_csi_storage_capacity_update(&csc, &old_csc);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: CSIStorageCapacity validated successfully (not updated)");
-        return Ok(Json(csc));
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    if let Ok(stored) = state.storage.get::<CSIStorageCapacity>(&key).await {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut csc.metadata,
-            &stored.metadata,
-        );
-    }
-    let updated = state.storage.update(&key, &csc).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &updated,
+pub async fn patch_csistoragecapacity(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    Ok(Json(updated))
+    .await
 }
 
 pub async fn delete_csistoragecapacity(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<CSIStorageCapacity>> {
-    info!(
-        "Deleting CSIStorageCapacity: {} in namespace: {}",
-        name, namespace
-    );
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "csistoragecapacities")
-        .with_api_group("storage.k8s.io")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("csistoragecapacities", Some(&namespace), &name);
-
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Get the resource for finalizer handling
-    let resource: CSIStorageCapacity = state.storage.get(&key).await?;
-
-    if is_dry_run {
-        info!("Dry-run: CSIStorageCapacity validated successfully (not deleted)");
-        return Ok(Json(resource));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &resource,
-        &delete_opts,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
     )
-    .await?;
-
-    if deleted_immediately {
-        Ok(Json(resource))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: CSIStorageCapacity = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+    .await
 }
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(
-    patch_csistoragecapacity,
-    CSIStorageCapacity,
-    "csistoragecapacities",
-    "storage.k8s.io"
-);
 
 pub async fn deletecollection_csistoragecapacities(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection csistoragecapacities in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "csistoragecapacities")
-        .with_namespace(&namespace)
-        .with_api_group("storage.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: CSIStorageCapacity collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all csistoragecapacities in the namespace
-    let prefix = build_prefix("csistoragecapacities", Some(&namespace));
-    let mut items = state.storage.list::<CSIStorageCapacity>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key(
-            "csistoragecapacities",
-            Some(&namespace),
-            &item.metadata.name,
-        );
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} csistoragecapacities deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
-
-    fn create_test_capacity(name: &str) -> CSIStorageCapacity {
-        CSIStorageCapacity {
-            type_meta: TypeMeta {
-                kind: "CSIStorageCapacity".to_string(),
-                api_version: "storage.k8s.io/v1".to_string(),
-            },
-            metadata: ObjectMeta::new(name).with_namespace("default"),
-            storage_class_name: "fast-ssd".to_string(),
-            capacity: Some("100Gi".to_string()),
-            maximum_volume_size: Some("10Gi".to_string()),
-            node_topology: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_csistoragecapacity_serialization() {
-        let csc = create_test_capacity("test-csc");
-        let json = serde_json::to_string(&csc).unwrap();
-        let deserialized: CSIStorageCapacity = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.metadata.name, "test-csc");
-        assert_eq!(deserialized.storage_class_name, "fast-ssd");
-    }
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await
 }
