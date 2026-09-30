@@ -255,7 +255,7 @@ pub struct NodeSelectorRequirement {
     pub values: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistentVolumeStatus {
     #[serde(default)]
