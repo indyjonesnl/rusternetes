@@ -3,8 +3,9 @@
 //! and ClusterIPs through the [`MetaAllocator`].
 //!
 //! Only the primary family is allocated: this api-server configures one
-//! (IPv4) ClusterIP allocator, and `initIPFamilyFields`' dual-stack handling
-//! moves over with the Service strategy (#2077).
+//! (IPv4) ClusterIP allocator, so [`init_ip_family_fields`] rejects a
+//! dual-stack requirement and the dual-stack cases of `updateClusterIPs`
+//! cannot be reached.
 //!
 //! Every entry point hands back the operation. The caller commits it once the
 //! Service is persisted (`callbackTransaction.commit`, alloc.go:485-491) and
@@ -12,7 +13,12 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::{Service, ServiceExternalTrafficPolicy, ServiceType};
+use rusternetes_common::resources::{
+    IPFamily, IPFamilyPolicy, Service, ServiceExternalTrafficPolicy, ServiceType,
+};
+use rusternetes_common::validation::service::{
+    parse_ip_sloppy, validate_service_cluster_ips_related_fields,
+};
 use rusternetes_common::validation::field;
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::Storage;
@@ -328,6 +334,265 @@ pub async fn settle<T>(mut op: PortAllocationOperation, result: &Result<T>) {
         op.commit().await;
     }
     op.finish().await;
+}
+
+// ---------------------------------------------------------------------------
+// IP families
+// ---------------------------------------------------------------------------
+
+/// The families this api-server allocates ClusterIPs from
+/// (`Allocators.serviceIPAllocatorsByFamily`): one IPv4 allocator.
+pub const CONFIGURED_IP_FAMILIES: &[IPFamily] = &[IPFamily::IPv4];
+
+/// `Allocators.defaultServiceIPFamily`.
+pub const DEFAULT_SERVICE_IP_FAMILY: IPFamily = IPFamily::IPv4;
+
+fn other_family(fam: &IPFamily) -> IPFamily {
+    match fam {
+        IPFamily::IPv4 => IPFamily::IPv6,
+        IPFamily::IPv6 => IPFamily::IPv4,
+    }
+}
+
+/// `familyOf` (alloc.go:1099-1107); `None` is upstream's `"unknown"`.
+fn family_of(ip: &str) -> Option<IPFamily> {
+    match parse_ip_sloppy(ip)? {
+        IpAddr::V4(_) => Some(IPFamily::IPv4),
+        IpAddr::V6(_) => Some(IPFamily::IPv6),
+    }
+}
+
+fn spec_cluster_ips(svc: &Service) -> &[String] {
+    svc.spec.cluster_ips.as_deref().unwrap_or(&[])
+}
+
+fn spec_ip_families(svc: &Service) -> &[IPFamily] {
+    svc.spec.ip_families.as_deref().unwrap_or(&[])
+}
+
+/// `sameClusterIPs` (alloc.go:1052-1064).
+pub fn same_cluster_ips(lhs: &Service, rhs: &Service) -> bool {
+    spec_cluster_ips(lhs) == spec_cluster_ips(rhs)
+}
+
+/// `sameIPFamilies` (alloc.go:1075-1087).
+fn same_ip_families(lhs: &Service, rhs: &Service) -> bool {
+    spec_ip_families(lhs) == spec_ip_families(rhs)
+}
+
+/// `reducedClusterIPs` (alloc.go:1066-1073).
+fn reduced_cluster_ips(service: &Service, old: &Service) -> bool {
+    let new = spec_cluster_ips(service);
+    !new.is_empty() && new.len() < spec_cluster_ips(old).len()
+}
+
+/// `reducedIPFamilies` (alloc.go:1089-1097).
+fn reduced_ip_families(service: &Service, old: &Service) -> bool {
+    let new = spec_ip_families(service);
+    !new.is_empty() && new.len() < spec_ip_families(old).len()
+}
+
+fn has_selector(svc: &Service) -> bool {
+    svc.spec.selector.as_ref().is_some_and(|s| !s.is_empty())
+}
+
+fn is_policy(svc: &Service, policy: IPFamilyPolicy) -> bool {
+    svc.spec.ip_family_policy.as_ref() == Some(&policy)
+}
+
+/// `isMatchingPreferDualStackClusterIPFields` (alloc.go:996-1042).
+fn is_matching_prefer_dual_stack_cluster_ip_fields(
+    service: &Service,
+    old: Option<&Service>,
+) -> bool {
+    let Some(old) = old else {
+        return false;
+    };
+    if service.spec.ip_family_policy.is_none() {
+        return false;
+    }
+    if old.spec.service_type != service.spec.service_type {
+        return false;
+    }
+    if !matches!(
+        service.spec.service_type,
+        Some(ServiceType::ClusterIP) | Some(ServiceType::NodePort) | Some(ServiceType::LoadBalancer)
+    ) {
+        return false;
+    }
+    if !is_policy(service, IPFamilyPolicy::PreferDualStack) {
+        return false;
+    }
+    if old.spec.ip_family_policy.is_some() && !is_policy(old, IPFamilyPolicy::PreferDualStack) {
+        return false;
+    }
+    same_cluster_ips(old, service) && same_ip_families(old, service)
+}
+
+fn policy_value(svc: &Service) -> serde_json::Value {
+    serde_json::to_value(&svc.spec.ip_family_policy).unwrap_or_default()
+}
+
+fn invalid_service(errs: field::ErrorList) -> Error {
+    Error::Invalid(errs)
+}
+
+/// `initIPFamilyFields` (alloc.go:104-303): default `ipFamilyPolicy` and
+/// `ipFamilies`, and reject families and policies this cluster cannot
+/// serve. `old` is `None` on create.
+pub fn init_ip_family_fields(service: &mut Service, old: Option<&Service>) -> Result<()> {
+    if matches!(service.spec.service_type, Some(ServiceType::ExternalName)) {
+        return Ok(());
+    }
+
+    if is_matching_prefer_dual_stack_cluster_ip_fields(service, old) {
+        return Ok(());
+    }
+
+    let headless_selectorless =
+        service.spec.cluster_ip.as_deref() == Some("None") && !has_selector(service);
+
+    if service.spec.ip_family_policy.is_none() {
+        service.spec.ip_family_policy = match old.and_then(|o| o.spec.ip_family_policy.clone()) {
+            Some(p) => Some(p),
+            None if headless_selectorless => Some(IPFamilyPolicy::RequireDualStack),
+            None => Some(IPFamilyPolicy::SingleStack),
+        };
+    }
+
+    let el = validate_service_cluster_ips_related_fields(service, old);
+    if !el.is_empty() {
+        return Err(invalid_service(el));
+    }
+
+    let policy_path = field::Path::new("spec").child("ipFamilyPolicy");
+    let mut el = Vec::new();
+
+    if let Some(old) = old {
+        if is_policy(service, IPFamilyPolicy::SingleStack) {
+            if same_cluster_ips(old, service) && spec_cluster_ips(service).len() > 1 {
+                if let Some(ips) = service.spec.cluster_ips.as_mut() {
+                    ips.truncate(1);
+                }
+            }
+            if same_ip_families(old, service) && spec_ip_families(service).len() > 1 {
+                if let Some(fams) = service.spec.ip_families.as_mut() {
+                    fams.truncate(1);
+                }
+            }
+        } else {
+            if reduced_cluster_ips(service, old) {
+                el.push(field::Error::invalid(
+                    &policy_path,
+                    policy_value(service),
+                    "must be 'SingleStack' to release the secondary cluster IP",
+                ));
+            }
+            if reduced_ip_families(service, old) {
+                el.push(field::Error::invalid(
+                    &policy_path,
+                    policy_value(service),
+                    "must be 'SingleStack' to release the secondary IP family",
+                ));
+            }
+        }
+    }
+
+    if is_policy(service, IPFamilyPolicy::SingleStack) {
+        if spec_cluster_ips(service).len() == 2 {
+            el.push(field::Error::invalid(
+                &policy_path,
+                policy_value(service),
+                "must be 'RequireDualStack' or 'PreferDualStack' when multiple cluster IPs are specified",
+            ));
+        }
+        if spec_ip_families(service).len() == 2 {
+            el.push(field::Error::invalid(
+                &policy_path,
+                policy_value(service),
+                "must be 'RequireDualStack' or 'PreferDualStack' when multiple IP families are specified",
+            ));
+        }
+    }
+
+    // Infer ipFamilies[] from clusterIPs[].
+    let ips = spec_cluster_ips(service).to_vec();
+    for (i, ip) in ips.iter().enumerate() {
+        if ip == "None" {
+            break;
+        }
+        if i >= spec_ip_families(service).len() {
+            match family_of(ip) {
+                Some(fam) if CONFIGURED_IP_FAMILIES.contains(&fam) => {
+                    service.spec.ip_families.get_or_insert_with(Vec::new).push(fam);
+                }
+                fam => {
+                    let name = match fam {
+                        Some(IPFamily::IPv4) => "IPv4",
+                        Some(IPFamily::IPv6) => "IPv6",
+                        None => "unknown",
+                    };
+                    el.push(field::Error::invalid(
+                        &field::Path::new("spec").child("clusterIPs").index(i),
+                        ips.clone(),
+                        format!("{name} is not configured on this cluster"),
+                    ));
+                }
+            }
+        }
+    }
+
+    if !el.is_empty() {
+        return Err(invalid_service(el));
+    }
+
+    // Headless + selectorless may carry families the cluster does not have.
+    if headless_selectorless {
+        let fams = service.spec.ip_families.get_or_insert_with(Vec::new);
+        if fams.is_empty() {
+            fams.push(DEFAULT_SERVICE_IP_FAMILY);
+        }
+        if fams.len() < 2
+            && service.spec.ip_family_policy.as_ref() != Some(&IPFamilyPolicy::SingleStack)
+        {
+            let alt = other_family(&fams[0]);
+            fams.push(alt);
+        }
+        return Ok(());
+    }
+
+    if is_policy(service, IPFamilyPolicy::RequireDualStack) && CONFIGURED_IP_FAMILIES.len() < 2 {
+        el.push(field::Error::invalid(
+            &policy_path,
+            policy_value(service),
+            "this cluster is not configured for dual-stack services",
+        ));
+    }
+    for (i, fam) in spec_ip_families(service).iter().enumerate() {
+        if !CONFIGURED_IP_FAMILIES.contains(fam) {
+            el.push(field::Error::invalid(
+                &field::Path::new("spec").child("ipFamilies").index(i),
+                serde_json::to_value(fam).unwrap_or_default(),
+                "not configured on this cluster",
+            ));
+        }
+    }
+    if !el.is_empty() {
+        return Err(invalid_service(el));
+    }
+
+    let fams = service.spec.ip_families.get_or_insert_with(Vec::new);
+    if fams.is_empty() {
+        fams.push(DEFAULT_SERVICE_IP_FAMILY);
+    }
+    if service.spec.ip_family_policy.as_ref() != Some(&IPFamilyPolicy::SingleStack)
+        && fams.len() == 1
+        && CONFIGURED_IP_FAMILIES.len() == 2
+    {
+        let alt = other_family(&fams[0]);
+        fams.push(alt);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
