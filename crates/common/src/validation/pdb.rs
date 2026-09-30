@@ -7,95 +7,82 @@ use crate::resources::policy::{
     PodDisruptionBudgetStatus,
 };
 use crate::types::Condition;
-use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::apps::{is_not_more_than_100_percent, validate_positive_int_or_percent};
+use crate::validation::field::{BadValue, Error, ErrorList, Path};
 use crate::validation::metav1::{
     validate_conditions, validate_label_selector, LabelSelectorValidationOptions,
 };
 use crate::validation::objectmeta::validate_nonnegative_field;
 
-/// Parse a percent string ("`N%`") to its integer value, or `None` if it is not
-/// a valid percent (upstream `IsValidPercent`: `^[0-9]+%$`).
-fn parse_percent(s: &str) -> Option<i64> {
-    let digits = s.strip_suffix('%')?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse::<i64>().ok()
+/// `PodDisruptionBudgetValidationOptions`
+/// (pkg/apis/policy/validation/validation.go:37-39).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PodDisruptionBudgetValidationOptions {
+    pub allow_invalid_label_value_in_selector: bool,
 }
 
-/// Validate an `IntOrString` used as a disruption budget bound, combining
-/// upstream `ValidatePositiveIntOrPercent` (non-negative int, or a valid
-/// percent) and `IsNotMoreThan100Percent` (a percent may not exceed 100%).
-fn validate_int_or_percent(v: &IntOrString, fld_path: &Path) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
-    match v {
-        IntOrString::Int(n) => {
-            if *n < 0 {
-                errs.push(Error::invalid(
-                    fld_path,
-                    *n,
-                    "must be greater than or equal to 0",
-                ));
-            }
-        }
-        IntOrString::String(s) => match parse_percent(s) {
-            None => errs.push(Error::invalid(
-                fld_path,
-                s.clone(),
-                "must be an integer or percentage (e.g '5%')",
-            )),
-            Some(pct) if pct > 100 => errs.push(Error::invalid(
-                fld_path,
-                s.clone(),
-                "must not be greater than 100%",
-            )),
-            Some(_) => {}
-        },
-    }
-    errs
+/// The bad value upstream reports when both bounds are set: the internal
+/// `policy.PodDisruptionBudgetSpec` itself (`field.Invalid(fldPath, spec, …)`,
+/// validation.go:53). The internal type has no json tags
+/// (pkg/apis/policy/types.go), so it marshals with Go field names and a nil
+/// pointer as `null`; the selector is a `metav1.LabelSelector`, which does
+/// carry tags.
+fn spec_bad_value(spec: &PodDisruptionBudgetSpec) -> BadValue {
+    let int_or_string = |v: &Option<IntOrString>| match v {
+        Some(v) => v.to_json(),
+        None => serde_json::Value::Null,
+    };
+    BadValue::Json(serde_json::json!({
+        "MinAvailable": int_or_string(&spec.min_available),
+        "Selector": spec.selector,
+        "MaxUnavailable": int_or_string(&spec.max_unavailable),
+        "UnhealthyPodEvictionPolicy": spec.unhealthy_pod_eviction_policy,
+    }))
 }
 
-/// Validate a `PodDisruptionBudgetSpec`. Mirrors upstream
-/// `ValidatePodDisruptionBudgetSpec`.
+/// `ValidatePodDisruptionBudgetSpec`
+/// (pkg/apis/policy/validation/validation.go:48-76).
 pub fn validate_pod_disruption_budget_spec(
     spec: &PodDisruptionBudgetSpec,
+    opts: PodDisruptionBudgetValidationOptions,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
-    // minAvailable and maxUnavailable are mutually exclusive.
     if spec.min_available.is_some() && spec.max_unavailable.is_some() {
         errs.push(Error::invalid(
             fld_path,
-            "{minAvailable, maxUnavailable}".to_string(),
+            spec_bad_value(spec),
             "minAvailable and maxUnavailable cannot be both set",
         ));
     }
 
     if let Some(mn) = &spec.min_available {
-        errs.extend(validate_int_or_percent(mn, &fld_path.child("minAvailable")));
+        let path = fld_path.child("minAvailable");
+        errs.extend(validate_positive_int_or_percent(mn, &path).1);
+        errs.extend(is_not_more_than_100_percent(mn, &path));
     }
     if let Some(mx) = &spec.max_unavailable {
-        errs.extend(validate_int_or_percent(
-            mx,
-            &fld_path.child("maxUnavailable"),
-        ));
+        let path = fld_path.child("maxUnavailable");
+        errs.extend(validate_positive_int_or_percent(mx, &path).1);
+        errs.extend(is_not_more_than_100_percent(mx, &path));
     }
 
-    // Upstream hands the pointer straight to `ValidateLabelSelector`, which
-    // returns no errors for a nil selector
-    // (`apimachinery/pkg/apis/meta/v1/validation/validation.go`), called from
-    // `pkg/apis/policy/validation/validation.go::ValidatePodDisruptionBudgetSpec`.
-    // A PDB with no selector is valid; it simply guards no pods.
+    // `ValidateLabelSelector` returns no errors for a nil selector
+    // (apimachinery/pkg/apis/meta/v1/validation/validation.go). A PDB with no
+    // selector is valid; it guards no pods.
     if let Some(selector) = &spec.selector {
         errs.extend(validate_label_selector(
             selector,
-            LabelSelectorValidationOptions::default(),
+            LabelSelectorValidationOptions {
+                allow_invalid_label_value_in_selector: opts.allow_invalid_label_value_in_selector,
+                ..Default::default()
+            },
             &fld_path.child("selector"),
         ));
     }
 
-    // unhealthyPodEvictionPolicy, when set, must be a known value.
+    // `supportedUnhealthyPodEvictionPolicies` (validation.go:33-35).
     if let Some(policy) = &spec.unhealthy_pod_eviction_policy {
         if policy != "IfHealthyBudget" && policy != "AlwaysAllow" {
             errs.push(Error::not_supported(
@@ -109,10 +96,12 @@ pub fn validate_pod_disruption_budget_spec(
     errs
 }
 
-/// Validate a new `PodDisruptionBudget`. Mirrors upstream
-/// `ValidatePodDisruptionBudget`.
-pub fn validate_pod_disruption_budget(pdb: &PodDisruptionBudget) -> ErrorList {
-    validate_pod_disruption_budget_spec(&pdb.spec, &Path::new("spec"))
+/// `ValidatePodDisruptionBudget` (validation.go:41-46).
+pub fn validate_pod_disruption_budget(
+    pdb: &PodDisruptionBudget,
+    opts: PodDisruptionBudgetValidationOptions,
+) -> ErrorList {
+    validate_pod_disruption_budget_spec(&pdb.spec, opts, &Path::new("spec"))
 }
 
 /// Convert a PDB-specific condition into the generic `metav1.Condition`

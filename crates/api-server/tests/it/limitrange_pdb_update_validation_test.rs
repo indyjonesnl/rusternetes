@@ -98,9 +98,12 @@ async fn pdb_update_rejects_invalid_spec() {
         "minAvailable + maxUnavailable on update must be rejected"
     );
 
-    // A valid update (just minAvailable) still succeeds.
-    let (code, _) = state
-        .put(&item_uri, &pdb(name, json!({"minAvailable": 2})))
-        .await;
-    assert_eq!(code, StatusCode::OK, "valid update must succeed");
+    // A valid update (just minAvailable) still succeeds. It carries the
+    // stored resourceVersion: PDBs refuse unconditional updates
+    // (`AllowUnconditionalUpdate`, pkg/registry/policy/poddisruptionbudget/strategy.go:125-129).
+    let (_, stored) = state.get(&item_uri).await;
+    let mut update = pdb(name, json!({"minAvailable": 2}));
+    update["metadata"]["resourceVersion"] = stored["metadata"]["resourceVersion"].clone();
+    let (code, body) = state.put(&item_uri, &update).await;
+    assert_eq!(code, StatusCode::OK, "valid update must succeed: {body}");
 }
