@@ -4,6 +4,7 @@
 pub mod configmap;
 pub mod endpoint;
 pub mod limitrange;
+pub mod node;
 pub mod persistentvolume;
 pub mod persistentvolumeclaim;
 pub mod podtemplate;

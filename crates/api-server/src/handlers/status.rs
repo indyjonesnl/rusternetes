@@ -23,20 +23,9 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 /// Run resource-type-specific status validation before persisting a status
-/// update. Currently covers Node `/status` (upstream `ValidateNodeUpdate`
-/// status-field checks: addresses, declaredFeatures, capacity/allocatable),
-/// Namespace and ValidatingAdmissionPolicy.
+/// update. Currently covers Namespace and ValidatingAdmissionPolicy.
 fn validate_status_subresource(resource_type: &str, resource: &Value) -> Result<()> {
-    if resource_type == "nodes" {
-        let node: rusternetes_common::resources::Node = serde_json::from_value(resource.clone())
-            .map_err(|e| {
-                rusternetes_common::Error::InvalidResource(format!("invalid Node: {e}"))
-            })?;
-        let errs = rusternetes_common::validation::node::validate_node_status_update(&node);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    } else if resource_type == "namespaces" {
+    if resource_type == "namespaces" {
         let ns: rusternetes_common::resources::Namespace = serde_json::from_value(resource.clone())
             .map_err(|e| {
                 rusternetes_common::Error::InvalidResource(format!("invalid Namespace: {e}"))
@@ -653,31 +642,6 @@ pub async fn update_cluster_status(
 
         // Update status
         obj.insert("status".to_string(), new_status);
-
-        // For nodes: sync capacity keys to allocatable.
-        // K8s kubelet copies extended resources from capacity to allocatable
-        // (extended resources have no system reservation). Without this, the
-        // scheduler can't see extended resources patched onto nodes.
-        if resource_type == "nodes" {
-            if let Some(status_obj) = obj.get_mut("status").and_then(|s| s.as_object_mut()) {
-                // Collect capacity keys first to avoid borrow conflict
-                let capacity_entries: Vec<(String, Value)> = status_obj
-                    .get("capacity")
-                    .and_then(|c| c.as_object())
-                    .map(|c| c.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                    .unwrap_or_default();
-                if !capacity_entries.is_empty() {
-                    let allocatable = status_obj
-                        .entry("allocatable")
-                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                    if let Some(alloc_obj) = allocatable.as_object_mut() {
-                        for (key, value) in capacity_entries {
-                            alloc_obj.entry(key).or_insert(value);
-                        }
-                    }
-                }
-            }
-        }
 
         // Merge metadata: start with current, then apply annotations/labels
         // from the request. K8s status updates can modify metadata annotations.

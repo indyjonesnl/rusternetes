@@ -71,3 +71,124 @@ fn validate_parent_reference(pr: &ParentReference, fld_path: &Path) -> ErrorList
 
     errs
 }
+
+/// Go's `net.IPNet.String()` for a parsed prefix: an IPv4-mapped IPv6
+/// network prints in IPv4 form, its mask cut to the last 32 bits
+/// (`networkNumberAndMask`, net/ip.go).
+fn go_ipnet_string(net: std::net::IpAddr, prefix: u8) -> String {
+    use std::net::IpAddr;
+    match net {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => format!("{v4}/{}", prefix.saturating_sub(96)),
+            None => format!("{v6}/{prefix}"),
+        },
+        IpAddr::V4(v4) => format!("{v4}/{prefix}"),
+    }
+}
+
+/// Go's `net.IP.String()`: an IPv4-mapped IPv6 address prints as IPv4.
+fn go_ip_string(ip: std::net::IpAddr) -> String {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
+        IpAddr::V4(v4) => v4.to_string(),
+    }
+}
+
+/// Port of `GetWarningsForCIDR`
+/// (apimachinery/pkg/util/validation/ip.go:211-250), for a value validation
+/// has already accepted: host bits set after the prefix, an IPv4-mapped IPv6
+/// value, or an IPv6 value not in RFC 5952 canonical form.
+///
+/// `ParseCIDRSloppy`'s leading-zero IPv4 form is rejected by the Rust
+/// parser, so that half of the non-standard-value warning cannot arise.
+pub fn get_warnings_for_cidr(fld_path: &Path, value: &str) -> Vec<String> {
+    use std::net::IpAddr;
+    let Some((ip_str, prefix_str)) = value.split_once('/') else {
+        return Vec::new();
+    };
+    let (Ok(ip), Ok(prefix)) = (ip_str.parse::<IpAddr>(), prefix_str.parse::<u8>()) else {
+        return Vec::new();
+    };
+    let (network, addr_len) = match ip {
+        IpAddr::V4(v4) if prefix <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+            (IpAddr::V4((u32::from(v4) & mask).into()), 32)
+        }
+        IpAddr::V6(v6) if prefix <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+            (IpAddr::V6((u128::from(v6) & mask).into()), 128)
+        }
+        _ => return Vec::new(),
+    };
+    let ipnet = go_ipnet_string(network, prefix);
+    let mut warnings = Vec::new();
+    if ip != network {
+        warnings.push(format!(
+            "{fld_path}: CIDR value {value:?} is ambiguous in this context (should be {ipnet:?} or {:?}?)",
+            format!("{}/{addr_len}", go_ip_string(ip)),
+        ));
+    }
+    // `netip.ParsePrefix` rejects what `ParseCIDRSloppy` let through: a
+    // prefix length with leading zeros, or an IPv4-mapped IPv6 address.
+    let mapped = matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some());
+    if mapped || prefix_str != prefix.to_string() {
+        warnings.push(format!(
+            "{fld_path}: non-standard CIDR value {value:?} will be considered invalid in a future Kubernetes release: use {ipnet:?}"
+        ));
+    }
+    if let IpAddr::V6(v6) = ip {
+        let canonical = format!("{v6}/{prefix}");
+        if warnings.is_empty() && canonical != value {
+            warnings.push(format!(
+                "{fld_path}: IPv6 CIDR value {value:?} should be in RFC 5952 canonical format ({canonical:?})"
+            ));
+        }
+    }
+    warnings
+}
+
+#[cfg(test)]
+mod cidr_warning_tests {
+    use super::*;
+
+    /// `TestGetWarningsForCIDR` (apimachinery/pkg/util/validation/ip_test.go:530-605),
+    /// less the leading-zero IPv4 cases the Rust parser rejects outright.
+    #[test]
+    fn warnings_match_upstream() {
+        let path = Path::new("spec").child("loadBalancerSourceRanges").index(0);
+        let cases: [(&str, &[&str]); 6] = [
+            ("192.12.2.0/24", &[]),
+            ("2001:db8::/64", &[]),
+            (
+                "192.12.2.0/024",
+                &[
+                    r#"spec.loadBalancerSourceRanges[0]: non-standard CIDR value "192.12.2.0/024" will be considered invalid in a future Kubernetes release: use "192.12.2.0/24""#,
+                ],
+            ),
+            (
+                "::ffff:192.12.2.0/120",
+                &[
+                    r#"spec.loadBalancerSourceRanges[0]: non-standard CIDR value "::ffff:192.12.2.0/120" will be considered invalid in a future Kubernetes release: use "192.12.2.0/24""#,
+                ],
+            ),
+            (
+                "192.12.2.8/24",
+                &[
+                    r#"spec.loadBalancerSourceRanges[0]: CIDR value "192.12.2.8/24" is ambiguous in this context (should be "192.12.2.0/24" or "192.12.2.8/32"?)"#,
+                ],
+            ),
+            (
+                "2001:db8:0:0::/64",
+                &[
+                    r#"spec.loadBalancerSourceRanges[0]: IPv6 CIDR value "2001:db8:0:0::/64" should be in RFC 5952 canonical format ("2001:db8::/64")"#,
+                ],
+            ),
+        ];
+        for (cidr, want) in cases {
+            assert_eq!(get_warnings_for_cidr(&path, cidr), want, "{cidr}");
+        }
+    }
+}
