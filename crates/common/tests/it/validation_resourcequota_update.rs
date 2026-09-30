@@ -10,7 +10,7 @@ fn rq(scopes: serde_json::Value) -> ResourceQuota {
     serde_json::from_value(json!({
         "apiVersion": "v1",
         "kind": "ResourceQuota",
-        "metadata": {"name": "rq", "namespace": "default"},
+        "metadata": {"name": "rq", "namespace": "default", "resourceVersion": "1"},
         "spec": spec
     }))
     .unwrap()

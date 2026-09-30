@@ -217,6 +217,7 @@ mod require_create_name_router_test;
 mod resourceclaim_decode_when_absent_test;
 mod resourceclaim_status_validation_test;
 mod resourcequota_concurrent_pod_create_test;
+mod resourcequota_generic_store_test;
 mod resourcequota_handler_test;
 mod resourcequota_status_preserve_test;
 mod resourcequota_status_validation_test;

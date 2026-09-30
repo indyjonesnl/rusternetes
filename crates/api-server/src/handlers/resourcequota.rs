@@ -1,129 +1,100 @@
+//! ResourceQuota endpoints.
+//!
+//! Writes, and the `/status` subresource, go through the
+//! generic endpoint handlers and [`crate::registry::generic::Store`] with the
+//! ResourceQuota strategies ([`crate::registry::core::resourcequota`]) —
+//! upstream's `pkg/registry/core/resourcequota/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::core::resourcequota;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
-    resources::{ResourceQuota, ResourceQuotaStatus},
+    resources::ResourceQuota,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The ResourceQuota `RequestScope`: `v1` `ResourceQuota` served as
+/// `resourcequotas` (or its `/status`), backed by `resourcequota.NewREST`'s
+/// stores.
+fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestScope<ResourceQuota> {
+    let store: Box<dyn crate::registry::rest::RestStorage<ResourceQuota>> = match subresource {
+        Some(_) => Box::new(resourcequota::new_status_store(state.storage.clone())),
+        None => Box::new(resourcequota::new_store(state.storage.clone())),
+    };
+    RequestScope {
+        kind: GroupVersionKind {
+            group: String::new(),
+            version: "v1".to_string(),
+            kind: "ResourceQuota".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "resourcequotas".to_string(),
+        },
+        subresource,
+        store,
+        apply: Some(crate::ssa::apply_legacy::<ResourceQuota>),
+        convert_to_internal: None,
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut quota): DumpingJson<ResourceQuota>,
-) -> Result<(StatusCode, Json<ResourceQuota>)> {
-    info!(
-        "Creating ResourceQuota: {} in namespace: {}",
-        quota.metadata.name, namespace
-    );
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "resourcequotas")
-        .with_api_group("")
-        .with_namespace(&namespace);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &quota.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Field validation (mirrors upstream ValidateResourceQuota).
-    {
-        let errs = rusternetes_common::validation::resourcequota::validate_resource_quota(&quota);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    quota.metadata.namespace = Some(namespace.clone());
-
-    // Enrich metadata with system fields
-    quota.metadata.ensure_uid();
-    quota.metadata.ensure_creation_timestamp();
-
-    // Set kind/apiVersion
-    quota.type_meta.kind = "ResourceQuota".to_string();
-    quota.type_meta.api_version = "v1".to_string();
-
-    // Initialize status with hard limits and zero usage
-    if quota.status.is_none() {
-        let used = quota
-            .spec
-            .hard
-            .as_ref()
-            .map(|hard| hard.keys().map(|k| (k.clone(), "0".to_string())).collect());
-        quota.status = Some(ResourceQuotaStatus {
-            hard: quota.spec.hard.clone(),
-            used,
-        });
-    }
-
-    let key = build_key("resourcequotas", Some(&namespace), &quota.metadata.name);
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: ResourceQuota {}/{} validated successfully (not created)",
-            namespace, quota.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(quota)));
-    }
-
-    let created = state.storage.create(&key, &quota).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<ResourceQuota>> {
-    info!(
-        "Getting ResourceQuota: {} in namespace: {}",
-        name, namespace
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "resourcequotas")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("resourcequotas", Some(&namespace), &name);
-    let quota = state.storage.get(&key).await?;
-
-    Ok(Json(quota))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn update(
@@ -131,185 +102,135 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut quota): DumpingJson<ResourceQuota>,
-) -> Result<Json<ResourceQuota>> {
-    info!(
-        "Updating ResourceQuota: {} in namespace: {}",
-        name, namespace
-    );
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "resourcequotas")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("resourcequotas", Some(&namespace), &name),
-        "",
-        "resourcequotas",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    quota.metadata.name = name.clone();
-    quota.metadata.namespace = Some(namespace.clone());
-
-    let key = build_key("resourcequotas", Some(&namespace), &name);
-
-    // Upstream resourcequotaStrategy.PrepareForUpdate copies the stored object's
-    // status onto the incoming object so status (used/hard) only mutates via the
-    // /status subresource. Without this, a spec-only PUT carries an empty status
-    // and wipes the controller-computed usage until the next reconcile.
-    let old_quota = match state.storage.get::<ResourceQuota>(&key).await {
-        Ok(old) => Some(old),
-        Err(rusternetes_common::Error::NotFound(_)) => None,
-        Err(e) => return Err(e),
-    };
-    if let Some(old) = &old_quota {
-        // Field validation on update (upstream ValidateResourceQuotaUpdate):
-        // re-validate the spec and reject changes to the immutable spec.scopes.
-        let errs = rusternetes_common::validation::resourcequota::validate_resource_quota_update(
-            &quota, old,
-        );
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-        // PrepareForUpdate: status only mutates via the /status subresource.
-        quota.status = old.status.clone();
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: ResourceQuota {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(quota));
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    // The stored object is already in hand from the read above; re-reading it
-    // here would cost a second round-trip on every PUT and widen the window
-    // between read and write for no benefit.
-    if let Some(stored) = old_quota.as_ref() {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut quota.metadata,
-            &stored.metadata,
-        );
-    }
-    let result = state.storage.update(&key, &quota).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<ResourceQuota>> {
-    info!(
-        "Deleting ResourceQuota: {} in namespace: {}",
-        name, namespace
-    );
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "resourcequotas")
-        .with_api_group("")
-        .with_namespace(&namespace)
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("resourcequotas", Some(&namespace), &name);
-
-    // Get the resource quota for finalizer handling
-    let quota: ResourceQuota = state.storage.get(&key).await?;
-
-    // Run validating admission webhooks for DELETE (object=nil, oldObject=quota).
-    crate::handlers::admission_helper::run_delete_validating_webhooks(
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
         &state,
-        "",
-        "v1",
-        "ResourceQuota",
-        "resourcequotas",
+        &scope(&state, None),
+        &auth_ctx.user,
         Some(&namespace),
         &name,
-        &quota,
-        &user_for_webhook,
-        is_dry_run,
+        &params,
+        &body,
     )
-    .await?;
-
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: ResourceQuota {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(quota));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &quota,
-        &delete_opts,
-    )
-    .await?;
-
-    if deleted_immediately {
-        Ok(Json(quota))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: ResourceQuota = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+    .await
 }
 
+pub async fn deletecollection_resourcequotas(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// GET `/status`: `StatusREST.Get` is the store's `Get` (storage.go:97-99).
+pub async fn get_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
+}
+
+/// PUT `/status`: `StatusREST.Update` (storage.go:102-106).
+pub async fn update_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// PATCH `/status`: a patch into `StatusREST.Update`.
+pub async fn patch_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
+}
 pub async fn list(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -397,90 +318,3 @@ pub async fn list_all(
 }
 
 // Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(patch, ResourceQuota, "resourcequotas", "");
-
-pub async fn deletecollection_resourcequotas(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection resourcequotas in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "resourcequotas")
-        .with_namespace(&namespace)
-        .with_api_group("");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ResourceQuota collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all resourcequotas in the namespace
-    let prefix = build_prefix("resourcequotas", Some(&namespace));
-    let mut items = state.storage.list::<ResourceQuota>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("resourcequotas", Some(&namespace), &item.metadata.name);
-
-        // Run validating admission webhooks for DELETE per item.
-        crate::handlers::admission_helper::run_delete_validating_webhooks(
-            &state,
-            "",
-            "v1",
-            "ResourceQuota",
-            "resourcequotas",
-            Some(&namespace),
-            &item.metadata.name,
-            &item,
-            &user_for_webhook,
-            false,
-        )
-        .await?;
-
-        // Handle deletion with finalizers. DeleteCollection is idempotent: if an
-        // item vanished between the list and this delete (e.g. the quota
-        // controller updated status concurrently and the backend delete races to
-        // 0 rows), treat NotFound as already-deleted instead of failing the whole
-        // collection delete with a 404.
-        match crate::handlers::finalizers::handle_delete_with_finalizers(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await
-        {
-            Ok(false) => deleted_count += 1, // deleted immediately (no finalizers)
-            Ok(true) => {}                   // finalizers pending — not counted
-            Err(rusternetes_common::Error::NotFound(_)) => deleted_count += 1,
-            Err(e) => return Err(e),
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} resourcequotas deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
-}
