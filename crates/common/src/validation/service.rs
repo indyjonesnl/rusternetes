@@ -1,637 +1,1143 @@
-//! Service field validation ported from upstream Kubernetes
-//! `pkg/apis/core/validation/validation.go` (release-1.35).
+//! Service validation — port of `pkg/apis/core/validation/validation.go`
+//! (release-1.35): `ValidateServiceCreate` (:6924-6936),
+//! `ValidateServiceUpdate` (:6939-6959), `ValidateServiceStatusUpdate`
+//! (:6962-6966), `validateService` (:6570-6778) and the helpers they call.
 //!
-//! Mirrors the upstream structure: validators return [`ErrorList`] (a
-//! `Vec<Error>`) and *accumulate* every problem rather than short-circuiting.
-//! Field paths and error wording match upstream byte-for-byte so conformance
-//! log greps and test needles stay valid.
+//! Validation runs on the object after v1 defaulting (`SetDefaults_Service`)
+//! and the Service REST's `beginCreate` / `beginUpdate`, which is why fields
+//! such as `sessionAffinity`, `type` and `internalTrafficPolicy` are
+//! `Required` here.
 //!
-//! Upstream sources (release-1.35):
-//! <https://github.com/kubernetes/kubernetes/blob/release-1.35/pkg/apis/core/validation/validation.go>
-//! <https://github.com/kubernetes/kubernetes/blob/release-1.35/pkg/apis/core/validation/validation_test.go>
+//! Feature gates at their 1.35 defaults: `RelaxedServiceNameValidation` off
+//! (names are DNS-1035 labels), `StrictIPCIDRValidation` off (IPs and CIDRs
+//! parse "sloppily"), `PreferSameTrafficDistribution` GA.
+//!
+//! `type`, `ipFamilies`, `ipFamilyPolicy` and the traffic policies are closed
+//! enums in [`ServiceSpec`], so a value outside the supported set fails to
+//! decode rather than reaching the `NotSupported` checks upstream has for them.
 
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
-use std::str::FromStr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use crate::resources::policy::IntOrString;
 use crate::resources::service::{
-    Service, ServiceExternalTrafficPolicy, ServicePort, ServiceSpec, ServiceType,
+    IPFamily, IPFamilyPolicy, LoadBalancerStatus, Service, ServiceExternalTrafficPolicy,
+    ServiceInternalTrafficPolicy, ServicePort, ServiceType, SessionAffinityConfig,
 };
-use crate::validation::field::{Error, ErrorList, Path};
-use crate::validation::metav1::is_dns1123_label;
+use crate::validation::field::{BadValue, Error, ErrorList, Path};
+use crate::validation::metav1::{
+    is_dns1035_label, is_dns1123_label, is_dns1123_subdomain, is_qualified_name, validate_labels,
+};
+use crate::validation::objectmeta::{validate_object_meta, validate_object_meta_update};
+
+/// `core.MaxClientIPServiceAffinitySeconds` (pkg/apis/core/types.go).
+const MAX_CLIENT_IP_SERVICE_AFFINITY_SECONDS: i32 = 86400;
+
+/// `core.DeprecatedAnnotationTopologyAwareHints`.
+const DEPRECATED_ANNOTATION_TOPOLOGY_AWARE_HINTS: &str =
+    "service.kubernetes.io/topology-aware-hints";
+/// `core.AnnotationTopologyMode`.
+const ANNOTATION_TOPOLOGY_MODE: &str = "service.kubernetes.io/topology-mode";
+/// `core.AnnotationLoadBalancerSourceRangesKey`.
+const ANNOTATION_LOAD_BALANCER_SOURCE_RANGES: &str =
+    "service.beta.kubernetes.io/load-balancer-source-ranges";
+
+/// `supportedPortProtocols` (validation.go:2717-2721).
+const SUPPORTED_PORT_PROTOCOLS: &[&str] = &["SCTP", "TCP", "UDP"];
+/// `supportedSessionAffinityType` (validation.go:6557).
+const SUPPORTED_SESSION_AFFINITY_TYPE: &[&str] = &["ClientIP", "None"];
+/// `supportedLoadBalancerIPMode` (validation.go:8649).
+const SUPPORTED_LOAD_BALANCER_IP_MODE: &[&str] = &["Proxy", "VIP"];
+/// `supportedTrafficDistribution` with `PreferSameTrafficDistribution` on
+/// (validation.go:6904-6913).
+const SUPPORTED_TRAFFIC_DISTRIBUTION: &[&str] =
+    &["PreferClose", "PreferSameZone", "PreferSameNode"];
 
 // ---------------------------------------------------------------------------
-// Constants (mirroring upstream)
+// Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Minimum valid port number. Upstream `MinValidPort`.
-const MIN_VALID_PORT: i32 = 1;
-
-/// Maximum valid port number. Upstream `MaxValidPort`.
-const MAX_VALID_PORT: i32 = 65535;
-
-/// Minimum NodePort value. Upstream default `NodePortMin`.
-const NODE_PORT_MIN: i32 = 30000;
-
-/// Maximum NodePort value. Upstream default `NodePortMax`.
-const NODE_PORT_MAX: i32 = 32767;
-
-/// Session affinity timeout minimum (seconds). Upstream `MinSessionAffinitySeconds`.
-const MIN_SESSION_AFFINITY_SECONDS: i32 = 1;
-
-/// Session affinity timeout maximum (seconds). Upstream `MaxSessionAffinitySeconds`.
-const MAX_SESSION_AFFINITY_SECONDS: i32 = 86400;
-
-// ---------------------------------------------------------------------------
-// Low-level helpers
-// ---------------------------------------------------------------------------
-
-/// Returns true iff `s` is a valid port name: a DNS-1123 label no longer than
-/// 15 characters and containing at least one letter. Mirrors upstream
-/// `utilvalidation.IsValidPortName`.
-fn is_valid_port_name(s: &str) -> bool {
-    if s.len() > 15 {
-        return false;
+/// `netutils.ParseIPSloppy` (k8s.io/utils/net/parse.go): like
+/// `net.ParseIP`, which also accepts IPv4 octets with leading zeros (read
+/// as decimal).
+pub fn parse_ip_sloppy(value: &str) -> Option<IpAddr> {
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Some(ip);
     }
-    // Must match DNS-1123 label rules
-    if !is_dns1123_label(s).is_empty() {
-        return false;
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.len() != 4 {
+        return None;
     }
-    // Must contain at least one letter
-    s.chars().any(|c| c.is_ascii_alphabetic())
-}
-
-/// Returns true iff `value` is a valid IP address (v4 or v6). Mirrors upstream
-/// `utilnet.IsValidIP`.
-fn is_valid_ip(value: &str) -> bool {
-    IpAddr::from_str(value).is_ok()
-}
-
-/// Returns true iff `value` is a valid CIDR (`ip/prefix`), with the prefix in
-/// range for the address family. Mirrors the create-path of upstream
-/// `IsValidCIDRForLegacyField` (strict, no legacy-tolerance when there is no
-/// prior value).
-fn is_valid_cidr(value: &str) -> bool {
-    let Some((ip, prefix)) = value.split_once('/') else {
-        return false;
-    };
-    let Ok(prefix) = prefix.parse::<u8>() else {
-        return false;
-    };
-    match IpAddr::from_str(ip) {
-        Ok(IpAddr::V4(_)) => prefix <= 32,
-        Ok(IpAddr::V6(_)) => prefix <= 128,
-        Err(_) => false,
-    }
-}
-
-/// Returns true iff `value` is a valid IANA IANA-registered FQDN. Mirrors upstream
-/// `utilvalidation.IsDNS1123Subdomain`. We reuse our own helper which returns
-/// an empty slice on success.
-fn is_valid_external_name(value: &str) -> Vec<String> {
-    crate::validation::metav1::is_dns1123_subdomain(value)
-}
-
-// ---------------------------------------------------------------------------
-// Port-level validators
-// ---------------------------------------------------------------------------
-
-/// Validate a single `ServicePort`. Mirrors upstream `validateServicePort`.
-///
-/// `require_name` is true when the service has more than one port (names are
-/// then mandatory and must be unique — the caller enforces uniqueness).
-/// `is_headless` is true when `spec.clusterIP == "None"`.
-/// `svc_type` is the resolved service type.
-fn validate_service_port(
-    port: &ServicePort,
-    require_name: bool,
-    is_headless: bool,
-    svc_type: &ServiceType,
-    fld: &Path,
-) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
-
-    // name: required when multi-port; must be a valid DNS-1123 label (≤63
-    // chars) when present.
-    //
-    // This is a DNS1123Label, NOT IsValidPortName. Upstream validates
-    // `ServicePort.Name` with `ValidateDNS1123Label` and reserves the 15-char
-    // IANA_SVC_NAME rule (`IsValidPortName`) for *ContainerPort.Name* and the
-    // *string* `targetPort` (handled below). Applying the 15-char rule here
-    // wrongly rejected valid real-world manifests — e.g. cert-manager's
-    // `tcp-prometheus-servicemonitor` (29 chars) Service port — which install
-    // fine on upstream Kubernetes.
-    match &port.name {
-        Some(name) if !name.is_empty() => {
-            let label_errs = is_dns1123_label(name);
-            if !label_errs.is_empty() {
-                errs.push(Error::invalid(
-                    &fld.child("name"),
-                    name.clone(),
-                    label_errs.join("; "),
-                ));
-            }
+    let mut octets = [0u8; 4];
+    for (i, p) in parts.iter().enumerate() {
+        if p.is_empty() || p.len() > 3 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
         }
-        _ => {
-            // None or empty string — required when multi-port
-            if require_name {
-                errs.push(Error::required(&fld.child("name"), ""));
-            }
-        }
+        octets[i] = p.parse::<u16>().ok().filter(|n| *n <= 255)? as u8;
     }
+    Some(IpAddr::V4(Ipv4Addr::from(octets)))
+}
 
-    // port number
-    let port_num = port.port as i32;
-    if !(MIN_VALID_PORT..=MAX_VALID_PORT).contains(&port_num) {
+/// `netutils.ParseCIDRSloppy`: `ip/prefix` with a sloppy IP and a decimal
+/// prefix no longer than the address.
+fn parse_cidr_sloppy(value: &str) -> Option<(IpAddr, u8)> {
+    let (ip, prefix) = value.split_once('/')?;
+    let ip = parse_ip_sloppy(ip)?;
+    if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let prefix: u32 = prefix.parse().ok()?;
+    let bits = if ip.is_ipv4() { 32 } else { 128 };
+    (prefix <= bits).then_some((ip, prefix as u8))
+}
+
+fn is_ipv6_string(value: &str) -> bool {
+    matches!(parse_ip_sloppy(value), Some(IpAddr::V6(_)))
+}
+
+/// `IsValidIPForLegacyField` (validation.go:9556-9558, apimachinery
+/// util/validation/ip.go:81-87) with `StrictIPCIDRValidation` off: a
+/// value already valid in the old object passes as-is.
+pub fn is_valid_ip_for_legacy_field(fld: &Path, value: &str, valid_old: &[String]) -> ErrorList {
+    if valid_old.iter().any(|v| v == value) || parse_ip_sloppy(value).is_some() {
+        return Vec::new();
+    }
+    vec![Error::invalid(
+        fld,
+        value,
+        "must be a valid IP address, (e.g. 10.9.8.7 or 2001:db8::ffff)",
+    )
+    .with_origin("format=ip-sloppy")]
+}
+
+/// `IsValidCIDRForLegacyField` (validation.go:9563-9565, ip.go:184-191).
+pub fn is_valid_cidr_for_legacy_field(fld: &Path, value: &str, valid_old: &[String]) -> ErrorList {
+    if valid_old.iter().any(|v| v == value) || parse_cidr_sloppy(value).is_some() {
+        return Vec::new();
+    }
+    vec![Error::invalid(
+        fld,
+        value,
+        "must be a valid CIDR value, (e.g. 10.9.8.0/24 or 2001:db8::/64)",
+    )]
+}
+
+/// `ValidateEndpointIP` (validation.go:8314-8334).
+fn validate_endpoint_ip(ip_address: &str, fld: &Path) -> ErrorList {
+    let mut errs = Vec::new();
+    let Some(ip) = parse_ip_sloppy(ip_address) else {
+        errs.push(
+            Error::invalid(fld, ip_address, "must be a valid IP address")
+                .with_origin("format=ip-sloppy"),
+        );
+        return errs;
+    };
+    if ip.is_unspecified() {
         errs.push(Error::invalid(
-            &fld.child("port"),
-            port_num,
-            format!(
-                "must be between {} and {}, inclusive",
-                MIN_VALID_PORT, MAX_VALID_PORT
-            ),
+            fld,
+            ip_address,
+            format!("may not be unspecified ({ip_address})"),
         ));
     }
-
-    // protocol: required, then must be one of TCP/UDP/SCTP. Upstream
-    // `validateServicePort` emits Required when protocol is empty, NotSupported
-    // otherwise — it does NOT default a missing protocol to TCP at validation
-    // time (defaulting happens earlier in the API machinery, on a separate
-    // path). validation.go:6798-6802.
-    match port.protocol.as_str() {
-        "" => {
-            errs.push(Error::required(&fld.child("protocol"), ""));
-        }
-        "TCP" | "UDP" | "SCTP" => {}
-        other => {
-            errs.push(Error::not_supported(
-                &fld.child("protocol"),
-                other.to_string(),
-                &["TCP", "UDP", "SCTP"],
-            ));
-        }
+    if ip.is_loopback() {
+        errs.push(Error::invalid(
+            fld,
+            ip_address,
+            "may not be in the loopback range (127.0.0.0/8, ::1/128)",
+        ));
     }
-
-    // targetPort
-    if let Some(tp) = &port.target_port {
-        match tp {
-            IntOrString::Int(n) => {
-                if !(MIN_VALID_PORT..=MAX_VALID_PORT).contains(n) {
-                    errs.push(Error::invalid(
-                        &fld.child("targetPort"),
-                        *n,
-                        format!(
-                            "must be between {} and {}, inclusive",
-                            MIN_VALID_PORT, MAX_VALID_PORT
-                        ),
-                    ));
-                }
-            }
-            IntOrString::String(s) => {
-                if !is_valid_port_name(s) {
-                    errs.push(Error::invalid(
-                        &fld.child("targetPort"),
-                        s.clone(),
-                        "must be an IANA_SVC_NAME (at most 15 characters, matching regex [a-z0-9]([a-z0-9-]*[a-z0-9])* and it must contain at least one letter [a-z], e.g. 'http')",
-                    ));
-                }
-            }
+    let (link_local_unicast, link_local_multicast) = match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            (v4.is_link_local(), o[0] == 224 && o[1] == 0 && o[2] == 0)
         }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            (s[0] & 0xffc0 == 0xfe80, s[0] & 0xff0f == 0xff02)
+        }
+    };
+    if link_local_unicast {
+        errs.push(Error::invalid(
+            fld,
+            ip_address,
+            "may not be in the link-local range (169.254.0.0/16, fe80::/10)",
+        ));
     }
-
-    // nodePort
-    let np_opt = port.node_port.map(|n| n as i32);
-    match svc_type {
-        ServiceType::NodePort | ServiceType::LoadBalancer => {
-            if let Some(np) = np_opt {
-                if np != 0 && !(NODE_PORT_MIN..=NODE_PORT_MAX).contains(&np) {
-                    errs.push(Error::invalid(
-                        &fld.child("nodePort"),
-                        np,
-                        format!(
-                            "must be between {} and {}, inclusive",
-                            NODE_PORT_MIN, NODE_PORT_MAX
-                        ),
-                    ));
-                }
-            }
-        }
-        _ => {
-            // nodePort is forbidden on ClusterIP / ExternalName / headless
-            if let Some(np) = np_opt {
-                if np != 0 {
-                    errs.push(Error::forbidden(
-                        &fld.child("nodePort"),
-                        "may not be used when `type` is 'ClusterIP'",
-                    ));
-                }
-            }
-        }
+    if link_local_multicast {
+        errs.push(Error::invalid(
+            fld,
+            ip_address,
+            "may not be in the link-local multicast range (224.0.0.0/24, ff02::/10)",
+        ));
     }
-
-    // headless + targetPort must be name when Protocol != SCTP
-    // (upstream skips this particular check; we only do it if headless is needed)
-    let _ = is_headless; // reserved for future headless-specific checks
-
     errs
 }
 
+/// `validation.IsValidPortNum`.
+fn is_valid_port_num(port: i64) -> Option<&'static str> {
+    (!(1..=65535).contains(&port)).then_some("must be between 1 and 65535, inclusive")
+}
+
+/// `validation.IsValidPortName` (apimachinery util/validation/validation.go).
+fn is_valid_port_name(port: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    if port.len() > 15 {
+        errs.push("must be no more than 15 characters".to_string());
+    }
+    if !port
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        errs.push(
+            "must contain only alpha-numeric characters (a-z, 0-9), and hyphens (-)".to_string(),
+        );
+    }
+    if !port.bytes().any(|b| b.is_ascii_lowercase()) {
+        errs.push("must contain at least one letter (a-z)".to_string());
+    }
+    if port.contains("--") {
+        errs.push("must not contain consecutive hyphens".to_string());
+    }
+    if !port.is_empty() && (port.starts_with('-') || port.ends_with('-')) {
+        errs.push("must not begin or end with a hyphen".to_string());
+    }
+    errs
+}
+
+/// `ValidatePortNumOrName` (validation.go).
+fn validate_port_num_or_name(port: &IntOrString, fld: &Path) -> ErrorList {
+    let mut errs = Vec::new();
+    match port {
+        IntOrString::Int(n) => {
+            if let Some(msg) = is_valid_port_num(i64::from(*n)) {
+                errs.push(Error::invalid(fld, *n, msg));
+            }
+        }
+        IntOrString::String(s) => {
+            if s.is_empty() {
+                errs.push(Error::required(fld, ""));
+            } else {
+                for msg in is_valid_port_name(s) {
+                    errs.push(Error::invalid(fld, s.clone(), msg));
+                }
+            }
+        }
+    }
+    errs
+}
+
+/// `ValidateDNS1123Label`.
+fn validate_dns1123_label(value: &str, fld: &Path) -> ErrorList {
+    is_dns1123_label(value)
+        .into_iter()
+        .map(|msg| Error::invalid(fld, value, msg))
+        .collect()
+}
+
+/// `ValidateQualifiedName`.
+fn validate_qualified_name(value: &str, fld: &Path) -> ErrorList {
+    is_qualified_name(value)
+        .into_iter()
+        .map(|msg| Error::invalid(fld, value, msg))
+        .collect()
+}
+
+/// `ValidateServiceName` = `NameIsDNS1035Label` (validation.go:290).
+fn name_is_dns1035_label(name: &str, prefix: bool) -> Vec<String> {
+    let name = if prefix && name.len() > 1 && name.ends_with('-') {
+        // `maskTrailingDash`.
+        format!("{}a", &name[..name.len() - 2])
+    } else {
+        name.to_string()
+    };
+    is_dns1035_label(&name)
+}
+
+fn opt_str(v: Option<&str>) -> BadValue {
+    match v {
+        Some(s) => BadValue::from(s),
+        None => BadValue::Json(serde_json::Value::Null),
+    }
+}
+
+fn policy_str(p: &IPFamilyPolicy) -> &'static str {
+    match p {
+        IPFamilyPolicy::SingleStack => "SingleStack",
+        IPFamilyPolicy::PreferDualStack => "PreferDualStack",
+        IPFamilyPolicy::RequireDualStack => "RequireDualStack",
+    }
+}
+
+fn family_str(f: &IPFamily) -> &'static str {
+    match f {
+        IPFamily::IPv4 => "IPv4",
+        IPFamily::IPv6 => "IPv6",
+    }
+}
+
+fn families_value(svc: &Service) -> BadValue {
+    BadValue::Json(serde_json::Value::Array(
+        ip_families(svc)
+            .iter()
+            .map(|f| serde_json::Value::String(family_str(f).to_string()))
+            .collect(),
+    ))
+}
+
+fn policy_value(svc: &Service) -> BadValue {
+    opt_str(svc.spec.ip_family_policy.as_ref().map(policy_str))
+}
+
+fn cluster_ips(svc: &Service) -> &[String] {
+    svc.spec.cluster_ips.as_deref().unwrap_or(&[])
+}
+
+fn ip_families(svc: &Service) -> &[IPFamily] {
+    svc.spec.ip_families.as_deref().unwrap_or(&[])
+}
+
+fn cluster_ip(svc: &Service) -> &str {
+    svc.spec.cluster_ip.as_deref().unwrap_or("")
+}
+
+fn service_type(svc: &Service) -> Option<&ServiceType> {
+    svc.spec.service_type.as_ref()
+}
+
+fn is_type(svc: &Service, t: ServiceType) -> bool {
+    service_type(svc) == Some(&t)
+}
+
+/// `isHeadlessService` (validation.go:9212-9216).
+fn is_headless_service(svc: &Service) -> bool {
+    cluster_ips(svc).len() == 1 && cluster_ips(svc)[0] == "None"
+}
+
+/// `apiservice.ExternallyAccessible` (pkg/api/service/util.go:71-75).
+pub fn externally_accessible(svc: &Service) -> bool {
+    is_type(svc, ServiceType::LoadBalancer)
+        || is_type(svc, ServiceType::NodePort)
+        || (is_type(svc, ServiceType::ClusterIP)
+            && svc
+                .spec
+                .external_ips
+                .as_ref()
+                .is_some_and(|v| !v.is_empty()))
+}
+
+/// `apiservice.NeedsHealthCheck` (util.go:78-93).
+pub fn needs_health_check(svc: &Service) -> bool {
+    is_type(svc, ServiceType::LoadBalancer)
+        && svc.spec.external_traffic_policy == Some(ServiceExternalTrafficPolicy::Local)
+}
+
+fn health_check_node_port(svc: &Service) -> i32 {
+    svc.spec.health_check_node_port.unwrap_or(0)
+}
+
+fn node_port(p: &ServicePort) -> i32 {
+    p.node_port.map(i32::from).unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
-// Top-level: validate_service_spec (mirrors ValidateServiceSpec)
+// validateService
 // ---------------------------------------------------------------------------
 
-/// Validates a `ServiceSpec`. Returns accumulated errors. Mirrors upstream
-/// `validateServiceSpec`.
-pub fn validate_service_spec(spec: &ServiceSpec, fld: &Path) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
-
-    let svc_type = spec
-        .service_type
-        .as_ref()
-        .unwrap_or(&ServiceType::ClusterIP);
-
-    // type must be a known enum value (deserialization already enforces this,
-    // but we also emit NotSupported so upstream test needles match)
-    match svc_type {
-        ServiceType::ClusterIP
-        | ServiceType::NodePort
-        | ServiceType::LoadBalancer
-        | ServiceType::ExternalName => {}
+/// `validateClientIPAffinityConfig` (validation.go:3395-3412) and
+/// `validateAffinityTimeout` (:3414-3420).
+fn validate_client_ip_affinity_config(
+    config: Option<&SessionAffinityConfig>,
+    fld: &Path,
+) -> ErrorList {
+    let detail = "when session affinity type is ClientIP";
+    let Some(config) = config else {
+        return vec![Error::required(fld, detail)];
+    };
+    let Some(client_ip) = &config.client_ip else {
+        return vec![Error::required(&fld.child("clientIP"), detail)];
+    };
+    let timeout_path = fld.child("clientIP").child("timeoutSeconds");
+    let Some(timeout) = client_ip.timeout_seconds else {
+        return vec![Error::required(&timeout_path, detail)];
+    };
+    if timeout <= 0 || timeout > MAX_CLIENT_IP_SERVICE_AFFINITY_SECONDS {
+        return vec![Error::invalid(
+            &timeout_path,
+            timeout,
+            format!(
+                "must be greater than 0 and less than {MAX_CLIENT_IP_SERVICE_AFFINITY_SECONDS}"
+            ),
+        )];
     }
+    Vec::new()
+}
 
-    // Ports validation
-    let require_name = spec.ports.len() > 1;
-    let is_headless = spec.cluster_ip.as_deref() == Some("None");
-
-    // Track (port, protocol) pairs for duplicate detection
-    let mut seen_port_proto: HashMap<(u16, String), usize> = HashMap::new();
-    // Track port names for duplicate detection
-    let mut seen_names: HashMap<String, usize> = HashMap::new();
-
-    for (i, port) in spec.ports.iter().enumerate() {
-        let port_path = fld.child("ports").index(i);
-        errs.extend(validate_service_port(
-            port,
-            require_name,
-            is_headless,
-            svc_type,
-            &port_path,
-        ));
-
-        // Duplicate (port, protocol) check
-        let proto = port.protocol.clone();
-        let key = (port.port, proto.clone());
-        if let Some(prev_idx) = seen_port_proto.get(&key) {
-            // Upstream reports the duplicate on the port number sub-field
-            errs.push(Error::duplicate(
-                &fld.child("ports").index(i).child("port"),
-                port.port as i32,
-            ));
-            let _ = prev_idx;
-        } else {
-            seen_port_proto.insert(key, i);
-        }
-
-        // Duplicate name check
-        if let Some(name) = &port.name {
-            if !name.is_empty() {
-                if let Some(prev_idx) = seen_names.get(name.as_str()) {
-                    errs.push(Error::duplicate(
-                        &fld.child("ports").index(i).child("name"),
-                        name.clone(),
-                    ));
-                    let _ = prev_idx;
-                } else {
-                    seen_names.insert(name.clone(), i);
-                }
-            }
+/// `validateServicePort` (validation.go:6780-6822).
+fn validate_service_port(
+    sp: &ServicePort,
+    require_name: bool,
+    all_names: &mut HashSet<String>,
+    fld: &Path,
+) -> ErrorList {
+    let mut errs = Vec::new();
+    let name = sp.name.as_deref().unwrap_or("");
+    if require_name && name.is_empty() {
+        errs.push(Error::required(&fld.child("name"), ""));
+    } else if !name.is_empty() {
+        errs.extend(validate_dns1123_label(name, &fld.child("name")));
+        if !all_names.insert(name.to_string()) {
+            errs.push(Error::duplicate(&fld.child("name"), name));
         }
     }
 
-    // clusterIP
-    let cluster_ip = spec.cluster_ip.as_deref().unwrap_or("");
-    if !cluster_ip.is_empty() && cluster_ip != "None" && !is_valid_ip(cluster_ip) {
-        errs.push(Error::invalid(
-            &fld.child("clusterIP"),
-            cluster_ip.to_string(),
-            "must be empty, 'None', or a valid IP address",
+    if let Some(msg) = is_valid_port_num(i64::from(sp.port)) {
+        errs.push(Error::invalid(&fld.child("port"), i32::from(sp.port), msg));
+    }
+
+    if sp.protocol.is_empty() {
+        errs.push(Error::required(&fld.child("protocol"), ""));
+    } else if !SUPPORTED_PORT_PROTOCOLS.contains(&sp.protocol.as_str()) {
+        errs.push(Error::not_supported(
+            &fld.child("protocol"),
+            sp.protocol.clone(),
+            SUPPORTED_PORT_PROTOCOLS,
         ));
     }
 
-    // externalName
-    match svc_type {
-        ServiceType::ExternalName => match &spec.external_name {
-            None => {
-                errs.push(Error::required(
-                    &fld.child("externalName"),
-                    "must be specified for ExternalName services",
-                ));
-            }
-            Some(name) if name.is_empty() => {
-                errs.push(Error::required(
-                    &fld.child("externalName"),
-                    "must be specified for ExternalName services",
-                ));
-            }
-            Some(name) => {
-                for msg in is_valid_external_name(name) {
-                    errs.push(Error::invalid(
-                        &fld.child("externalName"),
-                        name.clone(),
-                        msg,
-                    ));
-                }
-            }
-        },
-        _ => {
-            if let Some(name) = &spec.external_name {
-                if !name.is_empty() {
-                    errs.push(Error::forbidden(
-                        &fld.child("externalName"),
-                        "may not be set for non-ExternalName services",
-                    ));
-                }
-            }
-        }
-    }
+    // Defaulting sets targetPort from port, so an unset one is the zero
+    // IntOrString.
+    let target = sp.target_port.clone().unwrap_or(IntOrString::Int(0));
+    errs.extend(validate_port_num_or_name(&target, &fld.child("targetPort")));
 
-    // externalIPs
-    if let Some(external_ips) = &spec.external_ips {
-        let mut seen_ips: HashSet<&str> = HashSet::new();
-        for (i, ip) in external_ips.iter().enumerate() {
-            if !is_valid_ip(ip) {
-                errs.push(Error::invalid(
-                    &fld.child("externalIPs").index(i),
-                    ip.clone(),
-                    "must be a valid IP address",
-                ));
-            }
-            if !seen_ips.insert(ip.as_str()) {
-                errs.push(Error::duplicate(
-                    &fld.child("externalIPs").index(i),
-                    ip.clone(),
-                ));
-            }
-        }
+    if let Some(app_protocol) = &sp.app_protocol {
+        errs.extend(validate_qualified_name(
+            app_protocol,
+            &fld.child("appProtocol"),
+        ));
     }
+    errs
+}
 
-    // sessionAffinity
-    if let Some(sa) = &spec.session_affinity {
-        match sa.as_str() {
-            "ClientIP" | "None" => {}
-            other => {
-                errs.push(Error::not_supported(
-                    &fld.child("sessionAffinity"),
-                    other.to_string(),
-                    &["ClientIP", "None"],
-                ));
-            }
-        }
-    }
-
-    // sessionAffinityConfig.clientIP.timeoutSeconds — only when ClientIP affinity
-    if let Some(sac) = &spec.session_affinity_config {
-        if let Some(client_ip) = &sac.client_ip {
-            if let Some(timeout) = client_ip.timeout_seconds {
-                if !(MIN_SESSION_AFFINITY_SECONDS..=MAX_SESSION_AFFINITY_SECONDS).contains(&timeout)
-                {
-                    errs.push(Error::invalid(
-                        &fld.child("sessionAffinityConfig")
-                            .child("clientIP")
-                            .child("timeoutSeconds"),
-                        timeout,
-                        format!(
-                            "must be between {} and {}, inclusive",
-                            MIN_SESSION_AFFINITY_SECONDS, MAX_SESSION_AFFINITY_SECONDS
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-
-    // healthCheckNodePort
-    if let Some(hcnp) = spec.health_check_node_port {
-        match svc_type {
-            ServiceType::LoadBalancer => {
-                if hcnp != 0 && !(NODE_PORT_MIN..=NODE_PORT_MAX).contains(&hcnp) {
-                    errs.push(Error::invalid(
-                        &fld.child("healthCheckNodePort"),
-                        hcnp,
-                        format!(
-                            "must be between {} and {}, inclusive",
-                            NODE_PORT_MIN, NODE_PORT_MAX
-                        ),
-                    ));
-                }
-            }
-            _ => {
-                if hcnp != 0 {
-                    errs.push(Error::forbidden(
-                        &fld.child("healthCheckNodePort"),
-                        "may only be set when `type` is 'LoadBalancer'",
-                    ));
-                }
-            }
-        }
-    }
-
-    // ports must be non-empty unless the service is headless (clusterIP "None")
-    // or ExternalName. Upstream `ValidateService`.
-    if spec.ports.is_empty() && !is_headless && !matches!(svc_type, ServiceType::ExternalName) {
-        errs.push(Error::required(&fld.child("ports"), ""));
-    }
-
-    // externalTrafficPolicy may only be set on externally-accessible services:
-    // LoadBalancer, NodePort, or ClusterIP with externalIPs. Upstream
-    // `validateServiceExternalTrafficPolicy`. (The complementary "required when
-    // accessible" rule is intentionally omitted — rusternetes does not default
-    // externalTrafficPolicy, so requiring it would reject valid NodePort/
-    // LoadBalancer services that simply left it unset.)
-    let externally_accessible =
-        matches!(svc_type, ServiceType::LoadBalancer | ServiceType::NodePort)
-            || (matches!(svc_type, ServiceType::ClusterIP)
-                && spec.external_ips.as_ref().is_some_and(|v| !v.is_empty()));
-    if !externally_accessible {
-        if let Some(etp) = spec.external_traffic_policy.as_ref() {
-            let value = match etp {
-                ServiceExternalTrafficPolicy::Cluster => "Cluster",
-                ServiceExternalTrafficPolicy::Local => "Local",
-            };
+/// `validateServiceExternalTrafficPolicy` (validation.go:6824-6859).
+fn validate_service_external_traffic_policy(svc: &Service) -> ErrorList {
+    let mut errs = Vec::new();
+    let fld = Path::new("spec");
+    let etp = svc.spec.external_traffic_policy.as_ref().map(|p| match p {
+        ServiceExternalTrafficPolicy::Cluster => "Cluster",
+        ServiceExternalTrafficPolicy::Local => "Local",
+    });
+    if !externally_accessible(svc) {
+        if let Some(etp) = etp {
             errs.push(Error::invalid(
                 &fld.child("externalTrafficPolicy"),
-                value.to_string(),
+                etp,
                 "may only be set for externally-accessible services",
             ));
         }
+    } else if etp.is_none() {
+        errs.push(Error::required(&fld.child("externalTrafficPolicy"), ""));
     }
 
-    // loadBalancerSourceRanges: only valid for type LoadBalancer, and each
-    // (whitespace-padding-tolerant) entry must be a valid CIDR. Upstream
-    // `ValidateService` LoadBalancerSourceRanges block. The legacy annotation
-    // form is not covered here.
-    if let Some(ranges) = spec.load_balancer_source_ranges.as_ref() {
-        if !ranges.is_empty() {
-            let ranges_path = fld.child("loadBalancerSourceRanges");
-            if !matches!(svc_type, ServiceType::LoadBalancer) {
+    let hcnp = health_check_node_port(svc);
+    if !needs_health_check(svc) {
+        if hcnp != 0 {
+            errs.push(Error::invalid(
+                &fld.child("healthCheckNodePort"),
+                hcnp,
+                "may only be set when `type` is 'LoadBalancer' and `externalTrafficPolicy` is 'Local'",
+            ));
+        }
+    } else if hcnp == 0 {
+        errs.push(Error::required(&fld.child("healthCheckNodePort"), ""));
+    } else if let Some(msg) = is_valid_port_num(i64::from(hcnp)) {
+        errs.push(Error::invalid(&fld.child("healthCheckNodePort"), hcnp, msg));
+    }
+    errs
+}
+
+/// `validateServiceExternalTrafficFieldsUpdate` (validation.go:6861-6871).
+fn validate_service_external_traffic_fields_update(before: &Service, after: &Service) -> ErrorList {
+    if needs_health_check(before)
+        && needs_health_check(after)
+        && health_check_node_port(after) != health_check_node_port(before)
+    {
+        return vec![Error::forbidden(
+            &Path::new("spec").child("healthCheckNodePort"),
+            "field is immutable",
+        )];
+    }
+    Vec::new()
+}
+
+/// `validateServiceInternalTrafficFieldsValue` (validation.go:6875-6892).
+/// The enum admits only the supported values.
+fn validate_service_internal_traffic_fields_value(svc: &Service) -> ErrorList {
+    let itp: Option<&ServiceInternalTrafficPolicy> = svc.spec.internal_traffic_policy.as_ref();
+    if itp.is_none()
+        && matches!(
+            service_type(svc),
+            Some(ServiceType::NodePort | ServiceType::LoadBalancer | ServiceType::ClusterIP)
+        )
+    {
+        return vec![Error::required(
+            &Path::new("spec").child("internalTrafficPolicy"),
+            "",
+        )];
+    }
+    Vec::new()
+}
+
+/// `validateServiceTrafficDistribution` (validation.go:6896-6921).
+fn validate_service_traffic_distribution(svc: &Service) -> ErrorList {
+    match &svc.spec.traffic_distribution {
+        Some(td) if !SUPPORTED_TRAFFIC_DISTRIBUTION.contains(&td.as_str()) => {
+            vec![Error::not_supported(
+                &Path::new("spec").child("trafficDistribution"),
+                td.clone(),
+                SUPPORTED_TRAFFIC_DISTRIBUTION,
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `sameLoadBalancerClass` (validation.go).
+fn same_load_balancer_class(old: &Service, new: &Service) -> bool {
+    old.spec.load_balancer_class == new.spec.load_balancer_class
+}
+
+/// `validateLoadBalancerClassField` (validation.go:9219-9240).
+fn validate_load_balancer_class_field(old: Option<&Service>, svc: &Service) -> ErrorList {
+    let mut errs = Vec::new();
+    let fld = Path::new("spec").child("loadBalancerClass");
+    if let Some(old) = old {
+        if is_type(old, ServiceType::LoadBalancer)
+            && is_type(svc, ServiceType::LoadBalancer)
+            && !same_load_balancer_class(old, svc)
+        {
+            errs.push(Error::invalid(
+                &fld,
+                opt_str(svc.spec.load_balancer_class.as_deref()),
+                "may not change once set",
+            ));
+        }
+    }
+    if is_type(svc, ServiceType::LoadBalancer) {
+        if let Some(class) = &svc.spec.load_balancer_class {
+            errs.extend(validate_qualified_name(class, &fld));
+        }
+    } else if svc.spec.load_balancer_class.is_some() {
+        errs.push(Error::forbidden(
+            &fld,
+            "may only be used when `type` is 'LoadBalancer'",
+        ));
+    }
+    errs
+}
+
+/// `validateService` (validation.go:6570-6778).
+fn validate_service(svc: &Service, old: Option<&Service>) -> ErrorList {
+    let mut errs = Vec::new();
+    let meta_path = Path::new("metadata");
+    let empty = HashMap::new();
+    let annotations = svc.metadata.annotations.as_ref().unwrap_or(&empty);
+
+    if let (Some(mode), Some(hints)) = (
+        annotations.get(ANNOTATION_TOPOLOGY_MODE),
+        annotations.get(DEPRECATED_ANNOTATION_TOPOLOGY_AWARE_HINTS),
+    ) {
+        if mode != hints {
+            errs.push(Error::invalid(
+                &meta_path.child("annotations").key(ANNOTATION_TOPOLOGY_MODE),
+                mode.clone(),
+                format!(
+                    "must match annotations[{DEPRECATED_ANNOTATION_TOPOLOGY_AWARE_HINTS}] when both are specified"
+                ),
+            ));
+        }
+    }
+
+    let spec_path = Path::new("spec");
+    let headless = is_headless_service(svc);
+
+    if svc.spec.ports.is_empty() && !headless && !is_type(svc, ServiceType::ExternalName) {
+        errs.push(Error::required(&spec_path.child("ports"), ""));
+    }
+    match service_type(svc) {
+        Some(ServiceType::LoadBalancer) if headless => errs.push(Error::invalid(
+            &spec_path.child("clusterIPs").index(0),
+            cluster_ips(svc)[0].clone(),
+            "may not be set to 'None' for LoadBalancer services",
+        )),
+        Some(ServiceType::NodePort) if headless => errs.push(Error::invalid(
+            &spec_path.child("clusterIPs").index(0),
+            cluster_ips(svc)[0].clone(),
+            "may not be set to 'None' for NodePort services",
+        )),
+        Some(ServiceType::ExternalName) => {
+            if !cluster_ips(svc).is_empty() {
                 errs.push(Error::forbidden(
-                    &ranges_path,
-                    "may only be used when `type` is 'LoadBalancer'",
+                    &spec_path.child("clusterIPs"),
+                    "may not be set for ExternalName services",
                 ));
             }
-            for (i, value) in ranges.iter().enumerate() {
-                if !is_valid_cidr(value.trim()) {
-                    errs.push(Error::invalid(
-                        &ranges_path.index(i),
-                        value.clone(),
-                        "must be a valid CIDR",
-                    ));
+            if !ip_families(svc).is_empty() {
+                errs.push(Error::forbidden(
+                    &spec_path.child("ipFamilies"),
+                    "may not be set for ExternalName services",
+                ));
+            }
+            if svc.spec.ip_family_policy.is_some() {
+                errs.push(Error::forbidden(
+                    &spec_path.child("ipFamilyPolicy"),
+                    "may not be set for ExternalName services",
+                ));
+            }
+            // The CNAME may have a trailing dot to mark it fully qualified.
+            let external_name = svc.spec.external_name.as_deref().unwrap_or("");
+            let cname = external_name.strip_suffix('.').unwrap_or(external_name);
+            if !cname.is_empty() {
+                for msg in is_dns1123_subdomain(cname) {
+                    errs.push(Error::invalid(&spec_path.child("externalName"), cname, msg));
+                }
+            } else {
+                errs.push(Error::required(&spec_path.child("externalName"), ""));
+            }
+        }
+        _ => {}
+    }
+
+    let mut all_port_names = HashSet::new();
+    let ports_path = spec_path.child("ports");
+    let require_name = svc.spec.ports.len() > 1;
+    for (i, port) in svc.spec.ports.iter().enumerate() {
+        errs.extend(validate_service_port(
+            port,
+            require_name,
+            &mut all_port_names,
+            &ports_path.index(i),
+        ));
+    }
+
+    if let Some(selector) = &svc.spec.selector {
+        errs.extend(validate_labels(selector, &spec_path.child("selector")));
+    }
+
+    match svc.spec.session_affinity.as_deref() {
+        None | Some("") => errs.push(Error::required(&spec_path.child("sessionAffinity"), "")),
+        Some(sa) if !SUPPORTED_SESSION_AFFINITY_TYPE.contains(&sa) => {
+            errs.push(Error::not_supported(
+                &spec_path.child("sessionAffinity"),
+                sa,
+                SUPPORTED_SESSION_AFFINITY_TYPE,
+            ))
+        }
+        _ => {}
+    }
+    match svc.spec.session_affinity.as_deref() {
+        Some("ClientIP") => errs.extend(validate_client_ip_affinity_config(
+            svc.spec.session_affinity_config.as_ref(),
+            &spec_path.child("sessionAffinityConfig"),
+        )),
+        Some("None") if svc.spec.session_affinity_config.is_some() => errs.push(Error::forbidden(
+            &spec_path.child("sessionAffinityConfig"),
+            "must not be set when session affinity is None",
+        )),
+        _ => {}
+    }
+
+    errs.extend(validate_service_cluster_ips_related_fields(svc, old));
+
+    // New external IPs must be valid and non-special; old ones stay.
+    let ip_path = spec_path.child("externalIPs");
+    let existing_external_ips: &[String] = old
+        .and_then(|o| o.spec.external_ips.as_deref())
+        .unwrap_or(&[]);
+    for (i, ip) in svc.spec.external_ips.iter().flatten().enumerate() {
+        let idx_path = ip_path.index(i);
+        let ip_errs = is_valid_ip_for_legacy_field(&idx_path, ip, existing_external_ips);
+        if !ip_errs.is_empty() {
+            errs.extend(ip_errs);
+        } else {
+            errs.extend(validate_endpoint_ip(ip, &idx_path));
+        }
+    }
+
+    if svc.spec.service_type.is_none() {
+        errs.push(Error::required(&spec_path.child("type"), ""));
+    }
+
+    if is_type(svc, ServiceType::ClusterIP) {
+        for (i, port) in svc.spec.ports.iter().enumerate() {
+            if node_port(port) != 0 {
+                errs.push(Error::forbidden(
+                    &ports_path.index(i).child("nodePort"),
+                    "may not be used when `type` is 'ClusterIP'",
+                ));
+            }
+        }
+    }
+
+    // Duplicate node ports and ports, by (protocol, port).
+    let mut node_ports: HashSet<(String, i32)> = HashSet::new();
+    for (i, port) in svc.spec.ports.iter().enumerate() {
+        if node_port(port) == 0 {
+            continue;
+        }
+        if !node_ports.insert((port.protocol.clone(), node_port(port))) {
+            errs.push(Error::duplicate(
+                &ports_path.index(i).child("nodePort"),
+                node_port(port),
+            ));
+        }
+    }
+    let mut ports: HashSet<(String, u16)> = HashSet::new();
+    for (i, port) in svc.spec.ports.iter().enumerate() {
+        if !ports.insert((port.protocol.clone(), port.port)) {
+            // `field.Duplicate(portPath, key)` renders the internal
+            // `core.ServicePort` key as JSON, whose fields carry no json tags.
+            // serde_json sorts the keys, where Go keeps field order.
+            errs.push(Error::duplicate(
+                &ports_path.index(i),
+                serde_json::json!({
+                    "Name": "", "Protocol": port.protocol, "AppProtocol": null,
+                    "Port": port.port, "TargetPort": 0, "NodePort": 0,
+                }),
+            ));
+        }
+    }
+
+    // Source ranges, from the field or the legacy annotation.
+    let source_ranges = svc
+        .spec
+        .load_balancer_source_ranges
+        .as_deref()
+        .unwrap_or(&[]);
+    if !source_ranges.is_empty() {
+        let fld = spec_path.child("LoadBalancerSourceRanges");
+        if !is_type(svc, ServiceType::LoadBalancer) {
+            errs.push(Error::forbidden(
+                &fld,
+                "may only be used when `type` is 'LoadBalancer'",
+            ));
+        }
+        let existing: Vec<String> = old
+            .and_then(|o| o.spec.load_balancer_source_ranges.as_ref())
+            .map(|r| r.iter().map(|v| v.trim().to_string()).collect())
+            .unwrap_or_default();
+        for (idx, value) in source_ranges.iter().enumerate() {
+            errs.extend(is_valid_cidr_for_legacy_field(
+                &fld.index(idx),
+                value.trim(),
+                &existing,
+            ));
+        }
+    } else if let Some(val) = annotations.get(ANNOTATION_LOAD_BALANCER_SOURCE_RANGES) {
+        let fld = Path::new("metadata")
+            .child("annotations")
+            .key(ANNOTATION_LOAD_BALANCER_SOURCE_RANGES);
+        if !is_type(svc, ServiceType::LoadBalancer) {
+            errs.push(Error::forbidden(
+                &fld,
+                "may only be used when `type` is 'LoadBalancer'",
+            ));
+        }
+        let old_val = old.and_then(|o| {
+            o.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(ANNOTATION_LOAD_BALANCER_SOURCE_RANGES))
+        });
+        if old_val != Some(val) {
+            let val = val.trim();
+            if !val.is_empty() {
+                for value in val.split(',') {
+                    errs.extend(is_valid_cidr_for_legacy_field(&fld, value.trim(), &[]));
                 }
             }
         }
     }
 
+    if svc.spec.allocate_load_balancer_node_ports.is_some()
+        && !is_type(svc, ServiceType::LoadBalancer)
+    {
+        errs.push(Error::forbidden(
+            &spec_path.child("allocateLoadBalancerNodePorts"),
+            "may only be used when `type` is 'LoadBalancer'",
+        ));
+    }
+    if is_type(svc, ServiceType::LoadBalancer)
+        && svc.spec.allocate_load_balancer_node_ports.is_none()
+    {
+        // Upstream's path really is the root `allocateLoadBalancerNodePorts`.
+        errs.push(Error::required(
+            &Path::new("allocateLoadBalancerNodePorts"),
+            "",
+        ));
+    }
+
+    errs.extend(validate_load_balancer_class_field(None, svc));
+    errs.extend(validate_service_external_traffic_policy(svc));
+    errs.extend(validate_service_internal_traffic_fields_value(svc));
+    errs.extend(validate_service_traffic_distribution(svc));
     errs
 }
 
 // ---------------------------------------------------------------------------
-// Top-level entry point
+// ClusterIPs, IP families and their upgrade/downgrade rules
 // ---------------------------------------------------------------------------
 
-/// Validate a `Service` object on create/update.
-///
-/// Mirrors upstream `ValidateService` in
-/// `pkg/apis/core/validation/validation.go`.
-pub fn validate_service(svc: &Service) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
+/// `ValidateServiceClusterIPsRelatedFields` (validation.go:8964-9092).
+pub fn validate_service_cluster_ips_related_fields(
+    svc: &Service,
+    old: Option<&Service>,
+) -> ErrorList {
+    // Validated (all unset) for ExternalName in `validateService`.
+    if is_type(svc, ServiceType::ExternalName) {
+        return Vec::new();
+    }
+    let mut errs = Vec::new();
+    let mut has_invalid_ips = false;
     let spec_path = Path::new("spec");
-    errs.extend(validate_service_spec(&svc.spec, &spec_path));
+    let cluster_ips_field = spec_path.child("clusterIPs");
+    let ip_families_field = spec_path.child("ipFamilies");
+    let ips = cluster_ips(svc);
+
+    if !cluster_ip(svc).is_empty() {
+        if ips.is_empty() {
+            errs.push(Error::required(&cluster_ips_field, ""));
+        } else if ips[0] != cluster_ip(svc) {
+            errs.push(Error::invalid(
+                &cluster_ips_field,
+                ips.to_vec(),
+                "first value must match `clusterIP`",
+            ));
+        }
+    } else if !ips.is_empty() {
+        errs.push(Error::invalid(
+            &cluster_ips_field,
+            ips.to_vec(),
+            "must be empty when `clusterIP` is not specified",
+        ));
+    }
+
+    // Families are a closed enum; only duplicates remain to check.
+    let mut seen = HashSet::new();
+    for (i, family) in ip_families(svc).iter().enumerate() {
+        if !seen.insert(family_str(family)) {
+            errs.push(Error::duplicate(
+                &ip_families_field.index(i),
+                family_str(family),
+            ));
+        }
+    }
+
+    let existing: &[String] = old.map(cluster_ips).unwrap_or(&[]);
+    for (i, ip) in ips.iter().enumerate() {
+        if i == 0 && ip == "None" {
+            if ips.len() > 1 {
+                has_invalid_ips = true;
+                errs.push(Error::invalid(
+                    &cluster_ips_field,
+                    ips.to_vec(),
+                    "'None' must be the first and only value",
+                ));
+            }
+            continue;
+        }
+        let ip_errs = is_valid_ip_for_legacy_field(&cluster_ips_field.index(i), ip, existing);
+        has_invalid_ips = has_invalid_ips || !ip_errs.is_empty();
+        errs.extend(ip_errs);
+    }
+
+    if ips.len() > 2 {
+        errs.push(Error::invalid(
+            &cluster_ips_field,
+            ips.to_vec(),
+            "may only hold up to 2 values",
+        ));
+    }
+
+    // Further checks would only restate a bad IP.
+    if has_invalid_ips {
+        return errs;
+    }
+
+    // `netutils.IsDualStackIPStrings` (k8s.io/utils/net/ipfamily.go:58-68):
+    // at least one IP of each family.
+    if ips.len() > 1 {
+        let v6 = ips.iter().filter(|ip| is_ipv6_string(ip)).count();
+        if v6 == 0 || v6 == ips.len() {
+            errs.push(Error::invalid(
+                &cluster_ips_field,
+                ips.to_vec(),
+                "may specify no more than one IP for each IP family",
+            ));
+        }
+    }
+
+    if !is_headless_service(svc) && !ips.is_empty() && !ip_families(svc).is_empty() {
+        for (i, ip) in ips.iter().enumerate() {
+            let Some(family) = ip_families(svc).get(i) else {
+                break;
+            };
+            if *family == IPFamily::IPv4 && is_ipv6_string(ip) {
+                errs.push(Error::invalid(
+                    &cluster_ips_field.index(i),
+                    ip.clone(),
+                    format!("expected an IPv4 value as indicated by `ipFamilies[{i}]`"),
+                ));
+            }
+            if *family == IPFamily::IPv6 && !is_ipv6_string(ip) {
+                errs.push(Error::invalid(
+                    &cluster_ips_field.index(i),
+                    ip.clone(),
+                    format!("expected an IPv6 value as indicated by `ipFamilies[{i}]`"),
+                ));
+            }
+        }
+    }
     errs
 }
 
-#[cfg(test)]
-mod lb_source_ranges_tests {
-    use super::*;
-
-    fn spec_errs(json: serde_json::Value) -> Vec<String> {
-        let spec: ServiceSpec = serde_json::from_value(json).unwrap();
-        validate_service_spec(&spec, &Path::new("spec"))
-            .into_iter()
-            .map(|e| e.to_string())
-            .collect()
-    }
-
-    #[test]
-    fn valid_cidrs_on_loadbalancer_pass() {
-        let e = spec_errs(serde_json::json!({
-            "type": "LoadBalancer",
-            "ports": [{"port": 80}],
-            "loadBalancerSourceRanges": ["10.0.0.0/8", " 192.168.1.0/24 ", "2001:db8::/64"]
-        }));
-        assert!(
-            !e.iter()
-                .any(|m| m.contains("loadBalancerSourceRanges") || m.contains("CIDR")),
-            "{e:?}"
-        );
-    }
-
-    #[test]
-    fn invalid_cidr_rejected() {
-        let e = spec_errs(serde_json::json!({
-            "type": "LoadBalancer",
-            "ports": [{"port": 80}],
-            "loadBalancerSourceRanges": ["10.0.0.0/8", "notacidr", "10.0.0.1"]
-        }));
-        // "notacidr" and bare IP "10.0.0.1" (no prefix) are both invalid CIDRs.
-        assert_eq!(
-            e.iter()
-                .filter(|m| m.contains("must be a valid CIDR"))
-                .count(),
-            2,
-            "{e:?}"
-        );
-    }
-
-    #[test]
-    fn source_ranges_forbidden_on_non_loadbalancer() {
-        let e = spec_errs(serde_json::json!({
-            "type": "ClusterIP",
-            "ports": [{"port": 80}],
-            "loadBalancerSourceRanges": ["10.0.0.0/8"]
-        }));
-        assert!(
-            e.iter()
-                .any(|m| m.contains("may only be used when `type` is 'LoadBalancer'")),
-            "{e:?}"
-        );
-    }
+fn is_single_stack(svc: &Service) -> bool {
+    svc.spec.ip_family_policy == Some(IPFamilyPolicy::SingleStack)
 }
 
-#[cfg(test)]
-mod port_protocol_tests {
-    use super::*;
-    use crate::validation::field::ErrorType;
-
-    fn spec_errs(json: serde_json::Value) -> ErrorList {
-        let spec: ServiceSpec = serde_json::from_value(json).unwrap();
-        validate_service_spec(&spec, &Path::new("spec"))
+/// `validateUpgradeDowngradeClusterIPs` (validation.go:9095-9148).
+fn validate_upgrade_downgrade_cluster_ips(old: &Service, svc: &Service) -> ErrorList {
+    let mut errs = Vec::new();
+    if is_type(svc, ServiceType::ExternalName) || is_type(old, ServiceType::ExternalName) {
+        return errs;
     }
-
-    fn has(errs: &ErrorList, field: &str, ty: ErrorType) -> bool {
-        errs.iter().any(|e| e.field == field && e.error_type == ty)
+    if is_headless_service(old) && is_headless_service(svc) {
+        return errs;
     }
-
-    // Upstream validateServicePort emits Required when protocol is empty
-    // (validation.go:6798-6799). A *missing* protocol is defaulted to TCP by
-    // serde before validation (matching upstream defaulting -> validation
-    // order), so it is not flagged Required; only an explicit "" is.
-    #[test]
-    fn missing_protocol_defaults_to_tcp() {
-        let errs = spec_errs(serde_json::json!({"ports": [{"port": 80}]}));
-        assert!(
-            !errs.iter().any(|e| e.field == "spec.ports[0].protocol"),
-            "{errs:?}"
-        );
+    let (old_ips, new_ips) = (cluster_ips(old), cluster_ips(svc));
+    let fld = Path::new("spec").child("clusterIPs");
+    match old_ips.len().cmp(&new_ips.len()) {
+        std::cmp::Ordering::Equal => {
+            for (i, ip) in old_ips.iter().enumerate() {
+                if *ip != new_ips[i] {
+                    errs.push(Error::invalid(
+                        &fld.index(i),
+                        new_ips.to_vec(),
+                        "may not change once set",
+                    ));
+                }
+            }
+        }
+        std::cmp::Ordering::Greater => {
+            if new_ips.is_empty() {
+                errs.push(Error::invalid(
+                    &fld.index(0),
+                    new_ips.to_vec(),
+                    "primary clusterIP can not be unset",
+                ));
+            }
+            if !old_ips.is_empty() && !new_ips.is_empty() && new_ips[0] != old_ips[0] {
+                errs.push(Error::invalid(
+                    &fld.index(0),
+                    new_ips.to_vec(),
+                    "may not change once set",
+                ));
+            }
+            if new_ips.len() == 1 && !is_single_stack(svc) {
+                errs.push(Error::invalid(
+                    &Path::new("spec").child("ipFamilyPolicy"),
+                    policy_value(svc),
+                    "must be set to 'SingleStack' when releasing the secondary clusterIP",
+                ));
+            }
+        }
+        std::cmp::Ordering::Less => {
+            if !old_ips.is_empty() && new_ips[0] != old_ips[0] {
+                errs.push(Error::invalid(
+                    &fld.index(0),
+                    new_ips.to_vec(),
+                    "may not change once set",
+                ));
+            }
+        }
     }
+    errs
+}
 
-    #[test]
-    fn empty_protocol_is_required() {
-        let errs = spec_errs(serde_json::json!({"ports": [{"port": 80, "protocol": ""}]}));
-        assert!(
-            has(&errs, "spec.ports[0].protocol", ErrorType::Required),
-            "{errs:?}"
-        );
+/// `validateUpgradeDowngradeIPFamilies` (validation.go:9151-9210).
+fn validate_upgrade_downgrade_ip_families(old: &Service, svc: &Service) -> ErrorList {
+    let mut errs = Vec::new();
+    if is_type(svc, ServiceType::ExternalName) || is_type(old, ServiceType::ExternalName) {
+        return errs;
     }
+    let (old_headless, new_headless) = (is_headless_service(old), is_headless_service(svc));
+    if old_headless != new_headless || new_headless {
+        return errs;
+    }
+    let (old_f, new_f) = (ip_families(old), ip_families(svc));
+    let fld = Path::new("spec").child("ipFamilies").index(0);
+    match old_f.len().cmp(&new_f.len()) {
+        std::cmp::Ordering::Equal => {
+            for (i, f) in old_f.iter().enumerate() {
+                if *f != new_f[i] {
+                    errs.push(Error::invalid(
+                        &fld,
+                        families_value(svc),
+                        "may not change once set",
+                    ));
+                }
+            }
+        }
+        std::cmp::Ordering::Greater => {
+            if cluster_ips(svc).is_empty() {
+                errs.push(Error::invalid(
+                    &fld,
+                    families_value(svc),
+                    "primary ipFamily can not be unset",
+                ));
+            }
+            if !new_f.is_empty() && new_f[0] != old_f[0] {
+                errs.push(Error::invalid(
+                    &fld,
+                    cluster_ips(svc).to_vec(),
+                    "may not change once set",
+                ));
+            }
+            if new_f.len() == 1 && !is_single_stack(svc) {
+                errs.push(Error::invalid(
+                    &Path::new("spec").child("ipFamilyPolicy"),
+                    policy_value(svc),
+                    "must be set to 'SingleStack' when releasing the secondary ipFamily",
+                ));
+            }
+        }
+        std::cmp::Ordering::Less => {
+            if !old_f.is_empty() && !new_f.is_empty() && new_f[0] != old_f[0] {
+                errs.push(Error::invalid(
+                    &fld,
+                    cluster_ips(svc).to_vec(),
+                    "may not change once set",
+                ));
+            }
+        }
+    }
+    errs
+}
 
-    #[test]
-    fn explicit_tcp_protocol_passes() {
-        let errs = spec_errs(serde_json::json!({"ports": [{"port": 80, "protocol": "TCP"}]}));
-        assert!(
-            !errs.iter().any(|e| e.field == "spec.ports[0].protocol"),
-            "{errs:?}"
-        );
-    }
+// ---------------------------------------------------------------------------
+// Status
+// ---------------------------------------------------------------------------
 
-    #[test]
-    fn unsupported_protocol_is_not_supported() {
-        let errs = spec_errs(serde_json::json!({"ports": [{"port": 80, "protocol": "ICMP"}]}));
-        assert!(
-            has(&errs, "spec.ports[0].protocol", ErrorType::NotSupported),
-            "{errs:?}"
-        );
+/// `ValidateLoadBalancerStatus` (validation.go:8653-8696).
+pub fn validate_load_balancer_status(
+    status: Option<&LoadBalancerStatus>,
+    old_status: Option<&LoadBalancerStatus>,
+    fld: &Path,
+    svc: &Service,
+) -> ErrorList {
+    let mut errs = Vec::new();
+    let ingress = status.map(|s| s.ingress.as_slice()).unwrap_or(&[]);
+    let ingr_path = fld.child("ingress");
+    if !is_type(svc, ServiceType::LoadBalancer) && !ingress.is_empty() {
+        errs.push(Error::forbidden(
+            &ingr_path,
+            "may only be used when `spec.type` is 'LoadBalancer'",
+        ));
+        return errs;
     }
+    let existing: Vec<String> = old_status
+        .map(|s| {
+            s.ingress
+                .iter()
+                .filter_map(|i| i.ip.clone().filter(|ip| !ip.is_empty()))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (i, ing) in ingress.iter().enumerate() {
+        let idx_path = ingr_path.index(i);
+        let ip = ing.ip.as_deref().unwrap_or("");
+        if !ip.is_empty() {
+            errs.extend(is_valid_ip_for_legacy_field(
+                &idx_path.child("ip"),
+                ip,
+                &existing,
+            ));
+        }
+        match ing.ip_mode.as_deref() {
+            None => {
+                if !ip.is_empty() {
+                    errs.push(Error::required(
+                        &idx_path.child("ipMode"),
+                        "must be specified when `ip` is set",
+                    ));
+                }
+            }
+            Some(_) if ip.is_empty() => errs.push(Error::forbidden(
+                &idx_path.child("ipMode"),
+                "may not be specified when `ip` is not set",
+            )),
+            Some(mode) if !SUPPORTED_LOAD_BALANCER_IP_MODE.contains(&mode) => {
+                errs.push(Error::not_supported(
+                    &idx_path.child("ipMode"),
+                    mode,
+                    SUPPORTED_LOAD_BALANCER_IP_MODE,
+                ))
+            }
+            _ => {}
+        }
+        let hostname = ing.hostname.as_deref().unwrap_or("");
+        if !hostname.is_empty() {
+            for msg in is_dns1123_subdomain(hostname) {
+                errs.push(Error::invalid(&idx_path.child("hostname"), hostname, msg));
+            }
+            if parse_ip_sloppy(hostname).is_some() {
+                errs.push(Error::invalid(
+                    &idx_path.child("hostname"),
+                    hostname,
+                    "must be a DNS name, not an IP address",
+                ));
+            }
+        }
+    }
+    errs
+}
 
-    // ServicePort.Name is a DNS-1123 label (≤63 chars), NOT the 15-char
-    // IANA_SVC_NAME rule (validation.go:6786).
-    #[test]
-    fn long_dns_label_port_name_passes() {
-        let errs = spec_errs(serde_json::json!({
-            "ports": [{"name": "tcp-prometheus-servicemonitor", "port": 80, "protocol": "TCP"}]
-        }));
-        assert!(
-            !errs.iter().any(|e| e.field == "spec.ports[0].name"),
-            "{errs:?}"
-        );
-    }
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
+
+/// `ValidateServiceCreate` (validation.go:6924-6936).
+pub fn validate_service_create(svc: &Service) -> ErrorList {
+    let mut errs = validate_object_meta(
+        &svc.metadata,
+        true,
+        name_is_dns1035_label,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_service(svc, None));
+    errs
+}
+
+/// `ValidateServiceUpdate` (validation.go:6939-6959).
+pub fn validate_service_update(svc: &Service, old: &Service) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&svc.metadata, &old.metadata, &Path::new("metadata"));
+    errs.extend(validate_upgrade_downgrade_cluster_ips(old, svc));
+    errs.extend(validate_upgrade_downgrade_ip_families(old, svc));
+    errs.extend(validate_load_balancer_class_field(Some(old), svc));
+    errs.extend(validate_service_external_traffic_fields_update(old, svc));
+    errs.extend(validate_service(svc, Some(old)));
+    errs
+}
+
+/// `ValidateServiceStatusUpdate` (validation.go:6962-6966).
+pub fn validate_service_status_update(svc: &Service, old: &Service) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&svc.metadata, &old.metadata, &Path::new("metadata"));
+    errs.extend(validate_load_balancer_status(
+        svc.status.as_ref().and_then(|s| s.load_balancer.as_ref()),
+        old.status.as_ref().and_then(|s| s.load_balancer.as_ref()),
+        &Path::new("status").child("loadBalancer"),
+        svc,
+    ));
+    errs
 }
