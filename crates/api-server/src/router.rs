@@ -2014,9 +2014,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/resource.k8s.io/v1/namespaces/:namespace/resourceclaims/:name/status",
-            get(handlers::status::get_status)
-                .put(handlers::resourceclaim::update_resourceclaim_status)
-                .patch(handlers::status::update_status),
+            get(handlers::resourceclaim::get_status)
+                .put(handlers::resourceclaim::update_status)
+                .patch(handlers::resourceclaim::patch_status),
         )
         // ResourceClaims (all namespaces)
         .route(
