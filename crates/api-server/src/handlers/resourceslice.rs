@@ -46,6 +46,7 @@ fn scope(state: &ApiServerState) -> RequestScope<ResourceSlice> {
         store: Box::new(resourceslice::new_store(state.storage.clone())),
         apply: Some(crate::ssa::apply_legacy::<ResourceSlice>),
         convert_to_internal: None,
+        patch_conversion: None,
     }
 }
 

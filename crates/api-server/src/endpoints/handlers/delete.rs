@@ -80,7 +80,8 @@ pub async fn delete_resource<T: Object>(
     .await?;
 
     let options = decode_delete_options(params, body)?;
-    let ctx = RequestContext::new(namespace);
+    let ctx =
+        RequestContext::new(namespace).with_group_version(&scope.kind.group, &scope.kind.version);
     let admission = Admission {
         state,
         kind: &scope.kind,
@@ -137,7 +138,8 @@ pub async fn delete_collection<T: Object>(
     .await?;
 
     let options = decode_delete_options(params, body)?;
-    let ctx = RequestContext::new(namespace);
+    let ctx =
+        RequestContext::new(namespace).with_group_version(&scope.kind.group, &scope.kind.version);
 
     let admission = Admission {
         state,

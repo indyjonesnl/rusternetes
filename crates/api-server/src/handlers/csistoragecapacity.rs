@@ -46,6 +46,7 @@ fn scope(state: &ApiServerState) -> RequestScope<CSIStorageCapacity> {
         store: Box::new(csistoragecapacity::new_store(state.storage.clone())),
         apply: Some(crate::ssa::apply_legacy::<CSIStorageCapacity>),
         convert_to_internal: None,
+        patch_conversion: None,
     }
 }
 

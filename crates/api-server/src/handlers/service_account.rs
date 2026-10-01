@@ -47,6 +47,7 @@ fn scope(state: &ApiServerState) -> RequestScope<ServiceAccount> {
         store: Box::new(serviceaccount::new_store(state.storage.clone())),
         apply: Some(crate::ssa::apply_legacy::<ServiceAccount>),
         convert_to_internal: None,
+        patch_conversion: None,
     }
 }
 

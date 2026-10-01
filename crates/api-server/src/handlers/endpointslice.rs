@@ -46,6 +46,7 @@ fn scope(state: &ApiServerState) -> RequestScope<EndpointSlice> {
         store: Box::new(endpointslice::new_store(state.storage.clone())),
         apply: Some(crate::ssa::apply_legacy::<EndpointSlice>),
         convert_to_internal: Some(endpointslice::convert_to_internal),
+        patch_conversion: None,
     }
 }
 

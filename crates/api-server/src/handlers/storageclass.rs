@@ -46,6 +46,7 @@ fn scope(state: &ApiServerState) -> RequestScope<StorageClass> {
         store: Box::new(storageclass::new_store(state.storage.clone())),
         apply: Some(crate::ssa::apply_legacy::<StorageClass>),
         convert_to_internal: Some(storageclass::convert_to_internal),
+        patch_conversion: None,
     }
 }
 

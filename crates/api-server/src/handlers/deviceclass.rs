@@ -46,6 +46,7 @@ fn scope(state: &ApiServerState) -> RequestScope<DeviceClass> {
         store: Box::new(deviceclass::new_store(state.storage.clone())),
         apply: Some(crate::ssa::apply_legacy::<DeviceClass>),
         convert_to_internal: None,
+        patch_conversion: None,
     }
 }
 

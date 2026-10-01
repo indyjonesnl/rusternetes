@@ -47,6 +47,7 @@ fn scope(state: &ApiServerState) -> RequestScope<PriorityClass> {
         store: Box::new(priorityclass::new_rest(state.storage.clone())),
         apply: Some(crate::ssa::apply_legacy::<PriorityClass>),
         convert_to_internal: Some(priorityclass::convert_to_internal),
+        patch_conversion: None,
     }
 }
 

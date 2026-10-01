@@ -47,6 +47,47 @@ pub struct RequestScope<T: Object> {
     /// they build. Our served and internal types are one type, so only the
     /// behaviour remains — e.g. Secret's `stringData` folded into `data`.
     pub convert_to_internal: Option<fn(&mut T)>,
+    /// How a PATCH reaches an object whose served version is not the stored
+    /// one; see [`RequestVersionConversion`]. `None` for every resource that
+    /// stores exactly what it serves.
+    pub patch_conversion: Option<RequestVersionConversion>,
+}
+
+/// How to move a stored object into the version a patch was written against,
+/// and back again.
+///
+/// Upstream applies every patch to the object in the **request's** version, not
+/// the stored (hub) one. `jsonPatcher.applyPatchToCurrentObject` encodes the
+/// current object through the request codec before applying the patch
+/// (staging/src/k8s.io/apiserver/pkg/endpoints/handlers/patch.go:323-338) --
+/// "Input and output objects must both have the external version, since that is
+/// what the patch must have been constructed against" (:386-388) -- and
+/// `smpPatcher.applyPatchToCurrentObject` calls
+/// `ConvertToVersion(currentObject, p.kind.GroupVersion())` before the merge,
+/// then `ConvertToVersion(versionedObjToUpdate, p.hubGroupVersion)` after it
+/// (:449-462). Server-side apply converts in the same place, inside the field
+/// manager (`apimachinery/pkg/util/managedfields/internal/structuredmerge.go:139`).
+///
+/// Nearly every resource here stores exactly what it serves, so the pair is
+/// `None` and the patch applies to the stored JSON directly. `events.k8s.io/v1`
+/// is the one endpoint whose wire schema differs from the stored (core) one:
+/// without the conversion a patch naming `note`, `regarding` or `deprecatedCount`
+/// lands on a key the core schema does not own, while `message`,
+/// `involvedObject` and `count` keep their old values (#1940).
+#[derive(Clone, Copy)]
+pub struct RequestVersionConversion {
+    /// Stored (hub) JSON -> the shape the patch was written against.
+    pub to_request_version: fn(&serde_json::Value) -> serde_json::Value,
+
+    /// Patched request-version JSON (second argument) -> stored (hub) JSON,
+    /// given the pre-patch stored object (first argument).
+    ///
+    /// Upstream needs no equivalent of that first argument: a Go object has no
+    /// unknown-field catch-all, so converting back writes every field there is.
+    /// Our stored types keep one (`Event::extra`), and what it holds survives
+    /// the round trip only if the reverse conversion can see the object it came
+    /// off.
+    pub from_request_version: fn(&serde_json::Value, serde_json::Value) -> serde_json::Value,
 }
 
 impl<T: Object> RequestScope<T> {

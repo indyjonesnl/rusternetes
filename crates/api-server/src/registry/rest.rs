@@ -74,6 +74,12 @@ pub struct RequestContext {
     /// `genericapirequest.UserFrom(ctx)`: the authenticated requester, when
     /// the entry point passes it on (create does).
     pub user: Option<UserInfo>,
+    /// `genericapirequest.RequestInfoFrom(ctx)`'s `APIGroup` and `APIVersion`:
+    /// the group-version the request was served under. Strategies whose rules
+    /// depend on it (Event's `requestGroupVersion`,
+    /// pkg/registry/core/event/strategy.go:134-139) read it; `None` is
+    /// upstream's "no RequestInfo", a zero-value group-version.
+    pub group_version: Option<(String, String)>,
     warnings: Mutex<Vec<String>>,
 }
 
@@ -82,8 +88,15 @@ impl RequestContext {
         Self {
             namespace: namespace.filter(|ns| !ns.is_empty()).map(str::to_string),
             user: None,
+            group_version: None,
             warnings: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The context with the request's group-version attached (`WithRequestInfo`).
+    pub fn with_group_version(mut self, group: &str, version: &str) -> Self {
+        self.group_version = Some((group.to_string(), version.to_string()));
+        self
     }
 
     /// The context with the requester attached (`WithUser`).

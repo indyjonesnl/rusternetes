@@ -47,6 +47,7 @@ fn scope(state: &ApiServerState) -> RequestScope<LimitRange> {
         store: Box::new(store),
         apply: Some(crate::ssa::apply_legacy::<LimitRange>),
         convert_to_internal: Some(limitrange::convert_to_internal),
+        patch_conversion: None,
     }
 }
 

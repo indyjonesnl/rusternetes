@@ -46,6 +46,7 @@ fn scope(state: &ApiServerState) -> RequestScope<CSINode> {
         store: Box::new(csinode::new_store(state.storage.clone())),
         apply: Some(crate::ssa::apply_legacy::<CSINode>),
         convert_to_internal: None,
+        patch_conversion: None,
     }
 }
 

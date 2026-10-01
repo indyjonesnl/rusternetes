@@ -66,6 +66,7 @@ fn scope(
         }),
         apply: Some(crate::ssa::apply_legacy::<HorizontalPodAutoscaler>),
         convert_to_internal: Some(horizontalpodautoscaler::convert_to_internal),
+        patch_conversion: None,
     }
 }
 

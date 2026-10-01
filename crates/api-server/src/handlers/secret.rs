@@ -97,6 +97,7 @@ fn scope(state: &ApiServerState) -> RequestScope<Secret> {
         )),
         apply: Some(crate::ssa::apply_secret),
         convert_to_internal: Some(crate::registry::core::secret::convert_to_internal),
+        patch_conversion: None,
     }
 }
 

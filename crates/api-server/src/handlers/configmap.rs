@@ -48,6 +48,7 @@ fn scope(state: &ApiServerState) -> RequestScope<ConfigMap> {
         apply: Some(crate::ssa::apply_configmap),
         // ConfigMap has no defaulter and no conversion logic.
         convert_to_internal: None,
+        patch_conversion: None,
     }
 }
 

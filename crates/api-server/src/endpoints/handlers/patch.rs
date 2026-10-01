@@ -121,7 +121,8 @@ pub async fn patch_resource<T: Object>(
     let force_allow_create =
         matches!(mechanism, Mechanism::Apply { .. }) && scope.subresource.is_none();
 
-    let ctx = RequestContext::new(namespace);
+    let ctx =
+        RequestContext::new(namespace).with_group_version(&scope.kind.group, &scope.kind.version);
     let admission = Admission {
         state,
         kind: &scope.kind,
@@ -211,8 +212,19 @@ impl<T: Object> Patcher<'_, T> {
             serde_json::to_value(current).map_err(|e| Error::Internal(e.to_string()))?;
         let patch: serde_json::Value = serde_json::from_slice(self.body)
             .map_err(|e| Error::BadRequest(format!("error decoding patch: {e}")))?;
-        let patched = apply_patch(&current_json, &patch, patch_type.clone())
-            .map_err(|e| Error::InvalidResource(e.to_string()))?;
+        // The patch was written against the served version, so it applies
+        // there and the result goes back to the stored one (patch.go:323-338,
+        // :449-462).
+        let patched = match self.scope.patch_conversion {
+            None => apply_patch(&current_json, &patch, patch_type.clone())
+                .map_err(|e| Error::InvalidResource(e.to_string()))?,
+            Some(conversion) => {
+                let versioned = (conversion.to_request_version)(&current_json);
+                let patched = apply_patch(&versioned, &patch, patch_type.clone())
+                    .map_err(|e| Error::InvalidResource(e.to_string()))?;
+                (conversion.from_request_version)(&current_json, patched)
+            }
+        };
         let patched_js = serde_json::to_string(&patched).unwrap_or_default();
 
         // Decode the result strictly or not, per fieldValidation. A strict
