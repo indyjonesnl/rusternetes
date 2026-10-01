@@ -194,7 +194,7 @@ async fn a_minimal_snapshot_and_content_are_written() {
 async fn a_source_name_is_immutable_once_set() {
     let api = TestApiServer::new();
 
-    let (status, _) = api
+    let (status, created) = api
         .send(
             "POST",
             SNAPSHOTS,
@@ -206,16 +206,22 @@ async fn a_source_name_is_immutable_once_set() {
         )
         .await;
     assert!(status.is_success());
+    // A custom resource's `AllowUnconditionalUpdate()` is false, so a PUT must
+    // carry the resourceVersion it read.
+    let with_rv = |mut body: Value| {
+        body["metadata"]["resourceVersion"] = created["metadata"]["resourceVersion"].clone();
+        body
+    };
 
     let (code, body) = api
         .send(
             "PUT",
             &format!("{SNAPSHOTS}/snap-immutable"),
             Some("application/json"),
-            Some(&snapshot(
+            Some(&with_rv(snapshot(
                 "snap-immutable",
                 json!({ "source": { "persistentVolumeClaimName": "pvc-2" } }),
-            )),
+            ))),
         )
         .await;
     assert_eq!(
@@ -236,10 +242,10 @@ async fn a_source_name_is_immutable_once_set() {
             "PUT",
             &format!("{SNAPSHOTS}/snap-immutable"),
             Some("application/json"),
-            Some(&snapshot(
+            Some(&with_rv(snapshot(
                 "snap-immutable",
                 json!({ "source": { "volumeSnapshotContentName": "content-1" } }),
-            )),
+            ))),
         )
         .await;
     assert_eq!(

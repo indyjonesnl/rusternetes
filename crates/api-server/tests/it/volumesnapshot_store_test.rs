@@ -107,7 +107,10 @@ async fn snapshot_status_writes_status_and_keeps_spec() {
     let (s, out) = api.put(&format!("{SNAPSHOTS}/s1/status"), &update).await;
     assert_eq!(s, StatusCode::OK, "{out}");
     assert_eq!(out["status"]["readyToUse"], true, "{out}");
-    assert!(out["spec"].get("volumeSnapshotClassName").is_none(), "{out}");
+    assert!(
+        out["spec"].get("volumeSnapshotClassName").is_none(),
+        "{out}"
+    );
     assert_eq!(out["metadata"]["generation"], 1, "{out}");
 
     let (s, got) = api.get(&format!("{SNAPSHOTS}/s1/status")).await;
@@ -118,7 +121,10 @@ async fn snapshot_status_writes_status_and_keeps_spec() {
     let (s, out) = api.patch(&format!("{SNAPSHOTS}/s1/status"), &patch).await;
     assert_eq!(s, StatusCode::OK, "{out}");
     assert_eq!(out["status"]["readyToUse"], false, "{out}");
-    assert!(out["spec"].get("volumeSnapshotClassName").is_none(), "{out}");
+    assert!(
+        out["spec"].get("volumeSnapshotClassName").is_none(),
+        "{out}"
+    );
 }
 
 #[tokio::test]
@@ -140,7 +146,10 @@ async fn content_status_writes_status_and_keeps_spec() {
     let (s, out) = api.put(&format!("{CONTENTS}/c1"), &spec).await;
     assert_eq!(s, StatusCode::OK, "{out}");
     assert_eq!(out["metadata"]["generation"], 2, "{out}");
-    assert_eq!(out["status"]["snapshotHandle"], "h", "status is kept: {out}");
+    assert_eq!(
+        out["status"]["snapshotHandle"], "h",
+        "status is kept: {out}"
+    );
 }
 
 /// `customResourceStrategy.AllowCreateOnUpdate() == false`.
@@ -281,9 +290,14 @@ async fn at_most_one_default_class_per_driver() {
 #[tokio::test]
 async fn source_immutability_and_create_rules_still_apply() {
     let api = TestApiServer::new();
-    let (s, out) = api.post(SNAPSHOTS, &json!({
+    let (s, out) = api
+        .post(
+            SNAPSHOTS,
+            &json!({
         "apiVersion": "snapshot.storage.k8s.io/v1", "kind": "VolumeSnapshot",
-        "metadata": {"name": "bad"}, "spec": {}})).await;
+        "metadata": {"name": "bad"}, "spec": {}}),
+        )
+        .await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
     assert!(message(&out).contains("spec.source"), "{out}");
 

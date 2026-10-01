@@ -1606,11 +1606,16 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 .patch(handlers::volumesnapshot::patch_volumesnapshot)
                 .delete(handlers::volumesnapshot::delete_volumesnapshot),
         )
-        // VolumeSnapshots (all namespaces)
+        .route(
+            "/apis/snapshot.storage.k8s.io/v1/namespaces/:namespace/volumesnapshots/:name/status",
+            get(handlers::volumesnapshot::get_status)
+                .put(handlers::volumesnapshot::update_status)
+                .patch(handlers::volumesnapshot::patch_status),
+        )
+        // VolumeSnapshots (all namespaces): LIST and WATCH only
         .route(
             "/apis/snapshot.storage.k8s.io/v1/volumesnapshots",
-            get(handlers::volumesnapshot::list_all_volumesnapshots)
-            .delete(handlers::volumesnapshot::deletecollection_volumesnapshots),
+            get(handlers::volumesnapshot::list_all_volumesnapshots),
         )
         // VolumeSnapshotContents (cluster-scoped)
         .route(
@@ -1625,6 +1630,12 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 .put(handlers::volumesnapshotcontent::update_volumesnapshotcontent)
                 .patch(handlers::volumesnapshotcontent::patch_volumesnapshotcontent)
                 .delete(handlers::volumesnapshotcontent::delete_volumesnapshotcontent),
+        )
+        .route(
+            "/apis/snapshot.storage.k8s.io/v1/volumesnapshotcontents/:name/status",
+            get(handlers::volumesnapshotcontent::get_status)
+                .put(handlers::volumesnapshotcontent::update_status)
+                .patch(handlers::volumesnapshotcontent::patch_status),
         )
         // Events (namespace-scoped)
         .route(

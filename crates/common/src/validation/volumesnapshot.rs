@@ -21,8 +21,9 @@
 //! entry points.
 
 use crate::resources::volume::{
-    VolumeSnapshot, VolumeSnapshotContent, VolumeSnapshotContentSource, VolumeSnapshotContentSpec,
-    VolumeSnapshotSource, VolumeSnapshotSpec,
+    DeletionPolicy, VolumeSnapshot, VolumeSnapshotClass, VolumeSnapshotContent,
+    VolumeSnapshotContentSource, VolumeSnapshotContentSpec, VolumeSnapshotSource,
+    VolumeSnapshotSpec,
 };
 use crate::validation::field::{Error, ErrorList, Path};
 
@@ -76,6 +77,23 @@ fn validate_volume_snapshot_source(source: &VolumeSnapshotSource, fld_path: &Pat
         content.is_some(),
         "exactly one of volumeSnapshotContentName and persistentVolumeClaimName must be set",
     )
+}
+
+/// Validate a `VolumeSnapshotClass`: the CRD
+/// (`snapshot.storage.k8s.io_volumesnapshotclasses.yaml`) declares
+/// `required: [deletionPolicy, driver]` and carries no CEL rule. An absent key
+/// decodes to `""` / `Unspecified`, so both are answered `Required`; a
+/// present-but-empty `driver` passes the CRD schema but names no driver, and
+/// is refused the same way `VolumeSnapshotContent` refuses it.
+pub fn validate_volume_snapshot_class(class: &VolumeSnapshotClass) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if class.driver.is_empty() {
+        errs.push(Error::required(&Path::new("driver"), ""));
+    }
+    if matches!(class.deletion_policy, DeletionPolicy::Unspecified) {
+        errs.push(Error::required(&Path::new("deletionPolicy"), ""));
+    }
+    errs
 }
 
 /// Validate a `VolumeSnapshotContent` on create.
