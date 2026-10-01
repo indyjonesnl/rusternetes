@@ -139,12 +139,12 @@ fn every_write_handler_finishes_a_drained_deletion() {
     }
 
     assert!(
-        checked >= 115,
+        checked >= 117,
         "guard scanned only {checked} write handlers -- the parser stopped \
          matching, which would make this test vacuously green"
     );
     assert!(
-        patches_checked >= 58,
+        patches_checked >= 60,
         "guard scanned {patches_checked} PATCH handlers -- the `patch*` half of \
          the parser stopped matching, which is exactly the hole that let #1919 \
          ship: the GC removes finalizers with a merge PATCH, not a PUT"
