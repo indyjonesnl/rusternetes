@@ -186,6 +186,14 @@ async fn spawn_state_rbac_admin_only() -> (TestApiServer, Arc<MemoryStorage>, Ar
                 resource_names: None,
                 non_resource_urls: None,
             },
+            // Let the `system:masters` caller act as `RBAC_ADMIN_USER`.
+            PolicyRule {
+                verbs: vec!["impersonate".into()],
+                api_groups: Some(vec!["".into()]),
+                resources: Some(vec!["users".into()]),
+                resource_names: None,
+                non_resource_urls: None,
+            },
         ],
         aggregation_rule: None,
     };
@@ -205,12 +213,20 @@ async fn spawn_state_rbac_admin_only() -> (TestApiServer, Arc<MemoryStorage>, Ar
             name: "test-bootstrap-rbac-admin-binding".into(),
             ..Default::default()
         },
-        subjects: vec![Subject {
-            kind: "Group".into(),
-            name: "system:masters".into(),
-            api_group: Some("rbac.authorization.k8s.io".into()),
-            namespace: None,
-        }],
+        subjects: vec![
+            Subject {
+                kind: "Group".into(),
+                name: "system:masters".into(),
+                api_group: Some("rbac.authorization.k8s.io".into()),
+                namespace: None,
+            },
+            Subject {
+                kind: "User".into(),
+                name: RBAC_ADMIN_USER.into(),
+                api_group: Some("rbac.authorization.k8s.io".into()),
+                namespace: None,
+            },
+        ],
         role_ref: RoleRef {
             api_group: "rbac.authorization.k8s.io".into(),
             kind: "ClusterRole".into(),
@@ -231,13 +247,43 @@ async fn spawn_state_rbac_admin_only() -> (TestApiServer, Arc<MemoryStorage>, Ar
     (api, mem, backend)
 }
 
-async fn post_json(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
-    let (status, value) = state.post(uri, body).await;
+/// The identity that holds the RBAC-admin rules but, unlike the default
+/// `skip_auth` caller, is not in `system:masters`. Upstream's
+/// `EscalationAllowed` (pkg/registry/rbac/escalation_check.go:33) lets
+/// `system:masters` through the escalation check, so the escalation tests must
+/// not run as it.
+const RBAC_ADMIN_USER: &str = "rbac-admin";
+
+async fn send_as_rbac_admin(
+    state: TestApiServer,
+    method: &str,
+    uri: &str,
+    body: &Value,
+) -> (u16, Value) {
+    let (status, _h, _b, value) = state
+        .send_with_headers(
+            method,
+            uri,
+            &[
+                ("impersonate-user", RBAC_ADMIN_USER),
+                ("content-type", "application/json"),
+            ],
+            Some(serde_json::to_vec(body).unwrap()),
+        )
+        .await;
     (status.as_u16(), value)
 }
 
-async fn put_json(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
-    let (status, value) = state.put(uri, body).await;
+async fn post_json_as_rbac_admin(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    send_as_rbac_admin(state, "POST", uri, body).await
+}
+
+async fn put_json_as_rbac_admin(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    send_as_rbac_admin(state, "PUT", uri, body).await
+}
+
+async fn post_json(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = state.post(uri, body).await;
     (status.as_u16(), value)
 }
 
@@ -435,15 +481,10 @@ async fn rolebinding_create_blocked_when_caller_lacks_escalate() {
     // to bind `secret-master` to `mallory` while the *real* caller does not
     // possess equivalent rules.
     //
-    // The skip_auth admin identity bypasses our home-grown bootstrap-binding
-    // grant; upstream's `policybased` storage layer would catch the missing
-    // `escalate` verb here. Until we implement that, the POST currently
-    // succeeds — which is exactly what this RED-state pin documents.
-    //
-    // For the pin to GREEN, the future implementation MUST: (a) detect that
-    // the request user lacks any of the rules in `secret-master`, (b) check
-    // for the `escalate` verb on `rolebindings`, and (c) return 403 when
-    // neither holds.
+    // The request runs as RBAC_ADMIN_USER: it can manage RBAC objects but
+    // holds neither the `secret-master` rules nor `escalate`/`bind`, so the
+    // `policybased` storage layer must answer 403 (the default skip_auth
+    // caller is in `system:masters` and would be let through).
     let rb_body = json!({
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "RoleBinding",
@@ -464,7 +505,7 @@ async fn rolebinding_create_blocked_when_caller_lacks_escalate() {
     // with a 403 + an error message naming the missing rule. We assert the
     // 403 here; the message contract is whatever upstream uses
     // ("user X cannot escalate to role Y").
-    let (status, body) = post_json(
+    let (status, body) = post_json_as_rbac_admin(
         state.clone(),
         &format!("/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings"),
         &rb_body,
@@ -557,7 +598,7 @@ async fn rolebinding_update_blocked_when_caller_lacks_escalate() {
             "name": "secret-master"
         }
     });
-    let (status, body) = put_json(
+    let (status, body) = put_json_as_rbac_admin(
         state.clone(),
         &format!("/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings/mallory-secret-binding"),
         &rb_body,
@@ -615,7 +656,7 @@ async fn clusterrolebinding_create_blocked_when_caller_lacks_escalate() {
             "name": "cluster-secret-master"
         }
     });
-    let (status, body) = post_json(
+    let (status, body) = post_json_as_rbac_admin(
         state.clone(),
         "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings",
         &crb_body,
@@ -705,7 +746,7 @@ async fn clusterrolebinding_update_blocked_when_caller_lacks_escalate() {
             "name": "cluster-secret-master"
         }
     });
-    let (status, body) = put_json(
+    let (status, body) = put_json_as_rbac_admin(
         state.clone(),
         "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/mallory-cluster-secret-binding",
         &crb_body,

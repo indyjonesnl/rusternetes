@@ -80,6 +80,9 @@ pub struct RequestContext {
     /// pkg/registry/core/event/strategy.go:134-139) read it; `None` is
     /// upstream's "no RequestInfo", a zero-value group-version.
     pub group_version: Option<(String, String)>,
+    /// `RequestInfo.Name`: the name in the request path, `None` for a POST
+    /// (and a collection request).
+    pub name: Option<String>,
     warnings: Mutex<Vec<String>>,
 }
 
@@ -89,6 +92,7 @@ impl RequestContext {
             namespace: namespace.filter(|ns| !ns.is_empty()).map(str::to_string),
             user: None,
             group_version: None,
+            name: None,
             warnings: Mutex::new(Vec::new()),
         }
     }
@@ -102,6 +106,12 @@ impl RequestContext {
     /// The context with the requester attached (`WithUser`).
     pub fn with_user(mut self, user: &UserInfo) -> Self {
         self.user = Some(user.clone());
+        self
+    }
+
+    /// The context with the request name attached (`RequestInfo.Name`).
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.name = Some(name.to_string());
         self
     }
 

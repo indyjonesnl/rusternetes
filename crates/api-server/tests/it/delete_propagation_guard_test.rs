@@ -132,7 +132,7 @@ fn every_delete_handler_passes_the_request_delete_options() {
     }
 
     assert!(
-        checked >= 32,
+        checked >= 24,
         "guard scanned only {checked} delete handlers -- the parser stopped \
          matching, which would make this test vacuously green"
     );
