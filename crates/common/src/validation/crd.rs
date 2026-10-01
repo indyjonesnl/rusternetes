@@ -48,13 +48,24 @@ const MAX_SELECTABLE_FIELDS: usize = 8;
 /// `acceptedConversionReviewVersions` (`validation.go:560`).
 const ACCEPTED_CONVERSION_REVIEW_VERSIONS: &[&str] = &["v1", "v1beta1"];
 
-/// `SetDefaults_CustomResourceDefinitionSpec`
-/// (`apiextensions/v1/defaults.go:41-53`). The `status.storedVersions` half of
-/// `SetDefaults_CustomResourceDefinition` (`:29-38`) is already done by the
-/// create handler, which seeds the whole status block. Must run *before* validation: the
-/// `names.singular` / `names.listKind` / `conversion.strategy` rules below are
-/// all satisfied by these defaults, exactly as upstream's are.
+/// `SetDefaults_CustomResourceDefinition` (`apiextensions/v1/defaults.go:30-40`):
+/// the spec defaults of `SetDefaults_CustomResourceDefinitionSpec` (`:42-55`),
+/// and `status.storedVersions` seeded with the first storage version when it
+/// is empty. Must run *before* validation: the `names.singular` /
+/// `names.listKind` / `conversion.strategy` rules below are all satisfied by
+/// these defaults, exactly as upstream's are.
 pub fn set_defaults_custom_resource_definition(crd: &mut CustomResourceDefinition) {
+    let seeded = crd
+        .status
+        .as_ref()
+        .and_then(|s| s.stored_versions.as_ref())
+        .is_some_and(|v| !v.is_empty());
+    if !seeded {
+        if let Some(v) = crd.spec.versions.iter().find(|v| v.storage) {
+            let status = crd.status.get_or_insert_with(Default::default);
+            status.stored_versions = Some(vec![v.name.clone()]);
+        }
+    }
     let names = &mut crd.spec.names;
     if names.singular.as_deref().unwrap_or("").is_empty() {
         names.singular = Some(names.kind.to_lowercase());
@@ -412,6 +423,31 @@ pub fn validate_custom_resource_definition_spec(
 /// `ValidateCustomResourceDefinitionNames` (`:785`). `singular` and `listKind`
 /// are required here because defaulting has already filled them.
 fn validate_names(names: &CustomResourceDefinitionNames, fld_path: &Path) -> ErrorList {
+    let mut errs = validate_custom_resource_definition_names(names, fld_path);
+    let singular = names.singular.clone().unwrap_or_default();
+    let list_kind = names.list_kind.clone().unwrap_or_default();
+    if names.plural.is_empty() {
+        errs.push(Error::required(&fld_path.child("plural"), ""));
+    }
+    if singular.is_empty() {
+        errs.push(Error::required(&fld_path.child("singular"), ""));
+    }
+    if names.kind.is_empty() {
+        errs.push(Error::required(&fld_path.child("kind"), ""));
+    }
+    if list_kind.is_empty() {
+        errs.push(Error::required(&fld_path.child("listKind"), ""));
+    }
+    errs
+}
+
+/// `ValidateCustomResourceDefinitionNames` (`validation.go:785-818`): the
+/// format rules, which hold for `spec.names` and `status.acceptedNames` alike.
+/// The "required" half is spec-only and stays in [`validate_names`].
+pub fn validate_custom_resource_definition_names(
+    names: &CustomResourceDefinitionNames,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let singular = names.singular.clone().unwrap_or_default();
     let list_kind = names.list_kind.clone().unwrap_or_default();
@@ -475,18 +511,6 @@ fn validate_names(names: &CustomResourceDefinitionNames, fld_path: &Path) -> Err
         }
     }
 
-    if names.plural.is_empty() {
-        errs.push(Error::required(&fld_path.child("plural"), ""));
-    }
-    if singular.is_empty() {
-        errs.push(Error::required(&fld_path.child("singular"), ""));
-    }
-    if names.kind.is_empty() {
-        errs.push(Error::required(&fld_path.child("kind"), ""));
-    }
-    if list_kind.is_empty() {
-        errs.push(Error::required(&fld_path.child("listKind"), ""));
-    }
     errs
 }
 
@@ -717,4 +741,411 @@ fn validate_conversion_review_versions(versions: &[String], fld_path: &Path) -> 
         ));
     }
     errs
+}
+
+// ---------------------------------------------------------------------------
+// Whole-object validation: `ValidateCustomResourceDefinition` and friends.
+// ---------------------------------------------------------------------------
+
+/// `apiextensionsv1.CustomResourceCleanupFinalizer`
+/// (`apiextensions/v1/types.go:392`).
+pub const CUSTOM_RESOURCE_CLEANUP_FINALIZER: &str = "customresourcecleanup.apiextensions.k8s.io";
+
+/// `apiextensionsv1beta1.KubeAPIApprovedAnnotation`
+/// (`apiextensions/v1beta1/types.go:32`).
+pub const KUBE_API_APPROVED_ANNOTATION: &str = "api-approved.kubernetes.io";
+
+/// `IsCRDConditionTrue` (`apiextensions/helpers.go:70`): the condition is
+/// present and strictly `True`.
+pub fn is_crd_condition_true(crd: &CustomResourceDefinition, condition_type: &str) -> bool {
+    crd.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|cs| cs.iter().find(|c| c.type_ == condition_type))
+        .is_some_and(|c| c.status == "True")
+}
+
+/// `IsProtectedCommunityGroup` (`apihelpers/helpers.go:31-41`).
+pub fn is_protected_community_group(group: &str) -> bool {
+    group == "k8s.io"
+        || group.ends_with(".k8s.io")
+        || group == "kubernetes.io"
+        || group.ends_with(".kubernetes.io")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiApprovalState {
+    Invalid,
+    Approved,
+    Bypassed,
+    Missing,
+}
+
+/// `GetAPIApprovalState` (`apihelpers/helpers.go:55-70`).
+fn api_approval_state(
+    annotations: Option<&std::collections::HashMap<String, String>>,
+) -> (ApiApprovalState, String) {
+    let annotation = annotations
+        .and_then(|a| a.get(KUBE_API_APPROVED_ANNOTATION))
+        .map(String::as_str)
+        .unwrap_or("");
+    if annotation.is_empty() {
+        return (
+            ApiApprovalState::Missing,
+            format!("protected groups must have approval annotation {KUBE_API_APPROVED_ANNOTATION:?}, see https://github.com/kubernetes/enhancements/pull/1111"),
+        );
+    }
+    if annotation.starts_with("unapproved") {
+        return (
+            ApiApprovalState::Bypassed,
+            format!("not approved: {annotation:?}"),
+        );
+    }
+    // `url.ParseRequestURI` with a non-empty host and scheme.
+    let approved = url::Url::parse(annotation)
+        .ok()
+        .is_some_and(|u| u.host().is_some() && !u.scheme().is_empty());
+    if approved {
+        return (
+            ApiApprovalState::Approved,
+            format!("approved in {annotation}"),
+        );
+    }
+    (
+        ApiApprovalState::Invalid,
+        format!("protected groups must have approval annotation {KUBE_API_APPROVED_ANNOTATION:?} with either a URL or a reason starting with \"unapproved\", see https://github.com/kubernetes/enhancements/pull/1111"),
+    )
+}
+
+/// `validateAPIApproval` (`validation.go:1857-1890`).
+fn validate_api_approval(
+    new_crd: &CustomResourceDefinition,
+    old_crd: Option<&CustomResourceDefinition>,
+) -> ErrorList {
+    if !is_protected_community_group(&new_crd.spec.group) {
+        return Vec::new();
+    }
+    let old_state = old_crd.map(|o| api_approval_state(o.metadata.annotations.as_ref()).0);
+    let (new_state, reason) = api_approval_state(new_crd.metadata.annotations.as_ref());
+    // A v1 client that only updates the spec must not be rejected over an
+    // approval it never touched.
+    if old_state == Some(new_state) {
+        return Vec::new();
+    }
+    let path = Path::new("metadata")
+        .child("annotations")
+        .key(KUBE_API_APPROVED_ANNOTATION);
+    match new_state {
+        ApiApprovalState::Approved | ApiApprovalState::Bypassed => Vec::new(),
+        ApiApprovalState::Missing => vec![Error::required(&path, reason)],
+        ApiApprovalState::Invalid => vec![Error::invalid(
+            &path,
+            new_crd
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(KUBE_API_APPROVED_ANNOTATION))
+                .cloned()
+                .unwrap_or_default(),
+            reason,
+        )],
+    }
+}
+
+/// `validatePreserveUnknownFields` (`validation.go:1892-1904`).
+fn validate_preserve_unknown_fields(
+    crd: &CustomResourceDefinition,
+    old_crd: Option<&CustomResourceDefinition>,
+) -> ErrorList {
+    if old_crd.is_some_and(|o| o.spec.preserve_unknown_fields == Some(true)) {
+        // No-op for compatibility with existing data.
+        return Vec::new();
+    }
+    if crd.spec.preserve_unknown_fields == Some(true) {
+        return vec![Error::invalid(
+            &Path::new("spec").child("preserveUnknownFields"),
+            true,
+            "cannot set to true, set x-kubernetes-preserve-unknown-fields to true in spec.versions[*].schema instead",
+        )];
+    }
+    Vec::new()
+}
+
+/// `ValidateCustomResourceDefinitionStatus` (`validation.go:778-783`).
+pub fn validate_custom_resource_definition_status(
+    status: Option<&crate::resources::CustomResourceDefinitionStatus>,
+    fld_path: &Path,
+) -> ErrorList {
+    // `AcceptedNames` is a struct upstream, so an absent one is the zero value,
+    // which has nothing to reject.
+    match status.and_then(|s| s.accepted_names.as_ref()) {
+        Some(names) => {
+            validate_custom_resource_definition_names(names, &fld_path.child("acceptedNames"))
+        }
+        None => Vec::new(),
+    }
+}
+
+/// `ValidateCustomResourceDefinitionStoredVersions` (`validation.go:261-285`).
+pub fn validate_custom_resource_definition_stored_versions(
+    stored_versions: &[String],
+    versions: &[crate::resources::CustomResourceDefinitionVersion],
+    fld_path: &Path,
+) -> ErrorList {
+    if stored_versions.is_empty() {
+        return vec![Error::invalid(
+            fld_path,
+            serde_json::json!(stored_versions),
+            "must have at least one stored version",
+        )];
+    }
+    let mut errs: ErrorList = Vec::new();
+    // `storedVersionsMap[v] = i` keeps the last index of a duplicate.
+    let mut remaining: Vec<(usize, &String)> = stored_versions.iter().enumerate().collect();
+    for v in versions {
+        let found = remaining.iter().any(|(_, s)| **s == v.name);
+        if v.storage && !found {
+            errs.push(Error::invalid(
+                fld_path,
+                serde_json::json!(stored_versions),
+                format!("must have the storage version {}", v.name),
+            ));
+        }
+        remaining.retain(|(_, s)| **s != v.name);
+    }
+    for (i, v) in remaining {
+        errs.push(Error::invalid(
+            &fld_path.index(i),
+            v.clone(),
+            format!("missing from spec.versions; {v} was previously a storage version, and must remain in spec.versions until a storage migration ensures no data remains persisted in {v} and removes {v} from status.storedVersions"),
+        ));
+    }
+    errs
+}
+
+/// The name function `ValidateCustomResourceDefinition` hands
+/// `ValidateObjectMeta` (`validation.go:76-83`) beyond `NameIsDNSSubdomain`:
+/// the name is `<plural>.<group>`. Upstream appends the message for the name
+/// and for a `generateName` prefix alike, because the prefix never equals the
+/// required name.
+fn required_name_errors(crd: &CustomResourceDefinition) -> ErrorList {
+    let required = format!("{}.{}", crd.spec.names.plural, crd.spec.group);
+    let message = "must be spec.names.plural+\".\"+spec.group";
+    let mut errs: ErrorList = Vec::new();
+    let meta_path = Path::new("metadata");
+    if let Some(gn) = crd
+        .metadata
+        .generate_name
+        .as_deref()
+        .filter(|g| !g.is_empty())
+    {
+        errs.push(Error::invalid(
+            &meta_path.child("generateName"),
+            gn.to_string(),
+            message,
+        ));
+    }
+    if !crd.metadata.name.is_empty() && crd.metadata.name != required {
+        errs.push(Error::invalid(
+            &meta_path.child("name"),
+            crd.metadata.name.clone(),
+            message,
+        ));
+    }
+    errs
+}
+
+fn stored_versions_of(crd: &CustomResourceDefinition) -> &[String] {
+    crd.status
+        .as_ref()
+        .and_then(|s| s.stored_versions.as_deref())
+        .unwrap_or_default()
+}
+
+/// `ValidateCustomResourceDefinition` (`validation.go:75-107`), without the
+/// structural-schema and CEL halves of the spec (see the module doc).
+pub fn validate_custom_resource_definition(crd: &CustomResourceDefinition) -> ErrorList {
+    let mut errs = crate::validation::objectmeta::validate_object_meta(
+        &crd.metadata,
+        false,
+        crate::validation::objectmeta::name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    errs.extend(required_name_errors(crd));
+    errs.extend(validate_custom_resource_definition_spec(
+        &crd.spec,
+        &Path::new("spec"),
+    ));
+    let status_path = Path::new("status");
+    errs.extend(validate_custom_resource_definition_status(
+        crd.status.as_ref(),
+        &status_path,
+    ));
+    errs.extend(validate_custom_resource_definition_stored_versions(
+        stored_versions_of(crd),
+        &crd.spec.versions,
+        &status_path.child("storedVersions"),
+    ));
+    errs.extend(validate_api_approval(crd, None));
+    errs.extend(validate_preserve_unknown_fields(crd, None));
+    errs
+}
+
+/// `ValidateCustomResourceDefinitionUpdate` (`validation.go:230-259`).
+pub fn validate_custom_resource_definition_update(
+    crd: &CustomResourceDefinition,
+    old: &CustomResourceDefinition,
+) -> ErrorList {
+    let mut errs = crate::validation::objectmeta::validate_object_meta_update(
+        &crd.metadata,
+        &old.metadata,
+        &Path::new("metadata"),
+    );
+    let spec_path = Path::new("spec");
+    errs.extend(validate_custom_resource_definition_spec(
+        &crd.spec, &spec_path,
+    ));
+    errs.extend(validate_custom_resource_definition_spec_update(
+        &crd.spec,
+        &old.spec,
+        is_crd_condition_true(old, "Established"),
+        &spec_path,
+    ));
+    let status_path = Path::new("status");
+    errs.extend(validate_custom_resource_definition_status(
+        crd.status.as_ref(),
+        &status_path,
+    ));
+    errs.extend(validate_custom_resource_definition_stored_versions(
+        stored_versions_of(crd),
+        &crd.spec.versions,
+        &status_path.child("storedVersions"),
+    ));
+    errs.extend(validate_api_approval(crd, Some(old)));
+    errs.extend(validate_preserve_unknown_fields(crd, Some(old)));
+    errs
+}
+
+/// `ValidateUpdateCustomResourceDefinitionStatus` (`validation.go:288-292`).
+pub fn validate_update_custom_resource_definition_status(
+    crd: &CustomResourceDefinition,
+    old: &CustomResourceDefinition,
+) -> ErrorList {
+    let mut errs = crate::validation::objectmeta::validate_object_meta_update(
+        &crd.metadata,
+        &old.metadata,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_custom_resource_definition_status(
+        crd.status.as_ref(),
+        &Path::new("status"),
+    ));
+    errs
+}
+
+#[cfg(test)]
+mod whole_object_tests {
+    use super::*;
+
+    fn crd(group: &str) -> CustomResourceDefinition {
+        let mut crd = CustomResourceDefinition::new("widget", group, "Widget", "widgets");
+        crd.spec.versions = vec![serde_json::from_value(serde_json::json!({
+            "name": "v1", "served": true, "storage": true
+        }))
+        .unwrap()];
+        set_defaults_custom_resource_definition(&mut crd);
+        crd
+    }
+
+    /// `TestValidateCustomResourceDefinitionStoredVersions`
+    /// (validation_test.go): the storage version must be stored, and a stored
+    /// version must stay in `spec.versions`.
+    #[test]
+    fn stored_versions_rules() {
+        let c = crd("example.com");
+        let path = Path::new("status").child("storedVersions");
+        assert!(validate_custom_resource_definition_stored_versions(
+            &["v1".into()],
+            &c.spec.versions,
+            &path
+        )
+        .is_empty());
+        let errs =
+            validate_custom_resource_definition_stored_versions(&[], &c.spec.versions, &path);
+        assert_eq!(errs.len(), 1);
+        let errs = validate_custom_resource_definition_stored_versions(
+            &["v0".into()],
+            &c.spec.versions,
+            &path,
+        );
+        assert_eq!(errs.len(), 2, "{errs:?}");
+    }
+
+    #[test]
+    fn protected_groups() {
+        for g in ["k8s.io", "a.k8s.io", "kubernetes.io", "a.kubernetes.io"] {
+            assert!(is_protected_community_group(g), "{g}");
+        }
+        assert!(!is_protected_community_group("example.com"));
+        assert!(!is_protected_community_group("notk8s.io.example.com"));
+    }
+
+    #[test]
+    fn approval_annotation_states() {
+        let mut c = crd("a.k8s.io");
+        let errs = validate_api_approval(&c, None);
+        assert!(
+            errs.iter().any(|e| e.error_body().contains("Required value")),
+            "{errs:?}"
+        );
+        for (value, ok) in [
+            ("https://github.com/kubernetes/kubernetes/pull/1", true),
+            ("unapproved, experimental-only", true),
+            ("not a url", false),
+        ] {
+            c.metadata.annotations =
+                Some([(KUBE_API_APPROVED_ANNOTATION.to_string(), value.to_string())].into());
+            let errs = validate_api_approval(&c, None);
+            assert_eq!(errs.is_empty(), ok, "{value}: {errs:?}");
+        }
+    }
+
+    /// An unchanged approval state is never rejected on update
+    /// (`validation.go:1873-1877`).
+    #[test]
+    fn unchanged_approval_state_passes_update() {
+        let c = crd("a.k8s.io");
+        assert!(validate_api_approval(&c, Some(&c)).is_empty());
+    }
+
+    #[test]
+    fn preserve_unknown_fields_true_is_rejected_unless_already_set() {
+        let mut c = crd("example.com");
+        c.spec.preserve_unknown_fields = Some(true);
+        assert_eq!(validate_preserve_unknown_fields(&c, None).len(), 1);
+        assert!(validate_preserve_unknown_fields(&c, Some(&c)).is_empty());
+    }
+
+    #[test]
+    fn defaults_seed_stored_versions_once() {
+        let mut c = crd("example.com");
+        assert_eq!(
+            c.status.as_ref().unwrap().stored_versions,
+            Some(vec!["v1".to_string()])
+        );
+        c.status.as_mut().unwrap().stored_versions = Some(vec!["v0".to_string()]);
+        set_defaults_custom_resource_definition(&mut c);
+        assert_eq!(
+            c.status.as_ref().unwrap().stored_versions,
+            Some(vec!["v0".to_string()])
+        );
+    }
+
+    #[test]
+    fn name_must_be_plural_dot_group() {
+        let mut c = crd("example.com");
+        assert!(required_name_errors(&c).is_empty());
+        c.metadata.name = "other.example.com".into();
+        assert_eq!(required_name_errors(&c).len(), 1);
+    }
 }
