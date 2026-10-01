@@ -20,8 +20,8 @@
 //! field error list, so [`legacy_errors`] turns the message back into one.
 //!
 //! Not ported here, and still served by the bespoke handlers:
-//! - `/scale` (`etcd.go: ScaleREST`), tracked in #2137;
-//! - list and watch;
+//! - `/scale` (`etcd.go: ScaleREST`), tracked in #2134;
+//! - list and watch, tracked in #2135;
 //! - `GetResetFields` (managed-fields reset sets) and table conversion;
 //! - `x-kubernetes-list-type` map/set uniqueness (`listtype.ValidateListSetsAndMaps`)
 //!   and the `schemaobjectmeta.Validate` embedded-resource check, which
