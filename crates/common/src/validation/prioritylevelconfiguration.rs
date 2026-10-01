@@ -190,12 +190,41 @@ fn validate_condition(
     errs
 }
 
+/// `ValidatePriorityLevelConfigurationStatusUpdate` (validation.go:525-527).
+pub fn validate_priority_level_configuration_status_update(
+    plc: &PriorityLevelConfiguration,
+) -> ErrorList {
+    match &plc.status {
+        Some(status) => validate_status(status, &Path::new("status")),
+        None => Vec::new(),
+    }
+}
+
+/// `PriorityLevelPreserveZeroConcurrencySharesKey`
+/// (staging/src/k8s.io/api/flowcontrol/v1beta3/types.go:117).
+const PRESERVE_ZERO_CONCURRENCY_SHARES_KEY: &str =
+    "flowcontrol.k8s.io/v1beta3-preserve-zero-concurrency-shares";
+
 /// Validate a `PriorityLevelConfiguration` on create. Mirrors upstream
 /// `ValidatePriorityLevelConfiguration` (spec + status) minus ObjectMeta.
 pub fn validate_priority_level_configuration(plc: &PriorityLevelConfiguration) -> ErrorList {
     let spec_path = Path::new("spec");
     let mut errs: ErrorList = Vec::new();
     let spec = &plc.spec;
+
+    // The roundtrip annotation is only for v1beta3; after conversion the
+    // internal object must not carry it (validation.go:350-355).
+    if plc
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(PRESERVE_ZERO_CONCURRENCY_SHARES_KEY))
+    {
+        errs.push(Error::forbidden(
+            &Path::new("metadata").child("annotations"),
+            format!("annotation '{PRESERVE_ZERO_CONCURRENCY_SHARES_KEY}' is forbidden"),
+        ));
+    }
 
     let is_exempt_type = matches!(spec.type_, PriorityLevelType::Exempt);
     let is_exempt_name = plc.metadata.name == "exempt";

@@ -1827,9 +1827,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/flowcontrol.apiserver.k8s.io/v1/prioritylevelconfigurations/:name/status",
-            get(handlers::status::get_cluster_status)
-                .put(handlers::status::update_cluster_status)
-                .patch(handlers::status::update_cluster_status),
+            get(handlers::flowcontrol::get_priority_level_configuration_status)
+                .put(handlers::flowcontrol::update_priority_level_configuration_status)
+                .patch(handlers::flowcontrol::patch_priority_level_configuration_status),
         )
         // FlowControl API - FlowSchemas (cluster-scoped)
         .route(
@@ -1847,9 +1847,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/flowcontrol.apiserver.k8s.io/v1/flowschemas/:name/status",
-            get(handlers::status::get_cluster_status)
-                .put(handlers::status::update_cluster_status)
-                .patch(handlers::status::update_cluster_status),
+            get(handlers::flowcontrol::get_flow_schema_status)
+                .put(handlers::flowcontrol::update_flow_schema_status)
+                .patch(handlers::flowcontrol::patch_flow_schema_status),
         )
         // Certificates API - CertificateSigningRequests (cluster-scoped)
         .route(

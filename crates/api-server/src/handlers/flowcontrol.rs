@@ -1,90 +1,102 @@
+//! FlowSchema and PriorityLevelConfiguration endpoints.
+//!
+//! Writes go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the strategies of
+//! [`crate::registry::flowcontrol`] — upstream's
+//! `pkg/registry/flowcontrol/{flowschema,prioritylevelconfiguration}/storage`
+//! wired into `endpoints/handlers/{create,update,patch,delete}.go`. Lists and
+//! watches are still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::flowcontrol::{flowschema, prioritylevelconfiguration};
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::{FlowSchema, PriorityLevelConfiguration},
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 
-// PriorityLevelConfiguration handlers
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
+/// The PriorityLevelConfiguration `RequestScope`: `flowcontrol.apiserver.k8s.io/v1` served as
+/// `prioritylevelconfigurations`, backed by the PriorityLevelConfiguration `NewREST`.
+fn plc_scope(
+    state: &ApiServerState,
+    subresource: Option<&'static str>,
+) -> RequestScope<PriorityLevelConfiguration> {
+    let (store, status_store) = prioritylevelconfiguration::new_stores(state.storage.clone());
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "flowcontrol.apiserver.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "PriorityLevelConfiguration".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "flowcontrol.apiserver.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "prioritylevelconfigurations".to_string(),
+        },
+        subresource,
+        store: Box::new(if subresource.is_some() {
+            status_store
+        } else {
+            store
+        }),
+        apply: Some(crate::ssa::apply_legacy::<PriorityLevelConfiguration>),
+        convert_to_internal: Some(prioritylevelconfiguration::convert_to_internal),
+    }
+}
 
 pub async fn create_priority_level_configuration(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut plc): DumpingJson<PriorityLevelConfiguration>,
-) -> Result<(StatusCode, Json<PriorityLevelConfiguration>)> {
-    info!("Creating PriorityLevelConfiguration: {}", plc.metadata.name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "prioritylevelconfigurations")
-        .with_api_group("flowcontrol.apiserver.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &plc.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &plc_scope(&state, None),
+        &auth_ctx.user,
         None,
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Validate spec (upstream APF ValidatePriorityLevelConfigurationSpec):
-    // type/name coupling, exempt/limited coupling, limited + queuing config.
-    let errs = rusternetes_common::validation::prioritylevelconfiguration::validate_priority_level_configuration(&plc);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Enrich metadata with system fields
-    plc.metadata.ensure_uid();
-    plc.metadata.ensure_creation_timestamp();
-
-    // Check for dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: PriorityLevelConfiguration validated successfully (not created)");
-        return Ok((StatusCode::CREATED, Json(plc)));
-    }
-
-    let key = build_key("prioritylevelconfigurations", None, &plc.metadata.name);
-    let created = state.storage.create(&key, &plc).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get_priority_level_configuration(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
-) -> Result<Json<PriorityLevelConfiguration>> {
-    debug!("Getting PriorityLevelConfiguration: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "prioritylevelconfigurations")
-        .with_api_group("flowcontrol.apiserver.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
-    }
-
-    let key = build_key("prioritylevelconfigurations", None, &name);
-    let plc = state.storage.get(&key).await?;
-
-    Ok(Json(plc))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &plc_scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+    )
+    .await
 }
 
 pub async fn update_priority_level_configuration(
@@ -92,149 +104,75 @@ pub async fn update_priority_level_configuration(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut plc): DumpingJson<PriorityLevelConfiguration>,
-) -> Result<Json<PriorityLevelConfiguration>> {
-    info!("Updating PriorityLevelConfiguration: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "prioritylevelconfigurations")
-        .with_api_group("flowcontrol.apiserver.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("prioritylevelconfigurations", None, &name),
-        "flowcontrol.apiserver.k8s.io",
-        "prioritylevelconfigurations",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &plc_scope(&state, None),
+        &auth_ctx.user,
+        None,
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    plc.metadata.name = name.clone();
-    plc.kind = "PriorityLevelConfiguration".to_string();
-    plc.api_version = "flowcontrol.apiserver.k8s.io/v1".to_string();
-
-    // Field validation on update (upstream re-runs ValidatePriorityLevelConfiguration
-    // on the new object — the spec is mutable, no immutability). The create path
-    // validated but the update path previously persisted PUTs unchecked.
-    {
-        let errs = rusternetes_common::validation::prioritylevelconfiguration::validate_priority_level_configuration(&plc);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // Check for dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: PriorityLevelConfiguration validated successfully (not updated)");
-        return Ok(Json(plc));
-    }
-
-    let key = build_key("prioritylevelconfigurations", None, &name);
-
-    // Get existing for resourceVersion check
-    let existing: Option<PriorityLevelConfiguration> = state.storage.get(&key).await.ok();
-    if let Some(ref existing) = existing {
-        crate::handlers::lifecycle::check_resource_version(
-            existing.metadata.resource_version.as_deref(),
-            plc.metadata.resource_version.as_deref(),
-            &name,
-        )?;
-    }
-
-    // Preserve status from existing
-    if let Some(ref existing) = existing {
-        if plc.status.is_none() {
-            plc.status = existing.status.clone();
-        }
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    // The stored object is already in hand from the read above; re-reading it
-    // here would cost a second round-trip on every PUT and widen the window
-    // between read and write for no benefit.
-    if let Some(stored) = existing.as_ref() {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut plc.metadata,
-            &stored.metadata,
-        );
-    }
-    let result = state.storage.update(&key, &plc).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
+pub async fn patch_priority_level_configuration(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &plc_scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete_priority_level_configuration(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<PriorityLevelConfiguration>> {
-    info!("Deleting PriorityLevelConfiguration: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "prioritylevelconfigurations")
-        .with_api_group("flowcontrol.apiserver.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
-    }
-
-    let key = build_key("prioritylevelconfigurations", None, &name);
-
-    // Get the resource for finalizer handling
-    let resource: PriorityLevelConfiguration = state.storage.get(&key).await?;
-
-    // Check for dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: PriorityLevelConfiguration validated successfully (not deleted)");
-        return Ok(Json(resource));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &resource,
-        &delete_opts,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &plc_scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    if deleted_immediately {
-        Ok(Json(resource))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: PriorityLevelConfiguration = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+pub async fn deletecollection_prioritylevelconfigurations(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &plc_scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn list_priority_level_configurations(
@@ -283,82 +221,113 @@ pub async fn list_priority_level_configurations(
     Ok(Json(list).into_response())
 }
 
-crate::patch_handler_cluster!(
-    patch_priority_level_configuration,
-    PriorityLevelConfiguration,
-    "prioritylevelconfigurations",
-    "flowcontrol.apiserver.k8s.io"
-);
+/// GET `/status`.
+pub async fn get_priority_level_configuration_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &plc_scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+    )
+    .await
+}
 
-// FlowSchema handlers
+/// PUT `/status`.
+pub async fn update_priority_level_configuration_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &plc_scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// PATCH `/status`.
+pub async fn patch_priority_level_configuration_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &plc_scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
+}
+
+/// The FlowSchema `RequestScope`: `flowcontrol.apiserver.k8s.io/v1` served as
+/// `flowschemas`, backed by the FlowSchema `NewREST`.
+fn fs_scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestScope<FlowSchema> {
+    let (store, status_store) = flowschema::new_stores(state.storage.clone());
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "flowcontrol.apiserver.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "FlowSchema".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "flowcontrol.apiserver.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "flowschemas".to_string(),
+        },
+        subresource,
+        store: Box::new(if subresource.is_some() {
+            status_store
+        } else {
+            store
+        }),
+        apply: Some(crate::ssa::apply_legacy::<FlowSchema>),
+        convert_to_internal: Some(flowschema::convert_to_internal),
+    }
+}
 
 pub async fn create_flow_schema(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut fs): DumpingJson<FlowSchema>,
-) -> Result<(StatusCode, Json<FlowSchema>)> {
-    info!("Creating FlowSchema: {}", fs.metadata.name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "flowschemas")
-        .with_api_group("flowcontrol.apiserver.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &fs.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &fs_scope(&state, None),
+        &auth_ctx.user,
         None,
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Validate spec (upstream APF ValidateFlowSchemaSpec): matchingPrecedence,
-    // priorityLevelConfiguration ref, and rules subjects/resource/nonResource.
-    let errs = rusternetes_common::validation::flowschema::validate_flow_schema(&fs);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Enrich metadata with system fields
-    fs.metadata.ensure_uid();
-    fs.metadata.ensure_creation_timestamp();
-
-    // Check for dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: FlowSchema validated successfully (not created)");
-        return Ok((StatusCode::CREATED, Json(fs)));
-    }
-
-    let key = build_key("flowschemas", None, &fs.metadata.name);
-    let created = state.storage.create(&key, &fs).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get_flow_schema(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
-) -> Result<Json<FlowSchema>> {
-    debug!("Getting FlowSchema: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "flowschemas")
-        .with_api_group("flowcontrol.apiserver.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
-    }
-
-    let key = build_key("flowschemas", None, &name);
-    let fs = state.storage.get(&key).await?;
-
-    Ok(Json(fs))
+) -> Result<Response> {
+    endpoints::get_resource(&state, &fs_scope(&state, None), &auth_ctx.user, None, &name).await
 }
 
 pub async fn update_flow_schema(
@@ -366,116 +335,75 @@ pub async fn update_flow_schema(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut fs): DumpingJson<FlowSchema>,
-) -> Result<Json<FlowSchema>> {
-    info!("Updating FlowSchema: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "flowschemas")
-        .with_api_group("flowcontrol.apiserver.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("flowschemas", None, &name),
-        "flowcontrol.apiserver.k8s.io",
-        "flowschemas",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &fs_scope(&state, None),
+        &auth_ctx.user,
+        None,
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    fs.metadata.name = name.clone();
-
-    // Field validation on update (upstream ValidateFlowSchemaUpdate just re-runs
-    // ValidateFlowSchema on the new object — the spec has no immutable fields).
-    {
-        let errs = rusternetes_common::validation::flowschema::validate_flow_schema(&fs);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // Check for dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: FlowSchema validated successfully (not updated)");
-        return Ok(Json(fs));
-    }
-
-    let key = build_key("flowschemas", None, &name);
-    let result = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
-        &*state.storage,
-        &key,
-        &mut fs,
+pub async fn patch_flow_schema(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &fs_scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
-    )
-    .await?;
-    Ok(Json(result))
+    .await
 }
 
 pub async fn delete_flow_schema(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<FlowSchema>> {
-    info!("Deleting FlowSchema: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "flowschemas")
-        .with_api_group("flowcontrol.apiserver.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
-    }
-
-    let key = build_key("flowschemas", None, &name);
-
-    // Get the resource for finalizer handling
-    let resource: FlowSchema = state.storage.get(&key).await?;
-
-    // Check for dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: FlowSchema validated successfully (not deleted)");
-        return Ok(Json(resource));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &resource,
-        &delete_opts,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &fs_scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    if deleted_immediately {
-        Ok(Json(resource))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: FlowSchema = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+pub async fn deletecollection_flowschemas(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &fs_scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn list_flow_schemas(
@@ -517,124 +445,60 @@ pub async fn list_flow_schemas(
     Ok(Json(list).into_response())
 }
 
-crate::patch_handler_cluster!(
-    patch_flow_schema,
-    FlowSchema,
-    "flowschemas",
-    "flowcontrol.apiserver.k8s.io"
-);
-
-pub async fn deletecollection_prioritylevelconfigurations(
+/// GET `/status`.
+pub async fn get_flow_schema_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection prioritylevelconfigurations with params: {:?}",
-        params
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(
-        auth_ctx.user,
-        "deletecollection",
-        "prioritylevelconfigurations",
+    Path(name): Path<String>,
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &fs_scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
     )
-    .with_api_group("flowcontrol.apiserver.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: PriorityLevelConfiguration collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all prioritylevelconfigurations
-    let prefix = build_prefix("prioritylevelconfigurations", None);
-    let mut items = state
-        .storage
-        .list::<PriorityLevelConfiguration>(&prefix)
-        .await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("prioritylevelconfigurations", None, &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} prioritylevelconfigurations deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
+    .await
 }
 
-pub async fn deletecollection_flowschemas(
+/// PUT `/status`.
+pub async fn update_flow_schema_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!("DeleteCollection flowschemas");
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "flowschemas")
-        .with_api_group("flowcontrol.apiserver.k8s.io");
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
-    }
-    if crate::handlers::dryrun::is_dry_run(&params) {
-        return Ok(StatusCode::OK);
-    }
-    let prefix = build_prefix("flowschemas", None);
-    let items: Vec<FlowSchema> = state.storage.list(&prefix).await?;
-    for item in items {
-        let key = build_key("flowschemas", None, &item.metadata.name);
-        // Route through the shared helper like every other collection delete:
-        // it honours finalizers and propagationPolicy, and tolerates an item
-        // deleted concurrently. The previous `let _ = ...delete()` both skipped
-        // finalizers and discarded the error (#1895).
-        match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(_) => {}
-            // Already gone; upstream DeleteCollection ignores NotFound.
-            None => continue,
-        }
-    }
-    Ok(StatusCode::OK)
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &fs_scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// PATCH `/status`.
+pub async fn patch_flow_schema_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &fs_scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
 }

@@ -24,6 +24,7 @@ pub mod autoscaling;
 pub mod batch;
 pub mod coordination;
 pub mod core;
+pub mod flowcontrol;
 pub mod generic;
 pub mod names;
 pub mod node;
