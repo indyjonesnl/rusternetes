@@ -1,94 +1,230 @@
+//! VolumeSnapshotContent endpoints.
+//!
+//! Writes, and the `/status` subresource, go through the generic endpoint
+//! handlers and [`crate::registry::generic::Store`] with the strategies of
+//! [`crate::registry::snapshot::volumesnapshotcontent`] — the
+//! apiextensions-apiserver's custom-resource strategy wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::snapshot::volumesnapshotcontent;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::HeaderMap,
+    response::Response,
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::VolumeSnapshotContent,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The VolumeSnapshotContent `RequestScope`: `snapshot.storage.k8s.io/v1`
+/// served as `volumesnapshotcontents` (or its `/status`).
+fn scope(
+    state: &ApiServerState,
+    subresource: Option<&'static str>,
+) -> RequestScope<VolumeSnapshotContent> {
+    let (store, status_store) = volumesnapshotcontent::new_stores(state.storage.clone());
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "snapshot.storage.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "VolumeSnapshotContent".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "snapshot.storage.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "volumesnapshotcontents".to_string(),
+        },
+        subresource,
+        store: Box::new(if subresource.is_some() {
+            status_store
+        } else {
+            store
+        }),
+        apply: Some(crate::ssa::apply_legacy::<VolumeSnapshotContent>),
+        convert_to_internal: None,
+        patch_conversion: None,
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create_volumesnapshotcontent(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut vsc): DumpingJson<VolumeSnapshotContent>,
-) -> Result<(StatusCode, Json<VolumeSnapshotContent>)> {
-    info!("Creating VolumeSnapshotContent: {}", vsc.metadata.name);
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &vsc.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
         None,
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // The whole of the external-snapshotter CRD's `required:` list and its
-    // `x-kubernetes-validations` CEL rules, not just `deletionPolicy` — see
-    // `crates/common/src/validation/volumesnapshot.rs`. Rusternetes serves this
-    // type natively rather than through the CRD machinery, so nothing else
-    // applies the schema.
-    let errs =
-        rusternetes_common::validation::volumesnapshot::validate_volume_snapshot_content(&vsc);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Check authorization (cluster-scoped)
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "volumesnapshotcontents")
-        .with_api_group("snapshot.storage.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    vsc.metadata.ensure_uid();
-    vsc.metadata.ensure_creation_timestamp();
-
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: VolumeSnapshotContent validated successfully (not created)");
-        return Ok((StatusCode::CREATED, Json(vsc)));
-    }
-
-    let key = build_key("volumesnapshotcontents", None, &vsc.metadata.name);
-    let created = state.storage.create(&key, &vsc).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 pub async fn get_volumesnapshotcontent(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
-) -> Result<Json<VolumeSnapshotContent>> {
-    debug!("Getting VolumeSnapshotContent: {}", name);
+) -> Result<Response> {
+    endpoints::get_resource(&state, &scope(&state, None), &auth_ctx.user, None, &name).await
+}
 
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "volumesnapshotcontents")
-        .with_api_group("snapshot.storage.k8s.io")
-        .with_name(&name);
+pub async fn update_volumesnapshotcontent(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
 
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
+pub async fn patch_volumesnapshotcontent(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
+}
 
-    let key = build_key("volumesnapshotcontents", None, &name);
-    let vsc = state.storage.get(&key).await?;
+pub async fn delete_volumesnapshotcontent(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
 
-    Ok(Json(vsc))
+pub async fn deletecollection_volumesnapshotcontents(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// GET `/status`: the status subresource's Get is the store's Get.
+pub async fn get_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+    )
+    .await
+}
+
+/// PUT `/status`.
+pub async fn update_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// PATCH `/status`.
+pub async fn patch_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
 }
 
 pub async fn list_volumesnapshotcontents(
@@ -134,205 +270,4 @@ pub async fn list_volumesnapshotcontents(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(axum::response::IntoResponse::into_response(Json(list)))
-}
-
-pub async fn update_volumesnapshotcontent(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path(name): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut vsc): DumpingJson<VolumeSnapshotContent>,
-) -> Result<Json<VolumeSnapshotContent>> {
-    info!("Updating VolumeSnapshotContent: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "volumesnapshotcontents")
-        .with_api_group("snapshot.storage.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("volumesnapshotcontents", None, &name),
-        "snapshot.storage.k8s.io",
-        "volumesnapshotcontents",
-        &name,
-    )
-    .await?;
-
-    vsc.metadata.name = name.clone();
-
-    // The CRD's source handles are `self == oldSelf` immutable, so the update
-    // path needs the stored object.
-    let stored: VolumeSnapshotContent = state
-        .storage
-        .get(&build_key("volumesnapshotcontents", None, &name))
-        .await?;
-    let errs =
-        rusternetes_common::validation::volumesnapshot::validate_volume_snapshot_content_update(
-            &vsc, &stored,
-        );
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: VolumeSnapshotContent validated successfully (not updated)");
-        return Ok(Json(vsc));
-    }
-
-    let key = build_key("volumesnapshotcontents", None, &name);
-    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
-        &*state.storage,
-        &key,
-        &mut vsc,
-    )
-    .await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &updated,
-    )
-    .await?;
-    Ok(Json(updated))
-}
-
-pub async fn delete_volumesnapshotcontent(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(name): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<VolumeSnapshotContent>> {
-    info!("Deleting VolumeSnapshotContent: {}", name);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "volumesnapshotcontents")
-        .with_api_group("snapshot.storage.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("volumesnapshotcontents", None, &name);
-
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Get the resource for finalizer handling
-    let resource: VolumeSnapshotContent = state.storage.get(&key).await?;
-
-    if is_dry_run {
-        info!("Dry-run: VolumeSnapshotContent validated successfully (not deleted)");
-        return Ok(Json(resource));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &resource,
-        &delete_opts,
-    )
-    .await?;
-
-    if deleted_immediately {
-        Ok(Json(resource))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: VolumeSnapshotContent = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_cluster!(
-    patch_volumesnapshotcontent,
-    VolumeSnapshotContent,
-    "volumesnapshotcontents",
-    "snapshot.storage.k8s.io"
-);
-
-pub async fn deletecollection_volumesnapshotcontents(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection volumesnapshotcontents with params: {:?}",
-        params
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "volumesnapshotcontents")
-        .with_api_group("snapshot.storage.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: VolumeSnapshotContent collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all volumesnapshotcontents
-    let prefix = build_prefix("volumesnapshotcontents", None);
-    let mut items = state.storage.list::<VolumeSnapshotContent>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("volumesnapshotcontents", None, &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} volumesnapshotcontents deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }

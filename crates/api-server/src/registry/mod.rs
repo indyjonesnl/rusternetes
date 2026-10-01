@@ -38,4 +38,5 @@ pub mod resource;
 pub mod rest;
 pub mod scale;
 pub mod scheduling;
+pub mod snapshot;
 pub mod storage;
