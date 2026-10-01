@@ -707,33 +707,6 @@ pub fn format_warning_header(warning_text: &str) -> String {
 // `rusternetes_middleware::generate_name_middleware` for every create request
 // (#1052), so per-handler helpers are no longer needed here.
 
-/// Name-required check for resources whose generated metadata carries an
-/// `Option<String>` name rather than the shared [`ObjectMeta`] — the
-/// `resource.k8s.io` kinds (DeviceClass, ResourceClaim, ResourceClaimTemplate,
-/// ResourceSlice). Returns the resolved name on success so the caller can use
-/// it for the storage key.
-///
-/// These kinds can't yet run the full [`validate_create_object_meta`] (their
-/// metadata isn't the shared [`ObjectMeta`]), so this covers only the upstream
-/// name-required case: a missing/empty name
-/// (after `generate_name_middleware` has resolved any `generateName`) is the
-/// 422 `name or generateName is required` from `ValidateObjectMeta`, with the
-/// structured `metadata.name` field cause — not a bare `InvalidResource`.
-///
-/// [`ObjectMeta`]: rusternetes_common::types::ObjectMeta
-pub fn require_optional_object_name(name: Option<&str>) -> Result<&str, Error> {
-    match name {
-        Some(n) if !n.is_empty() => Ok(n),
-        _ => {
-            use rusternetes_common::validation::field::{Error as FieldError, Path};
-            Err(Error::Invalid(vec![FieldError::required(
-                &Path::new("metadata").child("name"),
-                "name or generateName is required",
-            )]))
-        }
-    }
-}
-
 /// Selects the per-kind name validator upstream attaches to each resource's
 /// strategy. Almost every kind uses [`NameKind::DnsSubdomain`]
 /// (`NameIsDNSSubdomain`); the handful that differ pick `PathSegment` (the RBAC Role/Binding kinds, via
@@ -812,27 +785,6 @@ pub fn validate_create_object_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn require_optional_object_name_rejects_missing_and_empty() {
-        for missing in [None, Some(""), Some(" ".trim())] {
-            let err = require_optional_object_name(missing)
-                .expect_err("missing/empty name must be rejected");
-            match err {
-                Error::Invalid(errs) => {
-                    assert_eq!(errs.len(), 1);
-                    assert_eq!(errs[0].field, "metadata.name");
-                    assert_eq!(errs[0].detail, "name or generateName is required");
-                }
-                other => panic!("expected Error::Invalid, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn require_optional_object_name_returns_name() {
-        assert_eq!(require_optional_object_name(Some("foo")).unwrap(), "foo");
-    }
 
     fn meta_named(name: &str) -> rusternetes_common::types::ObjectMeta {
         rusternetes_common::types::ObjectMeta {

@@ -29,6 +29,7 @@ use crate::validation::metav1::{
     is_dns1123_label, is_dns1123_subdomain, is_valid_label_value, validate_conditions,
     validate_label_name,
 };
+use crate::validation::objectmeta::validate_immutable_field;
 use crate::validation::pod::validate_node_selector;
 use crate::validation::resourceslice::{validate_device_name, validate_pool_name};
 use std::collections::{HashMap, HashSet};
@@ -59,18 +60,21 @@ pub fn validate_resource_claim(claim: &ResourceClaim) -> ErrorList {
     validate_resource_claim_spec(&claim.spec, &Path::new("spec"))
 }
 
-/// Validate a `ResourceClaim` on update. Mirrors `ValidateResourceClaimUpdate`:
-/// `spec` is immutable after creation, plus the create validation.
+/// `ValidateResourceClaimUpdate` (validation.go:116-124), minus ObjectMeta:
+/// the spec is immutable and, unlike create, is not validated again — "the
+/// only actionable error is for the immutability violation". The bad value is
+/// the submitted spec.
 pub fn validate_resource_claim_update(new: &ResourceClaim, old: &ResourceClaim) -> ErrorList {
-    let mut errs = validate_resource_claim(new);
-    if serde_json::to_value(&new.spec).ok() != serde_json::to_value(&old.spec).ok() {
-        errs.push(Error::invalid(
-            &Path::new("spec"),
-            "<spec>".to_string(),
-            "field is immutable",
-        ));
-    }
-    errs
+    validate_immutable_field(&new.spec, &old.spec, &Path::new("spec"))
+}
+
+/// `ValidateResourceClaimTemplateUpdate` (validation.go:617-625), minus
+/// ObjectMeta: `spec` is immutable and not validated again.
+pub fn validate_resource_claim_template_update(
+    new: &crate::resources::ResourceClaimTemplate,
+    old: &crate::resources::ResourceClaimTemplate,
+) -> ErrorList {
+    validate_immutable_field(&new.spec, &old.spec, &Path::new("spec"))
 }
 
 /// Validate a `ResourceClaimSpec` at the given path. Shared by `ResourceClaim`

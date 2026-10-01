@@ -129,7 +129,15 @@ fn cases() -> Vec<(&'static str, Value, &'static str)> {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn every_bad_resource_claim_answers_422_with_a_field_path() {
+    // Tolerations are behind the alpha `DRADeviceTaints` gate, off by default
+    // in 1.35: `dropDisabledFields` (resourceclaimspec/util.go) clears them
+    // before validation. One case validates them, so turn the gate on.
+    let _taints = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::DRADeviceTaints,
+        true,
+    );
     let api = TestApiServer::new();
 
     for (i, (label, spec, expected)) in cases().into_iter().enumerate() {
