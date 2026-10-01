@@ -1,12 +1,24 @@
+//! ServiceAccount endpoints.
+//!
+//! Writes go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the ServiceAccount strategy
+//! ([`crate::registry::core::serviceaccount`]) — upstream's
+//! `pkg/registry/core/serviceaccount/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::core::serviceaccount;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     auth::ServiceAccountClaims,
     authz::{Decision, RequestAttributes},
     resources::{Secret, ServiceAccount},
@@ -17,63 +29,43 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
-pub async fn create(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path(namespace): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut service_account): DumpingJson<ServiceAccount>,
-) -> Result<(StatusCode, Json<ServiceAccount>)> {
-    info!(
-        "Creating service account: {}/{}",
-        namespace, service_account.metadata.name
-    );
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &service_account.metadata,
-        Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "serviceaccounts")
-        .with_namespace(&namespace)
-        .with_api_group("");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
+/// The ServiceAccount `RequestScope`: core `v1` `ServiceAccount` served as
+/// `serviceaccounts`, backed by `serviceaccount.NewREST`.
+fn scope(state: &ApiServerState) -> RequestScope<ServiceAccount> {
+    RequestScope {
+        kind: GroupVersionKind {
+            group: String::new(),
+            version: "v1".to_string(),
+            kind: "ServiceAccount".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "serviceaccounts".to_string(),
+        },
+        subresource: None,
+        store: Box::new(serviceaccount::new_store(state.storage.clone())),
+        apply: Some(crate::ssa::apply_legacy::<ServiceAccount>),
+        convert_to_internal: None,
     }
+}
 
-    service_account.metadata.namespace = Some(namespace.clone());
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
-    // Enrich metadata with system fields
-    service_account.metadata.ensure_uid();
-    service_account.metadata.ensure_creation_timestamp();
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: ServiceAccount {}/{} validated successfully (not created)",
-            namespace, service_account.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(service_account)));
-    }
-
-    let key = build_key(
-        "serviceaccounts",
-        Some(&namespace),
-        &service_account.metadata.name,
-    );
-    let created = state.storage.create(&key, &service_account).await?;
-    info!("ServiceAccount stored successfully, preparing to create token Secret");
-
+/// Rusternetes-specific (upstream stopped auto-generating token Secrets in
+/// 1.24, `LegacyServiceAccountTokenNoAutoGeneration`): a created ServiceAccount
+/// gets a long-lived token Secret right away rather than at the next
+/// serviceaccount-controller pass. A failure here never fails the create.
+async fn create_token_secret(state: &ApiServerState, namespace: &str, created: &ServiceAccount) {
+    let namespace = namespace.to_string();
     // Generate ServiceAccount token and store it in a Secret
     let sa_uid = created.metadata.uid.clone();
     let sa_name = created.metadata.name.clone();
@@ -87,7 +79,13 @@ pub async fn create(
         87600, // 10 years in hours
     );
 
-    let token = state.token_manager.generate_token(claims)?;
+    let token = match state.token_manager.generate_token(claims) {
+        Ok(token) => token,
+        Err(e) => {
+            info!("Warning: Failed to generate ServiceAccount token {sa_name}: {e}");
+            return;
+        }
+    };
 
     // Create Secret to store the token
     let secret_name = format!("{}-token", sa_name);
@@ -146,34 +144,50 @@ pub async fn create(
             // Don't fail the ServiceAccount creation if secret creation fails
         }
     }
+}
 
-    Ok((StatusCode::CREATED, Json(created)))
+pub async fn create(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    let response = endpoints::create_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await?;
+    if response.status() != StatusCode::CREATED || crate::handlers::dryrun::is_dry_run(&params) {
+        return Ok(response);
+    }
+    let (parts, resp_body) = response.into_parts();
+    let bytes = axum::body::to_bytes(resp_body, usize::MAX)
+        .await
+        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+    if let Ok(created) = serde_json::from_slice::<ServiceAccount>(&bytes) {
+        create_token_secret(&state, &namespace, &created).await;
+    }
+    Ok(Response::from_parts(parts, axum::body::Body::from(bytes)))
 }
 
 pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<ServiceAccount>> {
-    debug!("Getting service account: {}/{}", namespace, name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "serviceaccounts")
-        .with_namespace(&namespace)
-        .with_api_group("")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("serviceaccounts", Some(&namespace), &name);
-    let service_account = state.storage.get(&key).await?;
-
-    Ok(Json(service_account))
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
 }
 
 pub async fn update(
@@ -181,141 +195,76 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut service_account): DumpingJson<ServiceAccount>,
-) -> Result<Json<ServiceAccount>> {
-    info!("Updating service account: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "serviceaccounts")
-        .with_namespace(&namespace)
-        .with_api_group("")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("serviceaccounts", Some(&namespace), &name),
-        "",
-        "serviceaccounts",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    service_account.metadata.name = name.clone();
-    service_account.metadata.namespace = Some(namespace.clone());
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: ServiceAccount {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(service_account));
-    }
-
-    let key = build_key("serviceaccounts", Some(&namespace), &name);
-    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
-        &*state.storage,
-        &key,
-        &mut service_account,
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &updated,
-    )
-    .await?;
-    Ok(Json(updated))
+    .await
 }
 
 pub async fn delete_service_account(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<ServiceAccount>> {
-    info!("Deleting service account: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "serviceaccounts")
-        .with_namespace(&namespace)
-        .with_api_group("")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("serviceaccounts", Some(&namespace), &name);
-
-    // Get the resource to check if it exists
-    let sa: ServiceAccount = state.storage.get(&key).await?;
-
-    // Run validating admission webhooks for DELETE (object=nil, oldObject=sa).
-    crate::handlers::admission_helper::run_delete_validating_webhooks(
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
         &state,
-        "",
-        "v1",
-        "ServiceAccount",
-        "serviceaccounts",
+        &scope(&state),
+        &auth_ctx.user,
         Some(&namespace),
         &name,
-        &sa,
-        &user_for_webhook,
-        is_dry_run,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: ServiceAccount {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(sa));
-    }
-
-    let has_finalizers = crate::handlers::finalizers::handle_delete_with_finalizers(
-        &*state.storage,
-        &key,
-        &sa,
-        &delete_opts,
+pub async fn deletecollection_serviceaccounts(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
     )
-    .await?;
-
-    if has_finalizers {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: ServiceAccount = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    } else {
-        Ok(Json(sa))
-    }
+    .await
 }
 
 pub async fn list(
@@ -448,90 +397,3 @@ pub async fn list_all_serviceaccounts(
 }
 
 // Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(patch, ServiceAccount, "serviceaccounts", "");
-
-pub async fn deletecollection_serviceaccounts(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection serviceaccounts in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "serviceaccounts")
-        .with_namespace(&namespace)
-        .with_api_group("");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ServiceAccount collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all serviceaccounts in the namespace
-    let prefix = build_prefix("serviceaccounts", Some(&namespace));
-    let mut items = state.storage.list::<ServiceAccount>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("serviceaccounts", Some(&namespace), &item.metadata.name);
-
-        // Run validating admission webhooks for DELETE per item.
-        crate::handlers::admission_helper::run_delete_validating_webhooks(
-            &state,
-            "",
-            "v1",
-            "ServiceAccount",
-            "serviceaccounts",
-            Some(&namespace),
-            &item.metadata.name,
-            &item,
-            &user_for_webhook,
-            false,
-        )
-        .await?;
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} serviceaccounts deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
-}
