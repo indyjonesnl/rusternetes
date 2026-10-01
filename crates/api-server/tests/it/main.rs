@@ -112,6 +112,7 @@ mod endpoints_lease_update_validation_test;
 mod endpointslice_handler_test;
 mod endpointslice_store_test;
 mod event_handler_test;
+mod event_store_test;
 mod events_v1_deprecated_fields_test;
 mod events_v1_response_schema_test;
 mod eviction_grace_period_test;
