@@ -72,6 +72,14 @@ fn every_delete_handler_passes_the_request_delete_options() {
         let src = src.split("\n#[cfg(test)]").next().unwrap_or("").to_string();
 
         for (fname, body) in delete_fn_bodies(&src) {
+            // Generic endpoint adapters decode and pass DeleteOptions to
+            // Store.Delete (endpoints/handlers/delete.go:86-126,151-153).
+            if body.contains("endpoints::delete_resource(")
+                || body.contains("endpoints::delete_collection(")
+            {
+                checked += 1;
+                continue;
+            }
             // Matches the `_json` variants too — they are thin wrappers over
             // the same helper (see `JsonResource`).
             let uses_helper = body.contains("handle_delete_with_finalizers")

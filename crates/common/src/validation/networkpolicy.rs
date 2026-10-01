@@ -139,10 +139,14 @@ fn port_name_errors(port: &str) -> Vec<&'static str> {
 fn validate_port(port: &NetworkPolicyPort, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
-    if !matches!(port.protocol.as_str(), "TCP" | "UDP" | "SCTP") {
+    if port
+        .protocol
+        .as_deref()
+        .is_some_and(|protocol| !matches!(protocol, "TCP" | "UDP" | "SCTP"))
+    {
         errs.push(Error::not_supported(
             &fld_path.child("protocol"),
-            port.protocol.clone(),
+            port.protocol.clone().unwrap_or_default(),
             &["TCP", "UDP", "SCTP"],
         ));
     }

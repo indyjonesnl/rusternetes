@@ -82,26 +82,13 @@ pub struct NetworkPolicyEgressRule {
     pub to: Option<Vec<NetworkPolicyPeer>>,
 }
 
-fn default_protocol() -> String {
-    "TCP".to_string()
-}
-
-// A nil *Protocol defaults to TCP; a pointer to an empty protocol stays empty.
-// pkg/apis/networking/v1/defaults.go:30-35.
-fn deserialize_protocol<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    Ok(Option::<String>::deserialize(d)?.unwrap_or_else(default_protocol))
-}
-
 /// NetworkPolicyPort describes a port to allow traffic on
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyPort {
     /// The protocol (TCP, UDP, SCTP)
-    #[serde(
-        default = "default_protocol",
-        deserialize_with = "deserialize_protocol"
-    )]
-    pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 
     /// The port on the given protocol
     #[serde(skip_serializing_if = "Option::is_none")]

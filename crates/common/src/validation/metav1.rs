@@ -260,47 +260,26 @@ pub fn is_relaxed_env_var_name(value: &str) -> Vec<String> {
 /// IPv4 octets with leading zeros, which `ParseIPSloppy` reads as decimal and
 /// `netip.ParseAddr` rejects, are warned about with their decimal form.
 pub fn get_warnings_for_ip(fld_path: &str, value: &str) -> Vec<String> {
-    let Ok(addr) = value.parse::<std::net::IpAddr>() else {
-        if let Some(v4) = parse_ipv4_sloppy(value) {
-            return vec![format!(
-                "{fld_path}: non-standard IP address {value:?} will be considered invalid in a future Kubernetes release: use \"{v4}\""
-            )];
-        }
+    use std::net::IpAddr;
+    let Some(addr) = super::ingress::parse_ip_sloppy(value) else {
         return Vec::new();
     };
-    let std::net::IpAddr::V6(v6) = addr else {
-        return Vec::new();
+    let mapped = match addr {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+        IpAddr::V4(_) => None,
     };
-    if let Some(v4) = v6.to_ipv4_mapped() {
+    let canonical = mapped.map_or_else(|| addr.to_string(), |v4| v4.to_string());
+    if value.parse::<IpAddr>().is_err() || mapped.is_some() {
         return vec![format!(
-            "{fld_path}: non-standard IP address {value:?} will be considered invalid in a future Kubernetes release: use \"{v4}\""
+            "{fld_path}: non-standard IP address {value:?} will be considered invalid in a future Kubernetes release: use {canonical:?}"
         )];
     }
-    let canonical = v6.to_string();
-    if canonical != value {
+    if addr.is_ipv6() && canonical != value {
         return vec![format!(
-            "{fld_path}: IPv6 address {value:?} should be in RFC 5952 canonical format (\"{canonical}\")"
+            "{fld_path}: IPv6 address {value:?} should be in RFC 5952 canonical format ({canonical:?})"
         )];
     }
     Vec::new()
-}
-
-/// The IPv4 half of `netutils.ParseIPSloppy`: four dotted decimal octets,
-/// leading zeros allowed.
-fn parse_ipv4_sloppy(value: &str) -> Option<std::net::Ipv4Addr> {
-    let octets: Vec<u8> = value
-        .split('.')
-        .map(|p| {
-            if p.is_empty() || p.len() > 3 || !p.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            p.parse::<u16>().ok().and_then(|n| u8::try_from(n).ok())
-        })
-        .collect::<Option<_>>()?;
-    let [a, b, c, d] = octets[..] else {
-        return None;
-    };
-    Some(std::net::Ipv4Addr::new(a, b, c, d))
 }
 
 /// Upstream `content.IsLabelValue`.

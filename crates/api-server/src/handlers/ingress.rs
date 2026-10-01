@@ -38,6 +38,7 @@ fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestSc
         store: Box::new(store),
         apply: Some(crate::ssa::apply_legacy::<Ingress>),
         convert_to_internal: None,
+        patch_conversion: None,
     }
 }
 fn patch_content_type(headers: &HeaderMap) -> &str {

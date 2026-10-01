@@ -14,9 +14,23 @@ use rusternetes_common::validation::{field::Path, ipaddress::get_warnings_for_ci
 use rusternetes_storage::StorageBackend;
 use std::sync::Arc;
 /// SetDefaults_NetworkPolicy (pkg/apis/networking/v1/defaults.go:38-45).
-/// Port protocols default at decode, including null pointers, per
-/// SetDefaults_NetworkPolicyPort (:30-35); an explicitly empty protocol is kept.
+/// SetDefaults_NetworkPolicyPort (:30-35) defaults nil protocol pointers only.
 pub fn convert_to_internal(obj: &mut NetworkPolicy) {
+    for rule in obj.spec.ingress.iter_mut().flatten() {
+        for port in rule.ports.iter_mut().flatten() {
+            if port.protocol.is_none() {
+                port.protocol = Some("TCP".to_string());
+            }
+        }
+    }
+    for rule in obj.spec.egress.iter_mut().flatten() {
+        for port in rule.ports.iter_mut().flatten() {
+            if port.protocol.is_none() {
+                port.protocol = Some("TCP".to_string());
+            }
+        }
+    }
+
     if obj
         .spec
         .policy_types

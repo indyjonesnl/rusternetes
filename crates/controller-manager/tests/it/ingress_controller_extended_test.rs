@@ -118,9 +118,12 @@ async fn path_type_exact_prefix_and_implementation_specific_all_reconcile() {
     let rules = stored.spec.unwrap().rules.unwrap();
     let stored_paths = &rules[0].http.as_ref().unwrap().paths;
     assert_eq!(stored_paths.len(), 3);
-    assert_eq!(stored_paths[0].path_type, "Exact");
-    assert_eq!(stored_paths[1].path_type, "Prefix");
-    assert_eq!(stored_paths[2].path_type, "ImplementationSpecific");
+    assert_eq!(stored_paths[0].path_type.as_deref(), Some("Exact"));
+    assert_eq!(stored_paths[1].path_type.as_deref(), Some("Prefix"));
+    assert_eq!(
+        stored_paths[2].path_type.as_deref(),
+        Some("ImplementationSpecific")
+    );
     assert!(stored.status.is_some(), "status must be populated");
 }
 

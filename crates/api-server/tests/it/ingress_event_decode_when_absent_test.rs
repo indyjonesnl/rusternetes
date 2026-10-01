@@ -49,7 +49,7 @@ fn cases() -> Vec<(&'static str, &'static str, Value, &'static str)> {
             ingress(json!({ "host": "a.example.com", "http": { "paths": [
                 { "path": "/", "pathType": "Prefix" }
             ] } })),
-            "spec.rules[0].http.paths[0].backend: Required value: must specify a service or resource",
+            "spec.rules[0].http.paths[0].backend: Invalid value: \"\": resource or service backend is required",
         ),
         (
             "a service backend with no name",

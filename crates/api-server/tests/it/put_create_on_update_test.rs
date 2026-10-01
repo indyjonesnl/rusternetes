@@ -313,6 +313,12 @@ async fn every_update_handler_consults_the_create_on_update_table() {
         let src = src.split("\n#[cfg(test)]").next().unwrap_or("").to_string();
 
         for (fname, body) in update_fn_bodies(&src) {
+            // Store adapters inherit the strategy's AllowCreateOnUpdate gate
+            // (registry/generic/registry/store.go:646-650).
+            if body.contains("endpoints::update_resource(") {
+                checked += 1;
+                continue;
+            }
             // In scope: every update handler that writes. The bug is a write
             // path that reaches `create` for a name that does not exist, and
             // only a handler that writes can have one.
