@@ -2538,6 +2538,19 @@ pub async fn get_networking_v1_resources() -> (StatusCode, Json<APIResourceList>
             storage_version_hash: None,
         },
         APIResource {
+            name: "servicecidrs/status".to_string(),
+            singular_name: "".to_string(),
+            namespaced: false,
+            kind: "ServiceCIDR".to_string(),
+            verbs: ["get", "patch", "update"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        },
+        APIResource {
             name: "ipaddresses".to_string(),
             singular_name: "ipaddress".to_string(),
             namespaced: false,
@@ -2555,7 +2568,7 @@ pub async fn get_networking_v1_resources() -> (StatusCode, Json<APIResourceList>
             .iter()
             .map(|s| s.to_string())
             .collect(),
-            short_names: None,
+            short_names: Some(vec!["ip".to_string()]),
             categories: None,
             storage_version_hash: None,
         },

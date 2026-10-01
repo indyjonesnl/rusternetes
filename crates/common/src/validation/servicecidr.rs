@@ -9,6 +9,9 @@
 
 use crate::resources::servicecidr::ServiceCIDR;
 use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
+};
 use std::net::IpAddr;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -31,8 +34,21 @@ fn parse_cidr(cidr: &str) -> Option<IpFamily> {
     }
 }
 
-/// Validate a `ServiceCIDR` on create. Mirrors upstream `validateServiceCIDRSpec`.
+/// Upstream `ValidateServiceCIDR` (validation.go:821-825): `ValidateObjectMeta`
+/// with `ValidateServiceCIDRName` (`NameIsDNSSubdomain`), then the spec.
 pub fn validate_service_cidr(sc: &ServiceCIDR) -> ErrorList {
+    let mut errs = validate_object_meta(
+        &sc.metadata,
+        false,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
+    errs.extend(validate_service_cidr_spec(sc));
+    errs
+}
+
+/// Upstream `validateServiceCIDRSpec` (validation.go:827-852).
+fn validate_service_cidr_spec(sc: &ServiceCIDR) -> ErrorList {
     let cidrs_path = Path::new("spec").child("cidrs");
     let mut errs: ErrorList = Vec::new();
 
@@ -88,7 +104,8 @@ pub fn validate_service_cidr(sc: &ServiceCIDR) -> ErrorList {
 /// single-stack CIDR may be expanded to dual-stack by appending one CIDR (the
 /// existing entry must not change; the new entry is fully validated).
 pub fn validate_service_cidr_update(new_sc: &ServiceCIDR, old_sc: &ServiceCIDR) -> ErrorList {
-    let mut errs = ErrorList::new();
+    let mut errs =
+        validate_object_meta_update(&new_sc.metadata, &old_sc.metadata, &Path::new("metadata"));
     let p = Path::new("spec").child("cidrs");
     let empty: Vec<String> = Vec::new();
     let old = old_sc.spec.as_ref().map(|s| &s.cidrs).unwrap_or(&empty);
@@ -112,9 +129,15 @@ pub fn validate_service_cidr_update(new_sc: &ServiceCIDR, old_sc: &ServiceCIDR) 
             ));
         }
         // Validate the (now dual-stack) cidrs set.
-        errs.extend(validate_service_cidr(new_sc));
+        errs.extend(validate_service_cidr_spec(new_sc));
     } else {
         errs.push(Error::invalid(&p, new.join(","), "field is immutable"));
     }
     errs
+}
+
+/// Upstream `ValidateServiceCIDRStatusUpdate` (validation.go:883-886): only
+/// `ValidateObjectMetaUpdate`.
+pub fn validate_service_cidr_status_update(update: &ServiceCIDR, old: &ServiceCIDR) -> ErrorList {
+    validate_object_meta_update(&update.metadata, &old.metadata, &Path::new("metadata"))
 }

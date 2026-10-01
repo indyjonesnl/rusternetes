@@ -2,25 +2,46 @@
 //! `ValidateIPAddress` / `validateIPAddressParentReference`
 //! (`pkg/apis/networking/validation/validation.go`).
 //!
-//! The `metadata.name` must be a canonical IP (upstream `ValidateIPAddressName`)
-//! — that is enforced by the api-server create handler via `NameKind::Ip`.
-//! This module covers `spec.parentRef`.
+//! The `metadata.name` must be a canonical IP (upstream `ValidateIPAddressName`).
 
 use crate::resources::ipaddress::{IPAddress, ParentReference};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::is_dns1123_subdomain;
-use crate::validation::objectmeta::name_is_path_segment;
+use crate::validation::objectmeta::{
+    name_is_ip, name_is_path_segment, validate_immutable_field, validate_object_meta,
+    validate_object_meta_update,
+};
 
-/// Validate an IPAddress on create — upstream `ValidateIPAddress` (minus the
-/// name check, which the handler does via `NameKind::Ip`).
+/// Upstream `ValidateIPAddress` (pkg/apis/networking/validation/validation.go:759-765):
+/// `ValidateObjectMeta` with `ValidateIPAddressName`, then the parent
+/// reference.
 pub fn validate_ip_address(ip: &IPAddress) -> ErrorList {
+    let mut errs = validate_object_meta(&ip.metadata, false, name_is_ip, &Path::new("metadata"));
     let spec_path = Path::new("spec");
     match ip.spec.as_ref().and_then(|spec| spec.parent_ref.as_ref()) {
         // A missing spec, or a spec with no parentRef, is a missing parentRef —
         // which upstream requires (`validation.go:771-773`).
-        None => vec![Error::required(&spec_path.child("parentRef"), "")],
-        Some(parent_ref) => validate_parent_reference(parent_ref, &spec_path),
+        None => errs.push(Error::required(&spec_path.child("parentRef"), "")),
+        Some(parent_ref) => errs.extend(validate_parent_reference(parent_ref, &spec_path)),
     }
+    errs
+}
+
+/// Upstream `ValidateIPAddressUpdate` (validation.go:812-817):
+/// `ValidateObjectMetaUpdate`, then `spec.parentRef` is immutable. The
+/// strategy's `ValidateUpdate` (ipaddress/strategy.go:84-89) runs
+/// `ValidateIPAddress` first; [`validate_ip_address`] is that half.
+pub fn validate_ip_address_update(update: &IPAddress, old: &IPAddress) -> ErrorList {
+    let mut errs =
+        validate_object_meta_update(&update.metadata, &old.metadata, &Path::new("metadata"));
+    let new_ref = update.spec.as_ref().and_then(|s| s.parent_ref.as_ref());
+    let old_ref = old.spec.as_ref().and_then(|s| s.parent_ref.as_ref());
+    errs.extend(validate_immutable_field(
+        &new_ref,
+        &old_ref,
+        &Path::new("spec").child("parentRef"),
+    ));
+    errs
 }
 
 /// Upstream `validateIPAddressParentReference`.
