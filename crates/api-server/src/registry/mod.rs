@@ -20,6 +20,7 @@
 //! time; each migration deletes its bespoke handler code.
 
 pub mod apps;
+pub mod autoscaling;
 pub mod batch;
 pub mod coordination;
 pub mod core;

@@ -121,6 +121,7 @@ mod generate_name_router_test;
 mod horizontalpodautoscaler_handler_test;
 mod hpa_default_minreplicas_test;
 mod hpa_status_validation_test;
+mod hpa_store_test;
 mod hpa_update_validation_test;
 mod immutable_drop_field_test;
 mod ingress_event_decode_when_absent_test;
