@@ -1,6 +1,9 @@
 use crate::types::{ObjectMeta, TypeMeta};
 use serde::{Deserialize, Serialize};
 
+// Go null decoding for value fields: vendor/sigs.k8s.io/json/internal/golang/encoding/json/decode.go:991-1002.
+// IngressPortStatus has value fields without defaults: api/networking/v1/types.go:366-372.
+
 /// Ingress is a collection of rules that allow inbound connections to reach the cluster services
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -38,7 +41,7 @@ impl Ingress {
 }
 
 /// IngressSpec describes the Ingress the user wishes to exist
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct IngressSpec {
     /// IngressClassName is the name of the IngressClass cluster resource
@@ -92,7 +95,7 @@ pub struct HTTPIngressRuleValue {
     ///
     /// Absent decodes to an empty list, which `ValidateIngressSpec` reports as
     /// `Required` (`pkg/apis/networking/validation/validation.go`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub paths: Vec<HTTPIngressPath>,
 }
 
@@ -107,16 +110,16 @@ pub struct HTTPIngressPath {
     /// PathType determines the interpretation of the Path matching
     /// Exact, Prefix, or ImplementationSpecific
     /// A pointer upstream whose absence `validateHTTPIngressPath` reports as
-    /// `Required(pathType, "pathType must be specified")`; the empty string
-    /// takes the same branch here.
+    /// `Required(pathType, "pathType must be specified")`; a present empty
+    /// string is NotSupported (validation.go:468-503).
     #[serde(alias = "pathType", default)]
-    pub path_type: String,
+    pub path_type: Option<String>,
 
     /// Backend defines the referenced service endpoint. A value upstream, and
     /// `validateHTTPIngressPath` always runs `validateIngressBackend` over it,
     /// so an absent backend is answered with "must specify a service or
     /// resource" rather than a decode failure.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub backend: IngressBackend,
 }
 
@@ -141,10 +144,10 @@ pub struct TypedLocalObjectReference {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_group: Option<String>,
     /// Kind of the referent.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub kind: String,
     /// Name of the referent.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub name: String,
 }
 
@@ -155,7 +158,7 @@ pub struct IngressServiceBackend {
     /// Name is the referenced service. `validateIngressBackend` requires it
     /// once a service backend is present, so an absent name is a 422 with a
     /// field path rather than a decode failure.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub name: String,
 
     /// Port of the referenced service
@@ -211,21 +214,17 @@ pub struct IngressLoadBalancerIngress {
     pub ports: Option<Vec<IngressPortStatus>>,
 }
 
-fn default_protocol() -> String {
-    "TCP".to_string()
-}
-
 /// IngressPortStatus represents the status of a port exposed by the load-balancer
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct IngressPortStatus {
     /// Port is the port number of the ingress port. Status-only, and upstream
     /// validates nothing here.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub port: i32,
 
     /// Protocol is the protocol of the ingress port (TCP, UDP, SCTP)
-    #[serde(default = "default_protocol")]
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub protocol: String,
 
     /// Error is to record the problem with the service port
@@ -261,7 +260,7 @@ mod tests {
 
         let path = HTTPIngressPath {
             path: Some("/".to_string()),
-            path_type: "Prefix".to_string(),
+            path_type: Some("Prefix".to_string()),
             backend,
         };
 

@@ -168,7 +168,7 @@ async fn test_networkpolicy_ingress_rules_reconcile() {
         pod_selector: selector_for(&[("app", "server")]),
         ingress: Some(vec![NetworkPolicyIngressRule {
             ports: Some(vec![NetworkPolicyPort {
-                protocol: "TCP".to_string(),
+                protocol: Some("TCP".to_string()),
                 port: Some(IntOrString::Int(80)),
                 end_port: None,
             }]),
@@ -214,7 +214,7 @@ async fn test_networkpolicy_egress_rules_reconcile() {
         ingress: None,
         egress: Some(vec![NetworkPolicyEgressRule {
             ports: Some(vec![NetworkPolicyPort {
-                protocol: "UDP".to_string(),
+                protocol: Some("UDP".to_string()),
                 port: Some(IntOrString::Int(53)),
                 end_port: None,
             }]),
@@ -240,7 +240,7 @@ async fn test_networkpolicy_egress_rules_reconcile() {
     let egress = stored.spec.egress.expect("egress preserved");
     assert_eq!(egress.len(), 1);
     let ports = egress[0].ports.as_ref().expect("ports preserved");
-    assert_eq!(ports[0].protocol.as_str(), "UDP");
+    assert_eq!(ports[0].protocol.as_deref().unwrap(), "UDP");
     let peers = egress[0].to.as_ref().expect("to peers preserved");
     assert!(peers[0].namespace_selector.is_some());
     assert!(peers[0].pod_selector.is_some());
@@ -341,7 +341,7 @@ async fn test_networkpolicy_port_ranges_accept_end_port() {
         pod_selector: selector_for(&[("app", "ranged")]),
         ingress: Some(vec![NetworkPolicyIngressRule {
             ports: Some(vec![NetworkPolicyPort {
-                protocol: "TCP".to_string(),
+                protocol: Some("TCP".to_string()),
                 port: Some(IntOrString::Int(8000)),
                 end_port: Some(8100),
             }]),
@@ -360,7 +360,7 @@ async fn test_networkpolicy_port_ranges_accept_end_port() {
     let stored: NetworkPolicy = storage.get(&key).await.unwrap();
     let ingress = stored.spec.ingress.as_ref().expect("ingress preserved");
     let port = &ingress[0].ports.as_ref().expect("ports preserved")[0];
-    assert_eq!(port.protocol.as_str(), "TCP");
+    assert_eq!(port.protocol.as_deref().unwrap(), "TCP");
     assert_eq!(port.end_port, Some(8100));
 }
 

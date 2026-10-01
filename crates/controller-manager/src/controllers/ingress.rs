@@ -320,12 +320,12 @@ impl<S: Storage + 'static> IngressController<S> {
     /// Validate HTTP path
     async fn validate_http_path(&self, path: &HTTPIngressPath, namespace: &str) -> Result<()> {
         // Validate path type
-        match path.path_type.as_str() {
+        match path.path_type.as_deref().unwrap_or("") {
             "Exact" | "Prefix" | "ImplementationSpecific" => {}
             _ => {
                 return Err(anyhow::anyhow!(
                     "Invalid path type '{}', must be Exact, Prefix, or ImplementationSpecific",
-                    path.path_type
+                    path.path_type.as_deref().unwrap_or("")
                 ));
             }
         }
@@ -501,7 +501,7 @@ mod tests {
 
         let path = HTTPIngressPath {
             path: Some("/".to_string()),
-            path_type: "Prefix".to_string(),
+            path_type: Some("Prefix".to_string()),
             backend,
         };
 
@@ -529,7 +529,7 @@ mod tests {
 
         let path = HTTPIngressPath {
             path: Some("/".to_string()),
-            path_type: "Invalid".to_string(),
+            path_type: Some("Invalid".to_string()),
             backend,
         };
 
@@ -623,7 +623,7 @@ mod tests {
 
         let path = HTTPIngressPath {
             path: Some("/api".to_string()),
-            path_type: "Prefix".to_string(),
+            path_type: Some("Prefix".to_string()),
             backend,
         };
 
@@ -656,7 +656,7 @@ mod tests {
 
         let path = HTTPIngressPath {
             path: Some("/".to_string()),
-            path_type: "Prefix".to_string(),
+            path_type: Some("Prefix".to_string()),
             backend,
         };
 

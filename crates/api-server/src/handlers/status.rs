@@ -98,8 +98,6 @@ fn resource_type_to_kind_api_version(resource_type: &str) -> (String, String) {
         "daemonsets" => ("DaemonSet".into(), "apps/v1".into()),
         "jobs" => ("Job".into(), "batch/v1".into()),
         "cronjobs" => ("CronJob".into(), "batch/v1".into()),
-        "ingresses" => ("Ingress".into(), "networking.k8s.io/v1".into()),
-        "networkpolicies" => ("NetworkPolicy".into(), "networking.k8s.io/v1".into()),
         "customresourcedefinitions" => (
             "CustomResourceDefinition".into(),
             "apiextensions.k8s.io/v1".into(),

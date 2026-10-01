@@ -4,37 +4,21 @@
 //!
 //! Covers `spec.controller` (length + domain-prefixed path) and
 //! `spec.parameters` (typed local object reference + scope/namespace coupling).
-//! ObjectMeta is validated separately (#1087 / #1277).
-//!
-//! The path component of `controller` is checked for the domain-prefixed
-//! *structure* (host is a DNS-1123 subdomain, both segments non-empty); the
-//! exact upstream `httpPathRegexp` on the trailing path segment is not
-//! replicated (rarely material).
+//! Includes ObjectMeta create/update validation and controller immutability.
 
 use crate::resources::ingressclass::{IngressClass, IngressClassParametersReference};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
+use crate::validation::objectmeta::{
+    name_is_dns_subdomain, name_is_path_segment, validate_object_meta, validate_object_meta_update,
+};
 
 const MAX_CONTROLLER_LEN: usize = 250;
 const SCOPE_NAMESPACE: &str = "Namespace";
 const SCOPE_CLUSTER: &str = "Cluster";
 
-/// Port of upstream `path.IsValidPathSegmentName`: not `.`/`..`, no `/` or `%`.
-fn path_segment_errors(name: &str) -> Vec<String> {
-    if name == "." || name == ".." {
-        return vec![format!("may not be '{}'", name)];
-    }
-    let mut errs = Vec::new();
-    if name.contains('/') {
-        errs.push("may not contain '/'".to_string());
-    }
-    if name.contains('%') {
-        errs.push("may not contain '%'".to_string());
-    }
-    errs
-}
-
-/// Port of upstream `IsDomainPrefixedPath` (structure + host subdomain).
+/// Upstream apimachinery/pkg/util/validation/validation.go:88-118,
+/// `IsDomainPrefixedPath`, including the complete HTTP path character set.
 fn validate_domain_prefixed_path(value: &str, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if value.is_empty() {
@@ -52,6 +36,16 @@ fn validate_domain_prefixed_path(value: &str, fld_path: &Path) -> ErrorList {
     }
     for msg in is_dns1123_subdomain(segments[0]) {
         errs.push(Error::invalid(fld_path, segments[0].to_string(), msg));
+    }
+    if !segments[1]
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"/\\-._~%!$&'()*+,;=:".contains(&byte))
+    {
+        errs.push(Error::invalid(
+            fld_path,
+            segments[1].to_string(),
+            r"Invalid path (regex used for validation is '[A-Za-z0-9/\\-._~%!$&'()*+,;=:]+')",
+        ));
     }
     errs
 }
@@ -73,7 +67,7 @@ fn validate_parameters(params: &IngressClassParametersReference, fld_path: &Path
     if params.kind.is_empty() {
         errs.push(Error::required(&fld_path.child("kind"), ""));
     } else {
-        for msg in path_segment_errors(&params.kind) {
+        for msg in name_is_path_segment(&params.kind, false) {
             errs.push(Error::invalid(
                 &fld_path.child("kind"),
                 params.kind.clone(),
@@ -84,7 +78,7 @@ fn validate_parameters(params: &IngressClassParametersReference, fld_path: &Path
     if params.name.is_empty() {
         errs.push(Error::required(&fld_path.child("name"), ""));
     } else {
-        for msg in path_segment_errors(&params.name) {
+        for msg in name_is_path_segment(&params.name, false) {
             errs.push(Error::invalid(
                 &fld_path.child("name"),
                 params.name.clone(),
@@ -132,12 +126,17 @@ fn validate_parameters(params: &IngressClassParametersReference, fld_path: &Path
     errs
 }
 
-/// Validate an `IngressClass` on create. Mirrors upstream `ValidateIngressClass`
-/// minus ObjectMeta.
+/// Upstream pkg/apis/networking/validation/validation.go:560,
+/// `ValidateIngressClass`.
 pub fn validate_ingress_class(ic: &IngressClass) -> ErrorList {
     let spec_path = Path::new("spec");
     let controller_path = spec_path.child("controller");
-    let mut errs: ErrorList = Vec::new();
+    let mut errs = validate_object_meta(
+        &ic.metadata,
+        false,
+        name_is_dns_subdomain,
+        &Path::new("metadata"),
+    );
 
     // Go's IngressClassSpec is a non-pointer struct (always present); a missing
     // spec here means a missing controller → upstream's required error.
@@ -165,7 +164,8 @@ pub fn validate_ingress_class(ic: &IngressClass) -> ErrorList {
 /// (pkg/apis/networking/validation): `spec.controller` is immutable, plus full
 /// re-validation of the new object.
 pub fn validate_ingress_class_update(new_ic: &IngressClass, old_ic: &IngressClass) -> ErrorList {
-    let mut errs = validate_ingress_class(new_ic);
+    let mut errs =
+        validate_object_meta_update(&new_ic.metadata, &old_ic.metadata, &Path::new("metadata"));
     let new_ctrl = new_ic
         .spec
         .as_ref()
@@ -183,5 +183,6 @@ pub fn validate_ingress_class_update(new_ic: &IngressClass, old_ic: &IngressClas
             "field is immutable",
         ));
     }
+    errs.extend(validate_ingress_class(new_ic));
     errs
 }

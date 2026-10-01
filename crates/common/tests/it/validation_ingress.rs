@@ -77,7 +77,7 @@ fn empty_paths_required() {
 #[test]
 fn missing_path_type_required() {
     let errs = validate_ingress(&ing(json!({
-        "rules": [{"http": {"paths": [{"path": "/", "pathType": "", "backend": svc_backend()}]}}]
+        "rules": [{"http": {"paths": [{"path": "/", "backend": svc_backend()}]}}]
     })));
     assert!(
         has(

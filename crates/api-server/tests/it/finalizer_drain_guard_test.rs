@@ -101,6 +101,17 @@ fn every_write_handler_finishes_a_drained_deletion() {
             {
                 continue;
             }
+            // Store adapters inherit ShouldDeleteDuringUpdate from the shared
+            // update/patch pipeline (registry/generic/registry/store.go:565).
+            if body.contains("endpoints::update_resource(")
+                || body.contains("endpoints::patch_resource(")
+            {
+                checked += 1;
+                if fname.starts_with("patch") {
+                    patches_checked += 1;
+                }
+                continue;
+            }
             // Only handlers that actually persist are in scope.
             if !body.contains("storage.update(") && !body.contains("update_inheriting") {
                 continue;

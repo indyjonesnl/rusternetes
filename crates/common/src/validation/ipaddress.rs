@@ -102,14 +102,16 @@ fn go_ip_string(ip: std::net::IpAddr) -> String {
 /// has already accepted: host bits set after the prefix, an IPv4-mapped IPv6
 /// value, or an IPv6 value not in RFC 5952 canonical form.
 ///
-/// `ParseCIDRSloppy`'s leading-zero IPv4 form is rejected by the Rust
-/// parser, so that half of the non-standard-value warning cannot arise.
+/// Includes the leading-zero forms accepted by `ParseCIDRSloppy`.
 pub fn get_warnings_for_cidr(fld_path: &Path, value: &str) -> Vec<String> {
     use std::net::IpAddr;
     let Some((ip_str, prefix_str)) = value.split_once('/') else {
         return Vec::new();
     };
-    let (Ok(ip), Ok(prefix)) = (ip_str.parse::<IpAddr>(), prefix_str.parse::<u8>()) else {
+    let (Some(ip), Ok(prefix)) = (
+        super::ingress::parse_ip_sloppy(ip_str),
+        prefix_str.parse::<u8>(),
+    ) else {
         return Vec::new();
     };
     let (network, addr_len) = match ip {
@@ -134,7 +136,7 @@ pub fn get_warnings_for_cidr(fld_path: &Path, value: &str) -> Vec<String> {
     // `netip.ParsePrefix` rejects what `ParseCIDRSloppy` let through: a
     // prefix length with leading zeros, or an IPv4-mapped IPv6 address.
     let mapped = matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some());
-    if mapped || prefix_str != prefix.to_string() {
+    if ip_str.parse::<IpAddr>().is_err() || mapped || prefix_str != prefix.to_string() {
         warnings.push(format!(
             "{fld_path}: non-standard CIDR value {value:?} will be considered invalid in a future Kubernetes release: use {ipnet:?}"
         ));

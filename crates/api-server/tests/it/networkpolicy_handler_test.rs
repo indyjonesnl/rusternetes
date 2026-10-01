@@ -181,7 +181,7 @@ async fn test_networkpolicy_with_ingress_rules() {
     // Add ingress rules
     np.spec.ingress = Some(vec![NetworkPolicyIngressRule {
         ports: Some(vec![NetworkPolicyPort {
-            protocol: "TCP".to_string(),
+            protocol: Some("TCP".to_string()),
             port: Some(IntOrString::Int(80)),
             end_port: None,
         }]),
@@ -223,7 +223,7 @@ async fn test_networkpolicy_with_egress_rules() {
     // Add egress rules
     np.spec.egress = Some(vec![NetworkPolicyEgressRule {
         ports: Some(vec![NetworkPolicyPort {
-            protocol: "TCP".to_string(),
+            protocol: Some("TCP".to_string()),
             port: Some(IntOrString::Int(443)),
             end_port: None,
         }]),
@@ -461,7 +461,7 @@ async fn test_networkpolicy_port_range() {
     // Add ingress rule with port range
     np.spec.ingress = Some(vec![NetworkPolicyIngressRule {
         ports: Some(vec![NetworkPolicyPort {
-            protocol: "TCP".to_string(),
+            protocol: Some("TCP".to_string()),
             port: Some(IntOrString::Int(8000)),
             end_port: Some(9000),
         }]),
@@ -531,7 +531,7 @@ async fn test_networkpolicy_multiple_policy_types() {
     // Add both ingress and egress rules
     np.spec.ingress = Some(vec![NetworkPolicyIngressRule {
         ports: Some(vec![NetworkPolicyPort {
-            protocol: "TCP".to_string(),
+            protocol: Some("TCP".to_string()),
             port: Some(IntOrString::Int(80)),
             end_port: None,
         }]),
@@ -540,7 +540,7 @@ async fn test_networkpolicy_multiple_policy_types() {
 
     np.spec.egress = Some(vec![NetworkPolicyEgressRule {
         ports: Some(vec![NetworkPolicyPort {
-            protocol: "TCP".to_string(),
+            protocol: Some("TCP".to_string()),
             port: Some(IntOrString::Int(443)),
             end_port: None,
         }]),

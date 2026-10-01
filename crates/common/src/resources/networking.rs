@@ -2,8 +2,10 @@ use crate::resources::policy::IntOrString;
 use crate::types::{LabelSelector, ObjectMeta, TypeMeta};
 use serde::{Deserialize, Serialize};
 
+// Go null decoding for value fields: vendor/sigs.k8s.io/json/internal/golang/encoding/json/decode.go:991-1002.
+
 /// NetworkPolicy describes what network traffic is allowed for a set of Pods
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicy {
     #[serde(flatten)]
@@ -12,7 +14,7 @@ pub struct NetworkPolicy {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub spec: NetworkPolicySpec,
 }
 
@@ -34,11 +36,11 @@ impl NetworkPolicy {
 }
 
 /// NetworkPolicySpec provides the specification of a NetworkPolicy
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicySpec {
     /// Selects the pods to which this NetworkPolicy applies
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub pod_selector: LabelSelector,
 
     /// List of ingress rules to be applied
@@ -55,7 +57,7 @@ pub struct NetworkPolicySpec {
 }
 
 /// NetworkPolicyIngressRule describes a particular set of traffic that is allowed to the pods
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyIngressRule {
     /// List of ports which should be made accessible
@@ -68,7 +70,7 @@ pub struct NetworkPolicyIngressRule {
 }
 
 /// NetworkPolicyEgressRule describes a particular set of traffic that is allowed out of pods
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyEgressRule {
     /// List of destination ports for outgoing traffic
@@ -80,17 +82,13 @@ pub struct NetworkPolicyEgressRule {
     pub to: Option<Vec<NetworkPolicyPeer>>,
 }
 
-fn default_protocol() -> String {
-    "TCP".to_string()
-}
-
 /// NetworkPolicyPort describes a port to allow traffic on
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyPort {
     /// The protocol (TCP, UDP, SCTP)
-    #[serde(default = "default_protocol")]
-    pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 
     /// The port on the given protocol
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,7 +100,7 @@ pub struct NetworkPolicyPort {
 }
 
 /// NetworkPolicyPeer describes a peer to allow traffic from/to
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyPeer {
     /// Selects pods
@@ -119,11 +117,11 @@ pub struct NetworkPolicyPeer {
 }
 
 /// IPBlock describes a particular CIDR range
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct IPBlock {
     /// CIDR is a string representing the IP Block
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub cidr: String,
 
     /// Except is a slice of CIDRs that should not be included within an IP Block
