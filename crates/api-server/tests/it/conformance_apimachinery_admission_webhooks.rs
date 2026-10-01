@@ -1026,7 +1026,7 @@ async fn should_be_able_to_deny_attaching_pod() {
 /// everything — and the interesting half was missing entirely: the delete
 /// refusal is decided from the **stored** object, since a delete
 /// AdmissionReview carries no new object
-/// (handlers/admission_helper.rs:68-75 sends `object: None`,
+/// (`Admission::validate` in endpoints/handlers/admission.rs sends `object: None`,
 /// `old_object: Some(stored)`), and the same delete must succeed once that
 /// stored content changes.
 /// Verifies a webhook bound to a CRD's resource (`example.com/v1/foos`)
@@ -1158,7 +1158,7 @@ async fn should_be_able_to_deny_custom_resource_creation_update_and_deletion() {
 
     // 3. deleting it is denied — and the decision can only come from the
     //    *stored* object, because a delete AdmissionReview carries no new
-    //    object (handlers/admission_helper.rs passes `object: None`,
+    //    object (`Admission::validate` in endpoints/handlers/admission.rs passes `object: None`,
     //    `old_object: Some(stored)`).
     let resp = run(
         Operation::Delete,
