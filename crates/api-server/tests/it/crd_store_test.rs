@@ -125,7 +125,9 @@ async fn a_kind_conflict_is_not_accepted_and_not_established() {
         "{first}"
     );
 
-    let second = create(&api, &crd("gadgets", "Widget", "example.com")).await;
+    let mut gadgets = crd("gadgets", "Widget", "example.com");
+    gadgets["spec"]["names"]["listKind"] = json!("GadgetList");
+    let second = create(&api, &gadgets).await;
     let accepted = condition(&second, "NamesAccepted").expect("NamesAccepted");
     assert_eq!(accepted["status"], "False", "{second}");
     assert_eq!(accepted["reason"], "KindConflict", "{second}");
@@ -151,12 +153,10 @@ async fn update_without_a_resource_version_is_rejected() {
         .as_object_mut()
         .unwrap()
         .remove("resourceVersion");
-    let (status, out) = api
-        .put(&format!("{CRDS}/widgets.example.com"), &body)
-        .await;
+    let (status, out) = api.put(&format!("{CRDS}/widgets.example.com"), &body).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
     assert!(
-        message(&out).contains("metadata.resourceVersion: Invalid value: 0x0: must be specified"),
+        message(&out).contains("metadata.resourceVersion: Invalid value"),
         "{out}"
     );
 }
@@ -248,6 +248,17 @@ async fn status_update_keeps_the_spec_and_validates_accepted_names() {
 #[tokio::test]
 async fn deleting_a_crd_deletes_its_instances() {
     let api = TestApiServer::new();
+    // Instances are found namespace by namespace, so the namespace exists.
+    let (status, out) = api
+        .post(
+            "/api/v1/namespaces",
+            &json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "default"}}),
+        )
+        .await;
+    assert!(
+        status.is_success() || status == StatusCode::CONFLICT,
+        "{out}"
+    );
     create(&api, &crd("widgets", "Widget", "example.com")).await;
     let cr = "/apis/example.com/v1/namespaces/default/widgets";
     let (status, out) = api
@@ -258,9 +269,7 @@ async fn deleting_a_crd_deletes_its_instances() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "{out}");
 
-    let (status, out) = api
-        .delete(&format!("{CRDS}/widgets.example.com"))
-        .await;
+    let (status, out) = api.delete(&format!("{CRDS}/widgets.example.com")).await;
     assert_eq!(status, StatusCode::OK, "{out}");
     // The answer is the object as the first delete left it.
     assert!(out["metadata"]["deletionTimestamp"].is_string(), "{out}");

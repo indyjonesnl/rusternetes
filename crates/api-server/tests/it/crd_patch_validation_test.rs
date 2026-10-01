@@ -176,6 +176,10 @@ async fn a_put_runs_the_same_immutability_rules() {
 
     let mut body = crd_body("widgets", "Widget", json!({}));
     body["spec"]["group"] = json!("other.com");
+    // A PUT carries the resourceVersion it read (`AllowUnconditionalUpdate`
+    // is false, customresourcedefinition/strategy.go:151).
+    let (_, current) = api.get(&url).await;
+    body["metadata"]["resourceVersion"] = current["metadata"]["resourceVersion"].clone();
 
     let (status, answer) = api
         .send("PUT", &url, Some("application/json"), Some(&body))

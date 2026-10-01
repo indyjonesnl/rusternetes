@@ -10,8 +10,13 @@
 //! `ValidateCustomResourceDefinitionSubresources` (`:1525`) and
 //! `validateCustomResourceConversion` (`:612`).
 //!
+//! Also here: the whole-object checks (`ValidateCustomResourceDefinition`,
+//! `ValidateCustomResourceDefinitionUpdate`, `...UpdateStatus`) -- required
+//! names, api-approval annotation, `preserveUnknownFields`, status conditions,
+//! `storedVersions` -- and `SetDefaults_CustomResourceDefinition`.
+//!
 //! Out of scope here: the structural-schema and CEL rule checks, which
-//! `handlers::cel_validation` already runs.
+//! `handlers::cel_validation` runs (wrapped by the registry strategy).
 //!
 //! Field paths follow upstream, which validates the *internal* type after
 //! converting from `v1` — so a conversion error is reported under
@@ -1095,7 +1100,8 @@ mod whole_object_tests {
         let mut c = crd("a.k8s.io");
         let errs = validate_api_approval(&c, None);
         assert!(
-            errs.iter().any(|e| e.error_body().contains("Required value")),
+            errs.iter()
+                .any(|e| e.error_body().contains("Required value")),
             "{errs:?}"
         );
         for (value, ok) in [

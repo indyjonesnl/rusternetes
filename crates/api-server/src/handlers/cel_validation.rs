@@ -620,16 +620,6 @@ fn correlate_old_item(
     None
 }
 
-/// Validate every served version's CEL rules at CRD admission time.
-pub fn validate_crd_versions(crd: &CustomResourceDefinition) -> Result<()> {
-    for v in &crd.spec.versions {
-        if let Some(validation) = &v.schema {
-            validate_crd_rules(&validation.open_apiv3_schema)?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
