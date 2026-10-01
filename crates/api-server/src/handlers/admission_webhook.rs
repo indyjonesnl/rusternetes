@@ -45,6 +45,7 @@ fn validating_scope(state: &ApiServerState) -> RequestScope<ValidatingWebhookCon
         store: Box::new(validating::new_store(state.storage.clone())),
         apply: Some(crate::ssa::apply_legacy::<ValidatingWebhookConfiguration>),
         convert_to_internal: Some(validating::convert_to_internal),
+        patch_conversion: None,
     }
 }
 
@@ -126,6 +127,7 @@ fn mutating_scope(state: &ApiServerState) -> RequestScope<MutatingWebhookConfigu
         store: Box::new(mutating::new_store(state.storage.clone())),
         apply: Some(crate::ssa::apply_legacy::<MutatingWebhookConfiguration>),
         convert_to_internal: Some(mutating::convert_to_internal),
+        patch_conversion: None,
     }
 }
 

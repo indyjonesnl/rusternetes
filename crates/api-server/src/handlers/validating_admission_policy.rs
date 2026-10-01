@@ -216,6 +216,7 @@ fn policy_scope(
         }),
         apply: Some(crate::ssa::apply_legacy::<ValidatingAdmissionPolicy>),
         convert_to_internal: Some(validatingadmissionpolicy::convert_to_internal),
+        patch_conversion: None,
     }
 }
 
@@ -362,6 +363,7 @@ fn binding_scope(state: &ApiServerState) -> RequestScope<ValidatingAdmissionPoli
         )),
         apply: Some(crate::ssa::apply_legacy::<ValidatingAdmissionPolicyBinding>),
         convert_to_internal: Some(validatingadmissionpolicybinding::convert_to_internal),
+        patch_conversion: None,
     }
 }
 
