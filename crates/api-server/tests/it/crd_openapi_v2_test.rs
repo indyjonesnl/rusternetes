@@ -46,6 +46,14 @@ async fn post_crd(state: &TestApiServer, crd_body: &Value) -> (u16, Value) {
 
 /// PUT an updated CRD body for an existing CRD.
 async fn put_crd(state: &TestApiServer, name: &str, crd_body: &Value) -> (u16, Value) {
+    // A PUT carries the resourceVersion it read: the CRD strategy's
+    // `AllowUnconditionalUpdate` is false (customresourcedefinition/strategy.go:151).
+    let mut crd_body = crd_body.clone();
+    let (_, current) = state.get(&format!("{CRDS_URI}/{name}")).await;
+    if let Some(rv) = current.pointer("/metadata/resourceVersion") {
+        crd_body["metadata"]["resourceVersion"] = rv.clone();
+    }
+    let crd_body = &crd_body;
     let (status, value) = state.put(&format!("{CRDS_URI}/{name}"), crd_body).await;
     (status.as_u16(), value)
 }

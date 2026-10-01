@@ -718,7 +718,7 @@ pub struct ServiceReference {
 }
 
 /// CustomResourceDefinitionStatus describes the observed state of a CRD
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomResourceDefinitionStatus {
     /// Conditions indicate the state of the CRD

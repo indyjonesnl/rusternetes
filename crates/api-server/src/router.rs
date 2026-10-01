@@ -1750,9 +1750,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/:name/status",
-            get(handlers::status::get_cluster_status)
-                .put(handlers::status::update_cluster_status)
-                .patch(handlers::status::update_cluster_status),
+            get(handlers::crd::get_crd_status)
+                .put(handlers::crd::update_crd_status)
+                .patch(handlers::crd::patch_crd_status),
         )
         // APIService (cluster-scoped, aggregator layer). Handlers require
         // Extension<AuthContext> for authz checks, so these routes must live

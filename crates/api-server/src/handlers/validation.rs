@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 /// Find duplicate JSON keys at any nesting level of a JSON object string.
 /// Returns the first duplicate key found (just the key name, not dotted path), or None.
 /// This scans each `{...}` object at every depth for duplicate keys within that object.
+#[cfg(test)]
 fn find_duplicate_json_key(json_str: &str) -> Option<String> {
     let dups = find_all_duplicate_json_keys(json_str);
     dups.into_iter().next()
@@ -309,12 +310,6 @@ fn skip_json_value(bytes: &[u8], pos: usize) -> Option<usize> {
         }
         _ => None,
     }
-}
-
-/// Public wrapper for `find_duplicate_json_key` so handlers can call it directly
-/// (e.g. for CRD creation where serde silently merges duplicate keys).
-pub fn find_duplicate_json_key_public(json_str: &str) -> Option<String> {
-    find_duplicate_json_key(json_str)
 }
 
 /// Returns true if `value` is one that our resource structs' `skip_serializing_if`

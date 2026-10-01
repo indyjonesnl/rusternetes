@@ -1480,7 +1480,14 @@ async fn ratchet_install_crd(router: &TestApiServer, body: &Value) {
 
 async fn ratchet_tighten_crd(router: &TestApiServer, group: &str, body: &Value) {
     let uri = format!("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/ratchets.{group}");
-    let (s, b) = put_json(router, &uri, body).await;
+    // A PUT carries the resourceVersion it read: the CRD strategy's
+    // `AllowUnconditionalUpdate` is false (customresourcedefinition/strategy.go:151).
+    let mut body = body.clone();
+    let (_, current) = get(router, &uri).await;
+    if let Some(rv) = current.pointer("/metadata/resourceVersion") {
+        body["metadata"]["resourceVersion"] = rv.clone();
+    }
+    let (s, b) = put_json(router, &uri, &body).await;
     assert_eq!(s, 200, "tight CRD update must succeed, body={b}");
 }
 
