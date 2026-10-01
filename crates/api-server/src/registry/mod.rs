@@ -22,6 +22,7 @@
 pub mod apps;
 pub mod autoscaling;
 pub mod batch;
+pub mod certificates;
 pub mod coordination;
 pub mod core;
 pub mod flowcontrol;

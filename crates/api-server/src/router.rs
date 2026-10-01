@@ -1873,7 +1873,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/certificates.k8s.io/v1/certificatesigningrequests/:name/approval",
-            get(handlers::certificates::get_certificate_signing_request)
+            get(handlers::certificates::get_certificate_signing_request_approval)
                 .put(handlers::certificates::approve_certificate_signing_request)
                 .patch(handlers::certificates::patch_certificate_signing_request_approval),
         )

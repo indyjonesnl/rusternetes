@@ -11,6 +11,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
+use rusternetes_common::auth::UserInfo;
 use rusternetes_common::deletion::{DeleteOptions, Preconditions};
 use rusternetes_common::types::ObjectMeta;
 use rusternetes_common::validation::field::{ErrorList, Path};
@@ -63,12 +64,16 @@ impl std::fmt::Display for GroupResource {
 }
 
 /// The request-scoped values upstream reads out of `context.Context`:
-/// `genericapirequest.NamespaceFrom(ctx)` and the `warning.AddWarning` sink.
+/// `genericapirequest.NamespaceFrom(ctx)`, `genericapirequest.UserFrom(ctx)`
+/// and the `warning.AddWarning` sink.
 #[derive(Debug, Default)]
 pub struct RequestContext {
     /// The namespace from the request path; `None` (upstream's
     /// `metav1.NamespaceNone`, `""`) for a cluster-scoped request.
     pub namespace: Option<String>,
+    /// `genericapirequest.UserFrom(ctx)`: the authenticated requester, when
+    /// the entry point passes it on (create does).
+    pub user: Option<UserInfo>,
     warnings: Mutex<Vec<String>>,
 }
 
@@ -76,8 +81,15 @@ impl RequestContext {
     pub fn new(namespace: Option<&str>) -> Self {
         Self {
             namespace: namespace.filter(|ns| !ns.is_empty()).map(str::to_string),
+            user: None,
             warnings: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The context with the requester attached (`WithUser`).
+    pub fn with_user(mut self, user: &UserInfo) -> Self {
+        self.user = Some(user.clone());
+        self
     }
 
     /// `warning.AddWarning(ctx, "", w)`. Like upstream's recorder
