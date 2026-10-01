@@ -4,12 +4,68 @@ use crate::registry::rest::{
     GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
     RestUpdateStrategy,
 };
-use rusternetes_common::equality::semantic_equal;
+
 use rusternetes_common::resources::Ingress;
 use rusternetes_common::validation::field::ErrorList;
 use rusternetes_common::validation::ingress::{validate_ingress_create, validate_ingress_update};
 use rusternetes_storage::StorageBackend;
 use std::sync::Arc;
+
+/// Compare Go value fields and nil/empty slices without erasing struct pointers.
+/// pkg/registry/networking/ingress/strategy.go:89;
+/// api/networking/v1/types.go:331,416,485,531,540-545;
+/// apimachinery/third_party/forked/golang/reflect/deep_equal.go:159-207.
+fn normalized_spec(obj: &Ingress) -> rusternetes_common::resources::ingress::IngressSpec {
+    let mut spec = obj.spec.clone().unwrap_or_default();
+    fn zero_string(value: &mut Option<String>) {
+        if value.as_ref().is_some_and(String::is_empty) {
+            *value = None;
+        }
+    }
+    fn backend(value: &mut rusternetes_common::resources::ingress::IngressBackend) {
+        if let Some(service) = &mut value.service {
+            if let Some(port) = &mut service.port {
+                zero_string(&mut port.name);
+                if port.number == Some(0) {
+                    port.number = None;
+                }
+                if port.name.is_none() && port.number.is_none() {
+                    service.port = None;
+                }
+            }
+        }
+    }
+    if spec.rules.as_ref().is_some_and(Vec::is_empty) {
+        spec.rules = None;
+    }
+    if spec.tls.as_ref().is_some_and(Vec::is_empty) {
+        spec.tls = None;
+    }
+    if let Some(tls) = &mut spec.tls {
+        for entry in tls {
+            zero_string(&mut entry.secret_name);
+            if entry.hosts.as_ref().is_some_and(Vec::is_empty) {
+                entry.hosts = None;
+            }
+        }
+    }
+    if let Some(value) = &mut spec.default_backend {
+        backend(value);
+    }
+    if let Some(rules) = &mut spec.rules {
+        for rule in rules {
+            zero_string(&mut rule.host);
+            if let Some(http) = &mut rule.http {
+                for path in &mut http.paths {
+                    zero_string(&mut path.path);
+                    backend(&mut path.backend);
+                }
+            }
+        }
+    }
+    spec
+}
+
 pub struct Strategy;
 impl NamespaceScopedStrategy for Strategy {
     fn namespace_scoped(&self) -> bool {
@@ -19,10 +75,10 @@ impl NamespaceScopedStrategy for Strategy {
 impl RestCreateStrategy<Ingress> for Strategy {
     /// PrepareForCreate (pkg/registry/networking/ingress/strategy.go:71-77).
     fn prepare_for_create(&self, _ctx: &RequestContext, obj: &mut Ingress) {
-        obj.status = Some(rusternetes_common::resources::IngressStatus {
-            load_balancer: Some(rusternetes_common::resources::IngressLoadBalancerStatus {
-                ingress: None,
-            }),
+        obj.status = Some(rusternetes_common::resources::ingress::IngressStatus {
+            load_balancer: Some(
+                rusternetes_common::resources::ingress::IngressLoadBalancerStatus { ingress: None },
+            ),
         });
         obj.metadata.generation = Some(1);
     }
@@ -54,7 +110,7 @@ impl RestUpdateStrategy<Ingress> for Strategy {
     /// PrepareForUpdate (pkg/registry/networking/ingress/strategy.go:80-93).
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut Ingress, old: &Ingress) {
         obj.status = old.status.clone();
-        if !semantic_equal(&obj.spec, &old.spec) {
+        if normalized_spec(obj) != normalized_spec(old) {
             obj.metadata.generation = Some(old.metadata.generation.unwrap_or(0) + 1);
         }
     }

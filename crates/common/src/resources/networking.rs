@@ -2,6 +2,8 @@ use crate::resources::policy::IntOrString;
 use crate::types::{LabelSelector, ObjectMeta, TypeMeta};
 use serde::{Deserialize, Serialize};
 
+// Go null decoding for value fields: vendor/sigs.k8s.io/json/internal/golang/encoding/json/decode.go:991-1002.
+
 /// NetworkPolicy describes what network traffic is allowed for a set of Pods
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -12,7 +14,7 @@ pub struct NetworkPolicy {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub spec: NetworkPolicySpec,
 }
 
@@ -38,7 +40,7 @@ impl NetworkPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicySpec {
     /// Selects the pods to which this NetworkPolicy applies
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub pod_selector: LabelSelector,
 
     /// List of ingress rules to be applied
@@ -132,7 +134,7 @@ pub struct NetworkPolicyPeer {
 #[serde(rename_all = "camelCase")]
 pub struct IPBlock {
     /// CIDR is a string representing the IP Block
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub cidr: String,
 
     /// Except is a slice of CIDRs that should not be included within an IP Block

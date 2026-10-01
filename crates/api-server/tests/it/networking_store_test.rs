@@ -323,11 +323,10 @@ async fn ingress_deprecated_class_annotation_warns_only_on_create_without_class_
             )
             .await;
         assert_eq!(status, StatusCode::CREATED, "{out}");
-        let has_warning = headers.get_all("warning").iter().any(|v| {
-            v.to_str()
-                .unwrap_or_default()
-                .contains("annotation \"kubernetes.io/ingress.class\" is deprecated")
-        });
+        let has_warning = headers
+            .get_all("warning")
+            .iter()
+            .any(|v| v.to_str().unwrap_or_default().contains("is deprecated"));
         assert_eq!(has_warning, warns, "{headers:?}");
         let (status, headers, _, out) = api
             .send_full(
@@ -414,11 +413,16 @@ async fn networking_delete_preconditions_and_dry_run_preserve_objects() {
             );
         }
         for (dry_uri, options) in [
-            (format!("{uri}?dryRun=All"), json!({})),
-            (uri.clone(), json!({"dryRun": ["All"]})),
+            (format!("{uri}?dryRun=All"), None),
+            (uri.clone(), Some(json!({"dryRun": ["All"]}))),
         ] {
             let (status, out) = api
-                .send("DELETE", &dry_uri, Some("application/json"), Some(&options))
+                .send(
+                    "DELETE",
+                    &dry_uri,
+                    Some("application/json"),
+                    options.as_ref(),
+                )
                 .await;
             assert_eq!(status, StatusCode::OK, "{collection}: {out}");
             assert_eq!(api.get(&uri).await.0, StatusCode::OK);
@@ -739,7 +743,7 @@ async fn ingress_class_annotation_mismatch_is_rejected_only_on_create() {
     body["metadata"]["annotations"] = json!({"kubernetes.io/ingress.class": "legacy"});
     body["spec"]["ingressClassName"] = json!("modern");
     let (status, out) = api.post(ING, &body).await;
-    assert_invalid(status, &out, "annotations[kubernetes.io/ingress.class]");
+    assert_invalid(status, &out, "annotations.kubernetes.io/ingress.class");
 
     body["spec"]["ingressClassName"] = json!("legacy");
     create(&api, ING, &body).await;

@@ -38,7 +38,7 @@ fn make_backend(service_name: &str, port: i32) -> IngressBackend {
 fn make_path(path: &str, path_type: &str, backend: IngressBackend) -> HTTPIngressPath {
     HTTPIngressPath {
         path: Some(path.to_string()),
-        path_type: path_type.to_string(),
+        path_type: Some(path_type.to_string()),
         backend,
     }
 }
