@@ -115,16 +115,6 @@ async fn custom_resource_fallback(
     let path = uri.path();
     debug!("Fallback handler called for path: {}", path);
 
-    // The CRD fallback dispatches to the custom-resource handlers by direct
-    // call rather than through the router, so it has to hand them the
-    // DeleteOptions that `delete_options_middleware` decoded onto the request.
-    // Absent (any non-DELETE method) means the default: no propagation policy.
-    let delete_opts = req
-        .extensions()
-        .get::<middleware::DeleteOptionsCtx>()
-        .cloned()
-        .unwrap_or_default();
-
     // Parse URI to extract custom resource information
     // Expected formats:
     //  - /apis/{group}/{version}/{plural}  (list cluster-scoped)
@@ -384,19 +374,23 @@ async fn custom_resource_fallback(
                 })
                 .unwrap_or_default();
 
+            let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                .await
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+
             match handlers::custom_resource::deletecollection_custom_resources(
                 state.clone(),
                 auth_ctx.clone(),
-                delete_opts.clone(),
                 group.to_string(),
                 version.to_string(),
                 plural.to_string(),
                 namespace.map(|s| s.to_string()),
                 query_params,
+                body,
             )
             .await
             {
-                Ok(status) => status.into_response(),
+                Ok(resp) => resp,
                 Err(e) => {
                     warn!("Error deleting custom resource collection: {}", e);
                     e.into_response()
@@ -433,7 +427,7 @@ async fn custom_resource_fallback(
             )
             .await
             {
-                Ok((status, json)) => (status, json).into_response(),
+                Ok(resp) => resp,
                 Err(e) => {
                     warn!("Error creating custom resource: {}", e);
                     e.into_response()
@@ -589,10 +583,13 @@ async fn custom_resource_fallback(
                 })
                 .unwrap_or_default();
 
+            let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                .await
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+
             match handlers::custom_resource::delete_custom_resource(
                 State(state.clone()),
                 Extension(auth_ctx.clone()),
-                Extension(delete_opts.clone()),
                 axum::extract::Path((
                     group.to_string(),
                     version.to_string(),
@@ -601,10 +598,11 @@ async fn custom_resource_fallback(
                     name.to_string(),
                 )),
                 axum::extract::Query(query_params),
+                body,
             )
             .await
             {
-                Ok(status) => status.into_response(),
+                Ok(resp) => resp,
                 Err(e) => {
                     warn!("Error deleting custom resource: {}", e);
                     e.into_response()
@@ -666,8 +664,14 @@ async fn custom_resource_fallback(
             let body = axum::body::to_bytes(req.into_body(), usize::MAX)
                 .await
                 .map_err(|_| StatusCode::BAD_REQUEST)?;
-            let status: serde_json::Value =
-                serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+            let query_params: std::collections::HashMap<String, String> = uri
+                .query()
+                .map(|q| {
+                    url::form_urlencoded::parse(q.as_bytes())
+                        .into_owned()
+                        .collect()
+                })
+                .unwrap_or_default();
 
             match handlers::custom_resource::update_custom_resource_status(
                 State(state.clone()),
@@ -679,11 +683,12 @@ async fn custom_resource_fallback(
                     namespace.map(|s| s.to_string()),
                     name.to_string(),
                 )),
-                DumpingJson(status),
+                axum::extract::Query(query_params),
+                body,
             )
             .await
             {
-                Ok(json) => json.into_response(),
+                Ok(resp) => resp,
                 Err(e) => {
                     warn!("Error updating custom resource status: {}", e);
                     e.into_response()

@@ -1,20 +1,30 @@
 //! Custom Resource (CR) API handlers for dynamically created CRDs
 //!
-//! This module handles CRUD operations for custom resources defined by CRDs.
+//! Create, get, update, patch, delete, deletecollection and the `/status`
+//! subresource go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the custom resource strategies
+//! ([`crate::registry::apiextensions::customresource`]) — the
+//! apiextensions-apiserver's `pkg/registry/customresource` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go` by
+//! `pkg/apiserver/customresource_handler.go`. Lists, watches and `/scale` are
+//! still served here directly.
 
 #![allow(dead_code)]
 
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::apiextensions::customresource::{CustomResourceRest, StrictMode};
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    response::Response,
     Extension, Json,
 };
+use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
 use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
-    resources::{prune_custom_resource, CustomResource, CustomResourceDefinition},
+    resources::{CustomResource, CustomResourceDefinition},
     schema_validation::SchemaValidator,
     List, Result,
 };
@@ -23,6 +33,110 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// The CRD serving `plural.group` at `version`, or `NotFound`: upstream's
+/// `crdHandler.ServeHTTP` answers a request for a CRD that is missing, whose
+/// version is not served, or whose `/status` is not enabled with a 404
+/// (customresource_handler.go:299-352).
+async fn serving_crd(
+    state: &ApiServerState,
+    group: &str,
+    version: &str,
+    plural: &str,
+    subresource: Option<&str>,
+) -> Result<Arc<CustomResourceDefinition>> {
+    let not_found = || {
+        rusternetes_common::Error::NotFound(
+            "the server could not find the requested resource".to_string(),
+        )
+    };
+    let crd = get_crd_for_resource(state, &format!("{plural}.{group}"))
+        .await
+        .map_err(|_| not_found())?;
+    let served = crd
+        .spec
+        .versions
+        .iter()
+        .find(|v| v.name == version)
+        .ok_or_else(not_found)?;
+    if !served.served {
+        return Err(not_found());
+    }
+    if subresource == Some("status")
+        && !served
+            .subresources
+            .as_ref()
+            .is_some_and(|s| s.status.is_some())
+    {
+        return Err(not_found());
+    }
+    Ok(Arc::new(crd))
+}
+
+/// The `RequestScope` of a custom resource (or its `/status`) at one served
+/// version, built from the CRD the way `getOrCreateServingInfoFor` builds the
+/// per-version serving info (customresource_handler.go:700-1000).
+fn scope(
+    state: &ApiServerState,
+    crd: &Arc<CustomResourceDefinition>,
+    version: &str,
+    subresource: Option<&'static str>,
+    strict: StrictMode,
+) -> RequestScope<CustomResource> {
+    let group = crd.spec.group.clone();
+    RequestScope {
+        kind: GroupVersionKind {
+            group: group.clone(),
+            version: version.to_string(),
+            kind: crd.spec.names.kind.clone(),
+        },
+        resource: GroupVersionResource {
+            group,
+            version: version.to_string(),
+            resource: crd.spec.names.plural.clone(),
+        },
+        subresource,
+        store: Box::new(CustomResourceRest::new(
+            state.storage.clone(),
+            crd.clone(),
+            version,
+            subresource.is_some(),
+            strict,
+        )),
+        apply: Some(crate::ssa::apply_legacy::<CustomResource>),
+        convert_to_internal: None,
+        patch_conversion: None,
+    }
+}
+
+fn strict_mode(params: &HashMap<String, String>, patch: bool) -> StrictMode {
+    match params.get("fieldValidation").map(String::as_str) {
+        Some("Strict") if patch => StrictMode::Patch,
+        Some("Strict") => StrictMode::Write,
+        _ => StrictMode::Off,
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn query_params(uri: &axum::http::Uri) -> HashMap<String, String> {
+    uri.query()
+        .map(|q| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Create a new custom resource instance
 pub async fn create_custom_resource(
     State(state): State<Arc<ApiServerState>>,
@@ -30,276 +144,18 @@ pub async fn create_custom_resource(
     Path((group, version, plural, namespace)): Path<(String, String, String, Option<String>)>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
     body: Bytes,
-) -> Result<(StatusCode, Json<CustomResource>)> {
-    // Parse the body manually so we can do strict field validation against the raw bytes
-    let mut cr: CustomResource = rusternetes_common::dump::decode_request_body(&body)?;
-
-    // Server-side name generation (metadata.generateName) is applied centrally
-    // by generate_name_middleware before this handler runs (#1052).
-    let cr_name = cr.metadata.name.clone();
-    info!(
-        "Creating custom resource {}/{}/{}: {}",
-        group, version, plural, cr_name
-    );
-
-    // Look up the CRD first — we need it to check preserve-unknown-fields
-    // before strict validation. CRDs with preserve-unknown-fields allow
-    // arbitrary top-level fields even with fieldValidation=Strict.
-    let crd_name_for_lookup = format!("{}.{}", plural, group);
-    let crd_for_validation = get_crd_for_resource(&state, &crd_name_for_lookup).await?;
-    let crd_preserves = crd_for_validation.spec.preserve_unknown_fields == Some(true);
-    let schema_preserves = crd_for_validation
-        .spec
-        .versions
-        .iter()
-        .find(|v| v.name == version)
-        .and_then(|v| v.schema.as_ref())
-        .map(|s| s.open_apiv3_schema.x_kubernetes_preserve_unknown_fields == Some(true))
-        .unwrap_or(false);
-
-    // Strict field validation for CRDs:
-    // K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/customresource_handler.go
-    if params.get("fieldValidation").map(|v| v.as_str()) == Some("Strict") {
-        // Check unknown top-level fields — but SKIP if CRD preserves unknown fields
-        if !cr.extra.is_empty() && !crd_preserves && !schema_preserves {
-            let unknown: Vec<&String> = cr.extra.keys().collect();
-            return Err(rusternetes_common::Error::InvalidResource(format!(
-                "strict decoding error: unknown field \"{}\"",
-                unknown[0]
-            )));
-        }
-        // Check unknown metadata fields — K8s validates ObjectMeta strictly,
-        // BOTH at root AND in embedded objects (x-kubernetes-embedded-resource).
-        // K8s ref: apiextensions-apiserver/pkg/apiserver/schema/objectmeta/validation.go
-        if let Ok(body_json) = serde_json::from_slice::<serde_json::Value>(&body) {
-            const KNOWN_META: &[&str] = &[
-                "name",
-                "generateName",
-                "namespace",
-                "selfLink",
-                "uid",
-                "resourceVersion",
-                "generation",
-                "creationTimestamp",
-                "deletionTimestamp",
-                "deletionGracePeriodSeconds",
-                "labels",
-                "annotations",
-                "ownerReferences",
-                "finalizers",
-                "managedFields",
-                "clusterName",
-            ];
-
-            // Recursively find all "metadata" objects in the body and validate them
-            fn check_metadata_fields(
-                value: &serde_json::Value,
-                path: &str,
-                known: &[&str],
-            ) -> Option<String> {
-                if let Some(obj) = value.as_object() {
-                    // Check if this object has a "metadata" field
-                    if let Some(meta) = obj.get("metadata").and_then(|m| m.as_object()) {
-                        let meta_path = if path.is_empty() {
-                            ".metadata".to_string()
-                        } else {
-                            format!("{}.metadata", path)
-                        };
-                        for key in meta.keys() {
-                            if !known.contains(&key.as_str()) {
-                                return Some(format!(
-                                    "{}.{}: field not declared in schema",
-                                    meta_path, key
-                                ));
-                            }
-                        }
-                    }
-                    // Recurse into all nested objects
-                    for (key, val) in obj {
-                        if key == "metadata" {
-                            continue; // Already checked above
-                        }
-                        let child_path = if path.is_empty() {
-                            format!(".{}", key)
-                        } else {
-                            format!("{}.{}", path, key)
-                        };
-                        if let Some(err) = check_metadata_fields(val, &child_path, known) {
-                            return Some(err);
-                        }
-                    }
-                } else if let Some(arr) = value.as_array() {
-                    for item in arr {
-                        if let Some(err) = check_metadata_fields(item, path, known) {
-                            return Some(err);
-                        }
-                    }
-                }
-                None
-            }
-
-            if let Some(err_msg) = check_metadata_fields(&body_json, "", KNOWN_META) {
-                return Err(rusternetes_common::Error::InvalidResource(err_msg));
-            }
-        }
-    }
-    crate::handlers::validation::validate_strict_fields(&params, &body, &cr)?;
-    // Full create-time ValidateObjectMeta (#1087). Custom resources use the
-    // generic NameIsDNSSubdomain validator; namespaced-ness comes from the URL
-    // path (Some(ns) for a namespaced CRD scope, None for cluster-scoped).
-    crate::handlers::validation::validate_create_object_meta(
-        &cr.metadata,
+) -> Result<Response> {
+    info!("Creating custom resource {group}/{version}/{plural}");
+    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    endpoints::create_resource(
+        &state,
+        &scope(&state, &crd, &version, None, strict_mode(&params, false)),
+        &auth_ctx.user,
         namespace.as_deref(),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Use the CRD we already looked up for preserve-unknown-fields check
-    let crd = crd_for_validation;
-
-    // Strict schema validation for nested unknown fields.
-    // When fieldValidation=Strict, validate nested fields against the CRD schema
-    // and reject unknown fields with K8s-format errors.
-    // K8s ref: apiextensions-apiserver/pkg/apiserver/schema/pruning — PruneWithOptions
-    if params.get("fieldValidation").map(|v| v.as_str()) == Some("Strict")
-        && !crd_preserves
-        && !schema_preserves
-    {
-        if let Some(crd_version) = crd.spec.versions.iter().find(|v| v.name == version) {
-            if let Some(ref validation) = crd_version.schema {
-                if let Some(ref properties) = validation.open_apiv3_schema.properties {
-                    if let Some(spec_schema) = properties.get("spec") {
-                        if let Some(ref spec) = cr.spec {
-                            SchemaValidator::validate_strict(spec_schema, spec, "spec")?;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Apply schema defaults before validation
-    apply_schema_defaults(&crd, &version, &mut cr);
-
-    // Validate the resource against CRD schema
-    validate_custom_resource(&crd, &version, &cr)?;
-
-    // Check authorization
-    let attrs = if let Some(ref ns) = namespace {
-        RequestAttributes::new(auth_ctx.user.clone(), "create", &plural)
-            .with_api_group(&group)
-            .with_namespace(ns)
-    } else {
-        RequestAttributes::new(auth_ctx.user.clone(), "create", &plural).with_api_group(&group)
-    };
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Ensure metadata fields
-    cr.metadata.ensure_uid();
-    cr.metadata.ensure_creation_timestamp();
-
-    // Set API version and kind
-    let kind = crd.spec.names.kind.clone();
-    cr.api_version = format!("{}/{}", group, version);
-    cr.kind = kind.clone();
-
-    // Run admission webhooks (mutating + validating) for custom resources
-    // K8s runs webhooks for ALL resource types including CRDs
-    let cr_is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    {
-        let gvk = rusternetes_common::admission::GroupVersionKind {
-            group: group.clone(),
-            version: version.clone(),
-            kind: kind.clone(),
-        };
-        let gvr = rusternetes_common::admission::GroupVersionResource {
-            group: group.clone(),
-            version: version.clone(),
-            resource: plural.clone(),
-        };
-        let user_info = rusternetes_common::admission::UserInfo {
-            username: auth_ctx.user.username.clone(),
-            uid: auth_ctx.user.uid.clone(),
-            groups: auth_ctx.user.groups.clone(),
-        };
-        let cr_val = serde_json::to_value(&cr).ok();
-        // Run mutating webhooks
-        let (mutation_response, mutated_obj) = state
-            .webhook_manager
-            .run_mutating_webhooks_with_dryrun(
-                &rusternetes_common::admission::Operation::Create,
-                &gvk,
-                &gvr,
-                namespace.as_deref(),
-                &cr_name,
-                cr_val.clone(),
-                None,
-                &user_info,
-                cr_is_dry_run,
-            )
-            .await?;
-        // K8s mutating webhooks CAN deny — enforce the denial.
-        if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = &mutation_response {
-            return Err(rusternetes_common::Error::Forbidden(format!(
-                "admission webhook denied the request: {}",
-                reason
-            )));
-        }
-        if let Some(mutated) = mutated_obj {
-            if let Ok(m) = serde_json::from_value::<CustomResource>(mutated) {
-                cr = m;
-            }
-        }
-        // Run validating webhooks
-        if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
-            .webhook_manager
-            .run_validating_webhooks_with_dryrun(
-                &rusternetes_common::admission::Operation::Create,
-                &gvk,
-                &gvr,
-                namespace.as_deref(),
-                &cr_name,
-                serde_json::to_value(&cr).ok(),
-                None,
-                &user_info,
-                cr_is_dry_run,
-            )
-            .await?
-        {
-            return Err(rusternetes_common::Error::Forbidden(format!(
-                "admission webhook denied the request: {}",
-                reason
-            )));
-        }
-    }
-
-    // K8s structural pruning: remove unknown fields from the CR based on
-    // the CRD schema, unless x-kubernetes-preserve-unknown-fields is set.
-    // This happens AFTER webhook mutation so webhook-added fields not in
-    // the schema are pruned. K8s ref: apiextensions-apiserver/pkg/apiserver/schema/pruning
-    prune_custom_resource(&crd, &version, &mut cr);
-
-    // Check for dry-run
-    if cr_is_dry_run {
-        return Ok((StatusCode::OK, Json(cr)));
-    }
-
-    // Build storage key
-    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
-    let key = if let Some(ref ns) = namespace {
-        build_key(&resource_type, Some(ns), &cr_name)
-    } else {
-        build_key(&resource_type, None, &cr_name)
-    };
-
-    let created = state.storage.create(&key, &cr).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
 /// Get a specific custom resource instance
@@ -313,54 +169,17 @@ pub async fn get_custom_resource(
         Option<String>,
         String,
     )>,
-) -> Result<Json<CustomResource>> {
-    info!(
-        "Getting custom resource {}/{}/{}: {}",
-        group, version, plural, name
-    );
-
-    // Find the CRD for this resource type
-    let crd_name = format!("{}.{}", plural, group);
-    let crd = get_crd_for_resource(&state, &crd_name).await?;
-
-    // Check authorization
-    let attrs = if let Some(ref ns) = namespace {
-        RequestAttributes::new(auth_ctx.user.clone(), "get", &plural)
-            .with_api_group(&group)
-            .with_namespace(ns)
-            .with_name(&name)
-    } else {
-        RequestAttributes::new(auth_ctx.user, "get", &plural)
-            .with_api_group(&group)
-            .with_name(&name)
-    };
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Build storage key
-    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
-    let key = if let Some(ref ns) = namespace {
-        build_key(&resource_type, Some(ns), &name)
-    } else {
-        build_key(&resource_type, None, &name)
-    };
-
-    let mut cr: CustomResource = state.storage.get(&key).await?;
-
-    // Apply schema defaults on read (K8s "defaulting on read")
-    apply_schema_defaults(&crd, &version, &mut cr);
-
-    // Convert the CR if the request version differs from the stored version.
-    // For `Webhook` strategy this round-trips through the configured webhook;
-    // for the default `None` strategy this just rewrites `apiVersion`.
-    cr = crate::conversion::convert_custom_resource(&crd, cr, &version, &state.storage).await?;
-
-    Ok(Json(cr))
+) -> Result<Response> {
+    info!("Getting custom resource {group}/{version}/{plural}: {name}");
+    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    endpoints::get_resource(
+        &state,
+        &scope(&state, &crd, &version, None, StrictMode::Off),
+        &auth_ctx.user,
+        namespace.as_deref(),
+        &name,
+    )
+    .await
 }
 
 /// List custom resource instances
@@ -451,116 +270,36 @@ pub async fn list_custom_resources(
 /// The dynamic client's `DeleteCollection` (used by the
 /// `CustomResourceFieldSelectors` conformance test) issues
 /// `DELETE /apis/{group}/{version}/namespaces/{ns}/{plural}?fieldSelector=...`.
-/// Without this handler that path matched no route and returned a bare 404
-/// ("the server could not find the requested resource").
-///
-/// Mirrors [`list_custom_resources`]'s pipeline so a field selector targeting a
-/// non-storage version (e.g. `host=host1,port=80` on `v2` while the stored
-/// version is `v1`) selects against the *requested-version* field layout:
-/// validate selectable paths -> default -> convert -> apply label/field
-/// selectors -> delete each match by name (the storage key is
-/// version-independent). Honours finalizers per item like the built-in
-/// `deletecollection_*` handlers.
+/// `CustomResourceRest::delete_collection` runs LIST's pipeline (selectable
+/// paths -> default -> convert -> label/field selectors) so a field selector
+/// on a non-storage version selects against the requested version's layout.
 // Called directly by the CRD fallback rather than routed, so the request parts
-// arrive as plain arguments instead of extractors -- adding the decoded
-// DeleteOptions takes it to eight. Grouping them into a struct would only move
-// the same fields behind one name at the single call site.
+// arrive as plain arguments instead of extractors.
 #[allow(clippy::too_many_arguments)]
 pub async fn deletecollection_custom_resources(
     state: Arc<ApiServerState>,
     auth_ctx: AuthContext,
-    // Not an axum handler: the CRD fallback calls this directly, so the
-    // decoded DeleteOptions arrive as a plain argument rather than an
-    // `Extension` extractor.
-    delete_opts: rusternetes_middleware::DeleteOptionsCtx,
     group: String,
     version: String,
     plural: String,
     namespace: Option<String>,
     params: HashMap<String, String>,
-) -> Result<StatusCode> {
+    body: Bytes,
+) -> Result<Response> {
     info!(
         "DeleteCollection custom resources {}/{}/{} (ns={:?}) params={:?}",
         group, version, plural, namespace, params
     );
-
-    // Find the CRD for this resource type
-    let crd_name = format!("{plural}.{group}");
-    let crd = get_crd_for_resource(&state, &crd_name).await?;
-
-    // Check authorization
-    let attrs = if let Some(ref ns) = namespace {
-        RequestAttributes::new(auth_ctx.user.clone(), "deletecollection", &plural)
-            .with_api_group(&group)
-            .with_namespace(ns)
-    } else {
-        RequestAttributes::new(auth_ctx.user.clone(), "deletecollection", &plural)
-            .with_api_group(&group)
-    };
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Same selectable-path gate LIST applies.
-    if let Some(fs) = params.get("fieldSelector").filter(|s| !s.is_empty()) {
-        validate_field_selector_paths(&crd, &version, fs)?;
-    }
-
-    // Build storage prefix and load the collection.
-    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
-    let prefix = if let Some(ref ns) = namespace {
-        build_prefix(&resource_type, Some(ns))
-    } else {
-        build_prefix(&resource_type, None)
-    };
-    let mut crs: Vec<CustomResource> = state.storage.list(&prefix).await?;
-
-    // Default + convert to the requested version, then filter — mirrors LIST so
-    // the field selector matches the requested-version layout.
-    for cr in &mut crs {
-        apply_schema_defaults(&crd, &version, cr);
-    }
-    crs = crate::conversion::convert_custom_resources(&crd, crs, &version, &state.storage).await?;
-    crate::handlers::filtering::apply_selectors(&mut crs, &params)?;
-
-    // Dry-run: report success without deleting.
-    if crate::handlers::dryrun::is_dry_run(&params) {
-        info!(
-            "Dry-run: would delete {} custom resources matching selectors",
-            crs.len()
-        );
-        return Ok(StatusCode::OK);
-    }
-
-    // Delete each matching resource by name (storage key is version-independent).
-    let mut deleted_count = 0;
-    for cr in &crs {
-        let key = if let Some(ref ns) = namespace {
-            build_key(&resource_type, Some(ns), &cr.metadata.name)
-        } else {
-            build_key(&resource_type, None, &cr.metadata.name)
-        };
-        let has_finalizers = crate::handlers::finalizers::handle_delete_with_finalizers(
-            &*state.storage,
-            &key,
-            cr,
-            &delete_opts,
-        )
-        .await?;
-        if !has_finalizers {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} custom resources deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
+    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    endpoints::delete_collection(
+        &state,
+        &scope(&state, &crd, &version, None, StrictMode::Off),
+        &auth_ctx.user,
+        namespace.as_deref(),
+        &params,
+        &body,
+    )
+    .await
 }
 
 /// Watch custom resources, converting every streamed object to the requested
@@ -667,7 +406,7 @@ pub async fn watch_custom_resources(
 /// `metadata.name` / `metadata.namespace` nor declared in the CRD version's
 /// `x-kubernetes-selectable-fields`. Mirrors the upstream apiextensions
 /// validator that gates which CR paths the apiserver indexes.
-fn validate_field_selector_paths(
+pub(crate) fn validate_field_selector_paths(
     crd: &CustomResourceDefinition,
     version: &str,
     field_selector: &str,
@@ -721,206 +460,38 @@ pub async fn update_custom_resource(
     )>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
     body: Bytes,
-) -> Result<Json<CustomResource>> {
-    // Parse the body manually so we can do strict field validation against the raw bytes
-    let mut cr: CustomResource = rusternetes_common::dump::decode_request_body(&body)?;
-
-    info!(
-        "Updating custom resource {}/{}/{}: {}",
-        group, version, plural, name
-    );
-
-    // A PUT to a custom resource that does not exist is a 404, not a create:
-    // "AllowCreateOnUpdate is false for CustomResources; this means a POST is
-    // needed to create one"
-    // (apiextensions-apiserver/pkg/registry/customresource/strategy.go:262-266).
-    // The key is rebuilt below, where the write happens; this early copy keeps
-    // the check ahead of validation, as upstream's is (#1905).
-    {
-        let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
-        let key = match namespace.as_deref() {
-            Some(ns) => build_key(&resource_type, Some(ns), &name),
-            None => build_key(&resource_type, None, &name),
-        };
-        crate::handlers::lifecycle::reject_create_on_update(
-            &*state.storage,
-            &key,
-            &group,
-            &plural,
-            &name,
-        )
-        .await?;
-    }
-
-    // Strict field validation: reject unknown top-level fields for CRDs
-    let is_strict = params.get("fieldValidation").map(|v| v.as_str()) == Some("Strict");
-    if is_strict && !cr.extra.is_empty() {
-        let unknown: Vec<&String> = cr.extra.keys().collect();
-        return Err(rusternetes_common::Error::InvalidResource(format!(
-            "strict decoding error: unknown field \"{}\"",
-            unknown[0]
-        )));
-    }
-    crate::handlers::validation::validate_strict_fields(&params, &body, &cr)?;
-
-    // Find the CRD for this resource type
-    let crd_name = format!("{}.{}", plural, group);
-    let crd = get_crd_for_resource(&state, &crd_name).await?;
-
-    // Strict schema validation for nested unknown fields
-    if is_strict {
-        let crd_preserves = crd.spec.preserve_unknown_fields == Some(true);
-        let schema_preserves = crd
-            .spec
-            .versions
-            .iter()
-            .find(|v| v.name == version)
-            .and_then(|v| v.schema.as_ref())
-            .map(|s| s.open_apiv3_schema.x_kubernetes_preserve_unknown_fields == Some(true))
-            .unwrap_or(false);
-        if !crd_preserves && !schema_preserves {
-            if let Some(crd_version) = crd.spec.versions.iter().find(|v| v.name == version) {
-                if let Some(ref validation) = crd_version.schema {
-                    if let Some(ref properties) = validation.open_apiv3_schema.properties {
-                        if let Some(spec_schema) = properties.get("spec") {
-                            if let Some(ref spec) = cr.spec {
-                                SchemaValidator::validate_strict(spec_schema, spec, "spec")?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Apply schema defaults before validation
-    apply_schema_defaults(&crd, &version, &mut cr);
-
-    // Load the prior version so transition rules (`oldSelf`) can be evaluated.
-    // Missing prior versions are not an error — the resource may be PUTting
-    // a fresh object (which K8s allows as create-on-PUT for some clients).
-    let resource_type_for_lookup = format!("{}_{}", group.replace('.', "_"), plural);
-    let old_key = if let Some(ref ns) = namespace {
-        build_key(&resource_type_for_lookup, Some(ns), &name)
-    } else {
-        build_key(&resource_type_for_lookup, None, &name)
-    };
-    let old_cr: Option<CustomResource> = state.storage.get(&old_key).await.ok();
-
-    // Validate the resource against CRD schema + CEL rules
-    validate_custom_resource_with_old(&crd, &version, &cr, old_cr.as_ref())?;
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. Custom resources own and are
-    // owned like any other object, so storing the client's blanks orphans
-    // children and lets the garbage collector delete them (#1605, #1793).
-    // Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146) — custom resources
-    // included, since they go through the same generic registry store.
-    if let Some(ref stored) = old_cr {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut cr.metadata,
-            &stored.metadata,
-        );
-    }
-
-    // Check authorization
-    let attrs = if let Some(ref ns) = namespace {
-        RequestAttributes::new(auth_ctx.user.clone(), "update", &plural)
-            .with_api_group(&group)
-            .with_namespace(ns)
-            .with_name(&name)
-    } else {
-        RequestAttributes::new(auth_ctx.user, "update", &plural)
-            .with_api_group(&group)
-            .with_name(&name)
-    };
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Ensure name matches
-    cr.metadata.name = name.clone();
-    cr.api_version = format!("{}/{}", group, version);
-    cr.kind = crd.spec.names.kind.clone();
-
-    let cr_is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Run validating webhooks for UPDATE operations.
-    // K8s runs webhooks on all mutating operations (CREATE, UPDATE, DELETE),
-    // and webhooks fire even for dry-run requests so deny decisions are honored.
-    {
-        use rusternetes_common::admission::{
-            AdmissionResponse, GroupVersionKind, GroupVersionResource, Operation,
-        };
-        let gvk = GroupVersionKind {
-            group: group.clone(),
-            version: version.clone(),
-            kind: cr.kind.clone(),
-        };
-        let gvr = GroupVersionResource {
-            group: group.clone(),
-            version: version.clone(),
-            resource: plural.clone(),
-        };
-        let user_info = rusternetes_common::admission::UserInfo {
-            username: "admin".to_string(),
-            uid: "system:admin".to_string(),
-            groups: vec!["system:masters".to_string()],
-        };
-        let cr_value = serde_json::to_value(&cr).ok();
-        if let AdmissionResponse::Deny(reason) = state
-            .webhook_manager
-            .run_validating_webhooks_with_dryrun(
-                &Operation::Update,
-                &gvk,
-                &gvr,
-                namespace.as_deref(),
-                &name,
-                cr_value,
-                None,
-                &user_info,
-                cr_is_dry_run,
-            )
-            .await?
-        {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Skip persistence for dry-run after webhooks have run.
-    if cr_is_dry_run {
-        return Ok(Json(cr));
-    }
-
-    // Build storage key
-    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
-    let key = if let Some(ref ns) = namespace {
-        build_key(&resource_type, Some(ns), &name)
-    } else {
-        build_key(&resource_type, None, &name)
-    };
-
-    let updated = state.storage.update(&key, &cr).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &updated,
+) -> Result<Response> {
+    info!("Updating custom resource {group}/{version}/{plural}: {name}");
+    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    endpoints::update_resource(
+        &state,
+        &scope(&state, &crd, &version, None, strict_mode(&params, false)),
+        &auth_ctx.user,
+        namespace.as_deref(),
+        &name,
+        &params,
+        &body,
     )
-    .await?;
-
-    Ok(Json(updated))
+    .await
 }
 
-/// Patch a custom resource instance (JSON Patch, JSON Merge Patch, or Strategic Merge Patch)
+/// Read the parts of a PATCH request the endpoint handler needs.
+async fn patch_request(
+    req: axum::extract::Request,
+) -> Result<(HashMap<String, String>, String, Bytes)> {
+    let (parts, body) = req.into_parts();
+    let body = axum::body::to_bytes(body, usize::MAX).await.map_err(|e| {
+        rusternetes_common::Error::BadRequest(format!("Failed to read patch body: {e}"))
+    })?;
+    Ok((
+        query_params(&parts.uri),
+        patch_content_type(&parts.headers),
+        body,
+    ))
+}
+
+/// Patch a custom resource instance (JSON Patch, JSON Merge Patch, or
+/// server-side apply)
 pub async fn patch_custom_resource(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -932,314 +503,21 @@ pub async fn patch_custom_resource(
         String,
     )>,
     req: axum::extract::Request,
-) -> Result<Json<CustomResource>> {
-    use axum::body::to_bytes;
-
-    info!(
-        "Patching custom resource {}/{}/{}: {}",
-        group, version, plural, name
-    );
-
-    // Find the CRD for this resource type
-    let crd_name = format!("{}.{}", plural, group);
-    let crd = get_crd_for_resource(&state, &crd_name).await?;
-
-    // Check authorization
-    let attrs = if let Some(ref ns) = namespace {
-        RequestAttributes::new(auth_ctx.user.clone(), "patch", &plural)
-            .with_api_group(&group)
-            .with_namespace(ns)
-            .with_name(&name)
-    } else {
-        RequestAttributes::new(auth_ctx.user, "patch", &plural)
-            .with_api_group(&group)
-            .with_name(&name)
-    };
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Get the current resource
-    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
-    let key = if let Some(ref ns) = namespace {
-        build_key(&resource_type, Some(ns), &name)
-    } else {
-        build_key(&resource_type, None, &name)
-    };
-
-    // Get current resource (may not exist for server-side apply)
-    let current_result: rusternetes_common::Result<CustomResource> = state.storage.get(&key).await;
-
-    // Split request into parts to avoid borrow/move conflict
-    let (parts, body) = req.into_parts();
-
-    // Get Content-Type header to determine patch type
-    // Check X-Original-Content-Type first (set by middleware when normalizing)
-    let content_type = parts
-        .headers
-        .get("x-original-content-type")
-        .or_else(|| parts.headers.get(axum::http::header::CONTENT_TYPE))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json-patch+json");
-
-    // Read the patch body
-    let body_bytes = to_bytes(body, usize::MAX).await.map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("Failed to read patch body: {}", e))
-    })?;
-
-    // Parse body as JSON or YAML depending on content type
-    let patch_value: serde_json::Value = if content_type.contains("yaml") {
-        // YAML body (server-side apply uses application/apply-patch+yaml)
-        // Check for duplicate keys in strict mode (K8s uses Go yaml.v2 which
-        // reports "key already set in map")
-        let is_strict = parts
-            .uri
-            .query()
-            .and_then(|q| {
-                url::form_urlencoded::parse(q.as_bytes())
-                    .find(|(k, _)| k == "fieldValidation")
-                    .map(|(_, v)| v.to_string())
-            })
-            .as_deref()
-            == Some("Strict");
-        if is_strict {
-            if let Ok(yaml_str) = std::str::from_utf8(&body_bytes) {
-                // Simple duplicate key detection: parse YAML lines looking for
-                // repeated keys at the same indentation level
-                let mut seen_keys: std::collections::HashMap<(usize, String), usize> =
-                    std::collections::HashMap::new();
-                for (line_num, line) in yaml_str.lines().enumerate() {
-                    let trimmed = line.trim_start();
-                    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
-                        continue;
-                    }
-                    let indent = line.len() - trimmed.len();
-                    if let Some(colon_pos) = trimmed.find(':') {
-                        let key = trimmed[..colon_pos].trim().trim_matches('"');
-                        if !key.is_empty() && !key.contains(' ') {
-                            let map_key = (indent, key.to_string());
-                            if let Some(_prev_line) = seen_keys.get(&map_key) {
-                                return Err(rusternetes_common::Error::InvalidResource(format!(
-                                    "line {}: key {:?} already set in map",
-                                    line_num + 1,
-                                    key
-                                )));
-                            }
-                            // Clear keys at deeper indentation when we encounter a new key
-                            seen_keys.retain(|(ind, _), _| *ind <= indent);
-                            seen_keys.insert(map_key, line_num + 1);
-                        }
-                    }
-                }
-            }
-        }
-        serde_yaml::from_slice(&body_bytes).map_err(|e| {
-            rusternetes_common::Error::InvalidResource(format!("Invalid patch YAML: {}", e))
-        })?
-    } else {
-        serde_json::from_slice(&body_bytes).map_err(|e| {
-            rusternetes_common::Error::InvalidResource(format!("Invalid patch JSON: {}", e))
-        })?
-    };
-
-    // For server-side apply (application/apply-patch+yaml), create if not found
-    let is_apply = content_type.contains("apply-patch");
-
-    let patched_json = if let Ok(current) = &current_result {
-        // Resource exists — apply patch
-        let current_json = serde_json::to_value(current).map_err(|e| {
-            rusternetes_common::Error::Internal(format!(
-                "Failed to serialize current resource: {}",
-                e
-            ))
-        })?;
-        let patch_type = crate::patch::PatchType::from_content_type(content_type).map_err(|e| {
-            rusternetes_common::Error::InvalidResource(format!(
-                "Unsupported patch content type: {}",
-                e
-            ))
-        })?;
-        crate::patch::apply_patch(&current_json, &patch_value, patch_type).map_err(|e| {
-            rusternetes_common::Error::InvalidResource(format!("Failed to apply patch: {}", e))
-        })?
-    } else if is_apply {
-        // Resource doesn't exist + server-side apply = create from patch body
-        patch_value.clone()
-    } else {
-        // Resource doesn't exist + regular patch = error
-        return Err(current_result.unwrap_err());
-    };
-
-    // Deserialize the patched JSON back to CustomResource
-    let mut patched: CustomResource = serde_json::from_value(patched_json).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!(
-            "Failed to deserialize patched resource: {}",
-            e
-        ))
-    })?;
-
-    // Strict field validation for patched CRDs: reject unknown top-level fields
-    // when the CRD does NOT have preserveUnknownFields.
-    // K8s prunes unknown fields and returns them as errors with fieldValidation=Strict.
-    let is_strict = parts
-        .uri
-        .query()
-        .and_then(|q| {
-            url::form_urlencoded::parse(q.as_bytes())
-                .find(|(k, _)| k == "fieldValidation")
-                .map(|(_, v)| v.to_string())
-        })
-        .as_deref()
-        == Some("Strict");
-    if is_strict && !patched.extra.is_empty() {
-        let crd_preserves = crd.spec.preserve_unknown_fields == Some(true);
-        if !crd_preserves {
-            let unknown: Vec<&String> = patched.extra.keys().collect();
-            return Err(rusternetes_common::Error::InvalidResource(format!(
-                ".{}: field not declared in schema",
-                unknown[0]
-            )));
-        }
-    }
-    // Also validate embedded metadata fields in the patched result
-    if is_strict {
-        let patched_value = serde_json::to_value(&patched).unwrap_or_default();
-        const KNOWN_META: &[&str] = &[
-            "name",
-            "generateName",
-            "namespace",
-            "selfLink",
-            "uid",
-            "resourceVersion",
-            "generation",
-            "creationTimestamp",
-            "deletionTimestamp",
-            "deletionGracePeriodSeconds",
-            "labels",
-            "annotations",
-            "ownerReferences",
-            "finalizers",
-            "managedFields",
-            "clusterName",
-        ];
-        fn check_embedded_meta(
-            value: &serde_json::Value,
-            path: &str,
-            known: &[&str],
-        ) -> Option<String> {
-            if let Some(obj) = value.as_object() {
-                if let Some(meta) = obj.get("metadata").and_then(|m| m.as_object()) {
-                    let mp = if path.is_empty() {
-                        ".metadata".to_string()
-                    } else {
-                        format!("{}.metadata", path)
-                    };
-                    for key in meta.keys() {
-                        if !known.contains(&key.as_str()) {
-                            return Some(format!("{}.{}: field not declared in schema", mp, key));
-                        }
-                    }
-                }
-                for (key, val) in obj {
-                    if key == "metadata" {
-                        continue;
-                    }
-                    let cp = if path.is_empty() {
-                        format!(".{}", key)
-                    } else {
-                        format!("{}.{}", path, key)
-                    };
-                    if let Some(err) = check_embedded_meta(val, &cp, known) {
-                        return Some(err);
-                    }
-                }
-            } else if let Some(arr) = value.as_array() {
-                for item in arr {
-                    if let Some(err) = check_embedded_meta(item, path, known) {
-                        return Some(err);
-                    }
-                }
-            }
-            None
-        }
-        if let Some(err_msg) = check_embedded_meta(&patched_value, "", KNOWN_META) {
-            return Err(rusternetes_common::Error::InvalidResource(err_msg));
-        }
-    }
-
-    // Strict schema validation for nested unknown fields in patched resource
-    if is_strict {
-        let crd_preserves = crd.spec.preserve_unknown_fields == Some(true);
-        let schema_preserves = crd
-            .spec
-            .versions
-            .iter()
-            .find(|v| v.name == version)
-            .and_then(|v| v.schema.as_ref())
-            .map(|s| s.open_apiv3_schema.x_kubernetes_preserve_unknown_fields == Some(true))
-            .unwrap_or(false);
-        if !crd_preserves && !schema_preserves {
-            if let Some(crd_version) = crd.spec.versions.iter().find(|v| v.name == version) {
-                if let Some(ref validation) = crd_version.schema {
-                    if let Some(ref properties) = validation.open_apiv3_schema.properties {
-                        if let Some(spec_schema) = properties.get("spec") {
-                            if let Some(ref spec) = patched.spec {
-                                SchemaValidator::validate_strict(spec_schema, spec, "spec")?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Validate the patched resource against CRD schema + CEL rules.
-    // Pass the prior version (when one exists — server-side apply may create)
-    // so transition rules are evaluated.
-    validate_custom_resource_with_old(&crd, &version, &patched, current_result.as_ref().ok())?;
-
-    // Ensure name matches
-    patched.metadata.name = name.clone();
-    patched.api_version = format!("{}/{}", group, version);
-    patched.kind = crd.spec.names.kind.clone();
-
-    // Update or create the resource in storage
-    let updated: CustomResource = if current_result.is_ok() {
-        state.storage.update(&key, &patched).await?
-    } else {
-        // Server-side apply creates new resource
-        patched.metadata.ensure_uid();
-        patched.metadata.ensure_creation_timestamp();
-        state.storage.create(&key, &patched).await?
-    };
-
-    // Upstream's ShouldDeleteDuringUpdate: a patch that drains the last
-    // finalizer off an object already pending deletion finishes that deletion
-    // in the same request. PUT and PATCH share the rule because upstream has a
-    // single `Store.Update`, and the garbage collector relies on the PATCH side
-    // of it — `removeFinalizer` sends a merge patch
-    // (pkg/controller/garbagecollector/operations.go:141) (#1919).
-    // Only on the update branch: an object this request just created was never
-    // pending deletion.
-    if let Ok(ref current) = current_result {
-        let updated_json =
-            serde_json::to_value(&updated).map_err(rusternetes_common::Error::Serialization)?;
-        let current_json =
-            serde_json::to_value(current).map_err(rusternetes_common::Error::Serialization)?;
-        crate::handlers::finalizers::finish_deletion_if_write_drained_finalizers(
-            &state.storage,
-            &key,
-            &updated_json,
-            &current_json,
-        )
-        .await?;
-    }
-
-    Ok(Json(updated))
+) -> Result<Response> {
+    info!("Patching custom resource {group}/{version}/{plural}: {name}");
+    let (params, content_type, body) = patch_request(req).await?;
+    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, &crd, &version, None, strict_mode(&params, true)),
+        &auth_ctx.user,
+        namespace.as_deref(),
+        &name,
+        &params,
+        &content_type,
+        &body,
+    )
+    .await
 }
 
 /// Patch the status subresource of a custom resource
@@ -1254,120 +532,33 @@ pub async fn patch_custom_resource_status(
         String,
     )>,
     req: axum::extract::Request,
-) -> Result<Json<CustomResource>> {
-    use axum::body::to_bytes;
-
-    info!(
-        "Patching custom resource status {}/{}/{}: {}",
-        group, version, plural, name
-    );
-
-    // Find the CRD for this resource type
-    let crd_name = format!("{}.{}", plural, group);
-    let crd = get_crd_for_resource(&state, &crd_name).await?;
-
-    // Check if status subresource is enabled
-    let version_spec = crd
-        .spec
-        .versions
-        .iter()
-        .find(|v| v.name == version)
-        .ok_or_else(|| {
-            rusternetes_common::Error::InvalidResource(format!(
-                "Version {} not found in CRD",
-                version
-            ))
-        })?;
-
-    if version_spec.subresources.is_none()
-        || version_spec.subresources.as_ref().unwrap().status.is_none()
-    {
-        return Err(rusternetes_common::Error::InvalidResource(
-            "Status subresource not enabled for this CRD".to_string(),
-        ));
-    }
-
-    // Check authorization
-    let attrs = if let Some(ref ns) = namespace {
-        RequestAttributes::new(auth_ctx.user.clone(), "patch", &plural)
-            .with_api_group(&group)
-            .with_namespace(ns)
-            .with_name(&name)
-            .with_subresource("status")
-    } else {
-        RequestAttributes::new(auth_ctx.user, "patch", &plural)
-            .with_api_group(&group)
-            .with_name(&name)
-            .with_subresource("status")
-    };
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Get the current resource
-    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
-    let key = if let Some(ref ns) = namespace {
-        build_key(&resource_type, Some(ns), &name)
-    } else {
-        build_key(&resource_type, None, &name)
-    };
-
-    let mut current: CustomResource = state.storage.get(&key).await?;
-
-    // Split request into parts to avoid borrow/move conflict
-    let (parts, body) = req.into_parts();
-
-    // Get Content-Type header to determine patch type
-    // Check X-Original-Content-Type first (set by middleware when normalizing)
-    let content_type = parts
-        .headers
-        .get("x-original-content-type")
-        .or_else(|| parts.headers.get(axum::http::header::CONTENT_TYPE))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json-patch+json");
-
-    // Read the patch body
-    let body_bytes = to_bytes(body, usize::MAX).await.map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("Failed to read patch body: {}", e))
-    })?;
-    let patch_value: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("Invalid patch JSON: {}", e))
-    })?;
-
-    let patch_type = crate::patch::PatchType::from_content_type(content_type).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("Unsupported patch content type: {}", e))
-    })?;
-
-    // Status patches are object-relative (e.g. merge `{"status":{...}}` or
-    // JSON-Patch `/status/conditions/-`), so apply them to the FULL object and
-    // then keep only the resulting `.status` — the status subresource ignores
-    // spec/metadata changes. Applying an object-relative patch directly to the
-    // status value would nest it wrongly (`status.status.…`).
-    let full = serde_json::to_value(&current).map_err(|e| {
-        rusternetes_common::Error::Internal(format!("Failed to serialize resource: {}", e))
-    })?;
-    let patched_full = crate::patch::apply_patch(&full, &patch_value, patch_type).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("Failed to apply status patch: {}", e))
-    })?;
-
-    // Update only the status field
-    current.status = patched_full.get("status").cloned();
-
-    // Save the updated resource
-    let updated = state.storage.update(&key, &current).await?;
-
-    Ok(Json(updated))
+) -> Result<Response> {
+    info!("Patching custom resource status {group}/{version}/{plural}: {name}");
+    let (params, content_type, body) = patch_request(req).await?;
+    let crd = serving_crd(&state, &group, &version, &plural, Some("status")).await?;
+    endpoints::patch_resource(
+        &state,
+        &scope(
+            &state,
+            &crd,
+            &version,
+            Some("status"),
+            strict_mode(&params, true),
+        ),
+        &auth_ctx.user,
+        namespace.as_deref(),
+        &name,
+        &params,
+        &content_type,
+        &body,
+    )
+    .await
 }
 
 /// Delete a custom resource instance
 pub async fn delete_custom_resource(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path((group, version, plural, namespace, name)): Path<(
         String,
         String,
@@ -1376,117 +567,20 @@ pub async fn delete_custom_resource(
         String,
     )>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
-) -> Result<Json<CustomResource>> {
-    info!(
-        "Deleting custom resource {}/{}/{}: {}",
-        group, version, plural, name
-    );
-
-    // Find the CRD for this resource type
-    let crd_name = format!("{}.{}", plural, group);
-    let crd = get_crd_for_resource(&state, &crd_name).await?;
-
-    // Check authorization
-    let user_for_webhook = auth_ctx.user.clone();
-    let attrs = if let Some(ref ns) = namespace {
-        RequestAttributes::new(auth_ctx.user.clone(), "delete", &plural)
-            .with_api_group(&group)
-            .with_namespace(ns)
-            .with_name(&name)
-    } else {
-        RequestAttributes::new(auth_ctx.user, "delete", &plural)
-            .with_api_group(&group)
-            .with_name(&name)
-    };
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Build storage key
-    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
-    let key = if let Some(ref ns) = namespace {
-        build_key(&resource_type, Some(ns), &name)
-    } else {
-        build_key(&resource_type, None, &name)
-    };
-
-    // Get the resource to check if it exists
-    let cr: CustomResource = state.storage.get(&key).await?;
-
-    // Run validating webhooks for DELETE operations.
-    // K8s runs validating admission (including webhooks) before deletion.
-    // Mutating webhooks are NOT called on DELETE in K8s — only validating.
-    {
-        let kind = crd.spec.names.kind.clone();
-        let gvk = rusternetes_common::admission::GroupVersionKind {
-            group: group.clone(),
-            version: version.clone(),
-            kind: kind.clone(),
-        };
-        let gvr = rusternetes_common::admission::GroupVersionResource {
-            group: group.clone(),
-            version: version.clone(),
-            resource: plural.clone(),
-        };
-        let user_info = rusternetes_common::admission::UserInfo {
-            username: user_for_webhook.username.clone(),
-            uid: user_for_webhook.uid.clone(),
-            groups: user_for_webhook.groups.clone(),
-        };
-        let cr_value = serde_json::to_value(&cr).ok();
-        // K8s DELETE AdmissionReview: object is nil, oldObject has the resource being deleted.
-        // The webhook inspects oldObject to decide whether to allow deletion.
-        let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-        if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
-            .webhook_manager
-            .run_validating_webhooks_with_dryrun(
-                &rusternetes_common::admission::Operation::Delete,
-                &gvk,
-                &gvr,
-                namespace.as_deref(),
-                &name,
-                None,
-                cr_value,
-                &user_info,
-                is_dry_run,
-            )
-            .await?
-        {
-            return Err(rusternetes_common::Error::Forbidden(format!(
-                "admission webhook denied the request: {}",
-                reason
-            )));
-        }
-    }
-
-    // Check for dry-run
-    if crate::handlers::dryrun::is_dry_run(&params) {
-        info!(
-            "Dry-run: CustomResource {}/{}/{} validated successfully (not deleted)",
-            group, plural, name
-        );
-        return Ok(Json(cr));
-    }
-
-    let has_finalizers = crate::handlers::finalizers::handle_delete_with_finalizers(
-        &*state.storage,
-        &key,
-        &cr,
-        &delete_opts,
+    body: Bytes,
+) -> Result<Response> {
+    info!("Deleting custom resource {group}/{version}/{plural}: {name}");
+    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    endpoints::delete_resource(
+        &state,
+        &scope(&state, &crd, &version, None, StrictMode::Off),
+        &auth_ctx.user,
+        namespace.as_deref(),
+        &name,
+        &params,
+        &body,
     )
-    .await?;
-
-    if has_finalizers {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: CustomResource = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    } else {
-        Ok(Json(cr))
-    }
+    .await
 }
 
 /// Helper to get CRD from storage
@@ -1501,7 +595,11 @@ async fn get_crd_for_resource(
 /// Apply schema defaults from the CRD to a custom resource's spec.
 /// Walks the CRD's JSONSchemaProps and for each property with a `default`
 /// value, sets it on the CR if the field is missing.
-fn apply_schema_defaults(crd: &CustomResourceDefinition, version: &str, cr: &mut CustomResource) {
+pub(crate) fn apply_schema_defaults(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    cr: &mut CustomResource,
+) {
     // Find the version in the CRD
     let crd_version = match crd.spec.versions.iter().find(|v| v.name == version) {
         Some(v) => v,
@@ -1565,7 +663,7 @@ fn validate_custom_resource(
 /// Transition rules (those that reference `oldSelf`) are never ratcheted.
 ///
 /// Upstream: `apiextensions-apiserver/pkg/apiserver/validation/ratcheting.go`.
-fn validate_custom_resource_with_old(
+pub(crate) fn validate_custom_resource_with_old(
     crd: &CustomResourceDefinition,
     version: &str,
     cr: &CustomResource,
@@ -1815,7 +913,8 @@ fn validate_custom_resource_schema(
     Ok(())
 }
 
-/// Get the status subresource of a custom resource
+/// Get the status subresource of a custom resource: `StatusREST.Get` is the
+/// store's `Get`, so the whole object comes back (etcd.go:195-198).
 pub async fn get_custom_resource_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -1826,27 +925,22 @@ pub async fn get_custom_resource_status(
         Option<String>,
         String,
     )>,
-) -> Result<Json<serde_json::Value>> {
-    info!(
-        "Getting custom resource status {}/{}/{}: {}",
-        group, version, plural, name
-    );
-
-    // Get the full resource first
-    let cr: CustomResource = get_custom_resource(
-        State(state.clone()),
-        Extension(auth_ctx),
-        Path((group, version, plural, namespace, name)),
+) -> Result<Response> {
+    info!("Getting custom resource status {group}/{version}/{plural}: {name}");
+    let crd = serving_crd(&state, &group, &version, &plural, Some("status")).await?;
+    endpoints::get_resource(
+        &state,
+        &scope(&state, &crd, &version, Some("status"), StrictMode::Off),
+        &auth_ctx.user,
+        namespace.as_deref(),
+        &name,
     )
-    .await?
-    .0;
-
-    // Extract and return just the status field
-    let status = cr.status.unwrap_or(serde_json::Value::Null);
-    Ok(Json(status))
+    .await
 }
 
-/// Update the status subresource of a custom resource
+/// Update the status subresource of a custom resource. The request body is
+/// the full object; the status strategy persists only its `.status`
+/// (status_strategy.go:62-86).
 pub async fn update_custom_resource_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -1857,98 +951,27 @@ pub async fn update_custom_resource_status(
         Option<String>,
         String,
     )>,
-    DumpingJson(status): DumpingJson<serde_json::Value>,
-) -> Result<Json<CustomResource>> {
-    info!(
-        "Updating custom resource status {}/{}/{}: {}",
-        group, version, plural, name
-    );
-
-    // Find the CRD for this resource type
-    let crd_name = format!("{}.{}", plural, group);
-    let crd = get_crd_for_resource(&state, &crd_name).await?;
-
-    // Check if status subresource is enabled
-    let version_spec = crd
-        .spec
-        .versions
-        .iter()
-        .find(|v| v.name == version)
-        .ok_or_else(|| {
-            rusternetes_common::Error::InvalidResource(format!(
-                "Version {} not found in CRD",
-                version
-            ))
-        })?;
-
-    if version_spec.subresources.is_none()
-        || version_spec.subresources.as_ref().unwrap().status.is_none()
-    {
-        return Err(rusternetes_common::Error::InvalidResource(
-            "Status subresource not enabled for this CRD".to_string(),
-        ));
-    }
-
-    // Check authorization
-    let attrs = if let Some(ref ns) = namespace {
-        RequestAttributes::new(auth_ctx.user.clone(), "update", &plural)
-            .with_api_group(&group)
-            .with_namespace(ns)
-            .with_name(&name)
-            .with_subresource("status")
-    } else {
-        RequestAttributes::new(auth_ctx.user, "update", &plural)
-            .with_api_group(&group)
-            .with_name(&name)
-            .with_subresource("status")
-    };
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Get the existing resource
-    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
-    let key = if let Some(ref ns) = namespace {
-        build_key(&resource_type, Some(ns), &name)
-    } else {
-        build_key(&resource_type, None, &name)
-    };
-
-    // Upstream serves a subresource from the same `genericregistry.Store` as
-    // its parent, with only the strategy swapped, so `Store.Update`'s
-    // create-on-update gate applies to a status write exactly as it does to a
-    // spec write (`registry/generic/registry/store.go:646-650`). Custom
-    // resources never opt in -- `apiextensions-apiserver/pkg/registry/
-    // customresource/strategy.go:262-266` returns false unconditionally --
-    // so this is always a NotFound (#1932).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &key,
-        &group,
-        &plural,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    info!("Updating custom resource status {group}/{version}/{plural}: {name}");
+    let crd = serving_crd(&state, &group, &version, &plural, Some("status")).await?;
+    endpoints::update_resource(
+        &state,
+        &scope(
+            &state,
+            &crd,
+            &version,
+            Some("status"),
+            strict_mode(&params, false),
+        ),
+        &auth_ctx.user,
+        namespace.as_deref(),
         &name,
+        &params,
+        &body,
     )
-    .await?;
-
-    let mut cr: CustomResource = state.storage.get(&key).await?;
-
-    // K8s status subresource semantics: the request body is the FULL object;
-    // the server persists ONLY its `.status` (spec/metadata changes via this
-    // endpoint are ignored). Extract `.status` from the body — NOT the whole
-    // body. Storing the entire object as the status nests it
-    // (`status.status.conditions`), so controllers that read the resource back
-    // never see their own condition and re-reconcile forever (cert-manager's
-    // Issuer/Certificate hot-loop).
-    cr.status = status.get("status").cloned();
-
-    // Save the updated resource
-    let updated = state.storage.update(&key, &cr).await?;
-
-    Ok(Json(updated))
+    .await
 }
 
 /// Get the scale subresource of a custom resource
