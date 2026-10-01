@@ -218,12 +218,11 @@ impl<T: Object> Patcher<'_, T> {
         // there and the result goes back to the stored one (patch.go:323-338,
         // :449-462).
         let patched = match self.scope.patch_conversion {
-            None => apply_patch(&current_json, &patch, patch_type.clone())
-                .map_err(|e| Error::InvalidResource(e.to_string()))?,
+            None => apply_patch(&current_json, &patch, patch_type.clone()).map_err(patch_error)?,
             Some(conversion) => {
                 let versioned = (conversion.to_request_version)(&current_json);
-                let patched = apply_patch(&versioned, &patch, patch_type.clone())
-                    .map_err(|e| Error::InvalidResource(e.to_string()))?;
+                let patched =
+                    apply_patch(&versioned, &patch, patch_type.clone()).map_err(patch_error)?;
                 (conversion.from_request_version)(&current_json, patched)
             }
         };
@@ -324,5 +323,23 @@ impl<T: Object> TransformFunc<T> for Patcher<'_, T> {
         )?;
         check_name(&obj, self.name, self.namespace)?;
         Ok(obj)
+    }
+}
+
+/// A failed patch application. RFC 6902 §4.2 mandates that the target of a
+/// `remove` (and friends) exists; upstream reports a missing one as
+/// `field.NotFound(<path>, "")`, so the 422 carries
+/// `causes[].reason = FieldValueNotFound` with the real field path.
+fn patch_error(e: crate::patch::PatchError) -> Error {
+    use rusternetes_common::validation::field::{BadValue, ErrorType};
+    match e {
+        crate::patch::PatchError::PathNotFound(field) => Error::Invalid(vec![FieldError {
+            error_type: ErrorType::NotFound,
+            field,
+            bad_value: BadValue::Omit,
+            detail: String::new(),
+            origin: String::new(),
+        }]),
+        other => Error::InvalidResource(other.to_string()),
     }
 }

@@ -318,47 +318,58 @@ async fn the_username_prefix_alone_is_not_a_node_identity() {
 // Wiring
 // ---------------------------------------------------------------------------
 
-/// The plugin is only worth anything if the handlers call it. Upstream cannot
-/// have this gap -- admission is a chain every request passes through -- so the
-/// equivalent here is asserting the two pod write paths that the node's RBAC
-/// rules now grant (`create`, `delete`) both invoke it.
+/// The plugin is only worth anything if the pod write paths run it. Upstream
+/// cannot have this gap -- admission is a chain every request passes through --
+/// so the equivalent here is asserting that the in-tree chain the generic
+/// create and delete endpoints run for a Pod invokes it, and that the pod
+/// handlers go through those endpoints.
 ///
 /// Keyed on the mechanism (the authorizer grant), not on handler names: if a
-/// verb is added to `NODE_RULES` for pods, this test names the handler that has
+/// verb is added to `NODE_RULES` for pods, this test names the place that has
 /// to gain the check.
 #[test]
 fn the_pod_create_and_delete_handlers_apply_the_restriction() {
-    let pod_rs = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/pod.rs"),
-    )
-    .expect("read pod.rs");
-    let src = pod_rs
-        .split("\n#[cfg(test)]")
-        .next()
-        .unwrap_or("")
-        .to_string();
-
-    for (fname, call) in [
-        ("pub async fn create(", "node_restriction::admit_pod_create"),
+    let read = |rel: &str| {
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel))
+            .unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    };
+    let admission = read("src/endpoints/handlers/admission.rs");
+    for (needle, why) in [
         (
-            "pub async fn delete_pod(",
+            "node_restriction::admit_pod_create",
+            "CREATE (admission.go:277-340)",
+        ),
+        (
             "node_restriction::admit_pod_delete",
+            "DELETE (admission.go:257-270)",
         ),
     ] {
-        let start = src
+        assert!(
+            admission.contains(needle),
+            "the pod admission chain does not call {needle} for {why}. A node's \
+             RBAC rules grant create and delete on pods outright \
+             (bootstrappolicy/policy.go:215-217); without the NodeRestriction \
+             check that grant lets any node write any pod (#1906)."
+        );
+    }
+
+    let pod_rs = read("src/handlers/pod.rs");
+    for (fname, endpoint) in [
+        ("pub async fn create(", "endpoints::create_resource"),
+        ("pub async fn delete_pod(", "endpoints::delete_resource"),
+    ] {
+        let start = pod_rs
             .find(fname)
             .unwrap_or_else(|| panic!("{fname} not found in pod.rs -- the handler was renamed"));
-        let body = &src[start..];
+        let body = &pod_rs[start..];
         let end = body
             .find("\npub async fn ")
             .map(|i| i + 1)
             .unwrap_or(body.len());
         assert!(
-            body[..end].contains(call),
-            "{fname} does not call {call}. A node's RBAC rules grant create and \
-             delete on pods outright (bootstrappolicy/policy.go:215-217); \
-             without the NodeRestriction check that grant lets any node write \
-             any pod (#1906)."
+            body[..end].contains(endpoint),
+            "{fname} does not go through {endpoint}, so the admission chain \
+             (and NodeRestriction with it) would not run (#1906)."
         );
     }
 }

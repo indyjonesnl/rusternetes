@@ -9,6 +9,7 @@ pub mod namespace;
 pub mod node;
 pub mod persistentvolume;
 pub mod persistentvolumeclaim;
+pub mod pod;
 pub mod podtemplate;
 pub mod replicationcontroller;
 pub mod resourcequota;

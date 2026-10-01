@@ -42,9 +42,12 @@ fn pod(name: &str) -> Value {
         "kind": "Pod",
         "metadata": { "name": name, "namespace": "default" },
         "spec": {
-            // 30s (upstream default) keeps the handler on the graceful path:
-            // read, stamp deletionTimestamp, write. Grace 0 deletes outright
-            // and never touches the CAS window this test is about.
+            // A scheduled pod with a 30s grace period keeps the delete on the
+            // graceful path: read, stamp deletionTimestamp, write.
+            // `CheckGracefulDelete` (pkg/registry/core/pod/strategy.go:166-197)
+            // deletes an unscheduled pod, or grace 0, outright, which never
+            // touches the CAS window this test is about.
+            "nodeName": "node-1",
             "terminationGracePeriodSeconds": 30,
             "containers": [ { "name": "c", "image": "busybox" } ]
         }

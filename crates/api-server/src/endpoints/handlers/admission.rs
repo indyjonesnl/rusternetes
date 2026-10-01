@@ -17,15 +17,19 @@
 //! The in-tree plugins ahead of them run first, in `AllOrderedPlugins` order
 //! (plugins.go:69-100), for the resources on this path that they handle:
 //! LimitRanger and DefaultStorageClass, for PersistentVolumeClaims, and
-//! Priority, for PriorityClasses.
+//! Priority, for PriorityClasses. For Pods, [`Admission::admit_pod`] runs
+//! NodeRestriction, LimitRanger, ServiceAccount, Priority,
+//! DefaultTolerationSeconds and RuntimeClass, and
+//! [`Admission::validate_pod`] runs PodSecurity and the pod ResourceQuota.
 
 use async_trait::async_trait;
 use rusternetes_common::admission::{
     self, AdmissionResponse, GroupVersionKind, GroupVersionResource, Operation,
 };
 use rusternetes_common::auth::UserInfo;
-use rusternetes_common::resources::{PersistentVolumeClaim, PriorityClass};
+use rusternetes_common::resources::{PersistentVolumeClaim, Pod, PriorityClass};
 use rusternetes_common::{Error, Result};
+use rusternetes_storage::Storage;
 
 use super::rest::{authorize, RequestScope};
 use crate::admission::resourcequota;
@@ -104,6 +108,10 @@ impl Admission<'_> {
     /// handles only CREATE of a PersistentVolumeClaim. LimitRanger's `Admit`
     /// mutates only pods.
     async fn admit_in_tree<T: Object>(&self, op: &Operation, obj: T) -> Result<T> {
+        if self.is_core("pods") {
+            let pod: Pod = recast(&obj)?;
+            return recast(&self.admit_pod(op, pod).await?);
+        }
         if *op != Operation::Create || !self.is_core("persistentvolumeclaims") {
             return Ok(obj);
         }
@@ -120,10 +128,16 @@ impl Admission<'_> {
     /// old object is being deleted.
     async fn validate_in_tree<T: Object>(
         &self,
+        ctx: &RequestContext,
         op: &Operation,
         obj: Option<&T>,
         old: Option<&T>,
     ) -> Result<()> {
+        if self.is_core("pods") {
+            let obj: Option<Pod> = obj.map(recast).transpose()?;
+            let old: Option<Pod> = old.map(recast).transpose()?;
+            return self.validate_pod(ctx, op, obj.as_ref(), old.as_ref()).await;
+        }
         // `Priority` sits ahead of `LimitRanger` in `AllOrderedPlugins`
         // (plugins.go:69-100).
         self.validate_priority(op, obj).await?;
@@ -180,6 +194,250 @@ impl Admission<'_> {
         Ok(())
     }
 
+    /// The in-tree mutating plugins for a Pod, in `AllOrderedPlugins` order
+    /// (plugins.go:69-100): LimitRanger, ServiceAccount, NodeRestriction,
+    /// Priority, DefaultTolerationSeconds, RuntimeClass. NodeRestriction runs
+    /// first here, as it did before the pod handlers moved onto this chain:
+    /// it only narrows a node's requests and reads the pod as sent.
+    async fn admit_pod(&self, op: &Operation, mut pod: Pod) -> Result<Pod> {
+        let name = pod.metadata.name.clone();
+        if *op == Operation::Update {
+            // DefaultTolerationSeconds registers for Create AND Update
+            // (plugin/pkg/admission/defaulttolerationseconds/admission.go:86).
+            if let Some(spec) = pod.spec.as_mut() {
+                rusternetes_common::tolerations::add_default_tolerations(spec);
+            }
+            return Ok(pod);
+        }
+        if *op != Operation::Create {
+            return Ok(pod);
+        }
+        let Some(namespace) = self.namespace else {
+            return Ok(pod);
+        };
+        let storage = &self.state.storage;
+
+        crate::handlers::node_restriction::admit_pod_create(
+            &**storage,
+            &rusternetes_middleware::AuthContext {
+                user: self.user.clone(),
+            },
+            &pod,
+        )
+        .await?;
+
+        // LimitRanger.Admit (plugin/pkg/admission/limitranger/admission.go).
+        let limit_ranges: Vec<rusternetes_common::resources::LimitRange> = storage
+            .list(&rusternetes_storage::build_prefix(
+                "limitranges",
+                Some(namespace),
+            ))
+            .await
+            .unwrap_or_default();
+        match crate::admission::apply_limit_range_with(&mut pod, &limit_ranges) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(self.forbidden(&name, "Pod violates LimitRange constraints"));
+            }
+            Err(e) => {
+                tracing::warn!("Error checking LimitRange for pod {namespace}/{name}: {e}");
+            }
+        }
+
+        // ServiceAccount.Admit: a failure to inject does not fail the pod.
+        if let Err(e) =
+            crate::admission::inject_service_account_token(storage, namespace, &mut pod).await
+        {
+            tracing::warn!("Error injecting service account token for pod {namespace}/{name}: {e}");
+        }
+
+        self.admit_pod_priority(&mut pod).await?;
+
+        // DefaultTolerationSeconds: the NotReady/Unreachable NoExecute
+        // tolerations (tolerationSeconds: 300), unless the pod has them.
+        if let Some(spec) = pod.spec.as_mut() {
+            rusternetes_common::tolerations::add_default_tolerations(spec);
+        }
+
+        // RuntimeClass.Admit (plugin/pkg/admission/runtimeclass/admission.go):
+        // the class must exist, and its overhead is set on the pod.
+        let runtime_class = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.runtime_class_name.clone())
+            .filter(|n| !n.is_empty());
+        if let Some(rc_name) = runtime_class {
+            let rc_key = rusternetes_storage::build_key("runtimeclasses", None, &rc_name);
+            let Ok(rc) = storage.get::<serde_json::Value>(&rc_key).await else {
+                return Err(self.forbidden(
+                    &name,
+                    format!("pod {name} references non-existent RuntimeClass \"{rc_name}\""),
+                ));
+            };
+            let overhead: std::collections::HashMap<String, String> = rc
+                .pointer("/overhead/podFixed")
+                .and_then(|o| o.as_object())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !overhead.is_empty() {
+                if let Some(spec) = pod.spec.as_mut() {
+                    spec.overhead = Some(overhead);
+                }
+            }
+        }
+        Ok(pod)
+    }
+
+    /// `Priority.Admit` for a Pod (plugin/pkg/admission/priority/admission.go:
+    /// 162-201): `spec.priority` is the one the PriorityClass names, and a
+    /// request that sets a different one is refused.
+    async fn admit_pod_priority(&self, pod: &mut Pod) -> Result<()> {
+        let name = pod.metadata.name.clone();
+        let storage = &self.state.storage;
+        let Some(spec) = pod.spec.as_mut() else {
+            return Ok(());
+        };
+        let mut priority: i32 = 0;
+        let mut preemption_policy: Option<String> = None;
+        match spec.priority_class_name.clone() {
+            Some(pc_name) if !pc_name.is_empty() => {
+                let pc_key = format!("/registry/priorityclasses/{pc_name}");
+                match storage.get::<serde_json::Value>(&pc_key).await {
+                    Ok(pc) => {
+                        priority = pc.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                        preemption_policy = pc
+                            .get("preemptionPolicy")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                    }
+                    Err(Error::NotFound(_)) => {
+                        return Err(self.forbidden(
+                            &name,
+                            format!("no PriorityClass with name {pc_name} was found"),
+                        ));
+                    }
+                    Err(_) => {}
+                }
+            }
+            Some(_) => {}
+            None => {
+                // No priorityClassName: the globalDefault class, if any.
+                let classes: Vec<serde_json::Value> = storage
+                    .list("/registry/priorityclasses/")
+                    .await
+                    .unwrap_or_default();
+                if let Some(pc) = classes.iter().find(|pc| {
+                    pc.get("globalDefault")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                }) {
+                    priority = pc.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    preemption_policy = pc
+                        .get("preemptionPolicy")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    if let Some(n) = pc.pointer("/metadata/name").and_then(|n| n.as_str()) {
+                        spec.priority_class_name = Some(n.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(existing) = spec.priority {
+            if existing != priority {
+                return Err(self.forbidden(
+                    &name,
+                    format!(
+                        "the integer value of priority ({existing}) must not be provided in pod spec; priority admission controller computed {priority} from the given PriorityClass name"
+                    ),
+                ));
+            }
+        }
+        spec.priority = Some(priority);
+        if spec.preemption_policy.is_none() {
+            spec.preemption_policy = preemption_policy;
+        }
+        Ok(())
+    }
+
+    /// The in-tree validating plugins for a Pod: NodeRestriction on DELETE
+    /// (admission.go:257-270), PodSecurity on CREATE, and the pod
+    /// ResourceQuota evaluator.
+    async fn validate_pod(
+        &self,
+        ctx: &RequestContext,
+        op: &Operation,
+        obj: Option<&Pod>,
+        old: Option<&Pod>,
+    ) -> Result<()> {
+        let name = obj
+            .or(old)
+            .map(|p| p.metadata.name.clone())
+            .unwrap_or_default();
+        let storage = &self.state.storage;
+        match op {
+            Operation::Delete => {
+                if let Some(old) = old {
+                    crate::handlers::node_restriction::admit_pod_delete(
+                        &rusternetes_middleware::AuthContext {
+                            user: self.user.clone(),
+                        },
+                        old,
+                    )?;
+                }
+            }
+            Operation::Create => {
+                if let (Some(pod), Some(namespace)) = (obj, self.namespace) {
+                    crate::admission::PodSecurityAdmission::new()
+                        .admit(storage, namespace, pod)
+                        .await?;
+                }
+            }
+            _ => {}
+        }
+
+        // The pod evaluator (pkg/quota/v1/evaluator/core/pods.go:179-199)
+        // handles CREATE, and an UPDATE only when the pod moves between
+        // quota scopes. The namespace lock is held until the pod is stored.
+        let (Some(pod), Some(namespace)) = (obj, self.namespace) else {
+            return Ok(());
+        };
+        match (op, old) {
+            (Operation::Create, _) => {
+                ctx.hold(crate::admission::lock_namespace_quota(namespace).await);
+                match crate::admission::check_resource_quota(storage, namespace, pod).await {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(self.forbidden(&name, "exceeded quota")),
+                    Err(e) => Err(Error::Internal(format!(
+                        "error checking ResourceQuota: {e}"
+                    ))),
+                }
+            }
+            (Operation::Update, Some(old)) if pod_quota_scope_changed(old, pod) => {
+                ctx.hold(crate::admission::lock_namespace_quota(namespace).await);
+                match crate::admission::check_resource_quota_with_old(
+                    storage,
+                    namespace,
+                    pod,
+                    Some(old),
+                )
+                .await
+                {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(self.forbidden(&name, "exceeded quota")),
+                    Err(e) => {
+                        tracing::warn!("Error checking ResourceQuota on pod update: {e}");
+                        Ok(())
+                    }
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The mutating plugins: `MutationInterface.Admit`.
     pub async fn admit<T: Object>(&self, op: Operation, obj: T, old: Option<&T>) -> Result<T> {
         let obj = self.admit_in_tree(&op, obj).await?;
@@ -216,11 +474,12 @@ impl Admission<'_> {
     /// on DELETE, `old` is `None` on CREATE.
     pub async fn validate<T: Object>(
         &self,
+        ctx: &RequestContext,
         op: Operation,
         obj: Option<&T>,
         old: Option<&T>,
     ) -> Result<()> {
-        self.validate_in_tree(&op, obj, old).await?;
+        self.validate_in_tree(ctx, &op, obj, old).await?;
         let name = obj
             .or(old)
             .map(|o| o.metadata().name.clone())
@@ -296,6 +555,30 @@ impl Admission<'_> {
     }
 }
 
+/// Whether a pod's ResourceQuota *scope* changed across an update, which is
+/// the only thing that makes an update worth re-evaluating against quota.
+///
+/// Ported from upstream's `podEvaluator.Handles`
+/// (pkg/quota/v1/evaluator/core/pods.go:179-199): quota is evaluated on
+/// CREATE, on the `resize` subresource, and on a plain UPDATE only when the
+/// terminating scope flips (`IsTerminating`, :417-422: a non-negative
+/// `activeDeadlineSeconds`). Everything else is already counted.
+///
+/// The gate is load-bearing here: our quota check recounts the namespace live,
+/// a paginated pod LIST, and running it on every update made
+/// `[sig-node] Pods Extended (pod generation) ... issue 500 podspec updates`
+/// take 2754 seconds before failing with `ResourceExhausted: h2 protocol
+/// error` against the storage backend.
+fn pod_quota_scope_changed(old: &Pod, new: &Pod) -> bool {
+    fn is_terminating(pod: &Pod) -> bool {
+        pod.spec
+            .as_ref()
+            .and_then(|s| s.active_deadline_seconds)
+            .is_some_and(|d| d >= 0)
+    }
+    is_terminating(old) != is_terminating(new)
+}
+
 /// `rest.AdmissionToValidateObjectFunc` for CREATE. With `authorize_create`
 /// it is also `withAuthorization` (update.go:258-283): an update or patch
 /// that turns into a create must be allowed to `create`.
@@ -306,7 +589,7 @@ pub struct CreateValidation<'a> {
 
 #[async_trait]
 impl<T: Object> ValidateObject<T> for CreateValidation<'_> {
-    async fn validate(&self, _ctx: &RequestContext, obj: &T) -> Result<()> {
+    async fn validate(&self, ctx: &RequestContext, obj: &T) -> Result<()> {
         if self.authorize_create {
             let a = self.admission;
             authorize(
@@ -321,7 +604,7 @@ impl<T: Object> ValidateObject<T> for CreateValidation<'_> {
             .await?;
         }
         self.admission
-            .validate(Operation::Create, Some(obj), None)
+            .validate(ctx, Operation::Create, Some(obj), None)
             .await
     }
 }
@@ -333,9 +616,9 @@ pub struct UpdateValidation<'a> {
 
 #[async_trait]
 impl<T: Object> ValidateObjectUpdate<T> for UpdateValidation<'_> {
-    async fn validate(&self, _ctx: &RequestContext, obj: &T, old: &T) -> Result<()> {
+    async fn validate(&self, ctx: &RequestContext, obj: &T, old: &T) -> Result<()> {
         self.admission
-            .validate(Operation::Update, Some(obj), Some(old))
+            .validate(ctx, Operation::Update, Some(obj), Some(old))
             .await
     }
 }
@@ -348,9 +631,9 @@ pub struct DeleteValidation<'a> {
 
 #[async_trait]
 impl<T: Object> ValidateObject<T> for DeleteValidation<'_> {
-    async fn validate(&self, _ctx: &RequestContext, obj: &T) -> Result<()> {
+    async fn validate(&self, ctx: &RequestContext, obj: &T) -> Result<()> {
         self.admission
-            .validate::<T>(Operation::Delete, None, Some(obj))
+            .validate::<T>(ctx, Operation::Delete, None, Some(obj))
             .await
     }
 }

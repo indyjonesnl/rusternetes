@@ -3818,12 +3818,16 @@ pub fn validate_pod_spec_update(
     old: &PodSpec,
     new: &PodSpec,
     is_ephemeral_subresource: bool,
-) -> Result<(), String> {
+) -> ErrorList {
     let spec = Path::new("spec");
+    let mut all_errs: ErrorList = Vec::new();
 
     // 1. Container count immutability.
     if old.containers.len() != new.containers.len() {
-        return Err("pod updates may not add or remove containers".to_string());
+        return vec![Error::forbidden(
+            &spec.child("containers"),
+            "pod updates may not add or remove containers",
+        )];
     }
 
     // 2. Tolerations: additions only.
@@ -3831,9 +3835,7 @@ pub fn validate_pod_spec_update(
     let old_tols = old.tolerations.as_ref().unwrap_or(&empty_tols);
     let new_tols = new.tolerations.as_ref().unwrap_or(&empty_tols);
     let errs = validate_only_added_tolerations(old_tols, new_tols, &spec.child("tolerations"));
-    if let Some(e) = errs.first() {
-        return Err(e.to_string());
-    }
+    all_errs.extend(errs);
 
     // 3. SchedulingGates: deletions only.
     let empty_gates: Vec<PodSchedulingGate> = Vec::new();
@@ -3844,9 +3846,7 @@ pub fn validate_pod_spec_update(
         new_gates,
         &spec.child("schedulingGates"),
     );
-    if let Some(e) = errs.first() {
-        return Err(e.to_string());
-    }
+    all_errs.extend(errs);
 
     // 4. activeDeadlineSeconds: nil->positive or decrease-only.
     let errs = validate_active_deadline_seconds_update(
@@ -3854,9 +3854,7 @@ pub fn validate_pod_spec_update(
         new.active_deadline_seconds,
         &spec.child("activeDeadlineSeconds"),
     );
-    if let Some(e) = errs.first() {
-        return Err(e.to_string());
-    }
+    all_errs.extend(errs);
 
     // 5. TerminationGracePeriodSeconds: immutable except negative→1.
     let errs = validate_termination_grace_period_immutable(
@@ -3864,9 +3862,7 @@ pub fn validate_pod_spec_update(
         new.termination_grace_period_seconds,
         &spec.child("terminationGracePeriodSeconds"),
     );
-    if let Some(e) = errs.first() {
-        return Err(e.to_string());
-    }
+    all_errs.extend(errs);
 
     // 6. Munge + DeepEqual fence. Reset every field K8s allows to mutate to
     //    the OLD value, then compare. Any remaining diff = forbidden change.
@@ -3902,9 +3898,7 @@ pub fn validate_pod_spec_update(
                 munged.node_selector.as_ref(),
                 old.node_selector.as_ref(),
             );
-            if let Some(e) = errs.first() {
-                return Err(e.to_string());
-            }
+            all_errs.extend(errs);
             munged.node_selector = old.node_selector.clone();
         }
 
@@ -3923,9 +3917,7 @@ pub fn validate_pod_spec_update(
                 munged_node_affinity,
                 old_node_affinity,
             );
-            if let Some(e) = errs.first() {
-                return Err(e.to_string());
-            }
+            all_errs.extend(errs);
             // Re-munge so the trailing DeepEqual fence ignores this
             // legitimate mutation. Mirrors upstream's four-way switch
             // (validation.go:5807-5821).
@@ -3973,14 +3965,16 @@ pub fn validate_pod_spec_update(
     strip_empty_objects(&mut munged_json);
     strip_empty_objects(&mut old_json);
     if munged_json != old_json {
-        return Err("pod updates may not change fields other than \
+        all_errs.push(Error::forbidden(
+            &spec,
+            "pod updates may not change fields other than \
              `spec.containers[*].image`, `spec.initContainers[*].image`, \
              `spec.activeDeadlineSeconds`, `spec.terminationGracePeriodSeconds`, \
-             `spec.tolerations` (additions only), `spec.schedulingGates` (deletions only)"
-            .to_string());
+             `spec.tolerations` (additions only), `spec.schedulingGates` (deletions only)",
+        ));
     }
 
-    Ok(())
+    all_errs
 }
 
 /// Recursively remove empty `{}` objects from a JSON value tree. Mirrors
@@ -4216,7 +4210,7 @@ mod tests {
         let old = pod_spec_with_active_deadline(None);
         let new = pod_spec_with_active_deadline(Some(5));
 
-        assert!(validate_pod_spec_update(&old, &new, false).is_ok());
+        assert!(validate_pod_spec_update(&old, &new, false).is_empty());
     }
 
     #[test]
@@ -4224,14 +4218,18 @@ mod tests {
         let old = pod_spec_with_active_deadline(Some(10));
         let new = pod_spec_with_active_deadline(Some(5));
 
-        assert!(validate_pod_spec_update(&old, &new, false).is_ok());
+        assert!(validate_pod_spec_update(&old, &new, false).is_empty());
     }
 
     #[test]
     fn active_deadline_update_rejects_increase() {
         let old = pod_spec_with_active_deadline(Some(5));
         let new = pod_spec_with_active_deadline(Some(10));
-        let err = validate_pod_spec_update(&old, &new, false).unwrap_err();
+        let err = validate_pod_spec_update(&old, &new, false)
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
 
         assert!(err.contains("spec.activeDeadlineSeconds"));
         assert!(err.contains("must be less than or equal to previous value"));

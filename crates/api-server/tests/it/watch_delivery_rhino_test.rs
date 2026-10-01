@@ -173,7 +173,14 @@ async fn run_case(case: &Case) -> Vec<String> {
     // Open the watch and start collecting (ADDED, MODIFIED, DELETED = 3).
     let watch_uri = format!("{}?watch=true&resourceVersion=0", case.collection);
     let watch_router = router.clone();
-    let handle = tokio::spawn(collect(watch_router, watch_uri, 3, Duration::from_secs(6)));
+    // A pod is deleted gracefully: MODIFIED (deletionTimestamp), then DELETED.
+    let expected = if case.stub["kind"] == "Pod" { 4 } else { 3 };
+    let handle = tokio::spawn(collect(
+        watch_router,
+        watch_uri,
+        expected,
+        Duration::from_secs(6),
+    ));
 
     // Give the watch task time to subscribe before we mutate.
     tokio::time::sleep(Duration::from_millis(300)).await;

@@ -42,7 +42,6 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 
 const TEST_NS: &str = "default";
-const JSON_PATCH_CT: &str = "application/json-patch+json";
 
 fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
     let api = TestApiServer::new();
@@ -77,13 +76,27 @@ async fn seed_pod(mem: &Arc<MemoryStorage>, name: &str) -> String {
     key
 }
 
-/// Send a JSON-Patch PATCH request and return (status, response_body).
+/// Apply `ops` the way the PATCH handler's patch step does, against the pod
+/// stored under `{name}`, and write the result back. These cases pin the patch
+/// ENGINE (`rusternetes_api_server::patch`), not what a Pod may become: a pod
+/// update fence refuses added containers and ports, as upstream's
+/// `ValidatePodUpdate` does, so sending them through `PATCH /pods` would test
+/// that fence instead.
 async fn apply_patch(router: TestApiServer, pod_name: &str, ops: &Value) -> (u16, Value) {
-    let uri = format!("/api/v1/namespaces/{TEST_NS}/pods/{pod_name}");
-    let (status, value) = router
-        .send("PATCH", &uri, Some(JSON_PATCH_CT), Some(ops))
-        .await;
-    (status.as_u16(), value)
+    use rusternetes_api_server::patch::{apply_patch, PatchType};
+    let key = build_key("pods", Some(TEST_NS), pod_name);
+    let current: Value = router.storage.get(&key).await.expect("pod must exist");
+    match apply_patch(&current, ops, PatchType::JsonPatch) {
+        Ok(patched) => {
+            router
+                .storage
+                .update(&key, &patched)
+                .await
+                .expect("store the patched pod");
+            (200, patched)
+        }
+        Err(e) => (422, json!({"message": e.to_string()})),
+    }
 }
 
 /// Read the JSON stored at `key`. Panics if the key is absent.
