@@ -4,7 +4,7 @@
 //! Covers `Role` / `ClusterRole` policy rules, `ClusterRole` aggregationRule
 //! selectors, and `RoleBinding` / `ClusterRoleBinding` roleRef + subjects.
 //! ObjectMeta (incl. the path-segment RBAC name) is validated separately by the
-//! handler (#1087 / #1277, `NameKind::PathSegment`).
+//! strategies in `api-server/src/registry/rbac/`.
 
 use crate::resources::rbac::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject,
@@ -196,9 +196,42 @@ pub fn validate_role(role: &Role) -> ErrorList {
     errs
 }
 
-/// Validate a `ClusterRole` on create (upstream `ValidateClusterRole`, minus
-/// ObjectMeta).
+/// Validate a `ClusterRole` on create (upstream `ValidateClusterRole` with
+/// `AllowInvalidLabelValueInSelector: false`, minus ObjectMeta).
 pub fn validate_cluster_role(role: &ClusterRole) -> ErrorList {
+    validate_cluster_role_with_options(role, false)
+}
+
+/// `hasInvalidLabelValueInLabelSelector`
+/// (`pkg/registry/rbac/clusterrole/strategy.go`): whether a stored
+/// ClusterRole's aggregation selectors only validate with
+/// `AllowInvalidLabelValueInSelector`, which an update that leaves them alone
+/// is then allowed to rely on.
+pub fn has_invalid_label_value_in_label_selector(role: &ClusterRole) -> bool {
+    let Some(sels) = role
+        .aggregation_rule
+        .as_ref()
+        .and_then(|a| a.cluster_role_selectors.as_ref())
+    else {
+        return false;
+    };
+    sels.iter().any(|sel| {
+        !validate_label_selector(
+            sel,
+            LabelSelectorValidationOptions::default(),
+            &Path::new("selector"),
+        )
+        .is_empty()
+    })
+}
+
+/// `ValidateClusterRole` (validation.go:62-93) with
+/// `ClusterRoleValidationOptions.AllowInvalidLabelValueInSelector`, minus
+/// ObjectMeta.
+pub fn validate_cluster_role_with_options(
+    role: &ClusterRole,
+    allow_invalid_label_value_in_selector: bool,
+) -> ErrorList {
     let rules_path = Path::new("rules");
     let mut errs: ErrorList = Vec::new();
     for (i, rule) in role.rules.iter().enumerate() {
@@ -220,7 +253,10 @@ pub fn validate_cluster_role(role: &ClusterRole) -> ErrorList {
                 for (i, sel) in sels.iter().enumerate() {
                     errs.extend(validate_label_selector(
                         sel,
-                        LabelSelectorValidationOptions::default(),
+                        LabelSelectorValidationOptions {
+                            allow_invalid_label_value_in_selector,
+                            ..Default::default()
+                        },
                         &base.index(i),
                     ));
                 }

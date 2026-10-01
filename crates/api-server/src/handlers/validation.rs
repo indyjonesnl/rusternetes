@@ -709,15 +709,12 @@ pub fn format_warning_header(warning_text: &str) -> String {
 
 /// Selects the per-kind name validator upstream attaches to each resource's
 /// strategy. Almost every kind uses [`NameKind::DnsSubdomain`]
-/// (`NameIsDNSSubdomain`); the handful that differ pick `PathSegment` (the RBAC Role/Binding kinds, via
-/// `ValidateRBACName`).
+/// (`NameIsDNSSubdomain`); the handful that differ pick another variant.
 #[derive(Clone, Copy, Debug)]
 pub enum NameKind {
     /// `apimachineryvalidation.NameIsDNSSubdomain` — the default for nearly all
     /// kinds.
     DnsSubdomain,
-    /// `path.IsValidPathSegmentName` — the RBAC kinds (`ValidateRBACName`).
-    PathSegment,
     /// `validation.IsValidIP` — the `IPAddress` kind (`ValidateIPAddressName`):
     /// the name must be a canonical IP address.
     Ip,
@@ -725,12 +722,9 @@ pub enum NameKind {
 
 impl NameKind {
     fn name_fn(self) -> rusternetes_common::validation::objectmeta::ValidateNameFunc {
-        use rusternetes_common::validation::objectmeta::{
-            name_is_dns_subdomain, name_is_ip, name_is_path_segment,
-        };
+        use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, name_is_ip};
         match self {
             NameKind::DnsSubdomain => name_is_dns_subdomain,
-            NameKind::PathSegment => name_is_path_segment,
             NameKind::Ip => name_is_ip,
         }
     }
@@ -823,15 +817,6 @@ mod tests {
             Error::Invalid(errs) => assert_eq!(errs[0].field, "metadata.name"),
             other => panic!("expected Error::Invalid, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn validate_create_object_meta_path_segment_rejects_slash() {
-        // RBAC names use path-segment rules: '/' is forbidden but '.' is fine.
-        let bad = meta_named("a/b");
-        assert!(validate_create_object_meta(&bad, Some("default"), NameKind::PathSegment).is_err());
-        let ok = meta_named("system:foo.bar");
-        assert!(validate_create_object_meta(&ok, Some("default"), NameKind::PathSegment).is_ok());
     }
 
     #[test]

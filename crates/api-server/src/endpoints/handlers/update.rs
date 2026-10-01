@@ -53,8 +53,10 @@ pub async fn update_resource<T: Object>(
     let dry_run = is_dry_run(options.dry_run.as_deref());
 
     let (mut obj, decode_warnings) = decode(scope, params, body)?;
-    let ctx =
-        RequestContext::new(namespace).with_group_version(&scope.kind.group, &scope.kind.version);
+    let ctx = RequestContext::new(namespace)
+        .with_group_version(&scope.kind.group, &scope.kind.version)
+        .with_user(user)
+        .with_name(name);
     for warning in decode_warnings {
         ctx.add_warning(warning);
     }

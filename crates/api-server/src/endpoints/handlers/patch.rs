@@ -121,8 +121,10 @@ pub async fn patch_resource<T: Object>(
     let force_allow_create =
         matches!(mechanism, Mechanism::Apply { .. }) && scope.subresource.is_none();
 
-    let ctx =
-        RequestContext::new(namespace).with_group_version(&scope.kind.group, &scope.kind.version);
+    let ctx = RequestContext::new(namespace)
+        .with_group_version(&scope.kind.group, &scope.kind.version)
+        .with_user(user)
+        .with_name(name);
     let admission = Admission {
         state,
         kind: &scope.kind,

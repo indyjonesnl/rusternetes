@@ -32,6 +32,7 @@ pub mod generic;
 pub mod names;
 pub mod node;
 pub mod policy;
+pub mod rbac;
 pub mod resource;
 pub mod rest;
 pub mod scale;
