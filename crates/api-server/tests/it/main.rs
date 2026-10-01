@@ -89,6 +89,7 @@ mod csidriver_update_immutable_test;
 mod csinode_handler_test;
 mod csistoragecapacity_test;
 mod csr_store_test;
+mod custom_resource_store_test;
 mod daemonset_generic_store_test;
 mod daemonset_handler_test;
 mod decode_missing_field_test;
