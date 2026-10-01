@@ -143,6 +143,12 @@ pub fn validate_endpoint_slice_update(
     old_slice: &EndpointSlice,
 ) -> ErrorList {
     let mut errs = validate_endpoint_slice(new_slice);
+    // `ValidateEndpointSlice` ignores the endpoint errors of an update that
+    // left `endpoints` unchanged: older versions considered that data valid
+    // (validation.go:66-76).
+    if new_slice.endpoints == old_slice.endpoints {
+        errs.retain(|e| !e.field.starts_with("endpoints"));
+    }
     if new_slice.address_type != old_slice.address_type {
         errs.push(Error::invalid(
             &Path::new("addressType"),

@@ -110,6 +110,7 @@ mod endpoints_generic_store_test;
 mod endpoints_handler_test;
 mod endpoints_lease_update_validation_test;
 mod endpointslice_handler_test;
+mod endpointslice_store_test;
 mod event_handler_test;
 mod events_v1_deprecated_fields_test;
 mod events_v1_response_schema_test;
