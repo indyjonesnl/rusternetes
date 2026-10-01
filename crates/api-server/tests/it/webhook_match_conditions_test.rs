@@ -182,19 +182,22 @@ async fn an_update_that_changes_match_conditions_is_validated() {
         .await;
     assert!(status.is_success(), "create must succeed: {status} {body}");
 
+    // `AllowUnconditionalUpdate()` is false: the PUT names the version.
+    let mut update = config(
+        "ValidatingWebhookConfiguration",
+        name,
+        json!([
+            { "name": "dup", "expression": "true" },
+            { "name": "dup", "expression": "false" }
+        ]),
+    );
+    update["metadata"]["resourceVersion"] = body["metadata"]["resourceVersion"].clone();
     let (status, body) = api
         .send(
             "PUT",
             &format!("{VALIDATING}/{name}"),
             Some("application/json"),
-            Some(&config(
-                "ValidatingWebhookConfiguration",
-                name,
-                json!([
-                    { "name": "dup", "expression": "true" },
-                    { "name": "dup", "expression": "false" }
-                ]),
-            )),
+            Some(&update),
         )
         .await;
 

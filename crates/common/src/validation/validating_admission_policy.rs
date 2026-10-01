@@ -69,6 +69,17 @@ pub fn set_defaults_match_resources(match_resources: &mut MatchResources) {
     if match_resources.object_selector.is_none() {
         match_resources.object_selector = Some(LabelSelector::default());
     }
+    // The generated `SetObjectDefaults_ValidatingAdmissionPolicy` /
+    // `..._Binding` (`zz_generated.defaults.go`) then run `SetDefaults_Rule`
+    // over every `resourceRules` and `excludeResourceRules` entry.
+    for rule in match_resources
+        .resource_rules
+        .iter_mut()
+        .chain(match_resources.exclude_resource_rules.iter_mut())
+        .flatten()
+    {
+        rule.rule.scope.get_or_insert_with(|| "*".to_string());
+    }
 }
 
 /// `SetDefaults_MatchResources` on a binding (`defaults.go:105`).

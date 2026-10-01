@@ -22,28 +22,6 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::{debug, info};
 
-/// Run resource-type-specific status validation before persisting a status
-/// update. Currently covers ValidatingAdmissionPolicy.
-fn validate_status_subresource(resource_type: &str, resource: &Value) -> Result<()> {
-    if resource_type == "validatingadmissionpolicies" {
-        // Upstream ValidateValidatingAdmissionPolicyStatusUpdate
-        // (pkg/apis/admissionregistration/validation/validation.go:1247) runs
-        // only on the new object — typeChecking's expressionWarnings and the
-        // metav1 condition rules. `old` is unused by the validator.
-        let policy: rusternetes_common::resources::validating_admission_policy::ValidatingAdmissionPolicy =
-            serde_json::from_value(resource.clone()).map_err(|e| {
-                rusternetes_common::Error::InvalidResource(format!(
-                    "invalid ValidatingAdmissionPolicy: {e}"
-                ))
-            })?;
-        let errs = rusternetes_common::validation::validating_admission_policy::validate_validating_admission_policy_status_update(&policy);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-    Ok(())
-}
-
 /// Extract the resource type from the request URI.
 ///
 /// For namespaced resources, the URI looks like:
@@ -362,8 +340,6 @@ pub async fn update_status(
             }
         }
 
-        validate_status_subresource(&resource_type, &result)?;
-
         let mut saved: Value = state.storage.update(&key, &result).await?;
         // Ensure kind/apiVersion in response
         if let Some(obj) = saved.as_object_mut() {
@@ -420,11 +396,6 @@ pub async fn update_status(
         ) {
             obj.insert("resourceVersion".to_string(), rv);
         }
-        // Validate the merged status object (resourceVersion now present). The
-        // json-patch branch above already does this; the PUT / merge-patch path
-        // previously skipped it, so e.g. a status with an invalid field was
-        // persisted unchecked (#1484).
-        validate_status_subresource(&resource_type, &updated_resource)?;
         match state.storage.update(&key, &updated_resource).await {
             Ok(v) => break v,
             Err(rusternetes_common::Error::Conflict(_)) if attempts < 8 => {
@@ -551,8 +522,6 @@ pub async fn update_cluster_status(
             }
         }
 
-        validate_status_subresource(&resource_type, &result)?;
-
         let mut saved: Value = state.storage.update(&key, &result).await?;
         // Ensure kind/apiVersion in response
         if let Some(obj) = saved.as_object_mut() {
@@ -674,8 +643,6 @@ pub async fn update_cluster_status(
                 .or_insert_with(|| Value::String(api_version));
         }
     }
-
-    validate_status_subresource(&resource_type, &updated_resource)?;
 
     // Save the updated resource
     let mut saved: Value = state.storage.update(&key, &updated_resource).await?;

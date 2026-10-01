@@ -100,10 +100,7 @@ async fn a_put_to_a_missing_admission_object_is_not_found() {
     let api = TestApiServer::new();
     for (uri, body) in [
         (format!("{VAP}/missing"), policy("missing")),
-        (
-            format!("{VAPB}/missing"),
-            binding("missing", "some-policy"),
-        ),
+        (format!("{VAPB}/missing"), binding("missing", "some-policy")),
         (
             format!("{VWC}/missing"),
             config("ValidatingWebhookConfiguration", "missing", vec![]),
@@ -335,7 +332,10 @@ async fn a_match_condition_compile_failure_is_a_field_error() {
     let mut h = hook("a.example.com");
     h["matchConditions"] = json!([{"name": "bad", "expression": "this is ((not cel"}]);
     let (s, body) = api
-        .post(VWC, &config("ValidatingWebhookConfiguration", "v1", vec![h]))
+        .post(
+            VWC,
+            &config("ValidatingWebhookConfiguration", "v1", vec![h]),
+        )
         .await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let field = body["details"]["causes"][0]["field"]

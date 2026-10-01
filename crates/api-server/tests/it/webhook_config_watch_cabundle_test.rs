@@ -62,7 +62,7 @@ async fn noop_update_emits_no_modified_event() {
     let api = TestApiServer::new();
 
     // Create WITHOUT a caBundle.
-    let (status, _created) = api.post(GROUP, &config(None)).await;
+    let (status, created) = api.post(GROUP, &config(None)).await;
     assert!(status.is_success(), "create failed: {status}");
 
     // Open a collection WATCH; collect every MODIFIED for our object.
@@ -102,7 +102,12 @@ async fn noop_update_emits_no_modified_event() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Update #1: add the caBundle (a REAL change) → exactly one MODIFIED.
-    let (s1, updated1) = api.put(&format!("{GROUP}/{NAME}"), &config(Some(CA))).await;
+    // A webhook configuration cannot be updated unconditionally
+    // (`AllowUnconditionalUpdate()` is false), so the PUT names the version,
+    // as cainjector's Get-then-Update does.
+    let mut update1 = config(Some(CA));
+    update1["metadata"]["resourceVersion"] = created["metadata"]["resourceVersion"].clone();
+    let (s1, updated1) = api.put(&format!("{GROUP}/{NAME}"), &update1).await;
     assert!(s1.is_success(), "update #1 failed: {s1} {updated1:#}");
     assert_eq!(
         ca_bundle_of(&updated1).as_deref(),
