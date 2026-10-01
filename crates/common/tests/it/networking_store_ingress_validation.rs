@@ -371,3 +371,17 @@ fn ingress_explicit_empty_path_type_is_unsupported() {
         "supported values: \"Exact\", \"ImplementationSpecific\", \"Prefix\""
     );
 }
+
+/// GetWarningsForIP (apimachinery/pkg/util/validation/ip.go:105-130) must
+/// use ParseIPSloppy, including long leading-zero octets and IPv6 tails.
+#[test]
+fn ingress_status_ip_warnings_preserve_sloppy_parsing() {
+    use rusternetes_common::validation::metav1::get_warnings_for_ip;
+    for value in ["00010.0000.0000.0001", "::ffff:00010.0000.0000.0001"] {
+        assert_eq!(
+            get_warnings_for_ip("status.loadBalancer.ingress[0]", value),
+            vec![format!("status.loadBalancer.ingress[0]: non-standard IP address {value:?} will be considered invalid in a future Kubernetes release: use \"10.0.0.1\"")],
+            "{value}",
+        );
+    }
+}
