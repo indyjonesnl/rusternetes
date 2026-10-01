@@ -119,9 +119,12 @@ async fn servicecidr_create_writes_no_status() {
     );
 }
 
-/// A client-supplied status is dropped, not persisted.
+/// A client-supplied status is stored as sent: upstream's PrepareForCreate is
+/// a no-op (pkg/registry/networking/servicecidr/strategy.go:68-71) despite its
+/// doc comment ("clears the status"). This test used to assert the opposite,
+/// which was not upstream behaviour.
 #[tokio::test]
-async fn servicecidr_create_drops_client_supplied_status() {
+async fn servicecidr_create_keeps_client_supplied_status() {
     let state = TestApiServer::new();
     let name = "clientstatus";
     let mut payload = sc(name, json!(["10.3.0.0/24"]));
@@ -133,9 +136,8 @@ async fn servicecidr_create_drops_client_supplied_status() {
     });
     let (code, body) = state.post(sc_uri(), &payload).await;
     assert_eq!(code, StatusCode::CREATED);
-    assert!(
-        body.get("status").is_none_or(Value::is_null),
-        "client-supplied status must be cleared, got {:?}",
-        body.get("status")
+    assert_eq!(
+        body["status"]["conditions"][0]["message"], "i said so",
+        "{body}"
     );
 }

@@ -106,7 +106,8 @@ fn name_must_be_canonical_ip() {
 #[test]
 fn update_parent_ref_is_immutable() {
     use rusternetes_common::validation::ipaddress::validate_ip_address_update;
-    let old = named("10.0.0.1");
+    let mut old = named("10.0.0.1");
+    old.metadata.resource_version = Some("1".to_string());
     assert!(validate_ip_address_update(&old, &old).is_empty());
     let mut changed = old.clone();
     changed

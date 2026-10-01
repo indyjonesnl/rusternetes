@@ -93,7 +93,8 @@ fn name_must_be_dns_subdomain() {
 #[test]
 fn status_update_checks_only_metadata() {
     use rusternetes_common::validation::servicecidr::validate_service_cidr_status_update;
-    let old = sc(vec!["10.96.0.0/12"]);
+    let mut old = sc(vec!["10.96.0.0/12"]);
+    old.metadata.resource_version = Some("1".to_string());
     let mut new = old.clone();
     new.spec = None;
     assert!(validate_service_cidr_status_update(&new, &old).is_empty());
