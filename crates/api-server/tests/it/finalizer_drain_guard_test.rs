@@ -24,8 +24,8 @@
 //! **No allowlist.** A handler that cannot finish the deletion is a reason to
 //! change the handler or the helper, not to record a name here. The two exits
 //! below are keyed on mechanism: a subresource cannot carry
-//! `metadata.finalizers`, and a handler that delegates to `generic_patch`
-//! inherits the check from it.
+//! `metadata.finalizers`, and a Store adapter inherits the check from
+//! `Store.Update`.
 
 use std::path::{Path, PathBuf};
 
@@ -116,16 +116,6 @@ fn every_write_handler_finishes_a_drained_deletion() {
             if !body.contains("storage.update(") && !body.contains("update_inheriting") {
                 continue;
             }
-            // A handler that delegates to the generic patch implementation
-            // inherits the check from it — that IS the shared mechanism, not an
-            // exemption. `generic_patch.rs` itself is still measured, because
-            // its own two functions appear in this scan.
-            if name != "generic_patch.rs"
-                && (body.contains("generic_patch::patch_namespaced_resource")
-                    || body.contains("generic_patch::patch_cluster_resource"))
-            {
-                continue;
-            }
             checked += 1;
             if fname.starts_with("patch") {
                 patches_checked += 1;
@@ -139,12 +129,12 @@ fn every_write_handler_finishes_a_drained_deletion() {
     }
 
     assert!(
-        checked >= 117,
+        checked >= 115,
         "guard scanned only {checked} write handlers -- the parser stopped \
          matching, which would make this test vacuously green"
     );
     assert!(
-        patches_checked >= 60,
+        patches_checked >= 58,
         "guard scanned {patches_checked} PATCH handlers -- the `patch*` half of \
          the parser stopped matching, which is exactly the hole that let #1919 \
          ship: the GC removes finalizers with a merge PATCH, not a PUT"

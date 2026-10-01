@@ -6,7 +6,6 @@ pub mod cel_validation;
 pub mod certificates;
 pub mod componentstatus;
 pub mod configmap;
-pub mod conflict_retry;
 pub mod controllerrevision;
 pub mod crd;
 pub mod cronjob;
@@ -30,10 +29,6 @@ pub mod filtering;
 pub mod finalizers;
 pub mod flowcontrol;
 pub mod generic;
-// The namespaced PATCH helpers lost their last user (VolumeSnapshot) when
-// snapshot.storage.k8s.io moved onto the generic Store (#1990).
-#[allow(dead_code)]
-pub mod generic_patch;
 #[allow(dead_code)]
 pub mod health;
 pub mod horizontalpodautoscaler;

@@ -2,7 +2,7 @@
 //!
 //! Covers:
 //!   8f271ca  fix: PATCH retry on rv conflict + inline ObjectMeta
-//!             → generic_patch.rs: retry once on Error::Conflict from storage.update()
+//!             → (generic_patch.rs, since removed): retry once on Error::Conflict from storage.update()
 //!   4f9111b  fix: scale PATCH retry on resourceVersion conflict
 //!             → scale.rs: retry up to 5 times on Error::Conflict from storage.update()
 //!

@@ -19,7 +19,7 @@
 //!   unchanged for SSA.
 //! - `crates/api-server/src/patch.rs::PatchType::from_content_type` —
 //!   maps the three patch MIME types onto `PatchType` variants.
-//! - `crates/api-server/src/handlers/generic_patch.rs::patch_namespaced_resource`
+//! - `crates/api-server/src/endpoints/handlers/patch.rs` (formerly `generic_patch.rs`)
 //!   and `crates/api-server/src/handlers/pod.rs::patch` — branch on
 //!   `apply-patch` to take the server-side apply path when
 //!   `?fieldManager=` is present.

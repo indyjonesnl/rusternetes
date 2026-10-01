@@ -215,7 +215,7 @@ pub fn gc_deletion_finalizers(
 /// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:565,
 /// applied via `deleteWithoutFinalizers`), so it covers PUT and PATCH alike.
 /// We had it on the PATCH path only
-/// ([`crate::handlers::generic_patch::should_delete_during_update`]), which left
+/// ([`should_delete_during_update`]), which left
 /// the GC's end-of-pass sweep as the only thing finishing an object whose last
 /// finalizer was removed by a PUT — and most controllers remove finalizers with
 /// Update, not Patch (#1831).
@@ -247,6 +247,53 @@ where
     let stored_json =
         serde_json::to_value(stored).map_err(rusternetes_common::Error::Serialization)?;
     finish_deletion_if_write_drained_finalizers(storage, key, &stored_json, &stored_json).await
+}
+
+/// Upstream `ShouldDeleteDuringUpdate`
+/// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:565): an
+/// update/patch removes the object from storage when the *new* object has no
+/// finalizers left, the *existing* object was already pending deletion
+/// (deletionTimestamp set), AND that object is not sitting inside a non-zero
+/// deletion grace period. This is how the garbage collector finishes
+/// orphan/foreground deletion — it PATCHes away the last finalizer (e.g.
+/// `orphan`) and the object must then disappear. Without this a Terminating
+/// object whose finalizers the GC has drained lingers forever, so
+/// `[sig-api-machinery] GarbageCollector should orphan RS ...` times out
+/// waiting for the owner (Deployment) to be deleted.
+pub(crate) fn should_delete_during_update(
+    new_json: &serde_json::Value,
+    existing_json: &serde_json::Value,
+) -> bool {
+    let new_finalizers_empty = new_json
+        .get("metadata")
+        .and_then(|m| m.get("finalizers"))
+        .map(|f| f.as_array().is_none_or(|a| a.is_empty()))
+        .unwrap_or(true);
+    if !new_finalizers_empty {
+        return false;
+    }
+    let existing_terminating = existing_json
+        .get("metadata")
+        .and_then(|m| m.get("deletionTimestamp"))
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+    if !existing_terminating {
+        return false;
+    }
+    // Upstream's last clause (store.go:584-585):
+    //
+    //     // delete if the existing object has no grace period or a grace period of 0
+    //     return oldMeta.GetDeletionGracePeriodSeconds() == nil || *oldMeta.GetDeletionGracePeriodSeconds() == 0
+    //
+    // An object still inside a non-zero grace period belongs to the graceful
+    // deletion path — for a pod, the kubelet, which removes it when the
+    // container actually stops. A finalizer-draining update must not cut that
+    // short.
+    existing_json
+        .get("metadata")
+        .and_then(|m| m.get("deletionGracePeriodSeconds"))
+        .and_then(|v| v.as_i64())
+        .is_none_or(|secs| secs == 0)
 }
 
 /// Upstream's `ShouldDeleteDuringUpdate`, plus the one registry that overrides
@@ -289,7 +336,7 @@ pub(crate) fn should_finish_deletion(
         return false;
     }
 
-    crate::handlers::generic_patch::should_delete_during_update(new_json, existing_json)
+    should_delete_during_update(new_json, existing_json)
 }
 
 /// Remove the object when [`should_finish_deletion`] says the write that just
@@ -1613,4 +1660,80 @@ where
 {
     let resource = JsonResource::new(doc.clone())?;
     delete_collection_item(storage, key, &resource, opts).await
+}
+
+#[cfg(test)]
+mod finalizer_drain_tests {
+    use super::should_delete_during_update;
+    use serde_json::json;
+
+    // GC removes the last finalizer (orphan) from a Terminating owner → delete.
+    #[test]
+    fn deletes_when_finalizers_drained_and_terminating() {
+        let existing = json!({"metadata":{"deletionTimestamp":"2026-07-25T00:00:00Z","finalizers":["orphan"]}});
+        let new = json!({"metadata":{"deletionTimestamp":"2026-07-25T00:00:00Z","finalizers":[]}});
+        assert!(should_delete_during_update(&new, &existing));
+    }
+
+    // finalizers key absent entirely (== empty) on a Terminating object → delete.
+    #[test]
+    fn deletes_when_finalizers_absent_and_terminating() {
+        let existing = json!({"metadata":{"deletionTimestamp":"2026-07-25T00:00:00Z"}});
+        let new = json!({"metadata":{}});
+        assert!(should_delete_during_update(&new, &existing));
+    }
+
+    // Finalizers remain in the new object → keep.
+    #[test]
+    fn keeps_while_finalizers_remain() {
+        let existing = json!({"metadata":{"deletionTimestamp":"2026-07-25T00:00:00Z","finalizers":["orphan"]}});
+        let new = json!({"metadata":{"finalizers":["orphan"]}});
+        assert!(!should_delete_during_update(&new, &existing));
+    }
+
+    // Not pending deletion → a plain patch that clears finalizers must NOT delete.
+    #[test]
+    fn keeps_when_not_terminating() {
+        let existing = json!({"metadata":{"finalizers":["x"]}});
+        let new = json!({"metadata":{"finalizers":[]}});
+        assert!(!should_delete_during_update(&new, &existing));
+    }
+
+    // Upstream's final clause: an object still inside a non-zero deletion grace
+    // period is NOT removed by a finalizer-draining update — it belongs to the
+    // graceful-deletion path (the kubelet, for a pod), which removes it when the
+    // container stops. `ShouldDeleteDuringUpdate`
+    // (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:584-585):
+    //
+    //     // delete if the existing object has no grace period or a grace period of 0
+    //     return oldMeta.GetDeletionGracePeriodSeconds() == nil || *oldMeta.GetDeletionGracePeriodSeconds() == 0
+    #[test]
+    fn keeps_a_pod_inside_its_deletion_grace_period() {
+        let existing = json!({"metadata":{
+            "deletionTimestamp":"2026-07-25T00:00:00Z",
+            "deletionGracePeriodSeconds": 30,
+            "finalizers":["example.com/x"],
+        }});
+        let new = json!({"metadata":{
+            "deletionTimestamp":"2026-07-25T00:00:00Z",
+            "deletionGracePeriodSeconds": 30,
+        }});
+        assert!(
+            !should_delete_during_update(&new, &existing),
+            "a terminating pod with a 30s grace period must not be removed by a \
+             finalizer-draining update"
+        );
+    }
+
+    // A grace period of 0 is a force delete: upstream removes it.
+    #[test]
+    fn deletes_when_grace_period_is_zero() {
+        let existing = json!({"metadata":{
+            "deletionTimestamp":"2026-07-25T00:00:00Z",
+            "deletionGracePeriodSeconds": 0,
+            "finalizers":["example.com/x"],
+        }});
+        let new = json!({"metadata":{"deletionTimestamp":"2026-07-25T00:00:00Z"}});
+        assert!(should_delete_during_update(&new, &existing));
+    }
 }

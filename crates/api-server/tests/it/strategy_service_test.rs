@@ -509,7 +509,7 @@ async fn test_service_strategy_explicit_zero_target_port_is_defaulted_on_update(
 
 /// A merge PATCH that rewrites `spec.ports` with an explicit `targetPort: 0`
 /// must default it to `port`, not silently persist a zero targetPort. The
-/// patch path delegates to generic_patch (no Service-specific defaulting), so
+/// patch path no longer delegates to the removed generic_patch (no Service-specific defaulting), so
 /// the Service handler must re-default after the merge.
 #[tokio::test]
 async fn test_service_strategy_explicit_zero_target_port_is_defaulted_on_patch() {
