@@ -843,3 +843,25 @@ async fn networking_json_null_uses_go_zero_values_before_validation() {
         assert_eq!(port["port"], expected_port, "{out}");
     }
 }
+
+/// Semantic.DeepEqual preserves nil versus non-nil STRUCT pointers, while
+/// equating nil/empty slices (ingress/strategy.go:89; apimachinery/pkg/api/equality).
+#[test]
+fn ingress_generation_preserves_http_pointer_presence() {
+    use rusternetes_api_server::registry::{
+        networking::ingress::Strategy,
+        rest::{RequestContext, RestUpdateStrategy},
+    };
+    use rusternetes_common::resources::Ingress;
+    let mut body = ingress("http-pointer");
+    body["metadata"]["generation"] = json!(1);
+    body["spec"]["rules"] = json!([{"host":"*.example.com", "http":{"paths":[]}}]);
+    let old: Ingress = serde_json::from_value(body.clone()).unwrap();
+    body["spec"]["rules"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("http");
+    let mut new: Ingress = serde_json::from_value(body).unwrap();
+    Strategy.prepare_for_update(&RequestContext::new(Some("default")), &mut new, &old);
+    assert_eq!(new.metadata.generation, Some(2));
+}
