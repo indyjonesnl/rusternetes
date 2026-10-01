@@ -30,7 +30,8 @@ pub async fn get_resource<T: Object>(
         Some(name),
     )
     .await?;
-    let ctx = RequestContext::new(namespace);
+    let ctx =
+        RequestContext::new(namespace).with_group_version(&scope.kind.group, &scope.kind.version);
     let obj = scope.store.get(&ctx, name).await?;
     Ok(respond(StatusCode::OK, &obj, &ctx))
 }

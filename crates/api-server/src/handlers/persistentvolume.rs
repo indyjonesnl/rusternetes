@@ -54,6 +54,7 @@ fn scope(
         store,
         apply: Some(crate::ssa::apply_legacy::<PersistentVolume>),
         convert_to_internal: Some(persistentvolume::convert_to_internal),
+        patch_conversion: None,
     }
 }
 

@@ -64,6 +64,7 @@ fn plc_scope(
         }),
         apply: Some(crate::ssa::apply_legacy::<PriorityLevelConfiguration>),
         convert_to_internal: Some(prioritylevelconfiguration::convert_to_internal),
+        patch_conversion: None,
     }
 }
 
@@ -302,6 +303,7 @@ fn fs_scope(state: &ApiServerState, subresource: Option<&'static str>) -> Reques
         }),
         apply: Some(crate::ssa::apply_legacy::<FlowSchema>),
         convert_to_internal: Some(flowschema::convert_to_internal),
+        patch_conversion: None,
     }
 }
 

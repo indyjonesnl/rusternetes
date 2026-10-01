@@ -54,6 +54,7 @@ fn scope(
         store: Box::new(store),
         apply: Some(crate::ssa::apply_legacy::<ReplicationController>),
         convert_to_internal: Some(replicationcontroller::convert_to_internal),
+        patch_conversion: None,
     }
 }
 
@@ -75,6 +76,7 @@ fn scale_scope(state: &ApiServerState) -> RequestScope<Scale> {
         store: Box::new(replicationcontroller::new_scale_rest(state.storage.clone())),
         apply: Some(crate::ssa::apply_legacy::<Scale>),
         convert_to_internal: None,
+        patch_conversion: None,
     }
 }
 

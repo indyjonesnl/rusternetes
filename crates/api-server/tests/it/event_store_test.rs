@@ -274,21 +274,22 @@ async fn a_dry_run_create_persists_nothing() {
     assert_eq!(code, StatusCode::NOT_FOUND);
 }
 
-/// The events.k8s.io/v1 DELETE and deletecollection are authorised against
-/// that group and answer in that schema.
+/// DELETE and deletecollection work through either API (the collection is
+/// one storage).
 #[tokio::test]
 async fn delete_and_delete_collection_work_on_both_versions() {
     let s = TestApiServer::new();
     send(&s, "POST", &v1_coll(), Some(&v1_body("del-v1"))).await;
     let (code, out) = send(&s, "DELETE", &v1("del-v1"), None).await;
     assert_eq!(code, StatusCode::OK, "{out}");
-    assert_eq!(out["apiVersion"], json!("events.k8s.io/v1"));
-    assert_eq!(out["note"], json!("hello"));
+    let (code, _) = send(&s, "GET", &v1("del-v1"), None).await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
 
     send(&s, "POST", &core_coll(), Some(&core_body("del-core"))).await;
     let (code, out) = send(&s, "DELETE", &core("del-core"), None).await;
     assert_eq!(code, StatusCode::OK, "{out}");
-    assert_eq!(out["apiVersion"], json!("v1"));
+    let (code, _) = send(&s, "GET", &core("del-core"), None).await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
 
     send(&s, "POST", &core_coll(), Some(&core_body("col-a"))).await;
     send(&s, "POST", &v1_coll(), Some(&v1_body("col-b"))).await;

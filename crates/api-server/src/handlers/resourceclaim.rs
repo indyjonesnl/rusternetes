@@ -51,6 +51,7 @@ fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestSc
         }),
         apply: Some(crate::ssa::apply_legacy::<ResourceClaim>),
         convert_to_internal: None,
+        patch_conversion: None,
     }
 }
 

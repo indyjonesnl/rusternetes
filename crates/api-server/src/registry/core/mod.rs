@@ -3,6 +3,7 @@
 
 pub mod configmap;
 pub mod endpoint;
+pub mod event;
 pub mod limitrange;
 pub mod namespace;
 pub mod node;

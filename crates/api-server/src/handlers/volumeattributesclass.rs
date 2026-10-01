@@ -46,6 +46,7 @@ fn scope(state: &ApiServerState) -> RequestScope<VolumeAttributesClass> {
         store: Box::new(volumeattributesclass::new_store(state.storage.clone())),
         apply: Some(crate::ssa::apply_legacy::<VolumeAttributesClass>),
         convert_to_internal: None,
+        patch_conversion: None,
     }
 }
 

@@ -1,20 +1,302 @@
+//! Event endpoints (core `v1` and `events.k8s.io/v1`, one storage).
+//!
+//! Writes go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the Event strategy
+//! ([`crate::registry::core::event`]) -- upstream's
+//! `pkg/registry/core/event/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+//!
+//! Both APIs reach one registry upstream. The stored object is the core Event;
+//! an `events.k8s.io/v1` request is converted onto it on the way in and back on
+//! the way out (`pkg/apis/events/v1/conversion.go:29-60`), and the scope carries
+//! the served version so the strategy can pick the legacy or the strict
+//! validation (`requestGroupVersion`, strategy.go:134-139).
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::core::event;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    body::{Body, Bytes},
+    extract::{OriginalUri, Path, Query, State},
+    http::{header, HeaderMap, Uri},
+    response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
+use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
+use rusternetes_common::dump::decode_request_body;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::{Event, EventList, EventV1, EventV1List},
     Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+/// The API a request addressed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Served {
+    Core,
+    EventsV1,
+}
+
+fn served(uri: &Uri) -> Served {
+    if uri.path().starts_with("/apis/events.k8s.io/") {
+        Served::EventsV1
+    } else {
+        Served::Core
+    }
+}
+
+/// The Event `RequestScope`: `v1` `Event` served as `events`, or
+/// `events.k8s.io/v1` `Event` served as `events`, over the one `NewREST` store.
+fn scope(state: &ApiServerState, uri: &Uri) -> (Served, RequestScope<Event>) {
+    let served = served(uri);
+    let group = match served {
+        Served::Core => "",
+        Served::EventsV1 => "events.k8s.io",
+    };
+    let scope = RequestScope {
+        kind: GroupVersionKind {
+            group: group.to_string(),
+            version: "v1".to_string(),
+            kind: "Event".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: group.to_string(),
+            version: "v1".to_string(),
+            resource: "events".to_string(),
+        },
+        subresource: None,
+        store: Box::new(event::new_store(state.storage.clone())),
+        apply: Some(match served {
+            Served::Core => crate::ssa::apply_legacy::<Event>,
+            Served::EventsV1 => event::apply_events_v1,
+        }),
+        convert_to_internal: Some(event::convert_to_internal),
+        patch_conversion: match served {
+            Served::Core => None,
+            Served::EventsV1 => Some(event::EVENTS_V1_PATCH_CONVERSION),
+        },
+    };
+    (served, scope)
+}
+
+/// A request body in the shape the scope decodes. An `events.k8s.io/v1` body is
+/// converted onto the core object *before* validation, as the codec does
+/// (`Convert_v1_Event_To_core_Event`): the strict validator reads
+/// `involvedObject.namespace`, the message length and requires `source`,
+/// `firstTimestamp`, `lastTimestamp` and `count` -- which arrive as
+/// `deprecated*` on this version -- to be unset (#1914).
+fn request_body(served: Served, body: &Bytes) -> Result<Bytes> {
+    if served == Served::Core {
+        return Ok(body.clone());
+    }
+    let value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(e) => {
+            return Err(decode_request_body::<EventV1>(body)
+                .err()
+                .unwrap_or_else(|| rusternetes_common::Error::BadRequest(e.to_string())))
+        }
+    };
+    if let Some(api_version) = value
+        .get("apiVersion")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+    {
+        if api_version != "events.k8s.io/v1" {
+            return Err(rusternetes_common::Error::BadRequest(format!(
+                "the API version in the data ({api_version}) does not match the expected API version (events.k8s.io/v1)"
+            )));
+        }
+    }
+    let v1: EventV1 = decode_request_body(body)?;
+    let mut core = serde_json::to_value(v1.into_core())
+        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+    // The scope's decode checks the body's apiVersion against the served one;
+    // `convert_to_internal` stamps the stored (core) version back on.
+    core["apiVersion"] = serde_json::json!("events.k8s.io/v1");
+    Ok(Bytes::from(serde_json::to_vec(&core).map_err(|e| {
+        rusternetes_common::Error::Internal(e.to_string())
+    })?))
+}
+
+/// A response in the served version's schema: the stored core Event, or a list
+/// of them, converted the way upstream's codec does on the way out
+/// (`Convert_core_Event_To_v1_Event`) (#1926).
+async fn response(served: Served, response: Response) -> Result<Response> {
+    if served == Served::Core || !response.status().is_success() {
+        return Ok(response);
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+    let converted = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(mut value) => match value.get("kind").and_then(|k| k.as_str()) {
+            Some("Event") => Some(event::core_event_json_to_events_v1(&value)),
+            Some("EventList") => {
+                if let Some(items) = value.get_mut("items").and_then(|i| i.as_array_mut()) {
+                    for item in items.iter_mut() {
+                        *item = event::core_event_json_to_events_v1(item);
+                    }
+                }
+                Some(value)
+            }
+            _ => None,
+        },
+        Err(_) => None,
+    };
+    let out = match converted.and_then(|v| serde_json::to_vec(&v).ok()) {
+        Some(out) => out,
+        None => bytes.to_vec(),
+    };
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Ok(Response::from_parts(parts, Body::from(out)))
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
+pub async fn create(
+    State(state): State<Arc<ApiServerState>>,
+    OriginalUri(uri): OriginalUri,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    let (served, scope) = scope(&state, &uri);
+    let body = request_body(served, &body)?;
+    let out = endpoints::create_resource(
+        &state,
+        &scope,
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await?;
+    response(served, out).await
+}
+
+pub async fn get(
+    State(state): State<Arc<ApiServerState>>,
+    OriginalUri(uri): OriginalUri,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Response> {
+    let (served, scope) = scope(&state, &uri);
+    let out =
+        endpoints::get_resource(&state, &scope, &auth_ctx.user, Some(&namespace), &name).await?;
+    response(served, out).await
+}
+
+pub async fn update(
+    State(state): State<Arc<ApiServerState>>,
+    OriginalUri(uri): OriginalUri,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    let (served, scope) = scope(&state, &uri);
+    let body = request_body(served, &body)?;
+    let out = endpoints::update_resource(
+        &state,
+        &scope,
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await?;
+    response(served, out).await
+}
+
+/// PATCH. The patch is applied to the object in the version it was written
+/// against and the result converted back before validation and storage, as
+/// upstream does for every patch
+/// (`staging/src/k8s.io/apiserver/pkg/endpoints/handlers/patch.go:323-338`,
+/// `:449-462`); the Store then runs `ValidateUpdate`, so on
+/// `events.k8s.io/v1` a patch of `note` is a 422 like the PUT (#1940).
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    OriginalUri(uri): OriginalUri,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    let (served, scope) = scope(&state, &uri);
+    let out = endpoints::patch_resource(
+        &state,
+        &scope,
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await?;
+    response(served, out).await
+}
+
+pub async fn delete(
+    State(state): State<Arc<ApiServerState>>,
+    OriginalUri(uri): OriginalUri,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    let (served, scope) = scope(&state, &uri);
+    let out = endpoints::delete_resource(
+        &state,
+        &scope,
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await?;
+    response(served, out).await
+}
+
+pub async fn deletecollection_events(
+    State(state): State<Arc<ApiServerState>>,
+    OriginalUri(uri): OriginalUri,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    let (served, scope) = scope(&state, &uri);
+    let out = endpoints::delete_collection(
+        &state,
+        &scope,
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await?;
+    response(served, out).await
+}
 
 /// List all events in a namespace
 pub async fn list(
@@ -150,435 +432,6 @@ pub async fn list_all(
         items: events,
     })
     .into_response())
-}
-
-/// Get a specific event
-pub async fn get(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<Event>> {
-    debug!("Getting event: {}/{}", namespace, name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "events")
-        .with_namespace(&namespace)
-        .with_api_group("")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("events", Some(&namespace), &name);
-    let event: Event = state.storage.get(&key).await?;
-
-    Ok(Json(event))
-}
-
-/// Create a new event
-pub async fn create(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path(namespace): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut event): DumpingJson<Event>,
-) -> Result<(StatusCode, Json<Event>)> {
-    info!("Creating event in namespace: {}", namespace);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "events")
-        .with_namespace(&namespace)
-        .with_api_group("");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Ensure namespace matches
-    event.metadata.namespace = Some(namespace.clone());
-
-    // Generate UID if not present
-    event.metadata.ensure_uid();
-
-    // Generate name if not present
-    if event.metadata.name.is_empty() {
-        let name = Event::generate_name(&event.involved_object, &event.reason);
-        event.metadata.name = name;
-    }
-
-    // Ensure creation timestamp is set
-    event.metadata.ensure_creation_timestamp();
-
-    // Field validation (mirrors upstream ValidateEventCreate, core/v1 path —
-    // legacy-only rules so internally-generated events are not over-tightened).
-    {
-        let errs = rusternetes_common::validation::events::validate_event_create(
-            &event,
-            rusternetes_common::validation::events::RequestVersion::CoreV1,
-        );
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    let key = build_key("events", Some(&namespace), &event.metadata.name);
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: Event {}/{} validated successfully (not created)",
-            namespace, event.metadata.name
-        );
-        return Ok((StatusCode::CREATED, Json(event)));
-    }
-
-    let created = state.storage.create(&key, &event).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
-}
-
-/// Update an existing event
-pub async fn update(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path((namespace, name)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut event): DumpingJson<Event>,
-) -> Result<Json<Event>> {
-    info!("Updating event: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "events")
-        .with_namespace(&namespace)
-        .with_api_group("")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Ensure namespace and name match
-    event.metadata.namespace = Some(namespace.clone());
-    event.metadata.name = name.clone();
-
-    let key = build_key("events", Some(&namespace), &name);
-
-    // Preserve creation_timestamp from the existing resource — the client
-    // may send a truncated version (Go's time.Time loses nanosecond precision
-    // during JSON round-trip in some cases).
-    let existing_event = state.storage.get::<Event>(&key).await.ok();
-    if let Some(existing) = &existing_event {
-        if existing.metadata.creation_timestamp.is_some() {
-            event.metadata.creation_timestamp = existing.metadata.creation_timestamp;
-        }
-        // Also preserve UID — must not change on update
-        if !existing.metadata.uid.is_empty() {
-            event.metadata.uid = existing.metadata.uid.clone();
-        }
-        // Events allow unconditional updates (upstream Event.Strategy
-        // AllowUnconditionalUpdate == true): if the client omits
-        // resourceVersion, back-fill it from the stored object before
-        // validation, mirroring registry/generic/registry/store.go.
-        if event
-            .metadata
-            .resource_version
-            .as_deref()
-            .unwrap_or("")
-            .is_empty()
-        {
-            event.metadata.resource_version = existing.metadata.resource_version.clone();
-        }
-    }
-
-    // Field validation (mirrors upstream ValidateEventUpdate, core/v1 path).
-    if let Some(existing) = &existing_event {
-        let errs = rusternetes_common::validation::events::validate_event_update(
-            &event,
-            existing,
-            rusternetes_common::validation::events::RequestVersion::CoreV1,
-        );
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: Event {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(event));
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    // The stored object is already in hand from the read above; re-reading it
-    // here would cost a second round-trip on every PUT and widen the window
-    // between read and write for no benefit.
-    if let Some(stored) = existing_event.as_ref() {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut event.metadata,
-            &stored.metadata,
-        );
-    }
-    // Event is one of the nine strategies whose `AllowCreateOnUpdate()` is
-    // true (pkg/registry/core/event/strategy.go:74), so a PUT to a name that
-    // does not exist creates it rather than answering NotFound (#1905).
-    let updated = match state.storage.update(&key, &event).await {
-        Ok(updated) => updated,
-        Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &event).await?,
-        Err(e) => return Err(e),
-    };
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &updated,
-    )
-    .await?;
-
-    Ok(Json(updated))
-}
-
-/// Delete an event
-pub async fn delete(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path((namespace, name)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Event>> {
-    info!("Deleting event: {}/{}", namespace, name);
-
-    // Check if this is a dry-run request
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "events")
-        .with_namespace(&namespace)
-        .with_api_group("")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("events", Some(&namespace), &name);
-
-    // Get the event for finalizer handling
-    let event: Event = state.storage.get(&key).await?;
-
-    // If dry-run, skip delete operation
-    if is_dry_run {
-        info!(
-            "Dry-run: Event {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(event));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &event,
-        &delete_opts,
-    )
-    .await?;
-
-    if deleted_immediately {
-        Ok(Json(event))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: Event = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_common::resources::EventType;
-    use rusternetes_common::resources::ObjectReference;
-
-    #[test]
-    fn test_event_creation() {
-        let obj_ref = ObjectReference {
-            kind: Some("Pod".to_string()),
-            namespace: Some("default".to_string()),
-            name: Some("test-pod".to_string()),
-            uid: Some("abc123".to_string()),
-            api_version: Some("v1".to_string()),
-            resource_version: None,
-            field_path: None,
-        };
-
-        let event = Event::new(
-            "test-event".to_string(),
-            "default".to_string(),
-            obj_ref,
-            "PodStarted".to_string(),
-            "Pod started successfully".to_string(),
-            EventType::Normal,
-        );
-
-        assert_eq!(event.metadata.name, "test-event".to_string());
-        assert_eq!(event.metadata.namespace, Some("default".to_string()));
-        assert_eq!(event.reason, "PodStarted");
-        assert_eq!(event.count, 1);
-    }
-
-    #[test]
-    fn test_event_field_selector_filtering() {
-        // Simulate what list_all does: filter events using apply_selectors
-        let mut events = vec![
-            Event::new(
-                "event-1".to_string(),
-                "default".to_string(),
-                ObjectReference {
-                    kind: Some("Pod".to_string()),
-                    namespace: Some("default".to_string()),
-                    name: Some("pod-a".to_string()),
-                    uid: Some("uid1".to_string()),
-                    api_version: Some("v1".to_string()),
-                    resource_version: None,
-                    field_path: None,
-                },
-                "Started".to_string(),
-                "Pod started".to_string(),
-                EventType::Normal,
-            ),
-            Event::new(
-                "event-2".to_string(),
-                "kube-system".to_string(),
-                ObjectReference {
-                    kind: Some("Pod".to_string()),
-                    namespace: Some("kube-system".to_string()),
-                    name: Some("pod-b".to_string()),
-                    uid: Some("uid2".to_string()),
-                    api_version: Some("v1".to_string()),
-                    resource_version: None,
-                    field_path: None,
-                },
-                "Failed".to_string(),
-                "Pod failed".to_string(),
-                EventType::Warning,
-            ),
-        ];
-
-        // Filter by involvedObject.name
-        let mut params = HashMap::new();
-        params.insert(
-            "fieldSelector".to_string(),
-            "involvedObject.name=pod-a".to_string(),
-        );
-        crate::handlers::filtering::apply_selectors(&mut events, &params).unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].metadata.name, "event-1");
-        assert_eq!(events[0].involved_object.name, Some("pod-a".to_string()));
-    }
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(patch, Event, "events", "");
-
-pub async fn deletecollection_events(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection events in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "events")
-        .with_namespace(&namespace)
-        .with_api_group("");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: Event collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all events in the namespace
-    let prefix = build_prefix("events", Some(&namespace));
-    let mut items = state.storage.list::<Event>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("events", Some(&namespace), &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} events deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }
 
 // ---- events.k8s.io/v1 API group handlers ----
@@ -725,379 +578,93 @@ pub async fn list_all_events_v1(
     .into_response())
 }
 
-/// Get a single event via events.k8s.io/v1
-pub async fn get_events_v1(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<EventV1>> {
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "events")
-        .with_namespace(&namespace)
-        .with_api_group("events.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("events", Some(&namespace), &name);
-    let event: Event = state.storage.get(&key).await?;
-
-    Ok(Json(event.to_events_v1()))
-}
-
-/// Create an event via events.k8s.io/v1
-pub async fn create_events_v1(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path(namespace): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    DumpingJson(body): DumpingJson<EventV1>,
-) -> Result<(StatusCode, Json<EventV1>)> {
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "events")
-        .with_namespace(&namespace)
-        .with_api_group("events.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Convert the request onto the core object BEFORE validation: the strict
-    // validator reads `involvedObject.namespace`, `message`/`note` length, and
-    // requires `source`, `firstTimestamp`, `lastTimestamp` and `count` — which
-    // arrive as `deprecated*` on this version — to be unset (#1914).
-    // Crucially we do NOT yet copy `reportingController` into `source`: strict
-    // validation requires `source` to be unset, and the client legitimately
-    // leaves it empty.
-    let mut event = body.into_core();
-    event.metadata.namespace = Some(namespace.clone());
-    event.metadata.ensure_uid();
-
-    if event.metadata.name.is_empty() {
-        let name = Event::generate_name(&event.involved_object, &event.reason);
-        event.metadata.name = name;
-    }
-
-    event.metadata.ensure_creation_timestamp();
-
-    // Strict field validation (mirrors upstream ValidateEventCreate on the
-    // events.k8s.io/v1 path). Run before the source-component back-fill so a
-    // valid client event with an empty `source` still passes the
-    // "source needs to be unset" rule.
-    {
-        let errs = rusternetes_common::validation::events::validate_event_create(
-            &event,
-            rusternetes_common::validation::events::RequestVersion::EventsV1,
-        );
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // Back-fill source.component from reportingController for field-selector
-    // compatibility now that strict validation has passed.
-    if event.source.component.is_empty() {
-        if let Some(ref rc) = event.reporting_component {
-            event.source.component = rc.clone();
-        }
-    }
-
-    let key = build_key("events", Some(&namespace), &event.metadata.name);
-
-    if is_dry_run {
-        return Ok((StatusCode::CREATED, Json(event.to_events_v1())));
-    }
-
-    let created: Event = state.storage.create(&key, &event).await?;
-
-    Ok((StatusCode::CREATED, Json(created.to_events_v1())))
-}
-
-/// Update an event via events.k8s.io/v1
-pub async fn update_events_v1(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path((namespace, name)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
-    DumpingJson(body): DumpingJson<EventV1>,
-) -> Result<Json<EventV1>> {
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "events")
-        .with_namespace(&namespace)
-        .with_api_group("events.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // The v1 body converts onto the core object unconditionally, as upstream's
-    // `Convert_v1_Event_To_core_Event` does: this version has no `count`,
-    // `message`, `source` or `involvedObject` field for the conversion to
-    // clobber, and reads now answer in the same schema, so a
-    // read-modify-write client round-trips the `deprecated*` names (#1926).
-    let mut event = body.into_core();
-    event.metadata.namespace = Some(namespace.clone());
-    event.metadata.name = name.clone();
-
-    let key = build_key("events", Some(&namespace), &name);
-
-    // Preserve creation_timestamp and UID from existing resource — the client
-    // may send a truncated version (Go's time.Time loses nanosecond precision
-    // during JSON round-trip in some cases).
-    let existing_event = state.storage.get::<Event>(&key).await.ok();
-    if let Some(existing) = &existing_event {
-        if existing.metadata.creation_timestamp.is_some() {
-            event.metadata.creation_timestamp = existing.metadata.creation_timestamp;
-        }
-        // Also preserve UID — must not change on update
-        if !existing.metadata.uid.is_empty() {
-            event.metadata.uid = existing.metadata.uid.clone();
-        }
-        // Events allow unconditional updates (upstream Event.Strategy
-        // AllowUnconditionalUpdate == true): if the client omits
-        // resourceVersion, back-fill it from the stored object before
-        // validation, mirroring registry/generic/registry/store.go.
-        if event
-            .metadata
-            .resource_version
-            .as_deref()
-            .unwrap_or("")
-            .is_empty()
-        {
-            event.metadata.resource_version = existing.metadata.resource_version.clone();
-        }
-    }
-
-    // Back-fill `source.component` from `reportingController` to mirror how the
-    // stored event was normalised at create time, so the strict update
-    // immutability check on `source` compares like with like. An explicit
-    // `deprecatedSource` already landed on `source` in the conversion above and
-    // still wins.
-    if event.source.component.is_empty() {
-        if let Some(ref rc) = event.reporting_component {
-            event.source.component = rc.clone();
-        }
-    }
-
-    // Strict field validation (mirrors upstream ValidateEventUpdate on the
-    // events.k8s.io/v1 path: immutability of most fields + microsecond-precision
-    // eventTime tolerance).
-    if let Some(existing) = &existing_event {
-        let errs = rusternetes_common::validation::events::validate_event_update(
-            &event,
-            existing,
-            rusternetes_common::validation::events::RequestVersion::EventsV1,
-        );
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    if is_dry_run {
-        return Ok(Json(event.to_events_v1()));
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    // The stored object is already in hand from the read above; re-reading it
-    // here would cost a second round-trip on every PUT and widen the window
-    // between read and write for no benefit.
-    if let Some(stored) = existing_event.as_ref() {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut event.metadata,
-            &stored.metadata,
-        );
-    }
-    // AllowCreateOnUpdate, as on the core endpoint above — both reach the same
-    // registry upstream (pkg/registry/core/event/strategy.go:74).
-    let updated: Event = match state.storage.update(&key, &event).await {
-        Ok(updated) => updated,
-        Err(rusternetes_common::Error::NotFound(_)) => state.storage.create(&key, &event).await?,
-        Err(e) => return Err(e),
-    };
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &updated,
-    )
-    .await?;
-
-    Ok(Json(updated.to_events_v1()))
-}
-
-/// Delete an event via events.k8s.io/v1
-pub async fn delete_events_v1(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path((namespace, name)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<EventV1>> {
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "events")
-        .with_namespace(&namespace)
-        .with_api_group("events.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("events", Some(&namespace), &name);
-    let event: Event = state.storage.get(&key).await?;
-
-    if is_dry_run {
-        return Ok(Json(event.to_events_v1()));
-    }
-
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &event,
-        &delete_opts,
-    )
-    .await?;
-
-    if deleted_immediately {
-        Ok(Json(event.to_events_v1()))
-    } else {
-        let updated: Event = state.storage.get(&key).await?;
-        Ok(Json(updated.to_events_v1()))
-    }
-}
-
-/// PATCH an event via events.k8s.io/v1.
-///
-/// The patch is applied to the object in the version it was written against —
-/// this one — and the result converted back before validation and storage, as
-/// upstream does for every patch
-/// (`staging/src/k8s.io/apiserver/pkg/endpoints/handlers/patch.go:323-338,:449-462`).
-/// Applied to the stored core object instead, a patch naming `note`,
-/// `regarding` or a `deprecated*` field would land on a key the core schema does
-/// not own and leave the real field alone (#1940).
-///
-/// The generic path then runs `validate_event_update` on the result, because
-/// upstream's patch and PUT paths share one `Store.Update` and therefore one
-/// `ValidateUpdate`: on this version everything but `series` and metadata is
-/// immutable, so a patch of `note` is a 422, not a write.
-pub async fn patch_events_v1(
-    state: State<Arc<ApiServerState>>,
-    auth_ctx: Extension<AuthContext>,
-    path: Path<(String, String)>,
-    query: Query<HashMap<String, String>>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<Json<EventV1>> {
-    let hooks = crate::handlers::generic_patch::PatchHooks::<Event> {
-        conversion: Some(crate::handlers::generic_patch::RequestVersionConversion {
-            to_request_version: core_event_json_to_events_v1_ref,
-            from_request_version: events_v1_json_onto_core_event,
-        }),
-        validate_update: Some(validate_events_v1_update),
-    };
-    let Json(patched) =
-        crate::handlers::generic_patch::patch_namespaced_resource_with_hooks::<Event>(
-            state,
-            auth_ctx,
-            path,
-            query,
-            headers,
-            body,
-            "events",
-            "events.k8s.io",
-            hooks,
-        )
-        .await?;
-    Ok(Json(patched.to_events_v1()))
-}
-
-/// `ValidateEventUpdate` on the events.k8s.io/v1 path, as a plain function so
-/// the generic PATCH path can hold it (`PatchHooks::validate_update`). Same call
-/// the PUT handler above makes.
-fn validate_events_v1_update(
-    new_event: &Event,
-    old_event: &Event,
-) -> rusternetes_common::validation::field::ErrorList {
-    rusternetes_common::validation::events::validate_event_update(
-        new_event,
-        old_event,
-        rusternetes_common::validation::events::RequestVersion::EventsV1,
-    )
-}
-
-/// `to_request_version` for the pair above: the stored core JSON in the
-/// `events.k8s.io/v1` shape.
-fn core_event_json_to_events_v1_ref(value: &serde_json::Value) -> serde_json::Value {
-    core_event_json_to_events_v1(value.clone())
-}
-
-/// `from_request_version` for the pair above: a patched `events.k8s.io/v1`
-/// document back onto the stored core shape, via
-/// `EventV1::into_core` — the same conversion the create and update handlers
-/// use, so PATCH cannot drift from them.
-fn events_v1_json_onto_core_event(
-    stored: &serde_json::Value,
-    patched: serde_json::Value,
-) -> serde_json::Value {
-    let Ok(v1) = serde_json::from_value::<EventV1>(patched.clone()) else {
-        // Best-effort, like the watch converter: hand back a document that will
-        // not decode as the v1 type so the caller's own decode produces the
-        // error message rather than this conversion swallowing it.
-        return patched;
-    };
-    let Ok(mut core) = serde_json::to_value(v1.into_core()) else {
-        return patched;
-    };
-    // Carry over whatever `Event::extra` was holding — keys neither schema
-    // names, kept only so a stored object survives a round trip unchanged. The
-    // patch was written against the v1 shape, so it cannot have named them.
-    if let Some(extra) = serde_json::from_value::<Event>(stored.clone())
-        .ok()
-        .and_then(|event| event.extra)
-    {
-        if let Some(obj) = core.as_object_mut() {
-            for (key, value) in extra {
-                obj.entry(key).or_insert(value);
-            }
-        }
-    }
-    core
-}
-
-/// Convert one stored core-Event JSON object into the `events.k8s.io/v1` shape.
-///
-/// Used by the watch path, which hands the converter raw JSON rather than a
-/// typed object. Best-effort like every other watch converter: an object that
-/// will not decode is passed through unchanged, exactly as before.
+/// One stored core-Event JSON object in the `events.k8s.io/v1` shape, for the
+/// watch path, which hands its converter raw JSON rather than a typed object.
 fn core_event_json_to_events_v1(value: serde_json::Value) -> serde_json::Value {
-    match serde_json::from_value::<Event>(value.clone()) {
-        Ok(event) => serde_json::to_value(event.to_events_v1()).unwrap_or(value),
-        Err(_) => value,
+    crate::registry::core::event::core_event_json_to_events_v1(&value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusternetes_common::resources::EventType;
+    use rusternetes_common::resources::ObjectReference;
+
+    #[test]
+    fn test_event_creation() {
+        let obj_ref = ObjectReference {
+            kind: Some("Pod".to_string()),
+            namespace: Some("default".to_string()),
+            name: Some("test-pod".to_string()),
+            uid: Some("abc123".to_string()),
+            api_version: Some("v1".to_string()),
+            resource_version: None,
+            field_path: None,
+        };
+
+        let event = Event::new(
+            "test-event".to_string(),
+            "default".to_string(),
+            obj_ref,
+            "PodStarted".to_string(),
+            "Pod started successfully".to_string(),
+            EventType::Normal,
+        );
+
+        assert_eq!(event.metadata.name, "test-event".to_string());
+        assert_eq!(event.metadata.namespace, Some("default".to_string()));
+        assert_eq!(event.reason, "PodStarted");
+        assert_eq!(event.count, 1);
+    }
+
+    #[test]
+    fn test_event_field_selector_filtering() {
+        // Simulate what list_all does: filter events using apply_selectors
+        let mut events = vec![
+            Event::new(
+                "event-1".to_string(),
+                "default".to_string(),
+                ObjectReference {
+                    kind: Some("Pod".to_string()),
+                    namespace: Some("default".to_string()),
+                    name: Some("pod-a".to_string()),
+                    uid: Some("uid1".to_string()),
+                    api_version: Some("v1".to_string()),
+                    resource_version: None,
+                    field_path: None,
+                },
+                "Started".to_string(),
+                "Pod started".to_string(),
+                EventType::Normal,
+            ),
+            Event::new(
+                "event-2".to_string(),
+                "kube-system".to_string(),
+                ObjectReference {
+                    kind: Some("Pod".to_string()),
+                    namespace: Some("kube-system".to_string()),
+                    name: Some("pod-b".to_string()),
+                    uid: Some("uid2".to_string()),
+                    api_version: Some("v1".to_string()),
+                    resource_version: None,
+                    field_path: None,
+                },
+                "Failed".to_string(),
+                "Pod failed".to_string(),
+                EventType::Warning,
+            ),
+        ];
+
+        // Filter by involvedObject.name
+        let mut params = HashMap::new();
+        params.insert(
+            "fieldSelector".to_string(),
+            "involvedObject.name=pod-a".to_string(),
+        );
+        crate::handlers::filtering::apply_selectors(&mut events, &params).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].metadata.name, "event-1");
+        assert_eq!(events[0].involved_object.name, Some("pod-a".to_string()));
     }
 }
