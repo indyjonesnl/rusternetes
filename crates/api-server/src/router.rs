@@ -1920,12 +1920,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             "/apis/autoscaling/v1/namespaces/:namespace/horizontalpodautoscalers/:name/status",
             get(handlers::horizontalpodautoscaler::get_status)
                 .put(handlers::horizontalpodautoscaler::update_status)
-                .patch(handlers::horizontalpodautoscaler::update_status),
+                .patch(handlers::horizontalpodautoscaler::patch_status),
         )
         .route(
             "/apis/autoscaling/v1/horizontalpodautoscalers",
-            get(handlers::horizontalpodautoscaler::list_all)
-            .delete(handlers::horizontalpodautoscaler::deletecollection_horizontalpodautoscalers),
+            get(handlers::horizontalpodautoscaler::list_all),
         )
         // Autoscaling v2 API - HorizontalPodAutoscalers (namespace-scoped)
         .route(
@@ -1945,13 +1944,12 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             "/apis/autoscaling/v2/namespaces/:namespace/horizontalpodautoscalers/:name/status",
             get(handlers::horizontalpodautoscaler::get_status)
                 .put(handlers::horizontalpodautoscaler::update_status)
-                .patch(handlers::horizontalpodautoscaler::update_status),
+                .patch(handlers::horizontalpodautoscaler::patch_status),
         )
         // HorizontalPodAutoscalers (all namespaces)
         .route(
             "/apis/autoscaling/v2/horizontalpodautoscalers",
-            get(handlers::horizontalpodautoscaler::list_all)
-            .delete(handlers::horizontalpodautoscaler::deletecollection_horizontalpodautoscalers),
+            get(handlers::horizontalpodautoscaler::list_all),
         )
         // Policy v1 API - PodDisruptionBudgets (namespace-scoped)
         .route(
