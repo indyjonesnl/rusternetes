@@ -363,6 +363,9 @@ async fn a_bad_policy_status_answers_422_with_a_field_path() {
         )
         .await;
     assert!(status.is_success(), "seed policy: {status} {body}");
+    // `AllowUnconditionalUpdate()` is false for a policy: a PUT names the
+    // version it replaces.
+    let resource_version = body["metadata"]["resourceVersion"].clone();
 
     let cases: Vec<(&str, Value, &str)> = vec![
         (
@@ -399,7 +402,7 @@ async fn a_bad_policy_status_answers_422_with_a_field_path() {
                 Some(&json!({
                     "apiVersion": "admissionregistration.k8s.io/v1",
                     "kind": "ValidatingAdmissionPolicy",
-                    "metadata": { "name": "policy-status" },
+                    "metadata": { "name": "policy-status", "resourceVersion": resource_version },
                     "status": status_body,
                 })),
             )
@@ -438,6 +441,7 @@ async fn a_valid_policy_status_is_written() {
         )
         .await;
     assert!(status.is_success(), "seed policy: {status} {body}");
+    let mut resource_version = body["metadata"]["resourceVersion"].clone();
 
     for status_body in [
         json!({ "observedGeneration": 1 }),
@@ -454,7 +458,7 @@ async fn a_valid_policy_status_is_written() {
                 Some(&json!({
                     "apiVersion": "admissionregistration.k8s.io/v1",
                     "kind": "ValidatingAdmissionPolicy",
-                    "metadata": { "name": "policy-status-ok" },
+                    "metadata": { "name": "policy-status-ok", "resourceVersion": resource_version },
                     "status": status_body,
                 })),
             )
@@ -463,5 +467,6 @@ async fn a_valid_policy_status_is_written() {
             code.is_success(),
             "a valid status must be written: {code} {body}"
         );
+        resource_version = body["metadata"]["resourceVersion"].clone();
     }
 }

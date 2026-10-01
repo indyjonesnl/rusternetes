@@ -16,9 +16,9 @@
 //! `namespaceSelector`/`objectSelector` label-selector validation are included.
 
 use crate::resources::admission_webhook::{
-    LabelSelector as WebhookLabelSelector, MatchCondition, MutatingWebhook,
-    MutatingWebhookConfiguration, RuleWithOperations, SideEffectClass, ValidatingWebhook,
-    ValidatingWebhookConfiguration,
+    FailurePolicy, LabelSelector as WebhookLabelSelector, MatchCondition, MatchPolicy,
+    MutatingWebhook, MutatingWebhookConfiguration, ReinvocationPolicy, RuleWithOperations,
+    SideEffectClass, ValidatingWebhook, ValidatingWebhookConfiguration,
 };
 use crate::resources::WebhookClientConfig;
 use crate::validation::field::{Error, ErrorList, Path};
@@ -496,6 +496,77 @@ pub fn ignore_mutating_webhook_match_conditions(
         .map(|h| h.match_conditions.as_ref())
         .collect();
     match_conditions_unchanged(&new_conditions, &old_conditions)
+}
+
+/// `SetDefaults_Rule` (`pkg/apis/admissionregistration/v1/defaults.go:77-82`).
+fn set_defaults_rules(rules: &mut [RuleWithOperations]) {
+    for rule in rules {
+        rule.rule.scope.get_or_insert_with(|| "*".to_string());
+    }
+}
+
+/// `SetDefaults_ServiceReference` (`defaults.go:85-89`).
+fn set_defaults_client_config(client_config: &mut WebhookClientConfig) {
+    if let Some(service) = client_config.service.as_mut() {
+        service.port.get_or_insert(443);
+    }
+}
+
+/// The defaults `SetDefaults_ValidatingWebhook` and `SetDefaults_MutatingWebhook`
+/// share (`defaults.go:32-45`, `:50-66`).
+#[allow(clippy::too_many_arguments)]
+fn set_defaults_webhook_common(
+    failure_policy: &mut Option<FailurePolicy>,
+    match_policy: &mut Option<MatchPolicy>,
+    namespace_selector: &mut Option<WebhookLabelSelector>,
+    object_selector: &mut Option<WebhookLabelSelector>,
+    timeout_seconds: &mut Option<i32>,
+    rules: &mut [RuleWithOperations],
+    client_config: &mut WebhookClientConfig,
+) {
+    failure_policy.get_or_insert(FailurePolicy::Fail);
+    match_policy.get_or_insert(MatchPolicy::Equivalent);
+    namespace_selector.get_or_insert_with(WebhookLabelSelector::default);
+    object_selector.get_or_insert_with(WebhookLabelSelector::default);
+    timeout_seconds.get_or_insert(10);
+    set_defaults_rules(rules);
+    set_defaults_client_config(client_config);
+}
+
+/// `SetObjectDefaults_ValidatingWebhookConfiguration`
+/// (`pkg/apis/admissionregistration/v1/zz_generated.defaults.go`):
+/// `SetDefaults_ValidatingWebhook`, then `SetDefaults_ServiceReference` and
+/// `SetDefaults_Rule` over each webhook.
+pub fn set_defaults_validating_webhook_configuration(cfg: &mut ValidatingWebhookConfiguration) {
+    for hook in cfg.webhooks.iter_mut().flatten() {
+        set_defaults_webhook_common(
+            &mut hook.failure_policy,
+            &mut hook.match_policy,
+            &mut hook.namespace_selector,
+            &mut hook.object_selector,
+            &mut hook.timeout_seconds,
+            &mut hook.rules,
+            &mut hook.client_config,
+        );
+    }
+}
+
+/// `SetObjectDefaults_MutatingWebhookConfiguration`: as the validating one,
+/// plus `reinvocationPolicy` (`SetDefaults_MutatingWebhook`, `defaults.go:64`).
+pub fn set_defaults_mutating_webhook_configuration(cfg: &mut MutatingWebhookConfiguration) {
+    for hook in cfg.webhooks.iter_mut().flatten() {
+        set_defaults_webhook_common(
+            &mut hook.failure_policy,
+            &mut hook.match_policy,
+            &mut hook.namespace_selector,
+            &mut hook.object_selector,
+            &mut hook.timeout_seconds,
+            &mut hook.rules,
+            &mut hook.client_config,
+        );
+        hook.reinvocation_policy
+            .get_or_insert(ReinvocationPolicy::Never);
+    }
 }
 
 /// Validate a `ValidatingWebhookConfiguration` (create path) — upstream

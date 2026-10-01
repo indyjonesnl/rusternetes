@@ -1,232 +1,238 @@
+//! ValidatingAdmissionPolicy and ValidatingAdmissionPolicyBinding endpoints.
+//!
+//! Writes go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the strategies of
+//! [`crate::registry::admissionregistration`] — upstream's
+//! `pkg/registry/admissionregistration/{validatingadmissionpolicy,validatingadmissionpolicybinding}/storage`
+//! wired into `endpoints/handlers/{create,update,patch,delete}.go`. Lists and
+//! watches are still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::admissionregistration::{
+    validatingadmissionpolicy, validatingadmissionpolicybinding,
+};
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::{ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding},
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 
-// ===== ValidatingAdmissionPolicy Handlers =====
-
-pub async fn create_validating_admission_policy(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut policy): DumpingJson<ValidatingAdmissionPolicy>,
-) -> Result<(StatusCode, Json<ValidatingAdmissionPolicy>)> {
-    info!(
-        "Creating ValidatingAdmissionPolicy: {}",
-        policy.metadata.name
-    );
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &policy.metadata,
-        None,
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "validatingadmissionpolicies")
-        .with_api_group("admissionregistration.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Default, then validate — upstream's registry strategy runs
-    // `SetDefaults_ValidatingAdmissionPolicySpec` / `SetDefaults_MatchResources`
-    // before `Validate`, and `failurePolicy`, `matchPolicy` and both selectors
-    // are `Required` by the validator precisely because defaulting fills them
-    // (`pkg/apis/admissionregistration/v1/defaults.go:97-119`,
-    // `.../validation/validation.go:772`).
-    rusternetes_common::validation::validating_admission_policy::set_defaults_validating_admission_policy(&mut policy);
-    let errs = rusternetes_common::validation::validating_admission_policy::validate_validating_admission_policy(&policy);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Enrich metadata with system fields
-    policy.metadata.ensure_uid();
-    policy.metadata.ensure_creation_timestamp();
-
-    // Check for dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ValidatingAdmissionPolicy validated successfully (not created)");
-        return Ok((StatusCode::CREATED, Json(policy)));
-    }
-
-    let key = build_key("validatingadmissionpolicies", None, &policy.metadata.name);
-    let created = state.storage.create(&key, &policy).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+pub(crate) fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
 }
 
-pub async fn get_validating_admission_policy(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path(name): Path<String>,
-) -> Result<Json<ValidatingAdmissionPolicy>> {
-    debug!("Getting ValidatingAdmissionPolicy: {}", name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "validatingadmissionpolicies")
-        .with_api_group("admissionregistration.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+/// The create / get / update / patch / delete / deletecollection handlers of a
+/// cluster-scoped resource served by a [`RequestScope`]: thin wrappers over
+/// `endpoints::{create,get,update,patch,delete}_resource` and
+/// `delete_collection`, as in the sibling per-resource handler files.
+macro_rules! store_crud_handlers {
+    (
+        scope: $scope:ident,
+        create: $create:ident,
+        get: $get:ident,
+        update: $update:ident,
+        patch: $patch:ident,
+        delete: $delete:ident,
+        deletecollection: $deletecollection:ident $(,)?
+    ) => {
+        pub async fn $create(
+            axum::extract::State(state): axum::extract::State<
+                std::sync::Arc<$crate::state::ApiServerState>,
+            >,
+            axum::Extension(auth_ctx): axum::Extension<$crate::middleware::AuthContext>,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+            body: axum::body::Bytes,
+        ) -> rusternetes_common::Result<axum::response::Response> {
+            $crate::endpoints::handlers::create_resource(
+                &state,
+                &$scope(&state),
+                &auth_ctx.user,
+                None,
+                &params,
+                &body,
+            )
+            .await
         }
+
+        pub async fn $get(
+            axum::extract::State(state): axum::extract::State<
+                std::sync::Arc<$crate::state::ApiServerState>,
+            >,
+            axum::Extension(auth_ctx): axum::Extension<$crate::middleware::AuthContext>,
+            axum::extract::Path(name): axum::extract::Path<String>,
+        ) -> rusternetes_common::Result<axum::response::Response> {
+            $crate::endpoints::handlers::get_resource(
+                &state,
+                &$scope(&state),
+                &auth_ctx.user,
+                None,
+                &name,
+            )
+            .await
+        }
+
+        pub async fn $update(
+            axum::extract::State(state): axum::extract::State<
+                std::sync::Arc<$crate::state::ApiServerState>,
+            >,
+            axum::Extension(auth_ctx): axum::Extension<$crate::middleware::AuthContext>,
+            axum::extract::Path(name): axum::extract::Path<String>,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+            body: axum::body::Bytes,
+        ) -> rusternetes_common::Result<axum::response::Response> {
+            $crate::endpoints::handlers::update_resource(
+                &state,
+                &$scope(&state),
+                &auth_ctx.user,
+                None,
+                &name,
+                &params,
+                &body,
+            )
+            .await
+        }
+
+        pub async fn $patch(
+            axum::extract::State(state): axum::extract::State<
+                std::sync::Arc<$crate::state::ApiServerState>,
+            >,
+            axum::Extension(auth_ctx): axum::Extension<$crate::middleware::AuthContext>,
+            axum::extract::Path(name): axum::extract::Path<String>,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
+        ) -> rusternetes_common::Result<axum::response::Response> {
+            $crate::endpoints::handlers::patch_resource(
+                &state,
+                &$scope(&state),
+                &auth_ctx.user,
+                None,
+                &name,
+                &params,
+                $crate::handlers::validating_admission_policy::patch_content_type(&headers),
+                &body,
+            )
+            .await
+        }
+
+        pub async fn $delete(
+            axum::extract::State(state): axum::extract::State<
+                std::sync::Arc<$crate::state::ApiServerState>,
+            >,
+            axum::Extension(auth_ctx): axum::Extension<$crate::middleware::AuthContext>,
+            axum::extract::Path(name): axum::extract::Path<String>,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+            body: axum::body::Bytes,
+        ) -> rusternetes_common::Result<axum::response::Response> {
+            $crate::endpoints::handlers::delete_resource(
+                &state,
+                &$scope(&state),
+                &auth_ctx.user,
+                None,
+                &name,
+                &params,
+                &body,
+            )
+            .await
+        }
+
+        pub async fn $deletecollection(
+            axum::extract::State(state): axum::extract::State<
+                std::sync::Arc<$crate::state::ApiServerState>,
+            >,
+            axum::Extension(auth_ctx): axum::Extension<$crate::middleware::AuthContext>,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+            body: axum::body::Bytes,
+        ) -> rusternetes_common::Result<axum::response::Response> {
+            $crate::endpoints::handlers::delete_collection(
+                &state,
+                &$scope(&state),
+                &auth_ctx.user,
+                None,
+                &params,
+                &body,
+            )
+            .await
+        }
+    };
+}
+pub(crate) use store_crud_handlers;
+
+// ===== ValidatingAdmissionPolicy =====
+
+/// The ValidatingAdmissionPolicy `RequestScope`: `admissionregistration.k8s.io/v1`
+/// served as `validatingadmissionpolicies`, backed by the policy `NewREST`
+/// (the status store for the `status` subresource).
+fn policy_scope(
+    state: &ApiServerState,
+    subresource: Option<&'static str>,
+) -> RequestScope<ValidatingAdmissionPolicy> {
+    let (store, status_store) = validatingadmissionpolicy::new_stores(state.storage.clone());
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "admissionregistration.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "ValidatingAdmissionPolicy".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "admissionregistration.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "validatingadmissionpolicies".to_string(),
+        },
+        subresource,
+        store: Box::new(if subresource.is_some() {
+            status_store
+        } else {
+            store
+        }),
+        apply: Some(crate::ssa::apply_legacy::<ValidatingAdmissionPolicy>),
+        convert_to_internal: Some(validatingadmissionpolicy::convert_to_internal),
+        patch_conversion: None,
     }
-
-    let key = build_key("validatingadmissionpolicies", None, &name);
-    let policy = state.storage.get(&key).await?;
-
-    Ok(Json(policy))
 }
 
-pub async fn update_validating_admission_policy(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path(name): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut policy): DumpingJson<ValidatingAdmissionPolicy>,
-) -> Result<Json<ValidatingAdmissionPolicy>> {
-    info!("Updating ValidatingAdmissionPolicy: {}", name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "validatingadmissionpolicies")
-        .with_api_group("admissionregistration.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("validatingadmissionpolicies", None, &name),
-        "admissionregistration.k8s.io",
-        "validatingadmissionpolicies",
-        &name,
-    )
-    .await?;
-
-    policy.metadata.name = name.clone();
-
-    // Default, then validate — upstream's registry strategy runs
-    // `SetDefaults_ValidatingAdmissionPolicySpec` / `SetDefaults_MatchResources`
-    // before `Validate`, and `failurePolicy`, `matchPolicy` and both selectors
-    // are `Required` by the validator precisely because defaulting fills them
-    // (`pkg/apis/admissionregistration/v1/defaults.go:97-119`,
-    // `.../validation/validation.go:772`).
-    rusternetes_common::validation::validating_admission_policy::set_defaults_validating_admission_policy(&mut policy);
-    let errs = rusternetes_common::validation::validating_admission_policy::validate_validating_admission_policy(&policy);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Check for dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ValidatingAdmissionPolicy validated successfully (not updated)");
-        return Ok(Json(policy));
-    }
-
-    let key = build_key("validatingadmissionpolicies", None, &name);
-
-    let result = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
-        &*state.storage,
-        &key,
-        &mut policy,
-    )
-    .await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
-    )
-    .await?;
-    Ok(Json(result))
+fn policy_main_scope(state: &ApiServerState) -> RequestScope<ValidatingAdmissionPolicy> {
+    policy_scope(state, None)
 }
 
-pub async fn delete_validating_admission_policy(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(name): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<ValidatingAdmissionPolicy>> {
-    info!("Deleting ValidatingAdmissionPolicy: {}", name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "validatingadmissionpolicies")
-        .with_api_group("admissionregistration.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("validatingadmissionpolicies", None, &name);
-
-    // Get the resource for finalizer handling
-    let resource: ValidatingAdmissionPolicy = state.storage.get(&key).await?;
-
-    // Check for dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ValidatingAdmissionPolicy validated successfully (not deleted)");
-        return Ok(Json(resource));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &resource,
-        &delete_opts,
-    )
-    .await?;
-
-    if deleted_immediately {
-        Ok(Json(resource))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: ValidatingAdmissionPolicy = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
-}
+store_crud_handlers!(
+    scope: policy_main_scope,
+    create: create_validating_admission_policy,
+    get: get_validating_admission_policy,
+    update: update_validating_admission_policy,
+    patch: patch_validating_admission_policy,
+    delete: delete_validating_admission_policy,
+    deletecollection: deletecollection_validatingadmissionpolicies,
+);
 
 pub async fn list_validating_admission_policies(
     State(state): State<Arc<ApiServerState>>,
@@ -277,224 +283,99 @@ pub async fn list_validating_admission_policies(
     Ok(Json(list).into_response())
 }
 
-// Use the macro to create a PATCH handler
-crate::patch_handler_cluster!(
-    patch_validating_admission_policy,
-    ValidatingAdmissionPolicy,
-    "validatingadmissionpolicies",
-    "admissionregistration.k8s.io"
-);
-
-// ===== ValidatingAdmissionPolicyBinding Handlers =====
-
-pub async fn create_validating_admission_policy_binding(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut binding): DumpingJson<ValidatingAdmissionPolicyBinding>,
-) -> Result<(StatusCode, Json<ValidatingAdmissionPolicyBinding>)> {
-    info!(
-        "Creating ValidatingAdmissionPolicyBinding: {}",
-        binding.metadata.name
-    );
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &binding.metadata,
-        None,
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // Check authorization
-    let attrs =
-        RequestAttributes::new(auth_ctx.user, "create", "validatingadmissionpolicybindings")
-            .with_api_group("admissionregistration.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Same order as the policy path: default `matchResources`, then validate
-    // (`validateValidatingAdmissionPolicyBindingSpec`, `validation.go:1181`).
-    rusternetes_common::validation::validating_admission_policy::set_defaults_validating_admission_policy_binding(&mut binding);
-    let errs = rusternetes_common::validation::validating_admission_policy::validate_validating_admission_policy_binding(&binding);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Enrich metadata with system fields
-    binding.metadata.ensure_uid();
-    binding.metadata.ensure_creation_timestamp();
-
-    // Check for dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ValidatingAdmissionPolicyBinding validated successfully (not created)");
-        return Ok((StatusCode::CREATED, Json(binding)));
-    }
-
-    let key = build_key(
-        "validatingadmissionpolicybindings",
-        None,
-        &binding.metadata.name,
-    );
-    let created = state.storage.create(&key, &binding).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
-}
-
-pub async fn get_validating_admission_policy_binding(
+/// GET `/status`.
+pub async fn get_validating_admission_policy_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
-) -> Result<Json<ValidatingAdmissionPolicyBinding>> {
-    debug!("Getting ValidatingAdmissionPolicyBinding: {}", name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "validatingadmissionpolicybindings")
-        .with_api_group("admissionregistration.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("validatingadmissionpolicybindings", None, &name);
-    let binding = state.storage.get(&key).await?;
-
-    Ok(Json(binding))
-}
-
-pub async fn update_validating_admission_policy_binding(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path(name): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut binding): DumpingJson<ValidatingAdmissionPolicyBinding>,
-) -> Result<Json<ValidatingAdmissionPolicyBinding>> {
-    info!("Updating ValidatingAdmissionPolicyBinding: {}", name);
-
-    // Check authorization
-    let attrs =
-        RequestAttributes::new(auth_ctx.user, "update", "validatingadmissionpolicybindings")
-            .with_api_group("admissionregistration.k8s.io")
-            .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("validatingadmissionpolicybindings", None, &name),
-        "admissionregistration.k8s.io",
-        "validatingadmissionpolicybindings",
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &policy_scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
         &name,
     )
-    .await?;
-
-    binding.metadata.name = name.clone();
-
-    // Same order as the policy path: default `matchResources`, then validate
-    // (`validateValidatingAdmissionPolicyBindingSpec`, `validation.go:1181`).
-    rusternetes_common::validation::validating_admission_policy::set_defaults_validating_admission_policy_binding(&mut binding);
-    let errs = rusternetes_common::validation::validating_admission_policy::validate_validating_admission_policy_binding(&binding);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
-
-    // Check for dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ValidatingAdmissionPolicyBinding validated successfully (not updated)");
-        return Ok(Json(binding));
-    }
-
-    let key = build_key("validatingadmissionpolicybindings", None, &name);
-
-    let result = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
-        &*state.storage,
-        &key,
-        &mut binding,
-    )
-    .await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &result,
-    )
-    .await?;
-    Ok(Json(result))
+    .await
 }
 
-pub async fn delete_validating_admission_policy_binding(
+/// PUT `/status`.
+pub async fn update_validating_admission_policy_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<ValidatingAdmissionPolicyBinding>> {
-    info!("Deleting ValidatingAdmissionPolicyBinding: {}", name);
-
-    // Check authorization
-    let attrs =
-        RequestAttributes::new(auth_ctx.user, "delete", "validatingadmissionpolicybindings")
-            .with_api_group("admissionregistration.k8s.io")
-            .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("validatingadmissionpolicybindings", None, &name);
-
-    // Get the resource for finalizer handling
-    let resource: ValidatingAdmissionPolicyBinding = state.storage.get(&key).await?;
-
-    // Check for dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ValidatingAdmissionPolicyBinding validated successfully (not deleted)");
-        return Ok(Json(resource));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &resource,
-        &delete_opts,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &policy_scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    if deleted_immediately {
-        Ok(Json(resource))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: ValidatingAdmissionPolicyBinding = state.storage.get(&key).await?;
-        Ok(Json(updated))
+/// PATCH `/status`.
+pub async fn patch_validating_admission_policy_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &policy_scope(&state, Some("status")),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
+}
+
+// ===== ValidatingAdmissionPolicyBinding =====
+
+/// The ValidatingAdmissionPolicyBinding `RequestScope`, backed by the binding
+/// `NewREST`.
+fn binding_scope(state: &ApiServerState) -> RequestScope<ValidatingAdmissionPolicyBinding> {
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "admissionregistration.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "ValidatingAdmissionPolicyBinding".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "admissionregistration.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "validatingadmissionpolicybindings".to_string(),
+        },
+        subresource: None,
+        store: Box::new(validatingadmissionpolicybinding::new_store(
+            state.storage.clone(),
+        )),
+        apply: Some(crate::ssa::apply_legacy::<ValidatingAdmissionPolicyBinding>),
+        convert_to_internal: Some(validatingadmissionpolicybinding::convert_to_internal),
+        patch_conversion: None,
     }
 }
+
+store_crud_handlers!(
+    scope: binding_scope,
+    create: create_validating_admission_policy_binding,
+    get: get_validating_admission_policy_binding,
+    update: update_validating_admission_policy_binding,
+    patch: patch_validating_admission_policy_binding,
+    delete: delete_validating_admission_policy_binding,
+    deletecollection: deletecollection_validatingadmissionpolicybindings,
+);
 
 pub async fn list_validating_admission_policy_bindings(
     State(state): State<Arc<ApiServerState>>,
@@ -543,168 +424,4 @@ pub async fn list_validating_admission_policy_bindings(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_cluster!(
-    patch_validating_admission_policy_binding,
-    ValidatingAdmissionPolicyBinding,
-    "validatingadmissionpolicybindings",
-    "admissionregistration.k8s.io"
-);
-
-pub async fn deletecollection_validatingadmissionpolicies(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection validatingadmissionpolicies with params: {:?}",
-        params
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(
-        auth_ctx.user,
-        "deletecollection",
-        "validatingadmissionpolicies",
-    )
-    .with_api_group("admissionregistration.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: ValidatingAdmissionPolicy collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all validatingadmissionpolicies
-    let prefix = build_prefix("validatingadmissionpolicies", None);
-    let mut items = state
-        .storage
-        .list::<ValidatingAdmissionPolicy>(&prefix)
-        .await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("validatingadmissionpolicies", None, &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} validatingadmissionpolicies deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
-}
-
-pub async fn deletecollection_validatingadmissionpolicybindings(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection validatingadmissionpolicybindings with params: {:?}",
-        params
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(
-        auth_ctx.user,
-        "deletecollection",
-        "validatingadmissionpolicybindings",
-    )
-    .with_api_group("admissionregistration.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!(
-            "Dry-run: ValidatingAdmissionPolicyBinding collection would be deleted (not deleted)"
-        );
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all validatingadmissionpolicybindings
-    let prefix = build_prefix("validatingadmissionpolicybindings", None);
-    let mut items = state
-        .storage
-        .list::<ValidatingAdmissionPolicyBinding>(&prefix)
-        .await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key(
-            "validatingadmissionpolicybindings",
-            None,
-            &item.metadata.name,
-        );
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} validatingadmissionpolicybindings deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }

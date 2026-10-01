@@ -2147,9 +2147,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/:name/status",
-            get(handlers::status::get_cluster_status)
-                .put(handlers::status::update_cluster_status)
-                .patch(handlers::status::update_cluster_status),
+            get(handlers::validating_admission_policy::get_validating_admission_policy_status)
+                .put(handlers::validating_admission_policy::update_validating_admission_policy_status)
+                .patch(handlers::validating_admission_policy::patch_validating_admission_policy_status),
         )
         // Admission v1 API - ValidatingAdmissionPolicyBindings (cluster-scoped)
         .route(

@@ -1586,16 +1586,20 @@ async fn should_not_be_able_to_mutate_or_prevent_deletion_of_webhook_configurati
             )
         }]),
     };
-    mem.create(
-        &build_key("validatingwebhookconfigurations", None, "self-targeting"),
-        &cfg,
-    )
-    .await
-    .unwrap();
+    let stored = mem
+        .create(
+            &build_key("validatingwebhookconfigurations", None, "self-targeting"),
+            &cfg,
+        )
+        .await
+        .unwrap();
 
     // Update via PUT through the real router. If the webhook were invoked
-    // we'd see a 5xx; if the protection works we see 200.
+    // we'd see a 5xx; if the protection works we see 200. The PUT carries the
+    // stored resourceVersion: `AllowUnconditionalUpdate()` is false for a
+    // webhook configuration (validatingwebhookconfiguration/strategy.go).
     let mut updated = cfg.clone();
+    updated.metadata.resource_version = stored.metadata.resource_version.clone();
     updated.metadata.labels = Some({
         let mut m = std::collections::HashMap::new();
         m.insert("touched".into(), "true".into());
@@ -2545,7 +2549,12 @@ async fn patching_updating_a_validating_webhook_should_work() {
     let (status, updated) = put_json(
         router.clone(),
         "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations/vwc-api-roundtrip",
-        &api_cfg(json!(["pods", "configmaps"])),
+        &{
+            // `AllowUnconditionalUpdate()` is false: the PUT names the version.
+            let mut cfg = api_cfg(json!(["pods", "configmaps"]));
+            cfg["metadata"]["resourceVersion"] = created["metadata"]["resourceVersion"].clone();
+            cfg
+        },
     )
     .await;
     assert_eq!(status, StatusCode::OK, "update config: {updated}");
@@ -2701,7 +2710,12 @@ async fn patching_updating_a_mutating_webhook_should_work() {
     let (status, updated) = put_json(
         router.clone(),
         "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations/mwc-api-roundtrip",
-        &api_cfg(json!(["pods", "configmaps"])),
+        &{
+            // `AllowUnconditionalUpdate()` is false: the PUT names the version.
+            let mut cfg = api_cfg(json!(["pods", "configmaps"]));
+            cfg["metadata"]["resourceVersion"] = created["metadata"]["resourceVersion"].clone();
+            cfg
+        },
     )
     .await;
     assert_eq!(status, StatusCode::OK, "update config: {updated}");
