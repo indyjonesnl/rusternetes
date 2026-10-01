@@ -721,21 +721,17 @@ pub enum NameKind {
     /// `validation.IsValidIP` — the `IPAddress` kind (`ValidateIPAddressName`):
     /// the name must be a canonical IP address.
     Ip,
-    /// No name-format constraint — kinds whose upstream validator `return nil`,
-    /// e.g. `CertificateSigningRequest` (`ValidateCertificateRequestName`).
-    NoConstraint,
 }
 
 impl NameKind {
     fn name_fn(self) -> rusternetes_common::validation::objectmeta::ValidateNameFunc {
         use rusternetes_common::validation::objectmeta::{
-            name_is_dns_subdomain, name_is_ip, name_is_path_segment, name_unconstrained,
+            name_is_dns_subdomain, name_is_ip, name_is_path_segment,
         };
         match self {
             NameKind::DnsSubdomain => name_is_dns_subdomain,
             NameKind::PathSegment => name_is_path_segment,
             NameKind::Ip => name_is_ip,
-            NameKind::NoConstraint => name_unconstrained,
         }
     }
 }
@@ -851,23 +847,6 @@ mod tests {
             &meta_named("2001:db8:0:0:0:0:0:1"),
             None,
             NameKind::Ip
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn validate_create_object_meta_no_constraint_kind() {
-        // Any non-empty name is accepted; empty still fails the required check.
-        assert!(validate_create_object_meta(
-            &meta_named("Any.Weird_Name"),
-            None,
-            NameKind::NoConstraint
-        )
-        .is_ok());
-        assert!(validate_create_object_meta(
-            &rusternetes_common::types::ObjectMeta::default(),
-            None,
-            NameKind::NoConstraint
         )
         .is_err());
     }

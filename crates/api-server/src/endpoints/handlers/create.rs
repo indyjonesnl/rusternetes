@@ -50,7 +50,7 @@ pub async fn create_resource<T: Object>(
     let dry_run = is_dry_run(options.dry_run.as_deref());
 
     let (mut obj, decode_warnings) = decode(scope, params, body)?;
-    let ctx = RequestContext::new(namespace);
+    let ctx = RequestContext::new(namespace).with_user(user);
     for warning in decode_warnings {
         ctx.add_warning(warning);
     }
