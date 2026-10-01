@@ -1894,8 +1894,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         // EndpointSlices (all namespaces)
         .route(
             "/apis/discovery.k8s.io/v1/endpointslices",
-            get(handlers::endpointslice::list_all_endpointslices)
-            .delete(handlers::endpointslice::deletecollection_endpointslices),
+            get(handlers::endpointslice::list_all_endpointslices),
         )
         // Watch endpointslices in a namespace
         .route(

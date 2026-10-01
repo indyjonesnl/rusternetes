@@ -25,6 +25,7 @@ pub mod batch;
 pub mod certificates;
 pub mod coordination;
 pub mod core;
+pub mod discovery;
 pub mod flowcontrol;
 pub mod generic;
 pub mod names;

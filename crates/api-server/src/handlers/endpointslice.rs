@@ -1,123 +1,172 @@
+//! EndpointSlice endpoints.
+//!
+//! Writes go through the generic endpoint handlers and
+//! [`crate::registry::generic::Store`] with the EndpointSlice strategy
+//! ([`crate::registry::discovery::endpointslice`]) — upstream's
+//! `pkg/registry/discovery/endpointslice/storage` wired into
+//! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
+//! still served here directly.
+
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::discovery::endpointslice;
 use crate::{handlers::watch::WatchParams, middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::HeaderMap,
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::EndpointSlice,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 
-/// Create endpointslice
+/// The EndpointSlice `RequestScope`: `discovery.k8s.io/v1` `EndpointSlice`
+/// served as `endpointslices`, backed by `endpointslice.NewREST`.
+fn scope(state: &ApiServerState) -> RequestScope<EndpointSlice> {
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "discovery.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "EndpointSlice".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "discovery.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "endpointslices".to_string(),
+        },
+        subresource: None,
+        store: Box::new(endpointslice::new_store(state.storage.clone())),
+        apply: Some(crate::ssa::apply_legacy::<EndpointSlice>),
+        convert_to_internal: Some(endpointslice::convert_to_internal),
+    }
+}
+
+/// The patch type of a PATCH. The content-type middleware moves a JSON patch
+/// type to `x-original-content-type` so the body extracts as JSON.
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
 pub async fn create_endpointslice(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut endpointslice): DumpingJson<EndpointSlice>,
-) -> Result<(StatusCode, Json<EndpointSlice>)> {
-    info!(
-        "Creating endpointslice: {}/{}",
-        namespace, endpointslice.metadata.name
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "endpointslices")
-        .with_namespace(&namespace)
-        .with_api_group("discovery.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::validate_create_object_meta(
-        &endpointslice.metadata,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
         Some(&namespace),
-        crate::handlers::validation::NameKind::DnsSubdomain,
-    )?;
-
-    // SetDefaults_EndpointSlice: each port protocol defaults to TCP.
-    for p in endpointslice.ports.iter_mut() {
-        if p.protocol.is_empty() {
-            p.protocol = "TCP".to_string();
-        }
-    }
-
-    // Field validation (mirrors upstream ValidateEndpointSlice).
-    {
-        let errs =
-            rusternetes_common::validation::endpointslice::validate_endpoint_slice(&endpointslice);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    endpointslice.metadata.namespace = Some(namespace.clone());
-
-    // Enrich metadata with system fields
-    endpointslice.metadata.ensure_uid();
-    endpointslice.metadata.ensure_creation_timestamp();
-
-    // Ensure managed-by label is set
-    endpointslice
-        .metadata
-        .labels
-        .get_or_insert_with(Default::default)
-        .entry("endpointslice.kubernetes.io/managed-by".to_string())
-        .or_insert_with(|| "endpointslice-controller.k8s.io".to_string());
-
-    // Check for dry-run
-    if crate::handlers::dryrun::is_dry_run(&params) {
-        return Ok((StatusCode::OK, Json(endpointslice)));
-    }
-
-    let key = build_key(
-        "endpointslices",
-        Some(&namespace),
-        &endpointslice.metadata.name,
-    );
-    let created = state.storage.create(&key, &endpointslice).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+        &params,
+        &body,
+    )
+    .await
 }
 
-/// Get endpointslice
 pub async fn get_endpointslice(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<EndpointSlice>> {
-    debug!("Getting endpointslice: {}/{}", namespace, name);
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
+}
 
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "endpointslices")
-        .with_namespace(&namespace)
-        .with_api_group("discovery.k8s.io")
-        .with_name(&name);
+pub async fn update_endpointslice(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
 
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
+pub async fn patch_endpointslice(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
+}
 
-    let key = build_key("endpointslices", Some(&namespace), &name);
-    let endpointslice = state.storage.get(&key).await?;
+pub async fn delete_endpointslice(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
 
-    Ok(Json(endpointslice))
+pub async fn deletecollection_endpointslices(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        Some(&namespace),
+        &params,
+        &body,
+    )
+    .await
 }
 
 /// List endpointslices in namespace
@@ -219,223 +268,4 @@ pub async fn list_all_endpointslices(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-/// Update endpointslice
-pub async fn update_endpointslice(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path((namespace, name)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut endpointslice): DumpingJson<EndpointSlice>,
-) -> Result<Json<EndpointSlice>> {
-    info!("Updating endpointslice: {}/{}", namespace, name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "endpointslices")
-        .with_namespace(&namespace)
-        .with_api_group("discovery.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("endpointslices", Some(&namespace), &name),
-        "discovery.k8s.io",
-        "endpointslices",
-        &name,
-    )
-    .await?;
-
-    endpointslice.metadata.name = name.clone();
-    endpointslice.metadata.namespace = Some(namespace.clone());
-
-    let key = build_key("endpointslices", Some(&namespace), &name);
-
-    // Field validation + addressType immutability (upstream
-    // ValidateEndpointSliceUpdate). addressType (IPv4/IPv6/FQDN) cannot change.
-    {
-        let old_slice: EndpointSlice = state.storage.get(&key).await?;
-        let errs = rusternetes_common::validation::endpointslice::validate_endpoint_slice_update(
-            &endpointslice,
-            &old_slice,
-        );
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // Check for dry-run
-    if crate::handlers::dryrun::is_dry_run(&params) {
-        return Ok(Json(endpointslice));
-    }
-
-    // Reinstate the server-owned metadata a PUT body may omit: uid,
-    // creationTimestamp and a pending deletion. A locally built object —
-    // what the dynamic client's Update() sends — carries none of them, and
-    // storing the blanks orphans every child, because ownerReferences[].uid
-    // then matches no live owner and the garbage collector deletes them
-    // (#1605, #1793). Upstream applies this to every resource at once in
-    // registry/rest/update.go::BeforeUpdate (lines 131-146).
-    if let Ok(stored) = state.storage.get::<EndpointSlice>(&key).await {
-        crate::handlers::lifecycle::inherit_server_owned_metadata(
-            &mut endpointslice.metadata,
-            &stored.metadata,
-        );
-    }
-    let updated = state.storage.update(&key, &endpointslice).await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &updated,
-    )
-    .await?;
-
-    Ok(Json(updated))
-}
-
-/// Delete endpointslice
-pub async fn delete_endpointslice(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path((namespace, name)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<EndpointSlice>> {
-    info!("Deleting endpointslice: {}/{}", namespace, name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "endpointslices")
-        .with_namespace(&namespace)
-        .with_api_group("discovery.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("endpointslices", Some(&namespace), &name);
-
-    // Get the resource to check if it exists
-    let endpointslice: EndpointSlice = state.storage.get(&key).await?;
-
-    // Check for dry-run
-    if crate::handlers::dryrun::is_dry_run(&params) {
-        info!(
-            "Dry-run: EndpointSlice {}/{} validated successfully (not deleted)",
-            namespace, name
-        );
-        return Ok(Json(endpointslice));
-    }
-
-    let has_finalizers = crate::handlers::finalizers::handle_delete_with_finalizers(
-        &*state.storage,
-        &key,
-        &endpointslice,
-        &delete_opts,
-    )
-    .await?;
-
-    if has_finalizers {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: EndpointSlice = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    } else {
-        Ok(Json(endpointslice))
-    }
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(
-    patch_endpointslice,
-    EndpointSlice,
-    "endpointslices",
-    "discovery.k8s.io"
-);
-
-pub async fn deletecollection_endpointslices(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    Path(namespace): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection endpointslices in namespace: {} with params: {:?}",
-        namespace, params
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "endpointslices")
-        .with_namespace(&namespace)
-        .with_api_group("discovery.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: EndpointSlice collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all endpointslices in the namespace
-    let prefix = build_prefix("endpointslices", Some(&namespace));
-    let mut items = state.storage.list::<EndpointSlice>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("endpointslices", Some(&namespace), &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} endpointslices deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }
