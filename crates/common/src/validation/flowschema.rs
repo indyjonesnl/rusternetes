@@ -368,6 +368,14 @@ fn validate_flow_schema_condition(condition: &FlowSchemaCondition, fld_path: &Pa
     errs
 }
 
+/// `ValidateFlowSchemaStatusUpdate` (validation.go:333-335), minus ObjectMeta.
+pub fn validate_flow_schema_status_update(fs: &FlowSchema) -> ErrorList {
+    match &fs.status {
+        Some(status) => validate_flow_schema_status(status, &Path::new("status")),
+        None => Vec::new(),
+    }
+}
+
 /// Validate a `FlowSchema` on create. Mirrors upstream `ValidateFlowSchema`
 /// (spec + status) minus ObjectMeta.
 pub fn validate_flow_schema(fs: &FlowSchema) -> ErrorList {
