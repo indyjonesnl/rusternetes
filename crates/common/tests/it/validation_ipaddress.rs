@@ -79,3 +79,45 @@ fn empty_group_skipped() {
     let ok = ip(json!({"group": "", "resource": "services", "name": "kubernetes"}));
     assert!(validate_ip_address(&ok).is_empty());
 }
+
+fn named(name: &str) -> IPAddress {
+    let mut v = ip(json!({"resource": "services", "name": "kubernetes"}));
+    v.metadata.name = name.to_string();
+    v
+}
+
+/// ValidateIPAddress runs ValidateObjectMeta with ValidateIPAddressName
+/// (validation.go:759-761): canonical IPs pass, non-IPs and non-canonical
+/// spellings fail on metadata.name.
+#[test]
+fn name_must_be_canonical_ip() {
+    assert!(validate_ip_address(&named("10.9.8.7")).is_empty());
+    assert!(validate_ip_address(&named("2001:db8::ffff")).is_empty());
+    for bad in ["not-an-ip", "2001:db8:0:0:0:0:0:1"] {
+        let errs = validate_ip_address(&named(bad));
+        assert!(
+            errs.iter().any(|e| e.field == "metadata.name"),
+            "{bad}: {errs:?}"
+        );
+    }
+}
+
+/// ValidateIPAddressUpdate (validation.go:812-817): parentRef is immutable.
+#[test]
+fn update_parent_ref_is_immutable() {
+    use rusternetes_common::validation::ipaddress::validate_ip_address_update;
+    let old = named("10.0.0.1");
+    assert!(validate_ip_address_update(&old, &old).is_empty());
+    let mut changed = old.clone();
+    changed
+        .spec
+        .as_mut()
+        .unwrap()
+        .parent_ref
+        .as_mut()
+        .unwrap()
+        .name = "other".to_string();
+    let errs = validate_ip_address_update(&changed, &old);
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert_eq!(errs[0].field, "spec.parentRef");
+}
