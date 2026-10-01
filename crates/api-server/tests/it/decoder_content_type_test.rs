@@ -631,7 +631,8 @@ async fn test_content_type_apply_patch_yaml_routes_to_ssa() {
         "metadata": {"name": "ssa-pod", "namespace": TEST_NS},
         "spec": {
             "containers": [
-                {"name": "c1", "image": "busybox:3.0"}
+                {"name": "c1", "image": "busybox:3.0"},
+                {"name": "c2", "image": "nginx:1.0"}
             ]
         }
     });

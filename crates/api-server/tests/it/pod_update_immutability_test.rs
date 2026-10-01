@@ -329,7 +329,11 @@ async fn test_update_ads_positive_to_nil_rejected() {
     let mut new_pod = pod.clone();
     new_pod.spec.as_mut().unwrap().active_deadline_seconds = None;
     let (status, body) = put_pod(state, &new_pod).await;
-    assert_rejected(status, &body, "must not be removed");
+    assert_rejected(
+        status,
+        &body,
+        "must not update from a positive integer to nil value",
+    );
 }
 
 #[tokio::test]
@@ -589,7 +593,7 @@ async fn test_ephemeral_container_remove_via_subresource_rejected() {
     assert_rejected(
         status,
         &body,
-        "existing ephemeral containers may not be removed",
+        "existing ephemeral containers \"debug\" may not be removed",
     );
 }
 
@@ -625,6 +629,6 @@ async fn test_ephemeral_container_on_main_path_rejected() {
     assert_rejected(
         status,
         &body,
-        "may not be updated outside of the ephemeralcontainers subresource",
+        "pod updates may not change fields other than",
     );
 }

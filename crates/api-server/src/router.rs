@@ -1040,15 +1040,15 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             // PUT goes through the dedicated subresource handler so we can do
             // CAS-retry on resourceVersion conflicts (KEP-1287). GET/PATCH fall
             // back to the generic pod handlers — only PUT is the resize hot path.
-            get(handlers::pod::get)
+            get(handlers::pod::get_resize)
                 .put(handlers::pod_subresources::resize_pod)
-                .patch(handlers::pod::patch),
+                .patch(handlers::pod::patch_resize),
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/ephemeralcontainers",
-            get(handlers::pod::get)
-                .put(handlers::pod::update)
-                .patch(handlers::pod::patch),
+            get(handlers::pod::get_ephemeralcontainers)
+                .put(handlers::pod::update_ephemeralcontainers)
+                .patch(handlers::pod::patch_ephemeralcontainers),
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/proxy",

@@ -84,6 +84,8 @@ pub struct RequestContext {
     /// (and a collection request).
     pub name: Option<String>,
     warnings: Mutex<Vec<String>>,
+    /// Values kept alive until the request is done; see [`Self::hold`].
+    held: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
 }
 
 impl RequestContext {
@@ -94,7 +96,21 @@ impl RequestContext {
             group_version: None,
             name: None,
             warnings: Mutex::new(Vec::new()),
+            held: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Keep `value` alive until the request's context is dropped, which is
+    /// after the Store has written. The quota admission plugin uses it for
+    /// the per-namespace lock: upstream serialises a namespace's admissions
+    /// on `quotaEvaluator`'s work queue (resourcequota/controller.go:688-735)
+    /// and records each admitted request's usage before the next is checked;
+    /// here usage is a live recount, so the lock must span the write.
+    pub fn hold(&self, value: impl std::any::Any + Send) {
+        self.held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Box::new(value));
     }
 
     /// The context with the request's group-version attached (`WithRequestInfo`).
