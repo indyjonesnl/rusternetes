@@ -702,45 +702,6 @@ pub async fn get_status(
     Ok(Json(resource))
 }
 
-/// Get status for a cluster-scoped resource (read-only)
-pub async fn get_cluster_status(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    uri: Uri,
-    Path(name): Path<String>,
-) -> Result<Json<Value>> {
-    let resource_type = extract_resource_type_from_uri(&uri);
-    let api_group = extract_api_group_from_uri(&uri);
-    debug!("Getting status for {}/{}", resource_type, name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", &resource_type)
-        .with_api_group(&api_group)
-        .with_name(&name)
-        .with_subresource("status");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key(&resource_type, None, &name);
-    let mut resource: Value = state.storage.get(&key).await?;
-
-    // Ensure kind/apiVersion are present in the response
-    if let Some(obj) = resource.as_object_mut() {
-        let (kind, api_version) = resource_type_to_kind_api_version(&resource_type);
-        obj.entry("kind".to_string())
-            .or_insert_with(|| Value::String(kind));
-        obj.entry("apiVersion".to_string())
-            .or_insert_with(|| Value::String(api_version));
-    }
-
-    Ok(Json(resource))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1505,17 +1466,12 @@ mod tests {
         assert_eq!(conds[1]["type"], "StatusUpdate");
         assert_eq!(conds[1]["message"], "Updated by an e2e test");
 
-        // GET /status must reflect the update for the next read.
-        let get_uri: Uri = "/api/v1/namespaces/nstest/status".parse().unwrap();
-        let got = get_cluster_status(
-            State(state.clone()),
-            Extension(admin_auth_ctx()),
-            get_uri,
-            Path("nstest".to_string()),
-        )
-        .await
-        .expect("GET /status must succeed");
-        let got = got.0;
+        // The write must be visible to the next read.
+        let got: Value = state
+            .storage
+            .get(&build_key("namespaces", None, "nstest"))
+            .await
+            .expect("stored namespace");
         let conds = got["status"]["conditions"].as_array().unwrap();
         assert_eq!(conds.len(), 2);
         assert_eq!(conds[1]["type"], "StatusUpdate");
