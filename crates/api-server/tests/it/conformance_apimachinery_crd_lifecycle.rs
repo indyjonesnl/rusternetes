@@ -57,8 +57,20 @@ async fn post_json(router: &TestApiServer, uri: &str, body: &Value) -> (u16, Val
     (status.as_u16(), value)
 }
 
+/// A PUT as client-go's `Update` sends it: the body carries the
+/// `resourceVersion` of the object it read. A custom resource's strategy does
+/// not allow unconditional updates (apiextensions-apiserver
+/// pkg/registry/customresource/strategy.go:282-285), so a PUT without one is
+/// refused with `metadata.resourceVersion: must be specified for an update`.
 async fn put_json(router: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
-    let (status, value) = router.put(uri, body).await;
+    let mut body = body.clone();
+    if body["metadata"]["resourceVersion"].is_null() && !uri.contains("customresourcedefinitions") {
+        let (_, live) = router.get(uri).await;
+        if let Some(rv) = live["metadata"]["resourceVersion"].as_str() {
+            body["metadata"]["resourceVersion"] = json!(rv);
+        }
+    }
+    let (status, value) = router.put(uri, &body).await;
     (status.as_u16(), value)
 }
 

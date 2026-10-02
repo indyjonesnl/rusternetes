@@ -92,13 +92,20 @@ async fn cr_status_update_is_delivered_to_watchers() {
 
     // Let the watch establish + send initial ADDED, then update status.
     tokio::time::sleep(Duration::from_millis(500)).await;
+    // A status write is conditional on the resourceVersion it read
+    // (strategy.go:282-285: custom resources do not allow unconditional
+    // updates).
+    let (_, live) = send(&router, Method::GET, &format!("{base}/w1"), None).await;
     let (sc, body) = send(
         &router,
         Method::PUT,
         &format!("{base}/w1/status"),
         Some(&json!({
             "apiVersion": format!("{GROUP}/v1"), "kind": "Widget",
-            "metadata": { "name": "w1", "namespace": "default" },
+            "metadata": {
+                "name": "w1", "namespace": "default",
+                "resourceVersion": live["metadata"]["resourceVersion"]
+            },
             "status": { "conditions": [{ "type": "Ready", "status": "True" }] }
         })),
     )
