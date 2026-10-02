@@ -1,5 +1,4 @@
 pub mod admission_webhook;
-pub mod apply;
 pub mod authentication;
 pub mod authorization;
 pub mod cel_validation;
