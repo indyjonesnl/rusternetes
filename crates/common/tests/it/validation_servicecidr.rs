@@ -78,3 +78,29 @@ fn same_family_pair_rejected() {
         .iter()
         .any(|e| e.field == "spec.cidrs" && e.detail.contains("one IP for each IP family")));
 }
+
+/// ValidateServiceCIDR runs ValidateObjectMeta with NameIsDNSSubdomain
+/// (validation.go:821-823).
+#[test]
+fn name_must_be_dns_subdomain() {
+    let mut x = sc(vec!["10.96.0.0/12"]);
+    x.metadata.name = "Bad_Name".to_string();
+    assert!(has(&validate_service_cidr(&x), "metadata.name"));
+}
+
+/// ValidateServiceCIDRStatusUpdate (validation.go:883-886) checks only the
+/// metadata update rules.
+#[test]
+fn status_update_checks_only_metadata() {
+    use rusternetes_common::validation::servicecidr::validate_service_cidr_status_update;
+    let mut old = sc(vec!["10.96.0.0/12"]);
+    old.metadata.resource_version = Some("1".to_string());
+    let mut new = old.clone();
+    new.spec = None;
+    assert!(validate_service_cidr_status_update(&new, &old).is_empty());
+    new.metadata.name = "renamed".to_string();
+    assert!(has(
+        &validate_service_cidr_status_update(&new, &old),
+        "metadata.name"
+    ));
+}

@@ -710,17 +710,13 @@ pub enum NameKind {
     /// `apimachineryvalidation.NameIsDNSSubdomain` — the default for nearly all
     /// kinds.
     DnsSubdomain,
-    /// `validation.IsValidIP` — the `IPAddress` kind (`ValidateIPAddressName`):
-    /// the name must be a canonical IP address.
-    Ip,
 }
 
 impl NameKind {
     fn name_fn(self) -> rusternetes_common::validation::objectmeta::ValidateNameFunc {
-        use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, name_is_ip};
+        use rusternetes_common::validation::objectmeta::name_is_dns_subdomain;
         match self {
             NameKind::DnsSubdomain => name_is_dns_subdomain,
-            NameKind::Ip => name_is_ip,
         }
     }
 }
@@ -812,23 +808,6 @@ mod tests {
             Error::Invalid(errs) => assert_eq!(errs[0].field, "metadata.name"),
             other => panic!("expected Error::Invalid, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn validate_create_object_meta_ip_kind() {
-        // Canonical IPs pass; non-IP and non-canonical names fail.
-        assert!(validate_create_object_meta(&meta_named("10.9.8.7"), None, NameKind::Ip).is_ok());
-        assert!(
-            validate_create_object_meta(&meta_named("2001:db8::ffff"), None, NameKind::Ip).is_ok()
-        );
-        assert!(validate_create_object_meta(&meta_named("not-an-ip"), None, NameKind::Ip).is_err());
-        // 2001:db8:0:0:0:0:0:1 is a valid but non-canonical spelling.
-        assert!(validate_create_object_meta(
-            &meta_named("2001:db8:0:0:0:0:0:1"),
-            None,
-            NameKind::Ip
-        )
-        .is_err());
     }
 
     #[test]

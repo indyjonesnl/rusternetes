@@ -24,8 +24,8 @@
 //! **No allowlist.** A handler that cannot finish the deletion is a reason to
 //! change the handler or the helper, not to record a name here. The two exits
 //! below are keyed on mechanism: a subresource cannot carry
-//! `metadata.finalizers`, and a handler that delegates to `generic_patch`
-//! inherits the check from it.
+//! `metadata.finalizers`, and a Store adapter inherits the check from
+//! `Store.Update`.
 
 use std::path::{Path, PathBuf};
 
@@ -114,16 +114,6 @@ fn every_write_handler_finishes_a_drained_deletion() {
             }
             // Only handlers that actually persist are in scope.
             if !body.contains("storage.update(") && !body.contains("update_inheriting") {
-                continue;
-            }
-            // A handler that delegates to the generic patch implementation
-            // inherits the check from it — that IS the shared mechanism, not an
-            // exemption. `generic_patch.rs` itself is still measured, because
-            // its own two functions appear in this scan.
-            if name != "generic_patch.rs"
-                && (body.contains("generic_patch::patch_namespaced_resource")
-                    || body.contains("generic_patch::patch_cluster_resource"))
-            {
                 continue;
             }
             checked += 1;

@@ -1,97 +1,71 @@
+//! Generic Store endpoints for IPAddress; list/watch retain their existing implementation.
+//! Port of pkg/registry/networking/ipaddress/storage/storage.go and apiserver endpoints/handlers.
+//! The service IP allocator (`registry::core::service::ipallocator`) writes
+//! IPAddress objects straight to storage, as upstream's does.
+use crate::endpoints::handlers::{self as endpoints, RequestScope};
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::HeaderMap,
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::IPAddress,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
+
+fn scope(state: &ApiServerState) -> RequestScope<IPAddress> {
+    let store = crate::registry::networking::ipaddress::new_store(state.storage.clone());
+    RequestScope {
+        kind: GroupVersionKind {
+            group: "networking.k8s.io".to_string(),
+            version: "v1".to_string(),
+            kind: "IPAddress".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "networking.k8s.io".to_string(),
+            version: "v1".to_string(),
+            resource: "ipaddresses".to_string(),
+        },
+        subresource: None,
+        store: Box::new(store),
+        apply: Some(crate::ssa::apply_legacy::<IPAddress>),
+        convert_to_internal: None,
+        patch_conversion: None,
+    }
+}
+
+fn patch_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 pub async fn create_ipaddress(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut ipaddress): DumpingJson<IPAddress>,
-) -> Result<(StatusCode, Json<IPAddress>)> {
-    info!("Creating IPAddress: {}", ipaddress.metadata.name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "ipaddresses")
-        .with_api_group("networking.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Full create-time ValidateObjectMeta (#1087). IPAddress is cluster-scoped
-    // and its name must be a canonical IP address (ValidateIPAddressName).
-    crate::handlers::validation::validate_create_object_meta(
-        &ipaddress.metadata,
-        None,
-        crate::handlers::validation::NameKind::Ip,
-    )?;
-
-    // Field validation (mirrors upstream ValidateIPAddress — spec.parentRef).
-    {
-        let errs = rusternetes_common::validation::ipaddress::validate_ip_address(&ipaddress);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // Enrich metadata with system fields
-    ipaddress.metadata.ensure_uid();
-    ipaddress.metadata.ensure_creation_timestamp();
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: IPAddress validated successfully (not created)");
-        return Ok((StatusCode::CREATED, Json(ipaddress)));
-    }
-
-    // IPAddress is cluster-scoped (no namespace)
-    let key = build_key("ipaddresses", None, &ipaddress.metadata.name);
-    let created = state.storage.create(&key, &ipaddress).await?;
-
-    Ok((StatusCode::CREATED, Json(created)))
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::create_resource(&state, &scope(&state), &auth_ctx.user, None, &params, &body).await
 }
 
 pub async fn get_ipaddress(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
-) -> Result<Json<IPAddress>> {
-    debug!("Getting IPAddress: {}", name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "ipaddresses")
-        .with_api_group("networking.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("ipaddresses", None, &name);
-    let ipaddress = state.storage.get(&key).await?;
-
-    Ok(Json(ipaddress))
+) -> Result<Response> {
+    endpoints::get_resource(&state, &scope(&state), &auth_ctx.user, None, &name).await
 }
 
 pub async fn update_ipaddress(
@@ -99,113 +73,67 @@ pub async fn update_ipaddress(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    DumpingJson(mut ipaddress): DumpingJson<IPAddress>,
-) -> Result<Json<IPAddress>> {
-    info!("Updating IPAddress: {}", name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "update", "ipaddresses")
-        .with_api_group("networking.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-    // A PUT to an object that does not exist is a 404, not a create: upstream
-    // consults the strategy's `AllowCreateOnUpdate()` in `Store.Update`
-    // (registry/generic/registry/store.go:646-650) and only nine resources opt
-    // in. The check sits ahead of every validator there, so it runs here before
-    // validation too (#1905).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &build_key("ipaddresses", None, &name),
-        "networking.k8s.io",
-        "ipaddresses",
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        None,
         &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    ipaddress.metadata.name = name.clone();
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: IPAddress validated successfully (not updated)");
-        return Ok(Json(ipaddress));
-    }
-
-    let key = build_key("ipaddresses", None, &name);
-    let updated = crate::handlers::lifecycle::update_inheriting_server_owned_metadata(
-        &*state.storage,
-        &key,
-        &mut ipaddress,
+pub async fn patch_ipaddress(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
     )
-    .await?;
-
-    // Upstream ShouldDeleteDuringUpdate: an update that drains the last
-    // finalizer off an object already pending deletion removes it as part of
-    // that same request (store.go:565).
-    crate::handlers::finalizers::finish_deletion_if_finalizers_drained(
-        &*state.storage,
-        &key,
-        &updated,
-    )
-    .await?;
-    Ok(Json(updated))
+    .await
 }
 
 pub async fn delete_ipaddress(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<IPAddress>> {
-    info!("Deleting IPAddress: {}", name);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "delete", "ipaddresses")
-        .with_api_group("networking.k8s.io")
-        .with_name(&name);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    let key = build_key("ipaddresses", None, &name);
-
-    // Get the resource for finalizer handling
-    let ipaddress: IPAddress = state.storage.get(&key).await?;
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: IPAddress validated successfully (not deleted)");
-        return Ok(Json(ipaddress));
-    }
-
-    // Handle deletion with finalizers
-    let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-        &state.storage,
-        &key,
-        &ipaddress,
-        &delete_opts,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_resource(
+        &state,
+        &scope(&state),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+        &body,
     )
-    .await?;
+    .await
+}
 
-    if deleted_immediately {
-        Ok(Json(ipaddress))
-    } else {
-        // Resource has finalizers, re-read to get updated version with deletionTimestamp
-        let updated: IPAddress = state.storage.get(&key).await?;
-        Ok(Json(updated))
-    }
+pub async fn deletecollection_ipaddresses(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::delete_collection(&state, &scope(&state), &auth_ctx.user, None, &params, &body).await
 }
 
 pub async fn list_ipaddresses(
@@ -269,77 +197,4 @@ pub async fn list_ipaddresses(
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
-}
-
-// Use the macro to create a PATCH handler
-crate::patch_handler_cluster!(
-    patch_ipaddress,
-    IPAddress,
-    "ipaddresses",
-    "networking.k8s.io"
-);
-
-pub async fn deletecollection_ipaddresses(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!("DeleteCollection ipaddresses with params: {:?}", params);
-
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "ipaddresses")
-        .with_api_group("networking.k8s.io");
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: IPAddress collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
-    }
-
-    // Get all ipaddresses
-    let prefix = build_prefix("ipaddresses", None);
-    let mut items = state.storage.list::<IPAddress>(&prefix).await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("ipaddresses", None, &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = match crate::handlers::finalizers::delete_collection_item(
-            &state.storage,
-            &key,
-            &item,
-            &delete_opts,
-        )
-        .await?
-        {
-            Some(deleted) => deleted,
-            // Already gone — a concurrent deleter won the race; upstream
-            // DeleteCollection ignores NotFound rather than failing the request.
-            None => continue,
-        };
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} ipaddresses deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }

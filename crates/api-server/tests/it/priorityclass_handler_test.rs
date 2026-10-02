@@ -454,7 +454,7 @@ async fn test_priorityclass_value_immutability_revert_uses_correct_resource_vers
     let created: PriorityClass = storage.create(&key, &pc).await.unwrap();
     assert_eq!(created.value, 1);
     // Step 2: Simulate what happens when a patch changes the value to 10
-    // (the generic_patch handler persists this to storage first)
+    // (the patch handler persists this to storage first)
     let mut patched = created.clone();
     patched.value = 10;
     let persisted: PriorityClass = storage.update(&key, &patched).await.unwrap();

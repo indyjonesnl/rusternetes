@@ -808,7 +808,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                         //
                         // We cannot drop this sweep outright yet:
                         // `ShouldDeleteDuringUpdate` is implemented only on the
-                        // PATCH path (crates/api-server/src/handlers/generic_patch.rs),
+                        // PATCH path (crates/api-server/src/endpoints/handlers/),
                         // so an object whose last finalizer is removed by a PUT —
                         // or by a controller writing straight to storage — has
                         // nothing else to finish it. Waiting out the grace period

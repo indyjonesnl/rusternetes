@@ -132,7 +132,7 @@ async fn draining_a_namespaced_resources_last_finalizer_by_patch_deletes_it() {
     assert!(
         !still_there,
         "a ConfigMap survived a finalizer-draining PATCH -- \
-         generic_patch::patch_namespaced_resource does not run the drain check \
+         the patch handler does not run the drain check \
          its cluster-scoped sibling does: {left}"
     );
 }
