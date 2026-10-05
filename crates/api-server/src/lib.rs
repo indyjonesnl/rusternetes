@@ -252,6 +252,10 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     // which lives in the apiserver — not KCM).
     bootstrap::spawn_apiservice_availability_controller(storage.clone());
 
+    // CRD controllers' resync (upstream post-start hook, apiextensions-apiserver
+    // pkg/apiserver/apiserver.go:244-252): retries a CRD left Terminating.
+    registry::apiextensions::customresourcedefinition::spawn_resync(storage.clone());
+
     // The `kubernetes` ServiceCIDR, owned by the apiserver-side
     // default-ServiceCIDR controller (upstream
     // `pkg/controlplane/controller/defaultservicecidr`). Reconciles rather than
