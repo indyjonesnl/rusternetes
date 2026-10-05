@@ -9,17 +9,17 @@
 //! * `applySchedulingGatedCondition`, `mutatePodAffinity`,
 //!   `mutateTopologySpreadConstraints` and `applyAppArmorVersionSkew`
 //!   (strategy.go:92-97): the api-server never ran them.
-//! * `podStatusStrategy` (`/status`) and `podBindingStrategy` (`/binding`):
-//!   those subresources are still served by their own handlers.
+//! * `podutil.DropDisabledPodFields` on `/status` (as above).
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use rusternetes_common::equality::semantic_equal;
 use rusternetes_common::resources::pod::PodSpec;
-use rusternetes_common::resources::{Container, Pod, PodStatus};
+use rusternetes_common::resources::{Binding, Container, Pod, PodCondition, PodStatus};
 use rusternetes_common::types::Phase;
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
-use rusternetes_common::validation::metav1::is_dns1123_label;
+use rusternetes_common::validation::metav1::{get_warnings_for_ip, is_dns1123_label};
 use rusternetes_common::validation::objectmeta::{
     name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
 };
@@ -210,6 +210,110 @@ impl RestGracefulDeleteStrategy<Pod> for Strategy {
         }
         // ensure the options and the pod are in sync
         options.grace_period_seconds = Some(period);
+        true
+    }
+}
+
+/// `podStatusStrategy` (strategy.go:197-283): the update strategy of
+/// `/status`.
+pub struct StatusStrategy;
+
+impl NamespaceScopedStrategy for StatusStrategy {
+    fn namespace_scoped(&self) -> bool {
+        true
+    }
+}
+
+/// `preserveOldObservedGeneration` (strategy.go:237-261): a request that
+/// clears `observedGeneration`, in the status or in a condition, keeps the
+/// stored value. Go's zero is "unset", so `None` and `0` are the same here.
+fn preserve_old_observed_generation(new: &mut Pod, old: &Pod) {
+    let old_status = old.status.clone().unwrap_or_default();
+    let new_status = new.status.get_or_insert_with(Default::default);
+    if new_status.observed_generation.unwrap_or(0) == 0 {
+        new_status.observed_generation = old_status.observed_generation;
+    }
+
+    // Remember observedGeneration values from old status conditions. This is
+    // a list per type because validation permits multiple conditions with the
+    // same type.
+    let mut old_generations: HashMap<String, VecDeque<i64>> = HashMap::new();
+    for condition in old_status.conditions.as_deref().unwrap_or(&[]) {
+        old_generations
+            .entry(condition.condition_type.clone())
+            .or_default()
+            .push_back(condition.observed_generation.unwrap_or(0));
+    }
+
+    // For any conditions in the new status without observedGeneration set,
+    // preserve the old value.
+    for condition in new_status.conditions.iter_mut().flatten() {
+        let old_generation = old_generations
+            .get_mut(&condition.condition_type)
+            .and_then(|generations| generations.pop_front())
+            .unwrap_or(0);
+        if condition.observed_generation.unwrap_or(0) == 0 {
+            condition.observed_generation = (old_generation != 0).then_some(old_generation);
+        }
+    }
+}
+
+impl RestUpdateStrategy<Pod> for StatusStrategy {
+    fn allow_create_on_update(&self) -> bool {
+        false
+    }
+
+    /// strategy.go:216-235. `DropDisabledPodFields` is not modelled (module
+    /// doc).
+    fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut Pod, old: &Pod) {
+        obj.spec = old.spec.clone();
+        obj.metadata.deletion_timestamp = None;
+
+        // don't allow the pods/status endpoint to touch owner references
+        // since old kubelets corrupt them in a way that breaks garbage
+        // collection
+        obj.metadata.owner_references = old.metadata.owner_references.clone();
+        // the Pod QoS is immutable and populated at creation time by the
+        // kube-apiserver. we need to backfill it for backward compatibility
+        // because the old kubelet dropped this field when the pod was
+        // rejected.
+        let old_qos = old.status.as_ref().and_then(|s| s.qos_class.clone());
+        let status = obj.status.get_or_insert_with(Default::default);
+        if status.qos_class.as_deref().unwrap_or("").is_empty() {
+            status.qos_class = old_qos;
+        }
+
+        preserve_old_observed_generation(obj, old);
+    }
+
+    /// strategy.go:263-271: `ValidatePodStatusUpdate`.
+    fn validate_update(&self, _ctx: &RequestContext, obj: &Pod, old: &Pod) -> ErrorList {
+        rusternetes_common::validation::pod_status::validate_pod_status_update(obj, old)
+    }
+
+    /// strategy.go:273-283: a non-standard IP in `podIPs` or `hostIPs`
+    /// draws a warning.
+    fn warnings_on_update(&self, _ctx: &RequestContext, obj: &Pod, _old: &Pod) -> Vec<String> {
+        let Some(status) = obj.status.as_ref() else {
+            return Vec::new();
+        };
+        let mut warnings = Vec::new();
+        for (i, pod_ip) in status.pod_i_ps.iter().flatten().enumerate() {
+            warnings.extend(get_warnings_for_ip(
+                &format!("status.podIPs[{i}].ip"),
+                &pod_ip.ip,
+            ));
+        }
+        for (i, host_ip) in status.host_i_ps.iter().flatten().enumerate() {
+            warnings.extend(get_warnings_for_ip(
+                &format!("status.hostIPs[{i}].ip"),
+                &host_ip.ip,
+            ));
+        }
+        warnings
+    }
+
+    fn allow_unconditional_update(&self) -> bool {
         true
     }
 }
@@ -444,6 +548,13 @@ pub fn new_store(storage: Arc<StorageBackend>) -> Store<Pod, StorageBackend> {
     store
 }
 
+/// The `/status` store (storage.go: `StatusREST`, whose store carries
+/// `registrypod.StatusStrategy`). The eviction subresource writes through the
+/// same store.
+pub fn new_status_store(storage: Arc<StorageBackend>) -> Store<Pod, StorageBackend> {
+    new_store(storage).with_update_strategy(Arc::new(StatusStrategy))
+}
+
 /// The `/ephemeralcontainers` store (storage.go: `EphemeralContainersREST`).
 pub fn new_ephemeral_containers_store(storage: Arc<StorageBackend>) -> Store<Pod, StorageBackend> {
     new_store(storage).with_update_strategy(Arc::new(EphemeralContainersStrategy))
@@ -452,6 +563,167 @@ pub fn new_ephemeral_containers_store(storage: Arc<StorageBackend>) -> Store<Pod
 /// The `/resize` store (storage.go: `ResizeREST`).
 pub fn new_resize_store(storage: Arc<StorageBackend>) -> Store<Pod, StorageBackend> {
     new_store(storage).with_update_strategy(Arc::new(ResizeStrategy))
+}
+
+/// `podutil.UpdatePodCondition` (pkg/api/v1/pod/util.go): replace the
+/// condition of the same type, or append it. The transition time moves only
+/// when the status flips.
+fn update_pod_condition(status: &mut PodStatus, mut condition: PodCondition) {
+    condition.last_transition_time = Some(chrono::Utc::now());
+    let conditions = status.conditions.get_or_insert_with(Vec::new);
+    match conditions
+        .iter_mut()
+        .find(|c| c.condition_type == condition.condition_type)
+    {
+        None => conditions.push(condition),
+        Some(old) => {
+            if condition.status == old.status {
+                condition.last_transition_time = old.last_transition_time;
+            }
+            *old = condition;
+        }
+    }
+}
+
+/// `BindingREST` (storage/storage.go:149-297, `Create` and its
+/// `assignPod` / `setPodNodeAndMetadata`): binds a pod to a node by writing
+/// the pod straight through the storage with the binding's UID and
+/// resourceVersion as preconditions, around the pod strategies.
+pub struct BindingRest {
+    store: Store<Pod, StorageBackend>,
+}
+
+impl BindingRest {
+    pub fn new(storage: Arc<StorageBackend>) -> Self {
+        Self {
+            store: new_store(storage),
+        }
+    }
+
+    /// `BindingREST.Create` (storage.go:177-201), after the handler decoded
+    /// `binding` and the admission chain mutated it.
+    pub async fn create(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        binding: &Binding,
+        dry_run: bool,
+    ) -> rusternetes_common::Result<()> {
+        use rusternetes_common::Error;
+        if name != binding.metadata.name {
+            return Err(Error::BadRequest(
+                "name in URL does not match name in Binding object".to_string(),
+            ));
+        }
+        // TODO upstream: "move me to a binding strategy". An aggregate error
+        // is a 500 there; the 422 with causes is kept (#1939).
+        let errs = rusternetes_common::validation::pod_status::validate_pod_binding(binding);
+        if !errs.is_empty() {
+            return Err(Error::Invalid(errs));
+        }
+        self.assign_pod(ctx, binding, dry_run).await
+    }
+
+    /// `assignPod` (storage.go:286-296): any failure that is not already an
+    /// API status is a Conflict on `pods/binding`.
+    async fn assign_pod(
+        &self,
+        ctx: &RequestContext,
+        binding: &Binding,
+        dry_run: bool,
+    ) -> rusternetes_common::Result<()> {
+        let name = binding.metadata.name.as_str();
+        // `PreserveRequestObjectMetaSystemFieldsOnSubresourceCreate`: the
+        // binding's UID and resourceVersion guard the pod it names.
+        let uid = (!binding.metadata.uid.is_empty()).then(|| binding.metadata.uid.clone());
+        let resource_version = binding
+            .metadata
+            .resource_version
+            .clone()
+            .filter(|rv| !rv.is_empty());
+        let preconditions = (uid.is_some() || resource_version.is_some()).then_some(
+            rusternetes_common::deletion::Preconditions {
+                uid,
+                resource_version,
+            },
+        );
+        let node = binding.target.name.clone();
+        let annotations = binding.metadata.annotations.clone();
+        let labels = binding.metadata.labels.clone();
+        let binding_resource = GroupResource::new("", "pods/binding");
+        let mutate = move |pod: &mut Pod| -> rusternetes_common::Result<()> {
+            set_pod_node_and_metadata(pod, &node, &annotations, &labels)
+                .map_err(|reason| crate::registry::rest::conflict(&binding_resource, name, reason))
+        };
+        self.store
+            .guaranteed_update_checked(ctx, name, preconditions.as_ref(), dry_run, &mutate)
+            .await
+            .map(|_| ())
+    }
+}
+
+/// The body of `setPodNodeAndMetadata`'s `SimpleUpdate` (storage.go:
+/// 213-270): sets the node if and only if the pod is unassigned, and merges
+/// the binding's annotations and labels.
+fn set_pod_node_and_metadata(
+    pod: &mut Pod,
+    machine: &str,
+    annotations: &Option<HashMap<String, String>>,
+    labels: &Option<HashMap<String, String>>,
+) -> Result<(), String> {
+    use rusternetes_common::feature_gates::{enabled, Feature};
+    let name = pod.metadata.name.clone();
+    if pod.metadata.deletion_timestamp.is_some() {
+        return Err(format!(
+            "pod {name} is being deleted, cannot be assigned to a host"
+        ));
+    }
+    let spec = pod.spec.get_or_insert_with(Default::default);
+    if let Some(node) = spec.node_name.as_deref().filter(|n| !n.is_empty()) {
+        return Err(format!("pod {name} is already assigned to node {node:?}"));
+    }
+    // Reject binding to a scheduling un-ready Pod.
+    if spec
+        .scheduling_gates
+        .as_ref()
+        .is_some_and(|g| !g.is_empty())
+    {
+        return Err(format!("pod {name} has non-empty .spec.schedulingGates"));
+    }
+    spec.node_name = Some(machine.to_string());
+    // Clear nomination hint to prevent stale information affecting external
+    // components (`ClearingNominatedNodeNameAfterBinding`, beta and on).
+    let status = pod.status.get_or_insert_with(Default::default);
+    status.nominated_node_name = None;
+    if let Some(annotations) = annotations {
+        pod.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .extend(annotations.clone());
+    }
+    // Copy all labels from the Binding over to the Pod object, overwriting
+    // any existing labels set on the Pod.
+    if enabled(Feature::PodTopologyLabelsAdmission) {
+        if let Some(labels) = labels.as_ref().filter(|l| !l.is_empty()) {
+            pod.metadata
+                .labels
+                .get_or_insert_with(Default::default)
+                .extend(labels.clone());
+        }
+    }
+    update_pod_condition(
+        pod.status.get_or_insert_with(Default::default),
+        PodCondition {
+            condition_type: "PodScheduled".to_string(),
+            status: "True".to_string(),
+            reason: None,
+            message: None,
+            last_probe_time: None,
+            last_transition_time: None,
+            observed_generation: None,
+        },
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -545,6 +817,29 @@ mod tests {
         assert_eq!(Strategy.warnings_on_create(&ctx(), &p).len(), 1);
         p.metadata.name = "ab".into();
         assert!(Strategy.warnings_on_create(&ctx(), &p).is_empty());
+    }
+
+    /// `podStatusStrategy.WarningsOnUpdate` (strategy.go:273-283): an IP that
+    /// is valid but not in canonical form draws a warning naming its path.
+    #[test]
+    fn status_update_warns_about_non_canonical_ips() {
+        let old = pod(serde_json::json!({}));
+        let mut new = old.clone();
+        new.status = Some(PodStatus {
+            pod_i_ps: Some(vec![rusternetes_common::resources::pod::PodIP {
+                ip: "010.0.0.1".into(),
+            }]),
+            host_i_ps: Some(vec![rusternetes_common::resources::pod::HostIP {
+                ip: "10.0.0.1".into(),
+            }]),
+            ..Default::default()
+        });
+        let warnings = StatusStrategy.warnings_on_update(&ctx(), &new, &old);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("status.podIPs[0].ip:"),
+            "{warnings:?}"
+        );
     }
 
     /// `dropNonResizeUpdates` (strategy.go:386-435): only the containers'

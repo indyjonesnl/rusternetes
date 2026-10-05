@@ -738,9 +738,10 @@ async fn test_pod_strategy_binding_sets_node_name() {
         resp
     );
 
-    // Response body shape mirrors upstream `Binding` echo.
-    assert_eq!(resp["kind"].as_str(), Some("Binding"));
-    assert_eq!(resp["target"]["name"].as_str(), Some("worker-1"));
+    // `BindingREST.Create` answers `&metav1.Status{Status: metav1.StatusSuccess}`
+    // (pkg/registry/core/pod/storage/storage.go:131-134), not a Binding echo.
+    assert_eq!(resp["kind"].as_str(), Some("Status"));
+    assert_eq!(resp["status"].as_str(), Some("Success"));
 
     // Storage assertion — the pod must now carry spec.nodeName.
     let after = stored_pod(&mem, "bind-once").await;

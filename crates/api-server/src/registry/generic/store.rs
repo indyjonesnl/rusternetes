@@ -529,6 +529,50 @@ impl<T: Object, S: Storage> Store<T, S> {
         }
     }
 
+    /// `Storage.GuaranteedUpdate` of the stored object with a fallible plain
+    /// mutation, for a REST wrapper whose `Create` writes the parent object
+    /// around the strategies, as `BindingREST.setPodNodeAndMetadata` does
+    /// (pkg/registry/core/pod/storage/storage.go:213-270). The storage
+    /// failures come back interpreted as by `InterpretGetError` and
+    /// `InterpretUpdateError`; an error `mutate` returns is passed through
+    /// untouched, for the caller to wrap.
+    pub(crate) async fn guaranteed_update_checked(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        preconditions: Option<&Preconditions>,
+        dry_run: bool,
+        mutate: &(dyn Fn(&mut T) -> Result<()> + Send + Sync),
+    ) -> Result<T> {
+        struct Mutate<'a, T> {
+            mutate: &'a (dyn Fn(&mut T) -> Result<()> + Send + Sync),
+        }
+        #[async_trait]
+        impl<T: Object> TryUpdate<T> for Mutate<'_, T> {
+            async fn try_update(
+                &mut self,
+                existing: Option<&T>,
+            ) -> std::result::Result<T, Abort<T>> {
+                let mut obj = existing
+                    .cloned()
+                    .expect("guaranteed_update reads with ignore_not_found = false");
+                (self.mutate)(&mut obj)?;
+                Ok(obj)
+            }
+        }
+
+        let key = self.key_func(ctx, name)?;
+        let mut attempt = Mutate { mutate };
+        match self
+            .guaranteed_update(&key, name, false, preconditions, dry_run, &mut attempt)
+            .await
+        {
+            Ok(obj) => Ok(obj),
+            Err(Abort::Api(err)) => Err(self.interpret_update_error(err, name)),
+            Err(_) => unreachable!("the mutation never aborts"),
+        }
+    }
+
     /// `Storage.Delete` with preconditions and a validation callback
     /// (`etcd3/store.go` `conditionalDelete`, and `DryRunnableStorage.Delete`,
     /// dryrun.go:49-60).

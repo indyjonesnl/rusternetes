@@ -85,6 +85,13 @@ impl Admission<'_> {
         }
     }
 
+    /// Whether the request is for the `resize` subresource of a Pod.
+    fn is_pod_resize(&self) -> bool {
+        self.resource.group.is_empty()
+            && self.resource.resource == "pods"
+            && self.subresource == Some("resize")
+    }
+
     /// Whether the request is for the core-group `resource` itself, not a
     /// subresource of it.
     fn is_core(&self, resource: &str) -> bool {
@@ -133,7 +140,7 @@ impl Admission<'_> {
         obj: Option<&T>,
         old: Option<&T>,
     ) -> Result<()> {
-        if self.is_core("pods") {
+        if self.is_core("pods") || self.is_pod_resize() {
             let obj: Option<Pod> = obj.map(recast).transpose()?;
             let old: Option<Pod> = old.map(recast).transpose()?;
             return self.validate_pod(ctx, op, obj.as_ref(), old.as_ref()).await;
@@ -396,6 +403,19 @@ impl Admission<'_> {
                         .await?;
                 }
             }
+            // KEP-5328 + KEP-1287: a Guaranteed-QoS CPU resize against a node
+            // that has not declared `GuaranteedQoSPodCPUResize` is refused
+            // (the NodeDeclaredFeatureValidator plugin, off with its gate).
+            Operation::Update if self.subresource == Some("resize") => {
+                if let (Some(pod), Some(old)) = (obj, old) {
+                    crate::handlers::pod_subresources::check_node_declared_features_for_resize(
+                        storage.as_ref(),
+                        old,
+                        pod,
+                    )
+                    .await?;
+                }
+            }
             _ => {}
         }
 
@@ -416,7 +436,9 @@ impl Admission<'_> {
                     ))),
                 }
             }
-            (Operation::Update, Some(old)) if pod_quota_scope_changed(old, pod) => {
+            (Operation::Update, Some(old))
+                if self.subresource == Some("resize") || pod_quota_scope_changed(old, pod) =>
+            {
                 ctx.hold(crate::admission::lock_namespace_quota(namespace).await);
                 match crate::admission::check_resource_quota_with_old(
                     storage,

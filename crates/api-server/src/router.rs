@@ -1009,9 +1009,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/status",
-            get(handlers::status::get_status)
-                .put(handlers::status::update_status)
-                .patch(handlers::status::update_status),
+            get(handlers::pod::get_status)
+                .put(handlers::pod::update_status)
+                .patch(handlers::pod::patch_status),
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/log",
@@ -1034,7 +1034,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/binding",
-            post(handlers::pod_subresources::create_binding),
+            post(handlers::pod::create_binding),
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/eviction",
@@ -1042,11 +1042,8 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/resize",
-            // PUT goes through the dedicated subresource handler so we can do
-            // CAS-retry on resourceVersion conflicts (KEP-1287). GET/PATCH fall
-            // back to the generic pod handlers — only PUT is the resize hot path.
             get(handlers::pod::get_resize)
-                .put(handlers::pod_subresources::resize_pod)
+                .put(handlers::pod::update_resize)
                 .patch(handlers::pod::patch_resize),
         )
         .route(
