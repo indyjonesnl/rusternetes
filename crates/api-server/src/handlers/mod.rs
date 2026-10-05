@@ -19,6 +19,8 @@ pub mod deployment;
 pub mod deviceclass;
 pub mod external_metrics;
 pub use rusternetes_discovery as discovery;
+pub mod aggregator;
+pub mod apiservice;
 pub mod dryrun;
 pub mod endpoints;
 pub mod endpointslice;
@@ -27,7 +29,6 @@ pub mod event;
 pub mod filtering;
 pub mod finalizers;
 pub mod flowcontrol;
-pub mod generic;
 #[allow(dead_code)]
 pub mod health;
 pub mod horizontalpodautoscaler;

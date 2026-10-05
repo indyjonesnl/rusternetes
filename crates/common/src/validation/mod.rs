@@ -5,6 +5,7 @@
 //! See [`field`] for the [`field::Error`] / [`field::Path`] types and
 //! [`metav1`] for the metav1 validators.
 
+pub mod apiservice;
 pub mod apps;
 pub mod authorization;
 pub mod certificatesigningrequest;

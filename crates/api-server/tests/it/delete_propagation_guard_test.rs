@@ -80,8 +80,8 @@ fn every_delete_handler_passes_the_request_delete_options() {
                 checked += 1;
                 continue;
             }
-            // Matches the `_json` variants too — they are thin wrappers over
-            // the same helper (see `JsonResource`).
+            // The Store adapters (`endpoints::delete_resource`) are counted above;
+            // this matches the remaining hand-written typed helpers.
             let uses_helper = body.contains("handle_delete_with_finalizers")
                 || body.contains("delete_collection_item");
             // A raw `storage.delete(...)` is the bypass shape: it removes the

@@ -23,6 +23,9 @@ use serde_json::{json, Value};
 const COLLECTION: &str = "/apis/apiregistration.k8s.io/v1/apiservices";
 
 fn apiservice(name: &str, finalizers: Option<Vec<&str>>) -> Value {
+    // `ValidateAPIService` (validation.go:36-47) requires the name to be
+    // `spec.version + "." + spec.group`.
+    let (version, group) = name.split_once('.').expect("version.group name");
     let mut metadata = json!({ "name": name, "labels": { "probe": "yes" } });
     if let Some(f) = finalizers {
         metadata["finalizers"] = json!(f);
@@ -32,8 +35,8 @@ fn apiservice(name: &str, finalizers: Option<Vec<&str>>) -> Value {
         "kind": "APIService",
         "metadata": metadata,
         "spec": {
-            "group": "wardle.example.com",
-            "version": "v1alpha1",
+            "group": group,
+            "version": version,
             "groupPriorityMinimum": 100,
             "versionPriority": 100,
         },
@@ -85,7 +88,7 @@ async fn a_finalizer_holds_an_apiservice_through_delete() {
     // typed ObjectMeta view.
     assert_eq!(
         live.pointer("/spec/group"),
-        Some(&json!("wardle.example.com")),
+        Some(&json!("held.example.com")),
         "spec was lost while marking for deletion: {live}"
     );
 }

@@ -1,4 +1,5 @@
 pub mod admission_webhook;
+pub mod apiregistration;
 pub mod authentication;
 pub mod authorization;
 pub mod autoscaling;
@@ -42,6 +43,9 @@ pub use admission_webhook::{
     FailurePolicy, LabelSelector, LabelSelectorOperator, LabelSelectorRequirement, MatchCondition,
     MatchPolicy, MutatingWebhook, MutatingWebhookConfiguration, OperationType, ReinvocationPolicy,
     Rule, RuleWithOperations, SideEffectClass, ValidatingWebhook, ValidatingWebhookConfiguration,
+};
+pub use apiregistration::{
+    APIService, APIServiceCondition, APIServiceReference, APIServiceSpec, APIServiceStatus,
 };
 pub use authentication::{
     BoundObjectReference, SelfSubjectReview, SelfSubjectReviewStatus, TokenRequest,

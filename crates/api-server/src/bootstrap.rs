@@ -1000,7 +1000,7 @@ fn resolve_cluster_ca(ca_cert_pem: Option<&str>) -> Option<String> {
 /// api-server does not take yet (#1577). Until it does, the effective
 /// configuration is published: the cluster CA for both client and front
 /// proxy, and the identity headers the aggregator proxy sends
-/// (`handlers::generic::build_proxy_headers`).
+/// (`handlers::aggregator::build_proxy_headers`).
 pub fn cluster_authentication_info(
     ca_cert_pem: Option<&str>,
 ) -> rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo {
