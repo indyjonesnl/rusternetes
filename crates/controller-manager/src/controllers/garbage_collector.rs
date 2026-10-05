@@ -71,6 +71,105 @@ enum DependentOp {
     /// written in the meantime — which the api-server rejects outright, see
     /// [`GarbageCollector::run_dependent_ops`].
     StripOwnerRef { key: String, owner_uid: String },
+    /// Re-verify that every owner of this dependent is gone, then delete it —
+    /// one background orphan-collection item (see [`delete_orphan_verified`]).
+    DeleteIfOrphan(Box<ResourceInfo>),
+}
+
+/// Delete an orphaned resource, but only after re-verifying the owner is gone.
+///
+/// The initial orphan detection uses a snapshot which can be stale — resources
+/// created between the scan start and the orphan check won't be in the snapshot.
+/// K8s GC re-reads the owner from the API server before deleting dependents:
+/// see attemptToDeleteItem → getObject in garbagecollector.go:521.
+///
+/// Free function over `&S` (not a `&self` method) so the executor can run it
+/// from a spawned task; see [`GarbageCollector::run_dependent_ops`].
+///
+/// We re-read both the dependent (to get fresh ownerRefs) and then look up
+/// each owner by constructing the storage key from the ownerReference fields.
+async fn delete_orphan_verified<S: Storage>(
+    storage: &S,
+    orphan: &ResourceInfo,
+) -> rusternetes_common::Result<()> {
+    // Re-read the resource from storage to get fresh ownerReferences.
+    // It may have been updated since the scan snapshot.
+    let fresh: Value = match storage.get(&orphan.key).await {
+        Ok(v) => v,
+        Err(rusternetes_common::Error::NotFound(_)) => return Ok(()), // already gone
+        Err(e) => return Err(e),
+    };
+    let fresh_meta: ObjectMeta = match fresh
+        .get("metadata")
+        .and_then(|m| serde_json::from_value(m.clone()).ok())
+    {
+        Some(m) => m,
+        None => return Ok(()), // can't parse metadata, skip
+    };
+
+    // If ownerReferences were removed (orphan policy processed), skip deletion
+    let owner_refs = match &fresh_meta.owner_references {
+        Some(refs) if !refs.is_empty() => refs,
+        _ => return Ok(()), // no owners = not an orphan (or already orphaned)
+    };
+
+    // For each ownerReference, construct the storage key and check if the owner exists.
+    // K8s uses the owner's GVR + namespace + name to look it up.
+    // We use kind → plural resource name mapping + namespace from the dependent.
+    let namespace = fresh_meta.namespace.as_deref();
+
+    for owner_ref in owner_refs {
+        let plural = kind_to_plural(&owner_ref.kind);
+        if plural.is_empty() {
+            // Unknown kind — be conservative, don't delete
+            debug!(
+                "GC: {} has owner of unknown kind '{}', skipping",
+                orphan.key, owner_ref.kind
+            );
+            return Ok(());
+        }
+        let owner_key = if let Some(ns) = namespace {
+            format!("/registry/{}/{}/{}", plural, ns, owner_ref.name)
+        } else {
+            format!("/registry/{}/{}", plural, owner_ref.name)
+        };
+
+        // Try to read the owner from storage
+        match storage.get::<Value>(&owner_key).await {
+            Ok(owner_value) => {
+                // Owner exists — verify UID matches
+                if let Some(uid) = owner_value
+                    .pointer("/metadata/uid")
+                    .and_then(|u| u.as_str())
+                {
+                    if uid == owner_ref.uid {
+                        // Owner with matching UID exists — NOT an orphan
+                        debug!(
+                            "GC: {} is NOT orphan — owner {}/{} (uid={}) still exists",
+                            orphan.key, owner_ref.kind, owner_ref.name, uid
+                        );
+                        return Ok(());
+                    }
+                    // UID mismatch — the resource was recreated with a different UID.
+                    // The old owner is gone, this ownerRef is dangling.
+                }
+            }
+            Err(rusternetes_common::Error::NotFound(_)) => {
+                // Owner not found — this ownerRef is dangling
+            }
+            Err(_) => {
+                // Storage error — be conservative, don't delete
+                return Ok(());
+            }
+        }
+    }
+
+    // All owners verified as gone — this is truly an orphan
+    info!(
+        "Deleting orphaned resource: {} ({}) — all owners verified gone",
+        orphan.key, orphan.resource_type
+    );
+    storage.delete(&orphan.key).await
 }
 
 /// Garbage collector controller
@@ -258,7 +357,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         // K8s GC does not require multiple scans to confirm an orphan — it
         // re-reads each owner from the apiserver before deleting the dependent
         // (attemptToDeleteItem → getObject in garbagecollector.go:521). We
-        // do the same in `delete_orphan`, which re-reads both the dependent
+        // do the same in `delete_orphan_verified`, which re-reads both the dependent
         // and every owner from storage and only deletes when all owners are
         // confirmed gone. The previous 2-scan grace introduced a full-cycle
         // delay between owner deletion and dependent removal, which
@@ -300,15 +399,23 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             const MAX_CASCADE_ROUNDS: usize = 10;
             let mut round_orphans = orphans.clone();
             for round in 0..MAX_CASCADE_ROUNDS {
-                for orphan in &round_orphans {
-                    match self.delete_orphan(orphan).await {
-                        Ok(_) => deleted_count += 1,
-                        Err(e) => {
-                            failed_count += 1;
-                            error!("Failed to delete orphan {}: {}", orphan.key, e);
-                        }
-                    }
-                }
+                // Each orphan is verified and deleted independently, so the
+                // round fans out over the same bounded executor as the policy
+                // paths. Upstream drains these through `ConcurrentGCSyncs` = 20
+                // `attemptToDeleteItem` workers, one queue item each
+                // (pkg/controller/garbagecollector/garbagecollector.go:172,
+                // :521). The re-read of every owner inside each item is kept
+                // as-is; it is overlapped across items, not skipped. The
+                // re-list below still runs strictly after the round joins.
+                let ops: Vec<DependentOp> = round_orphans
+                    .iter()
+                    .cloned()
+                    .map(|o| DependentOp::DeleteIfOrphan(Box::new(o)))
+                    .collect();
+                let total = ops.len();
+                let failures = self.run_dependent_ops(ops).await;
+                failed_count += failures.len();
+                deleted_count += total - failures.len();
 
                 // Re-list and re-derive: anything that just lost its last owner
                 // is an orphan now. Stop as soon as a round finds nothing new.
@@ -618,93 +725,6 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         orphans
     }
 
-    /// Delete an orphaned resource, but only after re-verifying the owner is gone.
-    ///
-    /// The initial orphan detection uses a snapshot which can be stale — resources
-    /// created between the scan start and the orphan check won't be in the snapshot.
-    /// K8s GC re-reads the owner from the API server before deleting dependents:
-    /// see attemptToDeleteItem → getObject in garbagecollector.go:521.
-    ///
-    /// We re-read both the dependent (to get fresh ownerRefs) and then look up
-    /// each owner by constructing the storage key from the ownerReference fields.
-    async fn delete_orphan(&self, orphan: &ResourceInfo) -> rusternetes_common::Result<()> {
-        // Re-read the resource from storage to get fresh ownerReferences.
-        // It may have been updated since the scan snapshot.
-        let fresh: Value = match self.storage.get(&orphan.key).await {
-            Ok(v) => v,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()), // already gone
-            Err(e) => return Err(e),
-        };
-        let fresh_meta = match self.extract_metadata(&fresh) {
-            Ok(m) => m,
-            Err(_) => return Ok(()), // can't parse metadata, skip
-        };
-
-        // If ownerReferences were removed (orphan policy processed), skip deletion
-        let owner_refs = match &fresh_meta.owner_references {
-            Some(refs) if !refs.is_empty() => refs,
-            _ => return Ok(()), // no owners = not an orphan (or already orphaned)
-        };
-
-        // For each ownerReference, construct the storage key and check if the owner exists.
-        // K8s uses the owner's GVR + namespace + name to look it up.
-        // We use kind → plural resource name mapping + namespace from the dependent.
-        let namespace = fresh_meta.namespace.as_deref();
-
-        for owner_ref in owner_refs {
-            let plural = kind_to_plural(&owner_ref.kind);
-            if plural.is_empty() {
-                // Unknown kind — be conservative, don't delete
-                debug!(
-                    "GC: {} has owner of unknown kind '{}', skipping",
-                    orphan.key, owner_ref.kind
-                );
-                return Ok(());
-            }
-            let owner_key = if let Some(ns) = namespace {
-                format!("/registry/{}/{}/{}", plural, ns, owner_ref.name)
-            } else {
-                format!("/registry/{}/{}", plural, owner_ref.name)
-            };
-
-            // Try to read the owner from storage
-            match self.storage.get::<Value>(&owner_key).await {
-                Ok(owner_value) => {
-                    // Owner exists — verify UID matches
-                    if let Some(uid) = owner_value
-                        .pointer("/metadata/uid")
-                        .and_then(|u| u.as_str())
-                    {
-                        if uid == owner_ref.uid {
-                            // Owner with matching UID exists — NOT an orphan
-                            debug!(
-                                "GC: {} is NOT orphan — owner {}/{} (uid={}) still exists",
-                                orphan.key, owner_ref.kind, owner_ref.name, uid
-                            );
-                            return Ok(());
-                        }
-                        // UID mismatch — the resource was recreated with a different UID.
-                        // The old owner is gone, this ownerRef is dangling.
-                    }
-                }
-                Err(rusternetes_common::Error::NotFound(_)) => {
-                    // Owner not found — this ownerRef is dangling
-                }
-                Err(_) => {
-                    // Storage error — be conservative, don't delete
-                    return Ok(());
-                }
-            }
-        }
-
-        // All owners verified as gone — this is truly an orphan
-        info!(
-            "Deleting orphaned resource: {} ({}) — all owners verified gone",
-            orphan.key, orphan.resource_type
-        );
-        self.storage.delete(&orphan.key).await
-    }
-
     /// Process deletion for a resource with deletion timestamp
     async fn process_deletion(
         &self,
@@ -949,6 +969,15 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                             Some(format!("{key}: {e}"))
                         }
                     },
+                    DependentOp::DeleteIfOrphan(orphan) => {
+                        match delete_orphan_verified(storage.as_ref(), orphan).await {
+                            Ok(()) => None,
+                            Err(e) => {
+                                error!("Failed to delete orphan {}: {}", orphan.key, e);
+                                Some(format!("{}: {e}", orphan.key))
+                            }
+                        }
+                    }
                     DependentOp::StripOwnerRef { key, owner_uid } => {
                         // Read-modify-write against a FRESH read, retrying if we
                         // lose the race.
@@ -2063,7 +2092,7 @@ mod tests {
     /// A single GC scan must remove an orphan whose owner is already gone.
     /// Conformance tests for orphan pod cleanup observe per-cycle latency,
     /// so the previous "2-scan grace" gating added a full reconcile cycle
-    /// of wait before any orphan was reaped. `delete_orphan` already re-reads
+    /// of wait before any orphan was reaped. `delete_orphan_verified` already re-reads
     /// the owner from storage as a race guard, so the second scan was
     /// unnecessary and observably slow.
     #[tokio::test]
@@ -2177,6 +2206,140 @@ mod tests {
         assert!(
             remaining.is_empty(),
             "a single scan must collect the whole chain, not one level per scan; still present: {names:?}"
+        );
+    }
+
+    /// Background orphan-collection must overlap its per-orphan work.
+    ///
+    /// `delete_orphan_verified` costs 1 + N reads (the dependent, then each owner) plus
+    /// a delete, so a serial round pays that per orphan, one after another.
+    /// Upstream drains orphans through `ConcurrentGCSyncs` = 20
+    /// `attemptToDeleteItem` workers
+    /// (`pkg/controller/garbagecollector/garbagecollector.go:172`, workers
+    /// from `cmd/kube-controller-manager/app/options/garbagecollectorcontroller.go`),
+    /// each item verified independently (`:521` re-reads the owner). Guards
+    /// issue #1860.
+    #[tokio::test]
+    async fn background_orphan_rounds_verify_and_delete_concurrently() {
+        struct SlowGet {
+            inner: Arc<MemoryStorage>,
+        }
+
+        #[async_trait::async_trait]
+        impl Storage for SlowGet {
+            async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.create(key, value).await
+            }
+            async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+            where
+                T: serde::de::DeserializeOwned + Send + Sync,
+            {
+                // A real backend's read is a round trip. MemoryStorage never
+                // yields, so without this a spawned task would run to
+                // completion before the next starts and overlap would be
+                // unobservable.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                self.inner.get(key).await
+            }
+            async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.update(key, value).await
+            }
+            async fn update_raw(
+                &self,
+                key: &str,
+                value: &serde_json::Value,
+            ) -> rusternetes_common::Result<()> {
+                self.inner.update_raw(key, value).await
+            }
+            async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+                self.inner.delete(key).await
+            }
+            async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.list(prefix).await
+            }
+            async fn watch(
+                &self,
+                prefix: &str,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch(prefix).await
+            }
+            async fn watch_from_revision(
+                &self,
+                prefix: &str,
+                revision: i64,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch_from_revision(prefix, revision).await
+            }
+            async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+                self.inner.current_revision().await
+            }
+            async fn is_revision_compacted(
+                &self,
+                revision: i64,
+            ) -> rusternetes_common::Result<bool> {
+                self.inner.is_revision_compacted(revision).await
+            }
+        }
+
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        const ORPHANS: usize = 20;
+        let inner = Arc::new(MemoryStorage::new());
+        let storage = Arc::new(SlowGet {
+            inner: inner.clone(),
+        });
+        let gc = GarbageCollector::new(storage.clone());
+
+        for i in 0..ORPHANS {
+            let mut meta = ObjectMeta::new(format!("orphan-{i}"));
+            meta.namespace = Some("gc-ns".to_string());
+            meta.uid = format!("orphan-{i}-uid");
+            meta.owner_references = Some(vec![OwnerReference {
+                api_version: "v1".to_string(),
+                kind: "ReplicationController".to_string(),
+                name: "gone-rc".to_string(),
+                uid: "gone-rc-uid".to_string(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]);
+            let pod = Pod {
+                type_meta: TypeMeta {
+                    kind: "Pod".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: meta,
+                spec: None,
+                status: None,
+            };
+            storage
+                .create(&format!("/registry/pods/gc-ns/orphan-{i}"), &pod)
+                .await
+                .unwrap();
+        }
+
+        gc.scan_and_collect().await.unwrap();
+
+        let remaining: Vec<Pod> = storage.list("/registry/pods/gc-ns/").await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "every orphan must still be collected, {} left",
+            remaining.len()
+        );
+        let peak = gc.peak_concurrent_dependent_ops();
+        assert!(
+            peak >= ORPHANS / 2,
+            "collecting {ORPHANS} orphans peaked at {peak} concurrent operations; \
+             upstream runs 20 workers over the same queue"
         );
     }
 
