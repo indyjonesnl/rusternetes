@@ -114,7 +114,7 @@ impl<T: Object> RequestScope<T> {
 
 /// The `WithAuthorization` filter's check for a resource request
 /// (endpoints/filters/authorization.go).
-pub(super) async fn authorize(
+pub(crate) async fn authorize(
     state: &ApiServerState,
     user: &UserInfo,
     verb: &str,
@@ -141,13 +141,13 @@ pub(super) async fn authorize(
 }
 
 /// The `dryRun` query parameter as `metav1.*Options.DryRun` decodes it.
-pub(super) fn dry_run_param(params: &HashMap<String, String>) -> Option<Vec<String>> {
+pub(crate) fn dry_run_param(params: &HashMap<String, String>) -> Option<Vec<String>> {
     params.get("dryRun").map(|v| vec![v.clone()])
 }
 
 /// `dryrun.IsDryRun` (apiserver/pkg/util/dryrun/dryrun.go): any value is a
 /// dry run. The options validation that runs first admits only `All`.
-pub(super) fn is_dry_run(dry_run: Option<&[String]>) -> bool {
+pub(crate) fn is_dry_run(dry_run: Option<&[String]>) -> bool {
     dry_run.is_some_and(|d| !d.is_empty())
 }
 
@@ -238,7 +238,7 @@ pub(super) fn check_name<T: Object>(obj: &T, name: &str, namespace: Option<&str>
 
 /// `transformResponseObject` for a JSON client, with the request's warnings
 /// as `Warning: 299` headers (endpoints/filters/warning.go).
-pub(super) fn respond<B: Serialize>(
+pub(crate) fn respond<B: Serialize>(
     status: StatusCode,
     body: &B,
     ctx: &RequestContext,

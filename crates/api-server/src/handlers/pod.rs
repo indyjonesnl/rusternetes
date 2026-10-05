@@ -7,12 +7,11 @@
 //! `endpoints/handlers/{create,update,patch,delete}.go`. The admission the
 //! pod handlers used to run inline is the in-tree chain of
 //! [`crate::endpoints::handlers::Admission`]. Lists and watches are still
-//! served here directly; `/status`, `/binding`, `/eviction` and the
-//! `/resize` PUT keep their own handlers.
+//! served here directly; `/eviction` keeps its own handler.
 
 use crate::endpoints::handlers::{self as endpoints, RequestScope};
 use crate::registry::core::pod;
-use crate::registry::rest::RestStorage;
+use crate::registry::rest::{RequestContext, RestStorage};
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     body::Bytes,
@@ -24,10 +23,12 @@ use axum::{
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
-    resources::Pod,
+    dump::decode_request_body,
+    resources::{Binding, Node, Pod},
+    validation::metav1::{validate_create_options, CreateOptions},
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::{build_key, build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -40,6 +41,9 @@ fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestSc
             Box::new(pod::new_ephemeral_containers_store(state.storage.clone()))
         }
         Some("resize") => Box::new(pod::new_resize_store(state.storage.clone())),
+        Some("status") => Box::new(pod::new_status_store(state.storage.clone())),
+        // `BindingREST` is not a `RestStorage<Pod>`; `create_binding` builds
+        // its own. The scope only names the resource for authorization.
         _ => Box::new(pod::new_store(state.storage.clone())),
     };
     RequestScope {
@@ -270,8 +274,27 @@ pub async fn get_resize(
     .await
 }
 
-/// PATCH `/resize`: a patch into `ResizeREST.Update`. The PUT keeps its own
-/// handler (`pod_subresources::resize_pod`).
+/// PUT `/resize`: `ResizeREST.Update` (storage.go).
+pub async fn update_resize(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, Some("resize")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// PATCH `/resize`: a patch into `ResizeREST.Update`.
 pub async fn patch_resize(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -291,6 +314,154 @@ pub async fn patch_resize(
         &body,
     )
     .await
+}
+
+/// GET `/status`: `StatusREST.Get` is the store's (storage.go).
+pub async fn get_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Response> {
+    endpoints::get_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+    )
+    .await
+}
+
+/// PUT `/status`: `StatusREST.Update` (storage.go).
+pub async fn update_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::update_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        &body,
+    )
+    .await
+}
+
+/// PATCH `/status`: a patch into `StatusREST.Update`.
+pub async fn patch_status(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    endpoints::patch_resource(
+        &state,
+        &scope(&state, Some("status")),
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+        patch_content_type(&headers),
+        &body,
+    )
+    .await
+}
+
+/// POST `/binding`: `BindingREST.Create` as a named create
+/// (`handlers.CreateNamedResource`, create.go, over a `Binding`).
+pub async fn create_binding(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    info!("Creating binding for pod {}/{}", namespace, name);
+    let scope = scope(&state, Some("binding"));
+    endpoints::authorize(
+        &state,
+        &auth_ctx.user,
+        "create",
+        &scope.resource,
+        scope.subresource,
+        Some(&namespace),
+        Some(&name),
+    )
+    .await?;
+
+    let options = CreateOptions {
+        field_manager: params.get("fieldManager").cloned(),
+        dry_run: endpoints::dry_run_param(&params),
+        field_validation: params.get("fieldValidation").cloned(),
+    };
+    let errs = validate_create_options(&options);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+    let dry_run = endpoints::is_dry_run(options.dry_run.as_deref());
+
+    let mut binding: Binding = decode_request_body(&body)?;
+    let ctx = RequestContext::new(Some(&namespace))
+        .with_user(&auth_ctx.user)
+        .with_name(&name);
+    admit_binding_topology_labels(&state, &mut binding).await?;
+
+    pod::BindingRest::new(state.storage.clone())
+        .create(&ctx, &name, &binding, dry_run)
+        .await?;
+    Ok(endpoints::respond(
+        axum::http::StatusCode::CREATED,
+        &rusternetes_common::Status::success(),
+        &ctx,
+    ))
+}
+
+/// `podtopologylabels.Plugin.admitBinding`
+/// (plugin/pkg/admission/podtopologylabels/admission.go): the node's
+/// topology labels go onto the Binding, and `BindingREST` copies them to the
+/// pod. Gated by `PodTopologyLabelsAdmission`; a node that is not there is
+/// ignored, "to avoid risking breaking compatibility/behaviour".
+async fn admit_binding_topology_labels(state: &ApiServerState, binding: &mut Binding) -> Result<()> {
+    use rusternetes_common::feature_gates::{enabled, Feature};
+    // The plugin's default `Config.Labels`.
+    const TOPOLOGY_LABELS: [&str; 2] = [
+        "topology.kubernetes.io/zone",
+        "topology.kubernetes.io/region",
+    ];
+    if !enabled(Feature::PodTopologyLabelsAdmission) {
+        return Ok(());
+    }
+    // other fields are not set by the default scheduler for the binding
+    // target, so only check the Kind.
+    if binding.target.kind.as_deref() != Some("Node") {
+        return Ok(());
+    }
+    let node_key = build_key("nodes", None::<&str>, &binding.target.name);
+    let node: Node = match state.storage.get(&node_key).await {
+        Ok(node) => node,
+        Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let Some(node_labels) = node.metadata.labels.as_ref() else {
+        return Ok(());
+    };
+    for key in TOPOLOGY_LABELS {
+        if let Some(value) = node_labels.get(key) {
+            binding
+                .metadata
+                .labels
+                .get_or_insert_with(Default::default)
+                .insert(key.to_string(), value.clone());
+        }
+    }
+    Ok(())
 }
 
 pub async fn list(

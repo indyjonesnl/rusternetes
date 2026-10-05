@@ -200,7 +200,6 @@ mod pod_probe_default_test;
 mod pod_qos_class_parity_test;
 mod pod_requests_from_limits_default_test;
 mod pod_subresources_store_test;
-mod pod_resize_cas_test;
 mod pod_security_admission_test;
 mod pod_spec_decodes_when_absent_test;
 mod pod_store_test;

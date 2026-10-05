@@ -396,6 +396,19 @@ impl Admission<'_> {
                         .await?;
                 }
             }
+            // KEP-5328 + KEP-1287: a Guaranteed-QoS CPU resize against a node
+            // that has not declared `GuaranteedQoSPodCPUResize` is refused
+            // (the NodeDeclaredFeatureValidator plugin, off with its gate).
+            Operation::Update if self.subresource == Some("resize") => {
+                if let (Some(pod), Some(old)) = (obj, old) {
+                    crate::handlers::pod_subresources::check_node_declared_features_for_resize(
+                        storage.as_ref(),
+                        old,
+                        pod,
+                    )
+                    .await?;
+                }
+            }
             _ => {}
         }
 
