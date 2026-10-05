@@ -1,6 +1,6 @@
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Extension, Json,
 };
 use chrono::Utc;
@@ -28,7 +28,7 @@ fn pod_metrics_type_meta() -> rusternetes_common::types::TypeMeta {
         kind: "PodMetrics".to_string(),
     }
 }
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -91,13 +91,17 @@ async fn pod_metrics_or_fallback<S: Storage>(
 ) -> PodMetrics {
     let name = &pod.metadata.name;
     let key = format!("/registry/metrics.k8s.io/pods/{}/{}", namespace, name);
-    if let Ok(metrics) = storage.get::<PodMetrics>(&key).await {
+    if let Ok(mut metrics) = storage.get::<PodMetrics>(&key).await {
+        // metrics-server pkg/api/pod.go builds PodMetrics with the source
+        // pod's labels, so selectors match the pod's labels.
+        metrics.metadata.labels = pod.metadata.labels.clone();
         return metrics;
     }
     PodMetrics {
         type_meta: pod_metrics_type_meta(),
         metadata: rusternetes_common::types::ObjectMeta {
             creation_timestamp: Some(Utc::now()),
+            labels: pod.metadata.labels.clone(),
             ..rusternetes_common::types::ObjectMeta::new(name.clone()).with_namespace(namespace)
         },
         timestamp: Utc::now(),
@@ -161,6 +165,7 @@ pub async fn get_node_metrics(
 pub async fn list_node_metrics(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<List<NodeMetrics>>> {
     debug!("Listing node metrics");
 
@@ -172,8 +177,23 @@ pub async fn list_node_metrics(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
+    // metrics-server pkg/api/node.go builds NodeMetrics with the source
+    // node's labels; selectors match those, so overlay them from the Node.
+    let nodes_prefix = build_prefix("nodes", None);
+    let nodes: Vec<rusternetes_common::resources::Node> =
+        state.storage.as_ref().list(&nodes_prefix).await?;
+    let node_labels: HashMap<String, HashMap<String, String>> = nodes
+        .iter()
+        .filter_map(|n| {
+            n.metadata
+                .labels
+                .clone()
+                .map(|l| (n.metadata.name.clone(), l))
+        })
+        .collect();
+
     // Read all node metrics from storage
-    let metrics: Vec<NodeMetrics> = state
+    let mut metrics: Vec<NodeMetrics> = state
         .storage
         .as_ref()
         .list("/registry/metrics.k8s.io/nodes/")
@@ -182,9 +202,6 @@ pub async fn list_node_metrics(
 
     // If no metrics in storage yet, return empty entries for each node
     if metrics.is_empty() {
-        let nodes_prefix = build_prefix("nodes", None);
-        let nodes: Vec<rusternetes_common::resources::Node> =
-            state.storage.as_ref().list(&nodes_prefix).await?;
         let mut metrics_list = Vec::new();
         for node in nodes {
             let mut usage = BTreeMap::new();
@@ -194,6 +211,7 @@ pub async fn list_node_metrics(
                 type_meta: node_metrics_type_meta(),
                 metadata: rusternetes_common::types::ObjectMeta {
                     creation_timestamp: Some(Utc::now()),
+                    labels: node.metadata.labels.clone(),
                     ..rusternetes_common::types::ObjectMeta::new(node.metadata.name.clone())
                 },
                 timestamp: Utc::now(),
@@ -201,6 +219,8 @@ pub async fn list_node_metrics(
                 usage,
             });
         }
+        // store.go ListPredicate: apply label/field selectors.
+        crate::handlers::filtering::apply_selectors(&mut metrics_list, &params)?;
         let mut list = List::new("NodeMetricsList", "metrics.k8s.io/v1beta1", metrics_list);
         list.metadata.resource_version = Some(
             crate::handlers::list_collection_resource_version(&state.storage, &list.items).await,
@@ -208,6 +228,12 @@ pub async fn list_node_metrics(
         return Ok(Json(list));
     }
 
+    for m in metrics.iter_mut() {
+        if let Some(l) = node_labels.get(&m.metadata.name) {
+            m.metadata.labels = Some(l.clone());
+        }
+    }
+    crate::handlers::filtering::apply_selectors(&mut metrics, &params)?;
     let mut list = List::new("NodeMetricsList", "metrics.k8s.io/v1beta1", metrics);
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
@@ -246,6 +272,7 @@ pub async fn list_pod_metrics(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<List<PodMetrics>>> {
     debug!("Listing pod metrics in namespace: {}", namespace);
 
@@ -270,6 +297,8 @@ pub async fn list_pod_metrics(
         metrics_list.push(metrics);
     }
 
+    // store.go ListPredicate: apply label/field selectors.
+    crate::handlers::filtering::apply_selectors(&mut metrics_list, &params)?;
     let mut list = List::new("PodMetricsList", "metrics.k8s.io/v1beta1", metrics_list);
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
@@ -280,6 +309,7 @@ pub async fn list_pod_metrics(
 pub async fn list_all_pod_metrics(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<List<PodMetrics>>> {
     debug!("Listing pod metrics across all namespaces");
 
@@ -311,6 +341,8 @@ pub async fn list_all_pod_metrics(
         }
     }
 
+    // store.go ListPredicate: apply label/field selectors.
+    crate::handlers::filtering::apply_selectors(&mut metrics_list, &params)?;
     let mut list = List::new("PodMetricsList", "metrics.k8s.io/v1beta1", metrics_list);
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
