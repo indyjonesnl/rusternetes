@@ -8,6 +8,12 @@ use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
+/// getJobName (pkg/controller/cronjob/cronjob_controllerv2.go:676):
+/// `{cronjob}-{scheduledTime.Unix()/60}` (getTimeHashInMinutes, utils.go:270).
+fn job_name_for(cronjob_name: &str, scheduled_time: chrono::DateTime<chrono::Utc>) -> String {
+    format!("{}-{}", cronjob_name, scheduled_time.timestamp() / 60)
+}
+
 pub struct CronJobController<S: Storage> {
     storage: Arc<S>,
 }
@@ -169,11 +175,12 @@ impl<S: Storage + 'static> CronJobController<S> {
         let now = chrono::Utc::now();
 
         // Simple cron parsing - in production, use a proper cron parser library
-        let should_run = self.should_run_now(schedule, now, cronjob)?;
-
-        if !should_run {
+        let Some(scheduled_time) = self.scheduled_run_time(schedule, now, cronjob)? else {
             return Ok(());
-        }
+        };
+        // getJobName (cronjob_controllerv2.go:676): the Job is named from the
+        // SCHEDULED time, so a retry after a lost status write is idempotent.
+        let scheduled_job_name = job_name_for(&cronjob.metadata.name, scheduled_time);
 
         info!("CronJob {}/{} triggered at {}", namespace, name, now);
 
@@ -184,12 +191,18 @@ impl<S: Storage + 'static> CronJobController<S> {
         let active_jobs: Vec<Job> = all_jobs
             .into_iter()
             .filter(|job| {
-                job.metadata
-                    .labels
-                    .as_ref()
-                    .and_then(|labels| labels.get("cronjob-name"))
-                    .map(|cj| cj == name)
-                    .unwrap_or(false)
+                // A Job already created for THIS scheduled time by an earlier
+                // attempt whose status write lost the race is not "another
+                // active run": the retry must reach create_job and get
+                // AlreadyExists (cronjob_controllerv2.go:615-632).
+                job.metadata.name != scheduled_job_name
+                    && job
+                        .metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|labels| labels.get("cronjob-name"))
+                        .map(|cj| cj == name)
+                        .unwrap_or(false)
                     && job
                         .status
                         .as_ref()
@@ -254,8 +267,9 @@ impl<S: Storage + 'static> CronJobController<S> {
                 if cronjob.status != new_status {
                     cronjob.status = new_status;
                     let key = format!("/registry/cronjobs/{}/{}", namespace, name);
-                    // Status subresource write: a full-object PUT strips `.status` (#1723).
-                    let _ = self.storage.update_status(&key, cronjob).await;
+                    // Conditional status write: a Conflict requeues
+                    // (Store.Update's resourceVersion precondition, #2153).
+                    self.storage.update_status_cas(&key, cronjob).await?;
                 }
                 return Ok(());
             }
@@ -274,7 +288,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         }
 
         // Create new Job
-        self.create_job(cronjob, namespace).await?;
+        self.create_job(cronjob, namespace, scheduled_time).await?;
 
         // Build active job references from all active jobs for this cronjob.
         // Sort by name so the active list is deterministic across reconciles
@@ -321,7 +335,9 @@ impl<S: Storage + 'static> CronJobController<S> {
         // Update status with active refs and last schedule time
         let new_status = Some(CronJobStatus {
             active: active_refs,
-            last_schedule_time: Some(now),
+            // syncCronJob sets LastScheduleTime = the scheduled time
+            // (cronjob_controllerv2.go, `cronJob.Status.LastScheduleTime`).
+            last_schedule_time: Some(scheduled_time),
             last_successful_time: cronjob.status.as_ref().and_then(|s| s.last_successful_time),
         });
 
@@ -330,8 +346,9 @@ impl<S: Storage + 'static> CronJobController<S> {
         if cronjob.status != new_status {
             cronjob.status = new_status;
             let key = format!("/registry/cronjobs/{}/{}", namespace, name);
-            // Status subresource write (#1723).
-            self.storage.update_status(&key, cronjob).await?;
+            // Conditional status write (#2153): a Conflict is returned and the
+            // work item requeued; the retry's create_job gets AlreadyExists.
+            self.storage.update_status_cas(&key, cronjob).await?;
         }
 
         // Clean up old jobs based on history limits
@@ -340,12 +357,24 @@ impl<S: Storage + 'static> CronJobController<S> {
         Ok(())
     }
 
+    #[cfg(test)]
     fn should_run_now(
         &self,
         schedule: &str,
         now: chrono::DateTime<chrono::Utc>,
         cronjob: &CronJob,
     ) -> Result<bool> {
+        Ok(self.scheduled_run_time(schedule, now, cronjob)?.is_some())
+    }
+
+    /// The most recent scheduled time in `(last, now]`, or None when nothing is
+    /// due (mostRecentScheduleTime, pkg/controller/cronjob/utils.go).
+    fn scheduled_run_time(
+        &self,
+        schedule: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        cronjob: &CronJob,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
         // Get last schedule time
         let last_schedule = cronjob.status.as_ref().and_then(|s| s.last_schedule_time);
 
@@ -380,7 +409,7 @@ impl<S: Storage + 'static> CronJobController<S> {
             Ok(s) => s,
             Err(e) => {
                 warn!("Failed to parse cron schedule '{}': {}", cron_schedule, e);
-                return Ok(false);
+                return Ok(None);
             }
         };
 
@@ -401,47 +430,39 @@ impl<S: Storage + 'static> CronJobController<S> {
                         "CronJob {}: invalid timeZone {:?}; not scheduling",
                         cronjob.metadata.name, name
                     );
-                    return Ok(false);
+                    return Ok(None);
                 }
             },
         };
         let now_tz = now.with_timezone(&tz);
 
-        // Determine if job should run now
-        // Check if we're within the schedule window since last run
-        if let Some(last) = last_schedule {
-            // Find next scheduled time after last run, evaluated in `tz`.
-            if let Some(next_run) = schedule_parsed.after(&last.with_timezone(&tz)).next() {
-                // Should run if current time >= next scheduled time
-                let should_run = now_tz >= next_run;
-                if should_run {
-                    info!("CronJob should run: next_run={}, current={}", next_run, now);
-                }
-                Ok(should_run)
-            } else {
-                // No next run time found
-                Ok(false)
-            }
-        } else {
-            // Never run before - check if there's a scheduled time in the past minute
-            // This prevents all cronjobs from running immediately on startup
-            let one_minute_ago = (now - chrono::Duration::minutes(1)).with_timezone(&tz);
-            if let Some(next_run) = schedule_parsed.after(&one_minute_ago).next() {
-                let should_run = now_tz >= next_run;
-                if should_run {
-                    info!("CronJob first run: next_run={}, current={}", next_run, now);
-                }
-                Ok(should_run)
-            } else {
-                Ok(false)
-            }
+        // Start of the window: the last scheduled run, else one minute ago so
+        // a fresh CronJob does not fire everything at startup.
+        let start = match last_schedule {
+            Some(last) => last.with_timezone(&tz),
+            None => (now - chrono::Duration::minutes(1)).with_timezone(&tz),
+        };
+        // Walk every scheduled time in (start, now]; the latest wins. Capped
+        // like upstream's "too many missed start times" guard (utils.go).
+        let latest = schedule_parsed
+            .after(&start)
+            .take(10_000)
+            .take_while(|t| *t <= now_tz)
+            .last();
+        if let Some(t) = latest {
+            info!("CronJob due: scheduled={}, current={}", t, now);
         }
+        Ok(latest.map(|t| t.with_timezone(&chrono::Utc)))
     }
 
-    async fn create_job(&self, cronjob: &CronJob, namespace: &str) -> Result<()> {
+    async fn create_job(
+        &self,
+        cronjob: &CronJob,
+        namespace: &str,
+        scheduled_time: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
         let cronjob_name = &cronjob.metadata.name;
-        let timestamp = chrono::Utc::now().timestamp();
-        let job_name = format!("{}-{}", cronjob_name, timestamp);
+        let job_name = job_name_for(cronjob_name, scheduled_time);
 
         let mut labels = cronjob
             .spec
@@ -492,7 +513,26 @@ impl<S: Storage + 'static> CronJobController<S> {
         };
 
         let key = format!("/registry/jobs/{}/{}", namespace, job_name);
-        self.storage.create(&key, &job).await?;
+        match self.storage.create(&key, &job).await {
+            Ok(_) => {}
+            Err(rusternetes_common::Error::AlreadyExists(_)) => {
+                // cronjob_controllerv2.go:615-632: AlreadyExists means a prior
+                // attempt created this Job but lost the status write. Success,
+                // unless another actor owns it (then it updates the status).
+                let existing: Job = self.storage.get(&key).await?;
+                let ours = existing
+                    .metadata
+                    .owner_references
+                    .as_ref()
+                    .is_some_and(|o| o.iter().any(|r| r.uid == cronjob.metadata.uid));
+                debug!(
+                    "Job {} already exists for CronJob {} (controlled by it: {})",
+                    job_name, cronjob_name, ours
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        }
 
         info!("Created Job {} from CronJob {}", job_name, cronjob_name);
 
