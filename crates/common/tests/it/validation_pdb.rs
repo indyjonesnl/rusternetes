@@ -208,10 +208,15 @@ fn both_bounds_report_the_spec() {
     );
     assert_eq!(
         errs[0].bad_value,
-        BadValue::Json(json!({
-            "MinAvailable": "10%", "Selector": null,
-            "MaxUnavailable": 1, "UnhealthyPodEvictionPolicy": null
-        }))
+        BadValue::Marshaled(
+            r#"{"MinAvailable":"10%","Selector":null,"MaxUnavailable":1,"UnhealthyPodEvictionPolicy":null}"#
+                .to_string()
+        )
+    );
+    // Go's field order, not sorted (#2086).
+    assert_eq!(
+        errs[0].error_body(),
+        r#"Invalid value: {"MinAvailable":"10%","Selector":null,"MaxUnavailable":1,"UnhealthyPodEvictionPolicy":null}: minAvailable and maxUnavailable cannot be both set"#
     );
 }
 
