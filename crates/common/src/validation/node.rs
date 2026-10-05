@@ -22,6 +22,7 @@ use crate::validation::objectmeta::{
 use crate::validation::resourcequota::validate_resource_quantity_value;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
@@ -96,25 +97,115 @@ fn validate_node_taints(taints: &[Taint], fld_path: &Path) -> ErrorList {
 /// decodes it as a taint list (`helper.GetTaintsFromNodeAnnotations`) and
 /// validates each entry.
 ///
-/// The `preferAvoidPods` half is not ported yet (#2070).
+/// The `preferAvoidPods` half is `ValidateAvoidPodsInNodeAnnotations`
+/// (:5096-5118), see [`validate_avoid_pods_in_node_annotations`].
 fn validate_node_specific_annotations(
     annotations: Option<&HashMap<String, String>>,
     fld_path: &Path,
 ) -> ErrorList {
-    let Some(raw) = annotations
+    let mut errs: ErrorList = Vec::new();
+    if let Some(raw) = annotations
         .and_then(|a| a.get(TAINTS_ANNOTATION_KEY))
         .filter(|v| !v.is_empty())
-    else {
-        return Vec::new();
-    };
-    match serde_json::from_str::<Vec<Taint>>(raw) {
-        Ok(taints) => validate_node_taints(&taints, &fld_path.child(TAINTS_ANNOTATION_KEY)),
-        Err(e) => vec![Error::invalid(
-            fld_path,
-            TAINTS_ANNOTATION_KEY.to_string(),
-            e.to_string(),
-        )],
+    {
+        match serde_json::from_str::<Vec<Taint>>(raw) {
+            Ok(taints) => {
+                errs.extend(validate_node_taints(
+                    &taints,
+                    &fld_path.child(TAINTS_ANNOTATION_KEY),
+                ));
+            }
+            Err(e) => errs.push(Error::invalid(
+                fld_path,
+                TAINTS_ANNOTATION_KEY.to_string(),
+                e.to_string(),
+            )),
+        }
     }
+    if let Some(raw) = annotations
+        .and_then(|a| a.get(PREFER_AVOID_PODS_ANNOTATION_KEY))
+        .filter(|v| !v.is_empty())
+    {
+        errs.extend(validate_avoid_pods_in_node_annotations(raw, fld_path));
+    }
+    errs
+}
+
+/// `core.PreferAvoidPodsAnnotationKey` (pkg/apis/core/annotation_key_constants.go).
+pub const PREFER_AVOID_PODS_ANNOTATION_KEY: &str = "scheduler.alpha.kubernetes.io/preferAvoidPods";
+
+/// `v1.AvoidPods` (staging/src/k8s.io/api/core/v1/types.go).
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct AvoidPods {
+    prefer_avoid_pods: Vec<PreferAvoidPodsEntry>,
+}
+
+/// `v1.PreferAvoidPodsEntry`.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct PreferAvoidPodsEntry {
+    pod_signature: Option<PodSignature>,
+}
+
+/// `v1.PodSignature`: the controller the pod belongs to.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct PodSignature {
+    pod_controller: Option<PodController>,
+}
+
+/// The `metav1.OwnerReference` of a `PodSignature`; only `controller` is
+/// validated, and Go decodes the other fields leniently, so they are not
+/// modelled (a missing `uid` etc. must not fail decoding).
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct PodController {
+    controller: Option<bool>,
+}
+
+/// Port of `ValidateAvoidPodsInNodeAnnotations` (validation.go:5096-5118) and
+/// `validatePreferAvoidPodsEntry` (:5121-5135). `raw` is the non-empty
+/// annotation value; decoding mirrors
+/// `GetAvoidPodsFromNodeAnnotations` (component-helpers/scheduling/corev1/helpers.go:52-61).
+///
+/// Deviation: upstream dereferences `PodController.Controller` unchecked and
+/// would panic when it is unset; here an unset value is treated as `false`.
+fn validate_avoid_pods_in_node_annotations(raw: &str, fld_path: &Path) -> ErrorList {
+    let avoids = match serde_json::from_str::<AvoidPods>(raw) {
+        Ok(a) => a,
+        Err(e) => {
+            return vec![Error::invalid(
+                &fld_path.child("AvoidPods"),
+                PREFER_AVOID_PODS_ANNOTATION_KEY.to_string(),
+                e.to_string(),
+            )]
+        }
+    };
+    let mut errs: ErrorList = Vec::new();
+    for (i, entry) in avoids.prefer_avoid_pods.iter().enumerate() {
+        let idx_path = fld_path.child(PREFER_AVOID_PODS_ANNOTATION_KEY).index(i);
+        match entry
+            .pod_signature
+            .as_ref()
+            .and_then(|s| s.pod_controller.as_ref())
+        {
+            None => errs.push(Error::required(&idx_path.child("PodSignature"), "")),
+            Some(controller) => {
+                if controller.controller != Some(true) {
+                    errs.push(Error::invalid(
+                        &idx_path
+                            .child("PodSignature")
+                            .child("PodController")
+                            .child("Controller"),
+                        false,
+                        "must point to a controller",
+                    ));
+                }
+            }
+        }
+    }
+    errs
 }
 
 /// Port of `ValidateNodeResources` (validation.go:7219-7234):
@@ -599,5 +690,67 @@ mod status_update_tests {
             errs.iter().any(|e| e.field.ends_with("kubeletConfigKey")),
             "{errs:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod avoid_pods_tests {
+    use super::*;
+
+    const KEY: &str = "scheduler.alpha.kubernetes.io/preferAvoidPods";
+
+    fn node_with_avoid(raw: &str) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "abc-123", "annotations": {KEY: raw}},
+        }))
+        .expect("node decodes")
+    }
+
+    fn fields(raw: &str) -> Vec<String> {
+        validate_node(&node_with_avoid(raw))
+            .into_iter()
+            .map(|e| e.field)
+            .collect()
+    }
+
+    // validation_test.go:18415-18435 (valid entry).
+    #[test]
+    fn valid_entry_passes() {
+        let raw = r#"{"preferAvoidPods":[{"podSignature":{"podController":{
+            "apiVersion":"v1","kind":"ReplicationController","name":"foo",
+            "uid":"abcdef123456","controller":true}},
+            "reason":"some reason","message":"some message"}]}"#;
+        assert!(fields(raw).is_empty());
+    }
+
+    // validation_test.go:18608-18628 ("missing-podSignature").
+    #[test]
+    fn missing_pod_signature_is_required() {
+        let f = fields(r#"{"preferAvoidPods":[{"reason":"r","message":"m"}]}"#);
+        assert_eq!(
+            f,
+            vec![format!("metadata.annotations.{KEY}[0].PodSignature")]
+        );
+    }
+
+    // validation_test.go:18630-18660 ("invalid-podController").
+    #[test]
+    fn non_controller_pod_controller_is_invalid() {
+        let raw = r#"{"preferAvoidPods":[{"podSignature":{"podController":{
+            "apiVersion":"v1","kind":"ReplicationController","name":"foo",
+            "uid":"abcdef123456","controller":false}}}]}"#;
+        let errs = validate_node(&node_with_avoid(raw));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(
+            errs[0].field,
+            format!("metadata.annotations.{KEY}[0].PodSignature.PodController.Controller")
+        );
+        assert!(errs[0].detail.contains("must point to a controller"));
+    }
+
+    #[test]
+    fn undecodable_annotation_is_invalid_at_avoid_pods() {
+        let f = fields("not json");
+        assert_eq!(f, vec!["metadata.annotations.AvoidPods".to_string()]);
     }
 }
