@@ -28,13 +28,16 @@ async fn send(api: &TestApiServer, method: &str, path: &str, body: Option<Value>
 }
 
 fn local_apiservice(name: &str) -> Value {
+    // `ValidateAPIService` (validation.go:36-47) requires the name to be
+    // `spec.version + "." + spec.group`.
+    let (version, group) = name.split_once('.').expect("version.group name");
     json!({
         "apiVersion": "apiregistration.k8s.io/v1",
         "kind": "APIService",
         "metadata": { "name": name },
         "spec": {
-            "group": "example.com",
-            "version": "v1",
+            "group": group,
+            "version": version,
             "versionPriority": 100,
             "groupPriorityMinimum": 1000,
         }
@@ -117,7 +120,7 @@ async fn get_apiservice_by_name_returns_200_not_500() {
 #[tokio::test]
 async fn update_apiservice_returns_200_not_500() {
     let state = make_test_state().await;
-    send(
+    let (_, created) = send(
         &state,
         "POST",
         "/apis/apiregistration.k8s.io/v1/apiservices",
@@ -126,6 +129,9 @@ async fn update_apiservice_returns_200_not_500() {
     .await;
     let mut updated = local_apiservice("v1.put.example.com");
     updated["spec"]["versionPriority"] = json!(200);
+    // The strategy refuses unconditional updates (strategy.go:98-100), so a
+    // PUT carries the resourceVersion it read.
+    updated["metadata"]["resourceVersion"] = created["metadata"]["resourceVersion"].clone();
     let (status, body) = send(
         &state,
         "PUT",
