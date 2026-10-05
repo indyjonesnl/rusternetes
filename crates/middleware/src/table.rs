@@ -283,6 +283,12 @@ fn normalize_kind(kind: &str) -> &str {
     kind.strip_suffix("List").unwrap_or(kind)
 }
 
+/// `ObjectMeta` swagger doc for `name`.
+const OBJECT_META_NAME_DOC: &str = "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names";
+
+/// `ObjectMeta` swagger doc for `creationTimestamp`.
+const OBJECT_META_CREATION_TIMESTAMP_DOC: &str = "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata";
+
 fn col(
     name: &str,
     column_type: &str,
@@ -413,6 +419,29 @@ pub fn printer_columns(kind: &str) -> Option<Vec<ColumnDefinition>> {
                 0,
             ),
             col("AGE", "string", "", "Age of the namespace", 0),
+        ],
+        // kube-aggregator pkg/registry/apiservice/etcd/etcd.go:85-92
+        // (`REST.ConvertToTable` column definitions). The Name and Age
+        // descriptions are the `ObjectMeta` swagger docs
+        // (`swaggerMetadataDescriptions["name"]` / `["creationTimestamp"]`,
+        // apimachinery meta/v1/types_swagger_doc_generated.go:255,262).
+        "APIService" => vec![
+            col("Name", "string", "name", OBJECT_META_NAME_DOC, 0),
+            col(
+                "Service",
+                "string",
+                "",
+                "The reference to the service that hosts this API endpoint.",
+                0,
+            ),
+            col(
+                "Available",
+                "string",
+                "",
+                "Whether this service is available.",
+                0,
+            ),
+            col("Age", "string", "", OBJECT_META_CREATION_TIMESTAMP_DOC, 0),
         ],
         _ => return None,
     };
@@ -581,6 +610,42 @@ pub fn printer_row_cells(kind: &str, obj: &serde_json::Value) -> Option<Vec<serd
             vec![
                 Value::String(name),
                 Value::String(phase),
+                Value::String(age),
+            ]
+        }
+        // etcd.go:96-117 (the `MetaToTableRow` callback).
+        "APIService" => {
+            let service = match (
+                str_at(obj, &["spec", "service", "namespace"]),
+                str_at(obj, &["spec", "service", "name"]),
+            ) {
+                (None, None) if obj.pointer("/spec/service").is_none_or(|s| s.is_null()) => {
+                    "Local".to_string()
+                }
+                (ns, name) => format!("{}/{}", ns.unwrap_or_default(), name.unwrap_or_default()),
+            };
+            let mut status = "Unknown".to_string();
+            let available = obj
+                .pointer("/status/conditions")
+                .and_then(|c| c.as_array())
+                .and_then(|conds| {
+                    conds
+                        .iter()
+                        .find(|c| c.get("type").and_then(|v| v.as_str()) == Some("Available"))
+                });
+            if let Some(cond) = available {
+                let cond_status = str_at(cond, &["status"]).unwrap_or_default();
+                let reason = str_at(cond, &["reason"]).unwrap_or_default();
+                status = if cond_status != "True" && !reason.is_empty() {
+                    format!("{} ({})", cond_status, reason)
+                } else {
+                    cond_status
+                };
+            }
+            vec![
+                Value::String(name),
+                Value::String(service),
+                Value::String(status),
                 Value::String(age),
             ]
         }
@@ -814,5 +879,87 @@ mod tests {
         assert_eq!(table.rows.len(), 1);
         // Cell count must match column count.
         assert_eq!(table.rows[0].cells.len(), table.column_definitions.len());
+    }
+
+    // Port of kube-aggregator pkg/registry/apiservice/etcd/etcd.go:82-120
+    // (`REST.ConvertToTable`).
+    fn api_service_cells(obj: serde_json::Value) -> Vec<serde_json::Value> {
+        printer_row_cells("APIService", &obj).expect("APIService has a printer")
+    }
+
+    #[test]
+    fn api_service_columns_match_upstream() {
+        let cols = printer_columns("APIServiceList").expect("APIService has a printer");
+        let got: Vec<(&str, &str, &str, i32)> = cols
+            .iter()
+            .map(|c| {
+                (
+                    c.name.as_str(),
+                    c.column_type.as_str(),
+                    c.format.as_str(),
+                    c.priority,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Name", "string", "name", 0),
+                ("Service", "string", "", 0),
+                ("Available", "string", "", 0),
+                ("Age", "string", "", 0),
+            ]
+        );
+        assert_eq!(
+            cols[1].description,
+            "The reference to the service that hosts this API endpoint."
+        );
+        assert_eq!(cols[2].description, "Whether this service is available.");
+    }
+
+    #[test]
+    fn api_service_local_without_condition_is_unknown() {
+        let cells = api_service_cells(json!({
+            "metadata": {"name": "v1.", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {}
+        }));
+        assert_eq!(cells[0], json!("v1."));
+        assert_eq!(cells[1], json!("Local"));
+        assert_eq!(cells[2], json!("Unknown"));
+    }
+
+    #[test]
+    fn api_service_remote_renders_namespace_slash_name() {
+        let cells = api_service_cells(json!({
+            "metadata": {"name": "v1beta1.metrics.k8s.io"},
+            "spec": {"service": {"namespace": "kube-system", "name": "metrics-server"}}
+        }));
+        assert_eq!(cells[1], json!("kube-system/metrics-server"));
+    }
+
+    #[test]
+    fn api_service_available_condition_rendering() {
+        let with = |status: &str, reason: Option<&str>| {
+            let mut c = json!({"type": "Available", "status": status});
+            if let Some(r) = reason {
+                c["reason"] = json!(r);
+            }
+            api_service_cells(json!({
+                "metadata": {"name": "x"},
+                "spec": {},
+                "status": {"conditions": [{"type": "Other", "status": "False", "reason": "No"}, c]}
+            }))[2]
+                .clone()
+        };
+        // etcd.go:105-110: True is bare even with a reason.
+        assert_eq!(with("True", Some("Passed")), json!("True"));
+        // etcd.go:107-108: non-True with a reason is "status (reason)".
+        assert_eq!(
+            with("False", Some("FailedDiscoveryCheck")),
+            json!("False (FailedDiscoveryCheck)")
+        );
+        // etcd.go:109-110: no reason is the bare status.
+        assert_eq!(with("False", None), json!("False"));
+        assert_eq!(with("False", Some("")), json!("False"));
     }
 }

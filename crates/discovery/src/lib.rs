@@ -3916,7 +3916,8 @@ pub async fn get_apiregistration_v1_resources() -> (StatusCode, Json<APIResource
             .map(|s| s.to_string())
             .collect(),
             short_names: None,
-            categories: None,
+            // etcd.go:75-78 `REST.Categories`.
+            categories: Some(vec!["api-extensions".to_string()]),
             storage_version_hash: None,
         },
         APIResource {
@@ -4337,5 +4338,25 @@ mod tests {
             sub_names.contains(&"log"),
             "pods should have log subresource"
         );
+    }
+
+    // kube-aggregator pkg/registry/apiservice/etcd/etcd.go:75-78
+    // (`REST.Categories`).
+    #[tokio::test]
+    async fn apiservices_are_in_the_api_extensions_category() {
+        let (_, Json(list)) = get_apiregistration_v1_resources().await;
+        let r = list
+            .resources
+            .iter()
+            .find(|r| r.name == "apiservices")
+            .expect("apiservices resource");
+        assert_eq!(r.categories, Some(vec!["api-extensions".to_string()]));
+        // The status subresource carries no categories.
+        let st = list
+            .resources
+            .iter()
+            .find(|r| r.name == "apiservices/status")
+            .unwrap();
+        assert_eq!(st.categories, None);
     }
 }
