@@ -5,10 +5,13 @@
 //! `rusternetes_common::validation::apiservice`).
 //!
 //! Not modelled: `GetResetFields` (managed-fields reset sets), `WarningsOn*`
-//! (both return nil upstream), `REST.Categories` and `ConvertToTable` (the
-//! table printer of `kubectl get apiservices`), and `MatchAPIService` /
+//! (both return nil upstream), and `MatchAPIService` /
 //! `ToSelectableFields`, which are the generic `metadata.name` field selector
 //! the list handler already serves.
+//!
+//! `REST.Categories` (etcd.go:75-78) is served by `rusternetes_discovery`
+//! (`api-extensions`) and `REST.ConvertToTable` (etcd.go:82-120) by
+//! `rusternetes_middleware::table::printer_columns` / `printer_row_cells`.
 
 use std::sync::Arc;
 
