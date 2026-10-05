@@ -31,6 +31,7 @@ pub mod core;
 pub mod discovery;
 pub mod flowcontrol;
 pub mod generic;
+pub mod metadata;
 pub mod names;
 pub mod networking;
 pub mod node;

@@ -1,7 +1,8 @@
 //! Additional edge case tests for finalizers handler
 
 use chrono::Utc;
-use rusternetes_api_server::handlers::finalizers::{handle_delete_with_finalizers, HasMetadata};
+use rusternetes_api_server::handlers::finalizers::handle_delete_with_finalizers;
+use rusternetes_api_server::registry::rest::HasMetadata;
 use rusternetes_common::resources::{Pod, PodSpec};
 
 use rusternetes_storage::{memory::MemoryStorage, Storage};
