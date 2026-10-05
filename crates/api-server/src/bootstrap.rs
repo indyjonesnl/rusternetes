@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
-use rusternetes_common::resources::rbac::{
-    ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
-};
+use rusternetes_common::resources::rbac::ClusterRole;
 use rusternetes_common::resources::{EndpointSlice, Endpoints};
 use rusternetes_storage::Storage;
 use rusternetes_storage::StorageBackend;
@@ -9,95 +7,183 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
+#[cfg(test)]
 const CLUSTER_ADMIN_ROLE_KEY: &str = "/registry/clusterroles/cluster-admin";
+#[cfg(test)]
 const CLUSTER_ADMIN_BINDING_KEY: &str = "/registry/clusterrolebindings/cluster-admin";
 
-/// Seed the `cluster-admin` ClusterRole and a ClusterRoleBinding granting it to
-/// the `system:masters` group, mirroring upstream bootstrap policy
-/// (`plugin/pkg/auth/authorizer/rbac/bootstrappolicy`: the `cluster-admin`
-/// ClusterRole bound to `SystemPrivilegedGroup`). Without this, a freshly
-/// bootstrapped (empty) store denies the cluster admin — kubeadm's
-/// `CN=kubernetes-admin, O=system:masters` client cert — every request, so
-/// nothing (not even the admin re-seeding RBAC) can bring the cluster up
-/// (#1659). The superuser effect thus comes from a real RBAC rule, so the
-/// privilege-escalation check stays rule-based (it is NOT an authorizer
-/// short-circuit). Idempotent: only creates what is missing.
+/// Upstream's bootstrap policy, vendored verbatim from
+/// `plugin/pkg/auth/authorizer/rbac/bootstrappolicy/testdata/` (release-1.35).
+/// Those files are the serialised output of `ClusterRoles()`,
+/// `ClusterRoleBindings()`, `ControllerRoles()`, `ControllerRoleBindings()`,
+/// `NamespaceRoles()` and `NamespaceRoleBindings()` in `policy.go` /
+/// `controller_policy.go` / `namespace_policy.go`, so every role carries the
+/// `kubernetes.io/bootstrapping=rbac-defaults` label and the
+/// `rbac.authorization.kubernetes.io/autoupdate=true` annotation exactly as
+/// `addClusterRoleLabel` (policy.go:48-60) stamps them. (The
+/// `cluster-roles-featuregates.yaml` variant is not vendored: it only adds
+/// alpha-gated roles.)
+const BOOTSTRAP_POLICY: &[&str] = &[
+    include_str!("bootstrap_policy/cluster-roles.yaml"),
+    include_str!("bootstrap_policy/controller-roles.yaml"),
+    include_str!("bootstrap_policy/namespace-roles.yaml"),
+    include_str!("bootstrap_policy/cluster-role-bindings.yaml"),
+    include_str!("bootstrap_policy/controller-role-bindings.yaml"),
+    include_str!("bootstrap_policy/namespace-role-bindings.yaml"),
+];
+
+const AUTOUPDATE_ANNOTATION: &str = "rbac.authorization.kubernetes.io/autoupdate";
+
+/// Decode one vendored `v1.List` into its items. Mirrors nothing upstream (Go
+/// builds the objects in code); this is only the Rust-side loader for the
+/// vendored testdata. A role's `rules: null` becomes `[]` so it decodes as a
+/// typed `ClusterRole`.
+fn load_policy_items(yaml: &str) -> Result<Vec<serde_json::Value>> {
+    let list: serde_json::Value =
+        serde_yaml::from_str(yaml).context("bootstrap policy YAML must parse")?;
+    let mut items = list["items"].as_array().cloned().unwrap_or_default();
+    for item in &mut items {
+        if item["kind"].as_str().is_some_and(|k| k.ends_with("Role")) && item["rules"].is_null() {
+            item["rules"] = serde_json::json!([]);
+        }
+    }
+    Ok(items)
+}
+
+fn policy_key(item: &serde_json::Value) -> Option<(String, String)> {
+    let plural = match item["kind"].as_str()? {
+        "ClusterRole" => "clusterroles",
+        "ClusterRoleBinding" => "clusterrolebindings",
+        "Role" => "roles",
+        "RoleBinding" => "rolebindings",
+        _ => return None,
+    };
+    let name = item["metadata"]["name"].as_str()?;
+    let ns = item["metadata"]["namespace"].as_str();
+    Some((
+        rusternetes_storage::build_key(plural, ns, name),
+        item["kind"].as_str()?.to_string(),
+    ))
+}
+
+/// Seed the full upstream RBAC bootstrap policy (#1659, #1753), mirroring
+/// `EnsureRBACPolicy` (`pkg/registry/rbac/rest/storage_rbac.go:269-331`, run
+/// from the `rbac/bootstrap-roles` post-start hook): every bootstrap
+/// ClusterRole/ClusterRoleBinding/Role/RoleBinding is created if missing, and
+/// an existing one is reconciled unless it opted out with
+/// `rbac.authorization.kubernetes.io/autoupdate: "false"`
+/// (`component-helpers/auth/rbac/reconciliation/reconcile_role.go`,
+/// `reconcile_rolebindings.go`: add missing rules / subjects, never remove).
+/// Namespaced objects get their namespace created first (`tryEnsureNamespace`,
+/// `namespace.go:31-45`).
+///
+/// This includes `cluster-admin` bound to `system:masters`: without it a
+/// freshly bootstrapped (empty) store denies the cluster admin — kubeadm's
+/// `CN=kubernetes-admin, O=system:masters` client cert — every request (#1659).
+/// The superuser effect comes from a real RBAC rule, so the
+/// privilege-escalation check stays rule-based (NOT an authorizer
+/// short-circuit). Idempotent.
+///
+/// Deviations: upstream's `Covers`-based rule reconciliation is approximated by
+/// "append rules not already present verbatim", and `ClusterRole`s with an
+/// `aggregationRule` are materialised once at seed time (no
+/// clusterroleaggregation controller exists here; see
+/// `registry/rbac/aggregation.rs`).
 pub async fn bootstrap_default_rbac(storage: Arc<StorageBackend>) -> Result<()> {
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
+    let mut namespaces = std::collections::BTreeSet::new();
+    let mut aggregated: Vec<String> = Vec::new();
 
-    if storage
-        .get::<ClusterRole>(CLUSTER_ADMIN_ROLE_KEY)
-        .await
-        .is_err()
-    {
-        let mut metadata = ObjectMeta::new("cluster-admin");
-        metadata.ensure_uid();
-        metadata.ensure_creation_timestamp();
-        let role = ClusterRole {
-            type_meta: TypeMeta {
-                kind: "ClusterRole".to_string(),
-                api_version: "rbac.authorization.k8s.io/v1".to_string(),
-            },
-            metadata,
-            rules: vec![
-                PolicyRule {
-                    verbs: vec!["*".to_string()],
-                    api_groups: Some(vec!["*".to_string()]),
-                    resources: Some(vec!["*".to_string()]),
-                    resource_names: None,
-                    non_resource_urls: None,
-                },
-                PolicyRule {
-                    verbs: vec!["*".to_string()],
-                    api_groups: None,
-                    resources: None,
-                    resource_names: None,
-                    non_resource_urls: Some(vec!["*".to_string()]),
-                },
-            ],
-            aggregation_rule: None,
-        };
-        storage
-            .create(CLUSTER_ADMIN_ROLE_KEY, &role)
-            .await
-            .context("Failed to create cluster-admin ClusterRole")?;
-        info!("Bootstrapped cluster-admin ClusterRole");
+    for yaml in BOOTSTRAP_POLICY {
+        for mut item in load_policy_items(yaml)? {
+            let Some((key, kind)) = policy_key(&item) else {
+                continue;
+            };
+            if let Some(ns) = item["metadata"]["namespace"].as_str() {
+                if namespaces.insert(ns.to_string()) {
+                    create_namespace_if_needed(storage.as_ref(), ns).await?;
+                }
+            }
+            match storage.get::<serde_json::Value>(&key).await {
+                Ok(existing) => {
+                    if let Some(updated) = reconcile_policy_object(&existing, &item) {
+                        storage
+                            .update(&key, &updated)
+                            .await
+                            .with_context(|| format!("reconcile {key}"))?;
+                        info!("Reconciled bootstrap RBAC object {key}");
+                    }
+                }
+                Err(_) => {
+                    item["metadata"]["uid"] = uuid::Uuid::new_v4().to_string().into();
+                    item["metadata"]["creationTimestamp"] = chrono::Utc::now()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        .into();
+                    match storage.create(&key, &item).await {
+                        Ok(_) | Err(rusternetes_common::Error::AlreadyExists(_)) => {}
+                        Err(e) => {
+                            return Err(anyhow::Error::from(e))
+                                .with_context(|| format!("create {key}"))
+                        }
+                    }
+                    if kind == "ClusterRole" && !item["aggregationRule"].is_null() {
+                        aggregated.push(key);
+                    }
+                }
+            }
+        }
     }
 
-    if storage
-        .get::<ClusterRoleBinding>(CLUSTER_ADMIN_BINDING_KEY)
-        .await
-        .is_err()
-    {
-        let mut metadata = ObjectMeta::new("cluster-admin");
-        metadata.ensure_uid();
-        metadata.ensure_creation_timestamp();
-        let binding = ClusterRoleBinding {
-            type_meta: TypeMeta {
-                kind: "ClusterRoleBinding".to_string(),
-                api_version: "rbac.authorization.k8s.io/v1".to_string(),
-            },
-            metadata,
-            subjects: vec![Subject {
-                kind: "Group".to_string(),
-                name: "system:masters".to_string(),
-                namespace: None,
-                api_group: Some("rbac.authorization.k8s.io".to_string()),
-            }],
-            role_ref: RoleRef {
-                api_group: "rbac.authorization.k8s.io".to_string(),
-                kind: "ClusterRole".to_string(),
-                name: "cluster-admin".to_string(),
-            },
-        };
-        storage
-            .create(CLUSTER_ADMIN_BINDING_KEY, &binding)
-            .await
-            .context("Failed to create cluster-admin ClusterRoleBinding")?;
-        info!("Bootstrapped cluster-admin ClusterRoleBinding -> system:masters");
+    // Aggregating roles (admin/edit/view) are filled from the leaf roles, which
+    // now all exist.
+    for key in aggregated {
+        let mut role: ClusterRole = storage.get(&key).await?;
+        crate::registry::rbac::aggregation::materialise_aggregated_rules(
+            storage.as_ref(),
+            &mut role,
+        )
+        .await;
+        storage.update(&key, &role).await?;
     }
-
     Ok(())
+}
+
+/// `ReconcileRole` / `ReconcileRoleBinding`: for an object that has not opted
+/// out of autoupdate, return the object with any missing rules (roles) or
+/// subjects (bindings) added, or `None` when nothing needs to change.
+fn reconcile_policy_object(
+    existing: &serde_json::Value,
+    desired: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if existing["metadata"]["annotations"][AUTOUPDATE_ANNOTATION].as_str() == Some("false") {
+        return None;
+    }
+    let mut updated = existing.clone();
+    let mut changed = false;
+    // Rules of an aggregating role belong to the aggregation, not the policy.
+    let field = if desired["kind"]
+        .as_str()
+        .is_some_and(|k| k.ends_with("Binding"))
+    {
+        "subjects"
+    } else if desired["aggregationRule"].is_null() {
+        "rules"
+    } else {
+        return None;
+    };
+    let have = updated[field].as_array().cloned().unwrap_or_default();
+    let mut merged = have.clone();
+    for want in desired[field].as_array().cloned().unwrap_or_default() {
+        if !have.contains(&want) {
+            merged.push(want);
+            changed = true;
+        }
+    }
+    if changed {
+        updated[field] = serde_json::Value::Array(merged);
+        Some(updated)
+    } else {
+        None
+    }
 }
 
 /// How often the `kubernetes` Service endpoint is re-asserted to the live
@@ -1162,7 +1248,7 @@ pub fn spawn_cluster_authentication_trust_controller(
 /// storage_rbac.go:269-331) creates each, creating the namespace first
 /// (`tryEnsureNamespace`, component-helpers/auth/rbac/reconciliation/
 /// namespace.go:31-45). Only the create half is ported, and only these two
-/// objects; the rest of the bootstrap policy is #1753.
+/// objects. The rest of the bootstrap policy is `bootstrap_default_rbac`.
 pub async fn bootstrap_extension_apiserver_authentication_rbac(
     storage: Arc<StorageBackend>,
 ) -> Result<()> {
@@ -1234,6 +1320,7 @@ pub async fn bootstrap_extension_apiserver_authentication_rbac(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusternetes_common::resources::rbac::ClusterRoleBinding;
     use rusternetes_storage::memory::MemoryStorage;
 
     #[tokio::test]
@@ -1291,6 +1378,102 @@ mod tests {
                 .iter()
                 .any(|s| s.kind == "Group" && s.name == "system:masters"),
             "binding must target the system:masters group"
+        );
+    }
+
+    /// #1753: the whole upstream bootstrap policy is seeded, not only
+    /// cluster-admin. Names are those of upstream's
+    /// `bootstrappolicy/testdata/{cluster-roles,cluster-role-bindings,
+    /// namespace-roles}.yaml` (release-1.35).
+    #[tokio::test]
+    async fn seeds_upstream_bootstrap_policy() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        bootstrap_default_rbac(storage.clone()).await.unwrap();
+        bootstrap_default_rbac(storage.clone()).await.unwrap();
+
+        let role: ClusterRole = storage
+            .get("/registry/clusterroles/system:service-account-issuer-discovery")
+            .await
+            .expect("issuer-discovery ClusterRole (policy.go:555-566)");
+        assert_eq!(role.rules.len(), 1);
+        let urls = role.rules[0].non_resource_urls.clone().unwrap();
+        assert_eq!(
+            urls,
+            [
+                "/.well-known/openid-configuration",
+                "/.well-known/openid-configuration/",
+                "/openid/v1/jwks",
+                "/openid/v1/jwks/"
+            ]
+        );
+        assert_eq!(role.rules[0].verbs, ["get"]);
+        let labels = role.metadata.labels.clone().unwrap();
+        assert_eq!(
+            labels
+                .get("kubernetes.io/bootstrapping")
+                .map(String::as_str),
+            Some("rbac-defaults")
+        );
+        assert_eq!(
+            role.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("rbac.authorization.kubernetes.io/autoupdate"))
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let binding: ClusterRoleBinding = storage
+            .get("/registry/clusterrolebindings/system:service-account-issuer-discovery")
+            .await
+            .expect("issuer-discovery binding (policy.go:709)");
+        assert_eq!(binding.subjects[0].name, "system:serviceaccounts");
+
+        for name in [
+            "admin",
+            "edit",
+            "view",
+            "system:discovery",
+            "system:basic-user",
+            "system:public-info-viewer",
+            "system:node",
+            "system:node-proxier",
+            "system:kube-scheduler",
+            "system:kube-controller-manager",
+            "system:controller:replicaset-controller",
+            "system:controller:generic-garbage-collector",
+        ] {
+            storage
+                .get::<ClusterRole>(&format!("/registry/clusterroles/{name}"))
+                .await
+                .unwrap_or_else(|e| panic!("ClusterRole {name} missing: {e}"));
+        }
+        for name in [
+            "system:discovery",
+            "system:basic-user",
+            "system:public-info-viewer",
+            "system:node-proxier",
+            "system:kube-scheduler",
+            "system:kube-controller-manager",
+            "system:controller:replicaset-controller",
+        ] {
+            storage
+                .get::<ClusterRoleBinding>(&format!("/registry/clusterrolebindings/{name}"))
+                .await
+                .unwrap_or_else(|e| panic!("ClusterRoleBinding {name} missing: {e}"));
+        }
+        // namespace-roles.yaml
+        storage
+            .get::<serde_json::Value>(
+                "/registry/roles/kube-system/system::leader-locking-kube-scheduler",
+            )
+            .await
+            .expect("kube-system leader-locking Role");
+        // admin aggregates the aggregate-to-admin roles, so it must not be empty.
+        let admin: ClusterRole = storage.get("/registry/clusterroles/admin").await.unwrap();
+        assert!(
+            !admin.rules.is_empty(),
+            "aggregated admin rules materialised"
         );
     }
 

@@ -41,7 +41,7 @@
 //! |---|---|
 //! | service_accounts.go:193 automount opt-out | full — all nine table cases |
 //! | service_accounts.go:307 projected token | admission half; kubelet materialisation is live-only |
-//! | service_accounts.go:561 OIDC discovery | document contract full; in-cluster validator is live-only; the bootstrap ClusterRole precondition is #1753 |
+//! | service_accounts.go:561 OIDC discovery | document contract full; in-cluster validator is live-only; the bootstrap ClusterRole precondition is asserted by `bootstrap::tests::seeds_upstream_bootstrap_policy` |
 //! | service_accounts.go:775 kube-root-ca | requirement 1 here; 2 and 3 in controller-manager's `namespace_controller_test.rs` |
 //! | certificates.go:202 CSR API operations | full, minus resourceVersion (#1751) |
 //!
@@ -171,13 +171,9 @@ async fn seed_service_account(mem: &Arc<MemoryStorage>, namespace: &str, name: &
 /// Not mirrored, and why: running the validator in-cluster needs a live
 /// kubelet and a pod that reaches the endpoints over the network.
 ///
-/// Also not mirrored: upstream's precondition that
-/// `system:service-account-issuer-discovery` "should have already been
-/// automatically created as part of the RBAC bootstrap policy"
-/// (service_accounts.go:563-565). `crates/api-server/src/bootstrap.rs` seeds
-/// only `cluster-admin` and its binding, so that ClusterRole and its binding
-/// to `system:serviceaccounts` (upstream policy.go:555-566 and :709) do not
-/// exist here. Porting them is #1753, not this test-only change.
+/// The precondition that `system:service-account-issuer-discovery` already
+/// exists (service_accounts.go:563-565) is asserted against the real seeded
+/// policy by `bootstrap::tests::seeds_upstream_bootstrap_policy` (#1753).
 #[tokio::test]
 async fn oidc_discovery_document_is_valid() {
     let (state, _) = spawn_state();
