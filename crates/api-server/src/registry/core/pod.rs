@@ -21,12 +21,12 @@ use rusternetes_common::podutil::update_pod_condition;
 use rusternetes_common::resources::pod::PodSpec;
 use rusternetes_common::resources::{Binding, Container, Pod, PodCondition, PodStatus};
 use rusternetes_common::types::Phase;
-use rusternetes_common::Status;
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use rusternetes_common::validation::metav1::{get_warnings_for_ip, is_dns1123_label};
 use rusternetes_common::validation::objectmeta::{
     name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
 };
+use rusternetes_common::Status;
 use rusternetes_storage::StorageBackend;
 
 use crate::registry::generic::Store;
@@ -991,9 +991,8 @@ pub trait PdbClient: Send + Sync {
     ) -> rusternetes_common::Result<rusternetes_common::resources::PodDisruptionBudget>;
 }
 
-/// The PDB client over the PodDisruptionBudget stores: what a loopback
-/// client's requests reach (`registry/policy/poddisruptionbudget.rs`, the
-/// main store for reads and the `/status` store for the write).
+/// The PDB client over the PodDisruptionBudget store (reads) and
+/// `Storage::update_status_cas` (the status write).
 pub struct StorePdbClient {
     storage: Arc<StorageBackend>,
 }
@@ -1041,20 +1040,12 @@ impl PdbClient for StorePdbClient {
         namespace: &str,
         pdb: &rusternetes_common::resources::PodDisruptionBudget,
     ) -> rusternetes_common::Result<rusternetes_common::resources::PodDisruptionBudget> {
-        let info =
-            crate::registry::rest::DefaultUpdatedObjectInfo::new(Some(pdb.clone()), Vec::new());
-        crate::registry::policy::poddisruptionbudget::new_status_store(self.storage.clone())
-            .update(
-                &Self::ctx(namespace),
-                &pdb.metadata.name,
-                &info,
-                None,
-                None,
-                false,
-                &crate::registry::generic::UpdateOptions::default(),
-            )
-            .await
-            .map(|(pdb, _created)| pdb)
+        // The loopback `UpdateStatus` is a resourceVersion-guarded write of
+        // the status: `Storage::update_status_cas` conflicts when the PDB
+        // changed since it was read, which `RetryOnConflict` re-reads on.
+        use rusternetes_storage::{build_key, Storage};
+        let key = build_key("poddisruptionbudgets", Some(namespace), &pdb.metadata.name);
+        self.storage.update_status_cas(&key, pdb).await
     }
 }
 
@@ -1181,7 +1172,9 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
         ctx: &RequestContext,
         name: &str,
         mut eviction: rusternetes_common::resources::Eviction,
-        create_validation: Option<&dyn crate::registry::rest::ValidateObject<rusternetes_common::resources::Eviction>>,
+        create_validation: Option<
+            &dyn crate::registry::rest::ValidateObject<rusternetes_common::resources::Eviction>,
+        >,
         options: &rusternetes_common::validation::metav1::CreateOptions,
     ) -> rusternetes_common::Result<Status> {
         use rusternetes_common::Error;
@@ -1213,17 +1206,21 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
 
         // by default, retry conflict errors; "if the original options included
         // a resourceVersion precondition, don't retry"
-        let should_retry: fn(&Error) -> bool = if resource_version_is_unset(&original_delete_options)
-        {
-            is_conflict
-        } else {
-            |_| false
-        };
+        let should_retry: fn(&Error) -> bool =
+            if resource_version_is_unset(&original_delete_options) {
+                is_conflict
+            } else {
+                |_| false
+            };
 
         let mut backoff = self.retry.clone();
         let attempt = loop {
             match self
-                .delete_if_pdb_can_be_ignored(ctx, &eviction.metadata.name, &original_delete_options)
+                .delete_if_pdb_can_be_ignored(
+                    ctx,
+                    &eviction.metadata.name,
+                    &original_delete_options,
+                )
                 .await
             {
                 Ok(attempt) => break Ok(attempt),
@@ -1335,7 +1332,9 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
             .add_condition_and_delete_pod(ctx, &eviction.metadata.name, &delete_options)
             .await
         {
-            if is_conflict(&err) && update_deletion_options && resource_version_is_unset(&original_delete_options)
+            if is_conflict(&err)
+                && update_deletion_options
+                && resource_version_is_unset(&original_delete_options)
             {
                 // If we encounter a resource conflict error, we updated the
                 // deletion options to include them, and the original deletion
@@ -1376,7 +1375,8 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
         // We should check if resourceVersion is already set by the requestor
         // as it might be older than the pod we just fetched and should be
         // honored.
-        if should_enforce_resource_version(&pod) && resource_version_is_unset(original_delete_options)
+        if should_enforce_resource_version(&pod)
+            && resource_version_is_unset(original_delete_options)
         {
             // Set deleteOptions.Preconditions.ResourceVersion to ensure we're
             // not racing with another PDB-impacting process elsewhere.
@@ -1486,7 +1486,10 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
             return Err(create_too_many_requests_error(&pdb_name));
         }
         if status.disruptions_allowed < 0 {
-            return Err(pdb_forbidden(&pdb_name, "pdb disruptions allowed is negative"));
+            return Err(pdb_forbidden(
+                &pdb_name,
+                "pdb disruptions allowed is negative",
+            ));
         }
         if status.disrupted_pods.as_ref().map_or(0, |d| d.len()) > MAX_DISRUPTED_POD_SIZE {
             return Err(pdb_forbidden(

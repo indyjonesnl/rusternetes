@@ -463,10 +463,11 @@ pub async fn create_eviction(
 
     // `EvictionREST.AcceptsGroupVersion` (eviction.go:87-95): both policy/v1
     // and policy/v1beta1 bodies are acceptable.
-    let value: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|_| decode_request_body::<Eviction>(&body).err().unwrap_or_else(|| {
-            Error::BadRequest("the request body is not valid JSON".to_string())
-        }))?;
+    let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
+        decode_request_body::<Eviction>(&body)
+            .err()
+            .unwrap_or_else(|| Error::BadRequest("the request body is not valid JSON".to_string()))
+    })?;
     if let Some(api_version) = value
         .get("apiVersion")
         .and_then(|v| v.as_str())

@@ -231,7 +231,12 @@ impl EvictionPodStore for SharedMock {
         Ok(self.0.pod.lock().unwrap().clone())
     }
 
-    async fn delete(&self, _: &RequestContext, _: &str, options: DeleteOptions) -> Result<(), Error> {
+    async fn delete(
+        &self,
+        _: &RequestContext,
+        _: &str,
+        options: DeleteOptions,
+    ) -> Result<(), Error> {
         let count = {
             let mut c = self.0.delete_count.lock().unwrap();
             *c += 1;
@@ -321,7 +326,8 @@ struct EvictionCase {
     policies: Option<Vec<Option<&'static str>>>,
 }
 
-const BUDGET_MSG: &str = "Cannot evict pod as it would violate the pod's disruption budget.: TooManyRequests: ";
+const BUDGET_MSG: &str =
+    "Cannot evict pod as it would violate the pod's disruption budget.: TooManyRequests: ";
 
 fn eviction_cases() -> Vec<EvictionCase> {
     let disruptions = |n: i64| json!({"disruptionsAllowed": n});
@@ -342,9 +348,8 @@ fn eviction_cases() -> Vec<EvictionCase> {
         format!("{BUDGET_MSG}The disruption budget foo is still being processed by the server.")
             .into_boxed_str(),
     );
-    let needs = |s: &str| -> &'static str {
-        Box::leak(format!("{BUDGET_MSG}{s}").into_boxed_str())
-    };
+    let needs =
+        |s: &str| -> &'static str { Box::leak(format!("{BUDGET_MSG}{s}").into_boxed_str()) };
     vec![
         EvictionCase {
             pod_phase: Some("Pending"),
@@ -622,7 +627,11 @@ impl StoreFixture {
         }
     }
 
-    async fn set_status(&self, name: &str, f: impl FnOnce(&mut rusternetes_common::resources::PodStatus)) {
+    async fn set_status(
+        &self,
+        name: &str,
+        f: impl FnOnce(&mut rusternetes_common::resources::PodStatus),
+    ) {
         let key = build_key("pods", Some("default"), name);
         let mut pod: Pod = self.mem().get(&key).await.unwrap();
         f(pod.status.get_or_insert_with(Default::default));
@@ -635,7 +644,13 @@ impl StoreFixture {
             .await
     }
 
-    fn rest(&self, client: FakePdbClient) -> EvictionRest<rusternetes_api_server::registry::generic::Store<Pod, StorageBackend>, FakePdbClient> {
+    fn rest(
+        &self,
+        client: FakePdbClient,
+    ) -> EvictionRest<
+        rusternetes_api_server::registry::generic::Store<Pod, StorageBackend>,
+        FakePdbClient,
+    > {
         {
             let mut rest = EvictionRest::new(new_status_store(self.backend.clone()), client);
             rest.retry = no_pause();
@@ -681,22 +696,34 @@ async fn test_eviction_with_etcd() {
             // AlwaysAllow would terminate the pod since Running pods are not
             // guarded by this policy
             policies: Some(vec![None, Some("IfHealthyBudget")]),
-            ..c("matching pdbs with no disruptions allowed, pod running", "t1")
+            ..c(
+                "matching pdbs with no disruptions allowed, pod running",
+                "t1",
+            )
         },
         EtcdCase {
             pod_phase: Some("Pending"),
             expect_deleted: true,
-            ..c("matching pdbs with no disruptions allowed, pod pending", "t2")
+            ..c(
+                "matching pdbs with no disruptions allowed, pod pending",
+                "t2",
+            )
         },
         EtcdCase {
             pod_phase: Some("Succeeded"),
             expect_deleted: true,
-            ..c("matching pdbs with no disruptions allowed, pod succeeded", "t3")
+            ..c(
+                "matching pdbs with no disruptions allowed, pod succeeded",
+                "t3",
+            )
         },
         EtcdCase {
             pod_phase: Some("Failed"),
             expect_deleted: true,
-            ..c("matching pdbs with no disruptions allowed, pod failed", "t4")
+            ..c(
+                "matching pdbs with no disruptions allowed, pod failed",
+                "t4",
+            )
         },
         EtcdCase {
             pdb_status: allowed(1),
@@ -712,14 +739,20 @@ async fn test_eviction_with_etcd() {
             pdb_status: allowed(1),
             bad_name_in_url: true,
             expect_error: "name in URL does not match name in Eviction object: BadRequest",
-            ..c("matching pdbs with disruptions allowed but bad name in Url", "t7")
+            ..c(
+                "matching pdbs with disruptions allowed but bad name in Url",
+                "t7",
+            )
         },
         EtcdCase {
             pdb_selector: json!({}),
             expect_error: violation,
             pod_phase: Some("Running"),
             policies: Some(vec![None, Some("IfHealthyBudget")]),
-            ..c("matching pdbs with no disruptions allowed, pod running, empty selector", "t8")
+            ..c(
+                "matching pdbs with no disruptions allowed, pod running, empty selector",
+                "t8",
+            )
         },
     ];
 
@@ -766,7 +799,8 @@ async fn test_eviction_with_etcd() {
                 );
             } else {
                 // graceful deletion
-                let existing = existing.unwrap_or_else(|e| panic!("expected graceful deletion, got {e}: {label}"));
+                let existing = existing
+                    .unwrap_or_else(|e| panic!("expected graceful deletion, got {e}: {label}"));
                 assert!(existing.metadata.deletion_timestamp.is_some(), "{label}");
             }
         }
@@ -792,7 +826,8 @@ async fn test_eviction_with_delete_options() {
     }
     let all = || Some(vec!["All".to_string()]);
     let zero = rusternetes_api_server::registry::rest::zero_delete_options;
-    let cases = vec![
+    let cases =
+        vec![
         Case {
             name: "dry run - just request-options",
             eviction_options: zero(),
@@ -866,7 +901,8 @@ async fn test_eviction_with_delete_options() {
                         case.name
                     );
                     assert_eq!(
-                        errs[0].detail, "can not be set for pod eviction, try after removing the option",
+                        errs[0].detail,
+                        "can not be set for pod eviction, try after removing the option",
                         "{}",
                         case.name
                     );
@@ -891,7 +927,12 @@ async fn test_eviction_with_delete_options() {
             );
             for budget in &case.pdbs {
                 let after = client.get_by_name(&budget.metadata.name);
-                assert_eq!(after.status.unwrap().disruptions_allowed, 1, "{}", case.name);
+                assert_eq!(
+                    after.status.unwrap().disruptions_allowed,
+                    1,
+                    "{}",
+                    case.name
+                );
             }
         }
     }
@@ -940,7 +981,12 @@ async fn non_matching_dry_run_options_are_refused() {
 #[tokio::test]
 async fn test_eviction_pdb_status() {
     for (name, allowed, expected_allowed, expected_reason) in [
-        ("pdb status is updated after eviction", 1, 0, "InsufficientPods"),
+        (
+            "pdb status is updated after eviction",
+            1,
+            0,
+            "InsufficientPods",
+        ),
         (
             "condition reason is only updated if AllowedDisruptions becomes 0",
             3,
@@ -1074,7 +1120,9 @@ async fn test_add_condition_and_delete() {
         } else {
             make_options(&valid_pod("foo", None, false, None))
         };
-        let result = rest.add_condition_and_delete_pod(&ctx(), "foo", &options).await;
+        let result = rest
+            .add_condition_and_delete_pod(&ctx(), "foo", &options)
+            .await;
         match (result, expect_err) {
             (Ok(()), "") => {}
             (Ok(()), want) => panic!("{name}: expected err containing {want:?}, got none"),
@@ -1127,7 +1175,10 @@ async fn seed_pdb(api: &TestApiServer, name: &str, spec: Value, status: Value) {
     }))
     .unwrap();
     api.storage
-        .create(&build_key("poddisruptionbudgets", Some("default"), name), &pdb)
+        .create(
+            &build_key("poddisruptionbudgets", Some("default"), name),
+            &pdb,
+        )
         .await
         .unwrap();
 }
@@ -1139,7 +1190,11 @@ async fn stored_pdb(api: &TestApiServer, name: &str) -> PodDisruptionBudget {
         .unwrap()
 }
 
-async fn evict(api: &TestApiServer, name: &str, uri_suffix: &str) -> (u16, Value, axum::http::HeaderMap) {
+async fn evict(
+    api: &TestApiServer,
+    name: &str,
+    uri_suffix: &str,
+) -> (u16, Value, axum::http::HeaderMap) {
     let body = serde_json::to_vec(&eviction_body(name)).unwrap();
     let (status, headers, _, value) = api
         .send_with_headers(
@@ -1198,7 +1253,11 @@ async fn a_budget_not_yet_observed_is_a_429_with_retry_after() {
         json!({"reason": "DisruptionBudget",
                "message": "The disruption budget b is still being processed by the server."})
     );
-    assert!(api.storage.get::<Pod>(&build_key("pods", Some("default"), "p")).await.is_ok());
+    assert!(api
+        .storage
+        .get::<Pod>(&build_key("pods", Some("default"), "p"))
+        .await
+        .is_ok());
 }
 
 /// A budget with no disruptions left is a 429 without `Retry-After`
@@ -1312,7 +1371,11 @@ async fn a_pod_under_two_budgets_is_a_500_status() {
         body["message"],
         "This pod has more than one PodDisruptionBudget, which the eviction subresource does not support."
     );
-    assert!(api.storage.get::<Pod>(&build_key("pods", Some("default"), "p")).await.is_ok());
+    assert!(api
+        .storage
+        .get::<Pod>(&build_key("pods", Some("default"), "p"))
+        .await
+        .is_ok());
 }
 
 /// #1802: `unhealthyPodEvictionPolicy` was ignored by eviction. An unready
@@ -1337,7 +1400,10 @@ async fn always_allow_evicts_an_unready_pod_without_the_budget() {
     .await;
     let (code, body, _) = evict(&api, "p", "").await;
     assert_eq!(code, 201, "{body}");
-    assert!(api.storage.get::<Pod>(&key).await.is_err(), "the pod is gone");
+    assert!(
+        api.storage.get::<Pod>(&key).await.is_err(),
+        "the pod is gone"
+    );
     let status = stored_pdb(&api, "b").await.status.unwrap();
     assert_eq!(status.disruptions_allowed, 0);
     assert!(status.disrupted_pods.is_none());
