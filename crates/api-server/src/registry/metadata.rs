@@ -7,7 +7,7 @@
 //! this single trait, re-exported as `registry::rest::HasMetadata`.
 
 /// Trait for resources that have metadata with finalizers.
-/// This allows the handle_delete_with_finalizers function to work with any
+/// This allows the generic registry and watch helpers to work with any
 /// Kubernetes resource type.
 pub trait HasMetadata {
     /// Get an immutable reference to the resource's metadata

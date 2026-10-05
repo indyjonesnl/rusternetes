@@ -151,7 +151,7 @@ fn service_stub(ns: &str, name: &str) -> Value {
 fn replicaset_stub(ns: &str, name: &str) -> Value {
     // ReplicaSet ships with no finalizers; the api-server adds
     // `foregroundDeletion` on DELETE when Foreground propagation is requested
-    // (see `handle_delete_with_finalizers_and_propagation`).
+    // (`Store.Delete`, `deletionFinalizersForGarbageCollection`).
     json!({
         "apiVersion": "apps/v1",
         "kind": "ReplicaSet",

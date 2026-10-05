@@ -27,7 +27,6 @@ pub mod endpointslice;
 pub mod event;
 #[allow(dead_code)]
 pub mod filtering;
-pub mod finalizers;
 pub mod flowcontrol;
 #[allow(dead_code)]
 pub mod health;

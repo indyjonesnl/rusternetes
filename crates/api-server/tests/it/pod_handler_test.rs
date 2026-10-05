@@ -177,39 +177,6 @@ async fn test_pod_delete_without_finalizers() {
 }
 
 #[tokio::test]
-async fn test_pod_delete_with_finalizers() {
-    let storage = Arc::new(MemoryStorage::new());
-
-    let mut pod = create_test_pod("test-pod-finalizer", "default");
-    pod.metadata.finalizers = Some(vec!["kubernetes.io/pv-protection".to_string()]);
-
-    let key = build_key("pods", Some("default"), "test-pod-finalizer");
-
-    // Create pod
-    storage.create(&key, &pod).await.unwrap();
-
-    // Attempt to delete - should mark for deletion but not remove
-    let marked = rusternetes_api_server::handlers::finalizers::handle_delete_with_finalizers(
-        &storage,
-        &key,
-        &pod,
-        &Default::default(),
-    )
-    .await
-    .unwrap();
-
-    assert!(marked, "Pod should be marked for deletion");
-
-    // Verify pod still exists with deletionTimestamp
-    let updated: Pod = storage.get(&key).await.unwrap();
-    assert!(updated.metadata.deletion_timestamp.is_some());
-    assert!(updated.metadata.finalizers.is_some());
-
-    // Clean up
-    storage.delete(&key).await.unwrap();
-}
-
-#[tokio::test]
 async fn test_pod_list_in_namespace() {
     let storage = Arc::new(MemoryStorage::new());
 
