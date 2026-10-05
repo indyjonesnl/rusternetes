@@ -203,3 +203,41 @@ fn user_subject_with_group_forbidden() {
         .iter()
         .any(|e| e.field.contains("group") && e.error_type == ErrorType::Forbidden));
 }
+
+// ---- mandatory-object spec equality (validation.go:86-94) ----
+
+use rusternetes_common::validation::flowcontrol_bootstrap::{
+    mandatory_flow_schema, MANDATORY_FLOW_SCHEMA_NAMES,
+};
+
+#[test]
+fn mandatory_flow_schemas_validate_clean() {
+    for name in MANDATORY_FLOW_SCHEMA_NAMES {
+        let fs = mandatory_flow_schema(name).expect("mandatory");
+        let errs = validate_flow_schema(&fs);
+        assert!(errs.is_empty(), "{name}: {errs:?}");
+    }
+}
+
+#[test]
+fn mandatory_flow_schema_with_changed_spec_rejected() {
+    for name in MANDATORY_FLOW_SCHEMA_NAMES {
+        let mut fs = mandatory_flow_schema(name).unwrap();
+        fs.spec.priority_level_configuration.name = "workload".to_string();
+        let errs = validate_flow_schema(&fs);
+        assert!(
+            errs.iter().any(|e| e.field == "spec"
+                && e.error_type == ErrorType::Invalid
+                && e.detail == format!("spec of '{name}' must equal the fixed value")),
+            "{name}: {errs:?}"
+        );
+    }
+}
+
+#[test]
+fn non_mandatory_flow_schema_spec_is_free() {
+    let mut fs = mandatory_flow_schema("catch-all").unwrap();
+    fs.metadata.name = "global-default".to_string();
+    fs.spec.matching_precedence = 9900;
+    assert!(validate_flow_schema(&fs).is_empty());
+}

@@ -21,6 +21,7 @@ pub mod endpoints;
 pub mod endpointslice;
 pub mod events;
 pub mod field;
+pub mod flowcontrol_bootstrap;
 pub mod flowschema;
 pub mod hpa;
 pub mod ingress;
