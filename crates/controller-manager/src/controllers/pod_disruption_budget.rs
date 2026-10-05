@@ -887,25 +887,16 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
     /// since overtaken is rejected with a conflict rather than clobbering the
     /// eviction's `disruptionsAllowed` (`TestUpdatePDBStatusRetries`).
     ///
-    /// `Storage::update_status` grafts onto the *current* object and ignores the
-    /// caller's `resourceVersion` on the direct backends, so the precondition is
-    /// checked here first. That leaves a window between the check and the write;
-    /// closing it needs a compare-and-set status write in the storage trait.
+    /// `Storage::update_status_cas` is that precondition: it grafts the status
+    /// onto the stored object only if its `resourceVersion` still equals the
+    /// one this sync read, atomically with the write on every backend, and
+    /// returns `Error::Conflict` otherwise (#2151).
     async fn write_pdb_status(&self, pdb: &PodDisruptionBudget) -> rusternetes_common::Result<()> {
         let ns = pdb.metadata.namespace.as_deref().unwrap_or("default");
         let key = build_key("poddisruptionbudgets", Some(ns), &pdb.metadata.name);
-        let current: PodDisruptionBudget = self.storage.get(&key).await?;
-        if current.metadata.resource_version != pdb.metadata.resource_version {
-            return Err(Error::Conflict(format!(
-                "Operation cannot be fulfilled on poddisruptionbudgets.policy {:?}: \
-                 the object has been modified; please apply your changes to the latest version \
-                 and try again",
-                pdb.metadata.name
-            )));
-        }
-        // update_status, NOT update: a full-object PUT has its `.status`
+        // A status write, NOT `update`: a full-object PUT has its `.status`
         // stripped by any api-server that exposes a status subresource (#1712).
-        self.storage.update_status(&key, pdb).await?;
+        self.storage.update_status_cas(&key, pdb).await?;
         Ok(())
     }
 
@@ -1557,6 +1548,10 @@ mod tests {
     /// `update`, so both paths persist status there.
     struct StatusStrippingStorage {
         inner: MemoryStorage,
+        /// Play the `/eviction` handler inside the status write: bump the
+        /// stored object after the controller read it and before the guarded
+        /// write lands.
+        overtake_status_write: bool,
     }
 
     #[async_trait::async_trait]
@@ -1615,6 +1610,20 @@ mod tests {
             }
             let merged: T = serde_json::from_value(stored).unwrap();
             self.inner.update(key, &merged).await
+        }
+
+        /// The status subresource with the resourceVersion precondition an
+        /// api-server applies; the compare is `MemoryStorage`'s own.
+        async fn update_status_cas<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            if self.overtake_status_write {
+                let mut stored: serde_json::Value = self.inner.get(key).await?;
+                stored["status"]["disruptionsAllowed"] = serde_json::json!(0);
+                self.inner.update(key, &stored).await?;
+            }
+            self.inner.update_status_cas(key, value).await
         }
 
         async fn update_raw(
@@ -1682,6 +1691,44 @@ mod tests {
         }
     }
 
+    /// #2151: the status write is a compare-and-set, not check-then-write. The
+    /// eviction lands AFTER the controller's read and INSIDE the status write,
+    /// a window a get-compare-then-`update_status` cannot see; the write must
+    /// conflict and leave the eviction's `disruptionsAllowed: 0` in place.
+    #[tokio::test]
+    async fn stale_status_write_conflicts_instead_of_overwriting() {
+        let storage = Arc::new(StatusStrippingStorage {
+            inner: MemoryStorage::new(),
+            overtake_status_write: true,
+        });
+        let mut pdb = pdb_fixture();
+        pdb.status = Some(PodDisruptionBudgetStatus {
+            current_healthy: 3,
+            desired_healthy: 1,
+            disruptions_allowed: 2,
+            expected_pods: 3,
+            observed_generation: Some(1),
+            conditions: None,
+            disrupted_pods: None,
+        });
+        let key = build_key("poddisruptionbudgets", Some("default"), "pdb-1");
+        storage.create(&key, &pdb).await.unwrap();
+        let read: PodDisruptionBudget = storage.get(&key).await.unwrap();
+
+        let controller = PodDisruptionBudgetController::new(storage.clone());
+        let mut computed = read.clone();
+        computed.status.as_mut().unwrap().disruptions_allowed = 2;
+        let err = controller.write_pdb_status(&computed).await.unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+
+        let stored: PodDisruptionBudget = storage.get(&key).await.unwrap();
+        assert_eq!(
+            stored.status.unwrap().disruptions_allowed,
+            0,
+            "the stale write must not overwrite the eviction's decrement"
+        );
+    }
+
     /// THE regression: reconcile must persist status through the status
     /// subresource, so observedGeneration advances even when a full-object PUT
     /// drops status.
@@ -1689,6 +1736,7 @@ mod tests {
     async fn pdb_status_survives_an_apiserver_that_strips_status_on_put() {
         let storage = Arc::new(StatusStrippingStorage {
             inner: MemoryStorage::new(),
+            overtake_status_write: false,
         });
         let pdb = pdb_fixture();
         let key = build_key("poddisruptionbudgets", Some("default"), "pdb-1");
@@ -1739,6 +1787,7 @@ mod tests {
     async fn disruptions_allowed_is_never_negative() {
         let storage = Arc::new(StatusStrippingStorage {
             inner: MemoryStorage::new(),
+            overtake_status_write: false,
         });
         // minAvailable: 2, and not a single pod matches the selector.
         let mut pdb = pdb_fixture();
@@ -1772,6 +1821,7 @@ mod tests {
     async fn disruptions_allowed_reports_real_slack() {
         let storage = Arc::new(StatusStrippingStorage {
             inner: MemoryStorage::new(),
+            overtake_status_write: false,
         });
         let mut pdb = pdb_fixture();
         pdb.spec.min_available = Some(IntOrString::Int(0));

@@ -7,6 +7,7 @@
 //! backend instantiates them via `contract_suite!`.
 
 pub mod fixtures;
+pub mod status_cas;
 pub mod store;
 pub mod watcher;
 
@@ -94,6 +95,25 @@ macro_rules! contract_suite {
                     return;
                 };
                 store::run_test_update_with_conflict(&fixture.storage).await;
+            }
+
+            #[tokio::test]
+            async fn update_status_cas() {
+                let Some(fixture) = $setup.await else {
+                    return;
+                };
+                $crate::contract::status_cas::run_test_update_status_cas(&fixture.storage).await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn update_status_cas_concurrent() {
+                let Some(fixture) = $setup.await else {
+                    return;
+                };
+                $crate::contract::status_cas::run_test_update_status_cas_concurrent(
+                    std::sync::Arc::new(fixture.storage),
+                )
+                .await;
             }
 
             // Multi-threaded on purpose: the invariant under test is what

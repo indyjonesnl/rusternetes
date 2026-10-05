@@ -93,6 +93,15 @@ impl Storage for StatusSubresourceStorage {
         self.inner.update(key, &merged).await
     }
 
+    /// Status subresource with the resourceVersion precondition (the compare
+    /// is `MemoryStorage`'s own).
+    async fn update_status_cas<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+    {
+        self.inner.update_status_cas(key, value).await
+    }
+
     async fn update_raw(
         &self,
         key: &str,

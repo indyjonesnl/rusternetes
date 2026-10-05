@@ -66,3 +66,50 @@ async fn update_status_preserves_concurrently_updated_spec() {
     assert_eq!(got["status"]["hard"]["cpu"], json!("1"));
     assert_eq!(got["status"]["used"]["cpu"], json!("0"));
 }
+
+// ---- update_status_cas (#2151) -------------------------------------------
+
+#[tokio::test]
+async fn update_status_cas_without_resource_version_is_unconditional() {
+    // Upstream: an empty resourceVersion is "no precondition".
+    let storage = MemoryStorage::new();
+    let key = "/registry/resourcequotas/ns/cas-norv";
+    storage
+        .create::<Value>(key, &quota("1", "1Gi"))
+        .await
+        .unwrap();
+    let mut v = quota("1", "1Gi");
+    v["status"] = json!({"used": {"cpu": "1"}});
+    storage.update_status_cas::<Value>(key, &v).await.unwrap();
+    let got: Value = storage.get(key).await.unwrap();
+    assert_eq!(got["status"]["used"]["cpu"], json!("1"));
+}
+
+#[tokio::test]
+async fn update_status_cas_stale_rv_conflicts_and_keeps_spec() {
+    let storage = MemoryStorage::new();
+    let key = "/registry/resourcequotas/ns/cas-stale";
+    storage
+        .create::<Value>(key, &quota("1", "1Gi"))
+        .await
+        .unwrap();
+    let stale: Value = storage.get(key).await.unwrap();
+    // A concurrent spec update overtakes the caller's read.
+    let mut newer = stale.clone();
+    newer["spec"]["hard"]["cpu"] = json!("2");
+    storage.update::<Value>(key, &newer).await.unwrap();
+
+    let mut v = stale.clone();
+    v["status"] = json!({"used": {"cpu": "9"}});
+    let err = storage
+        .update_status_cas::<Value>(key, &v)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, rusternetes_common::Error::Conflict(_)),
+        "{err:?}"
+    );
+    let got: Value = storage.get(key).await.unwrap();
+    assert_eq!(got["spec"]["hard"]["cpu"], json!("2"));
+    assert!(got.get("status").is_none() || got["status"].is_null());
+}

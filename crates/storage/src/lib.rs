@@ -120,6 +120,42 @@ pub trait Storage: Send + Sync {
         )))
     }
 
+    /// Compare-and-set status write: graft `value`'s `.status` onto the stored
+    /// object **only if** the stored `metadata.resourceVersion` equals the
+    /// caller's, otherwise fail with [`Error::Conflict`] and write nothing.
+    ///
+    /// This is `UpdateStatus` on the object the caller read: the generic
+    /// registry `Store.Update` hands the caller's resourceVersion to
+    /// `GuaranteedUpdate` as a precondition, and the etcd3 store commits with
+    /// `OptimisticPut` (a txn comparing the key's mod revision), retrying only
+    /// if the *store's* cached copy was stale, never past a caller-visible
+    /// mismatch (`registry/generic/registry/store.go` `Update`;
+    /// `etcd3/store.go` `GuaranteedUpdate`). A controller computing status from
+    /// a read that a concurrent writer has overtaken — the PDB controller vs
+    /// Pod `/eviction`, `disruption.go` `writePdbStatus` /
+    /// `TestUpdatePDBStatusRetries` — must see that conflict rather than
+    /// overwrite the newer status (#2151).
+    ///
+    /// Unlike [`Storage::update_status`] there is no re-read-and-retry: the
+    /// conflict is the caller's to handle (requeue and recompute).
+    ///
+    /// A value with no `resourceVersion` carries no precondition and is
+    /// written like [`Storage::update_status`] (upstream: an empty
+    /// resourceVersion means "unconditional").
+    ///
+    /// The default is correct for every direct backend: it validates the
+    /// caller's version and then writes through [`Storage::update`] carrying
+    /// that same version, so the backend's own atomic guard (memory's write
+    /// lock, etcd's mod-revision txn, rhino's revision-guarded update) is what
+    /// closes the window between the compare and the write. API-backed storage
+    /// overrides it to PUT `/status`, where the api-server does the compare.
+    async fn update_status_cas<T>(&self, key: &str, value: &T) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        update_status_cas_via_update(self, key, value).await
+    }
+
     /// Update a resource with raw JSON value (for GC operations)
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()>;
 
@@ -483,6 +519,51 @@ pub enum WatchEvent {
 /// Stream of watch events
 pub type WatchStream = futures::stream::BoxStream<'static, Result<WatchEvent>>;
 
+/// Body of the default [`Storage::update_status_cas`]: validate the caller's
+/// resourceVersion against the stored object, graft the incoming `.status`
+/// onto the stored object, and write it through `update` carrying the stored
+/// (== caller's) resourceVersion so the backend's atomic guard decides any race
+/// that slips between the read and the write.
+async fn update_status_cas_via_update<S, T>(storage: &S, key: &str, value: &T) -> Result<T>
+where
+    S: Storage + ?Sized,
+    T: Serialize + DeserializeOwned + Send + Sync,
+{
+    let incoming = serde_json::to_value(value).map_err(Error::Serialization)?;
+    let Some(expected_rv) = incoming
+        .pointer("/metadata/resourceVersion")
+        .and_then(|v| v.as_str())
+        .filter(|rv| !rv.is_empty())
+    else {
+        return storage.update_status(key, value).await;
+    };
+
+    let mut current: serde_json::Value = storage.get(key).await?;
+    let current_rv = current
+        .pointer("/metadata/resourceVersion")
+        .and_then(|v| v.as_str());
+    if current_rv != Some(expected_rv) {
+        return Err(Error::Conflict(format!(
+            "Operation cannot be fulfilled on {key}: the object has been modified; \
+             please apply your changes to the latest version and try again \
+             (expected resourceVersion {expected_rv}, current {})",
+            current_rv.unwrap_or("unknown")
+        )));
+    }
+    if let Some(obj) = current.as_object_mut() {
+        match incoming.get("status") {
+            Some(status) => {
+                obj.insert("status".to_string(), status.clone());
+            }
+            None => {
+                obj.remove("status");
+            }
+        }
+    }
+    let updated = storage.update::<serde_json::Value>(key, &current).await?;
+    serde_json::from_value(updated).map_err(Error::Serialization)
+}
+
 /// Blanket implementation so `Arc<S>` can be used wherever `S: Storage` is required.
 #[async_trait]
 impl<S: Storage> Storage for std::sync::Arc<S> {
@@ -524,6 +605,15 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
         T: Serialize + DeserializeOwned + Send + Sync,
     {
         (**self).update_status(key, value).await
+    }
+
+    // Same reason as `update_status`: forward so `ApiStorage`'s `/status` PUT
+    // (and any double's override) is not bypassed by the trait default.
+    async fn update_status_cas<T>(&self, key: &str, value: &T) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        (**self).update_status_cas(key, value).await
     }
 
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()> {
@@ -939,6 +1029,20 @@ impl Storage for StorageBackend {
                     MAX_ATTEMPTS, key
                 )))
             }
+        }
+    }
+
+    /// `Api` PUTs `/status` (the api-server does the compare); every other
+    /// variant runs the default over `StorageBackend::{get,update}`, which
+    /// dispatch to the backend's own guarded `update`.
+    async fn update_status_cas<T>(&self, key: &str, value: &T) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        match self {
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::update_status_cas(s, key, value).await,
+            _ => update_status_cas_via_update(self, key, value).await,
         }
     }
 
