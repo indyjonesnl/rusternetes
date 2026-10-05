@@ -111,6 +111,42 @@ pub enum Feature {
 
     /// Upstream: `pkg/features/kube_features.go::DRAResourceClaimDeviceStatus` (1.33 Beta, on in v1.35).
     DRAResourceClaimDeviceStatus,
+
+    /// Upstream: `pkg/features/kube_features.go::InPlacePodLevelResourcesVerticalScaling` (1.35 Alpha, off in v1.35; kube_features.go:1372).
+    InPlacePodLevelResourcesVerticalScaling,
+
+    /// Upstream: `pkg/features/kube_features.go::DRAExtendedResource` (1.34 Alpha, off in v1.35; kube_features.go:1248).
+    DRAExtendedResource,
+
+    /// Upstream: `pkg/features/kube_features.go::ClusterTrustBundleProjection` (1.33 Beta, but off (no `Default: true`) in v1.35; kube_features.go:1204).
+    ClusterTrustBundleProjection,
+
+    /// Upstream: `pkg/features/kube_features.go::PodCertificateRequest` (1.35 Beta, but off in v1.35; kube_features.go:1602).
+    PodCertificateRequest,
+
+    /// Upstream: `pkg/features/kube_features.go::ContainerStopSignals` (1.33 Alpha, off in v1.35; kube_features.go:1219).
+    ContainerStopSignals,
+
+    /// Upstream: `pkg/features/kube_features.go::ResourceHealthStatus` (1.31 Alpha, off in v1.35; kube_features.go:1716).
+    ResourceHealthStatus,
+
+    /// Upstream: `pkg/features/kube_features.go::GenericWorkload` (1.35 Alpha, off in v1.35; kube_features.go:1321).
+    GenericWorkload,
+
+    /// Upstream: `pkg/features/kube_features.go::TaintTolerationComparisonOperators` (1.35 Alpha, off in v1.35; kube_features.go:1859).
+    TaintTolerationComparisonOperators,
+
+    /// Upstream: `pkg/features/kube_features.go::PodLevelResources` (1.34 Beta, on in v1.35; kube_features.go:1612).
+    PodLevelResources,
+
+    /// Upstream: `pkg/features/kube_features.go::MatchLabelKeysInPodTopologySpread` (1.27 Beta, on in v1.35; kube_features.go:1506).
+    MatchLabelKeysInPodTopologySpread,
+
+    /// Upstream: `pkg/features/kube_features.go::MatchLabelKeysInPodTopologySpreadSelectorMerge` (1.34 Beta, on in v1.35; kube_features.go:1511).
+    MatchLabelKeysInPodTopologySpreadSelectorMerge,
+
+    /// Upstream: `pkg/features/kube_features.go::PodDeletionCost` (1.22 Beta, on in v1.35; kube_features.go:1607).
+    PodDeletionCost,
 }
 
 impl Feature {
@@ -130,6 +166,18 @@ impl Feature {
             Feature::DRADeviceBindingConditions => 10,
             Feature::DRAConsumableCapacity => 11,
             Feature::DRAResourceClaimDeviceStatus => 12,
+            Feature::InPlacePodLevelResourcesVerticalScaling => 13,
+            Feature::DRAExtendedResource => 14,
+            Feature::ClusterTrustBundleProjection => 15,
+            Feature::PodCertificateRequest => 16,
+            Feature::ContainerStopSignals => 17,
+            Feature::ResourceHealthStatus => 18,
+            Feature::GenericWorkload => 19,
+            Feature::TaintTolerationComparisonOperators => 20,
+            Feature::PodLevelResources => 21,
+            Feature::MatchLabelKeysInPodTopologySpread => 22,
+            Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge => 23,
+            Feature::PodDeletionCost => 24,
         }
     }
 
@@ -162,6 +210,30 @@ impl Feature {
             Feature::DRAConsumableCapacity => false,
             // 1.33 Beta, on (kube_features.go:1227-1266).
             Feature::DRAResourceClaimDeviceStatus => true,
+            // 1.35 Alpha, off (kube_features.go:1372).
+            Feature::InPlacePodLevelResourcesVerticalScaling => false,
+            // 1.34 Alpha, off (kube_features.go:1248).
+            Feature::DRAExtendedResource => false,
+            // 1.33 Beta, but off (no `Default: true`) (kube_features.go:1204).
+            Feature::ClusterTrustBundleProjection => false,
+            // 1.35 Beta, but off (kube_features.go:1602).
+            Feature::PodCertificateRequest => false,
+            // 1.33 Alpha, off (kube_features.go:1219).
+            Feature::ContainerStopSignals => false,
+            // 1.31 Alpha, off (kube_features.go:1716).
+            Feature::ResourceHealthStatus => false,
+            // 1.35 Alpha, off (kube_features.go:1321).
+            Feature::GenericWorkload => false,
+            // 1.35 Alpha, off (kube_features.go:1859).
+            Feature::TaintTolerationComparisonOperators => false,
+            // 1.34 Beta, on (kube_features.go:1612).
+            Feature::PodLevelResources => true,
+            // 1.27 Beta, on (kube_features.go:1506).
+            Feature::MatchLabelKeysInPodTopologySpread => true,
+            // 1.34 Beta, on (kube_features.go:1511).
+            Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge => true,
+            // 1.22 Beta, on (kube_features.go:1607).
+            Feature::PodDeletionCost => true,
         }
     }
 }
@@ -191,6 +263,18 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::DRADeviceBindingConditions,
     Feature::DRAConsumableCapacity,
     Feature::DRAResourceClaimDeviceStatus,
+    Feature::InPlacePodLevelResourcesVerticalScaling,
+    Feature::DRAExtendedResource,
+    Feature::ClusterTrustBundleProjection,
+    Feature::PodCertificateRequest,
+    Feature::ContainerStopSignals,
+    Feature::ResourceHealthStatus,
+    Feature::GenericWorkload,
+    Feature::TaintTolerationComparisonOperators,
+    Feature::PodLevelResources,
+    Feature::MatchLabelKeysInPodTopologySpread,
+    Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge,
+    Feature::PodDeletionCost,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -218,6 +302,18 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::DRADeviceBindingConditions.default_enabled()),
     AtomicBool::new(Feature::DRAConsumableCapacity.default_enabled()),
     AtomicBool::new(Feature::DRAResourceClaimDeviceStatus.default_enabled()),
+    AtomicBool::new(Feature::InPlacePodLevelResourcesVerticalScaling.default_enabled()),
+    AtomicBool::new(Feature::DRAExtendedResource.default_enabled()),
+    AtomicBool::new(Feature::ClusterTrustBundleProjection.default_enabled()),
+    AtomicBool::new(Feature::PodCertificateRequest.default_enabled()),
+    AtomicBool::new(Feature::ContainerStopSignals.default_enabled()),
+    AtomicBool::new(Feature::ResourceHealthStatus.default_enabled()),
+    AtomicBool::new(Feature::GenericWorkload.default_enabled()),
+    AtomicBool::new(Feature::TaintTolerationComparisonOperators.default_enabled()),
+    AtomicBool::new(Feature::PodLevelResources.default_enabled()),
+    AtomicBool::new(Feature::MatchLabelKeysInPodTopologySpread.default_enabled()),
+    AtomicBool::new(Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge.default_enabled()),
+    AtomicBool::new(Feature::PodDeletionCost.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.

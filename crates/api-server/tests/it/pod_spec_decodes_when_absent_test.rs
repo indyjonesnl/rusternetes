@@ -105,7 +105,13 @@ fn cases() -> Vec<(&'static str, Value, &'static str)> {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn every_absent_pod_level_field_answers_422_with_a_field_path() {
+    // Upstream DropDisabledPodFields (pkg/api/pod/util.go dropDisabledWorkloadRef) drops spec.workloadRef while GenericWorkload (off in 1.35) is off, so validation only sees it with the gate on.
+    let _gate = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::GenericWorkload,
+        true,
+    );
     let api = TestApiServer::new();
 
     for (i, (label, spec, expected)) in cases().into_iter().enumerate() {

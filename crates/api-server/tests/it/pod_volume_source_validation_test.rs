@@ -186,7 +186,18 @@ fn cases() -> Vec<(&'static str, Value, &'static str)> {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn every_bad_volume_source_answers_422_with_a_field_path() {
+    // Upstream dropDisabledClusterTrustBundleProjection (pkg/api/pod/util.go:1437) drops the projection while the gate (off in 1.35) is off, so validation only sees it with the gate on.
+    let _gate = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::ClusterTrustBundleProjection,
+        true,
+    );
+    // Same for the podCertificate projection under PodCertificateRequest.
+    let _pod_certificate = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+        true,
+    );
     let api = TestApiServer::new();
 
     for (i, (label, spec, expected)) in cases().into_iter().enumerate() {
