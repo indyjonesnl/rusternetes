@@ -1231,6 +1231,131 @@ pub async fn bootstrap_extension_apiserver_authentication_rbac(
     Ok(())
 }
 
+/// `SystemPriorityClasses()` (pkg/apis/scheduling/v1/helpers.go:29-54): the
+/// classes the api-server seeds. `SystemCriticalPriority` is 2 * 10^9
+/// (pkg/apis/scheduling/types.go); node-critical adds 1000.
+fn system_priority_classes() -> [rusternetes_common::resources::PriorityClass; 2] {
+    use rusternetes_common::resources::PriorityClass;
+    let mut node = PriorityClass::new("system-node-critical", 2_000_001_000);
+    node.description = Some(
+        "Used for system critical pods that must not be moved from their current node.".into(),
+    );
+    let mut cluster = PriorityClass::new("system-cluster-critical", 2_000_000_000);
+    cluster.description = Some(
+        "Used for system critical pods that must run in the cluster, but can be moved to another node if necessary."
+            .into(),
+    );
+    [node, cluster]
+}
+
+/// One pass of `AddSystemPriorityClasses` (pkg/registry/scheduling/rest/
+/// storage_scheduling.go:100-139): create each system PriorityClass that is
+/// missing; an existing one is left alone. The created object carries what
+/// the PriorityClass strategy gives a create (`generation` 1,
+/// `PrepareForCreate` strategy.go:46-50; `preemptionPolicy` default,
+/// `SetDefaults_PriorityClass`).
+pub async fn bootstrap_system_priority_classes<S: Storage + ?Sized>(storage: &S) -> Result<()> {
+    for mut pc in system_priority_classes() {
+        let key = rusternetes_storage::build_key("priorityclasses", None, &pc.metadata.name);
+        match storage
+            .get::<rusternetes_common::resources::PriorityClass>(&key)
+            .await
+        {
+            Ok(_) => continue,
+            Err(rusternetes_common::Error::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        pc.metadata.generation = Some(1);
+        pc.preemption_policy = Some("PreemptLowerPriority".to_string());
+        match storage.create(&key, &pc).await {
+            Ok(_) => info!(
+                "created PriorityClass {} with value {}",
+                pc.metadata.name, pc.value
+            ),
+            Err(rusternetes_common::Error::AlreadyExists(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// The `scheduling/bootstrap-system-priority-classes` PostStartHook
+/// (storage_scheduling.go:96-139): `wait.Poll(1s, 30s)` until
+/// [`bootstrap_system_priority_classes`] succeeds. Upstream treats a failure
+/// as fatal for the apiserver ("many critical system components may fail");
+/// here the failure is logged, as the other bootstrap steps do.
+pub fn spawn_system_priority_classes_hook<S: Storage + 'static>(storage: Arc<S>) {
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match bootstrap_system_priority_classes(storage.as_ref()).await {
+                Ok(()) => {
+                    info!("all system priority classes are created successfully or already exist.");
+                    return;
+                }
+                Err(e) if tokio::time::Instant::now() >= deadline => {
+                    warn!("failed to create system priority classes: {e}");
+                    return;
+                }
+                Err(e) => warn!("unable to create system priority classes: {e}. Retrying..."),
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+#[cfg(test)]
+mod system_priority_class_tests {
+    use super::*;
+    use rusternetes_common::resources::PriorityClass;
+    use rusternetes_storage::memory::MemoryStorage;
+
+    /// `AddSystemPriorityClasses` seeds `SystemPriorityClasses()`.
+    #[tokio::test]
+    async fn seeds_the_two_system_priority_classes() {
+        let storage = MemoryStorage::new();
+        bootstrap_system_priority_classes(&storage).await.unwrap();
+        let node: PriorityClass = storage
+            .get("/registry/priorityclasses/system-node-critical")
+            .await
+            .unwrap();
+        assert_eq!(node.value, 2_000_001_000);
+        assert_eq!(node.global_default, None);
+        assert_eq!(node.metadata.generation, Some(1));
+        assert_eq!(
+            node.preemption_policy.as_deref(),
+            Some("PreemptLowerPriority")
+        );
+        let cluster: PriorityClass = storage
+            .get("/registry/priorityclasses/system-cluster-critical")
+            .await
+            .unwrap();
+        assert_eq!(cluster.value, 2_000_000_000);
+    }
+
+    /// The hook only creates what is missing: an existing class is left alone.
+    #[tokio::test]
+    async fn leaves_an_existing_class_alone() {
+        let storage = MemoryStorage::new();
+        let mut pc = PriorityClass::new("system-node-critical", 2_000_001_000);
+        pc.description = Some("custom".into());
+        storage
+            .create("/registry/priorityclasses/system-node-critical", &pc)
+            .await
+            .unwrap();
+        bootstrap_system_priority_classes(&storage).await.unwrap();
+        let got: PriorityClass = storage
+            .get("/registry/priorityclasses/system-node-critical")
+            .await
+            .unwrap();
+        assert_eq!(got.description.as_deref(), Some("custom"));
+        assert!(storage
+            .get::<PriorityClass>("/registry/priorityclasses/system-cluster-critical")
+            .await
+            .is_ok());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -332,6 +332,28 @@ async fn priority_comes_from_the_priority_class() {
     assert_eq!(s, StatusCode::FORBIDDEN, "{resp}");
 }
 
+/// `getDefaultPriorityClass` (plugin/pkg/admission/priority/admission.go:
+/// 268-285): if a race left several `globalDefault` classes, the one with the
+/// lowest value wins - not the first listed.
+#[tokio::test]
+async fn the_lowest_valued_global_default_wins() {
+    use rusternetes_common::resources::PriorityClass;
+
+    let api = TestApiServer::new();
+    // "a-high" lists first but has the higher value.
+    for (name, value) in [("a-high", 500), ("z-low", 10)] {
+        let mut pc = PriorityClass::new(name, value);
+        pc.global_default = Some(true);
+        api.storage
+            .create(&format!("/registry/priorityclasses/{name}"), &pc)
+            .await
+            .unwrap();
+    }
+    let created = create(&api, &pod("p1")).await;
+    assert_eq!(created["spec"]["priority"], 10, "{created}");
+    assert_eq!(created["spec"]["priorityClassName"], "z-low", "{created}");
+}
+
 /// `DefaultTolerationSeconds` adds the NotReady and Unreachable NoExecute
 /// tolerations to a new pod.
 #[tokio::test]

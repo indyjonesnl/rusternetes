@@ -333,23 +333,12 @@ impl Admission<'_> {
             Some(_) => {}
             None => {
                 // No priorityClassName: the globalDefault class, if any.
-                let classes: Vec<serde_json::Value> = storage
-                    .list("/registry/priorityclasses/")
-                    .await
-                    .unwrap_or_default();
-                if let Some(pc) = classes.iter().find(|pc| {
-                    pc.get("globalDefault")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                }) {
-                    priority = pc.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                    preemption_policy = pc
-                        .get("preemptionPolicy")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-                    if let Some(n) = pc.pointer("/metadata/name").and_then(|n| n.as_str()) {
-                        spec.priority_class_name = Some(n.to_string());
-                    }
+                // getDefaultPriorityClass (admission.go:268-285): the lowest
+                // value wins if a race left several defaults.
+                if let Some(pc) = crate::admission::get_default_priority_class(storage).await? {
+                    priority = pc.value;
+                    preemption_policy = pc.preemption_policy;
+                    spec.priority_class_name = Some(pc.metadata.name);
                 }
             }
         }
