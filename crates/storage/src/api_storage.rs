@@ -597,6 +597,18 @@ impl Storage for ApiStorage {
         )))
     }
 
+    /// PUT `/status` with the caller's object, resourceVersion included: the
+    /// api-server's registry `Update` applies it as a precondition and answers
+    /// 409 on mismatch, which `map_write_err` maps to `Error::Conflict`. No
+    /// re-GET and no retry — that is what distinguishes it from
+    /// [`Storage::update_status`] above.
+    async fn update_status_cas<T>(&self, key: &str, value: &T) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        self.update_subresource(key, "status", value).await
+    }
+
     async fn update_raw(&self, key: &str, value: &Value) -> Result<()> {
         let path = self.object_path(key).await?;
         let _: Value = self.client.put(&path, value).await.map_err(map_write_err)?;
