@@ -22,18 +22,20 @@ use crate::resources::deployment::{
 use crate::resources::policy::IntOrString;
 use crate::resources::workloads::{
     DaemonSet, DaemonSetSpec, DaemonSetStatus, ReplicaSet, ReplicaSetSpec, ReplicaSetStatus,
-    StatefulSet, StatefulSetSpec, StatefulSetStatus,
+    RollingUpdateStatefulSetStrategy, StatefulSet, StatefulSetPersistentVolumeClaimRetentionPolicy,
+    StatefulSetSpec, StatefulSetStatus,
 };
 use crate::types::LabelSelector;
 use crate::validation::field::{BadValue, Error, ErrorList, Path};
 use crate::validation::metav1::{
-    is_dns1123_label, validate_label_selector, LabelSelectorValidationOptions,
+    is_dns1123_label, validate_label_selector, validate_labels, LabelSelectorValidationOptions,
 };
 use crate::validation::objectmeta::{
-    name_is_dns_label, name_is_dns_subdomain, validate_immutable_field, validate_nonnegative_field,
-    validate_object_meta, validate_object_meta_update,
+    name_is_dns_label, name_is_dns_subdomain, validate_annotations, validate_immutable_field,
+    validate_nonnegative_field, validate_object_meta, validate_object_meta_update,
 };
 use crate::validation::podtemplate::validate_pod_template_spec;
+use crate::validation::pvc::validate_persistent_volume_claim_spec;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -840,8 +842,6 @@ pub struct StatefulSetValidationOptions {
     /// Skip validating the pod template spec (StatefulSet update).
     pub skip_validate_pod_template_spec: bool,
     /// Skip validating the volume claim templates (StatefulSet update).
-    /// `validateVolumeClaimTemplates` is not ported yet (#2000), so nothing
-    /// reads this; it is kept so the update path sets what upstream sets.
     pub skip_validate_volume_claim_templates: bool,
 }
 
@@ -880,15 +880,10 @@ fn validate_statefulset_spec(
             }
             Some("RollingUpdate") => {
                 if let Some(ru) = &us.rolling_update {
-                    if let Some(p) = ru.partition {
-                        if p < 0 {
-                            errs.push(Error::invalid(
-                                &us_path.child("rollingUpdate").child("partition"),
-                                p,
-                                "must be greater than or equal to 0",
-                            ));
-                        }
-                    }
+                    errs.extend(validate_rolling_update_statefulset(
+                        ru,
+                        &us_path.child("rollingUpdate"),
+                    ));
                 }
             }
             Some(other) => errs.push(Error::invalid(
@@ -897,6 +892,24 @@ fn validate_statefulset_spec(
                 "must be 'RollingUpdate' or 'OnDelete'",
             )),
         },
+    }
+
+    // ValidatePersistentVolumeClaimRetentionPolicy (validation.go:93-100,
+    // called at :154) and validateVolumeClaimTemplates (:118-125, :155-157).
+    errs.extend(validate_pvc_retention_policy(
+        spec.persistent_volume_claim_retention_policy.as_ref(),
+        &fld_path.child("persistentVolumeClaimRetentionPolicy"),
+    ));
+    if !set_opts.skip_validate_volume_claim_templates {
+        for (i, pvc) in spec.volume_claim_templates.iter().flatten().enumerate() {
+            errs.extend(validate_persistent_volume_claim_spec(
+                &pvc.spec,
+                &fld_path
+                    .child("volumeClaimTemplates")
+                    .index(i)
+                    .child("spec"),
+            ));
+        }
     }
 
     // replicas >= 0
@@ -993,14 +1006,130 @@ fn validate_statefulset_spec(
     // `spec.template.spec.containers: Required value` — not a decoder error —
     // the answer to a workload with no containers (#1939). An update skips
     // it when the stored object's own spec is already invalid (:71-73).
+    //
+    // Before that, `subdomain` and `hostname` are cleared (the controller
+    // overwrites them in initIdentity) and the volumeClaimTemplates' volumes
+    // are merged in so a mount of a claim-template volume resolves
+    // (validation.go:193-213).
+    let template_to_validate = template_for_validation(spec);
+    let template_path = fld_path.child("template");
     if !set_opts.skip_validate_pod_template_spec {
         errs.extend(validate_pod_template_spec(
-            &spec.template,
-            &fld_path.child("template"),
+            &template_to_validate,
+            &template_path,
             false,
         ));
+    } else if let Some(meta) = &template_to_validate.metadata {
+        // ValidatePodTemplateSpecForStatefulSet still runs ValidateLabels /
+        // ValidateAnnotations when the template spec itself is skipped (:75-76).
+        if let Some(labels) = &meta.labels {
+            errs.extend(validate_labels(labels, &template_path.child("labels")));
+        }
+        if let Some(annotations) = &meta.annotations {
+            errs.extend(validate_annotations(
+                annotations,
+                &template_path.child("annotations"),
+            ));
+        }
     }
     errs
+}
+
+/// Upstream `ValidatePersistentVolumeClaimRetentionPolicy`
+/// (validation.go:83-100): each policy must be `Retain` or `Delete`. An absent
+/// field is not checked (upstream defaulting turns it into `Retain`).
+fn validate_pvc_retention_policy(
+    policy: Option<&StatefulSetPersistentVolumeClaimRetentionPolicy>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let Some(policy) = policy else { return errs };
+    for (name, value) in [
+        ("whenDeleted", &policy.when_deleted),
+        ("whenScaled", &policy.when_scaled),
+    ] {
+        if let Some(v) = value {
+            if !matches!(v.as_str(), "Retain" | "Delete") {
+                errs.push(Error::not_supported(
+                    &fld_path.child(name),
+                    v.clone(),
+                    &["Retain", "Delete"],
+                ));
+            }
+        }
+    }
+    errs
+}
+
+/// Upstream `validateRollingUpdateStatefulSet` (validation.go:499-516).
+fn validate_rolling_update_statefulset(
+    ru: &RollingUpdateStatefulSetStrategy,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if let Some(p) = ru.partition {
+        if p < 0 {
+            errs.push(Error::invalid(
+                &fld_path.child("partition"),
+                p,
+                "must be greater than or equal to 0",
+            ));
+        }
+    }
+    if let Some(mu) = &ru.max_unavailable {
+        let mu_path = fld_path.child("maxUnavailable");
+        let (is_zero, sub) = validate_positive_int_or_percent(mu, &mu_path);
+        errs.extend(sub);
+        if is_zero {
+            errs.push(Error::invalid(
+                &mu_path,
+                int_or_percent_display(mu),
+                "cannot be 0",
+            ));
+        }
+        errs.extend(is_not_more_than_100_percent(mu, &mu_path));
+    }
+    errs
+}
+
+/// The template upstream validates (validation.go:193-213): `subdomain` and
+/// `hostname` cleared, and one `persistentVolumeClaim` volume per
+/// volumeClaimTemplate (`volumesToAddForTemplates`, :102-116) merged in ahead
+/// of the template's own volumes of a different name.
+fn template_for_validation(spec: &StatefulSetSpec) -> crate::resources::PodTemplateSpec {
+    let mut t = spec.template.clone();
+    let vcts = spec.volume_claim_templates.as_deref().unwrap_or(&[]);
+    if t.spec.subdomain.as_deref().is_none_or(str::is_empty)
+        && t.spec.hostname.as_deref().is_none_or(str::is_empty)
+        && vcts.is_empty()
+    {
+        return t;
+    }
+    t.spec.subdomain = None;
+    t.spec.hostname = None;
+    if !vcts.is_empty() {
+        let mut volumes: Vec<crate::resources::pod::Volume> = Vec::new();
+        for v in vcts {
+            let name = v.metadata.name.clone();
+            if volumes.iter().any(|x| x.name == name) {
+                continue; // upstream keys a map by name
+            }
+            volumes.push(
+                serde_json::from_value(serde_json::json!({
+                    "name": name,
+                    "persistentVolumeClaim": {"claimName": name},
+                }))
+                .expect("static volume shape"),
+            );
+        }
+        for v in t.spec.volumes.take().unwrap_or_default() {
+            if !vcts.iter().any(|c| c.metadata.name == v.name) {
+                volumes.push(v);
+            }
+        }
+        t.spec.volumes = Some(volumes);
+    }
+    t
 }
 
 /// Validate a new `StatefulSet`: upstream `ValidateStatefulSet`
@@ -1688,6 +1817,91 @@ mod workload_parity_tests {
                 && a.contains("activeDeadlineSeconds in StatefulSet is not Supported"),
             "got: {a}"
         );
+    }
+
+    // --- #2000: the rest of ValidateStatefulSetSpec ---------------------------
+
+    fn ss_errs(mutate: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut s = base_statefulset(template(Some("Always"), None));
+        mutate(&mut s);
+        agg(&validate_statefulset(&statefulset(s)))
+    }
+
+    #[test]
+    fn statefulset_rolling_update_max_unavailable_rules() {
+        // validateRollingUpdateStatefulSet (validation.go:499-516).
+        let ru = |mu: serde_json::Value| {
+            ss_errs(|s| {
+                s["spec"]["updateStrategy"]["rollingUpdate"] =
+                    serde_json::json!({"maxUnavailable": mu})
+            })
+        };
+        assert!(ru(serde_json::json!(1)).is_empty());
+        assert!(ru(serde_json::json!("50%")).is_empty());
+        let a = ru(serde_json::json!(0));
+        assert!(
+            a.contains(
+                "spec.updateStrategy.rollingUpdate.maxUnavailable: Invalid value: 0: cannot be 0"
+            ),
+            "{a}"
+        );
+        let a = ru(serde_json::json!(-1));
+        assert!(
+            a.contains("maxUnavailable: Invalid value: -1: must be greater than or equal to 0"),
+            "{a}"
+        );
+        let a = ru(serde_json::json!("101%"));
+        assert!(
+            a.contains("maxUnavailable: Invalid value: \"101%\": must not be greater than 100%"),
+            "{a}"
+        );
+    }
+
+    #[test]
+    fn statefulset_retention_policy_must_be_retain_or_delete() {
+        // ValidatePersistentVolumeClaimRetentionPolicy (validation.go:93-100).
+        let a = ss_errs(|s| {
+            s["spec"]["persistentVolumeClaimRetentionPolicy"] =
+                serde_json::json!({"whenDeleted": "Bogus", "whenScaled": "Delete"})
+        });
+        assert!(a.contains("spec.persistentVolumeClaimRetentionPolicy.whenDeleted: Unsupported value: \"Bogus\": supported values: \"Retain\", \"Delete\""), "{a}");
+        assert!(!a.contains("whenScaled"), "{a}");
+    }
+
+    fn vct(name: &str, spec: serde_json::Value) -> serde_json::Value {
+        serde_json::json!([{"metadata": {"name": name}, "spec": spec}])
+    }
+
+    #[test]
+    fn statefulset_volume_claim_templates_are_validated() {
+        // validateVolumeClaimTemplates (validation.go:118-125).
+        let a = ss_errs(|s| s["spec"]["volumeClaimTemplates"] = vct("data", serde_json::json!({})));
+        assert!(a.contains("spec.volumeClaimTemplates[0].spec.accessModes: Required value: at least 1 access mode is required"), "{a}");
+        let ok = ss_errs(|s| {
+            s["spec"]["volumeClaimTemplates"] = vct(
+                "data",
+                serde_json::json!({"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}),
+            )
+        });
+        assert!(ok.is_empty(), "{ok}");
+    }
+
+    #[test]
+    fn statefulset_template_may_mount_a_volume_claim_template_volume() {
+        // validation.go:193-213: the VCT volumes are merged into the template
+        // before pod validation, and subdomain/hostname are cleared.
+        let a = ss_errs(|s| {
+            s["spec"]["volumeClaimTemplates"] = vct(
+                "data",
+                serde_json::json!({"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}),
+            );
+            let t = &mut s["spec"]["template"]["spec"];
+            t["containers"][0]["volumeMounts"] =
+                serde_json::json!([{"name": "data", "mountPath": "/d"}]);
+            t["subdomain"] = serde_json::json!("Not_Valid");
+            t["hostname"] = serde_json::json!("Not_Valid");
+        });
+        assert!(a.is_empty(), "{a}");
     }
 
     #[test]
