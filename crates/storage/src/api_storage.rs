@@ -261,6 +261,13 @@ fn force_delete_query() -> Vec<(String, String)> {
     ]
 }
 
+/// Query params for a collection delete: only the propagation policy, as in
+/// upstream's namespace deleter
+/// (`namespaced_resources_deleter.go:322-323`).
+fn collection_delete_query() -> Vec<(String, String)> {
+    vec![("propagationPolicy".to_string(), "Background".to_string())]
+}
+
 /// Query params for a GRACEFUL delete: none. The api-server then applies its
 /// own defaults — for a pod, `spec.terminationGracePeriodSeconds` — exactly as
 /// upstream's controllers do when they call `Pods(ns).Delete(ctx, name,
@@ -667,6 +674,35 @@ impl Storage for ApiStorage {
         } else {
             Err(Error::Storage(format!(
                 "graceful delete {key} failed: HTTP {status}"
+            )))
+        }
+    }
+
+    /// One `DELETE` on the collection URL with `propagationPolicy=Background`
+    /// and nothing else — upstream's `deleteCollection`
+    /// (`pkg/controller/namespace/deletion/namespaced_resources_deleter.go:322-326`:
+    /// `DeleteOptions{PropagationPolicy: &background}`). 404 and 405 mean the
+    /// type serves no `deletecollection` verb (`:340-348` maps NotFound and
+    /// MethodNotSupported to "not supported"), so they return `Ok(false)` and
+    /// the caller falls back to per-item deletes.
+    async fn delete_collection(&self, prefix: &str) -> Result<bool> {
+        let (rt, rest) = parse_key(prefix)?;
+        let Some((root, namespaced)) = self.try_resolve(&rt).await else {
+            return Ok(false);
+        };
+        let path = build_collection_for_prefix(&root, namespaced, &rt, &rest)?;
+        let status = self
+            .client
+            .delete_with_options(&path, &collection_delete_query(), None)
+            .await
+            .map_err(|e| Error::Storage(format!("{e:#}")))?;
+        if status.is_success() {
+            Ok(true)
+        } else if matches!(status.as_u16(), 404 | 405) {
+            Ok(false)
+        } else {
+            Err(Error::Storage(format!(
+                "delete collection {prefix} failed: HTTP {status}"
             )))
         }
     }

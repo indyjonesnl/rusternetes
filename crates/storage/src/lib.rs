@@ -218,6 +218,26 @@ pub trait Storage: Send + Sync {
         self.update_raw(key, &obj).await
     }
 
+    /// Delete every object under `prefix` with ONE server-side
+    /// `DeleteCollection`, the way upstream's namespace deleter does
+    /// (`pkg/controller/namespace/deletion/namespaced_resources_deleter.go:326`,
+    /// `d.metadataClient.Resource(gvr).Namespace(namespace).DeleteCollection`)
+    /// instead of one DELETE round trip per object.
+    ///
+    /// Returns `Ok(true)` when the collection verb ran, `Ok(false)` when the
+    /// backend does not support it (upstream's `deleteCollection` maps
+    /// MethodNotSupported and NotFound to `false`, `:340-348`) so the caller
+    /// falls back to list + per-item delete (`deleteEachItem`, `:393-415`).
+    /// Any other failure is an `Err`.
+    ///
+    /// The default is `Ok(false)`: the direct-store backends have no server
+    /// in the path, so there is no round trip to save and the caller's
+    /// per-item path is already the whole job. `ApiStorage` overrides it with
+    /// a real collection DELETE.
+    async fn delete_collection(&self, _prefix: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     /// List resources with a given prefix
     async fn list<T>(&self, prefix: &str) -> Result<Vec<T>>
     where
@@ -626,6 +646,10 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
 
     async fn delete_gracefully(&self, key: &str) -> Result<()> {
         (**self).delete_gracefully(key).await
+    }
+
+    async fn delete_collection(&self, prefix: &str) -> Result<bool> {
+        (**self).delete_collection(prefix).await
     }
 
     async fn list<T>(&self, prefix: &str) -> Result<Vec<T>>
@@ -1082,6 +1106,19 @@ impl Storage for StorageBackend {
             StorageBackend::Memory(s) => Storage::delete_gracefully(s.as_ref(), key).await,
             #[cfg(feature = "api-client")]
             StorageBackend::Api(s) => Storage::delete_gracefully(s, key).await,
+        }
+    }
+
+    async fn delete_collection(&self, prefix: &str) -> Result<bool> {
+        match self {
+            StorageBackend::Etcd(s) => Storage::delete_collection(s, prefix).await,
+            #[cfg(feature = "sqlite")]
+            StorageBackend::Sqlite(s) => Storage::delete_collection(s, prefix).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::delete_collection(s, prefix).await,
+            StorageBackend::Memory(s) => Storage::delete_collection(s.as_ref(), prefix).await,
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::delete_collection(s, prefix).await,
         }
     }
 

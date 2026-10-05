@@ -101,6 +101,11 @@ pub struct NamespaceController<S: Storage> {
     /// paths, so it is threaded in from the resolved kubeconfig CA. `None`
     /// falls back to the legacy file-path reads (used by unit tests).
     ca_cert: Option<String>,
+    /// Resource types whose `deletecollection` verb is unsupported, so the
+    /// deleter goes straight to per-item deletes. Port of upstream's
+    /// `operationNotSupportedCache` (`opCache`,
+    /// `pkg/controller/namespace/deletion/namespaced_resources_deleter.go:187-197`).
+    delete_collection_unsupported: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl<S: Storage + 'static> NamespaceController<S> {
@@ -108,6 +113,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
         Self {
             storage,
             ca_cert: None,
+            delete_collection_unsupported: Default::default(),
         }
     }
 
@@ -606,9 +612,8 @@ impl<S: Storage + 'static> NamespaceController<S> {
         // Per-resource-type *delete* errors (API/transport-level), separate
         // from "items still remain because of finalizers". Mirrors
         // upstream's `deleteContentErrors` slice that powers
-        // `NamespaceDeletionContentFailure`. We currently log-and-continue
-        // inside `delete_all_resources_with_metadata`, so this stays empty.
-        let content_delete_errors: Vec<String> = Vec::new();
+        // `NamespaceDeletionContentFailure` (namespaced_resources_deleter.go:530-536).
+        let mut content_delete_errors: Vec<String> = Vec::new();
 
         let mut any_finalizers_remaining = false;
         // Pods still present after the delete pass. Upstream keys the ordering
@@ -627,7 +632,10 @@ impl<S: Storage + 'static> NamespaceController<S> {
                     any_finalizers_remaining = true;
                 }
             }
-            Err(e) => warn!("Failed to delete pods in namespace {}: {}", name, e),
+            Err(e) => {
+                warn!("Failed to delete pods in namespace {}: {}", name, e);
+                content_delete_errors.push(format!("pods: {e}"));
+            }
         }
 
         // Ordered deletion: while ANY pod remains, refresh the conditions and
@@ -702,6 +710,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
                         "Failed to delete {} in namespace {}: {}",
                         resource_type, name, e
                     );
+                    content_delete_errors.push(format!("{resource_type}: {e}"));
                 }
             }
         }
@@ -934,6 +943,27 @@ impl<S: Storage + 'static> NamespaceController<S> {
         resource_type: &str,
     ) -> Result<GvrDeletionMetadata> {
         let prefix = build_prefix(resource_type, Some(namespace));
+
+        // First try to delete the entire collection with one call
+        // (`deleteAllContentForGroupVersionResource`, upstream
+        // namespaced_resources_deleter.go:429-435). When the verb is
+        // unsupported — remembered per type, as upstream's opCache — fall
+        // through to the per-item path below (`deleteEachItem`, `:393-415`).
+        // An error is returned to the caller, as upstream does (`:431-433`).
+        let cached_unsupported = self
+            .delete_collection_unsupported
+            .lock()
+            .unwrap()
+            .contains(resource_type);
+        if !cached_unsupported && !self.storage.delete_collection(&prefix).await? {
+            self.delete_collection_unsupported
+                .lock()
+                .unwrap()
+                .insert(resource_type.to_string());
+        }
+
+        // The verification list (`:437-441`): whatever is still here is stuck
+        // on a finalizer or is mid-graceful-termination.
         let resources: Vec<serde_json::Value> =
             self.storage.list(&prefix).await.unwrap_or_default();
         if resources.is_empty() {
@@ -1964,6 +1994,191 @@ mod tests {
             "run()'s worker pool peaked at {observed} concurrent namespace operations; \
              a single worker drains ~1 namespace at a time and stalled a conformance \
              run behind 307 terminating namespaces"
+        );
+    }
+
+    /// Storage that records `delete_collection` calls and per-object deletes,
+    /// and answers the collection verb with a fixed `supported` verdict.
+    struct CollectionStorage {
+        inner: Arc<MemoryStorage>,
+        supported: bool,
+        collection_calls: std::sync::Mutex<Vec<String>>,
+        single_deletes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CollectionStorage {
+        fn new(supported: bool) -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(MemoryStorage::new()),
+                supported,
+                collection_calls: Default::default(),
+                single_deletes: Default::default(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for CollectionStorage {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.create(key, value).await
+        }
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update(key, value).await
+        }
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.inner.update_raw(key, value).await
+        }
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.single_deletes.lock().unwrap().push(key.to_string());
+            self.inner.delete(key).await
+        }
+        async fn delete_collection(&self, prefix: &str) -> rusternetes_common::Result<bool> {
+            self.collection_calls
+                .lock()
+                .unwrap()
+                .push(prefix.to_string());
+            if !self.supported {
+                return Ok(false);
+            }
+            let items: Vec<serde_json::Value> = self.inner.list(prefix).await?;
+            for item in items {
+                if let Some(name) = item.pointer("/metadata/name").and_then(|n| n.as_str()) {
+                    let ns = item
+                        .pointer("/metadata/namespace")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or_default();
+                    let _ = self
+                        .inner
+                        .delete(&build_key("configmaps", Some(ns), name))
+                        .await;
+                }
+            }
+            Ok(true)
+        }
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list(prefix).await
+        }
+        async fn watch(
+            &self,
+            prefix: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    async fn seed_terminating_ns_with_configmaps(
+        storage: &CollectionStorage,
+        ns_name: &str,
+    ) -> Namespace {
+        let mut ns = Namespace::new(ns_name);
+        ns.metadata.deletion_timestamp = Some(Utc::now());
+        set_namespace_finalizers(&mut ns, vec!["kubernetes".to_string()]);
+        storage
+            .create(&build_key("namespaces", None, ns_name), &ns)
+            .await
+            .unwrap();
+        for i in 0..3 {
+            let name = format!("cm-{i}");
+            let cm = serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {"name": name, "namespace": ns_name}
+            });
+            storage
+                .create(&build_key("configmaps", Some(ns_name), &name), &cm)
+                .await
+                .unwrap();
+        }
+        ns
+    }
+
+    /// Upstream issues ONE `DeleteCollection` per resource type and only
+    /// falls back to per-item deletes when the verb is unsupported
+    /// (`namespaced_resources_deleter.go:322-326`, `:429-435`). #1850.
+    #[tokio::test]
+    async fn namespace_deleter_uses_delete_collection_when_supported() {
+        let storage = CollectionStorage::new(true);
+        let ns = seed_terminating_ns_with_configmaps(&storage, "dc-ns").await;
+        let controller = NamespaceController::new(Arc::clone(&storage));
+        controller.finalize_namespace(&ns).await.unwrap();
+
+        let calls = storage.collection_calls.lock().unwrap().clone();
+        let cm_prefix = build_prefix("configmaps", Some("dc-ns"));
+        assert_eq!(
+            calls.iter().filter(|p| **p == cm_prefix).count(),
+            1,
+            "expected exactly one DeleteCollection for configmaps, got {calls:?}"
+        );
+        let singles = storage.single_deletes.lock().unwrap().clone();
+        assert!(
+            !singles.iter().any(|k| k.contains("/configmaps/")),
+            "configmaps must go through DeleteCollection, not per-item deletes: {singles:?}"
+        );
+        let left: Vec<serde_json::Value> = storage
+            .list(&build_prefix("configmaps", Some("dc-ns")))
+            .await
+            .unwrap();
+        assert!(left.is_empty());
+    }
+
+    /// When the verb is unsupported the deleter falls back to per-item
+    /// deletes, and remembers (upstream `opCache.setNotSupported`,
+    /// `namespaced_resources_deleter.go:187-197`) so it does not retry the
+    /// collection verb on the next pass.
+    #[tokio::test]
+    async fn namespace_deleter_falls_back_and_caches_unsupported_delete_collection() {
+        let storage = CollectionStorage::new(false);
+        let ns = seed_terminating_ns_with_configmaps(&storage, "fb-ns").await;
+        let controller = NamespaceController::new(Arc::clone(&storage));
+        controller.finalize_namespace(&ns).await.unwrap();
+        controller.finalize_namespace(&ns).await.unwrap();
+
+        let calls = storage.collection_calls.lock().unwrap().clone();
+        let cm_prefix = build_prefix("configmaps", Some("fb-ns"));
+        assert_eq!(
+            calls.iter().filter(|p| **p == cm_prefix).count(),
+            1,
+            "an unsupported verb must be cached, not retried: {calls:?}"
+        );
+        let singles = storage.single_deletes.lock().unwrap().clone();
+        assert_eq!(
+            singles
+                .iter()
+                .filter(|k| k.contains("/configmaps/"))
+                .count(),
+            3,
+            "fallback must delete each configmap individually: {singles:?}"
         );
     }
 }
