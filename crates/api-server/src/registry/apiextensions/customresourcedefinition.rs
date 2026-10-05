@@ -375,6 +375,56 @@ impl CrdRest {
         }
     }
 
+    /// One CRD as the informer-driven controllers see it on a resync: the
+    /// naming and establishing controllers' `sync` (their `UpdateFunc`
+    /// enqueues every update, resyncs included - naming_controller.go:359-363),
+    /// then the finalizer's, which only acts on a CRD that is being deleted
+    /// and still holds the cleanup finalizer (crd_finalizer.go:330-335).
+    pub async fn resync_one(&self, name: &str) -> Result<()> {
+        let Some(crd) = self.get_crd(name).await? else {
+            return Ok(());
+        };
+        if self.sync_one(name).await? {
+            self.sync_group_except(&crd.spec.group, name).await?;
+        }
+        self.finalize(name).await
+    }
+
+    /// The names of every CRD, as the informer's initial list and its
+    /// periodic resync deliver them.
+    async fn all_names(&self) -> Result<Vec<String>> {
+        let prefix = build_prefix(&self.store.storage_prefix, None);
+        Ok(self
+            .store
+            .storage
+            .list::<CustomResourceDefinition>(&prefix)
+            .await?
+            .into_iter()
+            .map(|c| c.metadata.name)
+            .collect())
+    }
+
+    /// A resync of every CRD (`NewSharedInformerFactory(crdClient,
+    /// 5*time.Minute)`, apiserver.go:170): the names whose sync failed, which
+    /// the caller requeues with backoff (crd_finalizer.go:296-308).
+    pub async fn resync(&self) -> Vec<String> {
+        let names = match self.all_names().await {
+            Ok(names) => names,
+            Err(e) => {
+                warn!("customresourcedefinitions: could not list for resync: {e}");
+                return Vec::new();
+            }
+        };
+        let mut failed = Vec::new();
+        for name in names {
+            if let Err(e) = self.resync_one(&name).await {
+                warn!("customresourcedefinition {name}: resync failed: {e}");
+                failed.push(name);
+            }
+        }
+        failed
+    }
+
     /// `deleteInstances` (crd_finalizer.go:181-): the stored instances of the
     /// CRD are removed straight from storage, where upstream issues
     /// `DeleteCollection` per namespace and then waits for the list to empty.
@@ -690,6 +740,79 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
         }
         Ok(deleted)
     }
+}
+
+/// `NewSharedInformerFactory(crdClient, 5*time.Minute)` (apiserver.go:170).
+pub const CRD_RESYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `workqueue.DefaultTypedControllerRateLimiter`'s per-item exponential
+/// failure limiter: `NewTypedItemExponentialFailureRateLimiter(5ms, 1000s)`
+/// (client-go/util/workqueue/default_rate_limiters.go). The overall bucket
+/// limiter (10 qps) is not modelled: the loop below retries one key at a time.
+fn requeue_delay(failures: u32) -> std::time::Duration {
+    let base = std::time::Duration::from_millis(5);
+    let max = std::time::Duration::from_secs(1000);
+    base.checked_mul(1u32.checked_shl(failures).unwrap_or(u32::MAX))
+        .map_or(max, |d| d.min(max))
+}
+
+/// The post-start hook that starts the CRD controllers
+/// (apiserver.go:244-252), for the part that runs on a timer: a sweep of every
+/// CRD at startup (the informer's initial list) and every
+/// [`CRD_RESYNC_PERIOD`], and a rate-limited retry of each CRD whose sync
+/// failed (`AddRateLimited`, crd_finalizer.go:307; polled every second like
+/// `wait.UntilWithContext(ctx, c.runWorker, time.Second)`, :280-282). A CRD
+/// left Terminating by a restart or a failed `delete_instances` is retried.
+///
+/// Deviation: upstream's controllers also react to each watch event; here the
+/// write path runs them inline (see [`super::controllers`]), so only the
+/// resync-driven half is a task.
+pub fn spawn_resync(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let rest = new_rest(storage);
+        let mut failing: std::collections::HashMap<String, (u32, tokio::time::Instant)> =
+            std::collections::HashMap::new();
+        let mut resync = tokio::time::interval(CRD_RESYNC_PERIOD);
+        let mut retry = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = resync.tick() => {
+                    let failed = rest.resync().await;
+                    // Forget what succeeded; back off what failed again.
+                    failing.retain(|name, _| failed.contains(name));
+                    for name in failed {
+                        let entry = failing
+                            .entry(name)
+                            .or_insert((0, tokio::time::Instant::now()));
+                        entry.1 = tokio::time::Instant::now() + requeue_delay(entry.0);
+                        entry.0 += 1;
+                    }
+                }
+                _ = retry.tick() => {
+                    let now = tokio::time::Instant::now();
+                    let due: Vec<String> = failing
+                        .iter()
+                        .filter(|(_, (_, at))| *at <= now)
+                        .map(|(n, _)| n.clone())
+                        .collect();
+                    for name in due {
+                        match rest.resync_one(&name).await {
+                            Ok(()) => {
+                                failing.remove(&name);
+                            }
+                            Err(e) => {
+                                warn!("customresourcedefinition {name}: retry failed: {e}");
+                                if let Some((n, at)) = failing.get_mut(&name) {
+                                    *at = tokio::time::Instant::now() + requeue_delay(*n);
+                                    *n += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// The CRD endpoint's storage: [`CrdRest`] over [`new_store`].
