@@ -48,6 +48,17 @@ impl<S: Storage + 'static> PVBinderController<S> {
                 }
             };
 
+            // Upstream's volume informer drives syncVolume on every PV event.
+            let pv_prefix = rusternetes_storage::build_prefix("persistentvolumes", None);
+            let mut pv_watch = match self.storage.watch(&pv_prefix).await {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("Failed to establish PV watch: {}, retrying", e);
+                    time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
             let mut resync = tokio::time::interval(std::time::Duration::from_secs(30));
             resync.tick().await;
 
@@ -66,6 +77,23 @@ impl<S: Storage + 'static> PVBinderController<S> {
                             }
                             None => {
                                 tracing::warn!("Watch stream ended, reconnecting");
+                                watch_broken = true;
+                            }
+                        }
+                    }
+                    event = pv_watch.next() => {
+                        match event {
+                            Some(Ok(_)) => {
+                                if let Err(e) = self.sync_unbound_volumes().await {
+                                    error!("PV availability pass failed: {}", e);
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("PV watch error: {}, reconnecting", e);
+                                watch_broken = true;
+                            }
+                            None => {
+                                tracing::warn!("PV watch stream ended, reconnecting");
                                 watch_broken = true;
                             }
                         }
@@ -112,6 +140,10 @@ impl<S: Storage + 'static> PVBinderController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
+        // Volume side of the sync (upstream syncVolume): unbound PVs -> Available.
+        if let Err(e) = self.sync_unbound_volumes().await {
+            error!("PV availability pass failed: {}", e);
+        }
         match self
             .storage
             .list::<PersistentVolumeClaim>("/registry/persistentvolumeclaims/")
@@ -149,6 +181,53 @@ impl<S: Storage + 'static> PVBinderController<S> {
             error!("PV release pass failed: {}", e);
         }
 
+        Ok(())
+    }
+
+    /// Port of the unbound branches of upstream
+    /// `PersistentVolumeController.syncVolume`
+    /// (`pkg/controller/volume/persistentvolume/pv_controller.go:576-579`,
+    /// `claimRef == nil`, and `:586-596`, `claimRef.UID == ""`, i.e. pre-bound
+    /// to a claim that has not yet bound): the volume is moved to `Available`
+    /// through `updateVolumePhase` (`:912-937`), which is a no-op when the
+    /// phase is already set and otherwise writes via `UpdateStatus` and clears
+    /// `status.message`. No event is emitted (plain `updateVolumePhase`, not
+    /// `updateVolumePhaseWithEvent`).
+    ///
+    /// A PV is created `Pending` (`persistentvolumeStrategy.PrepareForCreate`,
+    /// `pkg/registry/core/persistentvolume/strategy.go:66-74`); this is the
+    /// step that makes it `Available`. PVs whose claimRef carries a UID are the
+    /// bound / claim-not-found branches and are left to the other passes.
+    pub async fn sync_unbound_volumes(&self) -> Result<()> {
+        let pvs: Vec<PersistentVolume> = self.storage.list("/registry/persistentvolumes/").await?;
+        for mut pv in pvs {
+            // Being deleted: nothing to advance.
+            if pv.metadata.deletion_timestamp.is_some() {
+                continue;
+            }
+            let unbound = match pv.spec.claim_ref.as_ref() {
+                None => true,
+                Some(cr) => cr.uid.as_deref().unwrap_or("").is_empty(),
+            };
+            if !unbound {
+                continue;
+            }
+            // updateVolumePhase: "Nothing to do" when already set.
+            if pv.status.as_ref().map(|s| &s.phase) == Some(&PersistentVolumePhase::Available) {
+                continue;
+            }
+            let mut status = pv.status.take().unwrap_or_default();
+            status.phase = PersistentVolumePhase::Available;
+            status.message = None;
+            pv.status = Some(status);
+            let pv_key = build_key("persistentvolumes", None, &pv.metadata.name);
+            // Phase-only write -> status subresource (pv_controller.go:925).
+            if let Err(e) = self.storage.update_status(&pv_key, &pv).await {
+                error!("Failed to set PV {} Available: {}", pv.metadata.name, e);
+                continue;
+            }
+            info!("Volume {} entered phase Available", pv.metadata.name);
+        }
         Ok(())
     }
 
@@ -708,6 +787,77 @@ mod tests {
                 last_phase_transition_time: None,
             }),
         }
+    }
+
+    fn pv_with(
+        name: &str,
+        claim_uid: Option<Option<&str>>,
+        phase: Option<PersistentVolumePhase>,
+    ) -> PersistentVolume {
+        let mut pv = make_prebound_pv(name, "c", "u");
+        pv.spec.claim_ref = claim_uid.map(|uid| ObjectReference {
+            uid: uid.map(String::from),
+            ..pv.spec.claim_ref.clone().unwrap()
+        });
+        pv.status = phase.map(|phase| PersistentVolumeStatus {
+            phase,
+            message: Some("stale".into()),
+            reason: None,
+            last_phase_transition_time: None,
+        });
+        pv
+    }
+
+    /// #2066: upstream syncVolume (pv_controller.go:576-596) moves a PV with no
+    /// claimRef, or a claimRef with an empty UID, to Available; a claimRef with
+    /// a UID is the bound branch and is untouched.
+    #[tokio::test]
+    async fn sync_unbound_volumes_moves_pending_to_available() {
+        use PersistentVolumePhase::*;
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = PVBinderController::new(storage.clone());
+        let cases = [
+            (
+                "nil-claim",
+                pv_with("nil-claim", None, Some(Pending)),
+                Available,
+            ),
+            ("no-status", pv_with("no-status", None, None), Available),
+            (
+                "empty-uid",
+                pv_with("empty-uid", Some(Some("")), Some(Pending)),
+                Available,
+            ),
+            (
+                "absent-uid",
+                pv_with("absent-uid", Some(None), Some(Pending)),
+                Available,
+            ),
+            (
+                "bound-uid",
+                pv_with("bound-uid", Some(Some("u")), Some(Pending)),
+                Pending,
+            ),
+        ];
+        for (name, pv, _) in &cases {
+            storage
+                .create(&build_key("persistentvolumes", None, name), pv)
+                .await
+                .unwrap();
+        }
+        controller.sync_unbound_volumes().await.unwrap();
+        for (name, _, want) in &cases {
+            let got: PersistentVolume = storage
+                .get(&build_key("persistentvolumes", None, name))
+                .await
+                .unwrap();
+            assert_eq!(got.status.as_ref().unwrap().phase, *want, "{name}");
+        }
+        let got: PersistentVolume = storage
+            .get(&build_key("persistentvolumes", None, "nil-claim"))
+            .await
+            .unwrap();
+        assert_eq!(got.status.unwrap().message, None, "message cleared");
     }
 
     /// #1095: two PVCs whose PVs were pre-bound (claimRef) by the dynamic
