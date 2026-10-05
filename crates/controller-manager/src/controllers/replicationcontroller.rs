@@ -997,13 +997,25 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 /// creates are being rejected (quota, admission) the first failing round costs
 /// one create, not N.
 fn slow_start_batches(count: usize, initial_batch_size: usize) -> Vec<usize> {
+    slow_start_batches_capped(count, initial_batch_size, usize::MAX)
+}
+
+/// `slow_start_batches` with each batch additionally capped at `max_batch_size`,
+/// as the StatefulSet controller's `slowStartBatch` does
+/// (pkg/controller/statefulset/stateful_set_control.go:334,
+/// `MaxBatchSize = 500` at :42).
+pub(crate) fn slow_start_batches_capped(
+    count: usize,
+    initial_batch_size: usize,
+    max_batch_size: usize,
+) -> Vec<usize> {
     let mut batches = Vec::new();
     let mut remaining = count;
     let mut batch = initial_batch_size.min(remaining);
     while batch > 0 {
         batches.push(batch);
         remaining -= batch;
-        batch = (2 * batch).min(remaining);
+        batch = (2 * batch).min(remaining).min(max_batch_size);
     }
     batches
 }
@@ -1842,6 +1854,16 @@ mod tests {
     /// three `[sig-api-machinery] Garbage collector` specs fail in setup on
     /// `rc.Status.Replicas (0)` never reaching `Spec.Replicas (100)` (#1847).
     /// Batched, the same 100 creates take 7 rounds instead of 100.
+    #[test]
+    fn slow_start_batches_capped_respects_max_batch_size() {
+        // statefulset slowStartBatch: min(min(2*batch, remaining), MaxBatchSize)
+        assert_eq!(slow_start_batches_capped(10, 1, 4), vec![1, 2, 4, 3]);
+        assert_eq!(
+            slow_start_batches_capped(10, 1, 4).iter().sum::<usize>(),
+            10
+        );
+    }
+
     #[test]
     fn slow_start_batches_double_and_cap_at_remaining() {
         // Upstream's worked example: 100 pods from an initial batch of 1.

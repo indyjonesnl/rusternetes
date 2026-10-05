@@ -498,6 +498,10 @@ async fn test_6573091_scale_down_waits_for_terminating_pod_before_next() {
 
     // SS spec: 4 pods scaled to 1
     let mut ss = make_statefulset("cache", "default", 4);
+    // The "one pod at a time, wait for the terminating one" guard is the
+    // OrderedReady (monotonic) behaviour; Parallel fans out (#1822), see the
+    // counterpart test below.
+    ss.spec.pod_management_policy = Some("OrderedReady".to_string());
     let ss_uid = ss.metadata.uid.clone();
     let key = build_key("statefulsets", Some("default"), "cache");
     storage.create(&key, &ss).await.unwrap();
@@ -559,4 +563,63 @@ async fn test_6573091_scale_down_waits_for_terminating_pod_before_next() {
         pod1.metadata.deletion_timestamp.is_none(),
         "cache-1 must NOT be marked for deletion while cache-3 is still terminating"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #1822: under Parallel (burst) the condemned pods fan out.
+// Upstream processCondemned returns (false, nil) for an already-terminating
+// pod when !monotonic (stateful_set_control.go:510-518) and runForAll runs
+// slowStartBatch over every condemned pod (:537-549), so one sync deletes all
+// of them rather than one per reconcile.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_1822_parallel_scale_down_fans_out_over_condemned_pods() {
+    let storage = setup().await;
+
+    let mut ss = make_statefulset("cache", "default", 4);
+    ss.spec.pod_management_policy = Some("Parallel".to_string());
+    let ss_uid = ss.metadata.uid.clone();
+    let key = build_key("statefulsets", Some("default"), "cache");
+    storage.create(&key, &ss).await.unwrap();
+
+    // pod-3 already terminating; pods 0-2 healthy.
+    for ordinal in 0..4i32 {
+        seed_pod(
+            &storage,
+            "cache",
+            &ss_uid,
+            "default",
+            ordinal,
+            Phase::Running,
+            true,
+            ordinal == 3,
+        )
+        .await;
+    }
+
+    ss.spec.replicas = Some(1);
+    storage.update(&key, &ss).await.unwrap();
+
+    let controller = StatefulSetController::new(storage.clone());
+    controller.reconcile_all().await.unwrap();
+
+    // Both remaining condemned pods must be going away after ONE sync: the
+    // terminating pod-3 must not block the batch.
+    for name in ["cache-2", "cache-1"] {
+        let k = build_key("pods", Some("default"), name);
+        let gone_or_terminating = match storage.get::<Pod>(&k).await {
+            Ok(p) => p.metadata.deletion_timestamp.is_some(),
+            Err(_) => true,
+        };
+        assert!(
+            gone_or_terminating,
+            "{name} must be deleted in the same sync under Parallel"
+        );
+    }
+    // The non-condemned pod is untouched.
+    let p0: Pod = storage
+        .get(&build_key("pods", Some("default"), "cache-0"))
+        .await
+        .unwrap();
+    assert!(p0.metadata.deletion_timestamp.is_none());
 }
