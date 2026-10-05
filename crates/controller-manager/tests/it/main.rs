@@ -51,6 +51,7 @@ mod namespace_controller_test;
 mod networkpolicy_controller_test;
 mod node_controller_test;
 mod pdb_controller_test;
+mod pdb_disruption_controller_test;
 mod priorityclass_controller_test;
 mod pv_binder_test;
 mod pv_controller_extended_test;
