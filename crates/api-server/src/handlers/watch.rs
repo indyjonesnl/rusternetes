@@ -1990,8 +1990,15 @@ pub async fn watch_services(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::Service>(
-        state, auth_ctx, namespace, "services", "", params,
+    watch_namespaced_converted::<rusternetes_common::resources::Service>(
+        state,
+        auth_ctx,
+        namespace,
+        "services",
+        "",
+        params,
+        crate::handlers::service::default_on_read_watch_converter(),
+        None,
     )
     .await
 }
