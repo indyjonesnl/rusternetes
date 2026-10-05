@@ -18,6 +18,7 @@ mod conformance_apps_statefulset_daemonset;
 mod conformance_network_services;
 mod conformance_storage_pv_csi;
 mod cronjob_controller_test;
+mod crd_controller_cr_keys_test;
 mod csr_controller_test;
 mod daemonset_controller_revision_test;
 mod daemonset_controller_test;
