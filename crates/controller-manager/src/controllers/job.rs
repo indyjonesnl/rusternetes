@@ -237,6 +237,7 @@ impl<S: Storage + 'static> JobController<S> {
     /// — so they cannot fall when a pod is deleted, and a pod that terminates
     /// and is collected between two passes is still counted, because it was
     /// held in place until its UID was written down.
+    #[allow(clippy::too_many_arguments)]
     fn track_terminated_pods(
         &self,
         job_key: &str,
@@ -245,6 +246,8 @@ impl<S: Storage + 'static> JobController<S> {
         never_count_failed: &HashSet<String>,
         is_indexed: bool,
         only_replace_failed_pods: bool,
+        delayed_deletion_uids: &HashSet<String>,
+        job_terminal: bool,
     ) -> TrackedPods {
         // Upstream satisfies an expectation when its informer delivers the pod
         // without the finalizer (`finalizerRemovalObserved`). Our equivalent
@@ -321,6 +324,15 @@ impl<S: Storage + 'static> JobController<S> {
                     to_release.push(pod.clone());
                 }
                 Some(Phase::Failed) => {
+                    // `canRemoveFinalizer` (`job_controller.go:1359`): the last
+                    // failed pod of an index is neither counted nor released
+                    // until a replacement for the index exists, because it is
+                    // the only carrier of the index's failure count and
+                    // failure time (`podsWithDelayedDeletionPerIndex`). A Job
+                    // that is terminal or being deleted overrides this.
+                    if !job_terminal && delayed_deletion_uids.contains(uid) {
+                        continue;
+                    }
                     // An excluded failure is still released — it just never
                     // reaches a counter. Upstream's `Ignore` action does the
                     // same: the pod goes into `podsToRemoveFinalizer` without
@@ -1334,6 +1346,44 @@ impl<S: Storage + 'static> JobController<S> {
         // persisted counters plus the terminal pods this pass is claiming
         // (#1959). See `job_tracking` for the protocol.
         let only_replace_failed_pods = job.spec.pod_replacement_policy.as_deref() == Some("Failed");
+
+        // backoffLimitPerIndex: which indexes are exhausted, and which failed
+        // pods must be held back as the carrier of an index's failure count.
+        // Computed BEFORE tracking because `canRemoveFinalizer` consumes it.
+        // Upstream seeds `calculateFailedIndexes` from `.status.failedIndexes`
+        // (`indexed_job_utils.go:80`) so a failed index survives its pods being
+        // deleted; the persisted set is merged in here for the same reason.
+        let backoff_limit_per_index = job.spec.backoff_limit_per_index;
+        let mut backoff_failed_index_set: HashSet<i32> = HashSet::new();
+        let mut delayed_deletion: HashMap<i32, Pod> = HashMap::new();
+        if is_indexed {
+            if let Some(per_index_limit) = backoff_limit_per_index {
+                backoff_failed_index_set =
+                    indexes_over_backoff_limit(job_pods.iter(), per_index_limit);
+                if let Some(prev) = job
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.failed_indexes.as_deref())
+                {
+                    backoff_failed_index_set.extend(parse_index_ranges(prev));
+                }
+                let failed_now: HashSet<i32> = fail_index_set
+                    .union(&backoff_failed_index_set)
+                    .copied()
+                    .collect();
+                delayed_deletion = pods_with_delayed_deletion_per_index(
+                    &job_pods,
+                    job.spec.completions.unwrap_or(1),
+                    &succeeded_index_set,
+                    &failed_now,
+                    only_replace_failed_pods,
+                );
+            }
+        }
+        let delayed_deletion_uids: HashSet<String> = delayed_deletion
+            .values()
+            .map(|p| p.metadata.uid.clone())
+            .collect();
         let tracked = self.track_terminated_pods(
             &format!("{}/{}", namespace, name),
             job.status.as_ref(),
@@ -1341,6 +1391,8 @@ impl<S: Storage + 'static> JobController<S> {
             &never_count_failed,
             is_indexed,
             only_replace_failed_pods,
+            &delayed_deletion_uids,
+            job.metadata.is_being_deleted() || job_is_finished(job),
         );
 
         // Decision values (counted + parked) drive completion and backoff.
@@ -1493,15 +1545,6 @@ impl<S: Storage + 'static> JobController<S> {
                     return Ok(());
                 }
             }
-        }
-
-        // Track failed indexes for backoffLimitPerIndex
-        let backoff_limit_per_index = job.spec.backoff_limit_per_index;
-        let mut backoff_failed_index_set: HashSet<i32> = HashSet::new();
-
-        if is_indexed && backoff_limit_per_index.is_some() {
-            let per_index_limit = backoff_limit_per_index.unwrap_or(0);
-            backoff_failed_index_set = indexes_over_backoff_limit(job_pods.iter(), per_index_limit);
         }
 
         // Merge FailIndex and backoff-per-index failed sets
@@ -1815,6 +1858,10 @@ impl<S: Storage + 'static> JobController<S> {
                             per_index_limit,
                         ));
                     }
+                    // `getPodCreationInfoForIndependentIndexes`
+                    // (`job_controller.go:1850`): an index is only retried once
+                    // its own failure backoff has elapsed.
+                    let now = chrono::Utc::now();
                     (0..completions)
                         .filter(|i| {
                             // Skip indexes that already have active or succeeded pods
@@ -1823,6 +1870,12 @@ impl<S: Storage + 'static> JobController<S> {
                             }
                             // Skip indexes that are permanently failed (backoffLimitPerIndex or FailIndex)
                             if exhausted_indexes.contains(i) {
+                                return false;
+                            }
+                            // Per-index failure backoff.
+                            if remaining_time_per_index(now, delayed_deletion.get(i))
+                                > Duration::ZERO
+                            {
                                 return false;
                             }
                             true
@@ -1834,7 +1887,20 @@ impl<S: Storage + 'static> JobController<S> {
                 };
 
                 for (i, idx) in indexes_to_create.iter().enumerate() {
-                    match self.create_pod(job, namespace, *idx, is_indexed).await {
+                    // `addIndexFailureCountAnnotation` (`indexed_job_utils.go:350`)
+                    let failure_counts = if is_indexed && backoff_limit_per_index.is_some() {
+                        let replaced = delayed_deletion.get(idx);
+                        Some(new_index_failure_counts(
+                            replaced,
+                            replaced.is_some_and(|p| ignored_pods.contains(&p.metadata.name)),
+                        ))
+                    } else {
+                        None
+                    };
+                    match self
+                        .create_pod(job, namespace, *idx, is_indexed, failure_counts)
+                        .await
+                    {
                         Ok(_) => {
                             info!(
                                 "Created pod for Job {}/{} ({}/{})",
@@ -1974,6 +2040,7 @@ impl<S: Storage + 'static> JobController<S> {
         namespace: &str,
         index: i32,
         is_indexed: bool,
+        index_failure_counts: Option<(i32, i32)>,
     ) -> Result<()> {
         let job_name = &job.metadata.name;
         let pod_name = format!(
@@ -2008,6 +2075,19 @@ impl<S: Storage + 'static> JobController<S> {
                 "batch.kubernetes.io/job-completion-index".to_string(),
                 index.to_string(),
             );
+        }
+
+        if let Some((failure_count, ignored_count)) = index_failure_counts {
+            annotations.insert(
+                JOB_INDEX_FAILURE_COUNT_ANNOTATION.to_string(),
+                failure_count.to_string(),
+            );
+            if ignored_count > 0 {
+                annotations.insert(
+                    JOB_INDEX_IGNORED_FAILURE_COUNT_ANNOTATION.to_string(),
+                    ignored_count.to_string(),
+                );
+            }
         }
 
         let mut spec = template.spec.clone();
@@ -2161,7 +2241,14 @@ fn indexes_over_backoff_limit<'a, I>(pods: I, per_index_limit: i32) -> HashSet<i
 where
     I: IntoIterator<Item = &'a Pod>,
 {
+    // A failed pod's `job-index-failure-count` annotation holds the failures
+    // BEFORE it, so the index has failed `count + 1` times once this pod has.
+    // Upstream's `isIndexFailed` (`indexed_job_utils.go:98`) reads exactly this
+    // (`getIndexFailureCount >= BackoffLimitPerIndex`), which keeps the count
+    // after earlier pods of the index are gone. The pod tally is kept as the
+    // other bound for pods that predate the annotation.
     let mut failures_per_index: HashMap<i32, i32> = HashMap::new();
+    let mut annotated_per_index: HashMap<i32, i32> = HashMap::new();
     for pod in pods {
         if matches!(
             pod.status.as_ref().and_then(|s| s.phase.as_ref()),
@@ -2169,14 +2256,186 @@ where
         ) {
             if let Some(index) = get_pod_index(pod) {
                 *failures_per_index.entry(index).or_insert(0) += 1;
+                let total = parse_count_annotation(pod, JOB_INDEX_FAILURE_COUNT_ANNOTATION) + 1;
+                let e = annotated_per_index.entry(index).or_insert(0);
+                *e = (*e).max(total);
             }
         }
     }
     failures_per_index
         .into_iter()
+        .map(|(idx, count)| {
+            (
+                idx,
+                count.max(annotated_per_index.get(&idx).copied().unwrap_or(0)),
+            )
+        })
         .filter(|(_, count)| *count > per_index_limit)
         .map(|(idx, _)| idx)
         .collect()
+}
+
+/// `batch.JobIndexFailureCountAnnotation`
+/// (`staging/src/k8s.io/api/batch/v1/types.go`).
+const JOB_INDEX_FAILURE_COUNT_ANNOTATION: &str = "batch.kubernetes.io/job-index-failure-count";
+/// `batch.JobIndexIgnoredFailureCountAnnotation`.
+const JOB_INDEX_IGNORED_FAILURE_COUNT_ANNOTATION: &str =
+    "batch.kubernetes.io/job-index-ignored-failure-count";
+/// `DefaultJobPodFailureBackOff` (`job_controller.go:70`).
+const DEFAULT_JOB_POD_FAILURE_BACKOFF: Duration = Duration::from_secs(10);
+/// `MaxJobPodFailureBackOff` (`job_controller.go:72`).
+const MAX_JOB_POD_FAILURE_BACKOFF: Duration = Duration::from_secs(600);
+
+/// `parseInt32` over a pod annotation (`indexed_job_utils.go:443`): missing,
+/// unparsable or negative values read as 0.
+fn parse_count_annotation(pod: &Pod, key: &str) -> i32 {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(key))
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(0)
+}
+
+/// `getFinishedTime` (`backoff_utils.go:174`): latest container finish time,
+/// else the Ready=False transition, else the deletion timestamp, else the
+/// creation timestamp.
+fn pod_finished_time(pod: &Pod) -> chrono::DateTime<chrono::Utc> {
+    use rusternetes_common::resources::pod::ContainerState;
+    let from_containers = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .into_iter()
+        .flatten()
+        .filter_map(|c| match &c.state {
+            Some(ContainerState::Terminated {
+                finished_at: Some(t),
+                ..
+            }) => chrono::DateTime::parse_from_rfc3339(t)
+                .ok()
+                .map(|t| t.with_timezone(&chrono::Utc)),
+            _ => None,
+        })
+        .max();
+    if let Some(t) = from_containers {
+        return t;
+    }
+    let ready_false = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .into_iter()
+        .flatten()
+        .find(|c| c.condition_type == "Ready" && c.status == "False")
+        .and_then(|c| c.last_transition_time);
+    if let Some(t) = ready_false {
+        return t;
+    }
+    pod.metadata
+        .deletion_timestamp
+        .or(pod.metadata.creation_timestamp)
+        .unwrap_or_else(chrono::Utc::now)
+}
+
+/// `getRemainingTimePerIndex` (`backoff_utils.go:248`) with
+/// `getRemainingTimeForFailuresCount` (`:258`): the failure backoff left for an
+/// index, doubling from 10s per failure up to 10m, measured from the last
+/// failed pod's finish time.
+fn remaining_time_per_index(
+    now: chrono::DateTime<chrono::Utc>,
+    last_failed_pod: Option<&Pod>,
+) -> Duration {
+    let Some(pod) = last_failed_pod else {
+        return Duration::ZERO;
+    };
+    let failures = parse_count_annotation(pod, JOB_INDEX_FAILURE_COUNT_ANNOTATION)
+        + parse_count_annotation(pod, JOB_INDEX_IGNORED_FAILURE_COUNT_ANNOTATION)
+        + 1;
+    let mut backoff = DEFAULT_JOB_POD_FAILURE_BACKOFF;
+    for _ in 1..failures {
+        backoff *= 2;
+        if backoff >= MAX_JOB_POD_FAILURE_BACKOFF {
+            backoff = MAX_JOB_POD_FAILURE_BACKOFF;
+            break;
+        }
+    }
+    let elapsed = (now - pod_finished_time(pod))
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    backoff.saturating_sub(elapsed)
+}
+
+/// `getNewIndexFailureCounts` (`indexed_job_utils.go:360`): the
+/// failure/ignored-failure counts for the pod that replaces `replaced`. An
+/// ignored failure (a podFailurePolicy `Ignore` match) bumps the ignored count
+/// instead of the failure count.
+fn new_index_failure_counts(replaced: Option<&Pod>, replaced_ignored: bool) -> (i32, i32) {
+    let Some(pod) = replaced else {
+        return (0, 0);
+    };
+    let count = parse_count_annotation(pod, JOB_INDEX_FAILURE_COUNT_ANNOTATION);
+    let ignored = parse_count_annotation(pod, JOB_INDEX_IGNORED_FAILURE_COUNT_ANNOTATION);
+    if replaced_ignored {
+        (count, ignored + 1)
+    } else {
+        (count + 1, ignored)
+    }
+}
+
+/// `getPodsWithDelayedDeletionPerIndex` (`indexed_job_utils.go:323`): per
+/// completion index, the last failed pod whose finalizer must be kept until a
+/// replacement for that index exists. Indexes that are active, succeeded or
+/// failed need no carrier. Only pods still holding the tracking finalizer are
+/// candidates (`getValidPodsWithFilter` skips already-accounted pods).
+fn pods_with_delayed_deletion_per_index(
+    job_pods: &[Pod],
+    completions: i32,
+    succeeded_indexes: &HashSet<i32>,
+    failed_indexes: &HashSet<i32>,
+    only_replace_failed_pods: bool,
+) -> HashMap<i32, Pod> {
+    let active_indexes: HashSet<i32> = job_pods
+        .iter()
+        .filter(|p| {
+            !matches!(
+                p.status.as_ref().and_then(|s| s.phase.as_ref()),
+                Some(Phase::Succeeded)
+            ) && !is_pod_failed(p, only_replace_failed_pods)
+        })
+        .filter_map(get_pod_index)
+        .collect();
+    let absolute = |p: &Pod| {
+        parse_count_annotation(p, JOB_INDEX_FAILURE_COUNT_ANNOTATION)
+            + parse_count_annotation(p, JOB_INDEX_IGNORED_FAILURE_COUNT_ANNOTATION)
+    };
+    let mut result: HashMap<i32, Pod> = HashMap::new();
+    for pod in job_pods {
+        if !has_job_tracking_finalizer(pod) || !is_pod_failed(pod, only_replace_failed_pods) {
+            continue;
+        }
+        let Some(ix) = get_pod_index(pod) else {
+            continue;
+        };
+        if ix >= completions
+            || succeeded_indexes.contains(&ix)
+            || failed_indexes.contains(&ix)
+            || active_indexes.contains(&ix)
+        {
+            continue;
+        }
+        let replace = match result.get(&ix) {
+            Some(last) => {
+                absolute(last) <= absolute(pod) && pod_finished_time(pod) >= pod_finished_time(last)
+            }
+            None => true,
+        };
+        if replace {
+            result.insert(ix, pod.clone());
+        }
+    }
+    result
 }
 
 fn collect_indexes_in_phase<'a, I>(pods: I, phase: Phase) -> HashSet<i32>
@@ -4336,5 +4595,221 @@ mod tests {
             held.is_empty(),
             "orphaned pods still hold the job-tracking finalizer: {held:?}"
         );
+    }
+
+    /// A failed pod for `index` that carries the index-failure-count
+    /// annotation and finished `finished_secs_ago` seconds ago.
+    fn failed_pod_with_count(
+        name: &str,
+        index: i32,
+        failure_count: i32,
+        finished_secs_ago: i64,
+    ) -> Pod {
+        let mut pod = make_indexed_pod(
+            name,
+            "default",
+            Phase::Failed,
+            "idx-job",
+            "job-uid-1",
+            index,
+        );
+        pod.metadata.annotations.as_mut().unwrap().insert(
+            "batch.kubernetes.io/job-index-failure-count".to_string(),
+            failure_count.to_string(),
+        );
+        let finished = chrono::Utc::now() - chrono::Duration::seconds(finished_secs_ago);
+        pod.status.as_mut().unwrap().container_statuses = Some(vec![ContainerStatus {
+            name: "test".to_string(),
+            ready: false,
+            restart_count: 0,
+            state: Some(ContainerState::Terminated {
+                exit_code: 1,
+                signal: None,
+                reason: Some("Error".to_string()),
+                message: None,
+                started_at: None,
+                finished_at: Some(finished.to_rfc3339()),
+                container_id: None,
+            }),
+            last_state: None,
+            image: Some("busybox".to_string()),
+            image_id: None,
+            container_id: None,
+            started: None,
+            allocated_resources: None,
+            resources: None,
+            volume_mounts: None,
+            user: None,
+            allocated_resources_status: None,
+            stop_signal: None,
+        }]);
+        pod
+    }
+
+    async fn per_index_job(storage: &Arc<MemoryStorage>, limit: i32) -> Job {
+        let mut job = make_job("idx-job", "default", 2, 2);
+        job.spec.completion_mode = Some("Indexed".to_string());
+        job.spec.backoff_limit_per_index = Some(limit);
+        job.spec.backoff_limit = Some(100);
+        storage
+            .create("/registry/jobs/default/idx-job", &job)
+            .await
+            .unwrap();
+        job
+    }
+
+    /// Port of `getPodsWithDelayedDeletionPerIndex`
+    /// (`indexed_job_utils.go:323`) and `addIndexFailureCountAnnotation`
+    /// (`indexed_job_utils.go:350`): the replacement for an index whose failed
+    /// pod is the only record of its failure count must inherit that count,
+    /// and the failed pod must keep its finalizer until the replacement exists.
+    #[tokio::test]
+    async fn test_delayed_deletion_per_index_carries_failure_count() {
+        let storage = Arc::new(MemoryStorage::new());
+        let job = per_index_job(&storage, 5).await;
+        // Index 0 has failed twice already; this pod is the last of them and
+        // finished long ago, so no backoff is pending. Index 1 is running.
+        let failed = failed_pod_with_count("idx-0-failed", 0, 1, 3600);
+        storage
+            .create("/registry/pods/default/idx-0-failed", &failed)
+            .await
+            .unwrap();
+        let running = make_indexed_pod(
+            "idx-1-run",
+            "default",
+            Phase::Running,
+            "idx-job",
+            "job-uid-1",
+            1,
+        );
+        storage
+            .create("/registry/pods/default/idx-1-run", &running)
+            .await
+            .unwrap();
+
+        let controller = JobController::new(storage.clone());
+        let mut job = job;
+        controller.reconcile(&mut job).await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        let old = pods
+            .iter()
+            .find(|p| p.metadata.name == "idx-0-failed")
+            .unwrap();
+        assert!(
+            has_job_tracking_finalizer(old),
+            "the last failed pod of an index keeps its finalizer until the replacement exists"
+        );
+        let replacement = pods
+            .iter()
+            .find(|p| p.metadata.name != "idx-0-failed" && get_pod_index(p) == Some(0))
+            .expect("a replacement pod for index 0 must be created");
+        assert_eq!(
+            replacement
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("batch.kubernetes.io/job-index-failure-count"))
+                .map(String::as_str),
+            Some("2"),
+            "the replacement inherits the failure count plus one"
+        );
+    }
+
+    /// Once the replacement is active the failed pod is no longer delayed and
+    /// its finalizer comes off (`canRemoveFinalizer`, `job_controller.go:1359`).
+    #[tokio::test]
+    async fn test_delayed_deletion_released_once_replacement_active() {
+        let storage = Arc::new(MemoryStorage::new());
+        let job = per_index_job(&storage, 5).await;
+        let failed = failed_pod_with_count("idx-0-failed", 0, 1, 3600);
+        storage
+            .create("/registry/pods/default/idx-0-failed", &failed)
+            .await
+            .unwrap();
+        for (n, i) in [("idx-0-new", 0), ("idx-1-run", 1)] {
+            let p = make_indexed_pod(n, "default", Phase::Running, "idx-job", "job-uid-1", i);
+            storage
+                .create(&format!("/registry/pods/default/{n}"), &p)
+                .await
+                .unwrap();
+        }
+        let controller = JobController::new(storage.clone());
+        let mut job = job;
+        controller.reconcile(&mut job).await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        // Released: either gone or without the tracking finalizer.
+        let held = pods
+            .iter()
+            .any(|p| p.metadata.name == "idx-0-failed" && has_job_tracking_finalizer(p));
+        assert!(
+            !held,
+            "failed pod must be released once its index is active"
+        );
+    }
+
+    /// Port of `getPodCreationInfoForIndependentIndexes` /
+    /// `getRemainingTimePerIndex` (`job_controller.go:1850`,
+    /// `backoff_utils.go:248`): an index that failed just now is not retried
+    /// until DefaultJobPodFailureBackOff * 2^(count) has elapsed.
+    #[tokio::test]
+    async fn test_per_index_failure_backoff_defers_replacement() {
+        let storage = Arc::new(MemoryStorage::new());
+        let job = per_index_job(&storage, 5).await;
+        let failed = failed_pod_with_count("idx-0-failed", 0, 0, 0);
+        storage
+            .create("/registry/pods/default/idx-0-failed", &failed)
+            .await
+            .unwrap();
+        let running = make_indexed_pod(
+            "idx-1-run",
+            "default",
+            Phase::Running,
+            "idx-job",
+            "job-uid-1",
+            1,
+        );
+        storage
+            .create("/registry/pods/default/idx-1-run", &running)
+            .await
+            .unwrap();
+        let controller = JobController::new(storage.clone());
+        let mut job = job;
+        controller.reconcile(&mut job).await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert!(
+            !pods
+                .iter()
+                .any(|p| p.metadata.name != "idx-0-failed" && get_pod_index(p) == Some(0)),
+            "no replacement may be created inside the per-index backoff window"
+        );
+    }
+
+    #[test]
+    fn test_remaining_time_per_index_doubles_up_to_max() {
+        let now = chrono::Utc::now();
+        let p = failed_pod_with_count("p", 0, 0, 0);
+        // absolute failure count 0 + 1 -> 10s window.
+        let r = remaining_time_per_index(now, Some(&p));
+        assert!(
+            r > Duration::from_secs(8) && r <= Duration::from_secs(10),
+            "{r:?}"
+        );
+        let p = failed_pod_with_count("p", 0, 2, 0);
+        // count 3 -> 10s * 2^2 = 40s.
+        let r = remaining_time_per_index(now, Some(&p));
+        assert!(
+            r > Duration::from_secs(38) && r <= Duration::from_secs(40),
+            "{r:?}"
+        );
+        let p = failed_pod_with_count("p", 0, 30, 0);
+        let r = remaining_time_per_index(now, Some(&p));
+        assert!(
+            r <= Duration::from_secs(600) && r > Duration::from_secs(598),
+            "{r:?}"
+        );
+        assert_eq!(remaining_time_per_index(now, None), Duration::ZERO);
     }
 }
