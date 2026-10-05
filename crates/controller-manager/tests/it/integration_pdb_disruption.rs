@@ -276,8 +276,31 @@ async fn test_pdb_with_scale_subresource() {
     );
     put_pdb(&storage, &pdb).await;
 
+    // A maxUnavailable budget sizes itself from the controller's scale
+    // (`getExpectedScale`), so the pods hang off a ReplicaSet of `replicas`.
+    let owner_uid = uuid::Uuid::new_v4().to_string();
+    storage
+        .create(
+            &build_key("replicasets", Some(ns), "rs"),
+            &serde_json::json!({
+                "apiVersion": "apps/v1", "kind": "ReplicaSet",
+                "metadata": { "name": "rs", "namespace": ns, "uid": owner_uid },
+                "spec": { "replicas": replicas },
+            }),
+        )
+        .await
+        .unwrap();
+
     for i in 0..replicas {
-        let pod = create_test_pod(&format!("pod-{}", i), ns, labels.clone());
+        let mut pod = create_test_pod(&format!("pod-{}", i), ns, labels.clone());
+        pod.metadata.owner_references = Some(vec![OwnerReference {
+            api_version: "apps/v1".to_string(),
+            kind: "ReplicaSet".to_string(),
+            name: "rs".to_string(),
+            uid: owner_uid.clone(),
+            block_owner_deletion: None,
+            controller: Some(true),
+        }]);
         put_pod(&storage, &pod).await;
     }
 
