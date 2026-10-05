@@ -711,11 +711,12 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
 
         let key = build_key("replicasets", Some(namespace), &replicaset.metadata.name);
 
-        // Re-read from storage for fresh resourceVersion to avoid CAS conflicts
-        let mut updated_rs: ReplicaSet = match self.storage.get(&key).await {
-            Ok(rs) => rs,
-            Err(_) => replicaset.clone(),
-        };
+        // Base the write on the object this sync read, not a fresh re-read:
+        // upstream `updateReplicaSetStatus`
+        // (pkg/controller/replicaset/replica_set_utils.go) copies the rs it was
+        // handed and calls `UpdateStatus` on it, so the resourceVersion
+        // precondition covers the pod list the counts came from.
+        let mut updated_rs: ReplicaSet = replicaset.clone();
 
         // Manage the `ReplicaFailure` condition: keep any conditions of other
         // types (user/test-set), drop our previous ReplicaFailure, and re-add
@@ -761,12 +762,16 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         if updated_rs.status != new_status {
             updated_rs.status = new_status;
 
-            // Status subresource write: through the api-server a full-object PUT
-            // strips `.status`, so status must go via update_status — which also
-            // does its own CAS read-modify-write, making the old manual
-            // re-read-and-retry redundant.
-            if let Err(e) = self.storage.update_status(&key, &updated_rs).await {
-                debug!("RS status update failed: {}", e);
+            // Status subresource write, conditional on `replicaset`'s
+            // resourceVersion (`update_status_cas`, #2153). A Conflict is
+            // returned, not dropped: the worker requeues the key rate-limited
+            // and the next sync recomputes from fresh state (upstream
+            // `syncReplicaSet` returns the `updateReplicaSetStatus` error, and
+            // the workqueue retries). NotFound means deleted mid-sync: done.
+            match self.storage.update_status_cas(&key, &updated_rs).await {
+                Ok(_) => {}
+                Err(rusternetes_common::Error::NotFound(_)) => {}
+                Err(e) => return Err(e),
             }
         }
 
@@ -1020,6 +1025,9 @@ mod tests {
         assert!(cond.message.as_deref().unwrap_or("").contains("quota"));
 
         // Failure resolved → ReplicaFailure cleared.
+        // A status write is conditional on the resourceVersion of the object it
+        // was handed (#2153), so the second sync re-reads like a worker would.
+        let rs: ReplicaSet = storage.get(&rs_key).await.unwrap();
         controller.update_status(&rs, 1, 1, 1, None).await.unwrap();
         let after2: ReplicaSet = storage.get(&rs_key).await.unwrap();
         let has_rf = after2

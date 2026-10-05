@@ -858,8 +858,12 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
             return Ok(());
         }
 
-        // Status subresource write: a full-object PUT strips `.status` (#1723).
-        self.storage.update_status(&key, &updated_hpa).await?;
+        // Status subresource write (a full-object PUT strips `.status`,
+        // #1723), conditional on the resourceVersion of the HPA this sync read:
+        // upstream `updateStatus` (pkg/controller/podautoscaler/horizontal.go)
+        // is `UpdateStatus` on `hpa.DeepCopy()`. A Conflict propagates so the
+        // worker requeues rate-limited (#2153).
+        self.storage.update_status_cas(&key, &updated_hpa).await?;
         debug!("Updated HPA status: {}/{}", namespace, hpa.metadata.name);
 
         Ok(())
@@ -909,8 +913,8 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
             conditions: Some(conditions),
         });
 
-        // Status subresource write: a full-object PUT strips `.status` (#1723).
-        self.storage.update_status(&key, &updated_hpa).await?;
+        // Same conditional status write as the success path (#2153).
+        self.storage.update_status_cas(&key, &updated_hpa).await?;
         debug!(
             "Updated HPA status with error: {}/{}",
             namespace, hpa.metadata.name

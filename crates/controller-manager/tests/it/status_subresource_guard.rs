@@ -54,7 +54,7 @@ fn offenders() -> BTreeSet<String> {
         let src = fs::read_to_string(&path).expect("read controller source");
 
         let assigns_status = src.contains("status = Some(");
-        let writes_status = src.contains("update_status(");
+        let writes_status = src.contains("update_status(") || src.contains("update_status_cas(");
         if assigns_status && !writes_status && !ALLOWED.iter().any(|(f, _)| *f == name) {
             out.insert(name);
         }
