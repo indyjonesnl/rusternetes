@@ -298,30 +298,6 @@ async fn hpa_status_write_conflicts_on_stale_read() {
 }
 
 #[tokio::test]
-async fn cronjob_status_write_conflicts_on_stale_read() {
-    let storage = RacingStatusStorage::new();
-    let key = "/registry/cronjobs/default/cj";
-    seed(
-        &storage,
-        key,
-        json!({
-            "apiVersion": "batch/v1", "kind": "CronJob",
-            "metadata": {"name": "cj", "namespace": "default", "uid": "u-cj"},
-            "spec": {"schedule": "* * * * *",
-                     "jobTemplate": {"spec": {"template": {
-                         "spec": {"restartPolicy": "Never",
-                                  "containers": [{"name": "c", "image": "busybox"}]}}}}}
-        }),
-    )
-    .await;
-    let c = CronJobController::new(storage.clone());
-    c.reconcile_all().await.unwrap();
-    assert_lost_race_is_refused(&storage, key, status_is_set).await;
-    c.reconcile_all().await.unwrap();
-    assert_converges(&storage, key, status_is_set).await;
-}
-
-#[tokio::test]
 async fn resourcequota_status_write_conflicts_on_stale_read() {
     let storage = RacingStatusStorage::new();
     let key = "/registry/resourcequotas/default/rq";

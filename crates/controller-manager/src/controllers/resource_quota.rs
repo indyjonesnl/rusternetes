@@ -395,15 +395,19 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
         // that cause resourceVersion conflicts with concurrent test PATCH operations
         if quota.status != new_status {
             let key = build_key("resourcequotas", Some(namespace), quota_name);
-            // Write the status SUBRESOURCE only. `update_status` re-reads the
-            // current object and grafts just `.status` onto it under a CAS
-            // retry, so this reconcile — which computed status from a possibly
-            // stale list snapshot — can never write a stale spec back. Writing
-            // the whole object here would revert a spec the client just updated
-            // (the ResourceQuota update+delete conformance flake, #268).
+            // Write the status SUBRESOURCE only, conditional on the
+            // resourceVersion of the quota this reconcile read (#2153):
+            // upstream `syncResourceQuota`
+            // (pkg/controller/resourcequota/resource_quota_controller.go) calls
+            // `UpdateStatus` on a copy of the quota it computed usage for. The
+            // status is derived from a possibly stale list snapshot, so a quota
+            // changed since conflicts and the worker requeues it rate-limited,
+            // rather than writing usage computed against the old spec. Only
+            // `.status` is ever applied, so a stale spec can never be written
+            // back (the update+delete conformance flake, #268).
             let mut desired = quota.clone();
             desired.status = new_status;
-            match self.storage.update_status(&key, &desired).await {
+            match self.storage.update_status_cas(&key, &desired).await {
                 Ok(_) => debug!("Updated quota {}/{} status", namespace, quota_name),
                 // Deleted concurrently (e.g. a DeleteCollection racing this
                 // reconcile): nothing to update, and update_status never

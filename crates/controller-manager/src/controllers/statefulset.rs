@@ -951,9 +951,14 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         if statefulset.status != new_status {
             statefulset.status = new_status;
             let key = format!("/registry/statefulsets/{}/{}", namespace, name);
-            // Status subresource: a full-object PUT strips `.status` through the
-            // api-server, so write status via update_status.
-            self.storage.update_status(&key, statefulset).await?;
+            // Status subresource (a full-object PUT strips `.status` through
+            // the api-server), conditional on the resourceVersion of the
+            // StatefulSet this sync read: upstream `updateStatefulSetStatus`
+            // (pkg/controller/statefulset/stateful_set_control.go) writes
+            // through `statusUpdater.UpdateStatefulSetStatus` -> `UpdateStatus`
+            // on the set it was handed. A Conflict propagates so the worker
+            // requeues rate-limited (#2153).
+            self.storage.update_status_cas(&key, statefulset).await?;
         }
 
         // Ensure a ControllerRevision exists for the current template revision

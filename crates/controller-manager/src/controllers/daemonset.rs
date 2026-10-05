@@ -869,9 +869,13 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         if daemonset.status != new_status {
             daemonset.status = new_status;
             let key = format!("/registry/daemonsets/{}/{}", namespace, name);
-            // Status subresource: a full-object PUT strips `.status` through the
-            // api-server, so write status via update_status.
-            self.storage.update_status(&key, daemonset).await?;
+            // Status subresource (a full-object PUT strips `.status` through
+            // the api-server), conditional on the resourceVersion of the
+            // DaemonSet this sync read: upstream `updateDaemonSetStatus`
+            // (pkg/controller/daemon/daemon_controller.go) calls
+            // `UpdateStatus` on the ds it was handed. A Conflict propagates so
+            // the worker requeues rate-limited (#2153).
+            self.storage.update_status_cas(&key, daemonset).await?;
         }
 
         Ok(())

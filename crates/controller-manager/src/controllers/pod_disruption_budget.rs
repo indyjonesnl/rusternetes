@@ -1433,8 +1433,12 @@ impl<S: Storage + 'static> StalePodDisruptionController<S> {
             cond.observed_generation = generation;
         }
         // Pod conditions live in status, so this goes through the status
-        // subresource (#1712/#1723).
-        self.storage.update_status(&pod_key, &new_pod).await?;
+        // subresource (#1712/#1723). Conditional on the resourceVersion of the
+        // pod read above, as upstream's `UpdateStatus(newPod)` is (registry
+        // `Store.Update` precondition): a pod changed since (e.g. already
+        // terminating) conflicts, and the worker requeues it rate-limited
+        // (`stalePodDisruptionWorker`, disruption.go) instead of overwriting.
+        self.storage.update_status_cas(&pod_key, &new_pod).await?;
         info!("Reset stale DisruptionTarget condition to False on pod {key}");
         Ok(())
     }

@@ -902,11 +902,11 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         let namespace = rc.metadata.namespace.as_deref().unwrap_or("default");
         let key = build_key("replicationcontrollers", Some(namespace), &rc.metadata.name);
 
-        // Re-read from storage for fresh resourceVersion to avoid CAS conflicts
-        let mut updated_rc: ReplicationController = match self.storage.get(&key).await {
-            Ok(rc) => rc,
-            Err(_) => rc.clone(),
-        };
+        // Base the write on the object this sync read (upstream
+        // `updateReplicationControllerStatus`,
+        // pkg/controller/replication/conversion.go, hands the rc to
+        // `UpdateStatus` and its resourceVersion is the precondition).
+        let mut updated_rc: ReplicationController = rc.clone();
 
         // Build conditions: preserve existing conditions of unknown types,
         // only manage "ReplicaFailure" condition type
@@ -961,27 +961,19 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             return Ok(());
         }
 
-        let new_status_clone = new_status.clone();
         updated_rc.status = Some(new_status);
 
-        // update_status, NOT update: a full-object PUT has its `.status`
+        // update_status_cas, NOT update: a full-object PUT has its `.status`
         // stripped by any api-server that exposes a status subresource (see
-        // crates/storage/src/api_storage.rs). Against a vanilla control plane
-        // every RC status write vanished — a Running single-replica RC reported
-        // `status={"replicas":0}` forever, so the lifecycle spec's watch for
-        // `replicas == readyReplicas == 1` timed out, the scale spec could not
-        // confirm its replica count, and the ReplicaFailure condition this
-        // function builds never reached the object. Same defect the PDB
-        // controller had in #1712.
-        if let Err(e) = self.storage.update_status(&key, &updated_rc).await {
-            // CAS conflict — re-read and retry once to ensure condition updates persist
-            debug!("RC status update CAS conflict, retrying: {}", e);
-            if let Ok(mut fresh_rc) = self.storage.get::<ReplicationController>(&key).await {
-                if fresh_rc.status.as_ref() != Some(&new_status_clone) {
-                    fresh_rc.status = Some(new_status_clone);
-                    let _ = self.storage.update_status(&key, &fresh_rc).await;
-                }
-            }
+        // crates/storage/src/api_storage.rs; #1712 class), and it must be
+        // conditional on the resourceVersion of the rc this sync read (#2153).
+        // A Conflict is returned so the worker requeues rate-limited, as
+        // upstream's `syncReplicationController` returns the status error to
+        // the workqueue; NotFound means deleted mid-sync.
+        match self.storage.update_status_cas(&key, &updated_rc).await {
+            Ok(_) => {}
+            Err(rusternetes_common::Error::NotFound(_)) => {}
+            Err(e) => return Err(e),
         }
 
         debug!(
