@@ -62,6 +62,40 @@ fn validate_pod_meta(pod: &Pod) -> ErrorList {
     )
 }
 
+/// `applySchedulingGatedCondition` (strategy.go:929-947): a new pod with
+/// scheduling gates and no `PodScheduled` condition gets
+/// `PodScheduled=False, reason SchedulingGated`.
+fn apply_scheduling_gated_condition(pod: &mut Pod) {
+    let gated = pod
+        .spec
+        .as_ref()
+        .is_some_and(|s| s.scheduling_gates.as_ref().is_some_and(|g| !g.is_empty()));
+    if !gated {
+        return;
+    }
+    let status = pod.status.get_or_insert_with(Default::default);
+    if status
+        .conditions
+        .iter()
+        .flatten()
+        .any(|c| c.condition_type == "PodScheduled")
+    {
+        return;
+    }
+    update_pod_condition(
+        status,
+        PodCondition {
+            condition_type: "PodScheduled".to_string(),
+            status: "False".to_string(),
+            reason: Some("SchedulingGated".to_string()),
+            message: Some("Scheduling is blocked due to non-empty scheduling gates".to_string()),
+            last_probe_time: None,
+            last_transition_time: None,
+            observed_generation: None,
+        },
+    );
+}
+
 /// `updatePodGeneration` (strategy.go:230-236): the generation moves when the
 /// spec does.
 fn update_pod_generation(new: &mut Pod, old: &Pod) {
@@ -114,6 +148,8 @@ impl RestCreateStrategy<Pod> for Strategy {
             qos_class: Some(qos.as_str().to_string()),
             ..Default::default()
         });
+        rusternetes_common::pod_drop_disabled::drop_disabled_pod_fields(obj, None);
+        apply_scheduling_gated_condition(obj);
     }
 
     /// strategy.go:111-116: `ValidatePodCreate`.
@@ -131,12 +167,16 @@ impl RestCreateStrategy<Pod> for Strategy {
     fn warnings_on_create(&self, _ctx: &RequestContext, obj: &Pod) -> Vec<String> {
         let msgs = is_dns1123_label(&obj.metadata.name);
         if msgs.is_empty() {
-            return Vec::new();
+            return rusternetes_common::pod_warnings::get_warnings_for_pod(obj, None);
         }
-        vec![format!(
+        let mut warnings = vec![format!(
             "metadata.name: this is used in the Pod's hostname, which can result in surprising behavior; a DNS label is recommended: [{}]",
             msgs.join(" ")
-        )]
+        )];
+        warnings.extend(rusternetes_common::pod_warnings::get_warnings_for_pod(
+            obj, None,
+        ));
+        warnings
     }
 }
 
@@ -149,6 +189,7 @@ impl RestUpdateStrategy<Pod> for Strategy {
     /// strategy.go:103-109: the main resource never writes status.
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut Pod, old: &Pod) {
         obj.status = old.status.clone();
+        rusternetes_common::pod_drop_disabled::drop_disabled_pod_fields(obj, Some(old));
         update_pod_generation(obj, old);
     }
 
@@ -289,6 +330,7 @@ impl RestUpdateStrategy<Pod> for StatusStrategy {
         }
 
         preserve_old_observed_generation(obj, old);
+        rusternetes_common::pod_drop_disabled::drop_disabled_pod_fields(obj, Some(old));
     }
 
     /// strategy.go:263-271: `ValidatePodStatusUpdate`.
@@ -351,6 +393,7 @@ impl RestUpdateStrategy<Pod> for EphemeralContainersStrategy {
         }
         obj.status = old.status.clone();
         reset_object_meta_for_status(&mut obj.metadata, &old.metadata);
+        rusternetes_common::pod_drop_disabled::drop_disabled_pod_fields(obj, Some(old));
         update_pod_generation(obj, old);
     }
 
@@ -491,6 +534,7 @@ impl RestUpdateStrategy<Pod> for ResizeStrategy {
     /// `status.resize = Proposed` the kubelet reads (KEP-1287).
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut Pod, old: &Pod) {
         drop_non_resize_updates(obj, old);
+        rusternetes_common::pod_drop_disabled::drop_disabled_pod_fields(obj, Some(old));
         update_pod_generation(obj, old);
         if container_resources_changed(old, obj) {
             if let Some(status) = obj.status.as_mut() {
