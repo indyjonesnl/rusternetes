@@ -180,7 +180,7 @@ pub use pod::{
     VolumeProjection, WeightedPodAffinityTerm,
 };
 pub use policy::{
-    IntOrString, LimitRange, LimitRangeItem, LimitRangeSpec, PodDisruptionBudget,
+    Eviction, IntOrString, LimitRange, LimitRangeItem, LimitRangeSpec, PodDisruptionBudget,
     PodDisruptionBudgetCondition, PodDisruptionBudgetSpec, PodDisruptionBudgetStatus,
     PriorityClass, ResourceQuota, ResourceQuotaSpec, ResourceQuotaStatus, ScopeSelector,
     ScopedResourceSelectorRequirement,

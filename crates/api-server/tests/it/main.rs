@@ -193,6 +193,7 @@ mod pod_binding_target_kind_test;
 mod pod_container_decodes_when_absent_test;
 mod pod_delete_cas_retry_test;
 mod pod_enable_service_links_default_test;
+mod pod_eviction_store_test;
 mod pod_handler_test;
 mod pod_lifecycle_extended_test;
 mod pod_log_error_status_test;

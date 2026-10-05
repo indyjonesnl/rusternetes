@@ -20,6 +20,8 @@ pub mod label_selector;
 pub mod leader_election;
 pub mod observability;
 pub mod pagination;
+pub mod pdbhelper;
+pub mod podutil;
 pub mod protobuf;
 pub mod qos;
 pub mod quantity;

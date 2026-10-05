@@ -423,6 +423,116 @@ pub async fn create_binding(
     ))
 }
 
+/// POST `/eviction`: `EvictionREST.Create` as a named create
+/// (`handlers.CreateNamedResource`, create.go, over a `policy/v1` `Eviction`).
+pub async fn create_eviction(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    use crate::endpoints::handlers::admission::{Admission, CreateValidation};
+    use rusternetes_common::admission::Operation;
+    use rusternetes_common::resources::Eviction;
+    use rusternetes_common::Error;
+
+    info!("Creating eviction for pod {}/{}", namespace, name);
+    let scope = scope(&state, Some("eviction"));
+    endpoints::authorize(
+        &state,
+        &auth_ctx.user,
+        "create",
+        &scope.resource,
+        scope.subresource,
+        Some(&namespace),
+        Some(&name),
+    )
+    .await?;
+
+    let options = CreateOptions {
+        field_manager: params.get("fieldManager").cloned(),
+        dry_run: endpoints::dry_run_param(&params),
+        field_validation: params.get("fieldValidation").cloned(),
+    };
+    let errs = validate_create_options(&options);
+    if !errs.is_empty() {
+        return Err(Error::Invalid(errs));
+    }
+    let dry_run = endpoints::is_dry_run(options.dry_run.as_deref());
+
+    // `EvictionREST.AcceptsGroupVersion` (eviction.go:87-95): both policy/v1
+    // and policy/v1beta1 bodies are acceptable.
+    let value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|_| decode_request_body::<Eviction>(&body).err().unwrap_or_else(|| {
+            Error::BadRequest("the request body is not valid JSON".to_string())
+        }))?;
+    if let Some(api_version) = value
+        .get("apiVersion")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+    {
+        if api_version != "policy/v1" && api_version != "policy/v1beta1" {
+            return Err(Error::BadRequest(format!(
+                "the API version in the data ({api_version}) does not match the expected API version (policy/v1)"
+            )));
+        }
+    }
+    let mut eviction: Eviction = decode_request_body(&body)?;
+    if eviction.type_meta.kind.is_empty() {
+        eviction.type_meta.kind = "Eviction".to_string();
+    }
+    if eviction.type_meta.api_version.is_empty() {
+        eviction.type_meta.api_version = "policy/v1".to_string();
+    }
+
+    let ctx = RequestContext::new(Some(&namespace))
+        .with_user(&auth_ctx.user)
+        .with_name(&name)
+        .with_group_version("policy", "v1");
+    crate::registry::rest::ensure_object_namespace_matches_request_namespace(
+        Some(&namespace),
+        &mut eviction.metadata,
+    )?;
+
+    let kind = GroupVersionKind {
+        group: "policy".to_string(),
+        version: "v1".to_string(),
+        kind: "Eviction".to_string(),
+    };
+    let admission = Admission {
+        state: &state,
+        kind: &kind,
+        resource: &scope.resource,
+        subresource: scope.subresource,
+        namespace: Some(&namespace),
+        user: &auth_ctx.user,
+        dry_run,
+    };
+    // Mutating admission, then the storage's create with validating
+    // admission as its callback (create.go:202-209).
+    let eviction = admission.admit(Operation::Create, eviction, None).await?;
+    let validation = CreateValidation {
+        admission: &admission,
+        authorize_create: false,
+    };
+    let status = pod::new_eviction_rest(state.storage.clone())
+        .create(&ctx, &name, eviction, Some(&validation), &options)
+        .await?;
+
+    // create.go:227-231: a result `Status` without a code is a 201; one with
+    // a code (the 500 for a pod under several budgets) is written as it is.
+    let code = status.code.unwrap_or(201);
+    let mut status = status;
+    status.code = Some(code);
+    Ok(endpoints::respond(
+        axum::http::StatusCode::from_u16(code)
+            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+        &status,
+        &ctx,
+    ))
+}
+
 /// `podtopologylabels.Plugin.admitBinding`
 /// (plugin/pkg/admission/podtopologylabels/admission.go): the node's
 /// topology labels go onto the Binding, and `BindingREST` copies them to the

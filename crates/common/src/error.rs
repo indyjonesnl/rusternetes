@@ -87,6 +87,15 @@ pub enum Error {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// An error that is an API `Status` of its own, upstream's
+    /// `*errors.StatusError`: the reason, code and `details` (causes,
+    /// `retryAfterSeconds`) are the constructor's, not derived from a variant.
+    /// Used where upstream builds a Status by hand, e.g. the eviction
+    /// subresource's `createTooManyRequestsError`
+    /// (`pkg/registry/core/pod/storage/eviction.go:413-421`).
+    #[error("{}", .0.message.as_deref().unwrap_or(""))]
+    Status(Box<crate::types::Status>),
 }
 
 /// Render an `ErrorList` upstream-style: one error per line joined by `; `.
@@ -119,6 +128,7 @@ impl Error {
             Error::UnsupportedMediaType(_) => "UnsupportedMediaType",
             Error::NotAcceptable(_) => "NotAcceptable",
             Error::Internal(_) => "InternalError",
+            Error::Status(status) => status.reason.as_deref().unwrap_or(""),
         }
     }
 }
@@ -137,7 +147,29 @@ impl axum::response::IntoResponse for Error {
         let mut continue_meta: Option<String> = None;
 
         // Extract resource name from error message for StatusDetails
+        // A hand-built Status is written as it is, with `Retry-After` taken
+        // from `details.retryAfterSeconds` (`responsewriters/writers.go:385`).
+        if let Error::Status(status_obj) = self {
+            let code = StatusCode::from_u16(status_obj.code.unwrap_or(500))
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let retry_after = status_obj
+                .details
+                .as_ref()
+                .and_then(|d| d.retry_after_seconds)
+                .filter(|s| *s > 0);
+            let mut response = (code, Json(*status_obj)).into_response();
+            if let Some(seconds) = retry_after {
+                if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::RETRY_AFTER, value);
+                }
+            }
+            return response;
+        }
+
         let (status, message, reason, details) = match self {
+            Error::Status(_) => unreachable!("handled above"),
             Error::NotFound(msg) => {
                 let (message, details) = resource_error_status(&msg, "not found");
                 (StatusCode::NOT_FOUND, message, "NotFound", details)
