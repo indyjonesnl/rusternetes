@@ -16,7 +16,8 @@ use rusternetes_common::resources::{Job, JobSpec, JobStatus};
 use rusternetes_common::types::LabelSelector;
 use rusternetes_common::validation::field::ErrorList;
 use rusternetes_common::validation::job::{
-    validate_job, validate_job_update, validate_job_update_status, JobValidationOptions,
+    get_status_validation_options, validate_job, validate_job_update, validate_job_update_status,
+    JobValidationOptions,
 };
 use rusternetes_common::validation::metav1::is_dns1123_label;
 use rusternetes_common::Result;
@@ -230,11 +231,10 @@ impl RestUpdateStrategy<Job> for StatusStrategy {
         obj.spec = old.spec.clone();
     }
 
-    /// `ValidateJobUpdateStatus` (strategy.go:340-346). The status
-    /// validation ports only the decreasing-counter rules of
-    /// `getStatusValidationOptions` (see `validate_job_status_update`).
+    /// `ValidateJobUpdateStatus` (strategy.go:340-346). Options
+    /// derive from the old and new objects (`get_status_validation_options`).
     fn validate_update(&self, _ctx: &RequestContext, obj: &Job, old: &Job) -> ErrorList {
-        validate_job_update_status(obj, old)
+        validate_job_update_status(obj, old, &get_status_validation_options(obj, old))
     }
 
     fn allow_unconditional_update(&self) -> bool {
