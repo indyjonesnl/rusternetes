@@ -648,7 +648,7 @@ impl<S: Storage + 'static> EndpointsController<S> {
             };
 
             // Check if pod is ready — if publishNotReadyAddresses, all go to ready
-            if publish_not_ready || self.is_pod_ready(pod) {
+            if publish_not_ready || rusternetes_common::podutil::is_pod_ready(pod) {
                 ready_addresses.push(address);
             } else {
                 not_ready_addresses.push(address);
@@ -720,7 +720,7 @@ impl<S: Storage + 'static> EndpointsController<S> {
                 let entry = port_groups
                     .entry(resolved_ports)
                     .or_insert_with(|| (Vec::new(), Vec::new()));
-                if self.is_pod_ready(pod) {
+                if rusternetes_common::podutil::is_pod_ready(pod) {
                     entry.0.push(address);
                 } else {
                     entry.1.push(address);
@@ -809,17 +809,6 @@ impl<S: Storage + 'static> EndpointsController<S> {
                 }
             })
         })
-    }
-
-    /// Check if a pod is ready by examining its conditions
-    fn is_pod_ready(&self, pod: &Pod) -> bool {
-        if let Some(conditions) = pod.status.as_ref().and_then(|s| s.conditions.as_ref()) {
-            conditions
-                .iter()
-                .any(|c| c.condition_type == "Ready" && c.status == "True")
-        } else {
-            false
-        }
     }
 }
 
@@ -996,7 +985,7 @@ mod tests {
             }),
             status: None,
         };
-        assert!(!controller.is_pod_ready(&pod_no_status));
+        assert!(!rusternetes_common::podutil::is_pod_ready(&pod_no_status));
 
         // Pod in Pending phase
         let pod_pending = Pod {
@@ -1022,7 +1011,7 @@ mod tests {
             }),
             ..pod_no_status.clone()
         };
-        assert!(!controller.is_pod_ready(&pod_pending));
+        assert!(!rusternetes_common::podutil::is_pod_ready(&pod_pending));
 
         // Pod with Ready condition = True
         let pod_ready = Pod {
@@ -1072,7 +1061,7 @@ mod tests {
             }),
             ..pod_no_status.clone()
         };
-        assert!(controller.is_pod_ready(&pod_ready));
+        assert!(rusternetes_common::podutil::is_pod_ready(&pod_ready));
 
         // Pod with Ready condition = False (not ready)
         let pod_not_ready = Pod {
@@ -1122,7 +1111,7 @@ mod tests {
             }),
             ..pod_no_status
         };
-        assert!(!controller.is_pod_ready(&pod_not_ready));
+        assert!(!rusternetes_common::podutil::is_pod_ready(&pod_not_ready));
     }
 
     /// Test that reconcile_all skips writing endpoints when nothing has changed.

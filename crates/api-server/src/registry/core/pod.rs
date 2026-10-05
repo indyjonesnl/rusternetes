@@ -29,7 +29,7 @@ use rusternetes_common::validation::objectmeta::{
 use rusternetes_common::Status;
 use rusternetes_storage::StorageBackend;
 
-use crate::registry::generic::Store;
+use crate::registry::generic::{Store, UpdateOptions};
 use crate::registry::rest::{
     reset_object_meta_for_status, DefaultUpdatedObjectInfo, GroupResource, NamespaceScopedStrategy,
     RequestContext, RestCreateStrategy, RestDeleteStrategy, RestGracefulDeleteStrategy,
@@ -1084,12 +1084,27 @@ impl PdbClient for StorePdbClient {
         namespace: &str,
         pdb: &rusternetes_common::resources::PodDisruptionBudget,
     ) -> rusternetes_common::Result<rusternetes_common::resources::PodDisruptionBudget> {
-        // The loopback `UpdateStatus` is a resourceVersion-guarded write of
-        // the status: `Storage::update_status_cas` conflicts when the PDB
-        // changed since it was read, which `RetryOnConflict` re-reads on.
-        use rusternetes_storage::{build_key, Storage};
-        let key = build_key("poddisruptionbudgets", Some(namespace), &pdb.metadata.name);
-        self.storage.update_status_cas(&key, pdb).await
+        // The loopback `UpdateStatus` (eviction.go:432, `PodDisruptionBudgets(ns).
+        // UpdateStatus`) is a PUT to `/status`: `Store.Update` on the status
+        // store (storage.go:60-62), so `podDisruptionBudgetStatusStrategy`
+        // runs -- `PrepareForUpdate` keeps the spec (strategy.go:156-161) and
+        // `ValidateUpdate` checks the status (:164-174). The object carries
+        // its `resourceVersion`, so a PDB changed since it was read is a
+        // Conflict, which `RetryOnConflict` re-reads on.
+        let info = DefaultUpdatedObjectInfo::new(Some(pdb.clone()), Vec::new());
+        let (updated, _) =
+            crate::registry::policy::poddisruptionbudget::new_status_store(self.storage.clone())
+                .update(
+                    &Self::ctx(namespace),
+                    &pdb.metadata.name,
+                    &info,
+                    None,
+                    None,
+                    false,
+                    &UpdateOptions::default(),
+                )
+                .await?;
+        Ok(updated)
     }
 }
 
