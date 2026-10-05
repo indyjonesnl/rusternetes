@@ -48,6 +48,96 @@ pub fn default_pod_requests_from_limits(spec: &mut PodSpec) {
     {
         default_container_requests_from_limits(container);
     }
+
+    // defaults.go:194-199 - "Pod Requests default values must be applied after
+    // container-level default values have been populated."
+    if crate::feature_gates::enabled(crate::feature_gates::Feature::PodLevelResources) {
+        default_huge_page_pod_limits(spec);
+        default_pod_level_requests(spec);
+    }
+}
+
+/// Port of upstream `defaultPodRequests` (`pkg/apis/core/v1/defaults.go:436-479`).
+///
+/// Only when pod-level limits are set (`len(Limits) == 0` returns early), a
+/// missing pod-level request is defaulted from (1) the aggregated container
+/// request, for overcommittable (native, non-hugepage) resources, then (2) the
+/// pod-level limit. This is what makes a pod carrying only
+/// `spec.resources.limits` Guaranteed.
+pub fn default_pod_level_requests(spec: &mut PodSpec) {
+    use crate::quota::{aggregate_container_resources, is_supported_pod_level_resource};
+
+    let Some(resources) = spec.resources.as_ref() else {
+        return;
+    };
+    let Some(limits) = resources.limits.clone().filter(|l| !l.is_empty()) else {
+        return;
+    };
+    let mut pod_reqs = resources.requests.clone().unwrap_or_default();
+
+    let pod = crate::resources::Pod::new("", spec.clone());
+    for (key, qty) in aggregate_container_resources(&pod, true) {
+        // IsOvercommitAllowed = IsNativeResource && !IsHugePageResourceName
+        // (pkg/apis/core/v1/helper/helpers.go:130-133).
+        if !pod_reqs.contains_key(&key)
+            && is_supported_pod_level_resource(&key)
+            && crate::quota::is_native_resource_name(&key)
+            && !crate::quota::is_hugepage_resource_name(&key)
+        {
+            pod_reqs.insert(key, qty.to_string());
+        }
+    }
+    for (key, lim) in &limits {
+        if !pod_reqs.contains_key(key) && is_supported_pod_level_resource(key) {
+            pod_reqs.insert(key.clone(), lim.clone());
+        }
+    }
+    if !pod_reqs.is_empty() {
+        if let Some(r) = spec.resources.as_mut() {
+            r.requests = Some(pod_reqs);
+        }
+    }
+}
+
+/// Port of upstream `defaultHugePagePodLimits` (`defaults.go:482-526`): when
+/// containers set a hugepages limit and the pod-level block (already partly
+/// specified) has neither that limit nor a request for it, the pod-level limit
+/// defaults to the aggregated container hugepages limit.
+pub fn default_huge_page_pod_limits(spec: &mut PodSpec) {
+    use crate::quota::{
+        aggregate_container_resources, is_hugepage_resource_name, is_supported_pod_level_resource,
+    };
+
+    let Some(resources) = spec.resources.as_ref() else {
+        return;
+    };
+    let has = |m: &Option<std::collections::HashMap<String, String>>| {
+        m.as_ref().is_some_and(|m| !m.is_empty())
+    };
+    if !has(&resources.limits) && !has(&resources.requests) {
+        return;
+    }
+    let mut pod_lims = resources.limits.clone().unwrap_or_default();
+
+    let pod = crate::resources::Pod::new("", spec.clone());
+    for (key, qty) in aggregate_container_resources(&pod, false) {
+        if !is_supported_pod_level_resource(&key) || !is_hugepage_resource_name(&key) {
+            continue;
+        }
+        if resources
+            .requests
+            .as_ref()
+            .is_some_and(|r| r.contains_key(&key))
+        {
+            continue;
+        }
+        pod_lims.entry(key).or_insert_with(|| qty.to_string());
+    }
+    if !pod_lims.is_empty() {
+        if let Some(r) = spec.resources.as_mut() {
+            r.limits = Some(pod_lims);
+        }
+    }
 }
 
 /// One container's share of [`default_pod_requests_from_limits`].

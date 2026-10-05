@@ -131,3 +131,123 @@ fn qos_class_strings_round_trip() {
     assert_eq!(QoSClass::from_status_str("besteffort"), None);
     assert_eq!(QoSClass::from_status_str(""), None);
 }
+
+// ---------------------------------------------------------------------------
+// PodLevelResources branch - upstream `ComputePodQOS`, qos.go:97-112, an
+// `if/else` against the container loop. With the gate on and `spec.resources`
+// set, the pod is classified from the pod-level block ONLY; the containers are
+// never consulted.
+// ---------------------------------------------------------------------------
+
+use rusternetes_common::feature_gates::{with_feature, Feature};
+
+/// Pod-level limits for both cpu and memory, containers declaring nothing.
+/// `SetDefaults_Pod` (defaults.go:196-199, `defaultPodRequests`) defaults the
+/// pod-level requests to the pod-level limits, so the pod is Guaranteed.
+#[test]
+#[serial_test::serial]
+fn pod_level_limits_only_is_guaranteed() {
+    let p = pod(json!({
+        "apiVersion": "v1", "kind": "Pod", "metadata": { "name": "pl-g" },
+        "spec": {
+            "resources": { "limits": { "cpu": "1", "memory": "1Gi" } },
+            "containers": [{ "name": "c", "image": "busybox" }],
+        },
+    }));
+    assert_eq!(compute_pod_qos(&p), QoSClass::Guaranteed);
+}
+
+/// Pod-level requests alone: no limits, so `isGuaranteed` stays true but
+/// `len(requests) != len(limits)` - Burstable.
+#[test]
+#[serial_test::serial]
+fn pod_level_requests_only_is_burstable() {
+    let p = pod(json!({
+        "apiVersion": "v1", "kind": "Pod", "metadata": { "name": "pl-b" },
+        "spec": {
+            "resources": { "requests": { "cpu": "1", "memory": "1Gi" } },
+            "containers": [{ "name": "c", "image": "busybox" }],
+        },
+    }));
+    assert_eq!(compute_pod_qos(&p), QoSClass::Burstable);
+}
+
+/// Pod-level limits missing memory: `!qosLimitResources.HasAll(memory, cpu)`
+/// (qos.go:107-109) forfeits Guaranteed.
+#[test]
+#[serial_test::serial]
+fn pod_level_limits_missing_memory_is_burstable() {
+    let p = pod(json!({
+        "apiVersion": "v1", "kind": "Pod", "metadata": { "name": "pl-cpu" },
+        "spec": {
+            "resources": { "limits": { "cpu": "1" } },
+            "containers": [{ "name": "c", "image": "busybox" }],
+        },
+    }));
+    assert_eq!(compute_pod_qos(&p), QoSClass::Burstable);
+}
+
+/// The branch is `if/else`, not additive: container resources are IGNORED when
+/// `spec.resources` is set. The containers here are individually Guaranteed,
+/// but the pod-level block only carries a cpu request, so the pod is Burstable.
+#[test]
+#[serial_test::serial]
+fn pod_level_branch_ignores_container_resources() {
+    let p = pod(json!({
+        "apiVersion": "v1", "kind": "Pod", "metadata": { "name": "pl-ignore" },
+        "spec": {
+            "resources": { "requests": { "cpu": "1" } },
+            "containers": [{
+                "name": "c", "image": "busybox",
+                "resources": {
+                    "limits":   { "cpu": "1", "memory": "1Gi" },
+                    "requests": { "cpu": "1", "memory": "1Gi" },
+                },
+            }],
+        },
+    }));
+    assert_eq!(compute_pod_qos(&p), QoSClass::Burstable);
+}
+
+/// A present-but-empty `spec.resources` still takes the branch (`!= nil`), so
+/// the pod is BestEffort even though its container is Guaranteed.
+#[test]
+#[serial_test::serial]
+fn empty_pod_level_resources_is_best_effort_despite_containers() {
+    let p = pod(json!({
+        "apiVersion": "v1", "kind": "Pod", "metadata": { "name": "pl-empty" },
+        "spec": {
+            "resources": {},
+            "containers": [{
+                "name": "c", "image": "busybox",
+                "resources": {
+                    "limits":   { "cpu": "1", "memory": "1Gi" },
+                    "requests": { "cpu": "1", "memory": "1Gi" },
+                },
+            }],
+        },
+    }));
+    assert_eq!(compute_pod_qos(&p), QoSClass::BestEffort);
+}
+
+/// With the gate off the pod-level block is not consulted and the container
+/// loop runs (qos.go:97 `Enabled(PodLevelResources) &&`).
+#[test]
+#[serial_test::serial]
+fn gate_off_falls_back_to_the_container_loop() {
+    let _gate = with_feature(Feature::PodLevelResources, false);
+    let p = pod(json!({
+        "apiVersion": "v1", "kind": "Pod", "metadata": { "name": "pl-off" },
+        "spec": {
+            "resources": { "requests": { "cpu": "1" } },
+            "containers": [{
+                "name": "c", "image": "busybox",
+                "resources": {
+                    "limits":   { "cpu": "1", "memory": "1Gi" },
+                    "requests": { "cpu": "1", "memory": "1Gi" },
+                },
+            }],
+        },
+    }));
+    assert_eq!(compute_pod_qos(&p), QoSClass::Guaranteed);
+}

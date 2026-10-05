@@ -17,6 +17,7 @@
 //! this module (kubelet status, kubelet eviction, api-server create) and all
 //! three disagreed.
 
+use crate::feature_gates::{enabled, Feature};
 use crate::quantity::Quantity;
 use crate::resources::Pod;
 use std::collections::HashMap;
@@ -133,9 +134,15 @@ pub fn get_pod_qos(pod: &Pod) -> QoSClass {
 /// corrected instead of echoed forever. Both answers agree for any pod whose
 /// class was computed by this port.
 ///
-/// Pod-level resources (`spec.resources`, the `PodLevelResources` branch at
-/// qos.go:95-110) are **not** implemented: rusternetes has no such feature gate
-/// yet, so the container loop is always the one that runs.
+/// ## Pod-level resources
+///
+/// With the `PodLevelResources` gate on (beta, default on in v1.35,
+/// `kube_features.go:1612`) and `spec.resources` set, the first branch
+/// (qos.go:97-111) classifies from the pod-level block only and never looks at
+/// the containers. Its input is the *defaulted* pod-level block:
+/// `SetDefaults_Pod` runs `defaultPodRequests` under the same gate
+/// (defaults.go:196-199), ported as
+/// [`crate::defaults::default_pod_level_requests`].
 ///
 /// ## The requests-from-limits step
 ///
@@ -160,28 +167,52 @@ pub fn compute_pod_qos(pod: &Pod) -> QoSClass {
     let mut limits: HashMap<&'static str, i128> = HashMap::new();
     let mut is_guaranteed = true;
 
-    for container in spec
-        .containers
-        .iter()
-        .chain(spec.init_containers.iter().flatten())
-    {
-        let mut container = container.clone();
-        crate::defaults::default_container_requests_from_limits(&mut container);
-        let resources = container.resources.as_ref();
-
+    // qos.go:97-98: with the gate on and `spec.resources` set, the pod is
+    // classified from the pod-level block ONLY (an `if/else`, not additive).
+    if enabled(Feature::PodLevelResources) && spec.resources.is_some() {
+        // Re-apply SetDefaults_Pod's pod-level pass to a local copy (see the
+        // requests-from-limits note above): a limits-only `spec.resources`
+        // carries no requests until `defaultPodRequests` fills them.
+        let mut defaulted = spec.clone();
+        crate::defaults::default_pod_requests_from_limits(&mut defaulted);
+        let resources = defaulted.resources.as_ref();
+        // qos.go:99-102
         if let Some(map) = resources.and_then(|r| r.requests.as_ref()) {
             process_resource_list(map, &mut requests);
         }
-
-        let mut qos_limits_found = 0u8;
-        if let Some(map) = resources.and_then(|r| r.limits.as_ref()) {
-            for name in process_resource_list(map, &mut limits) {
-                qos_limits_found |= if name == "cpu" { 1 } else { 2 };
+        // qos.go:104-111: `!qosLimitResources.HasAll(memory, cpu)`
+        if let Some(map) = resources
+            .and_then(|r| r.limits.as_ref())
+            .filter(|m| !m.is_empty())
+        {
+            if process_resource_list(map, &mut limits).len() != 2 {
+                is_guaranteed = false;
             }
         }
-        // `!qosLimitsFound.HasAll(memory, cpu)` — both bits, or not Guaranteed.
-        if qos_limits_found != 3 {
-            is_guaranteed = false;
+    } else {
+        for container in spec
+            .containers
+            .iter()
+            .chain(spec.init_containers.iter().flatten())
+        {
+            let mut container = container.clone();
+            crate::defaults::default_container_requests_from_limits(&mut container);
+            let resources = container.resources.as_ref();
+
+            if let Some(map) = resources.and_then(|r| r.requests.as_ref()) {
+                process_resource_list(map, &mut requests);
+            }
+
+            let mut qos_limits_found = 0u8;
+            if let Some(map) = resources.and_then(|r| r.limits.as_ref()) {
+                for name in process_resource_list(map, &mut limits) {
+                    qos_limits_found |= if name == "cpu" { 1 } else { 2 };
+                }
+            }
+            // `!qosLimitsFound.HasAll(memory, cpu)`: both bits, or not Guaranteed.
+            if qos_limits_found != 3 {
+                is_guaranteed = false;
+            }
         }
     }
 
