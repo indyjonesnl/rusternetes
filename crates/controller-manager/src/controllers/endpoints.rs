@@ -913,11 +913,8 @@ mod tests {
         assert!(!controller.pod_matches_selector(&pod, &selector));
     }
 
-    #[tokio::test]
-    async fn test_is_pod_ready() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = EndpointsController { storage };
-
+    #[test]
+    fn test_is_pod_ready() {
         // Pod without status
         let pod_no_status = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
