@@ -10,10 +10,10 @@
 //! not in the PDB controller. The controller only maintains status.
 
 use rusternetes_common::resources::{
-    pod::{Container, Pod, PodSpec, PodStatus},
+    pod::{Container, Pod, PodCondition, PodSpec, PodStatus},
     IntOrString, PodDisruptionBudget, PodDisruptionBudgetSpec,
 };
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
+use rusternetes_common::types::{LabelSelector, ObjectMeta, OwnerReference, Phase, TypeMeta};
 use rusternetes_controller_manager::controllers::pod_disruption_budget::PodDisruptionBudgetController;
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
@@ -21,6 +21,36 @@ use std::sync::Arc;
 
 async fn setup_test() -> Arc<MemoryStorage> {
     Arc::new(MemoryStorage::new())
+}
+
+/// Store a ReplicaSet of `replicas` and return the controller ownerReference
+/// pods use to point at it. A maxUnavailable budget and a percentage budget
+/// size themselves from the controllers' scale (`getExpectedScale`,
+/// `pkg/controller/disruption/disruption.go:860`), so their pods need one;
+/// ownerless pods are "unmanaged" and contribute nothing.
+async fn replica_set_owner(
+    storage: &Arc<MemoryStorage>,
+    name: &str,
+    replicas: i32,
+) -> OwnerReference {
+    let uid = uuid::Uuid::new_v4().to_string();
+    let rs = serde_json::json!({
+        "apiVersion": "apps/v1", "kind": "ReplicaSet",
+        "metadata": { "name": name, "namespace": "default", "uid": uid },
+        "spec": { "replicas": replicas },
+    });
+    storage
+        .create(&build_key("replicasets", Some("default"), name), &rs)
+        .await
+        .unwrap();
+    OwnerReference {
+        api_version: "apps/v1".to_string(),
+        kind: "ReplicaSet".to_string(),
+        name: name.to_string(),
+        uid,
+        block_owner_deletion: None,
+        controller: Some(true),
+    }
 }
 
 fn create_test_pod(
@@ -134,7 +164,18 @@ fn create_test_pod(
             nominated_node_name: None,
             qos_class: None,
             start_time: None,
-            conditions: None,
+            // Health is the Ready condition (apipod.IsPodReady), not the phase.
+            conditions: is_healthy.then(|| {
+                vec![PodCondition {
+                    condition_type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: None,
+                    message: None,
+                    last_probe_time: None,
+                    last_transition_time: None,
+                    observed_generation: None,
+                }]
+            }),
             container_statuses: None,
             init_container_statuses: None,
             ephemeral_container_statuses: None,
@@ -215,13 +256,15 @@ async fn test_pdb_calculates_status_with_max_unavailable() {
     storage.create(&pdb_key, &pdb).await.unwrap();
 
     // Create 5 healthy pods
+    let owner = replica_set_owner(&storage, "api-rs", 5).await;
     for i in 0..5 {
-        let pod = create_test_pod(
+        let mut pod = create_test_pod(
             &format!("api-{}", i),
             "default",
             HashMap::from([("app".to_string(), "api".to_string())]),
             true,
         );
+        pod.metadata.owner_references = Some(vec![owner.clone()]);
         let pod_key = build_key("pods", Some("default"), &format!("api-{}", i));
         storage.create(&pod_key, &pod).await.unwrap();
     }
@@ -427,13 +470,15 @@ async fn test_pdb_percentage_min_available() {
     storage.create(&pdb_key, &pdb).await.unwrap();
 
     // Create 10 healthy pods
+    let owner = replica_set_owner(&storage, "cache-rs", 10).await;
     for i in 0..10 {
-        let pod = create_test_pod(
+        let mut pod = create_test_pod(
             &format!("cache-{}", i),
             "default",
             HashMap::from([("app".to_string(), "cache".to_string())]),
             true,
         );
+        pod.metadata.owner_references = Some(vec![owner.clone()]);
         let pod_key = build_key("pods", Some("default"), &format!("cache-{}", i));
         storage.create(&pod_key, &pod).await.unwrap();
     }
@@ -475,13 +520,15 @@ async fn test_pdb_percentage_max_unavailable() {
     storage.create(&pdb_key, &pdb).await.unwrap();
 
     // Create 10 healthy pods
+    let owner = replica_set_owner(&storage, "worker-rs", 10).await;
     for i in 0..10 {
-        let pod = create_test_pod(
+        let mut pod = create_test_pod(
             &format!("worker-{}", i),
             "default",
             HashMap::from([("component".to_string(), "worker".to_string())]),
             true,
         );
+        pod.metadata.owner_references = Some(vec![owner.clone()]);
         let pod_key = build_key("pods", Some("default"), &format!("worker-{}", i));
         storage.create(&pod_key, &pod).await.unwrap();
     }

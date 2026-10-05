@@ -150,7 +150,8 @@ async fn verify(
             desired_healthy,
             expected_pods
         ),
-        "(disruptionsAllowed, currentHealthy, desiredHealthy, expectedPods) mismatch"
+        "(disruptionsAllowed, currentHealthy, desiredHealthy, expectedPods) mismatch; conditions: {:?}",
+        status.conditions
     );
     assert_eq!(
         status.observed_generation, pdb.metadata.generation,
@@ -443,7 +444,7 @@ async fn scale_resource_supplies_expected_pods() {
     .await
     .unwrap();
     let cr = custom_resource(Some(replicas));
-    put(&s, "custom.k8s.io_customresources", "cr", &cr).await;
+    put(&s, "custom_k8s_io_customresources", "cr", &cr).await;
     put_pdb(&s, &max_unavailable(json!(max_unavail))).await;
     for i in 0..pods {
         put(
@@ -509,7 +510,7 @@ async fn scale_finder_resource_without_scale_subresource_is_an_error() {
     .unwrap();
     put_pdb(&s, &max_unavailable(json!(1))).await;
     let cr = custom_resource(Some(3));
-    put(&s, "custom.k8s.io_customresources", "cr", &cr).await;
+    put(&s, "custom_k8s_io_customresources", "cr", &cr).await;
     put(&s, "pods", "p", &owned_by(pod("p"), &cr)).await;
     sync(&s).await;
     let msg = sync_failed_message(&s).await.expect("sync fails safe");
@@ -535,7 +536,7 @@ async fn scale_resource_with_unset_spec_replicas_reads_as_zero() {
     .await
     .unwrap();
     let cr = custom_resource(None);
-    put(&s, "custom.k8s.io_customresources", "cr", &cr).await;
+    put(&s, "custom_k8s_io_customresources", "cr", &cr).await;
     put_pdb(&s, &max_unavailable(json!(1))).await;
     put(&s, "pods", "p", &owned_by(pod("p"), &cr)).await;
     sync(&s).await;
@@ -812,7 +813,20 @@ async fn invalid_selectors_fail_safe() {
         put_pdb(&s, &pdb).await;
         put(&s, "pods", "p", &pod("p")).await;
         sync(&s).await;
-        verify(&s, 0, 0, 0, 0).await;
+        // failSafe only zeroes disruptionsAllowed and sets SyncFailed; the other
+        // counters keep their (zero) values. observedGeneration is NOT advanced
+        // (upstream's PDB has generation 0 so `VerifyPdbStatus` cannot see it).
+        let status = pdb_now(&s).await.status.expect("failSafe writes a status");
+        assert_eq!(
+            (
+                status.disruptions_allowed,
+                status.current_healthy,
+                status.desired_healthy,
+                status.expected_pods
+            ),
+            (0, 0, 0, 0),
+            "{name}"
+        );
         assert!(
             sync_failed_message(&s).await.is_some(),
             "{name}: an unusable selector must fail safe"
@@ -1237,4 +1251,95 @@ async fn status_write_from_a_stale_read_does_not_clobber_a_concurrent_eviction()
         .disrupted_pods
         .unwrap_or_default()
         .contains_key("larry"));
+}
+
+// ---------------------------------------------------------------------------
+// TestStalePodDisruption: the parts the pod-event wiring adds
+// (`nonTerminatingPodHasStaleDisruptionCondition`, disruption.go:1046-1062)
+// ---------------------------------------------------------------------------
+fn pod_with_disruption_target(name: &str, phase: &str, reason: Option<&str>) -> Value {
+    let mut cond = json!({
+        "type": "DisruptionTarget", "status": "True", "message": "evicting",
+        "lastTransitionTime": "2020-01-01T00:00:00Z",
+    });
+    if let Some(r) = reason {
+        cond["reason"] = json!(r);
+    }
+    let mut p = pod(name);
+    p["status"] = json!({ "phase": phase, "conditions": [cond] });
+    p
+}
+
+async fn disruption_target(s: &Arc<MemoryStorage>, name: &str) -> Value {
+    let p: Value = s.get(&build_key("pods", Some(NS), name)).await.unwrap();
+    p["status"]["conditions"][0].clone()
+}
+
+#[tokio::test]
+async fn stale_disruption_target_is_reset_on_any_non_terminal_phase_and_loses_its_reason() {
+    use rusternetes_controller_manager::controllers::pod_disruption_budget::StalePodDisruptionController;
+    let s = storage();
+    // Upstream is not limited to Running: a Pending pod is non-terminal too.
+    put(
+        &s,
+        "pods",
+        "pending",
+        &pod_with_disruption_target("pending", "Pending", Some("DeletionByTaintManager")),
+    )
+    .await;
+    // Terminal phases and kubelet-set conditions are never stale.
+    put(
+        &s,
+        "pods",
+        "succeeded",
+        &pod_with_disruption_target("succeeded", "Succeeded", None),
+    )
+    .await;
+    put(
+        &s,
+        "pods",
+        "kubelet",
+        &pod_with_disruption_target("kubelet", "Running", Some("TerminationByKubelet")),
+    )
+    .await;
+
+    StalePodDisruptionController::new(s.clone())
+        .reconcile_all()
+        .await
+        .unwrap();
+
+    let c = disruption_target(&s, "pending").await;
+    assert_eq!(c["status"], "False");
+    // apipod.UpdatePodCondition replaces the whole condition.
+    assert!(
+        c.get("reason").is_none() && c.get("message").is_none(),
+        "{c}"
+    );
+    assert_eq!(disruption_target(&s, "succeeded").await["status"], "True");
+    assert_eq!(disruption_target(&s, "kubelet").await["status"], "True");
+}
+
+#[tokio::test]
+async fn stale_disruption_target_is_reset_by_the_pod_watch_without_a_resync() {
+    use rusternetes_controller_manager::controllers::pod_disruption_budget::StalePodDisruptionController;
+    let s = storage();
+    let controller = Arc::new(StalePodDisruptionController::with_timeout(
+        s.clone(),
+        Duration::from_millis(100),
+    ));
+    let handle = tokio::spawn(controller.run());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut p = pod_with_disruption_target("late", "Running", None);
+    p["status"]["conditions"][0]["lastTransitionTime"] =
+        json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    put(&s, "pods", "late", &p).await;
+
+    let s2 = s.clone();
+    eventually("the condition is reset once it goes stale", 8, || {
+        let s = s2.clone();
+        async move { disruption_target(&s, "late").await["status"] == "False" }
+    })
+    .await;
+    handle.abort();
 }

@@ -1,497 +1,732 @@
-use chrono::{DateTime, Utc};
+//! The disruption controller: maintains `PodDisruptionBudget.status`.
+//!
+//! A faithful port of `pkg/controller/disruption/disruption.go`
+//! (Kubernetes release-1.35). The status written here is the **source of truth**
+//! for Pod `/eviction`: upstream's `EvictionREST` reads it and decrements
+//! `disruptionsAllowed` (`pkg/registry/core/pod/storage/eviction.go`
+//! `checkAndDecrement`), so every divergence in this file is an over- or
+//! under-eviction.
+//!
+//! Mapping of upstream symbols to this file:
+//!
+//! | upstream (`disruption.go`)                          | here                                  |
+//! |-----------------------------------------------------|---------------------------------------|
+//! | `addPod`/`updatePod`/`deletePod` (:522-:575)        | `enqueue_pdb_for_pod_event`           |
+//! | `addDB`/`updateDB`/`removeDB`                       | the PDB arm of `run`                  |
+//! | `getPdbForPod` (:605)                               | `get_pdb_for_pod`                     |
+//! | `getPodsForPdb` (:631)                              | `get_pods_for_pdb`                    |
+//! | `sync` (:700), `trySync` (:735)                     | `sync`, `try_sync`                    |
+//! | `getExpectedPodCount` (:818)                        | `get_expected_pod_count`              |
+//! | `getExpectedScale` (:860)                           | `get_expected_scale`                  |
+//! | `finders` + `getPod*`/`getScaleController` (:241-:416) | `find_controller_and_scale` et al. |
+//! | `countHealthyPods` (:924)                           | `count_healthy_pods`                  |
+//! | `buildDisruptedPodMap` (:944)                       | `build_disrupted_pod_map`             |
+//! | `failSafe` (:983)                                   | `fail_safe`                           |
+//! | `updatePdbStatus` (:1002)                           | `update_pdb_status`                   |
+//! | `recheckQueue`/`enqueuePdbForRecheck` (:590)        | `recheck_queue`/`enqueue_pdb_for_recheck` |
+//! | `nonTerminatingPodHasStaleDisruptionCondition` (:1046) | `non_terminating_pod_has_stale_disruption_condition` |
+//! | `syncStalePodDisruption` (:774)                     | [`StalePodDisruptionController`]      |
+
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures::StreamExt;
+use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::{
-    CustomResource, CustomResourceDefinition, IntOrString, Pod, PodDisruptionBudget,
-    PodDisruptionBudgetStatus,
+    CustomResource, CustomResourceDefinition, EventSource, EventType, IntOrString, Pod,
+    PodDisruptionBudget, PodDisruptionBudgetCondition, PodDisruptionBudgetStatus,
 };
-use rusternetes_common::types::{LabelSelector, OwnerReference, Phase};
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
-use std::collections::HashSet;
+use rusternetes_common::types::{LabelSelector, OwnerReference, Phase, Selector};
+use rusternetes_common::validation::metav1::{is_qualified_name, is_valid_label_value};
+use rusternetes_common::Error;
+use rusternetes_storage::{
+    build_key, build_prefix, extract_key, EventRecorder, Storage, WatchEvent, WorkQueue,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{debug, error, info, warn};
 
+/// `DeletionTimeout` (`disruption.go:60-68`): the maximum time from a pod being
+/// added to `status.disruptedPods` to the controller seeing it marked for
+/// deletion. Past it the pod is assumed never to be deleted and the entry is
+/// dropped.
+pub const DELETION_TIMEOUT: StdDuration = StdDuration::from_secs(2 * 60);
+
+/// `stalePodDisruptionTimeout` (`disruption.go:70-74`).
+pub const STALE_POD_DISRUPTION_TIMEOUT: StdDuration = StdDuration::from_secs(2 * 60);
+
+/// `policy.DisruptionAllowedCondition` and its reasons
+/// (`staging/src/k8s.io/api/policy/v1/types.go:153-165`).
+const DISRUPTION_ALLOWED_CONDITION: &str = "DisruptionAllowed";
+const SYNC_FAILED_REASON: &str = "SyncFailed";
+const SUFFICIENT_PODS_REASON: &str = "SufficientPods";
+const INSUFFICIENT_PODS_REASON: &str = "InsufficientPods";
+
+/// `v1.PodReasonTerminationByKubelet`.
+const POD_REASON_TERMINATION_BY_KUBELET: &str = "TerminationByKubelet";
+
+/// Safety-net full resync. Upstream relies on informer relists; this
+/// storage-watch controller keeps a periodic enqueue (as its siblings do)
+/// because a dropped watch event would otherwise leave a budget stale.
+const RESYNC_INTERVAL: StdDuration = StdDuration::from_secs(30);
+
+/// `controllerAndScale` (`disruption.go:130-134`): a controller UID and its scale.
+struct ControllerAndScale {
+    uid: String,
+    scale: i32,
+}
+
 pub struct PodDisruptionBudgetController<S: Storage> {
     storage: Arc<S>,
+    recorder: EventRecorder<S>,
+    /// `dc.queue`: PodDisruptionBudget keys (`namespace/name`) that need a sync.
+    queue: WorkQueue,
+    /// `dc.recheckQueue`: delays a PDB's re-sync until the earliest
+    /// `disruptedPods` entry expires.
+    recheck_queue: WorkQueue,
 }
 
 impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            recorder: EventRecorder::new(Arc::clone(&storage)),
+            storage,
+            queue: WorkQueue::new(),
+            recheck_queue: WorkQueue::new(),
+        }
     }
 
+    /// `DisruptionController.Run` (`disruption.go:419`): the sync worker, the
+    /// recheck worker, and the PDB + Pod event sources feeding them.
     pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
-        use futures::StreamExt;
-
         info!("Starting PodDisruptionBudget controller");
 
-        let queue = WorkQueue::new();
-
-        let worker_queue = queue.clone();
         let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
-        });
+        tokio::spawn(async move { worker_self.worker().await });
+        let recheck_self = Arc::clone(&self);
+        tokio::spawn(async move { recheck_self.recheck_worker().await });
 
         loop {
-            self.enqueue_all(&queue).await;
+            self.enqueue_all().await;
 
-            let prefix = build_prefix("poddisruptionbudgets", None);
-            let watch_result = self.storage.watch(&prefix).await;
-            let mut watch = match watch_result {
+            let pdb_prefix = build_prefix("poddisruptionbudgets", None);
+            let mut pdb_watch = match self.storage.watch(&pdb_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish watch: {}, retrying", e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                    error!("Failed to establish PDB watch: {}, retrying", e);
+                    tokio::time::sleep(RESYNC_INTERVAL).await;
+                    continue;
+                }
+            };
+            let pod_prefix = build_prefix("pods", None);
+            let mut pod_watch = match self.storage.watch(&pod_prefix).await {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("Failed to establish pod watch: {}, retrying", e);
+                    tokio::time::sleep(RESYNC_INTERVAL).await;
                     continue;
                 }
             };
 
-            let mut resync = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut resync = tokio::time::interval(RESYNC_INTERVAL);
             resync.tick().await;
 
             let mut watch_broken = false;
             while !watch_broken {
                 tokio::select! {
-                    event = watch.next() => {
-                        match event {
-                            Some(Ok(ev)) => {
-                                let key = extract_key(&ev);
-                                queue.add(key).await;
-                            }
-                            Some(Err(e)) => {
-                                warn!("Watch error: {}, reconnecting", e);
-                                watch_broken = true;
-                            }
-                            None => {
-                                warn!("Watch stream ended, reconnecting");
-                                watch_broken = true;
+                    event = pdb_watch.next() => match event {
+                        // addDB / updateDB / removeDB all `enqueuePdb`.
+                        Some(Ok(ev)) => {
+                            if let Some(key) = meta_namespace_key(&extract_key(&ev)) {
+                                self.queue.add(key).await;
                             }
                         }
-                    }
-                    _ = resync.tick() => {
-                        self.enqueue_all(&queue).await;
-                    }
+                        Some(Err(e)) => {
+                            warn!("PDB watch error: {}, reconnecting", e);
+                            watch_broken = true;
+                        }
+                        None => {
+                            warn!("PDB watch stream ended, reconnecting");
+                            watch_broken = true;
+                        }
+                    },
+                    event = pod_watch.next() => match event {
+                        Some(Ok(ev)) => self.enqueue_pdb_for_pod_event(&ev).await,
+                        Some(Err(e)) => {
+                            warn!("Pod watch error: {}, reconnecting", e);
+                            watch_broken = true;
+                        }
+                        None => {
+                            warn!("Pod watch stream ended, reconnecting");
+                            watch_broken = true;
+                        }
+                    },
+                    _ = resync.tick() => self.enqueue_all().await,
                 }
             }
-        }
-    }
-    async fn worker(&self, queue: WorkQueue) {
-        while let Some(key) = queue.get().await {
-            let parts: Vec<&str> = key.splitn(3, '/').collect();
-            let (ns, name) = match parts.len() {
-                3 => (parts[1], parts[2]),
-                _ => {
-                    queue.done(&key).await;
-                    continue;
-                }
-            };
-            let storage_key = build_key("poddisruptionbudgets", Some(ns), name);
-            match self.storage.get::<PodDisruptionBudget>(&storage_key).await {
-                Ok(resource) => match self.reconcile_pdb(&resource).await {
-                    Ok(()) => queue.forget(&key).await,
-                    Err(e) => {
-                        error!("Failed to reconcile {}: {}", key, e);
-                        queue.requeue_rate_limited(key.clone()).await;
-                    }
-                },
-                Err(_) => {
-                    // Resource was deleted — nothing to reconcile
-                    queue.forget(&key).await;
-                }
-            }
-            queue.done(&key).await;
         }
     }
 
-    async fn enqueue_all(&self, queue: &WorkQueue) {
+    /// `worker` / `processNextWorkItem` (`disruption.go:673-698`).
+    async fn worker(&self) {
+        while let Some(key) = self.queue.get().await {
+            match self.sync(&key).await {
+                Ok(()) => self.queue.forget(&key).await,
+                Err(e) => {
+                    error!("Error syncing PodDisruptionBudget {key}, requeuing: {e}");
+                    self.queue.requeue_rate_limited(key.clone()).await;
+                }
+            }
+            self.queue.done(&key).await;
+        }
+    }
+
+    /// `recheckWorker` / `processNextRecheckWorkItem` (`disruption.go:700-712`):
+    /// a key whose recheck delay elapsed goes back to the main queue.
+    async fn recheck_worker(&self) {
+        while let Some(key) = self.recheck_queue.get().await {
+            self.queue.requeue_rate_limited(key.clone()).await;
+            self.recheck_queue.forget(&key).await;
+            self.recheck_queue.done(&key).await;
+        }
+    }
+
+    async fn enqueue_all(&self) {
         match self
             .storage
-            .list::<PodDisruptionBudget>("/registry/poddisruptionbudgets/")
+            .list::<PodDisruptionBudget>(&build_prefix("poddisruptionbudgets", None))
             .await
         {
             Ok(items) => {
-                for item in &items {
-                    let key = {
-                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                        format!("poddisruptionbudgets/{}/{}", ns, item.metadata.name)
-                    };
-                    queue.add(key).await;
+                for pdb in &items {
+                    self.queue.add(pdb_key(pdb)).await;
                 }
             }
-            Err(e) => {
-                error!("Failed to list poddisruptionbudgets for enqueue: {}", e);
-            }
+            Err(e) => error!("Failed to list poddisruptionbudgets for enqueue: {}", e),
         }
     }
 
-    #[allow(dead_code)]
-    pub async fn reconcile_all(&self) -> rusternetes_common::Result<()> {
-        debug!("Reconciling all PodDisruptionBudgets");
-
-        // Get all PDBs
-        let prefix = build_prefix("poddisruptionbudgets", None);
-        let pdbs: Vec<PodDisruptionBudget> = self.storage.list(&prefix).await?;
-
-        for pdb in pdbs {
-            if let Err(e) = self.reconcile_pdb(&pdb).await {
-                warn!("Failed to reconcile PDB {}: {}", pdb.metadata.name, e);
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn reconcile_pdb(&self, pdb: &PodDisruptionBudget) -> rusternetes_common::Result<()> {
-        let namespace = pdb.metadata.namespace.as_deref().unwrap_or("default");
-
-        debug!(
-            "Reconciling PodDisruptionBudget: {}/{}",
-            namespace, pdb.metadata.name
-        );
-
-        // 1. Find all pods matching the selector in the PDB's namespace
-        let pods_prefix = build_prefix("pods", Some(namespace));
-        let all_pods: Vec<Pod> = self.storage.list(&pods_prefix).await?;
-
-        // 2. Filter pods that match the PDB selector. The `policy/v1beta1` API
-        // gave empty selectors the opposite meaning to `policy/v1`: an empty
-        // selector matches NO pods (whereas v1 treats it as match-all). We
-        // detect the apiVersion off the stored TypeMeta and pass it through.
-        // A *null* selector is a third case, separate from both of those: it
-        // matches no pods in either version, because upstream's `getPodsForPdb`
-        // (`pkg/controller/disruption/disruption.go:630`) lists with
-        // `LabelSelectorAsSelector(nil)` = `labels.Nothing()`
-        // (`apimachinery/pkg/apis/meta/v1/helpers.go:37-43`).
-        let is_v1beta1 = pdb.type_meta.api_version == "policy/v1beta1";
-        let matching_pods: Vec<Pod> = match &pdb.spec.selector {
-            None => Vec::new(),
-            Some(selector) => all_pods
-                .into_iter()
-                .filter(|p| self.pod_matches_selector(p, selector, is_v1beta1))
-                .collect(),
+    /// `addPod` / `updatePod` / `deletePod` (`disruption.go:522-575`): find the
+    /// PDB a pod belongs to and enqueue it. The pod comes from the event value
+    /// (the previous pod, for a delete), as upstream's `deletePod` reads the
+    /// tombstone.
+    async fn enqueue_pdb_for_pod_event(&self, event: &WatchEvent) {
+        let value = match event {
+            WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) | WatchEvent::Deleted(_, v) => v,
         };
+        let Ok(pod) = serde_json::from_str::<Pod>(value) else {
+            return;
+        };
+        if let Some(pdb) = self.get_pdb_for_pod(&pod).await {
+            self.queue.add(pdb_key(&pdb)).await;
+        }
+    }
 
-        // 3. Count healthy pods (Running + Ready).
-        let pod_count = matching_pods.len() as i32;
-        let healthy_pods = matching_pods
-            .iter()
-            .filter(|p| self.is_pod_healthy(p))
-            .count() as i32;
+    /// `enqueuePdbForRecheck` (`disruption.go:590`).
+    async fn enqueue_pdb_for_recheck(&self, pdb: &PodDisruptionBudget, delay: ChronoDuration) {
+        self.recheck_queue
+            .add_after(pdb_key(pdb), delay.to_std().unwrap_or(StdDuration::ZERO))
+            .await;
+    }
 
-        // 3a. Compute expectedPods. Upstream mirrors
-        // `pkg/controller/disruption/disruption.go::getExpectedScale`: walk
-        // every matched pod's controller ownerReference up to a workload
-        // root (Deployment, ReplicaSet, StatefulSet, ReplicationController,
-        // or any CRD with a scale subresource) and SUM their `spec.replicas`
-        // values. Pods without a resolvable controller fall back to the
-        // pod count for that owner, which is the same shape upstream uses
-        // when an owner kind is unknown.
-        let total_pods = self
-            .compute_expected_pods(namespace, &matching_pods)
+    /// `getPdbForPod` (`disruption.go:605`), over the lister's
+    /// `GetPodPodDisruptionBudgets`
+    /// (`client-go/listers/policy/v1/poddisruptionbudget_expansion.go:39`): the
+    /// PDBs in the pod's namespace whose selector matches it, the first chosen
+    /// when several do (with a `MultiplePodDisruptionBudgets` warning).
+    async fn get_pdb_for_pod(&self, pod: &Pod) -> Option<PodDisruptionBudget> {
+        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let pdbs: Vec<PodDisruptionBudget> = self
+            .storage
+            .list(&build_prefix("poddisruptionbudgets", Some(ns)))
             .await
-            .unwrap_or(pod_count);
-
-        debug!(
-            "PDB {}/{}: total={} (pods={}), healthy={}",
-            namespace, pdb.metadata.name, total_pods, pod_count, healthy_pods
-        );
-
-        // 4. Calculate desired_healthy based on min_available or max_unavailable
-        let desired_healthy = self.calculate_desired_healthy(pdb, total_pods)?;
-
-        // 5. Calculate disruptions_allowed, clamped at 0.
-        //
-        // Upstream (pkg/controller/disruption/disruption.go:1008-1011):
-        //
-        //     disruptionsAllowed := currentHealthy - desiredHealthy
-        //     if expectedCount <= 0 || disruptionsAllowed <= 0 {
-        //         disruptionsAllowed = 0
-        //     }
-        //
-        // The field is `+optional` but validated `Minimum=0`, so a negative
-        // value (0 healthy under `minAvailable: 2` gives -2) makes the whole
-        // status write fail:
-        //
-        //     Error from server (Invalid): PodDisruptionBudget.policy "foo" is
-        //     invalid: status.disruptionsAllowed: Invalid value: -2: must be
-        //     greater than or equal to 0
-        //
-        // observedGeneration then never advances and upstream's
-        // waitForPdbToBeProcessed polls until the spec times out.
-        let disruptions_allowed = if total_pods <= 0 {
-            0
-        } else {
-            (healthy_pods - desired_healthy).max(0)
-        };
-
-        debug!(
-            "PDB {}/{}: desired_healthy={}, disruptions_allowed={}",
-            namespace, pdb.metadata.name, desired_healthy, disruptions_allowed
-        );
-
-        // 6. Build desired status
-        let new_status = PodDisruptionBudgetStatus {
-            current_healthy: healthy_pods,
-            desired_healthy,
-            disruptions_allowed,
-            expected_pods: total_pods,
-            observed_generation: pdb.metadata.generation,
-            conditions: pdb.status.as_ref().and_then(|s| s.conditions.clone()),
-            disrupted_pods: pdb.status.as_ref().and_then(|s| s.disrupted_pods.clone()),
-        };
-
-        // Only write if status actually changed to avoid unnecessary storage writes
-        // that cause resourceVersion conflicts with concurrent test PATCH operations
-        if pdb.status.as_ref() != Some(&new_status) {
-            let key = build_key("poddisruptionbudgets", Some(namespace), &pdb.metadata.name);
-            // Re-read from storage for fresh resourceVersion to avoid CAS conflicts
-            let mut fresh_pdb: PodDisruptionBudget = match self.storage.get(&key).await {
-                Ok(p) => p,
-                Err(_) => pdb.clone(),
-            };
-            fresh_pdb.status = Some(new_status);
-            // update_status, NOT update: a full-object PUT has its `.status`
-            // stripped by any api-server that exposes a status subresource (see
-            // crates/storage/src/api_storage.rs). Driving a vanilla api-server, the
-            // write silently vanished, observedGeneration never advanced, and
-            // upstream's waitForPdbToBeProcessed polled until every
-            // DisruptionController [Conformance] spec timed out (#1712).
-            self.storage.update_status(&key, &fresh_pdb).await?;
+            .ok()?;
+        let mut matching: Vec<PodDisruptionBudget> = pdbs
+            .into_iter()
+            // An invalid selector "does not match the pod" in the lister.
+            .filter(|pdb| matches!(pdb_selector_matches(pdb, pod), Ok(true)))
+            .collect();
+        if matching.is_empty() {
+            return None;
         }
-
-        Ok(())
+        matching.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+        if matching.len() > 1 {
+            let msg = format!(
+                "Pod {:?}/{:?} matches multiple PodDisruptionBudgets.  Chose {:?} arbitrarily.",
+                ns, pod.metadata.name, matching[0].metadata.name
+            );
+            warn!("{msg}");
+            self.record_pod_event(
+                pod,
+                EventType::Warning,
+                "MultiplePodDisruptionBudgets",
+                &msg,
+            )
+            .await;
+        }
+        Some(matching.swap_remove(0))
     }
 
-    /// Calculate desired_healthy based on min_available or max_unavailable
-    fn calculate_desired_healthy(
+    /// `getPodsForPdb` (`disruption.go:631`): `LabelSelectorAsSelector` then a
+    /// namespace-scoped list. A `nil` selector is `labels.Nothing()`, an empty
+    /// one `labels.Everything()` (`apimachinery/.../meta/v1/helpers.go:37-43`).
+    async fn get_pods_for_pdb(
         &self,
         pdb: &PodDisruptionBudget,
-        total_pods: i32,
-    ) -> rusternetes_common::Result<i32> {
-        if let Some(ref min_available) = pdb.spec.min_available {
-            // Use min_available (either int or percentage)
-            match min_available {
-                IntOrString::Int(value) => Ok(*value),
-                IntOrString::String(s) => {
-                    // Parse percentage (e.g., "50%")
-                    if let Some(stripped) = s.strip_suffix('%') {
-                        let percentage: f64 = stripped.parse().map_err(|_| {
-                            rusternetes_common::Error::InvalidResource(format!(
-                                "Invalid percentage in minAvailable: {}",
-                                s
-                            ))
-                        })?;
-                        let desired = ((total_pods as f64) * (percentage / 100.0)).ceil() as i32;
-                        Ok(desired)
-                    } else {
-                        Err(rusternetes_common::Error::InvalidResource(format!(
-                            "Invalid minAvailable string format: {}",
-                            s
-                        )))
-                    }
-                }
-            }
-        } else if let Some(ref max_unavailable) = pdb.spec.max_unavailable {
-            // Use max_unavailable (either int or percentage)
-            let max_unavailable_count = match max_unavailable {
-                IntOrString::Int(value) => *value,
-                IntOrString::String(s) => {
-                    // Parse percentage (e.g., "20%")
-                    if let Some(stripped) = s.strip_suffix('%') {
-                        let percentage: f64 = stripped.parse().map_err(|_| {
-                            rusternetes_common::Error::InvalidResource(format!(
-                                "Invalid percentage in maxUnavailable: {}",
-                                s
-                            ))
-                        })?;
-                        ((total_pods as f64) * (percentage / 100.0)).floor() as i32
-                    } else {
-                        return Err(rusternetes_common::Error::InvalidResource(format!(
-                            "Invalid maxUnavailable string format: {}",
-                            s
-                        )));
-                    }
-                }
-            };
-            // desired_healthy = total - max_unavailable
-            Ok(total_pods - max_unavailable_count)
-        } else {
-            // No min_available or max_unavailable specified - invalid PDB
-            Err(rusternetes_common::Error::InvalidResource(
-                "PodDisruptionBudget must specify either minAvailable or maxUnavailable"
-                    .to_string(),
-            ))
+    ) -> rusternetes_common::Result<Vec<Pod>> {
+        let selector = pdb_selector(pdb).map_err(Error::InvalidResource)?;
+        let ns = pdb.metadata.namespace.as_deref().unwrap_or("default");
+        // The v1beta1 compat rule: an empty selector selects no pods.
+        if selector.is_everything() && pdb.type_meta.api_version == "policy/v1beta1" {
+            return Ok(Vec::new());
         }
+        let pods: Vec<Pod> = self.storage.list(&build_prefix("pods", Some(ns))).await?;
+        Ok(pods
+            .into_iter()
+            .filter(|p| selector.matches(p.metadata.labels.as_ref()))
+            .collect())
     }
 
-    /// Compute `expectedPods` by walking each pod's controller ownerReference
-    /// up to a workload root and summing the workload sizes.
-    ///
-    /// Mirrors upstream `pkg/controller/disruption/disruption.go::
-    /// getExpectedScale`. The upstream algorithm:
-    ///
-    ///   1. Bucket pods by their controller ownerReference UID. Pods with
-    ///      no controller owner are bucketed under a sentinel "orphan" key.
-    ///   2. For each unique controller, resolve a scale value:
-    ///        - Well-known workload kinds (Deployment, StatefulSet,
-    ///          ReplicaSet, ReplicationController) → read `spec.replicas`
-    ///          from the workload object.
-    ///        - ReplicaSet whose controller owner is a Deployment → bubble
-    ///          up to the Deployment's `spec.replicas`.
-    ///        - CRD kinds with a `scale` subresource → fetch the CR and
-    ///          resolve `subresources.scale.specReplicasPath` against its
-    ///          JSON body.
-    ///        - Unknown / unresolvable → fall back to the pod count for
-    ///          that owner (so we never UNDER-report).
-    ///   3. Sum the scales. Orphan pods contribute their own count.
-    ///
-    /// Returns `None` only when the storage layer is unreachable — that
-    /// case is treated as transient and the caller falls back to the raw
-    /// pod count rather than failing the whole reconcile.
-    async fn compute_expected_pods(&self, namespace: &str, matching_pods: &[Pod]) -> Option<i32> {
-        // Group pods by their controller owner UID. Pods without a
-        // controller owner are accumulated into `orphan_pods` and
-        // contribute their raw count to expectedPods (one-per-pod), which
-        // mirrors upstream's "no controller found" path in
-        // `getExpectedScale`.
-        let mut owners_by_uid: std::collections::HashMap<String, OwnerReference> =
-            std::collections::HashMap::new();
-        let mut pod_count_by_owner: std::collections::HashMap<String, i32> =
-            std::collections::HashMap::new();
-        let mut orphan_pods: i32 = 0;
-        for pod in matching_pods {
-            match controller_ref(pod) {
-                Some(owner) => {
-                    *pod_count_by_owner.entry(owner.uid.clone()).or_insert(0) += 1;
-                    owners_by_uid
-                        .entry(owner.uid.clone())
-                        .or_insert_with(|| owner.clone());
-                }
-                None => orphan_pods += 1,
-            }
-        }
-
-        // Dedupe scales by the **root** owner UID, not the pod's direct
-        // owner UID. Upstream `getExpectedScale` does the same: when a
-        // ReplicaSet bubbles up to its Deployment, the returned UID is
-        // the Deployment's, so two RSes of the same Deployment collapse
-        // to a single Deployment-scale entry rather than double-counting.
-        let mut scale_by_root_uid: std::collections::HashMap<String, i32> =
-            std::collections::HashMap::new();
-        // `unresolved_pod_fallback` accumulates pod counts for owners
-        // whose scale we could not determine (deleted workload, unknown
-        // CRD, missing replicas field). These contribute their raw pod
-        // count so we never under-report expectedPods.
-        let mut unresolved_pod_fallback: i32 = 0;
-        for (uid, owner) in &owners_by_uid {
-            let pod_count = pod_count_by_owner.get(uid).copied().unwrap_or(0);
-            let mut visited: HashSet<String> = HashSet::new();
-            visited.insert(uid.clone());
-            match self
-                .resolve_owner_scale(namespace, owner, &mut visited)
-                .await
-            {
-                Some((root_uid, scale)) => {
-                    // Insert dedupes; if the same Deployment is reached
-                    // via two different RSes we keep one entry.
-                    scale_by_root_uid.insert(root_uid, scale);
-                }
-                None => unresolved_pod_fallback += pod_count,
-            }
-        }
-
-        let total = orphan_pods + unresolved_pod_fallback + scale_by_root_uid.values().sum::<i32>();
-        Some(total)
+    /// `sync` (`disruption.go:700-731`), keyed `namespace/name`.
+    pub async fn sync(&self, key: &str) -> rusternetes_common::Result<()> {
+        self.sync_at(key, Utc::now()).await
     }
 
-    /// Resolve `(root_uid, replicas)` for a single controller ownerReference.
-    ///
-    /// `root_uid` is the UID we want the caller to dedupe by — for the
-    /// built-in workloads it is the workload's own UID, except for a
-    /// ReplicaSet whose controller owner is a Deployment, in which case
-    /// it is the Deployment's UID (mirrors upstream
-    /// `pkg/controller/disruption/disruption.go::getPodReplicaSet`).
-    ///
-    /// Returns `None` when:
-    ///   - the owner could not be fetched (deleted / not yet stored)
-    ///   - the owner kind is unknown AND no CRD with a scale subresource
-    ///     matches its apiVersion+kind
-    ///   - the scale path on a CRD-backed owner did not resolve to a
-    ///     non-negative integer
-    ///
-    /// In any "unresolvable" case the caller falls back to the pod count
-    /// for that owner, mirroring upstream's behaviour of never
-    /// under-reporting `expectedPods`.
-    async fn resolve_owner_scale(
-        &self,
-        namespace: &str,
-        owner: &OwnerReference,
-        visited: &mut HashSet<String>,
-    ) -> Option<(String, i32)> {
-        // Built-in workload kinds — read .spec.replicas directly.
-        // Upstream uses the same hard-coded list because the dynamic
-        // scale client is only consulted for kinds that DO NOT appear
-        // here (`disruption.go::finders`).
-        let key = match owner.kind.as_str() {
-            "Deployment" => Some(build_key("deployments", Some(namespace), &owner.name)),
-            "StatefulSet" => Some(build_key("statefulsets", Some(namespace), &owner.name)),
-            "ReplicationController" => Some(build_key(
-                "replicationcontrollers",
-                Some(namespace),
-                &owner.name,
-            )),
-            "ReplicaSet" => Some(build_key("replicasets", Some(namespace), &owner.name)),
-            _ => None,
+    /// [`sync`](Self::sync) with an injected "now" (upstream injects a
+    /// `clock.Clock`; `disruption_test.go` drives it with a fake one).
+    #[doc(hidden)]
+    pub async fn sync_at(&self, key: &str, now: DateTime<Utc>) -> rusternetes_common::Result<()> {
+        let (namespace, name) = match key.split_once('/') {
+            Some((ns, n)) => (ns, n),
+            None => ("", key),
+        };
+        let storage_key = build_key("poddisruptionbudgets", Some(namespace), name);
+        let pdb: PodDisruptionBudget = match self.storage.get(&storage_key).await {
+            Ok(p) => p,
+            Err(Error::NotFound(_)) => {
+                debug!("podDisruptionBudget {key} has been deleted");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
         };
 
-        if let Some(key) = key {
-            // Built-in workload — fetch as opaque JSON and read .spec.replicas.
-            // Going through JSON keeps this function generic across the four
-            // workload types without pulling a half-dozen typed structs.
-            let workload: serde_json::Value = self.storage.get(&key).await.ok()?;
-            // ReplicaSets owned by a Deployment must report the
-            // Deployment's UID + scale (NOT the RS's), so two RSes of the
-            // same Deployment dedupe to a single entry at the caller.
-            if owner.kind == "ReplicaSet" {
-                if let Some(parent) = controller_ref_from_json(&workload) {
-                    if parent.kind == "Deployment" && !visited.contains(&parent.uid) {
-                        visited.insert(parent.uid.clone());
-                        if let Some((dep_uid, dep_scale)) =
-                            Box::pin(self.resolve_owner_scale(namespace, &parent, visited)).await
-                        {
-                            return Some((dep_uid, dep_scale));
-                        }
-                    }
-                }
+        match self.try_sync(&pdb, now).await {
+            Ok(()) => Ok(()),
+            // "If the reason for failure was a conflict, then allow this PDB
+            // update to be requeued without triggering the failSafe logic."
+            Err(e @ Error::Conflict(_)) => Err(e),
+            Err(e) => {
+                error!("Failed to sync PDB {key}: {e}");
+                self.fail_safe(&pdb, &e).await
             }
-            let scale = workload
-                .get("spec")
-                .and_then(|s| s.get("replicas"))
-                .and_then(|r| r.as_i64())
-                .map(|r| r as i32)?;
-            return Some((owner.uid.clone(), scale));
+        }
+    }
+
+    /// `trySync` (`disruption.go:735-772`).
+    async fn try_sync(
+        &self,
+        pdb: &PodDisruptionBudget,
+        now: DateTime<Utc>,
+    ) -> rusternetes_common::Result<()> {
+        let pods = match self.get_pods_for_pdb(pdb).await {
+            Ok(p) => p,
+            Err(e) => {
+                self.record_pdb_event(
+                    pdb,
+                    EventType::Warning,
+                    "NoPods",
+                    &format!("Failed to get pods: {e}"),
+                )
+                .await;
+                return Err(e);
+            }
+        };
+        if pods.is_empty() {
+            self.record_pdb_event(pdb, EventType::Normal, "NoPods", "No matching pods found")
+                .await;
         }
 
-        // CRD path: look up a CRD whose names.kind matches the owner kind
-        // AND whose group matches the owner apiVersion's group. Then use
-        // the CRD's subresources.scale.specReplicasPath to resolve scale
-        // from the CR body.
-        let (group, version) = split_group_version(&owner.api_version);
-        let crd = self.find_crd(&group, &owner.kind).await?;
-        let crd_version = crd.spec.versions.iter().find(|v| v.name == version)?;
-        let scale = crd_version.subresources.as_ref()?.scale.as_ref()?;
+        let (expected_count, desired_healthy, unmanaged_pods) =
+            match self.get_expected_pod_count(pdb, &pods).await {
+                Ok(v) => v,
+                Err(e) => {
+                    self.record_pdb_event(
+                        pdb,
+                        EventType::Warning,
+                        "CalculateExpectedPodCountFailed",
+                        &format!("Failed to calculate the number of expected pods: {e}"),
+                    )
+                    .await;
+                    return Err(e);
+                }
+            };
+        // "We have unmamanged pods, instead of erroring and hotlooping in
+        // disruption controller, log and continue."
+        if !unmanaged_pods.is_empty() {
+            debug!("Found unmanaged pods associated with this PDB: {unmanaged_pods:?}");
+            self.record_pdb_event(
+                pdb,
+                EventType::Warning,
+                "UnmanagedPods",
+                &format!(
+                    "Pods selected by this PodDisruptionBudget (selector: {:?}) were found \
+                     to be unmanaged. As a result, the status of the PDB cannot be calculated \
+                     correctly, which may result in undefined behavior. To account for these pods \
+                     please set \".spec.minAvailable\" field of the PDB to an integer value.",
+                    pdb.spec.selector
+                ),
+            )
+            .await;
+        }
 
-        // Storage key for the CR mirrors the api-server convention:
-        // `<group_with_underscores>_<plural>`. We fetch it as a generic
-        // CustomResource (whose `spec` is a serde_json::Value) so we can
-        // resolve the JSONPath without growing a schema dependency.
+        let (disrupted_pods, recheck_time) = self.build_disrupted_pod_map(&pods, pdb, now).await;
+        let current_healthy = count_healthy_pods(&pods, &disrupted_pods, now);
+        self.update_pdb_status(
+            pdb,
+            current_healthy,
+            desired_healthy,
+            expected_count,
+            disrupted_pods,
+        )
+        .await?;
+
+        if let Some(recheck_time) = recheck_time {
+            // "There is always at most one PDB waiting with a particular name
+            // in the queue" — `add_after` keeps one deadline per key.
+            self.enqueue_pdb_for_recheck(pdb, recheck_time - now).await;
+        }
+        Ok(())
+    }
+
+    /// `getExpectedPodCount` (`disruption.go:818-858`). `maxUnavailable` is
+    /// consulted first; an integer `minAvailable` needs no controller scale
+    /// (`expectedCount = len(pods)`); a percentage of either needs
+    /// [`get_expected_scale`](Self::get_expected_scale).
+    async fn get_expected_pod_count(
+        &self,
+        pdb: &PodDisruptionBudget,
+        pods: &[Pod],
+    ) -> rusternetes_common::Result<(i32, i32, Vec<String>)> {
+        let mut expected_count = 0;
+        let mut desired_healthy = 0;
+        let mut unmanaged_pods = Vec::new();
+
+        if let Some(max_unavailable) = &pdb.spec.max_unavailable {
+            (expected_count, unmanaged_pods) = self.get_expected_scale(pods).await?;
+            let max_unavailable =
+                get_scaled_value_from_int_or_percent(max_unavailable, expected_count, true)?;
+            desired_healthy = expected_count - max_unavailable;
+            if desired_healthy < 0 {
+                desired_healthy = 0;
+            }
+        } else if let Some(min_available) = &pdb.spec.min_available {
+            match min_available {
+                IntOrString::Int(v) => {
+                    desired_healthy = *v;
+                    expected_count = pods.len() as i32;
+                }
+                IntOrString::String(_) => {
+                    (expected_count, unmanaged_pods) = self.get_expected_scale(pods).await?;
+                    desired_healthy =
+                        get_scaled_value_from_int_or_percent(min_available, expected_count, true)?;
+                }
+            }
+        }
+        Ok((expected_count, desired_healthy, unmanaged_pods))
+    }
+
+    /// `getExpectedScale` (`disruption.go:860-922`): `SUM_{c in C} scale(c)`
+    /// where `C` is the set of controllers of the selected pods. Pods without a
+    /// controller are collected as unmanaged rather than failing the sync; a
+    /// controller no finder recognises is an error.
+    async fn get_expected_scale(
+        &self,
+        pods: &[Pod],
+    ) -> rusternetes_common::Result<(i32, Vec<String>)> {
+        let mut controller_scale: HashMap<String, i32> = HashMap::new();
+        let mut unmanaged_pods = Vec::new();
+
+        for pod in pods {
+            let Some(controller_ref) = controller_ref(pod) else {
+                unmanaged_pods.push(pod.metadata.name.clone());
+                continue;
+            };
+            // "If we already know the scale of the controller there is no need
+            // to do anything."
+            if controller_scale.contains_key(&controller_ref.uid) {
+                continue;
+            }
+            let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+            match self
+                .find_controller_and_scale(&controller_ref, namespace)
+                .await?
+            {
+                Some(found) => {
+                    controller_scale.insert(found.uid, found.scale);
+                }
+                None => {
+                    return Err(Error::InvalidResource(format!(
+                        "found no controllers for pod {:?}",
+                        pod.metadata.name
+                    )));
+                }
+            }
+        }
+        Ok((controller_scale.values().sum(), unmanaged_pods))
+    }
+
+    /// `finders()` (`disruption.go:236-243`), tried in upstream's order.
+    async fn find_controller_and_scale(
+        &self,
+        controller_ref: &OwnerReference,
+        namespace: &str,
+    ) -> rusternetes_common::Result<Option<ControllerAndScale>> {
+        if let Some(c) = self
+            .get_pod_replication_controller(controller_ref, namespace)
+            .await?
+        {
+            return Ok(Some(c));
+        }
+        if let Some(c) = self.get_pod_deployment(controller_ref, namespace).await? {
+            return Ok(Some(c));
+        }
+        if let Some(c) = self.get_pod_replica_set(controller_ref, namespace).await? {
+            return Ok(Some(c));
+        }
+        if let Some(c) = self.get_pod_stateful_set(controller_ref, namespace).await? {
+            return Ok(Some(c));
+        }
+        self.get_scale_controller(controller_ref, namespace).await
+    }
+
+    /// Fetch a workload by name as JSON. `Ok(None)` is upstream's
+    /// "The only possible error is NotFound, which is ok here."
+    async fn get_workload(
+        &self,
+        resource: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Option<serde_json::Value> {
+        self.storage
+            .get(&build_key(resource, Some(namespace), name))
+            .await
+            .ok()
+    }
+
+    /// `getPodReplicaSet` (`disruption.go:245`): "finds a replicaset which has
+    /// no matching deployments".
+    async fn get_pod_replica_set(
+        &self,
+        controller_ref: &OwnerReference,
+        namespace: &str,
+    ) -> rusternetes_common::Result<Option<ControllerAndScale>> {
+        if !verify_group_kind(controller_ref, "ReplicaSet", &["apps", "extensions"])? {
+            return Ok(None);
+        }
+        let Some(rs) = self
+            .get_workload("replicasets", namespace, &controller_ref.name)
+            .await
+        else {
+            return Ok(None);
+        };
+        if json_uid(&rs) != controller_ref.uid {
+            return Ok(None);
+        }
+        // "Skip RS if it's controlled by a Deployment."
+        if let Some(owner) = controller_ref_from_json(&rs) {
+            if owner.kind == "Deployment" {
+                return Ok(None);
+            }
+        }
+        Ok(Some(ControllerAndScale {
+            uid: controller_ref.uid.clone(),
+            scale: json_replicas(&rs),
+        }))
+    }
+
+    /// `getPodStatefulSet` (`disruption.go:266`).
+    async fn get_pod_stateful_set(
+        &self,
+        controller_ref: &OwnerReference,
+        namespace: &str,
+    ) -> rusternetes_common::Result<Option<ControllerAndScale>> {
+        if !verify_group_kind(controller_ref, "StatefulSet", &["apps"])? {
+            return Ok(None);
+        }
+        let Some(ss) = self
+            .get_workload("statefulsets", namespace, &controller_ref.name)
+            .await
+        else {
+            return Ok(None);
+        };
+        if json_uid(&ss) != controller_ref.uid {
+            return Ok(None);
+        }
+        Ok(Some(ControllerAndScale {
+            uid: controller_ref.uid.clone(),
+            scale: json_replicas(&ss),
+        }))
+    }
+
+    /// `getPodDeployment` (`disruption.go:285`): "finds deployments for any
+    /// replicasets which are being managed by deployments".
+    async fn get_pod_deployment(
+        &self,
+        controller_ref: &OwnerReference,
+        namespace: &str,
+    ) -> rusternetes_common::Result<Option<ControllerAndScale>> {
+        if !verify_group_kind(controller_ref, "ReplicaSet", &["apps", "extensions"])? {
+            return Ok(None);
+        }
+        let Some(rs) = self
+            .get_workload("replicasets", namespace, &controller_ref.name)
+            .await
+        else {
+            return Ok(None);
+        };
+        if json_uid(&rs) != controller_ref.uid {
+            return Ok(None);
+        }
+        let Some(rs_owner) = controller_ref_from_json(&rs) else {
+            return Ok(None);
+        };
+        if !verify_group_kind(&rs_owner, "Deployment", &["apps", "extensions"])? {
+            return Ok(None);
+        }
+        let Some(deployment) = self
+            .get_workload("deployments", namespace, &rs_owner.name)
+            .await
+        else {
+            return Ok(None);
+        };
+        if json_uid(&deployment) != rs_owner.uid {
+            return Ok(None);
+        }
+        Ok(Some(ControllerAndScale {
+            uid: rs_owner.uid.clone(),
+            scale: json_replicas(&deployment),
+        }))
+    }
+
+    /// `getPodReplicationController` (`disruption.go:318`).
+    async fn get_pod_replication_controller(
+        &self,
+        controller_ref: &OwnerReference,
+        namespace: &str,
+    ) -> rusternetes_common::Result<Option<ControllerAndScale>> {
+        if !verify_group_kind(controller_ref, "ReplicationController", &[""])? {
+            return Ok(None);
+        }
+        let Some(rc) = self
+            .get_workload("replicationcontrollers", namespace, &controller_ref.name)
+            .await
+        else {
+            return Ok(None);
+        };
+        if json_uid(&rc) != controller_ref.uid {
+            return Ok(None);
+        }
+        Ok(Some(ControllerAndScale {
+            uid: controller_ref.uid.clone(),
+            scale: json_replicas(&rc),
+        }))
+    }
+
+    /// `getScaleController` (`disruption.go:337-380`): for any other owner kind,
+    /// ask its scale subresource. Upstream resolves the kind through a
+    /// `RESTMapper`, `Get`s `<resource>/scale` through the scale client and, on
+    /// NotFound, uses discovery (`implementsScale`) to tell "object gone" (nil)
+    /// from "kind has no scale subresource" (error).
+    ///
+    /// The equivalents here: the RESTMapper is the CRD list (plus the four
+    /// built-in scalable kinds); the scale client is a read of the object whose
+    /// replica count is the CRD's `subresources.scale.specReplicasPath`
+    /// (apiextensions `scaleFromCustomResource`,
+    /// `customresource/etcd.go:251-296`: an absent value reads as 0); and
+    /// `implementsScale` is "does that CRD version declare `subresources.scale`".
+    async fn get_scale_controller(
+        &self,
+        controller_ref: &OwnerReference,
+        namespace: &str,
+    ) -> rusternetes_common::Result<Option<ControllerAndScale>> {
+        let (group, version) = parse_group_version(&controller_ref.api_version)?;
+
+        // Built-in kinds that implement /scale (a pod owned directly by one).
+        let builtin = match (group.as_str(), controller_ref.kind.as_str()) {
+            ("apps", "Deployment") => Some("deployments"),
+            ("apps", "ReplicaSet") => Some("replicasets"),
+            ("apps", "StatefulSet") => Some("statefulsets"),
+            ("", "ReplicationController") => Some("replicationcontrollers"),
+            _ => None,
+        };
+        if let Some(resource) = builtin {
+            let Some(obj) = self
+                .get_workload(resource, namespace, &controller_ref.name)
+                .await
+            else {
+                return Ok(None);
+            };
+            if json_uid(&obj) != controller_ref.uid {
+                return Ok(None);
+            }
+            return Ok(Some(ControllerAndScale {
+                uid: controller_ref.uid.clone(),
+                scale: json_replicas(&obj),
+            }));
+        }
+
+        // `mapper.RESTMapping(gk, version)`: no CRD means no mapping.
+        let crds: Vec<CustomResourceDefinition> = self
+            .storage
+            .list(&build_prefix("customresourcedefinitions", None))
+            .await?;
+        let no_match = || {
+            Error::InvalidResource(format!(
+                "no matches for kind {:?} in version {:?}",
+                controller_ref.kind, controller_ref.api_version
+            ))
+        };
+        let crd = crds
+            .into_iter()
+            .find(|c| c.spec.group == group && c.spec.names.kind == controller_ref.kind)
+            .ok_or_else(no_match)?;
+        let crd_version = crd
+            .spec
+            .versions
+            .iter()
+            .find(|v| v.name == version)
+            .ok_or_else(no_match)?;
+        let gr = format!("{}.{}", crd.spec.names.plural, group);
+        // Without a scale subresource the scale `Get` is NotFound and
+        // `implementsScale` is false.
+        let Some(scale) = crd_version
+            .subresources
+            .as_ref()
+            .and_then(|s| s.scale.as_ref())
+        else {
+            return Err(Error::InvalidResource(format!(
+                "{gr} does not implement the scale subresource"
+            )));
+        };
+
         let resource_type = format!("{}_{}", group.replace('.', "_"), crd.spec.names.plural);
-        let cr_key = build_key(&resource_type, Some(namespace), &owner.name);
-        let cr: CustomResource = self.storage.get(&cr_key).await.ok()?;
+        let cr: CustomResource = match self
+            .storage
+            .get(&build_key(
+                &resource_type,
+                Some(namespace),
+                &controller_ref.name,
+            ))
+            .await
+        {
+            Ok(cr) => cr,
+            // NotFound on a kind that does implement scale: the object is gone.
+            Err(Error::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if cr.metadata.uid != controller_ref.uid {
+            return Ok(None);
+        }
 
-        // Build the JSON document from the CR's spec/status so the path
-        // can address either side (`.spec.replicas`, `.status.replicas`,
-        // ...). Upstream's scale client walks the same document shape.
         let mut doc = serde_json::Map::new();
         if let Some(s) = cr.spec {
             doc.insert("spec".to_string(), s);
@@ -500,83 +735,526 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
             doc.insert("status".to_string(), s);
         }
         let doc = serde_json::Value::Object(doc);
-
-        let scale_val = resolve_json_path(&doc, &scale.spec_replicas_path)
-            .and_then(|v| v.as_i64().map(|i| i as i32))?;
-        Some((owner.uid.clone(), scale_val))
+        let replicas = match resolve_json_path(&doc, &scale.spec_replicas_path) {
+            None => 0,
+            Some(v) => v.as_i64().ok_or_else(|| {
+                Error::InvalidResource(format!(
+                    "{} accessor error: {v} is of the type {}, expected int64",
+                    scale.spec_replicas_path,
+                    json_type_name(v)
+                ))
+            })? as i32,
+        };
+        Ok(Some(ControllerAndScale {
+            uid: controller_ref.uid.clone(),
+            scale: replicas,
+        }))
     }
 
-    /// Look up a CRD by group + kind (mirrors apiextensions discovery).
-    /// Returns `None` if no matching CRD is registered.
-    async fn find_crd(&self, group: &str, kind: &str) -> Option<CustomResourceDefinition> {
-        let crds: Vec<CustomResourceDefinition> = self
-            .storage
-            .list("/registry/customresourcedefinitions/")
-            .await
-            .ok()?;
-        crds.into_iter()
-            .find(|c| c.spec.group == group && c.spec.names.kind == kind)
+    /// `buildDisruptedPodMap` (`disruption.go:944-981`): "Builds new PodDisruption
+    /// map, possibly removing items that refer to non-existing, already deleted
+    /// or not-deleted at all items. Also returns an information when this check
+    /// should be repeated."
+    async fn build_disrupted_pod_map(
+        &self,
+        pods: &[Pod],
+        pdb: &PodDisruptionBudget,
+        current_time: DateTime<Utc>,
+    ) -> (HashMap<String, DateTime<Utc>>, Option<DateTime<Utc>>) {
+        let mut result = HashMap::new();
+        let mut recheck_time: Option<DateTime<Utc>> = None;
+        let Some(disrupted_pods) = pdb.status.as_ref().and_then(|s| s.disrupted_pods.as_ref())
+        else {
+            return (result, recheck_time);
+        };
+        for pod in pods {
+            if pod.metadata.deletion_timestamp.is_some() {
+                // Already being deleted.
+                continue;
+            }
+            let Some(disruption_time) = disrupted_pods.get(&pod.metadata.name) else {
+                // Pod not on the list.
+                continue;
+            };
+            let expected_deletion = *disruption_time + deletion_timeout();
+            if expected_deletion < current_time {
+                debug!(
+                    "pod {} was expected to be deleted but it wasn't, updating PDB",
+                    pod.metadata.name
+                );
+                // Upstream formats this with `pdb.Namespace` twice; reproduced.
+                self.record_pod_event(
+                    pod,
+                    EventType::Warning,
+                    "NotDeleted",
+                    &format!(
+                        "Pod was expected by PDB {}/{} to be deleted but it wasn't",
+                        pdb.metadata.namespace.as_deref().unwrap_or(""),
+                        pdb.metadata.namespace.as_deref().unwrap_or("")
+                    ),
+                )
+                .await;
+            } else {
+                if recheck_time.is_none_or(|r| expected_deletion < r) {
+                    recheck_time = Some(expected_deletion);
+                }
+                result.insert(pod.metadata.name.clone(), *disruption_time);
+            }
+        }
+        (result, recheck_time)
     }
 
-    /// Check if a pod is healthy (Running and Ready)
-    fn is_pod_healthy(&self, pod: &Pod) -> bool {
-        // Check if pod is in Running phase
-        let is_running = pod
-            .status
-            .as_ref()
-            .map(|s| matches!(s.phase, Some(rusternetes_common::types::Phase::Running)))
-            .unwrap_or(false);
+    /// `failSafe` (`disruption.go:983-1000`): "an attempt to at least update the
+    /// DisruptionsAllowed field to 0 if everything else has failed. This is one
+    /// place we implement the 'fail open' part of the design since if we manage
+    /// to update this field correctly, we will prevent the /evict handler from
+    /// approving an eviction when it may be unsafe to do so."
+    async fn fail_safe(
+        &self,
+        pdb: &PodDisruptionBudget,
+        err: &Error,
+    ) -> rusternetes_common::Result<()> {
+        let mut new_pdb = pdb.clone();
+        let status = new_pdb.status.get_or_insert_with(empty_status);
+        status.disruptions_allowed = 0;
+        let observed_generation = status.observed_generation;
+        set_status_condition(
+            status.conditions.get_or_insert_with(Vec::new),
+            PodDisruptionBudgetCondition {
+                condition_type: DISRUPTION_ALLOWED_CONDITION.to_string(),
+                status: "False".to_string(),
+                reason: Some(SYNC_FAILED_REASON.to_string()),
+                message: Some(err.to_string()),
+                observed_generation,
+                last_transition_time: None,
+            },
+        );
+        self.write_pdb_status(&new_pdb).await
+    }
 
-        if !is_running {
-            return false;
+    /// `updatePdbStatus` (`disruption.go:1002-1044`).
+    async fn update_pdb_status(
+        &self,
+        pdb: &PodDisruptionBudget,
+        current_healthy: i32,
+        desired_healthy: i32,
+        expected_count: i32,
+        disrupted_pods: HashMap<String, DateTime<Utc>>,
+    ) -> rusternetes_common::Result<()> {
+        // "We require expectedCount to be > 0 so that PDBs which currently match
+        // no pods are in a safe state when their first pods appear but this
+        // controller has not updated their status yet."
+        let mut disruptions_allowed = current_healthy - desired_healthy;
+        if expected_count <= 0 || disruptions_allowed <= 0 {
+            disruptions_allowed = 0;
         }
 
-        // Check if pod has Ready condition set to True
-        // For simplicity, we'll consider a pod ready if it's Running
-        // In a full implementation, we'd check pod.status.conditions for Ready=True
-        true
+        if let Some(status) = &pdb.status {
+            if status.current_healthy == current_healthy
+                && status.desired_healthy == desired_healthy
+                && status.expected_pods == expected_count
+                && status.disruptions_allowed == disruptions_allowed
+                && disrupted_pods_equal(status.disrupted_pods.as_ref(), &disrupted_pods)
+                && status.observed_generation.unwrap_or(0) == pdb.metadata.generation.unwrap_or(0)
+                && conditions_are_up_to_date(pdb)
+            {
+                return Ok(());
+            }
+        }
+
+        let mut new_pdb = pdb.clone();
+        let conditions = new_pdb.status.as_ref().and_then(|s| s.conditions.clone());
+        new_pdb.status = Some(PodDisruptionBudgetStatus {
+            current_healthy,
+            desired_healthy,
+            disruptions_allowed,
+            expected_pods: expected_count,
+            observed_generation: pdb.metadata.generation,
+            conditions,
+            // `omitempty` on an empty map.
+            disrupted_pods: if disrupted_pods.is_empty() {
+                None
+            } else {
+                Some(disrupted_pods)
+            },
+        });
+        update_disruption_allowed_condition(&mut new_pdb);
+        self.write_pdb_status(&new_pdb).await
     }
 
-    /// Whether `pod` is selected by the PDB's selector.
+    /// `writePdbStatus` (`disruption.go:1046`): `UpdateStatus` on the object read
+    /// at the start of the sync, so a write computed from a read an eviction has
+    /// since overtaken is rejected with a conflict rather than clobbering the
+    /// eviction's `disruptionsAllowed` (`TestUpdatePDBStatusRetries`).
     ///
-    /// One matcher, not a copy: `label_selector_as_selector`
-    /// (`apimachinery/pkg/apis/meta/v1/helpers.go:36-72`) + `Selector::matches`.
-    /// A present-but-empty selector is `labels.Everything()` and matches every
-    /// pod, including one with no labels at all —
-    /// `TestSelectorsForPodsWithoutLabels` pins that for `policy/v1`.
-    ///
-    /// `empty_selector_matches_nothing` is the `policy/v1beta1` compat rule
-    /// (`staging/src/k8s.io/api/policy/v1beta1/types.go:33-37`: "An empty
-    /// selector ({}) also selects no pods, which differs from standard
-    /// behavior"). Upstream implements it by *conversion* rather than by a
-    /// controller flag — `Convert_v1beta1_PodDisruptionBudget_To_policy_PodDisruptionBudget`
-    /// (`pkg/apis/policy/v1beta1/conversion.go:26-47`) swaps an empty v1beta1
-    /// selector for `NonV1beta1MatchNoneSelector`, a non-empty selector that
-    /// never matches (`pkg/apis/policy/helper.go:27-37`) — so its controller
-    /// has one rule. Rusternetes serves only `policy/v1`, so there is no
-    /// conversion boundary to hook and the rule stays here, keyed off the
-    /// stored `apiVersion`.
-    fn pod_matches_selector(
+    /// `Storage::update_status` grafts onto the *current* object and ignores the
+    /// caller's `resourceVersion` on the direct backends, so the precondition is
+    /// checked here first. That leaves a window between the check and the write;
+    /// closing it needs a compare-and-set status write in the storage trait.
+    async fn write_pdb_status(&self, pdb: &PodDisruptionBudget) -> rusternetes_common::Result<()> {
+        let ns = pdb.metadata.namespace.as_deref().unwrap_or("default");
+        let key = build_key("poddisruptionbudgets", Some(ns), &pdb.metadata.name);
+        let current: PodDisruptionBudget = self.storage.get(&key).await?;
+        if current.metadata.resource_version != pdb.metadata.resource_version {
+            return Err(Error::Conflict(format!(
+                "Operation cannot be fulfilled on poddisruptionbudgets.policy {:?}: \
+                 the object has been modified; please apply your changes to the latest version \
+                 and try again",
+                pdb.metadata.name
+            )));
+        }
+        // update_status, NOT update: a full-object PUT has its `.status`
+        // stripped by any api-server that exposes a status subresource (#1712).
+        self.storage.update_status(&key, pdb).await?;
+        Ok(())
+    }
+
+    /// Reconcile every PDB once (tests and one-shot callers).
+    #[allow(dead_code)]
+    pub async fn reconcile_all(&self) -> rusternetes_common::Result<()> {
+        let pdbs: Vec<PodDisruptionBudget> = self
+            .storage
+            .list(&build_prefix("poddisruptionbudgets", None))
+            .await?;
+        for pdb in pdbs {
+            if let Err(e) = self.sync(&pdb_key(&pdb)).await {
+                warn!("Failed to reconcile PDB {}: {}", pdb.metadata.name, e);
+            }
+        }
+        Ok(())
+    }
+
+    async fn record_pdb_event(
+        &self,
+        pdb: &PodDisruptionBudget,
+        event_type: EventType,
+        reason: &str,
+        message: &str,
+    ) {
+        let involved = ObjectReference {
+            kind: Some("PodDisruptionBudget".to_string()),
+            namespace: pdb.metadata.namespace.clone(),
+            name: Some(pdb.metadata.name.clone()),
+            uid: Some(pdb.metadata.uid.clone()),
+            api_version: Some("policy/v1".to_string()),
+            ..Default::default()
+        };
+        self.record(involved, event_type, reason, message).await;
+    }
+
+    async fn record_pod_event(
         &self,
         pod: &Pod,
-        selector: &LabelSelector,
-        empty_selector_matches_nothing: bool,
-    ) -> bool {
-        let Ok(selector) = rusternetes_common::types::label_selector_as_selector(Some(selector))
-        else {
-            // An invalid operator: upstream's `getPodsForPdb` propagates the
-            // error and the sync fails, so no pod is counted.
-            return false;
+        event_type: EventType,
+        reason: &str,
+        message: &str,
+    ) {
+        let involved = ObjectReference {
+            kind: Some("Pod".to_string()),
+            namespace: pod.metadata.namespace.clone(),
+            name: Some(pod.metadata.name.clone()),
+            uid: Some(pod.metadata.uid.clone()),
+            api_version: Some("v1".to_string()),
+            ..Default::default()
         };
-        if selector.is_everything() && empty_selector_matches_nothing {
-            return false;
+        self.record(involved, event_type, reason, message).await;
+    }
+
+    /// A failure to record an event is logged and dropped: it must not mask the
+    /// sync outcome it describes.
+    async fn record(
+        &self,
+        involved: ObjectReference,
+        event_type: EventType,
+        reason: &str,
+        message: &str,
+    ) {
+        let source = EventSource {
+            component: "controllermanager".to_string(),
+            host: None,
+        };
+        if let Err(e) = self
+            .recorder
+            .event(&involved, &source, event_type, reason, message)
+            .await
+        {
+            warn!("failed to record {reason} event: {e}");
         }
-        selector.matches(pod.metadata.labels.as_ref())
     }
 }
 
-/// Return the *controller* ownerReference of an object (the one with
-/// `controller: true`). Mirrors upstream `metav1.GetControllerOf`.
+fn deletion_timeout() -> ChronoDuration {
+    ChronoDuration::from_std(DELETION_TIMEOUT).unwrap_or(ChronoDuration::minutes(2))
+}
+
+/// `countHealthyPods` (`disruption.go:924-942`).
+fn count_healthy_pods(
+    pods: &[Pod],
+    disrupted_pods: &HashMap<String, DateTime<Utc>>,
+    current_time: DateTime<Utc>,
+) -> i32 {
+    let mut current_healthy = 0;
+    for pod in pods {
+        // Pod is being deleted.
+        if pod.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        // Pod is expected to be deleted soon.
+        if let Some(disruption_time) = disrupted_pods.get(&pod.metadata.name) {
+            if *disruption_time + deletion_timeout() > current_time {
+                continue;
+            }
+        }
+        if is_pod_ready(pod) {
+            current_healthy += 1;
+        }
+    }
+    current_healthy
+}
+
+/// `apipod.IsPodReady` (`pkg/api/v1/pod/util.go:297`): the `Ready` condition is `True`.
+fn is_pod_ready(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .is_some_and(|conds| {
+            conds
+                .iter()
+                .any(|c| c.condition_type == "Ready" && c.status == "True")
+        })
+}
+
+/// `apipod.IsPodPhaseTerminal` (`pkg/api/v1/pod/util.go:307`).
+fn is_pod_phase_terminal(phase: Option<&Phase>) -> bool {
+    matches!(phase, Some(Phase::Failed) | Some(Phase::Succeeded))
+}
+
+fn empty_status() -> PodDisruptionBudgetStatus {
+    PodDisruptionBudgetStatus {
+        current_healthy: 0,
+        desired_healthy: 0,
+        disruptions_allowed: 0,
+        expected_pods: 0,
+        observed_generation: None,
+        conditions: None,
+        disrupted_pods: None,
+    }
+}
+
+/// `apiequality.Semantic.DeepEqual` on the disrupted-pod maps: nil and empty are equal.
+fn disrupted_pods_equal(
+    stored: Option<&HashMap<String, DateTime<Utc>>>,
+    computed: &HashMap<String, DateTime<Utc>>,
+) -> bool {
+    match stored {
+        None => computed.is_empty(),
+        Some(s) => s == computed,
+    }
+}
+
+/// `apimeta.SetStatusCondition` (`apimachinery/pkg/api/meta/conditions.go:31-68`).
+fn set_status_condition(
+    conditions: &mut Vec<PodDisruptionBudgetCondition>,
+    mut new: PodDisruptionBudgetCondition,
+) {
+    let now = || Some(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    match conditions
+        .iter_mut()
+        .find(|c| c.condition_type == new.condition_type)
+    {
+        None => {
+            if new.last_transition_time.is_none() {
+                new.last_transition_time = now();
+            }
+            conditions.push(new);
+        }
+        Some(existing) => {
+            if existing.status != new.status {
+                existing.status = new.status;
+                existing.last_transition_time = new.last_transition_time.or_else(now);
+            }
+            existing.reason = new.reason;
+            existing.message = new.message;
+            existing.observed_generation = new.observed_generation;
+        }
+    }
+}
+
+/// `pdbhelper.UpdateDisruptionAllowedCondition`
+/// (`component-helpers/apps/poddisruptionbudget/helpers.go:28-46`).
+fn update_disruption_allowed_condition(pdb: &mut PodDisruptionBudget) {
+    let Some(status) = pdb.status.as_mut() else {
+        return;
+    };
+    let (cond_status, reason) = if status.disruptions_allowed > 0 {
+        ("True", SUFFICIENT_PODS_REASON)
+    } else {
+        ("False", INSUFFICIENT_PODS_REASON)
+    };
+    let observed_generation = status.observed_generation;
+    set_status_condition(
+        status.conditions.get_or_insert_with(Vec::new),
+        PodDisruptionBudgetCondition {
+            condition_type: DISRUPTION_ALLOWED_CONDITION.to_string(),
+            status: cond_status.to_string(),
+            reason: Some(reason.to_string()),
+            message: None,
+            observed_generation,
+            last_transition_time: None,
+        },
+    );
+}
+
+/// `pdbhelper.ConditionsAreUpToDate` (`helpers.go:50-65`).
+fn conditions_are_up_to_date(pdb: &PodDisruptionBudget) -> bool {
+    let Some(status) = &pdb.status else {
+        return false;
+    };
+    let Some(cond) = status.conditions.as_ref().and_then(|c| {
+        c.iter()
+            .find(|c| c.condition_type == DISRUPTION_ALLOWED_CONDITION)
+    }) else {
+        return false;
+    };
+    if status.observed_generation.unwrap_or(0) != pdb.metadata.generation.unwrap_or(0) {
+        return false;
+    }
+    if status.disruptions_allowed > 0 {
+        cond.status == "True" && cond.reason.as_deref() == Some(SUFFICIENT_PODS_REASON)
+    } else {
+        cond.status == "False" && cond.reason.as_deref() == Some(INSUFFICIENT_PODS_REASON)
+    }
+}
+
+/// `intstr.GetScaledValueFromIntOrPercent`
+/// (`apimachinery/pkg/util/intstr/intstr.go:182-198`) with `getIntOrPercentValueSafely`
+/// (`:239-259`): an integer is itself; a string must end in `%`.
+fn get_scaled_value_from_int_or_percent(
+    value: &IntOrString,
+    total: i32,
+    round_up: bool,
+) -> rusternetes_common::Result<i32> {
+    match value {
+        IntOrString::Int(v) => Ok(*v),
+        IntOrString::String(s) => {
+            let Some(percent) = s.strip_suffix('%') else {
+                return Err(Error::InvalidResource(
+                    "invalid value for IntOrString: invalid type: string is not a percentage"
+                        .to_string(),
+                ));
+            };
+            let percent: i64 = percent.parse().map_err(|e| {
+                Error::InvalidResource(format!(
+                    "invalid value for IntOrString: invalid value {s:?}: {e}"
+                ))
+            })?;
+            let scaled = percent as f64 * total as f64 / 100.0;
+            Ok(if round_up {
+                scaled.ceil()
+            } else {
+                scaled.floor()
+            } as i32)
+        }
+    }
+}
+
+/// `metav1.LabelSelectorAsSelector` (`apimachinery/.../meta/v1/helpers.go:36-72`):
+/// every `matchLabels` / `matchExpressions` key and value is validated by
+/// `labels.NewRequirement`, so an unusable selector is an error here too.
+fn pdb_selector(pdb: &PodDisruptionBudget) -> Result<Selector, String> {
+    let selector =
+        rusternetes_common::types::label_selector_as_selector(pdb.spec.selector.as_ref())?;
+    if let Some(sel) = &pdb.spec.selector {
+        validate_selector_requirements(sel)?;
+    }
+    Ok(selector)
+}
+
+fn validate_selector_requirements(sel: &LabelSelector) -> Result<(), String> {
+    let check = |key: &str, values: &[&str]| -> Result<(), String> {
+        let errs = is_qualified_name(key);
+        if !errs.is_empty() {
+            return Err(format!("key: Invalid value: {key:?}: {}", errs.join("; ")));
+        }
+        for v in values {
+            let errs = is_valid_label_value(v);
+            if !errs.is_empty() {
+                return Err(format!("values: Invalid value: {v:?}: {}", errs.join("; ")));
+            }
+        }
+        Ok(())
+    };
+    for (k, v) in sel.match_labels.iter().flatten() {
+        check(k, &[v.as_str()])?;
+    }
+    for req in sel.match_expressions.iter().flatten() {
+        let values: Vec<&str> = req.values.iter().flatten().map(String::as_str).collect();
+        check(&req.key, &values)?;
+    }
+    Ok(())
+}
+
+/// Whether `pdb`'s selector selects `pod`. The `policy/v1beta1` compat rule
+/// ("An empty selector ({}) also selects no pods", `staging/src/k8s.io/api/policy/
+/// v1beta1/types.go:33-37`) is upstream's `Convert_v1beta1_PodDisruptionBudget_To_
+/// policy_PodDisruptionBudget` (`pkg/apis/policy/v1beta1/conversion.go:26-47`);
+/// rusternetes serves only `policy/v1`, so there is no conversion boundary to
+/// hook and the rule is keyed off the stored `apiVersion`.
+fn pdb_selector_matches(pdb: &PodDisruptionBudget, pod: &Pod) -> Result<bool, String> {
+    let selector = pdb_selector(pdb)?;
+    if selector.is_everything() && pdb.type_meta.api_version == "policy/v1beta1" {
+        return Ok(false);
+    }
+    Ok(selector.matches(pod.metadata.labels.as_ref()))
+}
+
+/// `verifyGroupKind` (`disruption.go:395-411`).
+fn verify_group_kind(
+    controller_ref: &OwnerReference,
+    expected_kind: &str,
+    expected_groups: &[&str],
+) -> rusternetes_common::Result<bool> {
+    let (group, _) = parse_group_version(&controller_ref.api_version)?;
+    if controller_ref.kind != expected_kind {
+        return Ok(false);
+    }
+    Ok(expected_groups.contains(&group.as_str()))
+}
+
+/// `schema.ParseGroupVersion` (`apimachinery/pkg/runtime/schema/group_version.go`).
+fn parse_group_version(gv: &str) -> rusternetes_common::Result<(String, String)> {
+    if gv.is_empty() || gv == "/" {
+        return Ok((String::new(), String::new()));
+    }
+    match gv.matches('/').count() {
+        0 => Ok((String::new(), gv.to_string())),
+        1 => {
+            let (g, v) = gv.split_once('/').expect("one slash");
+            Ok((g.to_string(), v.to_string()))
+        }
+        _ => Err(Error::InvalidResource(format!(
+            "unexpected GroupVersion string: {gv}"
+        ))),
+    }
+}
+
+/// `controller.KeyFunc` (`namespace/name`) for a PDB.
+fn pdb_key(pdb: &PodDisruptionBudget) -> String {
+    format!(
+        "{}/{}",
+        pdb.metadata.namespace.as_deref().unwrap_or("default"),
+        pdb.metadata.name
+    )
+}
+
+/// `poddisruptionbudgets/<ns>/<name>` (a watch key) to `<ns>/<name>`.
+fn meta_namespace_key(watch_key: &str) -> Option<String> {
+    let mut parts = watch_key.splitn(3, '/');
+    parts.next()?;
+    Some(format!("{}/{}", parts.next()?, parts.next()?))
+}
+
+/// `metav1.GetControllerOf`.
 fn controller_ref(pod: &Pod) -> Option<OwnerReference> {
     pod.metadata
         .owner_references
@@ -584,8 +1262,7 @@ fn controller_ref(pod: &Pod) -> Option<OwnerReference> {
         .and_then(|refs| refs.iter().find(|r| r.controller == Some(true)).cloned())
 }
 
-/// Same as [`controller_ref`] but reads from a raw JSON object so we can
-/// chase ownership through workload types fetched as `serde_json::Value`.
+/// [`controller_ref`] over a raw JSON object.
 fn controller_ref_from_json(obj: &serde_json::Value) -> Option<OwnerReference> {
     let refs = obj
         .get("metadata")
@@ -599,21 +1276,35 @@ fn controller_ref_from_json(obj: &serde_json::Value) -> Option<OwnerReference> {
     None
 }
 
-/// Split a Kubernetes apiVersion ("group/version" or just "version" for
-/// core /api/v1) into its component parts. Core resources return an
-/// empty group, matching upstream's `schema.ParseGroupVersion`.
-fn split_group_version(api_version: &str) -> (String, String) {
-    match api_version.split_once('/') {
-        Some((g, v)) => (g.to_string(), v.to_string()),
-        None => (String::new(), api_version.to_string()),
+fn json_uid(obj: &serde_json::Value) -> &str {
+    obj.get("metadata")
+        .and_then(|m| m.get("uid"))
+        .and_then(|u| u.as_str())
+        .unwrap_or("")
+}
+
+/// `*(x.Spec.Replicas)`: the API server defaults an unset `replicas` to 1.
+fn json_replicas(obj: &serde_json::Value) -> i32 {
+    obj.get("spec")
+        .and_then(|s| s.get("replicas"))
+        .and_then(|r| r.as_i64())
+        .map(|r| r as i32)
+        .unwrap_or(1)
+}
+
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "nil",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "float64",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "[]interface {}",
+        serde_json::Value::Object(_) => "map[string]interface {}",
     }
 }
 
-/// Resolve a dot-prefixed JSONPath (e.g. `.spec.replicas`) against a
-/// JSON object. Only supports the dotted-field subset that CRD
-/// `specReplicasPath` / `statusReplicasPath` are allowed to use per the
-/// apiextensions docs — no array indexing, no filters. The leading `.`
-/// is required by the spec; we tolerate its absence for ergonomics.
+/// Resolve a dot-prefixed JSONPath (e.g. `.spec.replicas`) against a JSON
+/// object: the dotted-field subset CRD `specReplicasPath` is allowed to use.
 fn resolve_json_path<'a>(doc: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let trimmed = path.strip_prefix('.').unwrap_or(path);
     let mut cur = doc;
@@ -626,29 +1317,48 @@ fn resolve_json_path<'a>(doc: &'a serde_json::Value, path: &str) -> Option<&'a s
     Some(cur)
 }
 
-/// Default `stalePodDisruptionTimeout` mirrored from upstream
-/// `pkg/controller/disruption/disruption.go` — the disruption controller
-/// flips a stale `DisruptionTarget=True` condition on a Running pod after
-/// this many minutes.
-pub const STALE_POD_DISRUPTION_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+/// `nonTerminatingPodHasStaleDisruptionCondition` (`disruption.go:1046-1062`):
+/// whether the pod carries a stale `DisruptionTarget=True` condition, and how
+/// long until it becomes stale.
+fn non_terminating_pod_has_stale_disruption_condition(
+    pod: &Pod,
+    now: DateTime<Utc>,
+    timeout: StdDuration,
+) -> Option<ChronoDuration> {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return None;
+    }
+    let status = pod.status.as_ref()?;
+    let cond = status
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.condition_type == "DisruptionTarget")?;
+    // "Pod disruption conditions added by kubelet are never considered stale
+    // because the condition might take arbitrarily long before the pod is
+    // terminating (has deletion timestamp). Also, pod conditions present on pods
+    // in terminal phase are not stale to avoid unnecessary status updates."
+    if cond.status != "True"
+        || cond.reason.as_deref() == Some(POD_REASON_TERMINATION_BY_KUBELET)
+        || is_pod_phase_terminal(status.phase.as_ref())
+    {
+        return None;
+    }
+    let transitioned = cond
+        .last_transition_time
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let wait_for = ChronoDuration::from_std(timeout).unwrap_or(ChronoDuration::zero())
+        - now.signed_duration_since(transitioned);
+    Some(wait_for.max(ChronoDuration::zero()))
+}
 
-/// Sub-controller that mirrors upstream
-/// `pkg/controller/disruption/stalepoddisruption.go`. Periodically scans
-/// pods carrying a `DisruptionTarget=True` condition and decides whether
-/// to flip the condition to `False` (the original disruption never
-/// completed) or leave it alone (the pod truly was disrupted).
+/// The pod half of `DisruptionController` (`syncStalePodDisruption`,
+/// `disruption.go:774-816`): a pod whose `DisruptionTarget=True` condition was
+/// set but which never got a `deletionTimestamp` has the condition reset to
+/// `False` after [`STALE_POD_DISRUPTION_TIMEOUT`].
 ///
-/// Decision matrix matches upstream (`syncStalePodDisruption`):
-///
-/// | Pod state                              | Action                       |
-/// |----------------------------------------|------------------------------|
-/// | `deletionTimestamp` set (terminating)  | Preserve `True`              |
-/// | `status.phase == Failed`               | Preserve `True` + reason     |
-/// | `status.phase == Running` AND stale    | Set `False`                  |
-/// | `status.phase == Running` AND fresh    | No-op (re-check on next tick)|
-///
-/// "Stale" means the condition's `lastTransitionTime` is older than
-/// [`STALE_POD_DISRUPTION_TIMEOUT`].
+/// Upstream shares the pod informer with the PDB sync; here it is its own
+/// controller with its own pod watch, which is observably the same.
 pub struct StalePodDisruptionController<S: Storage> {
     storage: Arc<S>,
     timeout: StdDuration,
@@ -662,126 +1372,166 @@ impl<S: Storage + 'static> StalePodDisruptionController<S> {
         }
     }
 
-    /// Test helper: install a custom timeout so the sub-controller can be
-    /// driven deterministically without 120s of wall-clock waiting.
+    /// Test helper: install a custom timeout so the controller can be driven
+    /// deterministically without 120s of wall-clock waiting.
     #[allow(dead_code)]
     #[doc(hidden)]
     pub fn with_timeout(storage: Arc<S>, timeout: StdDuration) -> Self {
         Self { storage, timeout }
     }
 
-    /// Periodic resync loop. Upstream rate-limits this work queue —
-    /// rusternetes uses a fixed 30s tick which is good enough until the
-    /// condition gets exercised by real workloads.
+    /// `stalePodDisruptionWorker` + the pod handlers' `enqueueStalePodDisruptionCleanup`.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
-        let mut interval = tokio::time::interval(StdDuration::from_secs(30));
-        interval.tick().await; // skip the immediate tick on startup
+        let queue = WorkQueue::new();
+        let worker_self = Arc::clone(&self);
+        let worker_queue = queue.clone();
+        tokio::spawn(async move { worker_self.worker(worker_queue).await });
+
         loop {
-            interval.tick().await;
-            if let Err(e) = self.reconcile_all().await {
-                error!("stale-pod-disruption reconcile_all failed: {}", e);
+            self.enqueue_all(&queue).await;
+
+            let mut pod_watch = match self.storage.watch(&build_prefix("pods", None)).await {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("stale-pod-disruption: failed to establish pod watch: {e}");
+                    tokio::time::sleep(RESYNC_INTERVAL).await;
+                    continue;
+                }
+            };
+            let mut resync = tokio::time::interval(RESYNC_INTERVAL);
+            resync.tick().await;
+            loop {
+                tokio::select! {
+                    event = pod_watch.next() => match event {
+                        Some(Ok(WatchEvent::Deleted(..))) => {}
+                        Some(Ok(WatchEvent::Added(_, v) | WatchEvent::Modified(_, v))) => {
+                            if let Ok(pod) = serde_json::from_str::<Pod>(&v) {
+                                self.enqueue_if_stale(&queue, &pod).await;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            warn!("stale-pod-disruption: pod watch error: {e}, reconnecting");
+                            break;
+                        }
+                        None => {
+                            warn!("stale-pod-disruption: pod watch ended, reconnecting");
+                            break;
+                        }
+                    },
+                    _ = resync.tick() => self.enqueue_all(&queue).await,
+                }
             }
         }
     }
 
-    /// Walk every pod, fix the stale ones. Designed for tests to call
-    /// directly against `Arc<MemoryStorage>` (no informers, no rate limit).
+    async fn enqueue_all(&self, queue: &WorkQueue) {
+        match self.storage.list::<Pod>(&build_prefix("pods", None)).await {
+            Ok(pods) => {
+                for pod in &pods {
+                    self.enqueue_if_stale(queue, pod).await;
+                }
+            }
+            Err(e) => error!("stale-pod-disruption: failed to list pods: {e}"),
+        }
+    }
+
+    /// `if has, cleanAfter := dc.nonTerminatingPodHasStaleDisruptionCondition(pod); has {
+    /// dc.enqueueStalePodDisruptionCleanup(logger, pod, cleanAfter) }`.
+    async fn enqueue_if_stale(&self, queue: &WorkQueue, pod: &Pod) {
+        if let Some(clean_after) =
+            non_terminating_pod_has_stale_disruption_condition(pod, Utc::now(), self.timeout)
+        {
+            let key = format!(
+                "{}/{}",
+                pod.metadata.namespace.as_deref().unwrap_or("default"),
+                pod.metadata.name
+            );
+            queue
+                .add_after(key, clean_after.to_std().unwrap_or(StdDuration::ZERO))
+                .await;
+        }
+    }
+
+    async fn worker(&self, queue: WorkQueue) {
+        while let Some(key) = queue.get().await {
+            match self.sync_stale_pod_disruption(&key, &queue).await {
+                Ok(()) => queue.forget(&key).await,
+                Err(e) => {
+                    error!("error syncing Pod {key} to clear DisruptionTarget condition, requeueing: {e}");
+                    queue.requeue_rate_limited(key.clone()).await;
+                }
+            }
+            queue.done(&key).await;
+        }
+    }
+
+    /// Walk every pod, fix the stale ones (tests call this directly).
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> anyhow::Result<()> {
+        let queue = WorkQueue::new();
         let pods: Vec<Pod> = self.storage.list("/registry/pods/").await?;
         for pod in pods {
-            if let Err(e) = self.reconcile_pod(&pod).await {
-                warn!(
-                    "stale-pod-disruption: failed to reconcile {}/{}: {}",
-                    pod.metadata.namespace.as_deref().unwrap_or("?"),
-                    pod.metadata.name,
-                    e
-                );
+            let key = format!(
+                "{}/{}",
+                pod.metadata.namespace.as_deref().unwrap_or("default"),
+                pod.metadata.name
+            );
+            if let Err(e) = self.sync_stale_pod_disruption(&key, &queue).await {
+                warn!("stale-pod-disruption: failed to reconcile {key}: {e}");
             }
         }
         Ok(())
     }
 
-    async fn reconcile_pod(&self, pod: &Pod) -> anyhow::Result<()> {
-        // Only act on pods that actually carry `DisruptionTarget=True`.
-        let conditions = match pod.status.as_ref().and_then(|s| s.conditions.as_ref()) {
-            Some(c) => c,
-            None => return Ok(()),
+    /// `syncStalePodDisruption` (`disruption.go:774-816`).
+    async fn sync_stale_pod_disruption(&self, key: &str, queue: &WorkQueue) -> anyhow::Result<()> {
+        let (namespace, name) = key.split_once('/').unwrap_or(("default", key));
+        let pod_key = build_key("pods", Some(namespace), name);
+        let pod: Pod = match self.storage.get(&pod_key).await {
+            Ok(p) => p,
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
         };
-        let dt_idx = conditions
-            .iter()
-            .position(|c| c.condition_type == "DisruptionTarget" && c.status == "True");
-        let dt_idx = match dt_idx {
-            Some(i) => i,
-            None => return Ok(()),
+        let Some(clean_after) =
+            non_terminating_pod_has_stale_disruption_condition(&pod, Utc::now(), self.timeout)
+        else {
+            return Ok(());
         };
-
-        // Preserve `True` for terminating pods.
-        if pod.metadata.deletion_timestamp.is_some() {
-            debug!(
-                "stale-pod-disruption: preserving DisruptionTarget=True on terminating pod {}/{}",
-                pod.metadata.namespace.as_deref().unwrap_or("?"),
-                pod.metadata.name
-            );
+        if clean_after > ChronoDuration::zero() {
+            queue
+                .add_after(
+                    key.to_string(),
+                    clean_after.to_std().unwrap_or(StdDuration::ZERO),
+                )
+                .await;
             return Ok(());
         }
 
-        // Preserve `True` for Failed pods (regardless of reason).
-        let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
-        if matches!(phase, Some(Phase::Failed)) {
-            debug!(
-                "stale-pod-disruption: preserving DisruptionTarget=True on Failed pod {}/{}",
-                pod.metadata.namespace.as_deref().unwrap_or("?"),
-                pod.metadata.name
-            );
-            return Ok(());
-        }
-
-        // For Running pods, flip to False only after the timeout elapses.
-        if !matches!(phase, Some(Phase::Running)) {
-            return Ok(());
-        }
-        let last_transition: Option<DateTime<Utc>> = conditions[dt_idx].last_transition_time;
-        let stale = match last_transition {
-            Some(t) => {
-                Utc::now().signed_duration_since(t)
-                    >= chrono::Duration::from_std(self.timeout)
-                        .unwrap_or(chrono::Duration::seconds(0))
-            }
-            None => true, // missing timestamp is treated as already stale
-        };
-        if !stale {
-            return Ok(());
-        }
-
-        // Flip True → False. Re-read for fresh resourceVersion to avoid CAS
-        // races with concurrent writers (the canonical in-repo pattern).
-        let key = build_key(
-            "pods",
-            pod.metadata.namespace.as_deref(),
-            &pod.metadata.name,
-        );
-        let mut fresh: Pod = self.storage.get(&key).await?;
-        if let Some(status) = fresh.status.as_mut() {
-            if let Some(conds) = status.conditions.as_mut() {
-                if let Some(c) = conds
-                    .iter_mut()
+        // `apipod.UpdatePodCondition` replaces the whole condition: reason and
+        // message are cleared, `lastTransitionTime` is now (the status changed),
+        // `observedGeneration` follows the pod's generation (PodObservedGenerationTracking
+        // is GA and locked on in 1.35).
+        let mut new_pod = pod.clone();
+        let generation = new_pod.metadata.generation;
+        if let Some(cond) = new_pod
+            .status
+            .as_mut()
+            .and_then(|s| s.conditions.as_mut())
+            .and_then(|c| {
+                c.iter_mut()
                     .find(|c| c.condition_type == "DisruptionTarget")
-                {
-                    if c.status == "True" {
-                        c.status = "False".to_string();
-                        c.last_transition_time = Some(Utc::now());
-                    }
-                }
-            }
+            })
+        {
+            cond.status = "False".to_string();
+            cond.reason = None;
+            cond.message = None;
+            cond.last_transition_time = Some(Utc::now());
+            cond.observed_generation = generation;
         }
-        // Pod conditions live in status, so this must go through the status
-        // subresource too — same reason as the PDB write above (#1712/#1723).
-        self.storage.update_status(&key, &fresh).await?;
-        info!(
-            "stale-pod-disruption: flipped DisruptionTarget True->False on Running pod {}/{}",
-            pod.metadata.namespace.as_deref().unwrap_or("?"),
-            pod.metadata.name
-        );
+        // Pod conditions live in status, so this goes through the status
+        // subresource (#1712/#1723).
+        self.storage.update_status(&pod_key, &new_pod).await?;
+        info!("Reset stale DisruptionTarget condition to False on pod {key}");
         Ok(())
     }
 }
@@ -789,11 +1539,9 @@ impl<S: Storage + 'static> StalePodDisruptionController<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::resources::{Container, IntOrString, PodDisruptionBudgetSpec, PodSpec};
+    use rusternetes_common::resources::{IntOrString, PodDisruptionBudgetSpec};
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
     use rusternetes_storage::MemoryStorage;
-    use std::collections::HashMap;
-
     /// A storage double that behaves like a real api-server: `update` (full-object
     /// PUT) DISCARDS `.status`; only the status subresource persists it. Upstream
     /// strips status on the main resource for any type with a status subresource,
@@ -947,7 +1695,7 @@ mod tests {
         storage.create(&key, &pdb).await.unwrap();
 
         let controller = PodDisruptionBudgetController::new(storage.clone());
-        controller.reconcile_pdb(&pdb).await.unwrap();
+        controller.sync("default/pdb-1").await.unwrap();
 
         let stored: PodDisruptionBudget = storage.get(&key).await.unwrap();
         let status = stored
@@ -999,7 +1747,7 @@ mod tests {
         storage.create(&key, &pdb).await.unwrap();
 
         let controller = PodDisruptionBudgetController::new(storage.clone());
-        controller.reconcile_pdb(&pdb).await.unwrap();
+        controller.sync("default/pdb-1").await.unwrap();
 
         let status = storage
             .get::<PodDisruptionBudget>(&key)
@@ -1031,7 +1779,7 @@ mod tests {
         storage.create(&key, &pdb).await.unwrap();
 
         let controller = PodDisruptionBudgetController::new(storage.clone());
-        controller.reconcile_pdb(&pdb).await.unwrap();
+        controller.sync("default/pdb-1").await.unwrap();
 
         let status = storage
             .get::<PodDisruptionBudget>(&key)
@@ -1070,17 +1818,26 @@ mod tests {
     }
 
     #[test]
-    fn test_split_group_version() {
+    fn test_parse_group_version() {
+        // schema.ParseGroupVersion: "" and "/" are the zero value; one slash
+        // splits; more is an error; core resources have no group.
         assert_eq!(
-            split_group_version("apps/v1"),
+            parse_group_version("apps/v1").unwrap(),
             ("apps".to_string(), "v1".to_string())
         );
-        // Core resources live under just "v1" (no group prefix).
-        assert_eq!(split_group_version("v1"), (String::new(), "v1".to_string()));
         assert_eq!(
-            split_group_version("example.com/v1beta1"),
-            ("example.com".to_string(), "v1beta1".to_string())
+            parse_group_version("v1").unwrap(),
+            (String::new(), "v1".to_string())
         );
+        assert_eq!(
+            parse_group_version("/v1").unwrap(),
+            (String::new(), "v1".to_string())
+        );
+        assert_eq!(
+            parse_group_version("").unwrap(),
+            (String::new(), String::new())
+        );
+        assert!(parse_group_version("a/b/c").is_err());
     }
 
     #[test]
@@ -1119,279 +1876,5 @@ mod tests {
         // No metadata at all → None.
         let obj3 = serde_json::json!({});
         assert!(controller_ref_from_json(&obj3).is_none());
-    }
-
-    #[tokio::test]
-    async fn test_calculate_desired_healthy_min_available_int() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = PodDisruptionBudgetController::new(storage);
-
-        let spec = PodDisruptionBudgetSpec {
-            min_available: Some(IntOrString::Int(3)),
-            max_unavailable: None,
-            selector: Some(LabelSelector {
-                match_labels: Some(HashMap::new()),
-                match_expressions: None,
-            }),
-            unhealthy_pod_eviction_policy: None,
-        };
-
-        let pdb = PodDisruptionBudget::new("test-pdb", "default", spec);
-        let desired = controller.calculate_desired_healthy(&pdb, 5).unwrap();
-        assert_eq!(desired, 3);
-    }
-
-    #[tokio::test]
-    async fn test_calculate_desired_healthy_min_available_percentage() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = PodDisruptionBudgetController::new(storage);
-
-        let spec = PodDisruptionBudgetSpec {
-            min_available: Some(IntOrString::String("50%".to_string())),
-            max_unavailable: None,
-            selector: Some(LabelSelector {
-                match_labels: Some(HashMap::new()),
-                match_expressions: None,
-            }),
-            unhealthy_pod_eviction_policy: None,
-        };
-
-        let pdb = PodDisruptionBudget::new("test-pdb", "default", spec);
-        let desired = controller.calculate_desired_healthy(&pdb, 10).unwrap();
-        assert_eq!(desired, 5); // 50% of 10 = 5
-    }
-
-    #[tokio::test]
-    async fn test_calculate_desired_healthy_max_unavailable_int() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = PodDisruptionBudgetController::new(storage);
-
-        let spec = PodDisruptionBudgetSpec {
-            min_available: None,
-            max_unavailable: Some(IntOrString::Int(2)),
-            selector: Some(LabelSelector {
-                match_labels: Some(HashMap::new()),
-                match_expressions: None,
-            }),
-            unhealthy_pod_eviction_policy: None,
-        };
-
-        let pdb = PodDisruptionBudget::new("test-pdb", "default", spec);
-        let desired = controller.calculate_desired_healthy(&pdb, 5).unwrap();
-        assert_eq!(desired, 3); // 5 - 2 = 3
-    }
-
-    #[tokio::test]
-    async fn test_pod_matches_selector() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = PodDisruptionBudgetController::new(storage);
-
-        let mut pod = Pod {
-            type_meta: TypeMeta {
-                kind: "Pod".to_string(),
-                api_version: "v1".to_string(),
-            },
-            metadata: ObjectMeta::new("test-pod"),
-            spec: Some(PodSpec {
-                containers: vec![Container {
-                    name: "test".to_string(),
-                    image: "nginx".to_string(),
-                    image_pull_policy: None,
-                    command: None,
-                    args: None,
-                    ports: None,
-                    env: None,
-                    volume_mounts: None,
-                    liveness_probe: None,
-                    readiness_probe: None,
-                    startup_probe: None,
-                    resources: None,
-                    working_dir: None,
-                    security_context: None,
-                    restart_policy: None,
-                    resize_policy: None,
-                    lifecycle: None,
-                    termination_message_path: None,
-                    termination_message_policy: None,
-                    stdin: None,
-                    stdin_once: None,
-                    tty: None,
-                    env_from: None,
-                    volume_devices: None,
-                    ..Default::default()
-                }],
-                init_containers: None,
-                restart_policy: None,
-                node_selector: None,
-                node_name: None,
-                volumes: None,
-                affinity: None,
-                tolerations: None,
-                service_account_name: None,
-                service_account: None,
-                priority: None,
-                priority_class_name: None,
-                hostname: None,
-                subdomain: None,
-                host_network: None,
-                host_pid: None,
-                host_ipc: None,
-                automount_service_account_token: None,
-                ephemeral_containers: None,
-                overhead: None,
-                scheduler_name: None,
-                topology_spread_constraints: None,
-                resource_claims: None,
-                active_deadline_seconds: None,
-                dns_policy: None,
-                dns_config: None,
-                security_context: None,
-                image_pull_secrets: None,
-                share_process_namespace: None,
-                readiness_gates: None,
-                runtime_class_name: None,
-                enable_service_links: None,
-                preemption_policy: None,
-                host_users: None,
-                set_hostname_as_fqdn: None,
-                termination_grace_period_seconds: None,
-                host_aliases: None,
-                os: None,
-                scheduling_gates: None,
-                resources: None,
-                ..Default::default()
-            }),
-            status: None,
-        };
-
-        pod.metadata.labels = Some(HashMap::from([
-            ("app".to_string(), "web".to_string()),
-            ("tier".to_string(), "frontend".to_string()),
-        ]));
-
-        let selector = LabelSelector {
-            match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
-            match_expressions: None,
-        };
-
-        assert!(controller.pod_matches_selector(&pod, &selector, false));
-
-        let selector_no_match = LabelSelector {
-            match_labels: Some(HashMap::from([("app".to_string(), "api".to_string())])),
-            match_expressions: None,
-        };
-
-        assert!(!controller.pod_matches_selector(&pod, &selector_no_match, false));
-    }
-
-    #[tokio::test]
-    async fn test_is_pod_healthy() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = PodDisruptionBudgetController::new(storage);
-
-        let mut pod = Pod {
-            type_meta: TypeMeta {
-                kind: "Pod".to_string(),
-                api_version: "v1".to_string(),
-            },
-            metadata: ObjectMeta::new("test-pod"),
-            spec: Some(PodSpec {
-                containers: vec![Container {
-                    name: "test".to_string(),
-                    image: "nginx".to_string(),
-                    image_pull_policy: None,
-                    command: None,
-                    args: None,
-                    ports: None,
-                    env: None,
-                    volume_mounts: None,
-                    liveness_probe: None,
-                    readiness_probe: None,
-                    startup_probe: None,
-                    resources: None,
-                    working_dir: None,
-                    security_context: None,
-                    restart_policy: None,
-                    resize_policy: None,
-                    lifecycle: None,
-                    termination_message_path: None,
-                    termination_message_policy: None,
-                    stdin: None,
-                    stdin_once: None,
-                    tty: None,
-                    env_from: None,
-                    volume_devices: None,
-                    ..Default::default()
-                }],
-                init_containers: None,
-                restart_policy: None,
-                node_selector: None,
-                node_name: None,
-                volumes: None,
-                affinity: None,
-                tolerations: None,
-                service_account_name: None,
-                service_account: None,
-                priority: None,
-                priority_class_name: None,
-                hostname: None,
-                subdomain: None,
-                host_network: None,
-                host_pid: None,
-                host_ipc: None,
-                automount_service_account_token: None,
-                ephemeral_containers: None,
-                overhead: None,
-                scheduler_name: None,
-                topology_spread_constraints: None,
-                resource_claims: None,
-                active_deadline_seconds: None,
-                dns_policy: None,
-                dns_config: None,
-                security_context: None,
-                image_pull_secrets: None,
-                share_process_namespace: None,
-                readiness_gates: None,
-                runtime_class_name: None,
-                enable_service_links: None,
-                preemption_policy: None,
-                host_users: None,
-                set_hostname_as_fqdn: None,
-                termination_grace_period_seconds: None,
-                host_aliases: None,
-                os: None,
-                scheduling_gates: None,
-                resources: None,
-                ..Default::default()
-            }),
-            status: Some(rusternetes_common::resources::PodStatus {
-                phase: Some(Phase::Running),
-                message: None,
-                reason: None,
-                host_ip: None,
-                host_i_ps: None,
-                pod_ip: None,
-                pod_i_ps: None,
-                nominated_node_name: None,
-                qos_class: None,
-                start_time: None,
-                conditions: None,
-                container_statuses: None,
-                init_container_statuses: None,
-                ephemeral_container_statuses: None,
-                resize: None,
-                resource_claim_statuses: None,
-                observed_generation: None,
-                ..Default::default()
-            }),
-        };
-
-        assert!(controller.is_pod_healthy(&pod));
-
-        // Test with Pending pod
-        if let Some(ref mut status) = pod.status {
-            status.phase = Some(Phase::Pending);
-        }
-        assert!(!controller.is_pod_healthy(&pod));
     }
 }
