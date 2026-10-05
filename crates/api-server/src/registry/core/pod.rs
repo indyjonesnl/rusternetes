@@ -14,7 +14,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use rusternetes_common::equality::semantic_equal;
+use rusternetes_common::podutil::update_pod_condition;
 use rusternetes_common::resources::pod::PodSpec;
 use rusternetes_common::resources::{Binding, Container, Pod, PodCondition, PodStatus};
 use rusternetes_common::types::Phase;
@@ -23,12 +26,14 @@ use rusternetes_common::validation::metav1::{get_warnings_for_ip, is_dns1123_lab
 use rusternetes_common::validation::objectmeta::{
     name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
 };
+use rusternetes_common::Status;
 use rusternetes_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{
-    reset_object_meta_for_status, GroupResource, NamespaceScopedStrategy, RequestContext,
-    RestCreateStrategy, RestDeleteStrategy, RestGracefulDeleteStrategy, RestUpdateStrategy,
+    reset_object_meta_for_status, DefaultUpdatedObjectInfo, GroupResource, NamespaceScopedStrategy,
+    RequestContext, RestCreateStrategy, RestDeleteStrategy, RestGracefulDeleteStrategy,
+    RestUpdateStrategy, TransformFunc, UpdatedObjectInfo,
 };
 
 /// `api.MirrorPodAnnotationKey`.
@@ -565,26 +570,6 @@ pub fn new_resize_store(storage: Arc<StorageBackend>) -> Store<Pod, StorageBacke
     new_store(storage).with_update_strategy(Arc::new(ResizeStrategy))
 }
 
-/// `podutil.UpdatePodCondition` (pkg/api/v1/pod/util.go): replace the
-/// condition of the same type, or append it. The transition time moves only
-/// when the status flips.
-fn update_pod_condition(status: &mut PodStatus, mut condition: PodCondition) {
-    condition.last_transition_time = Some(chrono::Utc::now());
-    let conditions = status.conditions.get_or_insert_with(Vec::new);
-    match conditions
-        .iter_mut()
-        .find(|c| c.condition_type == condition.condition_type)
-    {
-        None => conditions.push(condition),
-        Some(old) => {
-            if condition.status == old.status {
-                condition.last_transition_time = old.last_transition_time;
-            }
-            *old = condition;
-        }
-    }
-}
-
 /// `BindingREST` (storage/storage.go:149-297, `Create` and its
 /// `assignPod` / `setPodNodeAndMetadata`): binds a pod to a node by writing
 /// the pod straight through the storage with the binding's UID and
@@ -724,6 +709,895 @@ fn set_pod_node_and_metadata(
         },
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// EvictionREST (pkg/registry/core/pod/storage/eviction.go)
+// ---------------------------------------------------------------------------
+
+/// `MaxDisruptedPodSize` (eviction.go:54): the most entries
+/// `PodDisruptionBudgetStatus.DisruptedPods` may hold before eviction refuses
+/// to add to it.
+pub const MAX_DISRUPTED_POD_SIZE: usize = 2000;
+
+/// `wait.Backoff` (apimachinery/pkg/util/wait/backoff.go): `steps` is the
+/// number of attempts, with a pause between them.
+#[derive(Debug, Clone)]
+pub struct Backoff {
+    pub steps: u32,
+    pub duration: std::time::Duration,
+    pub factor: f64,
+    pub jitter: f64,
+}
+
+/// `EvictionsRetry` (eviction.go:59-64): "the retry for a conflict where
+/// multiple clients are making changes to the same resource".
+pub fn evictions_retry() -> Backoff {
+    Backoff {
+        steps: 20,
+        duration: std::time::Duration::from_millis(500),
+        factor: 1.0,
+        jitter: 0.1,
+    }
+}
+
+impl Backoff {
+    /// The pause `wait.ExponentialBackoff` takes between two attempts
+    /// (backoff.go:`ExponentialBackoff`): `false`, without pausing, once the
+    /// last attempt has been made (`if backoff.Steps == 1 { break }`).
+    async fn wait(&mut self) -> bool {
+        if self.steps <= 1 {
+            return false;
+        }
+        self.steps -= 1;
+        let mut delay = self.duration;
+        if self.factor != 0.0 {
+            self.duration = self.duration.mul_f64(self.factor);
+        }
+        if self.jitter > 0.0 {
+            // `wait.Jitter`: duration + rand * maxFactor * duration.
+            delay += delay.mul_f64(rand::random::<f64>() * self.jitter);
+        }
+        tokio::time::sleep(delay).await;
+        true
+    }
+}
+
+/// `errors.IsConflict`.
+fn is_conflict(err: &rusternetes_common::Error) -> bool {
+    matches!(err, rusternetes_common::Error::Conflict(_))
+}
+
+/// `dryrun.IsDryRun`: any entry is a dry run.
+fn is_dry_run(dry_run: Option<&[String]>) -> bool {
+    dry_run.is_some_and(|d| !d.is_empty())
+}
+
+/// `resourceVersionIsUnset` (eviction.go:409-411).
+fn resource_version_is_unset(options: &rusternetes_common::deletion::DeleteOptions) -> bool {
+    options
+        .preconditions
+        .as_ref()
+        .is_none_or(|p| p.resource_version.is_none())
+}
+
+/// `setPreconditionsResourceVersion` (eviction.go:382-387).
+fn set_preconditions_resource_version(
+    options: &mut rusternetes_common::deletion::DeleteOptions,
+    resource_version: Option<String>,
+) {
+    options
+        .preconditions
+        .get_or_insert_with(Default::default)
+        .resource_version = Some(resource_version.unwrap_or_default());
+}
+
+/// `canIgnorePDB` (eviction.go:389-397): "pod conditions that allow the pod to
+/// be deleted without checking PDBs".
+fn can_ignore_pdb(pod: &Pod) -> bool {
+    let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
+    matches!(
+        phase,
+        Some(Phase::Succeeded) | Some(Phase::Failed) | Some(Phase::Pending)
+    ) || pod.metadata.deletion_timestamp.is_some()
+}
+
+/// `shouldEnforceResourceVersion` (eviction.go:399-407).
+fn should_enforce_resource_version(pod: &Pod) -> bool {
+    let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
+    // We don't need to enforce ResourceVersion for terminal pods.
+    if matches!(phase, Some(Phase::Succeeded) | Some(Phase::Failed))
+        || pod.metadata.deletion_timestamp.is_some()
+    {
+        return false;
+    }
+    // True for all other pods, to ensure we don't race against a pod becoming
+    // healthy (ready) and violating PDBs.
+    true
+}
+
+/// `propagateDryRun` (eviction.go:108-126): the request's dry-run option goes
+/// into the eviction's delete options. "It returns an error if they have
+/// non-matching dry-run options."
+fn propagate_dry_run(
+    eviction: &mut rusternetes_common::resources::Eviction,
+    options: &rusternetes_common::validation::metav1::CreateOptions,
+) -> rusternetes_common::Result<rusternetes_common::deletion::DeleteOptions> {
+    use crate::registry::rest::zero_delete_options;
+    let request = options.dry_run.clone().filter(|d| !d.is_empty());
+    let Some(delete_options) = eviction.delete_options.as_mut() else {
+        return Ok(rusternetes_common::deletion::DeleteOptions {
+            dry_run: options.dry_run.clone(),
+            ..zero_delete_options()
+        });
+    };
+    let own = delete_options.dry_run.clone().filter(|d| !d.is_empty());
+    match (own, request) {
+        (None, request) => {
+            delete_options.dry_run = request.or(options.dry_run.clone());
+            Ok(delete_options.clone())
+        }
+        (Some(_), None) => Ok(delete_options.clone()),
+        (Some(own), Some(request)) => {
+            if own != request {
+                return Err(rusternetes_common::Error::Internal(format!(
+                    "Non-matching dry-run options in request and content: {request:?} and {own:?}"
+                )));
+            }
+            Ok(delete_options.clone())
+        }
+    }
+}
+
+/// `&metav1.Status{Status: metav1.StatusSuccess}`: no code, which the create
+/// handler turns into a 201 (create.go:227-231).
+fn success_status() -> Status {
+    Status {
+        code: None,
+        ..Status::success()
+    }
+}
+
+/// `createTooManyRequestsError` (eviction.go:413-421).
+fn create_too_many_requests_error(name: &str) -> rusternetes_common::Error {
+    // TODO upstream: once there are time-based budgets, we can sometimes
+    // compute a sensible suggested value. Even without that, a suggestion
+    // (even a small one) prevents well-behaved clients from hammering us.
+    too_many_requests(
+        10,
+        vec![rusternetes_common::StatusCause {
+            reason: Some("DisruptionBudget".to_string()),
+            message: Some(format!(
+                "The disruption budget {name} is still being processed by the server."
+            )),
+            field: None,
+        }],
+    )
+}
+
+/// `errors.NewTooManyRequests(message, retryAfterSeconds)` (errors.go) with
+/// the eviction message, and `causes` appended to its `Details`.
+fn too_many_requests(
+    retry_after_seconds: i32,
+    causes: Vec<rusternetes_common::StatusCause>,
+) -> rusternetes_common::Error {
+    let details = rusternetes_common::StatusDetails {
+        name: None,
+        group: None,
+        kind: None,
+        uid: None,
+        causes: (!causes.is_empty()).then_some(causes),
+        retry_after_seconds: (retry_after_seconds > 0).then_some(retry_after_seconds),
+    };
+    rusternetes_common::Error::Status(Box::new(Status::failure_with_details(
+        "Cannot evict pod as it would violate the pod's disruption budget.",
+        "TooManyRequests",
+        429,
+        details,
+    )))
+}
+
+/// `errors.NewForbidden(policy.Resource("poddisruptionbudget"), name, err)`.
+fn pdb_forbidden(name: &str, err: &str) -> rusternetes_common::Error {
+    rusternetes_common::Error::Forbidden(format!(
+        "poddisruptionbudget.policy \"{name}\" is forbidden: {err}"
+    ))
+}
+
+/// The pod storage `EvictionREST` reads and writes through (its `store`,
+/// `rest.StandardStorage` upstream — the pod **status** store, see
+/// `NewStorage`, storage.go:103-116). A trait so the port of `TestEviction`
+/// can script `Delete` with upstream's `mockStore`.
+#[async_trait]
+pub trait EvictionPodStore: Send + Sync {
+    /// `Get`.
+    async fn get(&self, ctx: &RequestContext, name: &str) -> rusternetes_common::Result<Pod>;
+    /// `Update`, with the validation callbacks of `rest.ValidateAllObjectFunc`.
+    async fn update(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        obj_info: &dyn UpdatedObjectInfo<Pod>,
+    ) -> rusternetes_common::Result<Pod>;
+    /// `Delete`, with `rest.ValidateAllObjectFunc`.
+    async fn delete(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        options: rusternetes_common::deletion::DeleteOptions,
+    ) -> rusternetes_common::Result<()>;
+}
+
+#[async_trait]
+impl<S: rusternetes_storage::Storage + 'static> EvictionPodStore for Store<Pod, S> {
+    async fn get(&self, ctx: &RequestContext, name: &str) -> rusternetes_common::Result<Pod> {
+        Store::get(self, ctx, name).await
+    }
+
+    async fn update(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        obj_info: &dyn UpdatedObjectInfo<Pod>,
+    ) -> rusternetes_common::Result<Pod> {
+        Store::update(
+            self,
+            ctx,
+            name,
+            obj_info,
+            None,
+            None,
+            false,
+            &crate::registry::generic::UpdateOptions::default(),
+        )
+        .await
+        .map(|(pod, _created)| pod)
+    }
+
+    async fn delete(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        options: rusternetes_common::deletion::DeleteOptions,
+    ) -> rusternetes_common::Result<()> {
+        Store::delete(self, ctx, name, None, options)
+            .await
+            .map(|_| ())
+    }
+}
+
+/// `policyclient.PodDisruptionBudgetsGetter` (the typed client upstream's
+/// `EvictionREST` is handed, a loopback client of the api-server itself): the
+/// calls `getPodDisruptionBudgets` and `checkAndDecrement` make.
+#[async_trait]
+pub trait PdbClient: Send + Sync {
+    /// `PodDisruptionBudgets(ns).List`.
+    async fn list(
+        &self,
+        namespace: &str,
+    ) -> rusternetes_common::Result<Vec<rusternetes_common::resources::PodDisruptionBudget>>;
+    /// `PodDisruptionBudgets(ns).Get`.
+    async fn get(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> rusternetes_common::Result<rusternetes_common::resources::PodDisruptionBudget>;
+    /// `PodDisruptionBudgets(ns).UpdateStatus`: a write of the whole object
+    /// that conflicts when its `resourceVersion` is not the stored one.
+    async fn update_status(
+        &self,
+        namespace: &str,
+        pdb: &rusternetes_common::resources::PodDisruptionBudget,
+    ) -> rusternetes_common::Result<rusternetes_common::resources::PodDisruptionBudget>;
+}
+
+/// The PDB client over the PodDisruptionBudget store (reads) and
+/// `Storage::update_status_cas` (the status write).
+pub struct StorePdbClient {
+    storage: Arc<StorageBackend>,
+}
+
+impl StorePdbClient {
+    pub fn new(storage: Arc<StorageBackend>) -> Self {
+        Self { storage }
+    }
+
+    fn ctx(namespace: &str) -> RequestContext {
+        RequestContext::new(Some(namespace)).with_group_version("policy", "v1")
+    }
+}
+
+#[async_trait]
+impl PdbClient for StorePdbClient {
+    async fn list(
+        &self,
+        namespace: &str,
+    ) -> rusternetes_common::Result<Vec<rusternetes_common::resources::PodDisruptionBudget>> {
+        use rusternetes_storage::{build_prefix, Storage};
+        let mut pdbs: Vec<rusternetes_common::resources::PodDisruptionBudget> = self
+            .storage
+            .list(&build_prefix("poddisruptionbudgets", Some(namespace)))
+            .await?;
+        // The storage codec's defaulting, as `Store::get` applies it.
+        for pdb in &mut pdbs {
+            crate::registry::policy::poddisruptionbudget::convert_to_internal(pdb);
+        }
+        Ok(pdbs)
+    }
+
+    async fn get(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> rusternetes_common::Result<rusternetes_common::resources::PodDisruptionBudget> {
+        crate::registry::policy::poddisruptionbudget::new_store(self.storage.clone())
+            .get(&Self::ctx(namespace), name)
+            .await
+    }
+
+    async fn update_status(
+        &self,
+        namespace: &str,
+        pdb: &rusternetes_common::resources::PodDisruptionBudget,
+    ) -> rusternetes_common::Result<rusternetes_common::resources::PodDisruptionBudget> {
+        // The loopback `UpdateStatus` is a resourceVersion-guarded write of
+        // the status: `Storage::update_status_cas` conflicts when the PDB
+        // changed since it was read, which `RetryOnConflict` re-reads on.
+        use rusternetes_storage::{build_key, Storage};
+        let key = build_key("poddisruptionbudgets", Some(namespace), &pdb.metadata.name);
+        self.storage.update_status_cas(&key, pdb).await
+    }
+}
+
+/// `EvictionREST` (eviction.go:70-74): the `pods/eviction` subresource.
+pub struct EvictionRest<P: EvictionPodStore, C: PdbClient> {
+    store: P,
+    pdb_client: C,
+    /// `EvictionsRetry`; a field so a test need not wait out 20 half-second
+    /// pauses.
+    pub retry: Backoff,
+}
+
+/// The `EvictionREST` the router serves.
+pub type StoreEvictionRest = EvictionRest<Store<Pod, StorageBackend>, StorePdbClient>;
+
+/// `newEvictionStorage(&statusStore, podDisruptionBudgetClient)`
+/// (storage.go:116).
+pub fn new_eviction_rest(storage: Arc<StorageBackend>) -> StoreEvictionRest {
+    EvictionRest::new(
+        new_status_store(storage.clone()),
+        StorePdbClient::new(storage),
+    )
+}
+
+/// `getLatestPod` (eviction.go:319-340): throw away the new object and take
+/// the latest pod from storage, so the condition appender cannot conflict;
+/// the delete options' preconditions are checked against it.
+struct GetLatestPod {
+    preconditions: Option<rusternetes_common::deletion::Preconditions>,
+}
+
+#[async_trait]
+impl TransformFunc<Pod> for GetLatestPod {
+    async fn transform(
+        &self,
+        _ctx: &RequestContext,
+        _new: Option<Pod>,
+        old: Option<&Pod>,
+    ) -> rusternetes_common::Result<Pod> {
+        let latest = old.cloned().ok_or_else(|| {
+            rusternetes_common::Error::Internal("the pod to evict is not stored".to_string())
+        })?;
+        let pod_resource = GroupResource::new("", "Pod");
+        if let Some(preconditions) = &self.preconditions {
+            if let Some(uid) = preconditions.uid.as_deref().filter(|u| !u.is_empty()) {
+                if uid != latest.metadata.uid {
+                    return Err(crate::registry::rest::conflict(
+                        &pod_resource,
+                        &latest.metadata.name,
+                        format!(
+                            "the UID in the precondition ({uid}) does not match the UID in record ({}). The object might have been deleted and then recreated",
+                            latest.metadata.uid
+                        ),
+                    ));
+                }
+            }
+            if let Some(rv) = preconditions
+                .resource_version
+                .as_deref()
+                .filter(|r| !r.is_empty())
+            {
+                let latest_rv = latest.metadata.resource_version.as_deref().unwrap_or("");
+                if rv != latest_rv {
+                    return Err(crate::registry::rest::conflict(
+                        &pod_resource,
+                        &latest.metadata.name,
+                        format!(
+                            "the ResourceVersion in the precondition ({rv}) does not match the ResourceVersion in record ({latest_rv}). The object might have been modified"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(latest)
+    }
+}
+
+/// `conditionAppender` (eviction.go:342-351): the `DisruptionTarget`
+/// condition.
+struct ConditionAppender;
+
+#[async_trait]
+impl TransformFunc<Pod> for ConditionAppender {
+    async fn transform(
+        &self,
+        _ctx: &RequestContext,
+        new: Option<Pod>,
+        _old: Option<&Pod>,
+    ) -> rusternetes_common::Result<Pod> {
+        let mut pod = new.ok_or_else(|| {
+            rusternetes_common::Error::Internal("no pod to add the condition to".to_string())
+        })?;
+        update_pod_condition(
+            pod.status.get_or_insert_with(Default::default),
+            PodCondition {
+                condition_type: "DisruptionTarget".to_string(),
+                status: "True".to_string(),
+                reason: Some("EvictionByEvictionAPI".to_string()),
+                message: Some("Eviction API: evicting".to_string()),
+                last_probe_time: None,
+                last_transition_time: None,
+                observed_generation: None,
+            },
+        );
+        Ok(pod)
+    }
+}
+
+impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
+    pub fn new(store: P, pdb_client: C) -> Self {
+        Self {
+            store,
+            pdb_client,
+            retry: evictions_retry(),
+        }
+    }
+
+    /// `EvictionREST.Create` (eviction.go:128-315): "attempts to create a new
+    /// eviction. That is, it tries to evict a pod." Returns the `Status` the
+    /// handler writes: a success, or the failure `Status` upstream returns as
+    /// the *object* (a pod covered by more than one PodDisruptionBudget).
+    pub async fn create(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        mut eviction: rusternetes_common::resources::Eviction,
+        create_validation: Option<
+            &dyn crate::registry::rest::ValidateObject<rusternetes_common::resources::Eviction>,
+        >,
+        options: &rusternetes_common::validation::metav1::CreateOptions,
+    ) -> rusternetes_common::Result<Status> {
+        use rusternetes_common::Error;
+        if name != eviction.metadata.name {
+            return Err(Error::BadRequest(
+                "name in URL does not match name in Eviction object".to_string(),
+            ));
+        }
+
+        if eviction
+            .delete_options
+            .as_ref()
+            .and_then(|o| o.ignore_store_read_error_with_cluster_breaking_potential)
+            .unwrap_or(false)
+        {
+            return Err(Error::Invalid(vec![FieldError::invalid(
+                &Path::new("deleteOptions")
+                    .child("ignoreStoreReadErrorWithClusterBreakingPotential"),
+                true,
+                "can not be set for pod eviction, try after removing the option",
+            )]));
+        }
+
+        let original_delete_options = propagate_dry_run(&mut eviction, options)?;
+
+        if let Some(validate) = create_validation {
+            validate.validate(ctx, &eviction).await?;
+        }
+
+        // by default, retry conflict errors; "if the original options included
+        // a resourceVersion precondition, don't retry"
+        let should_retry: fn(&Error) -> bool =
+            if resource_version_is_unset(&original_delete_options) {
+                is_conflict
+            } else {
+                |_| false
+            };
+
+        let mut backoff = self.retry.clone();
+        let attempt = loop {
+            match self
+                .delete_if_pdb_can_be_ignored(
+                    ctx,
+                    &eviction.metadata.name,
+                    &original_delete_options,
+                )
+                .await
+            {
+                Ok(attempt) => break Ok(attempt),
+                Err(err) if should_retry(&err) => {
+                    if !backoff.wait().await {
+                        // `retry.OnError` hands back the last error once the
+                        // attempts are spent.
+                        break Err(err);
+                    }
+                }
+                Err(err) => break Err(err),
+            }
+        };
+        let pod = match attempt {
+            // this can happen in cases where the PDB can be ignored, but
+            // there was a problem issuing the pod delete: maybe we conflicted
+            // too many times or we didn't have permission or something else
+            // weird.
+            Err(err) => return Err(err),
+            // we successfully deleted the pod, so we're done: we've
+            // evicted/deleted the pod
+            Ok((_, true)) => return Ok(success_status()),
+            // we cannot ignore the PDB for this pod, so this is the fall
+            // through case.
+            Ok((pod, false)) => pod,
+        };
+
+        let namespace = pod
+            .metadata
+            .namespace
+            .clone()
+            .or_else(|| ctx.namespace.clone())
+            .unwrap_or_default();
+        let mut pdb_name = String::new();
+        let mut update_deletion_options = false;
+
+        let pdbs = self.get_pod_disruption_budgets(&namespace, &pod).await?;
+        if pdbs.len() > 1 {
+            return Ok(Status {
+                kind: "Status".to_string(),
+                api_version: "v1".to_string(),
+                metadata: None,
+                status: Some("Failure".to_string()),
+                message: Some(
+                    "This pod has more than one PodDisruptionBudget, which the eviction subresource does not support."
+                        .to_string(),
+                ),
+                reason: None,
+                details: None,
+                code: Some(500),
+            });
+        }
+        if let Some(pdb) = pdbs.into_iter().next() {
+            pdb_name = pdb.metadata.name.clone();
+            let status = pdb.status.clone().unwrap_or_else(default_pdb_status);
+
+            // IsPodReady is the current implementation of IsHealthy. If the
+            // pod is healthy, it should be guarded by the PDB.
+            let mut check_budget = true;
+            if !rusternetes_common::podutil::is_pod_ready(&pod) {
+                if pdb.spec.unhealthy_pod_eviction_policy.as_deref() == Some("AlwaysAllow") {
+                    // Delete the unhealthy pod, it doesn't count towards
+                    // currentHealthy and desiredHealthy and we should not
+                    // decrement disruptionsAllowed.
+                    update_deletion_options = true;
+                    check_budget = false;
+                } else if status.current_healthy >= status.desired_healthy
+                    && status.desired_healthy > 0
+                {
+                    // default nil and IfHealthyBudget policy. Delete the
+                    // unhealthy pod, it doesn't count towards currentHealthy
+                    // and desiredHealthy and we should not decrement
+                    // disruptionsAllowed. Application guarded by the PDB is
+                    // not disrupted at the moment and deleting unhealthy
+                    // (unready) pod will not disrupt it.
+                    update_deletion_options = true;
+                    check_budget = false;
+                }
+                // confirm no disruptions allowed in checkAndDecrement
+            }
+
+            if check_budget {
+                self.decrement_with_retry(
+                    &namespace,
+                    &pod.metadata.name,
+                    pdb,
+                    is_dry_run(original_delete_options.dry_run.as_deref()),
+                )
+                .await?;
+            }
+        }
+
+        // At this point there was either no PDB or we succeeded in
+        // decrementing or the pod was unhealthy (unready) and we have enough
+        // healthy replicas.
+        let mut delete_options = original_delete_options.clone();
+
+        // Set deleteOptions.Preconditions.ResourceVersion to ensure the pod
+        // hasn't been considered healthy (ready) since we calculated.
+        if update_deletion_options {
+            set_preconditions_resource_version(
+                &mut delete_options,
+                pod.metadata.resource_version.clone(),
+            );
+        }
+
+        // Try the delete
+        if let Err(err) = self
+            .add_condition_and_delete_pod(ctx, &eviction.metadata.name, &delete_options)
+            .await
+        {
+            if is_conflict(&err)
+                && update_deletion_options
+                && resource_version_is_unset(&original_delete_options)
+            {
+                // If we encounter a resource conflict error, we updated the
+                // deletion options to include them, and the original deletion
+                // options did not specify ResourceVersion, we send back
+                // TooManyRequests so clients will retry.
+                return Err(create_too_many_requests_error(&pdb_name));
+            }
+            return Err(err);
+        }
+
+        // Success!
+        Ok(success_status())
+    }
+
+    /// One pass of the first `retry.OnError` body (eviction.go:166-197):
+    /// fetch the pod and, when its PDB can be ignored, delete it. Returns the
+    /// pod and whether it was deleted.
+    async fn delete_if_pdb_can_be_ignored(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        original_delete_options: &rusternetes_common::deletion::DeleteOptions,
+    ) -> rusternetes_common::Result<(Pod, bool)> {
+        let pod = self.store.get(ctx, name).await?;
+
+        // Evicting a terminal pod should result in direct deletion of pod as
+        // it already caused disruption by the time we are evicting. There is
+        // no need to check for pdb.
+        if !can_ignore_pdb(&pod) {
+            // Pod is not in a state where we can skip checking PDBs, exit the
+            // loop, and continue to PDB checks.
+            return Ok((pod, false));
+        }
+
+        // the PDB can be ignored, so delete the pod
+        let mut delete_options = original_delete_options.clone();
+
+        // We should check if resourceVersion is already set by the requestor
+        // as it might be older than the pod we just fetched and should be
+        // honored.
+        if should_enforce_resource_version(&pod)
+            && resource_version_is_unset(original_delete_options)
+        {
+            // Set deleteOptions.Preconditions.ResourceVersion to ensure we're
+            // not racing with another PDB-impacting process elsewhere.
+            set_preconditions_resource_version(
+                &mut delete_options,
+                pod.metadata.resource_version.clone(),
+            );
+        }
+        self.add_condition_and_delete_pod(ctx, name, &delete_options)
+            .await?;
+        Ok((pod, true))
+    }
+
+    /// The `retry.RetryOnConflict` around `checkAndDecrement`
+    /// (eviction.go:256-273): on a conflict the PDB is read again.
+    async fn decrement_with_retry(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pdb: rusternetes_common::resources::PodDisruptionBudget,
+        dry_run: bool,
+    ) -> rusternetes_common::Result<()> {
+        let pdb_name = pdb.metadata.name.clone();
+        let mut pdb = pdb;
+        let mut refresh = false;
+        let mut backoff = self.retry.clone();
+        loop {
+            let result = async {
+                if refresh {
+                    pdb = self.pdb_client.get(namespace, &pdb_name).await?;
+                }
+                // Try to verify-and-decrement.
+                //
+                // If it was false already, or if it becomes false during the
+                // course of our retries, raise an error marked as a 429.
+                self.check_and_decrement(namespace, pod_name, pdb.clone(), dry_run)
+                    .await
+            }
+            .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    refresh = true;
+                    if !is_conflict(&err) || !backoff.wait().await {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `addConditionAndDeletePod` (eviction.go:317-372): the pod gets the
+    /// `DisruptionTarget` condition, through the status store, and is then
+    /// deleted through the pod store, so its graceful-delete strategy runs.
+    pub async fn add_condition_and_delete_pod(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        options: &rusternetes_common::deletion::DeleteOptions,
+    ) -> rusternetes_common::Result<()> {
+        let mut options = options.clone();
+        if !is_dry_run(options.dry_run.as_deref()) {
+            // order important
+            let pod_updated_object_info = DefaultUpdatedObjectInfo::new(
+                None,
+                vec![
+                    Box::new(GetLatestPod {
+                        preconditions: options.preconditions.clone(),
+                    }),
+                    Box::new(ConditionAppender),
+                ],
+            );
+            let updated = self
+                .store
+                .update(ctx, name, &pod_updated_object_info)
+                .await?;
+
+            if !resource_version_is_unset(&options) {
+                // bump the resource version, since we are the one who
+                // modified it via the update
+                if let Some(preconditions) = options.preconditions.as_mut() {
+                    preconditions.resource_version = updated.metadata.resource_version.clone();
+                }
+            }
+        }
+        self.store.delete(ctx, name, options).await
+    }
+
+    /// `checkAndDecrement` (eviction.go:423-484): "checks if the provided
+    /// PodDisruptionBudget allows any disruption", and records the one this
+    /// eviction is about to cause.
+    async fn check_and_decrement(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        mut pdb: rusternetes_common::resources::PodDisruptionBudget,
+        dry_run: bool,
+    ) -> rusternetes_common::Result<()> {
+        use rusternetes_common::pdbhelper::{
+            find_status_condition, update_disruption_allowed_condition,
+            DISRUPTION_ALLOWED_CONDITION, SYNC_FAILED_REASON,
+        };
+        let pdb_name = pdb.metadata.name.clone();
+        let generation = pdb.metadata.generation.unwrap_or(0);
+        let status = pdb.status.get_or_insert_with(default_pdb_status);
+        if status.observed_generation.unwrap_or(0) < generation {
+            return Err(create_too_many_requests_error(&pdb_name));
+        }
+        if status.disruptions_allowed < 0 {
+            return Err(pdb_forbidden(
+                &pdb_name,
+                "pdb disruptions allowed is negative",
+            ));
+        }
+        if status.disrupted_pods.as_ref().map_or(0, |d| d.len()) > MAX_DISRUPTED_POD_SIZE {
+            return Err(pdb_forbidden(
+                &pdb_name,
+                "DisruptedPods map too big - too many evictions not confirmed by PDB controller",
+            ));
+        }
+        if status.disruptions_allowed == 0 {
+            let condition = status
+                .conditions
+                .as_deref()
+                .and_then(|c| find_status_condition(c, DISRUPTION_ALLOWED_CONDITION));
+            let failed = condition.filter(|c| {
+                c.status == "False" && c.message.as_deref().is_some_and(|m| !m.is_empty())
+            });
+            let msg = match failed {
+                // check whether sync is failed first because DesiredHealthy
+                // and CurrentHealthy are not trustworthy when the sync is
+                // failed
+                Some(c) if c.reason.as_deref() == Some(SYNC_FAILED_REASON) => format!(
+                    "The disruption budget {pdb_name} does not allow evicting pods currently because it failed sync: {}",
+                    c.message.as_deref().unwrap_or("")
+                ),
+                _ if status.current_healthy <= status.desired_healthy => format!(
+                    "The disruption budget {pdb_name} needs {} healthy pods and has {} currently",
+                    status.desired_healthy, status.current_healthy
+                ),
+                Some(c) => format!(
+                    "The disruption budget {pdb_name} does not allow evicting pods currently ({}): {}",
+                    c.reason.as_deref().unwrap_or(""),
+                    c.message.as_deref().unwrap_or("")
+                ),
+                None => format!(
+                    "The disruption budget {pdb_name} does not allow evicting pods currently"
+                ),
+            };
+            return Err(too_many_requests(
+                0,
+                vec![rusternetes_common::StatusCause {
+                    reason: Some("DisruptionBudget".to_string()),
+                    message: Some(msg),
+                    field: None,
+                }],
+            ));
+        }
+
+        status.disruptions_allowed -= 1;
+        let now_zero = status.disruptions_allowed == 0;
+        if now_zero {
+            update_disruption_allowed_condition(&mut pdb);
+        }
+
+        // If this is a dry-run, we don't need to go any further than that.
+        if dry_run {
+            return Ok(());
+        }
+
+        // Eviction handler needs to inform the PDB controller that it is
+        // about to delete a pod so it should not consider it as available in
+        // calculations when updating PodDisruptions allowed. If the pod is
+        // not deleted within a reasonable time limit PDB controller will
+        // assume that it won't be deleted at all and remove it from
+        // DisruptedPod map.
+        pdb.status
+            .get_or_insert_with(default_pdb_status)
+            .disrupted_pods
+            .get_or_insert_with(Default::default)
+            .insert(pod_name.to_string(), chrono::Utc::now());
+        self.pdb_client.update_status(namespace, &pdb).await?;
+        Ok(())
+    }
+
+    /// `getPodDisruptionBudgets` (eviction.go:486-511): "any PDBs that match
+    /// the pod".
+    async fn get_pod_disruption_budgets(
+        &self,
+        namespace: &str,
+        pod: &Pod,
+    ) -> rusternetes_common::Result<Vec<rusternetes_common::resources::PodDisruptionBudget>> {
+        let pdbs = self.pdb_client.list(namespace).await?;
+        let pod_labels = pod.metadata.labels.clone().unwrap_or_default();
+        Ok(pdbs
+            .into_iter()
+            .filter(|pdb| pdb.metadata.namespace.as_deref().unwrap_or(namespace) == namespace)
+            // `LabelSelectorAsSelector`: a nil selector matches nothing, an
+            // empty one everything, and an invalid one (an error) skips the
+            // PDB: "it does not match the pod".
+            .filter(|pdb| {
+                pdb.spec
+                    .selector
+                    .as_ref()
+                    .is_some_and(|s| s.matches_labels(&pod_labels))
+            })
+            .collect())
+    }
+}
+
+/// The zero `policyv1.PodDisruptionBudgetStatus`.
+fn default_pdb_status() -> rusternetes_common::resources::PodDisruptionBudgetStatus {
+    rusternetes_common::resources::PodDisruptionBudgetStatus {
+        current_healthy: 0,
+        desired_healthy: 0,
+        disruptions_allowed: 0,
+        expected_pods: 0,
+        observed_generation: None,
+        conditions: None,
+        disrupted_pods: None,
+    }
 }
 
 #[cfg(test)]

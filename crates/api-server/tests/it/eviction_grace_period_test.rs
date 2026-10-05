@@ -1,5 +1,11 @@
-//! Eviction deleteOptions.gracePeriodSeconds must be non-negative (upstream
-//! ValidateDeleteOptions). Previously a negative value was accepted.
+//! Eviction `deleteOptions.gracePeriodSeconds`.
+//!
+//! Upstream's `ValidateDeleteOptions`
+//! (apimachinery/pkg/apis/meta/v1/validation/validation.go:157) does not
+//! check the grace period, so a negative one is not rejected: the pod's
+//! `CheckGracefulDelete` treats it as 1 second
+//! (pkg/registry/core/pod/strategy.go:166-197). The first version of this test
+//! asserted a 422 the old hand-written handler made up (#2145).
 
 use axum::http::StatusCode;
 use rusternetes_test_support::harness::TestApiServer;
@@ -31,7 +37,7 @@ fn eviction(pod: &str, grace: i64) -> Value {
 }
 
 #[tokio::test]
-async fn eviction_rejects_negative_grace_period() {
+async fn eviction_treats_a_negative_grace_period_as_one_second() {
     let state = TestApiServer::new();
     let name = "p-evict";
     let (code, _) = state.post(&pods_uri(), &pod(name)).await;
@@ -40,8 +46,8 @@ async fn eviction_rejects_negative_grace_period() {
     let (code, body) = state.post(&eviction_uri(name), &eviction(name, -5)).await;
     assert_eq!(
         code,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "negative gracePeriodSeconds must be rejected: {body}"
+        StatusCode::CREATED,
+        "a negative gracePeriodSeconds is not rejected: {body}"
     );
 }
 

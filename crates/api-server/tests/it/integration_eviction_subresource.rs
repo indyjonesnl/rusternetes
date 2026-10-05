@@ -179,8 +179,19 @@ async fn test_concurrent_eviction_requests() {
     let mut labels = HashMap::new();
     labels.insert("app".to_string(), "evict-me".to_string());
 
-    // Seed PDB allowing arbitrary disruptions.
-    let pdb = pdb_with_selector("pdb-concurrent", ns, 0, labels.clone());
+    // Seed PDB allowing N disruptions: the budget the eviction reads is the
+    // PDB status the disruption controller maintains (eviction.go:425-458),
+    // so it is seeded, as upstream's tests do.
+    let mut pdb = pdb_with_selector("pdb-concurrent", ns, 0, labels.clone());
+    pdb.status = Some(rusternetes_common::resources::PodDisruptionBudgetStatus {
+        current_healthy: N as i32,
+        desired_healthy: 0,
+        disruptions_allowed: N as i32,
+        expected_pods: N as i32,
+        observed_generation: None,
+        conditions: None,
+        disrupted_pods: None,
+    });
     mem.create(
         &build_key("poddisruptionbudgets", Some(ns), "pdb-concurrent"),
         &pdb,

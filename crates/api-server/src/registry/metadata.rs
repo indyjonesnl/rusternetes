@@ -7,7 +7,7 @@
 //! this single trait, re-exported as `registry::rest::HasMetadata`.
 
 /// Trait for resources that have metadata with finalizers.
-/// This allows the handle_delete_with_finalizers function to work with any
+/// This allows the generic registry and watch helpers to work with any
 /// Kubernetes resource type.
 pub trait HasMetadata {
     /// Get an immutable reference to the resource's metadata
@@ -221,6 +221,16 @@ impl HasMetadata for rusternetes_common::resources::ResourceQuota {
 }
 
 impl HasMetadata for rusternetes_common::resources::LimitRange {
+    fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+        &mut self.metadata
+    }
+}
+
+impl HasMetadata for rusternetes_common::resources::Eviction {
     fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
         &self.metadata
     }

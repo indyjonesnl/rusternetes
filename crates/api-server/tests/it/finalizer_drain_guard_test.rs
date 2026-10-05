@@ -7,10 +7,9 @@
 //! upstream — PUT, PATCH and apply all funnel through that `Update` — so this
 //! holds for every resource and every verb by construction.
 //!
-//! Rusternetes has one handler per resource per verb, each calling
-//! `finalizers::finish_deletion_if_finalizers_drained` (PUT, stored object) or
-//! `finalizers::finish_deletion_if_write_drained_finalizers` (PATCH, patched +
-//! pre-write object) after it persists.
+//! Rusternetes has one handler per resource per verb; the ones on the generic
+//! Store get this from `Store.Update`, and the rest finish the deletion
+//! themselves after they persist.
 //!
 //! Both verbs are in scope, and the PATCH half is the one that matters most:
 //! upstream's garbage collector removes a finalizer with a JSON **merge
@@ -82,10 +81,6 @@ fn every_write_handler_finishes_a_drained_deletion() {
 
     for path in handler_files() {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        // The helper's own home, and the shared scale machinery.
-        if name == "finalizers.rs" {
-            continue;
-        }
         let src = std::fs::read_to_string(&path).expect("read handler");
         let src = src.split("\n#[cfg(test)]").next().unwrap_or("").to_string();
 

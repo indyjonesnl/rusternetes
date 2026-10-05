@@ -258,6 +258,22 @@ impl PriorityClass {
     }
 }
 
+/// `policy/v1.Eviction` (`staging/src/k8s.io/api/policy/v1/types.go`): the
+/// body of a POST to `pods/{name}/eviction`. `metadata` names the pod and
+/// `deleteOptions` are handed to the pod's delete.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Eviction {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_options: Option<crate::deletion::DeleteOptions>,
+}
+
 /// PodDisruptionBudget limits the number of pods that can be disrupted during voluntary disruptions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

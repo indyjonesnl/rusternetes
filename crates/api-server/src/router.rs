@@ -1038,7 +1038,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/eviction",
-            post(handlers::pod_subresources::create_eviction),
+            post(handlers::pod::create_eviction),
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/resize",

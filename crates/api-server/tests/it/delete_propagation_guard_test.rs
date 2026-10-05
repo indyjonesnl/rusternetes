@@ -64,10 +64,6 @@ fn every_delete_handler_passes_the_request_delete_options() {
 
     for path in files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        // The helper itself, and the eviction path, build their own context.
-        if name == "finalizers.rs" {
-            continue;
-        }
         let src = std::fs::read_to_string(&path).expect("read handler");
         let src = src.split("\n#[cfg(test)]").next().unwrap_or("").to_string();
 

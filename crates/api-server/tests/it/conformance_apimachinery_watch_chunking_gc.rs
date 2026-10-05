@@ -987,8 +987,8 @@ async fn gc_background_deletion_leaves_no_orphan_dependents() {
 /// Sonobuoy (Round 160, 2026-04-26): FAIL — the GC controller deleted
 /// dependents even when the caller asked for Orphan propagation.
 /// Status: PASS — the GC honours the `orphan` finalizer (added by the
-/// resource DELETE handler when `propagationPolicy=Orphan` via
-/// `handle_delete_with_finalizers_and_propagation`), strips the owner
+/// resource DELETE handler when `propagationPolicy=Orphan`, upstream's
+/// `deletionFinalizersForGarbageCollection`), strips the owner
 /// reference from each dependent in `orphan_dependents`, then removes the
 /// finalizer so the owner itself can be deleted. Dependents survive the
 /// scan with the relevant ownerReference gone.
@@ -1001,8 +1001,7 @@ async fn gc_orphan_propagation_should_strip_owner_refs_not_delete() {
     // -----------------------------------------------------------------
     // The DELETE handler in api-server attaches the `orphan` finalizer and
     // sets deletionTimestamp when the caller requests Orphan propagation
-    // (see crates/api-server/src/handlers/finalizers.rs::
-    // handle_delete_with_finalizers_and_propagation). We mirror that
+    // (`Store.Delete`'s `deletionFinalizersForGarbageCollection`). We mirror that
     // exact wire state directly into storage so the test exercises the
     // GC controller's reaction to it without spinning the full HTTP
     // stack.
