@@ -82,8 +82,8 @@ fn every_write_handler_finishes_a_drained_deletion() {
 
     for path in handler_files() {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        // The helper's own home, and the shared status/scale machinery.
-        if name == "finalizers.rs" || name == "lifecycle.rs" {
+        // The helper's own home, and the shared scale machinery.
+        if name == "finalizers.rs" {
             continue;
         }
         let src = std::fs::read_to_string(&path).expect("read handler");

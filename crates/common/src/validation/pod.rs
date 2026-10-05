@@ -3988,8 +3988,7 @@ pub fn validate_pod_spec_update(
 /// is itself stripped (e.g. `{"a":{"b":{}}}` → `{}`).
 ///
 /// Exported for shared use by other DeepEqual-style spec comparators
-/// (notably `crates/api-server/src/handlers/lifecycle.rs::
-/// maybe_increment_generation`).
+/// (e.g. the pod strategy's generation bump).
 pub fn strip_empty_objects(v: &mut serde_json::Value) {
     use serde_json::Value;
     match v {
