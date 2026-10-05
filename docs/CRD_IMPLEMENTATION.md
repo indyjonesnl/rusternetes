@@ -413,7 +413,6 @@ crates/
 │   │   └── custom_resource.rs        # CR CRUD + status/scale/watch (1900+ lines)
 │   └── dynamic_routes.rs             # Dynamic route registration (350+ lines)
 ├── controller-manager/src/controllers/
-│   └── crd.rs                        # CRD controller (590+ lines)
 └── examples/
     └── crd-example.yaml              # Example CRD and CR
 ```
