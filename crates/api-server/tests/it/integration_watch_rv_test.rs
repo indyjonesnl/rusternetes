@@ -21,7 +21,7 @@
 //!   regress it).
 //! - PUT with `metadata.resourceVersion` != stored RV returns **409 Conflict**
 //!   with reason `Conflict` — gated by
-//!   `handlers::lifecycle::check_resource_version`.
+//!   the generic Store's resourceVersion precondition.
 //! - DELETE on a missing object returns **404 NotFound**.
 //! - Watch streams emit one `ADDED` envelope per subsequent create, in arrival
 //!   order, on the long-lived chunked response.
@@ -181,8 +181,8 @@ async fn test_resource_version_present_after_create() {
 
 /// PUT with `metadata.resourceVersion` that does NOT match the stored RV must
 /// return 409 Conflict + Status `reason=Conflict`. Source-of-truth:
-/// `crates/api-server/src/handlers/lifecycle.rs::check_resource_version`,
-/// invoked from `handlers::pod::update`.
+/// the generic Store's resourceVersion precondition, reached from
+/// `handlers::pod::update`.
 #[tokio::test]
 async fn test_resource_version_stale_update_returns_409() {
     let (mem, router) = spawn_router();

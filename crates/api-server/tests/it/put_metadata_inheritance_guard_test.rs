@@ -205,12 +205,9 @@ fn every_put_handler_reinstates_server_owned_metadata() {
 
     for path in files {
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
-        // lifecycle.rs defines the helper; status.rs and scale.rs serve
-        // subresources, whose bodies carry no client metadata to reinstate.
-        if matches!(
-            file_name.as_str(),
-            "lifecycle.rs" | "status.rs" | "scale.rs"
-        ) {
+        // scale.rs serves a subresource, whose body carries no client
+        // metadata to reinstate.
+        if file_name == "scale.rs" {
             continue;
         }
         let src = std::fs::read_to_string(&path).expect("read handler");

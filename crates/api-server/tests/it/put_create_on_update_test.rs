@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The ten upstream strategies whose `AllowCreateOnUpdate()` returns `true`,
-/// as `(group, resource)`. Mirrors `handlers::lifecycle::allow_create_on_update`
+/// as `(group, resource)`. Mirrors the strategies' `allow_create_on_update`
 /// — deliberately restated here rather than imported, so a change to the table
 /// has to be made twice and cannot be waved through as "the test follows the
 /// code".
@@ -305,10 +305,6 @@ async fn every_update_handler_consults_the_create_on_update_table() {
 
     for path in files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        // The helper's own module.
-        if name == "lifecycle.rs" {
-            continue;
-        }
         let src = std::fs::read_to_string(&path).expect("read handler");
         let src = src.split("\n#[cfg(test)]").next().unwrap_or("").to_string();
 
@@ -350,7 +346,7 @@ async fn every_update_handler_consults_the_create_on_update_table() {
     // scan — its update path is `Store.Update`, whose create-on-update gate
     // `configmap_generic_store_test` pins — so the floor falls with them.
     assert!(
-        checked >= 93,
+        checked >= 92,
         "guard scanned only {checked} update handlers that can create -- the \
          parser stopped matching, which would make this test vacuously green"
     );
@@ -359,9 +355,9 @@ async fn every_update_handler_consults_the_create_on_update_table() {
         "{} update handler(s) can create an object on PUT without consulting \
          the create-on-update table. Upstream answers NotFound unless the \
          strategy's AllowCreateOnUpdate() is true \
-         (registry/generic/registry/store.go:646-650). Call \
-         `lifecycle::reject_create_on_update(...)` after authorization, or -- \
-         for one of the ten that opt in -- keep the create fallback and say \
+         (registry/generic/registry/store.go:646-650). Route \
+         the write through the generic Store (`Store.Update` owns the gate), or \
+         -- for one of the ten that opt in -- keep the create fallback and say \
          so.\n\nOffenders:\n  {}",
         offenders.len(),
         offenders.join("\n  ")

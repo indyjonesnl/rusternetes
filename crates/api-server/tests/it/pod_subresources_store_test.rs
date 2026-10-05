@@ -367,6 +367,78 @@ async fn status_patch_merges_and_ignores_the_spec() {
     assert!(out["spec"].get("activeDeadlineSeconds").is_none(), "{out}");
 }
 
+/// Seed a Running pod with the four pod conditions `True`, as the kubelet
+/// writes it.
+async fn seed_running_pod(api: &TestApiServer, name: &str) -> Value {
+    create(api, &pod(name)).await;
+    let mut seeded = stored(api, name).await;
+    seeded["status"]["phase"] = json!("Running");
+    seeded["status"]["conditions"] = json!([
+        {"type": "Initialized", "status": "True", "lastTransitionTime": "2024-01-01T00:00:00Z"},
+        {"type": "ContainersReady", "status": "True", "lastTransitionTime": "2024-01-01T00:00:01Z"},
+        {"type": "Ready", "status": "True", "lastTransitionTime": "2024-01-01T00:00:02Z"},
+        {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2024-01-01T00:00:00Z"}
+    ]);
+    put_stored(api, name, &seeded).await;
+    stored(api, name).await
+}
+
+/// The conformance test "Pods should run through the lifecycle of Pods and
+/// PodStatus" (test/e2e/common/node/pods.go, release-1.35): after
+/// `UpdateStatus` flips `Ready` and `ContainersReady` to `False` the response
+/// must carry both flipped conditions (`podStatusFieldPatchCount == 2`).
+#[tokio::test]
+async fn status_put_returns_the_flipped_ready_conditions() {
+    let api = TestApiServer::new();
+    let mut update = seed_running_pod(&api, "p1").await;
+    for cond in update["status"]["conditions"].as_array_mut().unwrap() {
+        if cond["type"] == "Ready" || cond["type"] == "ContainersReady" {
+            cond["status"] = json!("False");
+        }
+    }
+    let (s, out) = api.put(&format!("{PODS}/p1/status"), &update).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    let flipped = out["status"]["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| {
+            (c["type"] == "Ready" || c["type"] == "ContainersReady") && c["status"] == "False"
+        })
+        .count();
+    assert_eq!(flipped, 2, "{out}");
+    assert_eq!(out["status"]["conditions"].as_array().unwrap().len(), 4);
+    // and the store holds them
+    let held = stored(&api, "p1").await;
+    assert_eq!(held["status"]["conditions"], out["status"]["conditions"]);
+}
+
+/// The same test's strategic-merge PATCH of `/status`: the patched fields
+/// land and the rest of the stored status (phase, conditions) survives.
+#[tokio::test]
+async fn status_strategic_merge_patch_keeps_the_other_status_fields() {
+    let api = TestApiServer::new();
+    seed_running_pod(&api, "p1").await;
+    let patch = json!({
+        "metadata": {"annotations": {"patchedstatus": "true"}},
+        "status": {"message": "Patched by e2e test", "reason": "E2E"}
+    });
+    let (s, out) = api.patch(&format!("{PODS}/p1/status"), &patch).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert_eq!(out["status"]["message"], "Patched by e2e test", "{out}");
+    assert_eq!(out["status"]["reason"], "E2E", "{out}");
+    assert_eq!(
+        out["metadata"]["annotations"]["patchedstatus"], "true",
+        "{out}"
+    );
+    assert_eq!(out["status"]["phase"], "Running", "{out}");
+    assert_eq!(
+        out["status"]["conditions"].as_array().unwrap().len(),
+        4,
+        "{out}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // /binding
 // ---------------------------------------------------------------------------
