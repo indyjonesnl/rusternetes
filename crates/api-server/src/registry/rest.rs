@@ -21,7 +21,7 @@ use rusternetes_common::validation::objectmeta::{
 use rusternetes_common::{Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
 
-pub use crate::handlers::finalizers::HasMetadata;
+pub use super::metadata::HasMetadata;
 
 /// What the registry needs from a stored type. Upstream gets all of it from
 /// `runtime.Object` + `meta.Accessor`.

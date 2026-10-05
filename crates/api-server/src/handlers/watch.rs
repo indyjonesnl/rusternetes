@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::registry::rest::HasMetadata;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     body::Body,
@@ -1883,12 +1884,6 @@ fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (S
     (kind.to_string(), api_version)
 }
 
-/// Trait for types that have metadata (all Kubernetes resources)
-pub trait HasMetadata {
-    fn metadata(&self) -> &ObjectMeta;
-    fn metadata_mut(&mut self) -> &mut ObjectMeta;
-}
-
 /// Bookmark object containing only metadata with resourceVersion
 /// Note: Bookmarks in Kubernetes watch streams don't need apiVersion/kind
 /// as they are just checkpoint markers
@@ -1972,82 +1967,6 @@ fn watch_lagged_error_line(message: &str) -> String {
         serde_json::json!({"type": "ERROR", "object": status})
     )
 }
-
-// Implement for common resource types
-// Macro to reduce boilerplate for HasMetadata implementations
-macro_rules! impl_has_metadata {
-    ($($type:ty),*) => {
-        $(
-            impl HasMetadata for $type {
-                fn metadata(&self) -> &ObjectMeta {
-                    &self.metadata
-                }
-                fn metadata_mut(&mut self) -> &mut ObjectMeta {
-                    &mut self.metadata
-                }
-            }
-        )*
-    };
-}
-
-impl_has_metadata!(
-    rusternetes_common::resources::Pod,
-    rusternetes_common::resources::Service,
-    rusternetes_common::resources::Deployment,
-    rusternetes_common::resources::ConfigMap,
-    rusternetes_common::resources::Secret,
-    rusternetes_common::resources::Node,
-    rusternetes_common::resources::Namespace,
-    rusternetes_common::resources::Endpoints,
-    rusternetes_common::resources::EndpointSlice,
-    rusternetes_common::resources::StatefulSet,
-    rusternetes_common::resources::ReplicaSet,
-    rusternetes_common::resources::DaemonSet,
-    rusternetes_common::resources::Job,
-    rusternetes_common::resources::CronJob,
-    rusternetes_common::resources::Event,
-    rusternetes_common::resources::EventV1,
-    rusternetes_common::resources::ServiceAccount,
-    rusternetes_common::resources::PersistentVolume,
-    rusternetes_common::resources::PersistentVolumeClaim,
-    rusternetes_common::resources::Lease,
-    rusternetes_common::resources::Ingress,
-    rusternetes_common::resources::NetworkPolicy,
-    rusternetes_common::resources::PodDisruptionBudget,
-    rusternetes_common::resources::IPAddress,
-    rusternetes_common::resources::PodTemplate,
-    rusternetes_common::resources::ControllerRevision,
-    rusternetes_common::resources::RuntimeClass,
-    rusternetes_common::resources::ResourceQuota,
-    rusternetes_common::resources::ServiceCIDR,
-    rusternetes_common::resources::CustomResourceDefinition,
-    rusternetes_common::resources::ValidatingWebhookConfiguration,
-    rusternetes_common::resources::MutatingWebhookConfiguration,
-    rusternetes_common::resources::ValidatingAdmissionPolicy,
-    rusternetes_common::resources::ValidatingAdmissionPolicyBinding,
-    rusternetes_common::resources::LimitRange,
-    rusternetes_common::resources::ReplicationController,
-    rusternetes_common::resources::PriorityClass,
-    rusternetes_common::resources::StorageClass,
-    rusternetes_common::resources::HorizontalPodAutoscaler,
-    rusternetes_common::resources::ClusterRole,
-    rusternetes_common::resources::ClusterRoleBinding,
-    rusternetes_common::resources::Role,
-    rusternetes_common::resources::RoleBinding,
-    rusternetes_common::resources::CertificateSigningRequest,
-    rusternetes_common::resources::FlowSchema,
-    rusternetes_common::resources::PriorityLevelConfiguration,
-    rusternetes_common::resources::IngressClass,
-    rusternetes_common::resources::CSIStorageCapacity,
-    rusternetes_common::resources::CSIDriver,
-    rusternetes_common::resources::CSINode,
-    rusternetes_common::resources::VolumeAttachment,
-    rusternetes_common::resources::VolumeAttributesClass,
-    rusternetes_common::resources::VolumeSnapshot,
-    rusternetes_common::resources::VolumeSnapshotClass,
-    rusternetes_common::resources::VolumeSnapshotContent,
-    rusternetes_common::resources::CustomResource
-);
 
 // Concrete handler functions for specific resources
 
