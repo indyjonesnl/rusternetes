@@ -19,9 +19,9 @@
 //! false and its stale status lands.
 
 use rusternetes_controller_manager::controllers::{
-    cronjob::CronJobController, daemonset::DaemonSetController,
-    hpa::HorizontalPodAutoscalerController, pod_disruption_budget::StalePodDisruptionController,
-    replicaset::ReplicaSetController, replicationcontroller::ReplicationControllerController,
+    daemonset::DaemonSetController, hpa::HorizontalPodAutoscalerController,
+    pod_disruption_budget::StalePodDisruptionController, replicaset::ReplicaSetController,
+    replicationcontroller::ReplicationControllerController,
     resource_quota::ResourceQuotaController, statefulset::StatefulSetController,
 };
 use rusternetes_storage::{memory::MemoryStorage, Storage, WatchStream};
