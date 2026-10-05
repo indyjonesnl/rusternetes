@@ -84,12 +84,6 @@ pub struct GarbageCollector<S: Storage> {
     /// (no orphans, nothing being deleted). Keeps an idle controller-manager
     /// quiet (#1040) without a hard-coded fast poll.
     max_scan_interval: Duration,
-    /// Maximum number of concurrent delete operations
-    max_concurrent_deletes: usize,
-    /// Batch size for deletion operations
-    delete_batch_size: usize,
-    /// Maximum retry attempts for failed deletions
-    max_retries: u32,
     /// Orphans detected in the previous scan. Only delete orphans that appear
     /// in TWO consecutive scans. This prevents race conditions where a resource
     /// is created between the GC listing owners and listing dependents.
@@ -116,31 +110,6 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             storage,
             scan_interval: Duration::from_secs(5),
             max_scan_interval: Duration::from_secs(60),
-            max_concurrent_deletes: 50,
-            delete_batch_size: 100,
-            max_retries: 3,
-            pending_orphans: std::sync::Mutex::new(HashSet::new()),
-            list_passes: std::sync::atomic::AtomicUsize::new(0),
-            dependent_ops_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            dependent_ops_peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }
-    }
-
-    /// Create a new garbage collector with custom settings
-    #[allow(dead_code)]
-    pub fn with_config(
-        storage: Arc<S>,
-        scan_interval_secs: u64,
-        max_concurrent_deletes: usize,
-        delete_batch_size: usize,
-    ) -> Self {
-        Self {
-            storage,
-            scan_interval: Duration::from_secs(scan_interval_secs),
-            max_scan_interval: Duration::from_secs(60),
-            max_concurrent_deletes,
-            delete_batch_size,
-            max_retries: 3,
             pending_orphans: std::sync::Mutex::new(HashSet::new()),
             list_passes: std::sync::atomic::AtomicUsize::new(0),
             dependent_ops_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1440,77 +1409,6 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         path.pop();
         rec_stack.remove(uid);
         None
-    }
-
-    /// Delete a batch of orphans with retry logic (no re-verification).
-    /// NOTE: For orphan deletion, use `delete_orphan()` which re-verifies
-    /// owner existence before deleting. This method is kept for non-orphan
-    /// batch deletions where re-verification is not needed.
-    #[allow(dead_code)]
-    async fn delete_batch_with_retry(&self, orphans: &[ResourceInfo]) -> Vec<Result<(), String>> {
-        use futures::future::join_all;
-
-        // Limit concurrency
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent_deletes));
-        let mut tasks = Vec::new();
-
-        for orphan in orphans {
-            let sem = Arc::clone(&semaphore);
-            let storage = Arc::clone(&self.storage);
-            let orphan_clone = orphan.clone();
-            let max_retries = self.max_retries;
-
-            let task = tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-
-                // Retry with exponential backoff
-                let mut attempt = 0;
-                let mut last_error = None;
-
-                while attempt < max_retries {
-                    match storage.delete(&orphan_clone.key).await {
-                        Ok(_) => {
-                            info!(
-                                "Successfully deleted orphan {} (attempt {})",
-                                orphan_clone.key,
-                                attempt + 1
-                            );
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            attempt += 1;
-                            last_error = Some(e.to_string());
-
-                            if attempt < max_retries {
-                                // Exponential backoff: 100ms, 200ms, 400ms, ...
-                                let backoff_ms = 100 * (1 << attempt);
-                                debug!(
-                                    "Failed to delete {} (attempt {}), retrying in {}ms: {}",
-                                    orphan_clone.key, attempt, backoff_ms, e
-                                );
-                                sleep(Duration::from_millis(backoff_ms)).await;
-                            }
-                        }
-                    }
-                }
-
-                Err(format!(
-                    "Failed to delete {} after {} attempts: {}",
-                    orphan_clone.key,
-                    max_retries,
-                    last_error.unwrap_or_else(|| "unknown error".to_string())
-                ))
-            });
-
-            tasks.push(task);
-        }
-
-        // Wait for all tasks and collect results
-        let results = join_all(tasks).await;
-        results
-            .into_iter()
-            .map(|r| r.unwrap_or_else(|e| Err(format!("Task panicked: {}", e))))
-            .collect()
     }
 }
 
@@ -3097,10 +2995,6 @@ mod tests {
     /// references the owner — precisely the race the aggregate-error path
     /// exists to prevent, and the reason upstream reports every dependent's
     /// error rather than the first (garbagecollector.go:697-706).
-    ///
-    /// The dead `delete_batch_with_retry` in this same file already gets this
-    /// right (`Task panicked: {}`), which is what makes the omission an
-    /// oversight rather than a decision.
     #[tokio::test]
     async fn a_panicking_dependent_op_is_reported_not_swallowed() {
         struct PanicOnUpdate {
