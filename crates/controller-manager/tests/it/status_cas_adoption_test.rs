@@ -19,9 +19,9 @@
 //! false and its stale status lands.
 
 use rusternetes_controller_manager::controllers::{
-    daemonset::DaemonSetController, hpa::HorizontalPodAutoscalerController,
-    pod_disruption_budget::StalePodDisruptionController, replicaset::ReplicaSetController,
-    replicationcontroller::ReplicationControllerController,
+    cronjob::CronJobController, daemonset::DaemonSetController,
+    hpa::HorizontalPodAutoscalerController, pod_disruption_budget::StalePodDisruptionController,
+    replicaset::ReplicaSetController, replicationcontroller::ReplicationControllerController,
     resource_quota::ResourceQuotaController, statefulset::StatefulSetController,
 };
 use rusternetes_storage::{memory::MemoryStorage, Storage, WatchStream};
@@ -356,4 +356,50 @@ async fn stale_pod_disruption_cleanup_conflicts_on_stale_read() {
     c.reconcile_all().await.unwrap();
     let stored: Value = storage.get(key).await.unwrap();
     assert_eq!(cond_status(&stored).as_deref(), Some("False"));
+}
+
+/// `syncCronJob` (pkg/controller/cronjob/cronjob_controllerv2.go:603-642):
+/// the Job is created BEFORE `UpdateStatus`, under the deterministic name
+/// `getJobName` (`{cronjob}-{scheduledTime/60}`, utils.go / v2.go:676), so a
+/// Conflict on the status write requeues and the retry's create returns
+/// AlreadyExists (treated as success) instead of spawning a second Job (#2159).
+#[tokio::test]
+async fn cronjob_status_write_conflicts_without_duplicating_the_job() {
+    use rusternetes_common::resources::workloads::Job;
+    let storage = RacingStatusStorage::new();
+    let key = "/registry/cronjobs/default/cj";
+    seed(
+        &storage,
+        key,
+        json!({
+            "apiVersion": "batch/v1", "kind": "CronJob",
+            "metadata": {"name": "cj", "namespace": "default", "uid": "u-cj"},
+            "spec": {"schedule": "* * * * *",
+                     "jobTemplate": {"spec": {"template": {"spec": {
+                         "restartPolicy": "Never",
+                         "containers": [{"name": "c", "image": "busybox"}]}}}}}
+        }),
+    )
+    .await;
+    let c = CronJobController::new(storage.clone());
+    c.reconcile_all().await.unwrap();
+    assert_lost_race_is_refused(&storage, key, status_is_set).await;
+    let jobs: Vec<Job> = storage.list("/registry/jobs/default/").await.unwrap();
+    assert_eq!(jobs.len(), 1, "the lost race created a Job");
+
+    // The requeue: the retry hits AlreadyExists and still converges.
+    c.reconcile_all().await.unwrap();
+    let jobs: Vec<Job> = storage.list("/registry/jobs/default/").await.unwrap();
+    assert_eq!(
+        jobs.len(),
+        1,
+        "the retry created a duplicate Job: {:?}",
+        jobs.iter().map(|j| &j.metadata.name).collect::<Vec<_>>()
+    );
+    assert_converges(&storage, key, |v| {
+        v.pointer("/status/active/0/name")
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| n == jobs[0].metadata.name)
+    })
+    .await;
 }

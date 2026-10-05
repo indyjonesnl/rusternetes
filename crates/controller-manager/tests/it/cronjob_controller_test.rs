@@ -26,6 +26,47 @@ async fn rewind_and_step(storage: &Arc<MemoryStorage>, namespace: &str, name: &s
         st.last_schedule_time = Some(chrono::Utc::now() - chrono::Duration::minutes(2));
     }
     storage.update(&key, &cj).await.unwrap();
+
+    // Jobs are named from the SCHEDULED minute (getJobName,
+    // cronjob_controllerv2.go:676), so a second run inside the same minute is
+    // the same schedule and would be AlreadyExists. Re-date the Job already
+    // created for the current minute to an earlier scheduled minute, as if
+    // that run had fired in the past.
+    let prefix = format!("/registry/jobs/{}/", namespace);
+    let jobs: Vec<Job> = storage.list(&prefix).await.unwrap();
+    let mine: Vec<Job> = jobs
+        .into_iter()
+        .filter(|j| {
+            j.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("cronjob-name"))
+                .is_some_and(|n| n == name)
+        })
+        .collect();
+    let minute = |j: &Job| -> i64 {
+        j.metadata
+            .name
+            .rsplit('-')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap()
+    };
+    let current = chrono::Utc::now().timestamp() / 60;
+    let mut earliest = mine.iter().map(minute).min().unwrap_or(current);
+    for mut j in mine.into_iter().filter(|j| minute(j) >= current) {
+        storage
+            .delete(&format!("{}{}", prefix, j.metadata.name))
+            .await
+            .unwrap();
+        earliest -= 1;
+        j.metadata.name = format!("{}-{}", name, earliest);
+        j.metadata.resource_version = None;
+        storage
+            .create(&format!("{}{}", prefix, j.metadata.name), &j)
+            .await
+            .unwrap();
+    }
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 }
 
@@ -622,7 +663,7 @@ async fn test_cronjob_concurrency_policy_replace_enforcement() {
     controller.reconcile_all().await.unwrap();
     let first: Vec<Job> = storage.list("/registry/jobs/default/").await.unwrap();
     assert_eq!(first.len(), 1, "first tick must spawn exactly one Job");
-    let first_name = first[0].metadata.name.clone();
+    let first_uid = first[0].metadata.uid.clone();
 
     rewind_and_step(&storage, "default", "replace-enforce").await;
     controller.reconcile_all().await.unwrap();
@@ -635,7 +676,7 @@ async fn test_cronjob_concurrency_policy_replace_enforcement() {
         jobs.len()
     );
     assert_ne!(
-        jobs[0].metadata.name, first_name,
+        jobs[0].metadata.uid, first_uid,
         "Replace must delete the previous Job"
     );
 }
@@ -660,7 +701,7 @@ async fn test_cronjob_concurrency_policy_allow_enforcement() {
 
     let first: Vec<Job> = storage.list("/registry/jobs/default/").await.unwrap();
     assert_eq!(first.len(), 1, "first tick must spawn exactly one Job");
-    let first_name = first[0].metadata.name.clone();
+    let first_uid = first[0].metadata.uid.clone();
 
     rewind_and_step(&storage, "default", "allow-enforce").await;
     controller.reconcile_all().await.unwrap();
@@ -672,7 +713,7 @@ async fn test_cronjob_concurrency_policy_allow_enforcement() {
         jobs.len()
     );
     assert!(
-        jobs.iter().any(|j| j.metadata.name == first_name),
+        jobs.iter().any(|j| j.metadata.uid == first_uid),
         "Allow must preserve the originally-active Job"
     );
 }
