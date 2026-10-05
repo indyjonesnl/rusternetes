@@ -55,58 +55,6 @@ pub fn maybe_increment_generation(
     }
 }
 
-/// Reinstate the server-owned metadata on an update of a raw document (the
-/// handlers that persist an untyped object).
-///
-/// Port of upstream — `BeforeUpdate`
-/// (staging/src/k8s.io/apiserver/pkg/registry/rest/update.go:131-146). The
-/// typed objects get the same rule from the generic Store's update path.
-///
-/// A missing or non-object `metadata` on either side is left alone rather than
-/// synthesised — this function reinstates fields, it does not repair shape.
-pub fn inherit_server_owned_metadata_json(
-    new_obj: &mut serde_json::Value,
-    old_obj: &serde_json::Value,
-) {
-    let Some(old_meta) = old_obj.get("metadata").and_then(|m| m.as_object()) else {
-        return;
-    };
-    let Some(new_meta) = new_obj.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
-        return;
-    };
-
-    // Use the existing UID if none is provided.
-    let uid_absent = new_meta
-        .get("uid")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .is_empty();
-    if uid_absent {
-        if let Some(uid) = old_meta.get("uid") {
-            new_meta.insert("uid".to_string(), uid.clone());
-        }
-    }
-
-    // Ignore changes to the creation timestamp, and never let an update start
-    // or clear a deletion.
-    for field in ["creationTimestamp", "deletionTimestamp"] {
-        if let Some(v) = old_meta.get(field) {
-            if !v.is_null() {
-                new_meta.insert(field.to_string(), v.clone());
-            }
-        }
-    }
-    if let Some(v) = old_meta.get("deletionGracePeriodSeconds") {
-        if !v.is_null()
-            && new_meta
-                .get("deletionGracePeriodSeconds")
-                .is_none_or(|n| n.is_null())
-        {
-            new_meta.insert("deletionGracePeriodSeconds".to_string(), v.clone());
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // AllowCreateOnUpdate
 // ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@
 
 pub mod admissionregistration;
 pub mod apiextensions;
+pub mod apiregistration;
 pub mod apps;
 pub mod autoscaling;
 pub mod batch;

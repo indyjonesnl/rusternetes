@@ -49,8 +49,8 @@ use std::path::PathBuf;
 const PENDING_DRA_METADATA_TYPE: &[(&str, &str)] = &[];
 
 /// Every other handler now reinstates the metadata, via
-/// `lifecycle::update_inheriting_server_owned_metadata` (typed) or
-/// `inherit_server_owned_metadata_json` (untyped documents). Kept as an empty
+/// `lifecycle::update_inheriting_server_owned_metadata` (typed) or the generic
+/// Store (`BeforeUpdate`). Kept as an empty
 /// list rather than deleted: a new handler that forgets belongs in a fix, not
 /// in an allowlist, and an empty constant says so louder than a missing one.
 const PENDING_READ: &[(&str, &str)] = &[];
@@ -411,9 +411,8 @@ async fn put_omitting_uid_does_not_blank_it() {
                            "pool":{"name":"p","resourceSliceCount":1,
                                    "generation":1}}}),
         ),
-        // The untyped-document path: APIService is stored as a raw
-        // `serde_json::Value`, so it goes through
-        // `inherit_server_owned_metadata_json` rather than the typed helper.
+        // APIService (kube-aggregator) is served by the generic Store like the
+        // rest; its name is structurally constrained (`version.group`).
         (
             "apiservices",
             "/apis/apiregistration.k8s.io/v1/apiservices",

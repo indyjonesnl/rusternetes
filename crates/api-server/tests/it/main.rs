@@ -125,6 +125,7 @@ mod finalizers_test;
 mod flowcontrol_store_test;
 mod flowschema_watch_from_list_rv_test;
 mod generate_name_router_test;
+mod generic_leftovers_store_test;
 mod horizontalpodautoscaler_handler_test;
 mod hpa_default_minreplicas_test;
 mod hpa_status_validation_test;

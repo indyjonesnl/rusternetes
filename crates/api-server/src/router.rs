@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 /// an extension apiserver, so it emits `resources: []` for APIService-backed
 /// groups. Here in the router we have the full [`ApiServerState`] (aggregator
 /// proxy machinery), so we fill those in via
-/// [`crate::handlers::generic::aggregated_discovery_resources`]. Built-in / CRD
+/// [`crate::handlers::aggregator::aggregated_discovery_resources`]. Built-in / CRD
 /// groups already carry their resources and have no APIService backend, so they
 /// are left untouched (the resolve returns `None`). See issue #1046 / PR #1010.
 async fn api_groups_with_aggregated_resources(
@@ -85,7 +85,7 @@ async fn api_groups_with_aggregated_resources(
                     continue;
                 };
                 if let Some(resources) =
-                    handlers::generic::aggregated_discovery_resources(&state, &group, &version)
+                    handlers::aggregator::aggregated_discovery_resources(&state, &group, &version)
                         .await
                 {
                     ver["resources"] = serde_json::Value::Array(resources);
@@ -135,7 +135,7 @@ async fn custom_resource_fallback(
     if parts.len() >= 2 {
         let group = parts[0];
         let version = parts[1];
-        match handlers::generic::resolve_aggregator_target(&state, group, version).await {
+        match handlers::aggregator::resolve_aggregator_target(&state, group, version).await {
             Ok(Some(target)) => {
                 let path_and_query = match uri.query() {
                     Some(q) => format!("{}?{}", uri.path(), q),
@@ -150,7 +150,7 @@ async fn custom_resource_fallback(
                     "API aggregation: proxying {}/{} -> {}:{}",
                     group, version, target.host, target.port
                 );
-                let resp = handlers::generic::forward_to_aggregator(
+                let resp = handlers::aggregator::forward_to_aggregator(
                     &target,
                     &auth_ctx,
                     method,
@@ -1765,22 +1765,22 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         // /apis/apiregistration.k8s.io/v1 stays public (no AuthContext).
         .route(
             "/apis/apiregistration.k8s.io/v1/apiservices",
-            get(handlers::generic::list_apiservices)
-                .post(handlers::generic::create_apiservice)
-                .delete(handlers::generic::deletecollection_apiservices),
+            get(handlers::apiservice::list_apiservices)
+                .post(handlers::apiservice::create_apiservice)
+                .delete(handlers::apiservice::deletecollection_apiservices),
         )
         .route(
             "/apis/apiregistration.k8s.io/v1/apiservices/:name",
-            get(handlers::generic::get_apiservice)
-                .put(handlers::generic::update_apiservice)
-                .patch(handlers::generic::patch_apiservice)
-                .delete(handlers::generic::delete_apiservice),
+            get(handlers::apiservice::get_apiservice)
+                .put(handlers::apiservice::update_apiservice)
+                .patch(handlers::apiservice::patch_apiservice)
+                .delete(handlers::apiservice::delete_apiservice),
         )
         .route(
             "/apis/apiregistration.k8s.io/v1/apiservices/:name/status",
-            get(handlers::generic::get_apiservice)
-                .put(handlers::generic::update_apiservice_status)
-                .patch(handlers::generic::patch_apiservice),
+            get(handlers::apiservice::get_apiservice_status)
+                .put(handlers::apiservice::update_apiservice_status)
+                .patch(handlers::apiservice::patch_apiservice_status),
         )
         // ValidatingWebhookConfiguration (cluster-scoped)
         .route(

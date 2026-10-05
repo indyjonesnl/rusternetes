@@ -1173,17 +1173,14 @@ pub async fn update_custom_resource_scale(
     // spec write (`registry/generic/registry/store.go:646-650`). Custom
     // resources never opt in -- `apiextensions-apiserver/pkg/registry/
     // customresource/strategy.go:262-266` returns false unconditionally --
-    // so this is always a NotFound (#1932).
-    crate::handlers::lifecycle::reject_create_on_update(
-        &*state.storage,
-        &key,
-        &group,
-        &plural,
-        &name,
-    )
-    .await?;
-
-    let mut cr: CustomResource = state.storage.get(&key).await?;
+    // so a write to an absent object is always `NewNotFound(qualifiedResource,
+    // name)` (#1932).
+    let mut cr: CustomResource = state.storage.get(&key).await.map_err(|e| match e {
+        rusternetes_common::Error::NotFound(_) => {
+            rusternetes_common::Error::NotFound(format!("{plural} \"{name}\" not found"))
+        }
+        other => other,
+    })?;
 
     // Update the replica count in the spec using JSONPath.
     // specReplicasPath is rooted at .spec (see GET path above) — strip the

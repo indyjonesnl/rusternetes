@@ -8,7 +8,7 @@
 //!   * `insecureSkipTLSVerify` / `caBundle` choice is honoured.
 
 use axum::http::{HeaderMap, HeaderValue, Method};
-use rusternetes_api_server::handlers::generic::{
+use rusternetes_api_server::handlers::aggregator::{
     build_proxy_headers, decode_ca_bundle_for_test, forward_to_aggregator,
     list_registered_apiservice_groups_with_storage, resolve_aggregator_target_with_storage,
     AggregatorTarget,

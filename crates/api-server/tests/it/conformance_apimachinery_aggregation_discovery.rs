@@ -844,7 +844,7 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
     // router, so this sub-assertion exercises `resolve_aggregator_target`
     // via the public helper directly (the routed call would fail TLS).
     let resolved =
-        rusternetes_api_server::handlers::generic::resolve_aggregator_target_with_storage(
+        rusternetes_api_server::handlers::aggregator::resolve_aggregator_target_with_storage(
             state.storage.as_ref(),
             "wardle.example.com",
             "v1alpha1",
@@ -858,7 +858,7 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
     // Now forward over HTTP through the public helper (test-only scheme
     // override), and verify the mock observed the proxied request with the
     // correct path and impersonation header.
-    let target = rusternetes_api_server::handlers::generic::AggregatorTarget {
+    let target = rusternetes_api_server::handlers::aggregator::AggregatorTarget {
         host: resolved.host.clone(),
         port: resolved.port,
         insecure_skip_tls_verify: true,
@@ -874,7 +874,7 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
             extra: std::collections::HashMap::new(),
         },
     };
-    let resp = rusternetes_api_server::handlers::generic::forward_to_aggregator(
+    let resp = rusternetes_api_server::handlers::aggregator::forward_to_aggregator(
         &target,
         &auth,
         axum::http::Method::GET,
@@ -910,7 +910,7 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
         .delete(&svc_key)
         .await
         .expect("delete service");
-    let err = rusternetes_api_server::handlers::generic::resolve_aggregator_target_with_storage(
+    let err = rusternetes_api_server::handlers::aggregator::resolve_aggregator_target_with_storage(
         state.storage.as_ref(),
         "wardle.example.com",
         "v1alpha1",

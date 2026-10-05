@@ -3,7 +3,7 @@
 //! They did not, and the reason was structural rather than per-handler: the DRA
 //! types declared their own `dra::ObjectMeta`, so they could not implement
 //! `HasMetadata`, so neither `handle_delete_with_finalizers` nor
-//! `delete_collection_item` typechecked against them. Eight delete paths
+//! the (since removed) `delete_collection_item` typechecked against them. Eight delete paths
 //! carried this comment instead:
 //!
 //! ```text
