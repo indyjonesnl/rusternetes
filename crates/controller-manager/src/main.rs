@@ -12,7 +12,6 @@ use clap::Parser;
 use controllers::{
     apiservice::APIServiceAvailabilityController,
     certificate_signing_request::CertificateSigningRequestController,
-    crd::CRDController,
     cronjob::CronJobController,
     daemonset::DaemonSetController,
     deployment::DeploymentController,
@@ -738,17 +737,6 @@ async fn main() -> Result<()> {
         async move {
             if let Err(e) = controller.run().await {
                 tracing::error!("CertificateSigningRequest controller error: {}", e);
-            }
-        }
-    });
-
-    // Start CRD controller
-    let crd_controller = Arc::new(CRDController::new(storage.clone()));
-    spawn_controller!("CRD controller", leader_elector, {
-        let controller = crd_controller.clone();
-        async move {
-            if let Err(e) = controller.run().await {
-                tracing::error!("CRD controller error: {}", e);
             }
         }
     });

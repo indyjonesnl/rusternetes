@@ -5,7 +5,6 @@ pub use controllers::*;
 use controllers::{
     apiservice::APIServiceAvailabilityController,
     certificate_signing_request::CertificateSigningRequestController,
-    crd::CRDController,
     cronjob::CronJobController,
     daemonset::DaemonSetController,
     deployment::DeploymentController,
@@ -383,14 +382,6 @@ async fn run_controllers<S: Storage + Send + Sync + 'static>(
         let c = Arc::new(controller);
         if let Err(e) = c.run().await {
             error!("CertificateSigningRequest controller error: {}", e);
-        }
-    });
-
-    let s = storage.clone();
-    tokio::spawn(async move {
-        let c = Arc::new(CRDController::new(s));
-        if let Err(e) = c.run().await {
-            error!("CRD controller error: {}", e);
         }
     });
 
