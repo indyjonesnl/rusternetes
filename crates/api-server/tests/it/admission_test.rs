@@ -927,3 +927,63 @@ async fn quota_admits_update_with_zero_delta_at_the_limit() {
         "an update that raises usage past the limit must be rejected"
     );
 }
+
+/// Upstream `Constraints` (`pods.go:124-168`, called from
+/// `resourcequota/controller.go:470`): a container omitting a quota'd
+/// `requests.cpu` is refused before any usage arithmetic, even when the
+/// namespace is nowhere near the ceiling.
+#[tokio::test]
+async fn quota_constraints_reject_container_omitting_quotad_cpu() {
+    use rusternetes_api_server::admission::check_pod_quota_constraints;
+
+    let storage = Arc::new(MemoryStorage::new());
+    put_quota(&storage, "cpu", &[("requests.cpu", "1")]).await;
+
+    let none = create_minimal_pod("p", "test-namespace");
+    let msg = check_pod_quota_constraints(&storage, "test-namespace", &none)
+        .await
+        .unwrap();
+    assert_eq!(
+        msg.as_deref(),
+        Some("failed quota: cpu: must specify requests.cpu for: test-container")
+    );
+
+    let with_cpu = pod_with_requests("p", "test-namespace", &[("cpu", "100m")]);
+    assert_eq!(
+        check_pod_quota_constraints(&storage, "test-namespace", &with_cpu)
+            .await
+            .unwrap(),
+        None
+    );
+
+    // An init container omitting it is refused too.
+    let mut init = pod_with_requests("p", "test-namespace", &[("cpu", "100m")]);
+    let mut ic = init.spec.as_ref().unwrap().containers[0].clone();
+    ic.name = "init".to_string();
+    ic.resources = None;
+    init.spec.as_mut().unwrap().init_containers = Some(vec![ic]);
+    assert_eq!(
+        check_pod_quota_constraints(&storage, "test-namespace", &init)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("failed quota: cpu: must specify requests.cpu for: init")
+    );
+}
+
+/// A quota on `pods` alone imposes no per-container requirement
+/// (`validationSet`, `pods.go:97-110`).
+#[tokio::test]
+async fn quota_constraints_pods_only_quota_imposes_nothing() {
+    use rusternetes_api_server::admission::check_pod_quota_constraints;
+
+    let storage = Arc::new(MemoryStorage::new());
+    put_quota(&storage, "count", &[("pods", "10")]).await;
+    let none = create_minimal_pod("p", "test-namespace");
+    assert_eq!(
+        check_pod_quota_constraints(&storage, "test-namespace", &none)
+            .await
+            .unwrap(),
+        None
+    );
+}

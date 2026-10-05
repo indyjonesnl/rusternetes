@@ -425,9 +425,24 @@ impl Admission<'_> {
         let (Some(pod), Some(namespace)) = (obj, self.namespace) else {
             return Ok(());
         };
+        // `Constraints` runs before any usage arithmetic
+        // (`resourcequota/controller.go:464-474`): a container omitting a
+        // quota'd cpu/memory is refused `failed quota: <name>: must specify ...`.
+        let constraints = |res: anyhow::Result<Option<String>>| -> Result<()> {
+            match res {
+                Ok(None) => Ok(()),
+                Ok(Some(msg)) => Err(self.forbidden(&name, msg)),
+                Err(e) => Err(Error::Internal(format!(
+                    "error checking ResourceQuota: {e}"
+                ))),
+            }
+        };
         match (op, old) {
             (Operation::Create, _) => {
                 ctx.hold(crate::admission::lock_namespace_quota(namespace).await);
+                constraints(
+                    crate::admission::check_pod_quota_constraints(storage, namespace, pod).await,
+                )?;
                 match crate::admission::check_resource_quota(storage, namespace, pod).await {
                     Ok(true) => Ok(()),
                     Ok(false) => Err(self.forbidden(&name, "exceeded quota")),
@@ -440,6 +455,9 @@ impl Admission<'_> {
                 if self.subresource == Some("resize") || pod_quota_scope_changed(old, pod) =>
             {
                 ctx.hold(crate::admission::lock_namespace_quota(namespace).await);
+                constraints(
+                    crate::admission::check_pod_quota_constraints(storage, namespace, pod).await,
+                )?;
                 match crate::admission::check_resource_quota_with_old(
                     storage,
                     namespace,
