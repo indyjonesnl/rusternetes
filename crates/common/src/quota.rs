@@ -289,7 +289,7 @@ pub fn is_extended_resource_name(name: &str) -> bool {
 /// Names a pod-level `spec.resources` entry may carry. Upstream
 /// `supportedPodLevelResources` (`component-helpers/resource/helpers.go`) plus
 /// hugepages.
-fn is_supported_pod_level_resource(name: &str) -> bool {
+pub fn is_supported_pod_level_resource(name: &str) -> bool {
     name == "cpu" || name == "memory" || is_hugepage_resource_name(name)
 }
 
