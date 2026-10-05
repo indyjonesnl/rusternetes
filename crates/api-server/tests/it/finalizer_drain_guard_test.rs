@@ -129,7 +129,7 @@ fn every_write_handler_finishes_a_drained_deletion() {
     }
 
     assert!(
-        checked >= 115,
+        checked >= 116,
         "guard scanned only {checked} write handlers -- the parser stopped \
          matching, which would make this test vacuously green"
     );

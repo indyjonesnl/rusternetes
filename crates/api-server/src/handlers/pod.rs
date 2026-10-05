@@ -428,7 +428,10 @@ pub async fn create_binding(
 /// topology labels go onto the Binding, and `BindingREST` copies them to the
 /// pod. Gated by `PodTopologyLabelsAdmission`; a node that is not there is
 /// ignored, "to avoid risking breaking compatibility/behaviour".
-async fn admit_binding_topology_labels(state: &ApiServerState, binding: &mut Binding) -> Result<()> {
+async fn admit_binding_topology_labels(
+    state: &ApiServerState,
+    binding: &mut Binding,
+) -> Result<()> {
     use rusternetes_common::feature_gates::{enabled, Feature};
     // The plugin's default `Config.Labels`.
     const TOPOLOGY_LABELS: [&str; 2] = [

@@ -5,7 +5,6 @@
 //! 2. `metadata.resourceVersion` conflict detection: 409 Conflict on stale updates
 //! 3. `spec.selector` immutability: 422 Invalid on selector changes for apps/v1 workloads
 
-
 // ---------------------------------------------------------------------------
 // AllowCreateOnUpdate
 // ---------------------------------------------------------------------------

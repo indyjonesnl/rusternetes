@@ -230,7 +230,11 @@ async fn a_null_selector_pdb_protects_no_pods_but_an_empty_one_protects_all() {
                 Some("application/json"),
                 Some(&json!({
                     "apiVersion": "v1", "kind": "Pod",
-                    "metadata": { "name": "victim", "namespace": ns },
+                    // `/status` replaces the labels with the request's
+                    // (podStatusStrategy resets only spec, deletionTimestamp
+                    // and ownerReferences), so the labels the PDB selects on
+                    // are sent along, as a kubelet's full pod always does.
+                    "metadata": { "name": "victim", "namespace": ns, "labels": { "app": "web" } },
                     "status": {
                         "phase": "Running",
                         "conditions": [{ "type": "Ready", "status": "True" }]

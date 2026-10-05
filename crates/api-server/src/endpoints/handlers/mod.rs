@@ -25,8 +25,8 @@ pub use create::create_resource;
 pub use delete::{delete_collection, delete_resource};
 pub use get::get_resource;
 pub use patch::patch_resource;
-pub use rest::{negotiate, RequestScope, RequestVersionConversion};
 pub(crate) use rest::{authorize, dry_run_param, is_dry_run, respond};
+pub use rest::{negotiate, RequestScope, RequestVersionConversion};
 pub use update::update_resource;
 
 #[cfg(test)]

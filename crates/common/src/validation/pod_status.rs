@@ -704,10 +704,7 @@ fn validate_container_status_allocated_resources_status(
             continue;
         };
         for (j, resource) in allocated.iter().enumerate() {
-            let res_path = fld_path
-                .index(i)
-                .child("allocatedResourcesStatus")
-                .index(j);
+            let res_path = fld_path.index(i).child("allocatedResourcesStatus").index(j);
             // ignore missing container, see kubernetes/kubernetes#124915
             if let Some(container) = containers.iter().find(|c| c.name == status.name) {
                 let resources = container.resources.as_ref();
@@ -747,7 +744,13 @@ fn validate_container_status_allocated_resources_status(
 
             // check resource IDs are unique
             let mut unique = HashSet::new();
-            for (k, r) in resource.resources.as_deref().unwrap_or(&[]).iter().enumerate() {
+            for (k, r) in resource
+                .resources
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .enumerate()
+            {
                 let health = r.health.as_deref().unwrap_or("");
                 if !matches!(health, "Healthy" | "Unhealthy" | "Unknown") {
                     errs.push(Error::not_supported(
@@ -858,7 +861,10 @@ mod tests {
     fn mirror_annotation_cannot_be_added() {
         let old = pod(serde_json::json!({}), serde_json::json!({}));
         let mut new = old.clone();
-        new.metadata.annotations = Some(HashMap::from([(MIRROR_POD_ANNOTATION_KEY.into(), "x".into())]));
+        new.metadata.annotations = Some(HashMap::from([(
+            MIRROR_POD_ANNOTATION_KEY.into(),
+            "x".into(),
+        )]));
         let errs = validate_pod_specific_annotation_updates(&new, &old, &Path::new("a"));
         assert!(messages(&errs).contains("may not add mirror pod annotation"));
     }

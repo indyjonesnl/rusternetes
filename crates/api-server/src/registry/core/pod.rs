@@ -214,7 +214,7 @@ impl RestGracefulDeleteStrategy<Pod> for Strategy {
     }
 }
 
-/// `podStatusStrategy` (strategy.go:199-260): the update strategy of
+/// `podStatusStrategy` (strategy.go:197-283): the update strategy of
 /// `/status`.
 pub struct StatusStrategy;
 
@@ -224,7 +224,7 @@ impl NamespaceScopedStrategy for StatusStrategy {
     }
 }
 
-/// `preserveOldObservedGeneration` (strategy.go:231-259): a request that
+/// `preserveOldObservedGeneration` (strategy.go:237-261): a request that
 /// clears `observedGeneration`, in the status or in a condition, keeps the
 /// stored value. Go's zero is "unset", so `None` and `0` are the same here.
 fn preserve_old_observed_generation(new: &mut Pod, old: &Pod) {
@@ -263,7 +263,7 @@ impl RestUpdateStrategy<Pod> for StatusStrategy {
         false
     }
 
-    /// strategy.go:210-228. `DropDisabledPodFields` is not modelled (module
+    /// strategy.go:216-235. `DropDisabledPodFields` is not modelled (module
     /// doc).
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut Pod, old: &Pod) {
         obj.spec = old.spec.clone();
@@ -286,12 +286,12 @@ impl RestUpdateStrategy<Pod> for StatusStrategy {
         preserve_old_observed_generation(obj, old);
     }
 
-    /// strategy.go:246-253: `ValidatePodStatusUpdate`.
+    /// strategy.go:263-271: `ValidatePodStatusUpdate`.
     fn validate_update(&self, _ctx: &RequestContext, obj: &Pod, old: &Pod) -> ErrorList {
         rusternetes_common::validation::pod_status::validate_pod_status_update(obj, old)
     }
 
-    /// strategy.go:255-269: a non-standard IP in `podIPs` or `hostIPs`
+    /// strategy.go:273-283: a non-standard IP in `podIPs` or `hostIPs`
     /// draws a warning.
     fn warnings_on_update(&self, _ctx: &RequestContext, obj: &Pod, _old: &Pod) -> Vec<String> {
         let Some(status) = obj.status.as_ref() else {
@@ -585,7 +585,7 @@ fn update_pod_condition(status: &mut PodStatus, mut condition: PodCondition) {
     }
 }
 
-/// `BindingREST` (storage/storage.go:101-216, `Create` and its
+/// `BindingREST` (storage/storage.go:149-297, `Create` and its
 /// `assignPod` / `setPodNodeAndMetadata`): binds a pod to a node by writing
 /// the pod straight through the storage with the binding's UID and
 /// resourceVersion as preconditions, around the pod strategies.
@@ -600,7 +600,7 @@ impl BindingRest {
         }
     }
 
-    /// `BindingREST.Create` (storage.go:111-135), after the handler decoded
+    /// `BindingREST.Create` (storage.go:177-201), after the handler decoded
     /// `binding` and the admission chain mutated it.
     pub async fn create(
         &self,
@@ -624,7 +624,7 @@ impl BindingRest {
         self.assign_pod(ctx, binding, dry_run).await
     }
 
-    /// `assignPod` (storage.go:218-227): any failure that is not already an
+    /// `assignPod` (storage.go:286-296): any failure that is not already an
     /// API status is a Conflict on `pods/binding`.
     async fn assign_pod(
         &self,
@@ -663,7 +663,7 @@ impl BindingRest {
 }
 
 /// The body of `setPodNodeAndMetadata`'s `SimpleUpdate` (storage.go:
-/// 168-215): sets the node if and only if the pod is unassigned, and merges
+/// 213-270): sets the node if and only if the pod is unassigned, and merges
 /// the binding's annotations and labels.
 fn set_pod_node_and_metadata(
     pod: &mut Pod,
@@ -683,7 +683,11 @@ fn set_pod_node_and_metadata(
         return Err(format!("pod {name} is already assigned to node {node:?}"));
     }
     // Reject binding to a scheduling un-ready Pod.
-    if spec.scheduling_gates.as_ref().is_some_and(|g| !g.is_empty()) {
+    if spec
+        .scheduling_gates
+        .as_ref()
+        .is_some_and(|g| !g.is_empty())
+    {
         return Err(format!("pod {name} has non-empty .spec.schedulingGates"));
     }
     spec.node_name = Some(machine.to_string());
@@ -813,6 +817,29 @@ mod tests {
         assert_eq!(Strategy.warnings_on_create(&ctx(), &p).len(), 1);
         p.metadata.name = "ab".into();
         assert!(Strategy.warnings_on_create(&ctx(), &p).is_empty());
+    }
+
+    /// `podStatusStrategy.WarningsOnUpdate` (strategy.go:273-283): an IP that
+    /// is valid but not in canonical form draws a warning naming its path.
+    #[test]
+    fn status_update_warns_about_non_canonical_ips() {
+        let old = pod(serde_json::json!({}));
+        let mut new = old.clone();
+        new.status = Some(PodStatus {
+            pod_i_ps: Some(vec![rusternetes_common::resources::pod::PodIP {
+                ip: "010.0.0.1".into(),
+            }]),
+            host_i_ps: Some(vec![rusternetes_common::resources::pod::HostIP {
+                ip: "10.0.0.1".into(),
+            }]),
+            ..Default::default()
+        });
+        let warnings = StatusStrategy.warnings_on_update(&ctx(), &new, &old);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("status.podIPs[0].ip:"),
+            "{warnings:?}"
+        );
     }
 
     /// `dropNonResizeUpdates` (strategy.go:386-435): only the containers'

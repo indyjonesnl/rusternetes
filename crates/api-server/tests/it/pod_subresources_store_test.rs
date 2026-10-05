@@ -514,7 +514,9 @@ async fn binding_uid_precondition_is_enforced() {
 #[tokio::test]
 async fn binding_a_missing_pod_is_not_found() {
     let api = TestApiServer::new();
-    let (s, out) = api.post(&binding_uri("ghost"), &binding("ghost", "n")).await;
+    let (s, out) = api
+        .post(&binding_uri("ghost"), &binding("ghost", "n"))
+        .await;
     assert_eq!(s, StatusCode::NOT_FOUND, "{out}");
 }
 
@@ -552,7 +554,10 @@ async fn binding_copies_the_node_topology_labels() {
     let (s, out) = api.post(&binding_uri("p1"), &binding("p1", "node-1")).await;
     assert_eq!(s, StatusCode::CREATED, "{out}");
     let pod = stored(&api, "p1").await;
-    assert_eq!(pod["metadata"]["labels"]["topology.kubernetes.io/zone"], "z1");
+    assert_eq!(
+        pod["metadata"]["labels"]["topology.kubernetes.io/zone"],
+        "z1"
+    );
     assert_eq!(
         pod["metadata"]["labels"]["topology.kubernetes.io/region"],
         "r1"

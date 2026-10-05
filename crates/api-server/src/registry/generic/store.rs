@@ -532,7 +532,7 @@ impl<T: Object, S: Storage> Store<T, S> {
     /// `Storage.GuaranteedUpdate` of the stored object with a fallible plain
     /// mutation, for a REST wrapper whose `Create` writes the parent object
     /// around the strategies, as `BindingREST.setPodNodeAndMetadata` does
-    /// (pkg/registry/core/pod/storage/storage.go:168-216). The storage
+    /// (pkg/registry/core/pod/storage/storage.go:213-270). The storage
     /// failures come back interpreted as by `InterpretGetError` and
     /// `InterpretUpdateError`; an error `mutate` returns is passed through
     /// untouched, for the caller to wrap.
