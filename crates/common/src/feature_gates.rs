@@ -147,6 +147,18 @@ pub enum Feature {
 
     /// Upstream: `pkg/features/kube_features.go::PodDeletionCost` (1.22 Beta, on in v1.35; kube_features.go:1607).
     PodDeletionCost,
+
+    /// Upstream gate `ClusterTrustBundle` (1.33 Beta, but off (no `Default: true`) (kube_features.go:1199-1202)).
+    ClusterTrustBundle,
+
+    /// Upstream gate `DRADeviceTaintRules` (1.35 Alpha, off (kube_features.go:1240-1242)).
+    DRADeviceTaintRules,
+
+    /// Upstream gate `ComponentFlagz` (1.32 Alpha, off (k8s.io/component-base/zpages/features/kube_features.go:40-42)).
+    ComponentFlagz,
+
+    /// Upstream gate `ComponentStatusz` (1.32 Alpha, off (k8s.io/component-base/zpages/features/kube_features.go:43-45)).
+    ComponentStatusz,
 }
 
 impl Feature {
@@ -178,6 +190,10 @@ impl Feature {
             Feature::MatchLabelKeysInPodTopologySpread => 22,
             Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge => 23,
             Feature::PodDeletionCost => 24,
+            Feature::ClusterTrustBundle => 25,
+            Feature::DRADeviceTaintRules => 26,
+            Feature::ComponentFlagz => 27,
+            Feature::ComponentStatusz => 28,
         }
     }
 
@@ -234,6 +250,14 @@ impl Feature {
             Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge => true,
             // 1.22 Beta, on (kube_features.go:1607).
             Feature::PodDeletionCost => true,
+            // 1.33 Beta, but off (no `Default: true`) (kube_features.go:1199-1202)
+            Feature::ClusterTrustBundle => false,
+            // 1.35 Alpha, off (kube_features.go:1240-1242)
+            Feature::DRADeviceTaintRules => false,
+            // 1.32 Alpha, off (k8s.io/component-base/zpages/features/kube_features.go:40-42)
+            Feature::ComponentFlagz => false,
+            // 1.32 Alpha, off (k8s.io/component-base/zpages/features/kube_features.go:43-45)
+            Feature::ComponentStatusz => false,
         }
     }
 }
@@ -275,6 +299,10 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::MatchLabelKeysInPodTopologySpread,
     Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge,
     Feature::PodDeletionCost,
+    Feature::ClusterTrustBundle,
+    Feature::DRADeviceTaintRules,
+    Feature::ComponentFlagz,
+    Feature::ComponentStatusz,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -314,6 +342,10 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::MatchLabelKeysInPodTopologySpread.default_enabled()),
     AtomicBool::new(Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge.default_enabled()),
     AtomicBool::new(Feature::PodDeletionCost.default_enabled()),
+    AtomicBool::new(Feature::ClusterTrustBundle.default_enabled()),
+    AtomicBool::new(Feature::DRADeviceTaintRules.default_enabled()),
+    AtomicBool::new(Feature::ComponentFlagz.default_enabled()),
+    AtomicBool::new(Feature::ComponentStatusz.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.
