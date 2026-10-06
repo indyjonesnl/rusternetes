@@ -383,7 +383,7 @@ fn test_operation(value: &Value, path: &str, test_value: &Value) -> Result<(), P
 /// Implements strategic merge with directive markers:
 /// - `$patch`: Specifies merge strategy ("replace", "merge", "delete")
 /// - `$retainKeys`: List of keys to retain when using replace strategy
-/// - `$deleteFromPrimitiveList`: Values to delete from primitive arrays
+/// - `$deleteFromPrimitiveList/<field>`: Values to delete from primitive arrays
 /// - Arrays with items that have a 'name' field are merged by name
 /// - Other arrays replace the original (unless directives specify otherwise)
 /// - Objects are recursively merged
@@ -476,6 +476,14 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
         _ => {
             // Default merge strategy
 
+            // `applyRetainKeysDirective` (patch.go:1047-1100): validate the
+            // patch against `$retainKeys`, then clear original keys that
+            // are not listed. Runs before `mergePatchIntoOriginal`
+            // (patch.go:1333-1342).
+            if let Some(retain) = patch_obj.get("$retainKeys") {
+                apply_retain_keys_directive(result_obj, patch_obj, retain)?;
+            }
+
             // Upstream `mergePatchIntoOriginal` (patch.go:1110-1230): a
             // `$setElementOrder/<field>` directive merges the `<field>` list
             // together with its order list, then drops both from the patch.
@@ -510,50 +518,21 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
                 } else if patch_value.is_array()
                     && result_obj.get(key).is_some_and(|v| v.is_array())
                 {
-                    // Check for $deleteFromPrimitiveList directive
-                    let delete_list: Option<Vec<Value>> = if let Some(obj) = patch_value.as_array()
-                    {
-                        // Look for $deleteFromPrimitiveList in array elements
-                        obj.iter().find_map(|item| {
-                            item.as_object()
-                                .and_then(|o| o.get("$deleteFromPrimitiveList"))
-                                .and_then(|v| v.as_array())
-                                .cloned()
-                        })
-                    } else {
-                        None
-                    };
-
-                    if let Some(to_delete) = delete_list {
-                        // Remove specified values from the original array
-                        let mut original_array = result_obj[key]
-                            .as_array()
-                            .ok_or_else(|| {
-                                PatchError::InvalidPatch(format!(
-                                    "strategic merge: '{}' is not an array",
-                                    key
-                                ))
-                            })?
-                            .clone();
-                        original_array.retain(|item| !to_delete.contains(item));
-                        result_obj.insert(key.clone(), Value::Array(original_array));
-                    } else {
-                        // Strategic merge for arrays
-                        let orig_arr = result_obj[key].as_array().ok_or_else(|| {
-                            PatchError::InvalidPatch(format!(
-                                "strategic merge: '{}' is not an array",
-                                key
-                            ))
-                        })?;
-                        let patch_arr = patch_value.as_array().ok_or_else(|| {
-                            PatchError::InvalidPatch(format!(
-                                "strategic merge: patch for '{}' is not an array",
-                                key
-                            ))
-                        })?;
-                        let merged_array = strategic_merge_arrays(orig_arr, patch_arr)?;
-                        result_obj.insert(key.clone(), Value::Array(merged_array));
-                    }
+                    // Strategic merge for arrays
+                    let orig_arr = result_obj[key].as_array().ok_or_else(|| {
+                        PatchError::InvalidPatch(format!(
+                            "strategic merge: '{}' is not an array",
+                            key
+                        ))
+                    })?;
+                    let patch_arr = patch_value.as_array().ok_or_else(|| {
+                        PatchError::InvalidPatch(format!(
+                            "strategic merge: patch for '{}' is not an array",
+                            key
+                        ))
+                    })?;
+                    let merged_array = strategic_merge_arrays(orig_arr, patch_arr)?;
+                    result_obj.insert(key.clone(), Value::Array(merged_array));
                 } else if patch_value.is_object()
                     && result_obj.get(key).is_some_and(|v| v.is_object())
                 {
@@ -584,23 +563,41 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
                     current.retain(|v| !to_delete.contains(v));
                 }
             }
-
-            // Upstream parity: `$retainKeys` is also honored in a merge
-            // context (not just under `$patch: replace`). After the
-            // normal merge, drop any pre-existing key that is neither
-            // listed in `$retainKeys` nor explicitly set by the patch.
-            if let Some(keys_to_retain) = &retain_keys {
-                let allowed: std::collections::HashSet<String> = keys_to_retain
-                    .iter()
-                    .cloned()
-                    .chain(patch_obj.keys().filter(|k| !k.starts_with('$')).cloned())
-                    .collect();
-                result_obj.retain(|k, _| allowed.contains(k));
-            }
         }
     }
 
     Ok(result)
+}
+
+/// Port of `applyRetainKeysDirective` (patch.go:1070-1099) for the
+/// `MergeParallelList` (apply-a-patch-to-an-object) case: a non-list
+/// directive, or a non-null patch key absent from the list, is
+/// `ErrBadPatchFormatForRetainKeys`; original keys not listed are cleared.
+fn apply_retain_keys_directive(
+    original: &mut serde_json::Map<String, Value>,
+    patch: &serde_json::Map<String, Value>,
+    retain: &Value,
+) -> Result<(), PatchError> {
+    let bad = || PatchError::InvalidPatch("invalid patch format of retainKeys".to_string());
+    let list = retain.as_array().ok_or_else(bad)?;
+    let keys: std::collections::HashSet<&str> = list.iter().filter_map(|v| v.as_str()).collect();
+    for (k, v) in patch {
+        // `$retainKeys` itself is deleted from the patch upstream before
+        // this loop; `$patch` never reaches here (handled as a directive).
+        if v.is_null()
+            || k == "$retainKeys"
+            || k == "$patch"
+            || k.starts_with(&format!("{DELETE_FROM_PRIMITIVE_LIST}/"))
+            || k.starts_with(&format!("{SET_ELEMENT_ORDER}/"))
+        {
+            continue;
+        }
+        if !keys.contains(k.as_str()) {
+            return Err(bad());
+        }
+    }
+    original.retain(|k, _| keys.contains(k.as_str()));
+    Ok(())
 }
 
 const DELETE_FROM_PRIMITIVE_LIST: &str = "$deleteFromPrimitiveList";
@@ -610,42 +607,48 @@ fn is_scalar_list(list: &[Value]) -> bool {
     list.iter().all(|v| !v.is_object() && !v.is_array())
 }
 
-/// Ported from `deduplicateScalars` (patch.go:1846) followed by
-/// `normalizeElementOrder` (patch.go:404-416): union of two scalar lists,
-/// patch-listed items ordered by `patch_order`, server-only items by the
-/// original order, then interleaved by `mergeSortedSlice`.
-fn merge_scalar_lists(original: &[Value], patch: &[Value]) -> Vec<Value> {
-    let mut merged: Vec<Value> = Vec::new();
-    for v in original.iter().chain(patch.iter()) {
-        if !merged.contains(v) {
-            merged.push(v.clone());
-        }
-    }
-    normalize_scalar_order(&merged, patch, original)
+/// Identity of a list item for ordering: the value itself for primitives
+/// (`index` default branch, patch.go:486), the merge key for maps
+/// (patch.go:477). `None` for a map without its merge key.
+type ItemId<'a> = &'a dyn Fn(&Value) -> Option<String>;
+
+fn scalar_id(v: &Value) -> Option<String> {
+    Some(v.to_string())
 }
 
-fn index_of(list: &[Value], v: &Value) -> Option<usize> {
-    list.iter().position(|x| x == v)
+fn index_of(list: &[Value], v: &Value, id: ItemId) -> Option<usize> {
+    let target = id(v)?;
+    list.iter().position(|x| id(x).as_ref() == Some(&target))
 }
 
-/// `partitionPrimitivesByPresentInList` (patch.go:1236) + `normalizeSliceOrder`
-/// (patch.go:521) + `mergeSortedSlice` (patch.go:427).
-fn normalize_scalar_order(
+/// `normalizeSliceOrder` (patch.go:521) + `normalizeElementOrder`
+/// (patch.go:404) + `mergeSortedSlice` (patch.go:427), after
+/// `partitionPrimitivesByPresentInList` / `partitionMapsByPresentInList`
+/// (patch.go:1236, 1254).
+fn normalize_order(
     merged: &[Value],
     patch_order: &[Value],
     server_order: &[Value],
-) -> Vec<Value> {
+    id: ItemId,
+) -> Result<Vec<Value>, PatchError> {
+    if merged.iter().any(|v| v.is_object() && id(v).is_none()) {
+        return Err(PatchError::InvalidPatch(
+            "map in list does not contain the merge key".to_string(),
+        ));
+    }
     let (mut patch_items, mut server_only): (Vec<Value>, Vec<Value>) = merged
         .iter()
         .cloned()
-        .partition(|v| patch_order.contains(v));
-    patch_items.sort_by_key(|v| index_of(patch_order, v));
-    server_only.sort_by_key(|v| index_of(server_order, v));
+        .partition(|v| index_of(patch_order, v, id).is_some());
+    patch_items.sort_by_key(|v| index_of(patch_order, v, id));
+    server_only.sort_by_key(|v| index_of(server_order, v, id));
     let (left, right) = (server_only, patch_items);
-    let less = |l: &Value, r: &Value| match (index_of(server_order, l), index_of(server_order, r)) {
-        (Some(li), Some(ri)) => li < ri,
-        _ => false,
-    };
+    let less =
+        |l: &Value, r: &Value| match (index_of(server_order, l, id), index_of(server_order, r, id))
+        {
+            (Some(li), Some(ri)) => li < ri,
+            _ => false,
+        };
     let mut out = Vec::with_capacity(left.len() + right.len());
     let (mut i, mut j) = (0, 0);
     while i < left.len() || j < right.len() {
@@ -660,25 +663,61 @@ fn normalize_scalar_order(
             j += 1;
         }
     }
-    out
+    Ok(out)
 }
 
-/// `validatePatchWithSetOrderList` (patch.go:977-1021), primitives only.
+/// Ported from `deduplicateScalars` (patch.go:1846) followed by
+/// `normalizeElementOrder` (patch.go:404-416): union of two scalar lists,
+/// patch-listed items ordered by `patch_order`, server-only items by the
+/// original order, then interleaved by `mergeSortedSlice`.
+fn merge_scalar_lists(original: &[Value], patch: &[Value]) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::new();
+    for v in original.iter().chain(patch.iter()) {
+        if !merged.contains(v) {
+            merged.push(v.clone());
+        }
+    }
+    normalize_order(&merged, patch, original, &scalar_id).expect("scalars always have an id")
+}
+
+/// `validatePatchWithSetOrderList` (patch.go:977-1021). For lists of maps
+/// `$patch: delete` items are dropped first (patch.go:992) and items that
+/// carry a directive are skipped (patch.go:1003).
 fn validate_patch_with_set_order_list(
     patch_list: &[Value],
     order: &[Value],
+    id: ItemId,
+    is_map_list: bool,
 ) -> Result<(), PatchError> {
     if patch_list.is_empty() || order.is_empty() {
         return Ok(());
     }
+    let non_delete: Vec<&Value> = patch_list
+        .iter()
+        .filter(|v| !(is_map_list && is_delete_directive(v)))
+        .collect();
     let (mut p, mut o) = (0, 0);
-    while p < patch_list.len() && o < order.len() {
-        if patch_list[p] == order[o] {
+    while p < non_delete.len() && o < order.len() {
+        if is_map_list
+            && non_delete[p]
+                .as_object()
+                .is_some_and(|m| m.contains_key("$patch"))
+        {
+            p += 1;
+            continue;
+        }
+        let (a, b) = (id(non_delete[p]), id(&order[o]));
+        if is_map_list && (a.is_none() || b.is_none()) {
+            return Err(PatchError::InvalidPatch(
+                "map in list does not contain the merge key".to_string(),
+            ));
+        }
+        if a == b {
             p += 1;
         }
         o += 1;
     }
-    if p < patch_list.len() && o >= order.len() {
+    if p < non_delete.len() && o >= order.len() {
         return Err(PatchError::InvalidPatch(format!(
             "The order in patch list:\n{patch_list:?}\n doesn't match {SET_ELEMENT_ORDER} list:\n{order:?}\n"
         )));
@@ -686,11 +725,24 @@ fn validate_patch_with_set_order_list(
     Ok(())
 }
 
-/// Port of `mergePatchIntoOriginal` (patch.go:1110-1230) for lists of
-/// primitives: merge `<field>` with its `$setElementOrder/<field>` list and
-/// enforce the order (precedence: `$setElementOrder` > patch list > live
-/// list). Returns the fields it consumed so the caller skips them. Lists of
-/// maps are not handled here (no schema to find the merge key).
+/// `removeDirectives` (patch.go:1282): drop objects carrying `$patch`.
+fn remove_directives(list: &[Value]) -> Vec<Value> {
+    list.iter()
+        .filter(|v| !v.as_object().is_some_and(|m| m.contains_key("$patch")))
+        .cloned()
+        .collect()
+}
+
+/// Port of `mergePatchIntoOriginal` (patch.go:1110-1230): merge `<field>`
+/// with its `$setElementOrder/<field>` list and enforce the order
+/// (precedence: `$setElementOrder` > patch list > live list). Returns the
+/// fields it consumed so the caller skips them.
+///
+/// Upstream finds the merge key through `schema.LookupPatchMetadataForSlice`
+/// (patch.go:1165); there is no schema here, so for lists of maps the key
+/// is derived from the order list itself via `detect_merge_key_strategy`
+/// (the same heuristic `strategic_merge_arrays` uses). An order list that
+/// yields no key leaves the field to the ordinary merge.
 fn merge_set_element_order_lists(
     result_obj: &mut serde_json::Map<String, Value>,
     patch_obj: &serde_json::Map<String, Value>,
@@ -717,14 +769,43 @@ fn merge_set_element_order_lists(
         let all_scalar = original.as_deref().is_none_or(is_scalar_list)
             && patch_list.as_deref().is_none_or(is_scalar_list)
             && is_scalar_list(order);
-        if !all_scalar {
-            continue;
-        }
-        validate_patch_with_set_order_list(patch_list.as_deref().unwrap_or(&[]), order)?;
+        let strategy = if all_scalar {
+            None
+        } else {
+            let all_maps = |l: &[Value]| l.iter().all(|v| v.is_object());
+            if !(original.as_deref().is_none_or(all_maps)
+                && patch_list.as_deref().is_none_or(all_maps)
+                && all_maps(order))
+            {
+                continue;
+            }
+            match detect_merge_key_strategy(order) {
+                Some(s) => Some(s),
+                None => continue,
+            }
+        };
+        let id = move |v: &Value| match strategy {
+            None => scalar_id(v),
+            Some(s) => merge_key_with(v, s),
+        };
+        let is_map_list = strategy.is_some();
+        validate_patch_with_set_order_list(
+            patch_list.as_deref().unwrap_or(&[]),
+            order,
+            &id,
+            is_map_list,
+        )?;
         let merged = match (&original, &patch_list) {
             (None, None) => continue,
             (Some(o), None) => o.clone(),
-            (None, Some(p)) => p.clone(),
+            (None, Some(p)) => {
+                if is_map_list {
+                    remove_directives(p)
+                } else {
+                    p.clone()
+                }
+            }
+            (Some(o), Some(p)) if is_map_list => strategic_merge_arrays(o, p)?,
             (Some(o), Some(p)) => {
                 let mut m: Vec<Value> = Vec::new();
                 for v in o.iter().chain(p.iter()) {
@@ -736,7 +817,7 @@ fn merge_set_element_order_lists(
             }
         };
         let server_order = original.unwrap_or_default();
-        let ordered = normalize_scalar_order(&merged, order, &server_order);
+        let ordered = normalize_order(&merged, order, &server_order, &id)?;
         result_obj.insert(field.to_string(), Value::Array(ordered));
         consumed.insert(field.to_string());
     }
@@ -1289,9 +1370,7 @@ mod tests {
 
         let patch = json!({
             "spec": {
-                "finalizers": [
-                    {"$deleteFromPrimitiveList": ["example.com/my-finalizer"]}
-                ]
+                "$deleteFromPrimitiveList/finalizers": ["example.com/my-finalizer"]
             }
         });
 
@@ -1369,6 +1448,145 @@ mod tests {
         assert!(pos("c") < pos("a") && pos("a") < pos("b"));
         assert_eq!(l.len(), 4);
         assert!(r.get("$setElementOrder/l").is_none());
+    }
+
+    #[test]
+    fn test_smp_set_element_order_lists_of_maps_merge_key_name() {
+        // patch_test.go:1455-1522 "merge lists of maps" (ThreeWay + Result).
+        let original = json!({"mergingList": [
+            {"name": "1", "other": "a"},
+            {"name": "2", "value": "2", "other": "b"}
+        ]});
+        let patch = json!({
+            "$setElementOrder/mergingList": [
+                {"name": "4"}, {"name": "1"}, {"name": "2"}, {"name": "3"}
+            ],
+            "mergingList": [
+                {"name": "4", "value": "4"},
+                {"name": "3", "value": "3"}
+            ]
+        });
+        let r = apply_strategic_merge_patch(&original, &patch).unwrap();
+        assert_eq!(
+            r,
+            json!({"mergingList": [
+                {"name": "4", "value": "4"},
+                {"name": "1", "other": "a"},
+                {"name": "2", "value": "2", "other": "b"},
+                {"name": "3", "value": "3"}
+            ]})
+        );
+    }
+
+    #[test]
+    fn test_smp_set_element_order_lists_of_maps_keeps_server_only() {
+        // Server-only item "x" is kept; patch items follow the order list.
+        let original = json!({"containers": [
+            {"name": "a"}, {"name": "x"}, {"name": "b"}
+        ]});
+        let patch = json!({
+            "$setElementOrder/containers": [{"name": "b"}, {"name": "a"}],
+            "containers": [{"name": "b", "image": "i"}]
+        });
+        let r = apply_strategic_merge_patch(&original, &patch).unwrap();
+        let names: Vec<&str> = r["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 3);
+        let pos = |n: &str| names.iter().position(|x| *x == n).unwrap();
+        assert!(pos("b") < pos("a"));
+        assert_eq!(r["containers"][pos("b")]["image"], "i");
+        assert!(r.get("$setElementOrder/containers").is_none());
+    }
+
+    #[test]
+    fn test_smp_set_element_order_lists_of_maps_delete_item() {
+        // patch_test.go:1275-1315: `$patch: delete` item listed in the order.
+        let original = json!({"mergingList": [{"name": "hello2"}]});
+        let patch = json!({
+            "$setElementOrder/mergingList": [{"name": "hello"}, {"name": "doesntexist"}],
+            "mergingList": [{"name": "hello"}, {"$patch": "delete", "name": "doesntexist"}]
+        });
+        let r = apply_strategic_merge_patch(&original, &patch).unwrap();
+        assert_eq!(
+            r,
+            json!({"mergingList": [{"name": "hello"}, {"name": "hello2"}]})
+        );
+    }
+
+    #[test]
+    fn test_smp_set_element_order_lists_of_maps_mismatch_errors() {
+        // validatePatchWithSetOrderList (patch.go:1018).
+        let r = apply_strategic_merge_patch(
+            &json!({"l": [{"name": "1"}]}),
+            &json!({
+                "$setElementOrder/l": [{"name": "1"}, {"name": "2"}],
+                "l": [{"name": "3"}]
+            }),
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_smp_retain_keys_clears_and_accepts_listed() {
+        // patch_test.go:4412-4440 discriminated union.
+        let original = json!({"retainKeysMap": {"name": "type1", "value": "foo"}});
+        let patch = json!({"retainKeysMap": {
+            "$retainKeys": ["name", "other"], "name": "type2", "other": "bar"
+        }});
+        let r = apply_strategic_merge_patch(&original, &patch).unwrap();
+        assert_eq!(
+            r,
+            json!({"retainKeysMap": {"name": "type2", "other": "bar"}})
+        );
+    }
+
+    #[test]
+    fn test_smp_retain_keys_rejects_patch_key_not_listed() {
+        // applyRetainKeysDirective (patch.go:1081-1090).
+        let err = apply_strategic_merge_patch(
+            &json!({"m": {"a": 1}}),
+            &json!({"m": {"$retainKeys": ["a"], "b": 2}}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid patch format of retainKeys"),
+            "{err}"
+        );
+        // null values are exempt (patch.go:1082).
+        let r = apply_strategic_merge_patch(
+            &json!({"m": {"a": 1, "b": 2}}),
+            &json!({"m": {"$retainKeys": ["a"], "b": null}}),
+        )
+        .unwrap();
+        assert_eq!(r, json!({"m": {"a": 1}}));
+    }
+
+    #[test]
+    fn test_smp_retain_keys_not_a_list_errors() {
+        // patch.go:1070-1073.
+        let err = apply_strategic_merge_patch(
+            &json!({"m": {"a": 1}}),
+            &json!({"m": {"$retainKeys": "a", "a": 2}}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("retainKeys"), "{err}");
+    }
+
+    #[test]
+    fn test_smp_array_element_delete_shim_removed() {
+        // Not an upstream wire form (only the parallel `$deleteFromPrimitiveList/<f>`
+        // key is); must not delete.
+        let r = apply_strategic_merge_patch(
+            &json!({"f": ["a", "b"]}),
+            &json!({"f": [{"$deleteFromPrimitiveList": ["a"]}]}),
+        )
+        .unwrap();
+        assert_ne!(r, json!({"f": ["b"]}));
     }
 
     #[test]
