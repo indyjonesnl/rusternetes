@@ -1202,8 +1202,8 @@ fn test_validate_tolerations_error_toleration_seconds_without_no_execute() {
         "tolerationSeconds with NoSchedule should fail"
     );
     assert!(
-        contains_field(&errs, "tolerationSeconds"),
-        "error on tolerationSeconds: {:?}",
+        contains_field(&errs, "tolerations[0].effect"),
+        "error on effect: {:?}",
         errs
     );
 }
