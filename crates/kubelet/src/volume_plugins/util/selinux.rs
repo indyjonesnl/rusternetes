@@ -25,17 +25,13 @@ pub trait SELinuxLabelTranslator: Send + Sync {
 /// Port of `translator` / `NewSELinuxLabelTranslator`
 /// (`pkg/volume/util/selinux.go:46-56`, `:104-106`).
 ///
-/// **Deliberate deviation, flagged.** Upstream's real translator calls
-/// `github.com/opencontainers/selinux`: `SELinuxEnabled` is `selinux.GetEnabled()`
-/// and the label is built by `label.InitLabels`. Rusternetes has no SELinux
-/// binding and no container-runtime label allocation to release afterwards, so
-/// this reports SELinux as disabled — which is exactly upstream's own
-/// behaviour on a platform that does not have SELinux enabled, the case its
-/// doc comment calls out ("It returns "" and no error on platforms that do not
-/// have SELinux enabled or don't support SELinux at all"). The consequence is
-/// that every label is `""`, which is what every caller in this crate already
-/// passes; it is not a silent behaviour change, but it *is* a gap to close
-/// when SELinux mounting is implemented.
+/// **Partial port, flagged.** `SELinuxEnabled` is the real
+/// `selinux.GetEnabled()` ([`crate::go_selinux::get_enabled`]), so on an
+/// SELinux-enforcing node `GetMountSELinuxLabel` proceeds past its
+/// `!SELinuxEnabled()` early return exactly as upstream. `SELinuxOptionsToFileLabel`
+/// still returns `""`: upstream's `label.InitLabels` needs the `lxc_contexts`
+/// policy reader and MCS allocator (`label_linux.go:29-80`), which is not ported
+/// yet, so no `-o context=` label is computed (tracked in a follow-up issue).
 pub struct Translator;
 
 impl SELinuxLabelTranslator for Translator {
@@ -47,7 +43,7 @@ impl SELinuxLabelTranslator for Translator {
     }
 
     fn selinux_enabled(&self) -> bool {
-        false
+        crate::go_selinux::get_enabled()
     }
 }
 
@@ -279,3 +275,18 @@ pub fn get_mount_selinux_label(
 /// .seLinuxChangePolicy` is an `Option<String>` in this project rather than a
 /// named type, so the constant is compared as a string.
 pub const SELINUX_CHANGE_POLICY_RECURSIVE: &str = "Recursive";
+
+#[cfg(test)]
+mod real_translator_tests {
+    use super::*;
+
+    #[test]
+    fn real_translator_reports_the_platform_selinux_state() {
+        // Upstream `translator.SELinuxEnabled` is `selinux.GetEnabled()`
+        // (selinux.go:96-98), not a constant.
+        assert_eq!(
+            Translator.selinux_enabled(),
+            crate::go_selinux::get_enabled()
+        );
+    }
+}
