@@ -1,7 +1,9 @@
+use crate::ratelimit::RateLimiter;
 use anyhow::{Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// List-level metadata (`metadata` on a `*List` envelope).
 ///
@@ -40,6 +42,11 @@ pub struct ApiClient {
     /// connect-timeout + TCP keepalive so a dead connection is detected.
     stream_client: Client,
     token: Option<String>,
+    /// Throttles every request EXCEPT watches (client-go `rest/request.go:763-764`).
+    /// Unlimited unless the component opts in via [`Self::with_rate_limit`]. A
+    /// limiter belongs to ONE client: [`Self::for_controller`] gives a clone its
+    /// own fresh bucket rather than sharing this one (#1863).
+    limiter: Arc<RateLimiter>,
 }
 
 #[derive(Debug)]
@@ -194,11 +201,46 @@ impl ApiClient {
             client,
             stream_client,
             token,
+            limiter: Arc::new(RateLimiter::unlimited()),
         })
+    }
+
+    /// Set this client's sustained request rate and burst, as a component's
+    /// `--kube-api-qps` / `--kube-api-burst` do upstream. A non-positive `qps`
+    /// disables throttling (`rest/config.go:370-381`: `if qps > 0`).
+    ///
+    /// Watches are never throttled regardless of this setting.
+    pub fn with_rate_limit(mut self, qps: f64, burst: f64) -> Self {
+        self.limiter = Arc::new(RateLimiter::new(qps, burst));
+        self
+    }
+
+    /// A client for one controller, cloned from this skeleton.
+    ///
+    /// Ported from upstream's `SimpleControllerClientBuilder.Config`
+    /// (`staging/src/k8s.io/controller-manager/pkg/clientbuilder/client_builder.go:40-47`):
+    /// `clientConfig := *b.ClientConfig` copies the skeleton, and
+    /// `RESTClientFor` then builds a FRESH token bucket for every client that
+    /// does not carry its own limiter (`client-go/rest/config.go:370-381`). So
+    /// "QPS = 20" means 20 per controller, never 20 shared by all of them
+    /// (#1856 shared one and was reverted in #1862).
+    ///
+    /// The HTTP connection pools (`reqwest::Client` is an `Arc` inside) are
+    /// shared, as upstream shares the transport cache; only the limiter is new,
+    /// with this skeleton's QPS/burst.
+    pub fn for_controller(&self, _name: &str) -> Self {
+        Self {
+            base_url: self.base_url.clone(),
+            client: self.client.clone(),
+            stream_client: self.stream_client.clone(),
+            token: self.token.clone(),
+            limiter: Arc::new(RateLimiter::new(self.limiter.qps(), self.limiter.burst())),
+        }
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, GetError> {
         let url = format!("{}{}", self.base_url, path);
+        self.limiter.acquire().await;
         let mut request = self.client.get(&url);
 
         if let Some(ref token) = self.token {
@@ -266,6 +308,7 @@ impl ApiClient {
 
     pub async fn post<T: Serialize, R: DeserializeOwned>(&self, path: &str, body: &T) -> Result<R> {
         let url = format!("{}{}", self.base_url, path);
+        self.limiter.acquire().await;
         let mut request = self.client.post(&url).json(body);
 
         if let Some(ref token) = self.token {
@@ -288,6 +331,7 @@ impl ApiClient {
 
     pub async fn put<T: Serialize, R: DeserializeOwned>(&self, path: &str, body: &T) -> Result<R> {
         let url = format!("{}{}", self.base_url, path);
+        self.limiter.acquire().await;
         let mut request = self.client.put(&url).json(body);
 
         if let Some(ref token) = self.token {
@@ -324,6 +368,7 @@ impl ApiClient {
             url.push_str(&format!("{}{}", separator, qs.join("&")));
         }
 
+        self.limiter.acquire().await;
         let mut request = self.client.delete(&url);
 
         if let Some(ref token) = self.token {
@@ -352,6 +397,7 @@ impl ApiClient {
     /// Check if a resource exists (GET returns 200). Returns false on 404.
     pub async fn resource_exists(&self, path: &str) -> Result<bool> {
         let url = format!("{}{}", self.base_url, path);
+        self.limiter.acquire().await;
         let mut request = self.client.get(&url);
 
         if let Some(ref token) = self.token {
@@ -370,6 +416,7 @@ impl ApiClient {
         content_type: &str,
     ) -> Result<R> {
         let url = format!("{}{}", self.base_url, path);
+        self.limiter.acquire().await;
         let mut request = self
             .client
             .patch(&url)
@@ -397,6 +444,7 @@ impl ApiClient {
     /// Get a resource as plain text (for logs, etc.)
     pub async fn get_text(&self, path: &str) -> Result<String> {
         let url = format!("{}{}", self.base_url, path);
+        self.limiter.acquire().await;
         let mut request = self.client.get(&url);
 
         if let Some(ref token) = self.token {
@@ -454,6 +502,7 @@ impl ApiClient {
         accept: &str,
     ) -> anyhow::Result<serde_json::Value> {
         let url = format!("{}{}", self.base_url, path);
+        self.limiter.acquire().await;
         let mut request = self.client.get(&url).header("Accept", accept);
 
         if let Some(ref token) = self.token {
@@ -625,5 +674,126 @@ pYMXass1aOZuRtmE5ibX9iPpBQ==
             None,
         );
         assert!(key_only.is_err(), "key without cert must error");
+    }
+
+    // ---- per-controller rate limiting (#1863) -------------------------------
+
+    /// Minimal HTTP/1.1 server answering every request with `{}`; returns its
+    /// base URL. Real time: the limiter's sleeps are tokio timers.
+    async fn spawn_ok_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {
+                                let resp = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}";
+                                if sock.write_all(resp.as_bytes()).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The whole point of #1863: two clients cloned from one skeleton must not
+    /// share tokens. Upstream clones the config per controller
+    /// (controller-manager clientbuilder/client_builder.go:40-47) and
+    /// `RESTClientFor` builds a fresh limiter for each (rest/config.go:370-381).
+    #[tokio::test(start_paused = true)]
+    async fn for_controller_clients_do_not_share_tokens() {
+        let skeleton = ApiClient::new("http://127.0.0.1:1", true, None)
+            .unwrap()
+            .with_rate_limit(10.0, 1.0);
+        let a = skeleton.for_controller("a");
+        let b = skeleton.for_controller("b");
+
+        assert!(!Arc::ptr_eq(&a.limiter, &b.limiter));
+        assert!(!Arc::ptr_eq(&a.limiter, &skeleton.limiter));
+        assert_eq!(a.limiter.qps(), 10.0, "clone keeps the skeleton's QPS");
+        assert_eq!(a.limiter.burst(), 1.0, "clone keeps the skeleton's burst");
+
+        // Exhaust A's burst and queue a lot more behind it.
+        for _ in 0..50 {
+            a.limiter.acquire().await;
+        }
+        // B still has its full burst: no time passes.
+        let start = tokio::time::Instant::now();
+        b.limiter.acquire().await;
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// An `ApiClient` that never opted in must behave exactly as before the
+    /// limiter existed, so kubelet/scheduler/kubectl are untouched.
+    #[tokio::test(start_paused = true)]
+    async fn default_client_is_unthrottled() {
+        let c = ApiClient::new("http://127.0.0.1:1", true, None).unwrap();
+        let start = tokio::time::Instant::now();
+        for _ in 0..1000 {
+            c.limiter.acquire().await;
+        }
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+        let d = c.for_controller("x");
+        for _ in 0..1000 {
+            d.limiter.acquire().await;
+        }
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// End to end over real HTTP: the limiter is wired into the request path,
+    /// one client's wait does not delay its sibling, and watches are exempt
+    /// (client-go rest/request.go:763-764).
+    #[tokio::test]
+    async fn requests_are_throttled_per_client_and_watches_are_exempt() {
+        use std::time::{Duration, Instant};
+        let base = spawn_ok_server().await;
+        // 2 QPS, burst 1: the second request on one client waits ~500ms.
+        let skeleton = ApiClient::new(&base, true, None)
+            .unwrap()
+            .with_rate_limit(2.0, 1.0);
+        let a = skeleton.for_controller("a");
+        let b = skeleton.for_controller("b");
+
+        let _: serde_json::Value = a.get("/x").await.unwrap(); // spends A's burst
+
+        let t = Instant::now();
+        let _: serde_json::Value = b.get("/x").await.unwrap(); // B's own burst
+        assert!(
+            t.elapsed() < Duration::from_millis(300),
+            "B must not wait on A's exhausted bucket: {:?}",
+            t.elapsed()
+        );
+
+        // Watches take no token even from the exhausted client A.
+        let t = Instant::now();
+        for _ in 0..3 {
+            a.get_stream("/x").await.unwrap();
+        }
+        assert!(
+            t.elapsed() < Duration::from_millis(300),
+            "watch streams must not be throttled: {:?}",
+            t.elapsed()
+        );
+
+        // A's next CRUD request has to wait for a token.
+        let t = Instant::now();
+        let _: serde_json::Value = a.get("/x").await.unwrap();
+        assert!(
+            t.elapsed() >= Duration::from_millis(400),
+            "A's second request must be throttled: {:?}",
+            t.elapsed()
+        );
     }
 }
