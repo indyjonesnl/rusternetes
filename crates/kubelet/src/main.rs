@@ -463,6 +463,7 @@ async fn main() -> Result<()> {
         metrics_bind_port: Some(runtime_config.metrics_bind_port),
         log_level: Some(runtime_config.log_level.clone()),
         cluster_service_cidr: None, // Not exposed in config endpoint
+        ..Default::default()
     };
     let kubelet_config = Arc::new(kubelet_config);
     let kubelet_config_clone = kubelet_config.clone();

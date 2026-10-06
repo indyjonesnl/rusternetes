@@ -38,6 +38,120 @@ pub struct KubeletConfiguration {
     )]
     pub sync_frequency: Option<std::time::Duration>,
 
+    /// `fileCheckFrequency` (`metav1.Duration`, Go duration string).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub file_check_frequency: Option<std::time::Duration>,
+
+    /// `httpCheckFrequency` (`metav1.Duration`, Go duration string).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub http_check_frequency: Option<std::time::Duration>,
+
+    /// `streamingConnectionIdleTimeout` (`metav1.Duration`, Go duration string).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub streaming_connection_idle_timeout: Option<std::time::Duration>,
+
+    /// `nodeStatusUpdateFrequency` (`metav1.Duration`, Go duration string).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub node_status_update_frequency: Option<std::time::Duration>,
+
+    /// `nodeStatusReportFrequency` (`metav1.Duration`, Go duration string).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub node_status_report_frequency: Option<std::time::Duration>,
+
+    /// `imageMinimumGCAge` (`metav1.Duration`, Go duration string).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    #[serde(rename = "imageMinimumGCAge")]
+    pub image_minimum_gc_age: Option<std::time::Duration>,
+
+    /// `volumeStatsAggPeriod` (`metav1.Duration`, Go duration string).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub volume_stats_agg_period: Option<std::time::Duration>,
+
+    /// `cpuManagerReconcilePeriod` (`metav1.Duration`, Go duration string).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub cpu_manager_reconcile_period: Option<std::time::Duration>,
+
+    /// `runtimeRequestTimeout` (`metav1.Duration`, Go duration string).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub runtime_request_timeout: Option<std::time::Duration>,
+
+    /// `evictionPressureTransitionPeriod` (`metav1.Duration`, Go duration string).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub eviction_pressure_transition_period: Option<std::time::Duration>,
+
+    /// `containerLogMonitorInterval` (`metav1.Duration`, Go duration string).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub container_log_monitor_interval: Option<std::time::Duration>,
+
+    /// `shutdownGracePeriod` (`metav1.Duration`, Go duration string).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub shutdown_grace_period: Option<std::time::Duration>,
+
+    /// `shutdownGracePeriodCriticalPods` (`metav1.Duration`, Go duration string).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub shutdown_grace_period_critical_pods: Option<std::time::Duration>,
+
+    /// `cpuCFSQuotaPeriod` (`*metav1.Duration`, upstream default 100ms).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    #[serde(rename = "cpuCFSQuotaPeriod")]
+    pub cpu_cfs_quota_period: Option<std::time::Duration>,
+
     /// Port for the metrics server
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics_bind_port: Option<u16>,
@@ -50,6 +164,13 @@ pub struct KubeletConfiguration {
     /// The first IP in this range is used for the kubernetes service
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_service_cidr: Option<String>,
+}
+
+/// A zero `metav1.Duration` means "unset" and takes the upstream default.
+#[allow(dead_code)] // consumers land with the fields they configure (#2284)
+fn nonzero_or(v: Option<std::time::Duration>, default_secs: u64) -> std::time::Duration {
+    v.filter(|d| !d.is_zero())
+        .unwrap_or(std::time::Duration::from_secs(default_secs))
 }
 
 fn default_api_version() -> String {
@@ -69,6 +190,20 @@ impl Default for KubeletConfiguration {
             volume_dir: None,
             volume_plugin_dir: None,
             sync_frequency: None,
+            file_check_frequency: None,
+            http_check_frequency: None,
+            streaming_connection_idle_timeout: None,
+            node_status_update_frequency: None,
+            node_status_report_frequency: None,
+            image_minimum_gc_age: None,
+            volume_stats_agg_period: None,
+            cpu_manager_reconcile_period: None,
+            runtime_request_timeout: None,
+            eviction_pressure_transition_period: None,
+            container_log_monitor_interval: None,
+            shutdown_grace_period: None,
+            shutdown_grace_period_critical_pods: None,
+            cpu_cfs_quota_period: None,
             metrics_bind_port: None,
             log_level: None,
             cluster_service_cidr: None,
@@ -76,7 +211,90 @@ impl Default for KubeletConfiguration {
     }
 }
 
+#[allow(dead_code)] // upstream-defaulted accessors; no runtime consumer yet (#2284)
 impl KubeletConfiguration {
+    /// `syncFrequency` with the upstream default applied (1m).
+    ///
+    /// Ported from `SetDefaults_KubeletConfiguration`
+    /// (`pkg/kubelet/apis/config/v1beta1/defaults.go`). NOTE: the kubelet's
+    /// *runtime* sync-loop tick (`RuntimeConfig::sync_frequency`) deliberately
+    /// stays at 10s: it drives pod reconciliation latency here, and moving it
+    /// to 1m would slow every pod status convergence. This accessor reports
+    /// the upstream-defaulted value for config consumers.
+    pub fn effective_sync_frequency(&self) -> std::time::Duration {
+        nonzero_or(self.sync_frequency, 60)
+    }
+
+    /// `fileCheckFrequency` with the upstream default applied (20s).
+    pub fn effective_file_check_frequency(&self) -> std::time::Duration {
+        nonzero_or(self.file_check_frequency, 20)
+    }
+
+    /// `httpCheckFrequency` with the upstream default applied (20s).
+    pub fn effective_http_check_frequency(&self) -> std::time::Duration {
+        nonzero_or(self.http_check_frequency, 20)
+    }
+
+    /// `streamingConnectionIdleTimeout` with the upstream default applied (14400s).
+    pub fn effective_streaming_connection_idle_timeout(&self) -> std::time::Duration {
+        nonzero_or(self.streaming_connection_idle_timeout, 14400)
+    }
+
+    /// `nodeStatusUpdateFrequency` with the upstream default applied (10s).
+    pub fn effective_node_status_update_frequency(&self) -> std::time::Duration {
+        nonzero_or(self.node_status_update_frequency, 10)
+    }
+
+    /// `imageMinimumGCAge` with the upstream default applied (120s).
+    pub fn effective_image_minimum_gc_age(&self) -> std::time::Duration {
+        nonzero_or(self.image_minimum_gc_age, 120)
+    }
+
+    /// `volumeStatsAggPeriod` with the upstream default applied (60s).
+    pub fn effective_volume_stats_agg_period(&self) -> std::time::Duration {
+        nonzero_or(self.volume_stats_agg_period, 60)
+    }
+
+    /// `cpuManagerReconcilePeriod` with the upstream default applied (10s).
+    pub fn effective_cpu_manager_reconcile_period(&self) -> std::time::Duration {
+        nonzero_or(self.cpu_manager_reconcile_period, 10)
+    }
+
+    /// `runtimeRequestTimeout` with the upstream default applied (120s).
+    pub fn effective_runtime_request_timeout(&self) -> std::time::Duration {
+        nonzero_or(self.runtime_request_timeout, 120)
+    }
+
+    /// `evictionPressureTransitionPeriod` with the upstream default applied (300s).
+    pub fn effective_eviction_pressure_transition_period(&self) -> std::time::Duration {
+        nonzero_or(self.eviction_pressure_transition_period, 300)
+    }
+
+    /// `containerLogMonitorInterval` with the upstream default applied (10s).
+    pub fn effective_container_log_monitor_interval(&self) -> std::time::Duration {
+        nonzero_or(self.container_log_monitor_interval, 10)
+    }
+
+    /// `nodeStatusReportFrequency` with the upstream default applied: 5m, or
+    /// the (explicit) `nodeStatusUpdateFrequency` for backward compatibility
+    /// (`defaults.go`, `NodeStatusReportFrequency` block).
+    pub fn effective_node_status_report_frequency(&self) -> std::time::Duration {
+        match self.node_status_report_frequency.filter(|d| !d.is_zero()) {
+            Some(d) => d,
+            None => match self.node_status_update_frequency.filter(|d| !d.is_zero()) {
+                Some(u) => u,
+                None => std::time::Duration::from_secs(300),
+            },
+        }
+    }
+
+    /// `cpuCFSQuotaPeriod` with the upstream default applied (100ms).
+    pub fn effective_cpu_cfs_quota_period(&self) -> std::time::Duration {
+        self.cpu_cfs_quota_period
+            .filter(|d| !d.is_zero())
+            .unwrap_or(std::time::Duration::from_millis(100))
+    }
+
     /// `syncFrequency` in whole seconds, rounded up; `None` when unset or zero
     /// (zero is defaulted upstream, so it must not override the CLI/default).
     pub fn sync_frequency_secs(&self) -> Option<u64> {
@@ -428,6 +646,64 @@ mod tests {
     }
 
     #[test]
+    fn test_upstream_duration_fields_and_defaults() {
+        // Defaults per SetDefaults_KubeletConfiguration (defaults.go).
+        let d = KubeletConfiguration::default();
+        let s = std::time::Duration::from_secs;
+        assert_eq!(d.effective_sync_frequency(), s(60));
+        assert_eq!(d.effective_file_check_frequency(), s(20));
+        assert_eq!(d.effective_http_check_frequency(), s(20));
+        assert_eq!(d.effective_streaming_connection_idle_timeout(), s(4 * 3600));
+        assert_eq!(d.effective_node_status_update_frequency(), s(10));
+        assert_eq!(d.effective_node_status_report_frequency(), s(300));
+        assert_eq!(d.effective_image_minimum_gc_age(), s(120));
+        assert_eq!(d.effective_volume_stats_agg_period(), s(60));
+        assert_eq!(d.effective_cpu_manager_reconcile_period(), s(10));
+        assert_eq!(d.effective_runtime_request_timeout(), s(120));
+        assert_eq!(d.effective_eviction_pressure_transition_period(), s(300));
+        assert_eq!(d.effective_container_log_monitor_interval(), s(10));
+        assert_eq!(
+            d.effective_cpu_cfs_quota_period(),
+            std::time::Duration::from_millis(100)
+        );
+
+        let yaml = "fileCheckFrequency: 5s\nhttpCheckFrequency: 1m\n\
+                    nodeStatusUpdateFrequency: 4s\nstreamingConnectionIdleTimeout: 30m\n\
+                    imageMinimumGCAge: 0s\ncpuCFSQuotaPeriod: 50ms\n\
+                    shutdownGracePeriod: 30s\nshutdownGracePeriodCriticalPods: 10s\n";
+        let c: KubeletConfiguration = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(c.effective_file_check_frequency(), s(5));
+        assert_eq!(c.effective_http_check_frequency(), s(60));
+        assert_eq!(c.effective_streaming_connection_idle_timeout(), s(1800));
+        assert_eq!(c.effective_image_minimum_gc_age(), s(120));
+        assert_eq!(c.effective_node_status_report_frequency(), s(4));
+        assert_eq!(
+            c.effective_cpu_cfs_quota_period(),
+            std::time::Duration::from_millis(50)
+        );
+        assert_eq!(c.shutdown_grace_period, Some(s(30)));
+        assert_eq!(c.shutdown_grace_period_critical_pods, Some(s(10)));
+        assert!(serde_yaml::from_str::<KubeletConfiguration>("fileCheckFrequency: 5\n").is_err());
+    }
+
+    #[test]
+    fn test_runtime_sync_frequency_default_stays_10s() {
+        let rc = RuntimeConfig::build(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "n".into(),
+            vec!["http://localhost:2379".to_string()],
+        )
+        .unwrap();
+        assert_eq!(rc.sync_frequency, 10);
+    }
+
+    #[test]
     fn test_sync_frequency_zero_means_unset_and_subsecond_rounds_up() {
         // Upstream SetDefaults_KubeletConfiguration: zero => default.
         let yaml = "syncFrequency: 0s\n";
@@ -506,6 +782,7 @@ mod tests {
             metrics_bind_port: Some(10250),
             log_level: Some("info".to_string()),
             cluster_service_cidr: Some("10.96.0.0/12".to_string()),
+            ..Default::default()
         };
 
         // Write to temp file

@@ -103,6 +103,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         metrics_bind_port: Some(config.metrics_port),
         log_level: Some("info".to_string()),
         cluster_service_cidr: None,
+        ..Default::default()
     };
     let kubelet_config = Arc::new(kubelet_config);
     let kubelet_config_clone = kubelet_config.clone();
