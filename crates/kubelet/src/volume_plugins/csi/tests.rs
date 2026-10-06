@@ -396,6 +396,110 @@ async fn set_up_omits_pod_info_by_default() {
         .is_empty());
 }
 
+/// `TestPodServiceAccountTokenAttrs` (`csi_mounter_test.go:1286`): a CSIDriver
+/// with `tokenRequests` gets `csi.storage.k8s.io/serviceAccount.tokens` in the
+/// volume context, a JSON map audience -> `{token, expirationTimestamp}`
+/// (`podServiceAccountTokenAttrs`, `csi_mounter.go:358-416`).
+#[tokio::test]
+async fn set_up_injects_service_account_tokens_into_the_volume_context() {
+    let f = fx(
+        "satoken",
+        &[],
+        Some(json!({"attachRequired": false,
+            "tokenRequests": [{"audience": "gcp", "expirationSeconds": 3600}, {"audience": ""}]})),
+    )
+    .await;
+    f.storage
+        .create(
+            &build_key("serviceaccounts", Some("ns1"), "sa-1"),
+            &json!({"apiVersion": "v1", "kind": "ServiceAccount",
+                "metadata": {"name": "sa-1", "namespace": "ns1", "uid": "sa-uid-1"}}),
+        )
+        .await
+        .unwrap();
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+    m.set_up().await.unwrap();
+    let calls = f.fake.calls.lock().unwrap();
+    let req = &calls.publish[0];
+    let raw = req
+        .volume_context
+        .get("csi.storage.k8s.io/serviceAccount.tokens")
+        .expect("tokens attribute missing from volume_context");
+    let tokens: serde_json::Value = serde_json::from_str(raw).unwrap();
+    // One entry per tokenRequest, keyed by the requested audience ("" kept).
+    assert_eq!(tokens.as_object().unwrap().len(), 2, "{raw}");
+    let gcp = tokens["gcp"]["token"].as_str().expect("gcp token");
+    assert!(tokens["gcp"]["expirationTimestamp"].as_str().is_some());
+    assert!(tokens[""]["token"].as_str().is_some());
+    // The token is for the pod's service account, bound to the requested audience.
+    let claims = rusternetes_common::auth::TokenManager::new_auto(b"test-secret")
+        .validate_token_with_audiences(gcp, &["gcp".to_string()])
+        .unwrap();
+    assert_eq!(claims.sub, "system:serviceaccount:ns1:sa-1");
+    // Not in the secrets unless the driver asks for it.
+    assert!(!req
+        .secrets
+        .contains_key("csi.storage.k8s.io/serviceAccount.tokens"));
+}
+
+/// `serviceAccountTokenInSecrets`: the tokens move from `volume_context` to
+/// `node_publish_secrets` (`csi_mounter.go:243-249`), so they stay out of the
+/// PV-visible context.
+#[tokio::test]
+async fn set_up_puts_service_account_tokens_in_secrets_when_asked() {
+    let f = fx(
+        "satokensecrets",
+        &[],
+        Some(
+            json!({"attachRequired": false, "serviceAccountTokenInSecrets": true,
+            "tokenRequests": [{"audience": "gcp"}]}),
+        ),
+    )
+    .await;
+    put_secret(&f.storage, "sec-ns", "pub-secret", "token", "s3cret").await;
+    let p = pv(
+        &f.driver,
+        json!({"nodePublishSecretRef": {"name": "pub-secret", "namespace": "sec-ns"}}),
+    );
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+    m.set_up().await.unwrap();
+    let calls = f.fake.calls.lock().unwrap();
+    let req = &calls.publish[0];
+    assert!(!req
+        .volume_context
+        .contains_key("csi.storage.k8s.io/serviceAccount.tokens"));
+    assert_eq!(req.secrets["token"], "s3cret", "merged, not replaced");
+    assert!(req.secrets["csi.storage.k8s.io/serviceAccount.tokens"].contains("\"gcp\""));
+}
+
+/// A CSIDriver without `tokenRequests` adds nothing.
+#[tokio::test]
+async fn set_up_without_token_requests_adds_no_token_attribute() {
+    let f = fx("notokens", &[], Some(json!({"attachRequired": false}))).await;
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+    m.set_up().await.unwrap();
+    assert!(f.fake.calls.lock().unwrap().publish[0]
+        .volume_context
+        .is_empty());
+}
+
 /// The publish context comes from the node's VolumeAttachment
 /// (`getPublishContext`, `csi_plugin.go:906-928`) when attach is required.
 #[tokio::test]

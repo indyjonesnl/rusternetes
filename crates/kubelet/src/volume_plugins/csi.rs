@@ -215,6 +215,7 @@ impl VolumePlugin for CsiPlugin {
                 .unwrap_or_default(),
             storage: self.host.get_kube_client().cloned(),
             plugin_dir: plugin_dir(self.host.get_volumes_base_path()),
+            token_manager: self.host.get_service_account_token_func().clone(),
         }))
     }
 }
@@ -280,6 +281,10 @@ struct CsiMounter {
     node_name: String,
     storage: Option<Arc<StorageBackend>>,
     plugin_dir: PathBuf,
+    /// `GetServiceAccountTokenFunc` (`plugins.go:405`): signs the fallback
+    /// token when the backend has no api-server to ask (see
+    /// [`CsiMounter::pod_service_account_token_attrs`]).
+    token_manager: rusternetes_common::auth::TokenManager,
 }
 
 fn transient(msg: String) -> anyhow::Error {
@@ -540,9 +545,8 @@ impl Mounter for CsiMounter {
     ///
     /// Not ported: `FSGroup` handling (`VOLUME_MOUNT_GROUP` delegation and the
     /// kubelet-side ownership change — `set_up` carries no `MounterArgs` yet),
-    /// SELinux mount context, `CSIDriver.spec.tokenRequests` service-account
-    /// tokens, and the post-publish SELinux-support probe. See the PR for the
-    /// tracking issue.
+    /// SELinux mount context, and the post-publish SELinux-support probe. See
+    /// #2312.
     async fn set_up(&self) -> Result<()> {
         let dir = Path::new(&self.path);
 
@@ -683,6 +687,25 @@ impl Mounter for CsiMounter {
             vol_attribs.extend(self.pod_info_attrs());
         }
 
+        // Inject service account token information into
+        // 1. volume_attributes (default behavior)
+        // 2. node_publish_secrets (if ServiceAccountTokenInSecrets is true in
+        //    the CSIDriver spec)
+        // (`csi_mounter.go:236-250`).
+        let (token_attrs, tokens_in_secrets) = self
+            .pod_service_account_token_attrs(csi_driver.as_ref())
+            .await
+            .map_err(|e| {
+                transient(format!(
+                    "kubernetes.io/csi: mounter.SetUpAt failed to get service accoount token attributes: {e}"
+                ))
+            })?;
+        if tokens_in_secrets {
+            node_publish_secrets.extend(token_attrs);
+        } else {
+            vol_attribs.extend(token_attrs);
+        }
+
         // Save volume info in pod dir; persisted for teardown.
         let volume_data = HashMap::from([
             (
@@ -753,6 +776,127 @@ impl Mounter for CsiMounter {
 }
 
 impl CsiMounter {
+    /// Port of `podServiceAccountTokenAttrs` (`csi_mounter.go:358-416`).
+    ///
+    /// Returns the `csi.storage.k8s.io/serviceAccount.tokens` attribute (a JSON
+    /// map of requested audience -> `TokenRequestStatus`) and whether the
+    /// driver wants it delivered in `node_publish_secrets`
+    /// (`CSIDriver.spec.serviceAccountTokenInSecrets`). `driver` is the
+    /// CSIDriver `set_up` already fetched; upstream re-reads it from the
+    /// lister, `None` being its `IsNotFound` arm.
+    ///
+    /// DEVIATION: upstream always asks the api-server (`serviceAccountTokenGetter`
+    /// = TokenRequest). Storage-direct backends have no api-server client, so
+    /// there the token is self-minted with the host's `TokenManager`, exactly as
+    /// the projected volume plugin does (`projected.rs`).
+    async fn pod_service_account_token_attrs(
+        &self,
+        driver: Option<&CSIDriver>,
+    ) -> Result<(HashMap<String, String>, bool)> {
+        let Some(driver) = driver else {
+            return Ok((HashMap::new(), false));
+        };
+        let requests = driver.spec.token_requests.as_deref().unwrap_or_default();
+        if requests.is_empty() {
+            return Ok((HashMap::new(), false));
+        }
+
+        // `map[string]authenticationv1.TokenRequestStatus`; json.Marshal sorts
+        // map keys, as BTreeMap does.
+        let mut outputs: std::collections::BTreeMap<
+            String,
+            rusternetes_common::resources::TokenRequestStatus,
+        > = Default::default();
+        for request in requests {
+            let audience = request.audience.clone();
+            // `audience == ""` requests no audience (the api-server defaults it).
+            let audiences: Vec<String> = if audience.is_empty() {
+                vec![]
+            } else {
+                vec![audience.clone()]
+            };
+            // `ExpirationSeconds` defaults to one hour
+            // (`pkg/apis/authentication/v1/defaults.go:29-31`).
+            let expiration_seconds = request.expiration_seconds.unwrap_or(3600);
+            let status = self
+                .get_service_account_token(&audiences, expiration_seconds)
+                .await?;
+            outputs.insert(audience, status);
+        }
+        debug!(
+            "kubernetes.io/csi: fetched service account token attrs for CSIDriver {}",
+            self.driver_name
+        );
+        let tokens = serde_json::to_string(&outputs)?;
+        Ok((
+            HashMap::from([(
+                "csi.storage.k8s.io/serviceAccount.tokens".to_string(),
+                tokens,
+            )]),
+            driver.spec.service_account_token_in_secrets == Some(true),
+        ))
+    }
+
+    /// `serviceAccountTokenGetter(namespace, serviceAccountName, tokenRequest)`
+    /// with `BoundObjectRef` = this pod (`csi_mounter.go:382-394`).
+    async fn get_service_account_token(
+        &self,
+        audiences: &[String],
+        expiration_seconds: i64,
+    ) -> Result<rusternetes_common::resources::TokenRequestStatus> {
+        if let Some(st) = self.storage.as_ref() {
+            if let Some((token, expiration_timestamp)) = st
+                .create_sa_token_status(
+                    &self.pod_namespace,
+                    &self.service_account_name,
+                    audiences,
+                    expiration_seconds,
+                    Some((self.pod_name.as_str(), self.pod_uid.as_str())),
+                )
+                .await?
+            {
+                return Ok(rusternetes_common::resources::TokenRequestStatus {
+                    expiration_timestamp,
+                    token,
+                });
+            }
+        }
+        // Self-mint (storage-direct backends), claims as in `projected.rs`.
+        let sa_uid = match self.storage.as_ref() {
+            Some(st) => st
+                .get::<rusternetes_common::resources::ServiceAccount>(&build_key(
+                    "serviceaccounts",
+                    Some(&self.pod_namespace),
+                    &self.service_account_name,
+                ))
+                .await
+                .map(|sa| sa.metadata.uid)
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        let mut claims = rusternetes_common::auth::ServiceAccountClaims::new(
+            self.service_account_name.clone(),
+            self.pod_namespace.clone(),
+            sa_uid,
+            0,
+        );
+        let exp = chrono::Utc::now() + chrono::Duration::seconds(expiration_seconds);
+        claims.exp = exp.timestamp();
+        claims.aud = if audiences.is_empty() {
+            vec!["rusternetes".to_string()]
+        } else {
+            audiences.to_vec()
+        };
+        claims.pod_name = Some(self.pod_name.clone());
+        claims.pod_uid = Some(self.pod_uid.clone());
+        claims.node_name = Some(self.node_name.clone()).filter(|n| !n.is_empty());
+        let token = self.token_manager.generate_token(claims)?;
+        Ok(rusternetes_common::resources::TokenRequestStatus {
+            expiration_timestamp: exp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            token,
+        })
+    }
+
     /// Port of `getPodInfoAttrs` (`csi_util.go:208-217`).
     fn pod_info_attrs(&self) -> HashMap<String, String> {
         HashMap::from([

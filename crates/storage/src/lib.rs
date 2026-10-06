@@ -822,10 +822,28 @@ impl StorageBackend {
         expiration_seconds: i64,
         bound_pod: Option<(&str, &str)>,
     ) -> Result<Option<String>> {
+        Ok(self
+            .create_sa_token_status(namespace, name, audiences, expiration_seconds, bound_pod)
+            .await?
+            .map(|(token, _)| token))
+    }
+
+    /// [`Self::create_sa_token`] plus the status's `expirationTimestamp`:
+    /// `Some((token, expirationTimestamp))` on the `Api` backend, `None` on the
+    /// storage-direct backends.
+    #[cfg_attr(not(feature = "api-client"), allow(unused_variables))]
+    pub async fn create_sa_token_status(
+        &self,
+        namespace: &str,
+        name: &str,
+        audiences: &[String],
+        expiration_seconds: i64,
+        bound_pod: Option<(&str, &str)>,
+    ) -> Result<Option<(String, String)>> {
         #[cfg(feature = "api-client")]
         if let StorageBackend::Api(s) = self {
             return s
-                .create_sa_token(namespace, name, audiences, expiration_seconds, bound_pod)
+                .create_sa_token_status(namespace, name, audiences, expiration_seconds, bound_pod)
                 .await
                 .map(Some);
         }
