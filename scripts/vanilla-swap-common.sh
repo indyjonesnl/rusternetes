@@ -1195,6 +1195,26 @@ vs_dump_module_logs() {
     "-l=component=kube-${VS_MODULE}" >&2 2>&1 || true
   KUBECONFIG="$kubeconfig" kubectl -n kube-system logs --tail="$tail" \
     "-l=app=rusternetes-${VS_MODULE}" >&2 2>&1 || true
+
+  # A swapped STATIC-POD module (api-server) is invisible to the two kubectl
+  # lookups above: when the swapped api-server cannot persist the kubelet's
+  # mirror pod there is no pod object to `kubectl logs`, which is exactly when
+  # its log is wanted ("No resources found in kube-system namespace" in run
+  # 37320847100, leaving module-did-not-come-up with no cause). Read it from the
+  # node's CRI runtime instead, and add the kubelet unit's journal — the other
+  # half of every "pods assigned to a node, none Running" failure.
+  local node
+  while IFS= read -r node; do
+    [ -n "$node" ] || continue
+    echo "--- kubelet journal on ${node} (last ${tail} lines) ---" >&2
+    docker exec "$node" journalctl -u kubelet --no-pager -n "$tail" >&2 2>&1 || true
+    local cid
+    cid="$(docker exec "$node" crictl ps -a --name "kube-${VS_MODULE}" -q 2>/dev/null | head -n1)"
+    if [ -n "$cid" ]; then
+      echo "--- crictl logs kube-${VS_MODULE} on ${node} (last ${tail} lines) ---" >&2
+      docker exec "$node" crictl logs --tail "$tail" "$cid" >&2 2>&1 || true
+    fi
+  done < <(docker ps --filter "name=^${cluster}-" --format '{{.Names}}' 2>/dev/null)
 }
 
 # vs_dump_test_failure_diagnostics <cluster> <kubeconfig>
