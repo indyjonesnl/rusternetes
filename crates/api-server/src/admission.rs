@@ -1083,13 +1083,88 @@ pub fn is_significant_pod_update(pod: &Pod, old_pod: &Pod) -> bool {
 /// - <https://kubernetes.io/docs/concepts/security/pod-security-admission/>
 /// - <https://kubernetes.io/docs/concepts/security/pod-security-standards/>
 /// - `staging/src/k8s.io/pod-security-admission/admission/admission.go`
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PodSecurityAdmission;
+#[derive(Debug, Default, Clone)]
+pub struct PodSecurityAdmission {
+    exemptions: PodSecurityExemptions,
+}
+
+/// `PodSecurityExemptions`
+/// (staging/src/k8s.io/pod-security-admission/admission/api/types.go:40-44),
+/// the `exemptions` of the PodSecurity plugin configuration.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PodSecurityExemptions {
+    pub usernames: Vec<String>,
+    pub namespaces: Vec<String>,
+    pub runtime_classes: Vec<String>,
+}
+
+impl PodSecurityExemptions {
+    /// `Admission.exemptNamespace` (admission.go:673-679): an empty name
+    /// is never exempt.
+    pub fn exempt_namespace(&self, namespace: &str) -> bool {
+        !namespace.is_empty() && self.namespaces.iter().any(|n| n == namespace)
+    }
+
+    /// `Admission.exemptUser` (admission.go:680-686).
+    pub fn exempt_user(&self, username: &str) -> bool {
+        !username.is_empty() && self.usernames.iter().any(|u| u == username)
+    }
+
+    /// `Admission.exemptRuntimeClass` (admission.go:687-693): a nil or
+    /// empty class is never exempt.
+    pub fn exempt_runtime_class(&self, runtime_class: Option<&str>) -> bool {
+        runtime_class
+            .is_some_and(|rc| !rc.is_empty() && self.runtime_classes.iter().any(|r| r == rc))
+    }
+
+    /// The PodSecurity plugin's `exemptions` out of an
+    /// `AdmissionConfiguration` document
+    /// (`--admission-control-config-file`): the entry named `PodSecurity`,
+    /// its inline `configuration` (a `PodSecurityConfiguration`). No such
+    /// entry means no exemptions (the plugin's defaults,
+    /// admission/api/v1/defaults.go).
+    pub fn from_admission_configuration(yaml: &str) -> Result<Self, String> {
+        let doc: serde_json::Value = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
+        let Some(cfg) = doc
+            .get("plugins")
+            .and_then(|p| p.as_array())
+            .into_iter()
+            .flatten()
+            .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("PodSecurity"))
+            .and_then(|p| p.get("configuration"))
+        else {
+            return Ok(Self::default());
+        };
+        match cfg.get("exemptions") {
+            Some(e) => serde_json::from_value(e.clone()).map_err(|e| e.to_string()),
+            None => Ok(Self::default()),
+        }
+    }
+}
+
+static CONFIGURED_EXEMPTIONS: std::sync::OnceLock<PodSecurityExemptions> =
+    std::sync::OnceLock::new();
+
+/// Install the process-wide PodSecurity exemptions, read once at startup
+/// from the admission control config file.
+pub fn install_pod_security_exemptions(exemptions: PodSecurityExemptions) {
+    let _ = CONFIGURED_EXEMPTIONS.set(exemptions);
+}
 
 impl PodSecurityAdmission {
-    /// Create a new PSA admission plugin instance.
-    pub const fn new() -> Self {
-        Self
+    /// Create a new PSA admission plugin instance using the exemptions
+    /// installed at startup (none by default).
+    pub fn new() -> Self {
+        Self {
+            exemptions: CONFIGURED_EXEMPTIONS.get().cloned().unwrap_or_default(),
+        }
+    }
+
+    /// A plugin instance with explicit exemptions.
+    #[allow(dead_code)]
+    pub fn with_exemptions(exemptions: PodSecurityExemptions) -> Self {
+        Self { exemptions }
     }
 
     /// Whether a pod CREATE/UPDATE reaches policy evaluation at all: the
@@ -1121,12 +1196,27 @@ impl PodSecurityAdmission {
     ///
     /// Upstream parity:
     /// `staging/src/k8s.io/pod-security-admission/policy/` (release-1.35).
-    pub async fn admit<S: Storage>(
+    /// `username` is the requester, so a user exemption can apply.
+    pub async fn admit_as<S: Storage>(
         &self,
         storage: &Arc<S>,
         namespace: &str,
         pod: &Pod,
+        username: &str,
     ) -> Result<(), rusternetes_common::Error> {
+        // ValidatePod short-circuits on exempt namespaces, then users
+        // (admission.go:334-343); EvaluatePod on exempt runtime classes
+        // (admission.go:457-461).
+        if self.exemptions.exempt_namespace(namespace)
+            || self.exemptions.exempt_user(username)
+            || self.exemptions.exempt_runtime_class(
+                pod.spec
+                    .as_ref()
+                    .and_then(|s| s.runtime_class_name.as_deref()),
+            )
+        {
+            return Ok(());
+        }
         let ns_key = rusternetes_storage::build_key("namespaces", None, namespace);
         let level = match storage
             .get::<rusternetes_common::resources::Namespace>(&ns_key)
@@ -1852,7 +1942,7 @@ mod tests {
             }),
         );
         PodSecurityAdmission::new()
-            .admit(&storage, "ns", &pod)
+            .admit_as(&storage, "ns", &pod, "")
             .await
             .expect("privileged namespace must admit everything");
     }
@@ -1936,7 +2026,7 @@ mod tests {
             }),
         );
         PodSecurityAdmission::new()
-            .admit(&storage, "ns", &pod)
+            .admit_as(&storage, "ns", &pod, "")
             .await
             .expect("absent enforce label must admit everything");
     }
@@ -1961,9 +2051,103 @@ mod tests {
             }),
         );
         PodSecurityAdmission::new()
-            .admit(&storage, "ns", &pod)
+            .admit_as(&storage, "ns", &pod, "")
             .await
             .expect("compliant restricted pod must be admitted");
+    }
+
+    // ---- PodSecurity exemptions (admission_test.go TestValidatePodAndController
+    // "exempt namespace" / "exempt user" / "exempt runtimeClass") ----
+
+    fn exemptions() -> PodSecurityExemptions {
+        PodSecurityExemptions {
+            usernames: vec!["exempt-user".into()],
+            namespaces: vec!["exempt-ns".into()],
+            runtime_classes: vec!["exempt-rc".into()],
+        }
+    }
+
+    fn privileged_pod(runtime_class: Option<&str>) -> Pod {
+        let mut spec = serde_json::json!({
+            "containers": [{
+                "name": "main", "image": "busybox",
+                "securityContext": { "privileged": true },
+            }],
+        });
+        if let Some(rc) = runtime_class {
+            spec["runtimeClassName"] = serde_json::json!(rc);
+        }
+        pod_from_spec("p", spec)
+    }
+
+    #[tokio::test]
+    async fn psa_exempt_namespace_admits_violating_pod() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_namespace(&storage, "exempt-ns", Some("restricted")).await;
+        put_namespace(&storage, "other-ns", Some("restricted")).await;
+        let psa = PodSecurityAdmission::with_exemptions(exemptions());
+        psa.admit_as(&storage, "exempt-ns", &privileged_pod(None), "alice")
+            .await
+            .expect("exempt namespace admits");
+        psa.admit_as(&storage, "other-ns", &privileged_pod(None), "alice")
+            .await
+            .expect_err("non-exempt namespace still enforced");
+    }
+
+    #[tokio::test]
+    async fn psa_exempt_user_admits_violating_pod() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_namespace(&storage, "ns", Some("restricted")).await;
+        let psa = PodSecurityAdmission::with_exemptions(exemptions());
+        psa.admit_as(&storage, "ns", &privileged_pod(None), "exempt-user")
+            .await
+            .expect("exempt user admits");
+        psa.admit_as(&storage, "ns", &privileged_pod(None), "alice")
+            .await
+            .expect_err("non-exempt user still enforced");
+        psa.admit_as(&storage, "ns", &privileged_pod(None), "")
+            .await
+            .expect_err("empty username is never exempt");
+    }
+
+    #[tokio::test]
+    async fn psa_exempt_runtime_class_admits_violating_pod() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_namespace(&storage, "ns", Some("restricted")).await;
+        let psa = PodSecurityAdmission::with_exemptions(exemptions());
+        psa.admit_as(&storage, "ns", &privileged_pod(Some("exempt-rc")), "alice")
+            .await
+            .expect("exempt runtimeClass admits");
+        psa.admit_as(&storage, "ns", &privileged_pod(Some("other-rc")), "alice")
+            .await
+            .expect_err("other runtimeClass still enforced");
+    }
+
+    #[test]
+    fn psa_exemptions_parse_from_admission_configuration() {
+        let yaml = r#"
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+- name: PodSecurity
+  configuration:
+    apiVersion: pod-security.admission.config.k8s.io/v1
+    kind: PodSecurityConfiguration
+    defaults:
+      enforce: baseline
+    exemptions:
+      usernames: ["u"]
+      namespaces: ["n1", "n2"]
+      runtimeClasses: ["rc"]
+"#;
+        let e = PodSecurityExemptions::from_admission_configuration(yaml).unwrap();
+        assert_eq!(e.usernames, vec!["u"]);
+        assert_eq!(e.namespaces, vec!["n1", "n2"]);
+        assert_eq!(e.runtime_classes, vec!["rc"]);
+        assert_eq!(
+            PodSecurityExemptions::from_admission_configuration("plugins: []").unwrap(),
+            PodSecurityExemptions::default()
+        );
     }
 
     // ---- imagePullSecrets propagation (SA admission, upstream parity) -------

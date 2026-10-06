@@ -41,7 +41,7 @@ mod state;
 mod streaming;
 mod watch_cache;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use prometheus_client::PrometheusClient;
@@ -129,6 +129,12 @@ struct Args {
     /// Client CA certificate file for mTLS client certificate authentication
     #[arg(long)]
     client_ca_file: Option<String>,
+
+    /// File with the admission control configuration (an
+    /// `AdmissionConfiguration`); only the `PodSecurity` plugin's
+    /// `exemptions` are read (kube-apiserver `--admission-control-config-file`).
+    #[arg(long)]
+    admission_control_config_file: Option<String>,
 }
 
 #[tokio::main]
@@ -141,6 +147,14 @@ async fn main() -> Result<()> {
 
     rusternetes_common::tracing::init_basic_tracing("api-server", &args.log_level)?;
     rusternetes_common::dump::install_panic_hook("api-server");
+
+    if let Some(path) = &args.admission_control_config_file {
+        let yaml = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --admission-control-config-file {path}"))?;
+        let exemptions = admission::PodSecurityExemptions::from_admission_configuration(&yaml)
+            .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
+        admission::install_pod_security_exemptions(exemptions);
+    }
 
     info!(
         "Starting Rusternetes API Server {}",

@@ -476,7 +476,7 @@ impl Admission<'_> {
                         pod,
                     ) {
                         crate::admission::PodSecurityAdmission::new()
-                            .admit(storage, namespace, pod)
+                            .admit_as(storage, namespace, pod, &self.user.username)
                             .await?;
                     }
                 }
@@ -494,7 +494,7 @@ impl Admission<'_> {
                         pod,
                     ) {
                         crate::admission::PodSecurityAdmission::new()
-                            .admit(storage, namespace, pod)
+                            .admit_as(storage, namespace, pod, &self.user.username)
                             .await?;
                     }
                     if self.subresource == Some("resize") {
