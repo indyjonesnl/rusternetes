@@ -6,7 +6,11 @@
 //! it is the seam the rest of epic #1970 needs.
 
 pub mod config_map;
+#[cfg(test)]
+mod create_volume_tests;
 pub mod csi;
+pub mod csi_client;
+pub mod csi_drivers_store;
 pub mod downward_api;
 pub mod empty_dir;
 pub mod host;
