@@ -1,3 +1,4 @@
+use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::workloads::{
@@ -17,6 +18,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, warn};
+
+/// Upstream `ConcurrentJobSyncs` default, workers launched by `Run`
+/// (pkg/controller/job/config/v1alpha1/defaults.go:34;
+/// pkg/controller/job/job_controller.go:268-270). Upstream also starts one
+/// `orphanWorker` per worker (:272); that sweep is `reconcile_orphan_pods`
+/// here and is unchanged.
+const CONCURRENT_JOB_SYNCS: usize = 5;
 
 pub struct JobController<S: Storage> {
     storage: Arc<S>,
@@ -641,10 +649,12 @@ impl<S: Storage + 'static> JobController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // Upstream starts `workers` goroutines over one queue (job_controller.go:268-270).
+        spawn_workers(CONCURRENT_JOB_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {
