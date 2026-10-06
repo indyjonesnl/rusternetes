@@ -4,6 +4,7 @@ use crate::registry::rest::{
     GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
     RestUpdateStrategy,
 };
+use crate::ssa::ResetFields;
 
 use rusternetes_common::resources::Ingress;
 use rusternetes_common::validation::field::ErrorList;
@@ -120,6 +121,14 @@ impl RestUpdateStrategy<Ingress> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+    /// `GetResetFields` (strategy.go:54-68): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        let path: &[&str] = &["status"];
+        ResetFields::new()
+            .with("extensions/v1beta1", &[path])
+            .with("networking.k8s.io/v1beta1", &[path])
+            .with("networking.k8s.io/v1", &[path])
+    }
 }
 impl RestDeleteStrategy<Ingress> for Strategy {}
 /// NewREST (pkg/registry/networking/ingress/storage/storage.go:41-63).
@@ -150,6 +159,14 @@ impl RestUpdateStrategy<Ingress> for StatusStrategy {
     }
     fn allow_unconditional_update(&self) -> bool {
         true
+    }
+    /// `GetResetFields` (strategy.go:145-160): `spec`.
+    fn get_reset_fields(&self) -> ResetFields {
+        let path: &[&str] = &["spec"];
+        ResetFields::new()
+            .with("extensions/v1beta1", &[path])
+            .with("networking.k8s.io/v1beta1", &[path])
+            .with("networking.k8s.io/v1", &[path])
     }
     /// WarningsOnUpdate (strategy.go:175-188).
     fn warnings_on_update(

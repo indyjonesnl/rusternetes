@@ -1467,6 +1467,14 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
         self.create_strategy.namespace_scoped()
     }
 
+    /// `Store.GetResetFields` (store.go:1698-1703). Upstream keeps one
+    /// `ResetFieldsStrategy` and swaps it for the status store
+    /// (servicecidr/storage/storage.go:62); here that is the update strategy
+    /// `with_update_strategy` swaps.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        self.update_strategy.get_reset_fields()
+    }
+
     async fn get(&self, ctx: &RequestContext, name: &str) -> Result<T> {
         Store::get(self, ctx, name).await
     }

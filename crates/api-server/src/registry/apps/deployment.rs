@@ -20,6 +20,7 @@ use crate::registry::rest::{
     RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
 };
 use crate::registry::scale::{Scalable, ScaleRest};
+use crate::ssa::ResetFields;
 
 /// The v1 defaulting a decoded Deployment goes through: `SetDefaults_Deployment`
 /// (pkg/apis/apps/v1/defaults.go:38-73) and the pod template's defaults.
@@ -92,6 +93,11 @@ impl RestUpdateStrategy<Deployment> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+
+    /// `GetResetFields` (strategy.go:63-71): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("apps/v1", &[&["status"]])
+    }
 }
 
 /// strategy.go:51-54.
@@ -138,6 +144,13 @@ impl RestUpdateStrategy<Deployment> for StatusStrategy {
 
     fn allow_unconditional_update(&self) -> bool {
         true
+    }
+
+    /// `GetResetFields` (strategy.go:161-168). `metadata.labels` is a deeper
+    /// path than the apply engine's per-top-level-key ownership can exclude,
+    /// so only `spec` takes effect there.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("apps/v1", &[&["spec"], &["metadata", "labels"]])
     }
 }
 

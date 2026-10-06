@@ -195,6 +195,13 @@ pub trait RestUpdateStrategy<T>: NamespaceScopedStrategy + Send + Sync {
     /// Whether an update without `metadata.resourceVersion` is applied to the
     /// latest stored object instead of being rejected.
     fn allow_unconditional_update(&self) -> bool;
+    /// `ResetFieldsStrategy.GetResetFields` (apiserver/pkg/registry/rest/
+    /// rest.go:385-389): the fields this strategy resets, per apiVersion, which
+    /// server-side apply must not let a manager own. Empty for a strategy that
+    /// does not implement the interface.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+    }
 }
 
 /// `rest.GarbageCollectionPolicy` (rest/delete.go:40-47).
@@ -722,6 +729,13 @@ pub trait RestStorage<T: Object>: Send + Sync {
 
     /// `NamespaceScoped` of the create strategy.
     fn namespace_scoped(&self) -> bool;
+
+    /// `Store.GetResetFields` (registry/generic/registry/store.go:1698-1703):
+    /// the strategy's reset fields, which `installer.go:697-705` hands the
+    /// field manager. Empty for a storage with no `ResetFieldsStrategy`.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+    }
 
     /// `rest.Getter`.
     async fn get(&self, ctx: &RequestContext, name: &str) -> Result<T>;
