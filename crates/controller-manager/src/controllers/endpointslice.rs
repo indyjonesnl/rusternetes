@@ -96,11 +96,9 @@ fn get_pod_update_projection_key(old: Option<&Pod>, new: Option<&Pod>) -> Option
         (Some(o), Some(n)) => (o, n),
     };
     // "Safe to ignore pod informer resync events as service informer already
-    // handles resync for all services." Two unset resourceVersions are not
-    // treated as equal: a deliberate, conservative deviation.
-    if old.metadata.resource_version.is_some()
-        && old.metadata.resource_version == new.metadata.resource_version
-    {
+    // handles resync for all services." (controller_utils.go:79). Go compares
+    // strings, so two unset resourceVersions are equal too.
+    if old.metadata.resource_version == new.metadata.resource_version {
         return None;
     }
     let (pod_changed, labels_changed) = pod_endpoints_changed(old, new);
@@ -202,14 +200,33 @@ pub struct EndpointSliceController<S: Storage> {
     /// once the first pod LIST has landed and never goes back, like
     /// `HasSynced`. `run` workers do not start syncing before it.
     pods_synced: tokio::sync::watch::Sender<bool>,
+    /// `c.podQueue` (`endpointslice_controller.go:247-250`): projection keys
+    /// from pod events, resolved to services by `pod_queue_worker`. Upstream
+    /// keys it by pointer, so every key is distinct and none is deduplicated;
+    /// an unbounded channel has the same semantics.
+    pod_queue_tx: tokio::sync::mpsc::UnboundedSender<PodQueueItem>,
+    pod_queue_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<PodQueueItem>>>,
 }
+
+/// A `podQueue` entry plus its `NumRequeues` count (`handlePodErr`).
+struct PodQueueItem {
+    key: PodProjectionKey,
+    requeues: u32,
+}
+
+/// `maxRetries` (`endpointslice_controller.go`): how often `handlePodErr`
+/// requeues a failing pod key before dropping it.
+const POD_QUEUE_MAX_RETRIES: u32 = 15;
 
 impl<S: Storage + 'static> EndpointSliceController<S> {
     pub fn new(storage: Arc<S>) -> Self {
+        let (pod_queue_tx, pod_queue_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             storage,
             pod_cache: Arc::new(std::sync::RwLock::new(None)),
             pods_synced: tokio::sync::watch::channel(false).0,
+            pod_queue_tx,
+            pod_queue_rx: Arc::new(tokio::sync::Mutex::new(pod_queue_rx)),
         }
     }
 
@@ -323,6 +340,14 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 worker_self.wait_for_pods_synced().await;
                 worker_self.worker(worker_queue).await;
             });
+            // `wait.Until(c.podQueueWorker ...)` runs beside each service
+            // worker (endpointslice_controller.go:301-305).
+            let pod_worker_queue = queue.clone();
+            let pod_worker_self = Arc::clone(&self);
+            tokio::spawn(async move {
+                pod_worker_self.wait_for_pods_synced().await;
+                pod_worker_self.pod_queue_worker(pod_worker_queue).await;
+            });
         }
 
         let mirror_worker_queue = mirror_queue.clone();
@@ -404,7 +429,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                         match event {
                             Some(Ok(ev)) => {
                                 let (old, new) = self.apply_pod_event(&ev);
-                                self.enqueue_services_for_pod(&queue, old.as_ref(), new.as_ref()).await;
+                                self.on_pod_update(old.as_ref(), new.as_ref());
                             }
                             Some(Err(e)) => {
                                 tracing::warn!("Pod watch error: {}, reconnecting", e);
@@ -450,29 +475,55 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
         let _ = rx.wait_for(|synced| *synced).await;
     }
 
-    /// `onPodUpdate` + `syncPod` (`endpointslice_controller.go:532-535`,
-    /// `:491-508`): project the pod event to a [`PodProjectionKey`] and
-    /// enqueue exactly the services it affects, instead of every service in
-    /// the namespace. Upstream puts the key on `podQueue` and a worker
-    /// resolves it; here it is resolved inline (no intermediate queue).
-    async fn enqueue_services_for_pod(
-        &self,
-        queue: &WorkQueue,
-        old: Option<&Pod>,
-        new: Option<&Pod>,
-    ) {
-        let Some(key) = get_pod_update_projection_key(old, new) else {
-            return;
-        };
-        if let Ok(services) = self
-            .storage
-            .list::<Service>(&build_prefix("services", Some(&key.namespace)))
-            .await
-        {
-            for svc_key in get_services_to_update(&services, &key) {
-                queue.add(svc_key).await;
+    /// `onPodUpdate` (`endpointslice_controller.go:529-535`): project the pod
+    /// event to a [`PodProjectionKey`] and put it on `podQueue`; a
+    /// `pod_queue_worker` finds the matching services later.
+    fn on_pod_update(&self, old: Option<&Pod>, new: Option<&Pod>) {
+        if let Some(key) = get_pod_update_projection_key(old, new) {
+            let _ = self.pod_queue_tx.send(PodQueueItem { key, requeues: 0 });
+        }
+    }
+
+    /// `podQueueWorker` / `processNextPodWorkItem` / `handlePodErr`
+    /// (`endpointslice_controller.go:456-489`).
+    async fn pod_queue_worker(&self, service_queue: WorkQueue) {
+        loop {
+            // Hold the receiver lock only while waiting, as `podQueue.Get`.
+            let item = self.pod_queue_rx.lock().await.recv().await;
+            let Some(mut item) = item else { return };
+            match self.sync_pod(&item.key, &service_queue).await {
+                Ok(()) => {}
+                Err(e) if item.requeues < POD_QUEUE_MAX_RETRIES => {
+                    tracing::debug!("Error syncing pod, retrying: {}", e);
+                    // AddRateLimited: DefaultTypedControllerRateLimiter's
+                    // per-item exponential backoff (5ms base, doubling).
+                    let delay = std::time::Duration::from_millis(5u64 << item.requeues.min(10));
+                    item.requeues += 1;
+                    let tx = self.pod_queue_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = tx.send(item);
+                    });
+                }
+                Err(e) => tracing::error!("Dropping pod out of the queue: {}", e),
             }
         }
+    }
+
+    /// `syncPod` (`endpointslice_controller.go:491-508`): resolve the key to
+    /// the services it affects and queue exactly those, instead of every
+    /// service in the namespace.
+    async fn sync_pod(&self, key: &PodProjectionKey, service_queue: &WorkQueue) -> Result<()> {
+        let services = self
+            .storage
+            .list::<Service>(&build_prefix("services", Some(&key.namespace)))
+            .await?;
+        for svc_key in get_services_to_update(&services, key) {
+            // `AddAfter(service, c.endpointUpdatesBatchPeriod)`: the period
+            // defaults to 0 (kube-controller-manager config), i.e. `Add`.
+            service_queue.add(svc_key).await;
+        }
+        Ok(())
     }
 
     /// Main reconciliation loop — syncs EndpointSlices for all Services
@@ -2476,6 +2527,21 @@ mod tests {
         assert_eq!(get_pod_update_projection_key(Some(&p), Some(&q)), None);
     }
 
+    /// `newPod.ResourceVersion == oldPod.ResourceVersion` (controller_utils.go:79)
+    /// compares Go strings, so two UNSET resourceVersions are equal and the
+    /// update is ignored as a resync (#2365).
+    #[test]
+    fn projection_key_two_unset_resource_versions_are_equal() {
+        let mut p = labelled("p", &[("app", "x")]);
+        p.metadata.resource_version = None;
+        let mut relabelled = p.clone();
+        relabelled.metadata.labels = Some([("app".to_string(), "y".to_string())].into());
+        assert_eq!(
+            get_pod_update_projection_key(Some(&p), Some(&relabelled)),
+            None
+        );
+    }
+
     /// Test_podChanged (controller_utils_test.go:448): readiness / IP change
     /// is a pod change with unchanged labels; a label change carries both
     /// label sets.
@@ -2558,5 +2624,43 @@ mod tests {
         )
         .await
         .expect("gate must not regress");
+    }
+
+    /// podQueue (endpointslice_controller.go:247, onPodUpdate :532, syncPod
+    /// :491): a pod event only lands a projection key on the pod queue; a
+    /// separate sync resolves it to the matching services.
+    #[tokio::test]
+    async fn pod_event_goes_through_pod_queue_to_matching_services() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut hit = snapshot_service("hit");
+        hit.spec.selector = Some([("app".to_string(), "x".to_string())].into());
+        let mut miss = snapshot_service("miss");
+        miss.spec.selector = Some([("app".to_string(), "other".to_string())].into());
+        for svc in [&hit, &miss] {
+            let name = svc.metadata.name.clone();
+            storage
+                .create(&build_key("services", Some("ns"), &name), svc)
+                .await
+                .unwrap();
+        }
+        let controller = EndpointSliceController::new(storage);
+        let service_queue = WorkQueue::new();
+
+        let pod = labelled("p", &[("app", "x")]);
+        controller.on_pod_update(None, Some(&pod));
+        // nothing is resolved until the pod worker syncs the key
+        assert!(service_queue.is_empty().await);
+
+        let item = controller.pod_queue_rx.lock().await.recv().await.unwrap();
+        controller
+            .sync_pod(&item.key, &service_queue)
+            .await
+            .unwrap();
+        assert_eq!(service_queue.len().await, 1);
+        assert_eq!(service_queue.get().await.unwrap(), "services/ns/hit");
+
+        // an ignored update (resync) never reaches the queue
+        controller.on_pod_update(Some(&pod), Some(&pod.clone()));
+        assert!(controller.pod_queue_rx.lock().await.try_recv().is_err());
     }
 }
