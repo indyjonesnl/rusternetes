@@ -24,6 +24,14 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Guard rhino submodule matches the superproject pin
+        # #1624: a drifted rhino checkout compiles pre-fix code. Cheap, so it
+        # runs unconditionally (before the Rust-change gate below).
+        run: |
+          command -v git >/dev/null || { echo "::error::git not found on runner"; exit 1; }
+          bash scripts/tests/test-check-rhino-submodule.sh
+          bash scripts/check-rhino-submodule.sh
+
       - name: Detect Rust-relevant changes
         id: rust
         # This is a REQUIRED status check. We keep it always triggered (so the
