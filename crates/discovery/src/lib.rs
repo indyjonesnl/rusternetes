@@ -888,8 +888,23 @@ fn resource_categories(group: &str, resource: &str) -> &'static [&'static str] {
         ("apps", "deployments" | "replicasets" | "statefulsets" | "daemonsets") => &["all"],
         ("batch", "jobs" | "cronjobs") => &["all"],
         ("autoscaling", "horizontalpodautoscalers") => &["all"],
-        // kube-aggregator pkg/registry/apiservice/etcd/etcd.go:75-78.
+        // kube-aggregator pkg/registry/apiservice/etcd/etcd.go:69-71.
         ("apiregistration.k8s.io", "apiservices") => &["api-extensions"],
+        // apiextensions-apiserver pkg/registry/customresourcedefinition/etcd.go:79-81.
+        ("apiextensions.k8s.io", "customresourcedefinitions") => &["api-extensions"],
+        // pkg/registry/admissionregistration/{validatingwebhookconfiguration,
+        // mutatingwebhookconfiguration,validatingadmissionpolicy,
+        // validatingadmissionpolicybinding,mutatingadmissionpolicy,
+        // mutatingadmissionpolicybinding}/storage/storage.go `Categories()`.
+        (
+            "admissionregistration.k8s.io",
+            "validatingwebhookconfigurations"
+            | "mutatingwebhookconfigurations"
+            | "validatingadmissionpolicies"
+            | "validatingadmissionpolicybindings"
+            | "mutatingadmissionpolicies"
+            | "mutatingadmissionpolicybindings",
+        ) => &["api-extensions"],
         _ => &[],
     }
 }
@@ -2939,7 +2954,7 @@ pub async fn get_apiextensions_v1_resources() -> (StatusCode, Json<APIResourceLi
             .map(|s| s.to_string())
             .collect(),
             short_names: Some(vec!["crd".to_string(), "crds".to_string()]),
-            categories: None,
+            categories: Some(vec!["api-extensions".to_string()]),
             storage_version_hash: None,
         },
         APIResource {
@@ -2990,7 +3005,7 @@ pub async fn get_admissionregistration_v1_resources() -> (StatusCode, Json<APIRe
             .map(|s| s.to_string())
             .collect(),
             short_names: None,
-            categories: None,
+            categories: Some(vec!["api-extensions".to_string()]),
             storage_version_hash: None,
         },
         APIResource {
@@ -3012,7 +3027,7 @@ pub async fn get_admissionregistration_v1_resources() -> (StatusCode, Json<APIRe
             .map(|s| s.to_string())
             .collect(),
             short_names: None,
-            categories: None,
+            categories: Some(vec!["api-extensions".to_string()]),
             storage_version_hash: None,
         },
         APIResource {
@@ -3034,7 +3049,7 @@ pub async fn get_admissionregistration_v1_resources() -> (StatusCode, Json<APIRe
             .map(|s| s.to_string())
             .collect(),
             short_names: None,
-            categories: None,
+            categories: Some(vec!["api-extensions".to_string()]),
             storage_version_hash: None,
         },
         APIResource {
@@ -3069,7 +3084,7 @@ pub async fn get_admissionregistration_v1_resources() -> (StatusCode, Json<APIRe
             .map(|s| s.to_string())
             .collect(),
             short_names: None,
-            categories: None,
+            categories: Some(vec!["api-extensions".to_string()]),
             storage_version_hash: None,
         },
     ];
@@ -4371,7 +4386,7 @@ mod tests {
         );
     }
 
-    // kube-aggregator pkg/registry/apiservice/etcd/etcd.go:75-78
+    // kube-aggregator pkg/registry/apiservice/etcd/etcd.go:69-71
     // (`REST.Categories`).
     #[tokio::test]
     async fn apiservices_are_in_the_api_extensions_category() {
@@ -4409,6 +4424,16 @@ mod tests {
                 "v1",
                 get_apiregistration_v1_resources().await.1 .0,
             ),
+            (
+                "apiextensions.k8s.io",
+                "v1",
+                get_apiextensions_v1_resources().await.1 .0,
+            ),
+            (
+                "admissionregistration.k8s.io",
+                "v1",
+                get_admissionregistration_v1_resources().await.1 .0,
+            ),
         ];
         let mut checked = 0;
         for (group, version, list) in typed {
@@ -4438,8 +4463,127 @@ mod tests {
             }
         }
         assert!(
-            checked >= 11,
+            checked >= 15,
             "only {checked} categorised resources compared"
         );
+    }
+
+    /// Every `Categories()` implementation in release-1.35, generated from
+    /// `grep -rn -A2 'Categories() \[\]string' pkg/registry
+    /// staging/src/k8s.io/apiextensions-apiserver staging/src/k8s.io/kube-aggregator`
+    /// (customresource/etcd.go:113 returns the CRD's own `spec.names.categories`,
+    /// so it is dynamic and not in this table).
+    const UPSTREAM_CATEGORIES: &[(&str, &str, &[&str])] = &[
+        // pkg/registry/batch/job/storage/storage.go:96
+        ("batch", "jobs", &["all"]),
+        // pkg/registry/batch/cronjob/storage/storage.go:71
+        ("batch", "cronjobs", &["all"]),
+        // pkg/registry/core/pod/storage/storage.go:148
+        ("", "pods", &["all"]),
+        // pkg/registry/core/replicationcontroller/storage/storage.go:124
+        ("", "replicationcontrollers", &["all"]),
+        // pkg/registry/core/service/storage/storage.go:162
+        ("", "services", &["all"]),
+        // pkg/registry/autoscaling/horizontalpodautoscaler/storage/storage.go:78
+        ("autoscaling", "horizontalpodautoscalers", &["all"]),
+        // pkg/registry/admissionregistration/mutatingadmissionpolicy/storage/storage.go:71
+        (
+            "admissionregistration.k8s.io",
+            "mutatingadmissionpolicies",
+            &["api-extensions"],
+        ),
+        // .../mutatingadmissionpolicybinding/storage/storage.go:74
+        (
+            "admissionregistration.k8s.io",
+            "mutatingadmissionpolicybindings",
+            &["api-extensions"],
+        ),
+        // .../validatingwebhookconfiguration/storage/storage.go:64
+        (
+            "admissionregistration.k8s.io",
+            "validatingwebhookconfigurations",
+            &["api-extensions"],
+        ),
+        // .../mutatingwebhookconfiguration/storage/storage.go:64
+        (
+            "admissionregistration.k8s.io",
+            "mutatingwebhookconfigurations",
+            &["api-extensions"],
+        ),
+        // .../validatingadmissionpolicy/storage/storage.go:87
+        (
+            "admissionregistration.k8s.io",
+            "validatingadmissionpolicies",
+            &["api-extensions"],
+        ),
+        // .../validatingadmissionpolicybinding/storage/storage.go:74
+        (
+            "admissionregistration.k8s.io",
+            "validatingadmissionpolicybindings",
+            &["api-extensions"],
+        ),
+        // pkg/registry/apps/statefulset/storage/storage.go:114
+        ("apps", "statefulsets", &["all"]),
+        // pkg/registry/apps/daemonset/storage/storage.go:78
+        ("apps", "daemonsets", &["all"]),
+        // pkg/registry/apps/replicaset/storage/storage.go:126
+        ("apps", "replicasets", &["all"]),
+        // pkg/registry/apps/deployment/storage/storage.go:130
+        ("apps", "deployments", &["all"]),
+        // apiextensions-apiserver pkg/registry/customresourcedefinition/etcd.go:79
+        (
+            "apiextensions.k8s.io",
+            "customresourcedefinitions",
+            &["api-extensions"],
+        ),
+        // kube-aggregator pkg/registry/apiservice/etcd/etcd.go:69
+        ("apiregistration.k8s.io", "apiservices", &["api-extensions"]),
+    ];
+
+    #[test]
+    fn resource_categories_matches_every_upstream_categories_impl() {
+        for (g, r, want) in UPSTREAM_CATEGORIES {
+            assert_eq!(resource_categories(g, r), *want, "{g}/{r}");
+        }
+        assert!(resource_categories("", "configmaps").is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_lists_carry_every_upstream_category() {
+        let typed: Vec<(&str, APIResourceList)> = vec![
+            ("", get_core_resources().await.1 .0),
+            ("apps", get_apps_v1_resources().await.1 .0),
+            ("batch", get_batch_v1_resources().await.1 .0),
+            ("autoscaling", get_autoscaling_v1_resources().await.1 .0),
+            ("autoscaling", get_autoscaling_v2_resources().await.1 .0),
+            (
+                "apiextensions.k8s.io",
+                get_apiextensions_v1_resources().await.1 .0,
+            ),
+            (
+                "admissionregistration.k8s.io",
+                get_admissionregistration_v1_resources().await.1 .0,
+            ),
+            (
+                "apiregistration.k8s.io",
+                get_apiregistration_v1_resources().await.1 .0,
+            ),
+        ];
+        let mut seen = 0;
+        for (group, list) in &typed {
+            for r in list.resources.iter().filter(|r| !r.name.contains('/')) {
+                let want = UPSTREAM_CATEGORIES
+                    .iter()
+                    .find(|(g, n, _)| g == group && *n == r.name)
+                    .map(|(_, _, c)| c.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                if want.is_some() {
+                    seen += 1;
+                }
+                assert_eq!(r.categories, want, "{group} {} typed categories", r.name);
+            }
+        }
+        // The two mutatingadmissionpolicy kinds are v1beta1 upstream and not
+        // served here; HPA appears in both the v1 and v2 lists.
+        assert!(seen >= 15, "only {seen} categorised typed resources");
     }
 }
