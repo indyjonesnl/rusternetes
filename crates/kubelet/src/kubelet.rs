@@ -4,8 +4,8 @@ use crate::lifecycle::{phase_is_terminal, should_skip_phase_write};
 use anyhow::Result;
 use rusternetes_common::{
     resources::{
-        ContainerState, ContainerStatus, Node, NodeAddress, NodeCondition, NodeSpec, NodeStatus,
-        Pod, PodCondition, PodIP, PodStatus, Taint, Toleration,
+        ContainerState, ContainerStatus, Node, NodeAddress, NodeSpec, NodeStatus, Pod,
+        PodCondition, PodIP, PodStatus, Taint, Toleration,
     },
     types::Phase,
 };
@@ -382,6 +382,9 @@ pub struct Kubelet {
     /// from the CRI Version RPC (`<runtime_name>://<runtime_version>`), not a
     /// hardcoded literal. Falls back to `"unknown"` if the handshake fails.
     container_runtime_version: String,
+    /// Runtime/network health fed by the CRI `Status` RPC; gates NodeReady.
+    /// Upstream: `Kubelet.runtimeState` (pkg/kubelet/runtime.go).
+    runtime_state: crate::runtime_state::RuntimeState,
     sync_interval: Duration,
     /// Filesystem path used for `statvfs` when computing nodefs eviction stats.
     /// Defaults to `/var/lib/kubelet` when not provided.
@@ -678,6 +681,9 @@ impl Kubelet {
             storage,
             runtime: Arc::new(runtime),
             container_runtime_version,
+            runtime_state: crate::runtime_state::RuntimeState::new(
+                crate::runtime_state::MAX_WAIT_FOR_CONTAINER_RUNTIME,
+            ),
             sync_interval: Duration::from_secs(sync_interval_secs),
             eviction_root_dir,
             eviction_manager: Mutex::new(eviction_manager),
@@ -768,6 +774,21 @@ impl Kubelet {
 
     pub async fn run(self: &Arc<Self>) -> Result<()> {
         info!("Kubelet started for node: {}", self.node_name);
+
+        // Check runtime state once before registering so the first Ready
+        // report is honest (kubelet.go:1849-1851), then keep polling every
+        // 5s (kubelet.go:1867).
+        self.update_runtime_up().await;
+        {
+            let rt_self = Arc::clone(self);
+            tokio::spawn(async move {
+                let mut t = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    t.tick().await;
+                    rt_self.update_runtime_up().await;
+                }
+            });
+        }
 
         // Register the node
         self.register_node().await?;
@@ -1101,6 +1122,28 @@ impl Kubelet {
         }
     }
 
+    /// Port of `updateRuntimeUp` (pkg/kubelet/kubelet.go:3113): poll the CRI
+    /// `Status` RPC and record RuntimeReady/NetworkReady in `runtime_state`.
+    async fn update_runtime_up(&self) {
+        let status = self
+            .runtime
+            .runtime_status()
+            .await
+            .map_err(|e| e.to_string());
+        self.runtime_state.update_from_status(status);
+    }
+
+    /// Errors gating NodeReady (setters.go:491 runtime + network + storage).
+    fn ready_errors(&self) -> Vec<String> {
+        [
+            self.runtime_state.runtime_errors(),
+            self.runtime_state.network_errors(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     async fn register_node(&self) -> Result<()> {
         info!("Registering node: {}", self.node_name);
 
@@ -1129,14 +1172,15 @@ impl Kubelet {
         node.status = Some(NodeStatus {
             capacity: Some(node_allocatable_map()),
             allocatable: Some(node_allocatable_map()),
-            conditions: Some(vec![NodeCondition {
-                condition_type: "Ready".to_string(),
-                status: "True".to_string(),
-                last_heartbeat_time: Some(chrono::Utc::now()),
-                last_transition_time: Some(chrono::Utc::now()),
-                reason: Some("KubeletReady".to_string()),
-                message: Some("kubelet is posting ready status".to_string()),
-            }]),
+            conditions: Some({
+                let mut conditions = Vec::new();
+                crate::runtime_state::set_ready_condition(
+                    &mut conditions,
+                    self.ready_errors(),
+                    chrono::Utc::now(),
+                );
+                conditions
+            }),
             addresses: Some(vec![
                 NodeAddress {
                     address_type: "InternalIP".to_string(),
@@ -1398,28 +1442,31 @@ impl Kubelet {
             }
         }
 
+        // NodeReady is composed from runtime health, never asserted
+        // (nodestatus.ReadyCondition, setters.go:469). Persist when the
+        // condition changed or the heartbeat is stale (>10s).
+        let ready_errs = self.ready_errors();
         if let Some(ref mut status) = node.status {
-            if let Some(ref mut conditions) = status.conditions {
-                for condition in conditions.iter_mut() {
-                    if condition.condition_type == "Ready" {
-                        let now = chrono::Utc::now();
-                        let last = condition
-                            .last_heartbeat_time
-                            .unwrap_or(now - chrono::Duration::seconds(60));
-                        let stale = (now - last).num_seconds() > 10;
-                        if stale {
-                            condition.last_heartbeat_time = Some(now);
-                            needs_write = true;
-                        }
-                        if condition.status != "True" {
-                            condition.status = "True".to_string();
-                            condition.last_transition_time = Some(now);
-                            condition.reason = Some("KubeletReady".to_string());
-                            condition.message = Some("kubelet is posting ready status".to_string());
-                            needs_write = true;
-                        }
-                    }
-                }
+            let conditions = status.conditions.get_or_insert_with(Vec::new);
+            let now = chrono::Utc::now();
+            let last = conditions
+                .iter()
+                .find(|c| c.condition_type == "Ready")
+                .and_then(|c| c.last_heartbeat_time)
+                .unwrap_or(now - chrono::Duration::seconds(60));
+            let was_ready = conditions
+                .iter()
+                .find(|c| c.condition_type == "Ready")
+                .map(|c| c.status.clone());
+            let changed = crate::runtime_state::set_ready_condition(conditions, ready_errs, now);
+            if changed || (now - last).num_seconds() > 10 {
+                needs_write = true;
+            } else if let Some(c) = conditions.iter_mut().find(|c| c.condition_type == "Ready") {
+                // Fresh heartbeat: do not churn the stored object.
+                c.last_heartbeat_time = Some(last);
+            }
+            if changed && was_ready.as_deref() != Some("True") {
+                info!("Node Ready condition changed (was {was_ready:?})");
             }
         }
 
@@ -5939,6 +5986,64 @@ mod taint_eviction_tests {
 #[cfg(test)]
 mod tests {
     use super::Kubelet;
+
+    /// #1929: a kubelet whose CRI endpoint is an absent socket must report
+    /// `Ready=False`/`KubeletNotReady`, both at registration and on every
+    /// heartbeat (upstream `nodestatus.ReadyCondition`,
+    /// pkg/kubelet/nodestatus/setters.go:469-513; `updateRuntimeUp`,
+    /// pkg/kubelet/kubelet.go:3113-3157).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn node_is_not_ready_when_the_cri_runtime_is_absent() {
+        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = Kubelet::new(
+            "node-x".into(),
+            storage.clone(),
+            10,
+            dir.path().join("vols").display().to_string(),
+            "10.96.0.10".into(),
+            "cluster.local".into(),
+            "bridge".into(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+        k.update_runtime_up().await;
+        k.register_node().await.unwrap();
+        let ready = |n: &rusternetes_common::resources::Node| {
+            n.status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|c| c.condition_type == "Ready")
+                .cloned()
+                .unwrap()
+        };
+        let key = build_key("nodes", None, "node-x");
+        let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        let c = ready(&node);
+        assert_eq!(c.status, "False");
+        assert_eq!(c.reason.as_deref(), Some("KubeletNotReady"));
+        assert!(
+            c.message.as_deref().unwrap().contains("container runtime"),
+            "message must name the runtime: {:?}",
+            c.message
+        );
+        // The heartbeat must not flip it back to True.
+        k.update_node_status().await.unwrap();
+        let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        assert_eq!(ready(&node).status, "False");
+    }
 
     fn resources(pairs: &[(&str, &str)]) -> Option<std::collections::HashMap<String, String>> {
         Some(
