@@ -9,6 +9,32 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+const SECRET_TYPE_SERVICE_ACCOUNT_TOKEN: &str = "kubernetes.io/service-account-token";
+const SA_NAME_ANNOTATION: &str = "kubernetes.io/service-account.name";
+const SA_UID_ANNOTATION: &str = "kubernetes.io/service-account.uid";
+
+/// Upstream `apiserverserviceaccount.IsServiceAccountToken`
+/// (staging/src/k8s.io/apiserver/pkg/authentication/serviceaccount/util.go:167):
+/// the type must be `kubernetes.io/service-account-token`, the name annotation
+/// must match, and the uid annotation must match when it is present.
+fn is_service_account_token(secret: &Secret, sa_name: &str, sa_uid: Option<&str>) -> bool {
+    if secret.secret_type.as_deref() != Some(SECRET_TYPE_SERVICE_ACCOUNT_TOKEN) {
+        return false;
+    }
+    let ann = secret.metadata.annotations.as_ref();
+    if ann
+        .and_then(|a| a.get(SA_NAME_ANNOTATION))
+        .map(String::as_str)
+        != Some(sa_name)
+    {
+        return false;
+    }
+    match (ann.and_then(|a| a.get(SA_UID_ANNOTATION)), sa_uid) {
+        (Some(want), Some(have)) if !want.is_empty() => want == have,
+        _ => true,
+    }
+}
+
 /// JWT Claims for ServiceAccount tokens
 /// Follows Kubernetes ServiceAccount token format
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,13 +79,18 @@ struct PodRef {
     uid: String,
 }
 
-/// ServiceAccountController automatically creates default ServiceAccounts in new namespaces
-/// and manages ServiceAccount tokens.
+/// ServiceAccountController: the union of upstream's two ServiceAccount controllers.
 ///
-/// Responsibilities:
-/// 1. Create "default" ServiceAccount in each namespace
-/// 2. Create ServiceAccount tokens as Secrets
-/// 3. Handle ServiceAccount deletion and cleanup
+/// 1. Creates the "default" ServiceAccount in each namespace — upstream
+///    `pkg/controller/serviceaccount/serviceaccounts_controller.go`
+///    (`ServiceAccountsController`). It creates ONLY the ServiceAccount; no
+///    token Secret (`LegacyServiceAccountTokenNoAutoGeneration`, GA in 1.26).
+/// 2. Populates token / ca.crt / namespace on user-created
+///    `kubernetes.io/service-account-token` Secrets and deletes such Secrets
+///    whose ServiceAccount is gone — upstream
+///    `pkg/controller/serviceaccount/tokens_controller.go` (`TokensController`,
+///    `syncSecret` / `syncServiceAccount` / `generateTokenIfNeeded`). It never
+///    creates a Secret.
 pub struct ServiceAccountController<S: Storage> {
     storage: Arc<S>,
     /// RSA private key for signing tokens (PEM format)
@@ -148,6 +179,18 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
                 }
             };
 
+            // Token Secrets are populated / reaped on Secret events too
+            // (TokensController's secret informer, tokens_controller.go:108-131).
+            let secret_prefix = build_prefix("secrets", None);
+            let mut secret_watch = match self.storage.watch(&secret_prefix).await {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!("Failed to establish secret watch: {}, retrying", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
             let mut resync = tokio::time::interval(std::time::Duration::from_secs(30));
             resync.tick().await;
 
@@ -166,6 +209,19 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
                             }
                             None => {
                                 tracing::warn!("Watch stream ended, reconnecting");
+                                watch_broken = true;
+                            }
+                        }
+                    }
+                    event = secret_watch.next() => {
+                        match event {
+                            Some(Ok(ev)) => queue.add(extract_key(&ev)).await,
+                            Some(Err(e)) => {
+                                tracing::warn!("Secret watch error: {}, reconnecting", e);
+                                watch_broken = true;
+                            }
+                            None => {
+                                tracing::warn!("Secret watch stream ended, reconnecting");
                                 watch_broken = true;
                             }
                         }
@@ -199,6 +255,17 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
                     continue;
                 }
             }
+            if parts[0] == "secrets" {
+                match self.sync_token_secret(ns, name).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        tracing::error!("Failed to sync token secret {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
+                    }
+                }
+                queue.done(&key).await;
+                continue;
+            }
             // Ensure the default service account exists in this namespace
             if let Err(e) = self.ensure_default_serviceaccount(ns).await {
                 tracing::error!("Failed to ensure default SA in {}: {}", ns, e);
@@ -231,6 +298,23 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             }
             Err(e) => {
                 tracing::error!("Failed to list serviceaccounts for enqueue: {}", e);
+            }
+        }
+        // Re-sync every service-account-token Secret
+        match self.storage.list::<Secret>("/registry/secrets/").await {
+            Ok(secrets) => {
+                for secret in secrets
+                    .iter()
+                    .filter(|s| s.secret_type.as_deref() == Some(SECRET_TYPE_SERVICE_ACCOUNT_TOKEN))
+                {
+                    let ns = secret.metadata.namespace.as_deref().unwrap_or("");
+                    queue
+                        .add(format!("secrets/{}/{}", ns, secret.metadata.name))
+                        .await;
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to list secrets for token sync: {}", e);
             }
         }
         // Also ensure default SA in all namespaces
@@ -341,102 +425,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             Err(e) => return Err(e.into()),
         }
 
-        // Create a token Secret for the ServiceAccount
-        self.create_token_secret(namespace, sa_name).await?;
-
         info!("Created default ServiceAccount in namespace {}", namespace);
-        Ok(())
-    }
-
-    /// Create a token Secret for a ServiceAccount
-    async fn create_token_secret(&self, namespace: &str, sa_name: &str) -> Result<()> {
-        let secret_name = format!("{}-token", sa_name);
-        let secret_key = build_key("secrets", Some(namespace), &secret_name);
-
-        // Check if token secret already exists
-        if self.storage.get::<Secret>(&secret_key).await.is_ok() {
-            debug!(
-                "Token secret already exists for ServiceAccount {}/{}",
-                namespace, sa_name
-            );
-            return Ok(());
-        }
-
-        debug!(
-            "Creating token secret for ServiceAccount {}/{}",
-            namespace, sa_name
-        );
-
-        // Get the ServiceAccount to retrieve its UID
-        let sa_key = build_key("serviceaccounts", Some(namespace), sa_name);
-        let sa: ServiceAccount = self.storage.get(&sa_key).await?;
-        let sa_uid = &sa.metadata.uid;
-
-        // Generate a JWT token (or fallback to simple token if no signing key)
-        let token = self.generate_token(namespace, sa_name, sa_uid)?;
-
-        let mut annotations = HashMap::new();
-        annotations.insert(
-            "kubernetes.io/service-account.name".to_string(),
-            sa_name.to_string(),
-        );
-        annotations.insert(
-            "kubernetes.io/service-account.uid".to_string(),
-            sa_uid.clone(),
-        );
-
-        let secret = Secret {
-            type_meta: TypeMeta {
-                kind: "Secret".to_string(),
-                api_version: "v1".to_string(),
-            },
-            metadata: ObjectMeta {
-                name: secret_name.clone(),
-                generate_name: None,
-                generation: None,
-                managed_fields: None,
-                namespace: Some(namespace.to_string()),
-                uid: String::new(),
-                resource_version: None,
-                deletion_grace_period_seconds: None,
-                finalizers: None,
-                owner_references: None,
-                creation_timestamp: None,
-                deletion_timestamp: None,
-                labels: None,
-                annotations: Some(annotations),
-            },
-            secret_type: Some("kubernetes.io/service-account-token".to_string()),
-            data: {
-                let mut data = HashMap::new();
-                // Secret data is raw bytes (not base64 encoded - that's done on serialization)
-                data.insert("token".to_string(), token.as_bytes().to_vec());
-                // Add namespace and ca.crt
-                data.insert("namespace".to_string(), namespace.as_bytes().to_vec());
-                let ca_bytes = self
-                    .ca_cert_pem
-                    .as_deref()
-                    .map(|pem| pem.as_bytes().to_vec())
-                    .unwrap_or_default();
-                data.insert("ca.crt".to_string(), ca_bytes);
-                Some(data)
-            },
-            string_data: None,
-            immutable: None,
-        };
-
-        match self.storage.create(&secret_key, &secret).await {
-            Ok(_) => {
-                info!(
-                    "Created token secret {} for ServiceAccount {}/{}",
-                    secret_name, namespace, sa_name
-                );
-            }
-            Err(rusternetes_common::Error::AlreadyExists(_)) => {
-                debug!("Token secret already exists for {}/{}", namespace, sa_name);
-            }
-            Err(e) => return Err(e.into()),
-        }
         Ok(())
     }
 
@@ -494,71 +483,170 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
         }
     }
 
-    /// Reconcile a specific ServiceAccount (called when a SA is created/updated)
+    /// Upstream `TokensController.syncSecret` (default branch) +
+    /// `getServiceAccount` + `deleteToken` + `generateTokenIfNeeded`
+    /// (pkg/controller/serviceaccount/tokens_controller.go:270-327, 349-445).
+    ///
+    /// Only Secrets of type `kubernetes.io/service-account-token` are handled.
+    /// If the ServiceAccount the Secret names is missing, or exists with a
+    /// different UID than the Secret's uid annotation, the Secret is deleted;
+    /// otherwise missing token / namespace data and a mismatched ca.crt are
+    /// populated. Never creates a Secret.
+    ///
+    /// Deviation: upstream reads a cache, then re-GETs the live Secret and
+    /// compares resourceVersion before updating. This controller reads storage
+    /// directly, so the object read here already is the live one.
+    pub async fn sync_token_secret(&self, namespace: &str, name: &str) -> Result<()> {
+        let secret_key = build_key("secrets", Some(namespace), name);
+        let mut secret: Secret = match self.storage.get(&secret_key).await {
+            Ok(s) => s,
+            // Upstream: a deleted token only has its reference removed from the
+            // ServiceAccount's secrets list (removeSecretReference) — not ported.
+            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if secret.secret_type.as_deref() != Some(SECRET_TYPE_SERVICE_ACCOUNT_TOKEN) {
+            return Ok(());
+        }
+
+        let annotation = |key: &str| {
+            secret
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(key))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let sa_name = annotation(SA_NAME_ANNOTATION);
+        let want_uid = annotation(SA_UID_ANNOTATION);
+
+        // getServiceAccount(ns, name, uid): nil when absent or the uid differs.
+        let sa_key = build_key("serviceaccounts", Some(namespace), &sa_name);
+        let sa: Option<ServiceAccount> = match self.storage.get::<ServiceAccount>(&sa_key).await {
+            Ok(sa) if want_uid.is_empty() || want_uid == sa.metadata.uid => Some(sa),
+            Ok(_) => None,
+            Err(rusternetes_common::Error::NotFound(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let Some(sa) = sa else {
+            let uid = secret.metadata.uid.clone();
+            return self.delete_token(namespace, name, &uid).await;
+        };
+
+        // secretUpdateNeeded
+        let root_ca = self
+            .ca_cert_pem
+            .as_deref()
+            .map(str::as_bytes)
+            .unwrap_or(&[]);
+        let data = secret.data.get_or_insert_with(HashMap::new);
+        let needs_ca =
+            !root_ca.is_empty() && data.get("ca.crt").map(Vec::as_slice).unwrap_or(&[]) != root_ca;
+        let needs_namespace = data.get("namespace").map(|v| v.is_empty()).unwrap_or(true);
+        let needs_token = data.get("token").map(|v| v.is_empty()).unwrap_or(true);
+        if !needs_ca && !needs_namespace && !needs_token {
+            return Ok(());
+        }
+
+        if needs_ca {
+            data.insert("ca.crt".to_string(), root_ca.to_vec());
+        }
+        if needs_namespace {
+            data.insert("namespace".to_string(), namespace.as_bytes().to_vec());
+        }
+        if needs_token {
+            let token = self.generate_token(namespace, &sa_name, &sa.metadata.uid)?;
+            data.insert("token".to_string(), token.into_bytes());
+        }
+        let annotations = secret.metadata.annotations.get_or_insert_with(HashMap::new);
+        annotations.insert(SA_NAME_ANNOTATION.to_string(), sa.metadata.name.clone());
+        annotations.insert(SA_UID_ANNOTATION.to_string(), sa.metadata.uid.clone());
+
+        match self.storage.update(&secret_key, &secret).await {
+            Ok(_) => {
+                info!(
+                    "Populated service account token Secret {}/{} for ServiceAccount {}",
+                    namespace, name, sa_name
+                );
+                Ok(())
+            }
+            // Conflict: someone else updated it, we are notified and retry.
+            // NotFound: deleted meanwhile, nothing to populate.
+            Err(rusternetes_common::Error::Conflict(_))
+            | Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Upstream `deleteToken`: delete with a UID precondition; NotFound and a
+    /// failed precondition need no retry.
+    async fn delete_token(&self, namespace: &str, name: &str, uid: &str) -> Result<()> {
+        let key = build_key("secrets", Some(namespace), name);
+        if !uid.is_empty() {
+            match self.storage.get::<Secret>(&key).await {
+                Ok(live) if live.metadata.uid != uid => return Ok(()),
+                Ok(_) => {}
+                Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        info!(
+            "Service account does not exist, deleting token Secret {}/{}",
+            namespace, name
+        );
+        match self.storage.delete(&key).await {
+            Ok(_) | Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Upstream `TokensController.deleteTokens` + `listTokenSecrets`
+    /// (tokens_controller.go:329-347, 539-552): delete every token Secret that
+    /// belongs to the ServiceAccount (`sa_uid` is `None` once it is gone).
+    async fn delete_tokens(
+        &self,
+        namespace: &str,
+        sa_name: &str,
+        sa_uid: Option<&str>,
+    ) -> Result<()> {
+        let prefix = build_prefix("secrets", Some(namespace));
+        let secrets: Vec<Secret> = self.storage.list(&prefix).await?;
+        for secret in secrets {
+            if is_service_account_token(&secret, sa_name, sa_uid) {
+                if let Err(e) = self
+                    .delete_token(namespace, &secret.metadata.name, &secret.metadata.uid)
+                    .await
+                {
+                    error!(
+                        "Failed to delete token secret {}: {}",
+                        secret.metadata.name, e
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Upstream `TokensController.syncServiceAccount`
+    /// (tokens_controller.go:235-268): a ServiceAccount that no longer exists
+    /// (or is being deleted) takes its token Secrets with it. A live
+    /// ServiceAccount needs nothing — upstream never mints a token for it.
     pub async fn reconcile_serviceaccount(&self, namespace: &str, sa_name: &str) -> Result<()> {
         debug!("Reconciling ServiceAccount {}/{}", namespace, sa_name);
 
         let sa_key = build_key("serviceaccounts", Some(namespace), sa_name);
-
-        // Get the ServiceAccount
-        let sa: ServiceAccount = match self.storage.get(&sa_key).await {
-            Ok(sa) => sa,
+        match self.storage.get::<ServiceAccount>(&sa_key).await {
+            Ok(sa) if sa.metadata.deletion_timestamp.is_some() => {
+                self.delete_tokens(namespace, sa_name, Some(&sa.metadata.uid))
+                    .await
+            }
+            Ok(_) => Ok(()),
             Err(rusternetes_common::Error::NotFound(_)) => {
-                // ServiceAccount was deleted, nothing to do
-                return Ok(());
+                self.delete_tokens(namespace, sa_name, None).await
             }
-            Err(e) => return Err(e.into()),
-        };
-
-        // If SA is being deleted, clean up tokens
-        if sa.metadata.deletion_timestamp.is_some() {
-            return self.cleanup_serviceaccount_tokens(namespace, sa_name).await;
+            Err(e) => Err(e.into()),
         }
-
-        // Ensure the SA has a token
-        self.create_token_secret(namespace, sa_name).await?;
-
-        Ok(())
-    }
-
-    /// Clean up token secrets when a ServiceAccount is deleted
-    async fn cleanup_serviceaccount_tokens(&self, namespace: &str, sa_name: &str) -> Result<()> {
-        info!(
-            "Cleaning up tokens for ServiceAccount {}/{}",
-            namespace, sa_name
-        );
-
-        // List all secrets in the namespace
-        let prefix = build_prefix("secrets", Some(namespace));
-        let secrets: Vec<Secret> = self.storage.list(&prefix).await?;
-
-        // Find and delete secrets associated with this ServiceAccount
-        for secret in secrets {
-            if let Some(annotations) = &secret.metadata.annotations {
-                if let Some(sa) = annotations.get("kubernetes.io/service-account.name") {
-                    if sa == sa_name {
-                        let secret_key =
-                            build_key("secrets", Some(namespace), &secret.metadata.name);
-                        match self.storage.delete(&secret_key).await {
-                            Ok(_) => {
-                                info!(
-                                    "Deleted token secret {} for ServiceAccount {}/{}",
-                                    secret.metadata.name, namespace, sa_name
-                                );
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to delete token secret {}: {}",
-                                    secret.metadata.name, e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 }
 

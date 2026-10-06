@@ -1,7 +1,7 @@
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::node::Taint;
-use rusternetes_common::resources::pod::{SecretVolumeSource, Toleration, Volume, VolumeMount};
+use rusternetes_common::resources::pod::Toleration;
 use rusternetes_common::resources::policy::IntOrString;
 use rusternetes_common::resources::{
     ControllerRevision, DaemonSet, DaemonSetStatus, Node, Pod, PodStatus,
@@ -1139,7 +1139,8 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         }
 
         // Inject service account token volume
-        self.inject_service_account_token(&mut spec, namespace);
+        self.inject_service_account_token(&mut spec, namespace)
+            .await;
 
         // Propagate the SA's imagePullSecrets (#1084) — controllers bypass the
         // api-server admission path that normally does this.
@@ -1230,97 +1231,32 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         Ok(())
     }
 
-    fn inject_service_account_token(
+    /// Inject the projected `kube-api-access` volume, as upstream's ServiceAccount
+    /// admission plugin does (plugin/pkg/admission/serviceaccount/admission.go).
+    /// Controllers write pods straight to storage and bypass that plugin, so the
+    /// automount decision (pod setting wins over the ServiceAccount's, default
+    /// true) is replicated here exactly like the ReplicaSet controller does.
+    /// There is no `<sa>-token` Secret to reference: upstream does not mint one
+    /// (LegacyServiceAccountTokenNoAutoGeneration).
+    async fn inject_service_account_token(
         &self,
         spec: &mut rusternetes_common::resources::PodSpec,
         namespace: &str,
     ) {
-        // Get service account name, default to "default"
-        let sa_name = spec.service_account_name.as_deref().unwrap_or("default");
-
-        // The service account token secret name follows the pattern: {sa-name}-token
-        let token_secret_name = format!("{}-token", sa_name);
-
-        // Define the service account token volume
-        let sa_token_volume = Volume {
-            name: "kube-api-access".to_string(),
-            empty_dir: None,
-            host_path: None,
-            config_map: None,
-            secret: Some(SecretVolumeSource {
-                secret_name: Some(token_secret_name.clone()),
-                items: None,
-                default_mode: None,
-                optional: None,
-            }),
-            persistent_volume_claim: None,
-            downward_api: None,
-            csi: None,
-            ephemeral: None,
-            nfs: None,
-            iscsi: None,
-            projected: None,
-            image: None,
+        let sa_name = rusternetes_common::serviceaccount::ensure_service_account_name(spec);
+        let sa_key = format!("/registry/serviceaccounts/{}/{}", namespace, sa_name);
+        let sa_automount = self
+            .storage
+            .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
+            .await
+            .ok()
+            .and_then(|sa| sa.automount_service_account_token);
+        let should_mount = match spec.automount_service_account_token {
+            Some(v) => v,
+            None => sa_automount.unwrap_or(true),
         };
-
-        // Add volume to pod spec
-        if let Some(volumes) = &mut spec.volumes {
-            // Check if volume already exists
-            if !volumes.iter().any(|v| v.name == "kube-api-access") {
-                volumes.push(sa_token_volume);
-                debug!(
-                    "Injected service account token volume for DaemonSet pod in namespace {}",
-                    namespace
-                );
-            }
-        } else {
-            spec.volumes = Some(vec![sa_token_volume]);
-            info!(
-                "Injected service account token volume for DaemonSet pod in namespace {}",
-                namespace
-            );
-        }
-
-        // Define the volume mount for the token
-        let sa_token_mount = VolumeMount {
-            name: "kube-api-access".to_string(),
-            mount_path: "/var/run/secrets/kubernetes.io/serviceaccount".to_string(),
-            read_only: Some(true),
-            sub_path: None,
-            sub_path_expr: None,
-            mount_propagation: None,
-            recursive_read_only: None,
-        };
-
-        // Add volume mount to all containers
-        for container in &mut spec.containers {
-            if let Some(mounts) = &mut container.volume_mounts {
-                // Check if mount already exists
-                if !mounts
-                    .iter()
-                    .any(|m| m.mount_path == "/var/run/secrets/kubernetes.io/serviceaccount")
-                {
-                    mounts.push(sa_token_mount.clone());
-                }
-            } else {
-                container.volume_mounts = Some(vec![sa_token_mount.clone()]);
-            }
-        }
-
-        // Also add to init containers if present
-        if let Some(init_containers) = &mut spec.init_containers {
-            for container in init_containers {
-                if let Some(mounts) = &mut container.volume_mounts {
-                    if !mounts
-                        .iter()
-                        .any(|m| m.mount_path == "/var/run/secrets/kubernetes.io/serviceaccount")
-                    {
-                        mounts.push(sa_token_mount.clone());
-                    }
-                } else {
-                    container.volume_mounts = Some(vec![sa_token_mount.clone()]);
-                }
-            }
+        if should_mount {
+            rusternetes_common::serviceaccount::add_kube_api_access_volume(spec);
         }
     }
 

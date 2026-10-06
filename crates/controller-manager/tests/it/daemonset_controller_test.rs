@@ -491,3 +491,75 @@ async fn test_daemonset_pod_naming_convention() {
         "Pod name should not contain dots"
     );
 }
+
+/// Upstream mints no `<sa>-token` Secret (LegacyServiceAccountTokenNoAutoGeneration),
+/// so a DaemonSet pod must get the projected `kube-api-access` volume that the
+/// ServiceAccount admission plugin injects, never a Secret volume naming
+/// `default-token`.
+#[tokio::test]
+async fn test_daemonset_pod_gets_projected_sa_token_volume_not_secret() {
+    let storage = setup_test().await;
+    let node = create_test_node("node-1", None);
+    storage
+        .create(&build_key("nodes", None, "node-1"), &node)
+        .await
+        .unwrap();
+    let ds = create_test_daemonset("sa-ds", "default", None);
+    storage
+        .create(&build_key("daemonsets", Some("default"), "sa-ds"), &ds)
+        .await
+        .unwrap();
+
+    DaemonSetController::new(storage.clone())
+        .reconcile_all()
+        .await
+        .unwrap();
+
+    let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    let spec = pods[0].spec.as_ref().unwrap();
+    let vol = spec
+        .volumes
+        .as_ref()
+        .and_then(|v| v.iter().find(|v| v.name.starts_with("kube-api-access")))
+        .expect("kube-api-access volume injected");
+    assert!(
+        vol.secret.is_none(),
+        "must not reference a <sa>-token Secret"
+    );
+    assert!(vol.projected.is_some(), "must be a projected volume");
+}
+
+/// `automountServiceAccountToken: false` on the pod template is honoured.
+#[tokio::test]
+async fn test_daemonset_pod_respects_automount_false() {
+    let storage = setup_test().await;
+    let node = create_test_node("node-1", None);
+    storage
+        .create(&build_key("nodes", None, "node-1"), &node)
+        .await
+        .unwrap();
+    let mut ds = create_test_daemonset("no-mount-ds", "default", None);
+    ds.spec.template.spec.automount_service_account_token = Some(false);
+    storage
+        .create(
+            &build_key("daemonsets", Some("default"), "no-mount-ds"),
+            &ds,
+        )
+        .await
+        .unwrap();
+
+    DaemonSetController::new(storage.clone())
+        .reconcile_all()
+        .await
+        .unwrap();
+
+    let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    let spec = pods[0].spec.as_ref().unwrap();
+    assert!(
+        !spec
+            .volumes
+            .as_ref()
+            .is_some_and(|v| v.iter().any(|v| v.name.starts_with("kube-api-access"))),
+        "no SA token volume when automount is false"
+    );
+}

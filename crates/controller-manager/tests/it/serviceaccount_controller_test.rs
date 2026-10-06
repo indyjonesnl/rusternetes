@@ -127,18 +127,16 @@ async fn test_serviceaccount_creates_default_in_namespace() {
     assert_eq!(sa.metadata.name, "default");
     assert_eq!(sa.metadata.namespace.as_ref().unwrap(), "test-sa-namespace");
 
-    // Verify token secret was created
+    // Upstream (LegacyServiceAccountTokenNoAutoGeneration, GA 1.24) never mints
+    // a `<sa>-token` Secret for a ServiceAccount.
     let secret_key = build_key("secrets", Some("test-sa-namespace"), "default-token");
-    let secret: Secret = storage.get(&secret_key).await.unwrap();
-    assert_eq!(secret.metadata.name, "default-token");
-    assert_eq!(
-        secret.secret_type.as_ref().unwrap(),
-        "kubernetes.io/service-account-token"
+    assert!(
+        storage.get::<Secret>(&secret_key).await.is_err(),
+        "the controller must not auto-mint a legacy token Secret"
     );
 
     // Clean up
     storage.delete(&sa_key).await.unwrap();
-    storage.delete(&secret_key).await.unwrap();
     storage.delete(&ns_key).await.unwrap();
 }
 
@@ -218,103 +216,6 @@ async fn test_serviceaccount_does_not_recreate_existing() {
 
     // Clean up
     storage.delete(&sa_key).await.unwrap();
-    storage.delete(&ns_key).await.unwrap();
-}
-
-#[tokio::test]
-async fn test_serviceaccount_token_contains_required_fields() {
-    let storage = Arc::new(MemoryStorage::new());
-    let controller = ServiceAccountController::new(storage.clone());
-
-    // Create a namespace
-    let namespace = Namespace {
-        type_meta: TypeMeta {
-            kind: "Namespace".to_string(),
-            api_version: "v1".to_string(),
-        },
-        metadata: ObjectMeta {
-            name: "test-token-fields".to_string(),
-            namespace: None,
-            uid: uuid::Uuid::new_v4().to_string(),
-            resource_version: None,
-            deletion_grace_period_seconds: None,
-            finalizers: None,
-            owner_references: None,
-            creation_timestamp: Some(chrono::Utc::now()),
-            deletion_timestamp: None,
-            labels: None,
-            annotations: None,
-            generate_name: None,
-            generation: None,
-            managed_fields: None,
-        },
-        spec: Some(NamespaceSpec { finalizers: None }),
-        status: Some(NamespaceStatus {
-            phase: Some(rusternetes_common::types::Phase::Active),
-            conditions: None,
-        }),
-    };
-
-    let ns_key = build_key("namespaces", None, "test-token-fields");
-    storage.create(&ns_key, &namespace).await.unwrap();
-
-    // Reconcile
-    controller.reconcile_all().await.unwrap();
-
-    // Get the token secret
-    let secret_key = build_key("secrets", Some("test-token-fields"), "default-token");
-    let secret: Secret = storage.get(&secret_key).await.unwrap();
-
-    // Verify secret has required fields
-    assert!(secret.data.is_some());
-    let data = secret.data.as_ref().unwrap();
-
-    // Should have token, namespace, and ca.crt
-    assert!(data.contains_key("token"));
-    assert!(data.contains_key("namespace"));
-    assert!(data.contains_key("ca.crt"));
-
-    // Token should not be empty
-    let token = data.get("token").unwrap();
-    assert!(!token.is_empty());
-
-    // Namespace should match
-    let namespace_bytes = data.get("namespace").unwrap();
-    let namespace_str = String::from_utf8(namespace_bytes.clone()).unwrap();
-    assert_eq!(namespace_str, "test-token-fields");
-
-    // Clean up
-    let sa_key = build_key("serviceaccounts", Some("test-token-fields"), "default");
-    storage.delete(&sa_key).await.unwrap();
-    storage.delete(&secret_key).await.unwrap();
-    storage.delete(&ns_key).await.unwrap();
-}
-
-#[tokio::test]
-async fn test_serviceaccount_token_secret_includes_configured_ca_cert() {
-    let storage = Arc::new(MemoryStorage::new());
-    let ca_cert_pem = "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----\n";
-    let controller =
-        ServiceAccountController::new(storage.clone()).with_ca_cert(Some(ca_cert_pem.to_string()));
-
-    let namespace = active_namespace("test-token-ca-cert");
-    let ns_key = build_key("namespaces", None, "test-token-ca-cert");
-    storage.create(&ns_key, &namespace).await.unwrap();
-
-    controller.reconcile_all().await.unwrap();
-
-    let secret_key = build_key("secrets", Some("test-token-ca-cert"), "default-token");
-    let secret: Secret = storage.get(&secret_key).await.unwrap();
-    let data = secret
-        .data
-        .as_ref()
-        .expect("service account token secret must have data");
-
-    assert_eq!(data.get("ca.crt"), Some(&ca_cert_pem.as_bytes().to_vec()));
-
-    let sa_key = build_key("serviceaccounts", Some("test-token-ca-cert"), "default");
-    storage.delete(&sa_key).await.unwrap();
-    storage.delete(&secret_key).await.unwrap();
     storage.delete(&ns_key).await.unwrap();
 }
 
@@ -478,74 +379,7 @@ async fn test_serviceaccount_image_pull_secrets_persist_through_reconcile() {
 // the propagation) against a stale "absent in admission.rs" claim, so it has
 // been removed.
 
-/// Every default SA created by the controller must have a companion legacy
-/// token Secret of type `kubernetes.io/service-account-token`, and that Secret
-/// must carry the upstream annotations (`kubernetes.io/service-account.name`
-/// and `kubernetes.io/service-account.uid`) that legacy auth flows rely on.
-#[tokio::test]
-async fn test_serviceaccount_token_secret_sync_annotations() {
-    let storage = Arc::new(MemoryStorage::new());
-    let controller = ServiceAccountController::new(storage.clone());
-
-    let ns_name = "test-sa-token-sync";
-    storage
-        .create(
-            &build_key("namespaces", None, ns_name),
-            &active_namespace(ns_name),
-        )
-        .await
-        .unwrap();
-
-    controller.reconcile_all().await.unwrap();
-
-    let sa_key = build_key("serviceaccounts", Some(ns_name), "default");
-    let sa: ServiceAccount = storage.get(&sa_key).await.unwrap();
-
-    let secret_key = build_key("secrets", Some(ns_name), "default-token");
-    let secret: Secret = storage.get(&secret_key).await.unwrap();
-
-    assert_eq!(
-        secret.secret_type.as_deref(),
-        Some("kubernetes.io/service-account-token"),
-        "token Secret must be typed kubernetes.io/service-account-token"
-    );
-
-    let annotations = secret
-        .metadata
-        .annotations
-        .as_ref()
-        .expect("token Secret must carry SA annotations");
-    assert_eq!(
-        annotations
-            .get("kubernetes.io/service-account.name")
-            .map(String::as_str),
-        Some("default"),
-        "missing service-account.name annotation"
-    );
-    assert_eq!(
-        annotations
-            .get("kubernetes.io/service-account.uid")
-            .cloned(),
-        Some(sa.metadata.uid.clone()),
-        "service-account.uid annotation must match owning SA UID"
-    );
-
-    let data = secret.data.as_ref().expect("token Secret must have data");
-    assert!(!data.get("token").map(|v| v.is_empty()).unwrap_or(true));
-    assert_eq!(
-        data.get("namespace").map(|v| v.as_slice()),
-        Some(ns_name.as_bytes())
-    );
-
-    storage.delete(&secret_key).await.unwrap();
-    storage.delete(&sa_key).await.unwrap();
-    storage
-        .delete(&build_key("namespaces", None, ns_name))
-        .await
-        .unwrap();
-}
-
-/// `reconcile_all` must fan out default SA + token creation across every
+/// `reconcile_all` must fan out default SA creation across every
 /// active namespace it sees, and must do so idempotently. Mirrors the upstream
 /// invariant exercised by the e2e suite when a fresh cluster spins up several
 /// namespaces back-to-back.
@@ -577,20 +411,16 @@ async fn test_serviceaccount_reconcile_fans_out_to_all_namespaces() {
         assert_eq!(sa.metadata.name, "default");
         assert_eq!(sa.metadata.namespace.as_deref(), Some(*name));
 
-        let secret: Secret = storage
-            .get(&build_key("secrets", Some(name), "default-token"))
-            .await
-            .unwrap_or_else(|e| panic!("default-token missing in {name}: {e}"));
-        assert_eq!(
-            secret.secret_type.as_deref(),
-            Some("kubernetes.io/service-account-token")
+        assert!(
+            storage
+                .get::<Secret>(&build_key("secrets", Some(name), "default-token"))
+                .await
+                .is_err(),
+            "no legacy token Secret may be minted in {name}"
         );
     }
 
     for name in &names {
-        let _ = storage
-            .delete(&build_key("secrets", Some(name), "default-token"))
-            .await;
         let _ = storage
             .delete(&build_key("serviceaccounts", Some(name), "default"))
             .await;
@@ -609,3 +439,264 @@ async fn test_serviceaccount_reconcile_fans_out_to_all_namespaces() {
 // `api-server/tests/conformance_auth_rbac_serviceaccount.rs` (audiences). The
 // previous `#[ignore]`d test asserted a non-upstream controller-written Secret
 // and has been removed.
+
+// ---------------------------------------------------------------------------
+// Populate-only tokens controller
+//
+// Ported from upstream `pkg/controller/serviceaccount/tokens_controller_test.go`
+// (release-1.35) `TestTokenCreation`: the controller never mints a Secret, it
+// only populates token / ca.crt / namespace on a user-created
+// `kubernetes.io/service-account-token` Secret, and deletes such a Secret when
+// the ServiceAccount it names is gone or has a different UID.
+// ---------------------------------------------------------------------------
+
+const SA_TOKEN_TYPE: &str = "kubernetes.io/service-account-token";
+const CA_PEM: &str = "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----\n";
+
+fn token_secret(
+    namespace: &str,
+    name: &str,
+    sa_name: &str,
+    sa_uid: Option<&str>,
+    secret_type: &str,
+    data: &[(&str, &str)],
+) -> Secret {
+    let mut annotations = std::collections::HashMap::new();
+    annotations.insert(
+        "kubernetes.io/service-account.name".to_string(),
+        sa_name.to_string(),
+    );
+    if let Some(uid) = sa_uid {
+        annotations.insert(
+            "kubernetes.io/service-account.uid".to_string(),
+            uid.to_string(),
+        );
+    }
+    let mut meta = service_account(namespace, name).metadata;
+    meta.annotations = Some(annotations);
+    Secret {
+        type_meta: TypeMeta {
+            kind: "Secret".to_string(),
+            api_version: "v1".to_string(),
+        },
+        metadata: meta,
+        secret_type: Some(secret_type.to_string()),
+        data: Some(
+            data.iter()
+                .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+                .collect(),
+        ),
+        string_data: None,
+        immutable: None,
+    }
+}
+
+/// Seed an SA with a real UID (the controller's own default SA has none).
+async fn seed_sa(storage: &Arc<MemoryStorage>, ns: &str, name: &str) -> ServiceAccount {
+    let sa = service_account(ns, name);
+    storage
+        .create(&build_key("serviceaccounts", Some(ns), name), &sa)
+        .await
+        .unwrap();
+    sa
+}
+
+async fn seed_secret(storage: &Arc<MemoryStorage>, secret: &Secret) {
+    storage
+        .create(
+            &build_key(
+                "secrets",
+                secret.metadata.namespace.as_deref(),
+                &secret.metadata.name,
+            ),
+            secret,
+        )
+        .await
+        .unwrap();
+}
+
+async fn get_secret(storage: &Arc<MemoryStorage>, ns: &str, name: &str) -> Option<Secret> {
+    storage
+        .get::<Secret>(&build_key("secrets", Some(ns), name))
+        .await
+        .ok()
+}
+
+/// "added token secret without token data" / "without ca data" /
+/// "without namespace data".
+#[tokio::test]
+async fn test_tokens_controller_populates_user_created_token_secret() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller =
+        ServiceAccountController::new(storage.clone()).with_ca_cert(Some(CA_PEM.to_string()));
+    let sa = seed_sa(&storage, "ns1", "sa1").await;
+    seed_secret(
+        &storage,
+        &token_secret(
+            "ns1",
+            "tok",
+            "sa1",
+            Some(&sa.metadata.uid),
+            SA_TOKEN_TYPE,
+            &[],
+        ),
+    )
+    .await;
+
+    controller.sync_token_secret("ns1", "tok").await.unwrap();
+
+    let got = get_secret(&storage, "ns1", "tok").await.expect("kept");
+    let data = got.data.expect("data populated");
+    assert!(!data.get("token").map(|v| v.is_empty()).unwrap_or(true));
+    assert_eq!(
+        data.get("namespace").map(|v| v.as_slice()),
+        Some(&b"ns1"[..])
+    );
+    assert_eq!(data.get("ca.crt"), Some(&CA_PEM.as_bytes().to_vec()));
+    let ann = got.metadata.annotations.unwrap();
+    assert_eq!(
+        ann.get("kubernetes.io/service-account.name").unwrap(),
+        "sa1"
+    );
+    assert_eq!(
+        ann.get("kubernetes.io/service-account.uid").unwrap(),
+        &sa.metadata.uid
+    );
+}
+
+/// "added token secret with mismatched ca data" + "with custom namespace data":
+/// a wrong CA is replaced, a present token and namespace are left alone.
+#[tokio::test]
+async fn test_tokens_controller_fixes_mismatched_ca_keeps_existing_data() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller =
+        ServiceAccountController::new(storage.clone()).with_ca_cert(Some(CA_PEM.to_string()));
+    let sa = seed_sa(&storage, "ns1", "sa1").await;
+    seed_secret(
+        &storage,
+        &token_secret(
+            "ns1",
+            "tok",
+            "sa1",
+            Some(&sa.metadata.uid),
+            SA_TOKEN_TYPE,
+            &[
+                ("token", "existing"),
+                ("ca.crt", "stale"),
+                ("namespace", "custom"),
+            ],
+        ),
+    )
+    .await;
+
+    controller.sync_token_secret("ns1", "tok").await.unwrap();
+
+    let data = get_secret(&storage, "ns1", "tok")
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(data.get("token").unwrap(), b"existing");
+    assert_eq!(data.get("namespace").unwrap(), b"custom");
+    assert_eq!(data.get("ca.crt").unwrap(), CA_PEM.as_bytes());
+}
+
+/// "added secret without serviceaccount": the token is deleted.
+#[tokio::test]
+async fn test_tokens_controller_deletes_token_when_sa_missing() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller = ServiceAccountController::new(storage.clone());
+    seed_secret(
+        &storage,
+        &token_secret("ns1", "tok", "gone", None, SA_TOKEN_TYPE, &[]),
+    )
+    .await;
+
+    controller.sync_token_secret("ns1", "tok").await.unwrap();
+
+    assert!(get_secret(&storage, "ns1", "tok").await.is_none());
+}
+
+/// `getServiceAccount(.., uid, ..)`: an SA with a different UID is "missing".
+#[tokio::test]
+async fn test_tokens_controller_deletes_token_on_sa_uid_mismatch() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller = ServiceAccountController::new(storage.clone());
+    seed_sa(&storage, "ns1", "sa1").await;
+    seed_secret(
+        &storage,
+        &token_secret(
+            "ns1",
+            "tok",
+            "sa1",
+            Some("some-other-uid"),
+            SA_TOKEN_TYPE,
+            &[],
+        ),
+    )
+    .await;
+
+    controller.sync_token_secret("ns1", "tok").await.unwrap();
+
+    assert!(get_secret(&storage, "ns1", "tok").await.is_none());
+}
+
+/// Only `kubernetes.io/service-account-token` Secrets are touched.
+#[tokio::test]
+async fn test_tokens_controller_ignores_other_secret_types() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller = ServiceAccountController::new(storage.clone());
+    seed_secret(
+        &storage,
+        &token_secret("ns1", "opaque", "gone", None, "Opaque", &[]),
+    )
+    .await;
+
+    controller.sync_token_secret("ns1", "opaque").await.unwrap();
+
+    let got = get_secret(&storage, "ns1", "opaque")
+        .await
+        .expect("untouched");
+    assert!(got.data.unwrap().is_empty());
+}
+
+/// "deleted serviceaccount with token secrets": the SA's tokens go with it,
+/// other SAs' tokens stay.
+#[tokio::test]
+async fn test_tokens_controller_deletes_tokens_of_deleted_sa() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller = ServiceAccountController::new(storage.clone());
+    let other = seed_sa(&storage, "ns1", "other").await;
+    seed_secret(
+        &storage,
+        &token_secret(
+            "ns1",
+            "t-gone",
+            "gone",
+            None,
+            SA_TOKEN_TYPE,
+            &[("token", "x")],
+        ),
+    )
+    .await;
+    seed_secret(
+        &storage,
+        &token_secret(
+            "ns1",
+            "t-other",
+            "other",
+            Some(&other.metadata.uid),
+            SA_TOKEN_TYPE,
+            &[("token", "x")],
+        ),
+    )
+    .await;
+
+    controller
+        .reconcile_serviceaccount("ns1", "gone")
+        .await
+        .unwrap();
+
+    assert!(get_secret(&storage, "ns1", "t-gone").await.is_none());
+    assert!(get_secret(&storage, "ns1", "t-other").await.is_some());
+}
