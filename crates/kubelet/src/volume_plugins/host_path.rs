@@ -1,4 +1,4 @@
-use crate::runtime::{check_host_path_type, HostPathCheck};
+use crate::runtime::check_host_path_type_msg;
 use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -163,30 +163,8 @@ impl Mounter for HostPathMounter {
         //      (991a503d:crates/kubelet/src/volumes.rs:959-988) ----
         let path = &self.path;
         let host_path_type = self.path_type.as_deref();
-        match check_host_path_type(path, host_path_type) {
-            HostPathCheck::Ok => {}
-            HostPathCheck::Missing => {
-                return Err(anyhow::anyhow!(
-                    "hostPath {} does not exist (type={:?})",
-                    path,
-                    host_path_type
-                ));
-            }
-            HostPathCheck::WrongKind => {
-                return Err(anyhow::anyhow!(
-                    "hostPath {} exists but does not match type={:?}",
-                    path,
-                    host_path_type
-                ));
-            }
-            HostPathCheck::UnsupportedType => {
-                return Err(anyhow::anyhow!(
-                    "hostPath {} declared unknown type {:?}",
-                    path,
-                    host_path_type
-                ));
-            }
-        }
+        // `checkType` (`host_path.go:251-253`): upstream's exact error text.
+        check_host_path_type_msg(path, host_path_type).map_err(|(_, msg)| anyhow!(msg))?;
         info!("Using hostPath volume {} at {}", self.volume_name, path);
         // ---- end moved body ----
         Ok(())
@@ -196,6 +174,7 @@ impl Mounter for HostPathMounter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{check_host_path_type, HostPathCheck};
     use rusternetes_common::resources::{PersistentVolume, Volume};
     use serde_json::json;
 
@@ -340,5 +319,145 @@ mod tests {
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
         assert_eq!(m.get_path(), "/data/$RUSTERNETES_HOSTPATH_TEST_UNSET_VAR");
+    }
+
+    async fn set_up_err(path: &str, ty: &str) -> String {
+        let v: Volume =
+            serde_json::from_value(json!({"name": "hp", "hostPath": {"path": path, "type": ty}}))
+                .unwrap();
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+        };
+        let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
+        m.set_up().await.unwrap_err().to_string()
+    }
+
+    /// `checkTypeInternal` error strings (`host_path.go:463-494`). A MISSING
+    /// path fails the same way as a wrong-kind one: `IsDir()`/`IsFile()`
+    /// return false when the path does not exist (`host_path.go:395-401`).
+    #[tokio::test]
+    async fn set_up_uses_upstream_type_check_error_strings() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        let file = d.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let missing = d.path().join("nope");
+        let (dir, file, missing) = (
+            dir.to_str().unwrap(),
+            file.to_str().unwrap(),
+            missing.to_str().unwrap(),
+        );
+        let fail = "hostPath type check failed";
+        assert_eq!(
+            set_up_err(file, "Directory").await,
+            format!("{fail}: {file} is not a directory")
+        );
+        assert_eq!(
+            set_up_err(missing, "Directory").await,
+            format!("{fail}: {missing} is not a directory")
+        );
+        assert_eq!(
+            set_up_err(file, "DirectoryOrCreate").await,
+            format!("{fail}: {file} is not a directory")
+        );
+        assert_eq!(
+            set_up_err(dir, "File").await,
+            format!("{fail}: {dir} is not a file")
+        );
+        assert_eq!(
+            set_up_err(missing, "File").await,
+            format!("{fail}: {missing} is not a file")
+        );
+        assert_eq!(
+            set_up_err(dir, "FileOrCreate").await,
+            format!("{fail}: {dir} is not a file")
+        );
+        assert_eq!(
+            set_up_err(file, "Socket").await,
+            format!("{fail}: {file} is not a socket file")
+        );
+        assert_eq!(
+            set_up_err(file, "CharDevice").await,
+            format!("{fail}: {file} is not a character device")
+        );
+        assert_eq!(
+            set_up_err(file, "BlockDevice").await,
+            format!("{fail}: {file} is not a block device")
+        );
+    }
+
+    /// `default:` arm (`host_path.go:492`).
+    #[tokio::test]
+    async fn set_up_rejects_an_unknown_type_with_upstream_wording() {
+        assert_eq!(
+            set_up_err("/tmp", "Bogus").await,
+            "Bogus is an invalid volume type"
+        );
+    }
+
+    /// `GetFileType` uses `os.Stat` and `PathExists` follows symlinks
+    /// (`hostutil.go:82`, `hostutil_linux.go:152-154`): a symlink to a
+    /// directory IS a directory, a symlink to a file IS a file.
+    #[cfg(unix)]
+    #[test]
+    fn type_check_follows_symlinks() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        let file = d.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let ld = d.path().join("ld");
+        let lf = d.path().join("lf");
+        std::os::unix::fs::symlink(&dir, &ld).unwrap();
+        std::os::unix::fs::symlink(&file, &lf).unwrap();
+        assert_eq!(
+            check_host_path_type(ld.to_str().unwrap(), Some("Directory")),
+            HostPathCheck::Ok
+        );
+        assert_eq!(
+            check_host_path_type(lf.to_str().unwrap(), Some("File")),
+            HostPathCheck::Ok
+        );
+        assert_eq!(
+            check_host_path_type(ld.to_str().unwrap(), Some("DirectoryOrCreate")),
+            HostPathCheck::Ok
+        );
+    }
+
+    /// `makeDir` 0755 / `makeFile` 0644 (`host_path.go:504-526`), observed
+    /// under the process umask (Go applies it too).
+    #[cfg(unix)]
+    #[test]
+    fn or_create_uses_upstream_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let sub = d.path().join("a/b");
+        let f = d.path().join("f");
+        assert_eq!(
+            check_host_path_type(sub.to_str().unwrap(), Some("DirectoryOrCreate")),
+            HostPathCheck::Ok
+        );
+        assert_eq!(
+            check_host_path_type(f.to_str().unwrap(), Some("FileOrCreate")),
+            HostPathCheck::Ok
+        );
+        let m = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(m(&sub), 0o755 & !current_umask());
+        assert_eq!(m(&f), 0o644 & !current_umask());
+    }
+
+    #[cfg(unix)]
+    fn current_umask() -> u32 {
+        // /proc/self/status "Umask:" avoids a racy umask() write.
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("Umask:"))
+                    .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
+            })
+            .unwrap_or(0o022)
     }
 }

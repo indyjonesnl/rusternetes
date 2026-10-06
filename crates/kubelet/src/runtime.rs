@@ -155,7 +155,15 @@ enum UnixKind {
 fn check_unix_special(
     meta_res: std::io::Result<std::fs::Metadata>,
     kind: UnixKind,
-) -> HostPathCheck {
+    noun: &str,
+    path: &str,
+) -> Result<(), (HostPathCheck, String)> {
+    let failed = |check| {
+        (
+            check,
+            format!("hostPath type check failed: {path} is not {noun}"),
+        )
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
@@ -168,18 +176,18 @@ fn check_unix_special(
                     UnixKind::BlockDevice => ft.is_block_device(),
                 };
                 if matched {
-                    HostPathCheck::Ok
+                    Ok(())
                 } else {
-                    HostPathCheck::WrongKind
+                    Err(failed(HostPathCheck::WrongKind))
                 }
             }
-            Err(_) => HostPathCheck::Missing,
+            Err(_) => Err(failed(HostPathCheck::Missing)),
         }
     }
     #[cfg(not(unix))]
     {
         let _ = (meta_res, kind);
-        HostPathCheck::WrongKind
+        Err(failed(HostPathCheck::WrongKind))
     }
 }
 
@@ -216,68 +224,104 @@ pub enum HostPathCheck {
 ///   matching device kind (treated as `WrongKind` on non-Unix targets).
 /// - Anything else → `UnsupportedType`.
 pub fn check_host_path_type(path: &str, type_: Option<&str>) -> HostPathCheck {
+    match check_host_path_type_msg(path, type_) {
+        Ok(()) => HostPathCheck::Ok,
+        Err((check, _)) => check,
+    }
+}
+
+/// Port of `checkTypeInternal` (`pkg/volume/hostpath/host_path.go:463-494`)
+/// with `makeDir`/`makeFile` (`:504-526`). Returns upstream's exact error
+/// string alongside the classification. Like upstream's
+/// `hostutil.GetFileType`/`PathExists` (`hostutil.go:82`,
+/// `hostutil_linux.go:152-154`) it uses `stat`, so symlinks are followed.
+/// A missing path fails exactly like a wrong-kind one (`IsDir()`/`IsFile()`
+/// are false when the path does not exist, `host_path.go:395-401`).
+pub fn check_host_path_type_msg(
+    path: &str,
+    type_: Option<&str>,
+) -> Result<(), (HostPathCheck, String)> {
     let kind = match type_ {
-        None | Some("") => return HostPathCheck::Ok,
+        None | Some("") => return Ok(()),
         Some(k) => k,
     };
 
-    let meta_res = std::fs::symlink_metadata(path);
+    let meta_res = std::fs::metadata(path);
+    let failed = |check, noun: &str| {
+        Err((
+            check,
+            format!("hostPath type check failed: {path} is not {noun}"),
+        ))
+    };
+    let missing_or_wrong = |meta: &std::io::Result<std::fs::Metadata>| match meta {
+        Ok(_) => HostPathCheck::WrongKind,
+        Err(_) => HostPathCheck::Missing,
+    };
 
     match kind {
-        "DirectoryOrCreate" => {
-            if let Ok(meta) = &meta_res {
-                if meta.file_type().is_dir() {
-                    return HostPathCheck::Ok;
-                }
-                return HostPathCheck::WrongKind;
+        "DirectoryOrCreate" | "Directory" => {
+            if kind == "DirectoryOrCreate" && meta_res.is_err() && !path_exists(path) {
+                return make_dir(path).map_err(|e| (HostPathCheck::Missing, e.to_string()));
             }
-            match std::fs::create_dir_all(path) {
-                Ok(()) => HostPathCheck::Ok,
-                Err(_) => HostPathCheck::Missing,
+            match &meta_res {
+                Ok(m) if m.is_dir() => Ok(()),
+                _ => failed(missing_or_wrong(&meta_res), "a directory"),
             }
         }
-        "Directory" => match meta_res {
-            Ok(meta) if meta.file_type().is_dir() => HostPathCheck::Ok,
-            Ok(_) => HostPathCheck::WrongKind,
-            Err(_) => HostPathCheck::Missing,
-        },
-        "FileOrCreate" => {
-            if let Ok(meta) = &meta_res {
-                if meta.file_type().is_file() {
-                    return HostPathCheck::Ok;
-                }
-                return HostPathCheck::WrongKind;
+        "FileOrCreate" | "File" => {
+            if kind == "FileOrCreate" && meta_res.is_err() && !path_exists(path) {
+                return make_file(path).map_err(|e| (HostPathCheck::Missing, e.to_string()));
             }
-            // Parent directory must already exist — `FileOrCreate` does
-            // NOT recursively create parent dirs (only `DirectoryOrCreate`
-            // does). This matches upstream `host_path.go::createHostPathFile`.
-            let parent_ok = std::path::Path::new(path)
-                .parent()
-                .map(|p| p.as_os_str().is_empty() || p.is_dir())
-                .unwrap_or(false);
-            if !parent_ok {
-                return HostPathCheck::Missing;
-            }
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(path)
-            {
-                Ok(_) => HostPathCheck::Ok,
-                Err(_) => HostPathCheck::Missing,
+            match &meta_res {
+                Ok(m) if m.is_file() => Ok(()),
+                _ => failed(missing_or_wrong(&meta_res), "a file"),
             }
         }
-        "File" => match meta_res {
-            Ok(meta) if meta.file_type().is_file() => HostPathCheck::Ok,
-            Ok(_) => HostPathCheck::WrongKind,
-            Err(_) => HostPathCheck::Missing,
-        },
-        "Socket" => check_unix_special(meta_res, UnixKind::Socket),
-        "CharDevice" => check_unix_special(meta_res, UnixKind::CharDevice),
-        "BlockDevice" => check_unix_special(meta_res, UnixKind::BlockDevice),
-        _ => HostPathCheck::UnsupportedType,
+        "Socket" => check_unix_special(meta_res, UnixKind::Socket, "a socket file", path),
+        "CharDevice" => {
+            check_unix_special(meta_res, UnixKind::CharDevice, "a character device", path)
+        }
+        "BlockDevice" => {
+            check_unix_special(meta_res, UnixKind::BlockDevice, "a block device", path)
+        }
+        other => Err((
+            HostPathCheck::UnsupportedType,
+            format!("{other} is an invalid volume type"),
+        )),
     }
+}
+
+/// `PathExists` (`hostutil_linux.go:152-154`): `os.Stat`, not-found => false.
+/// (A dangling symlink therefore does not exist, and `makeFile`'s
+/// `O_CREATE` open then creates its target, as in Go.)
+fn path_exists(path: &str) -> bool {
+    !matches!(std::fs::metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// `makeDir` (`host_path.go:504-514`): `os.MkdirAll(pathname, 0755)`.
+fn make_dir(path: &str) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o755);
+    }
+    b.create(path)
+}
+
+/// `makeFile` (`host_path.go:516-526`): `os.OpenFile(O_CREATE, 0644)`.
+fn make_file(path: &str) -> std::io::Result<()> {
+    let mut o = std::fs::OpenOptions::new();
+    // Rust refuses `create` without write/append; no truncate, so an existing
+    // file is untouched (Go: bare O_CREATE).
+    o.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o644);
+    }
+    o.open(path).map(|_| ())
 }
 
 /// Compute the supplementary group IDs that must be added to a container's
