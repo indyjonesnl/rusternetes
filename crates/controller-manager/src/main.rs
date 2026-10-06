@@ -12,6 +12,7 @@ use clap::Parser;
 use controllers::{
     apiservice::APIServiceAvailabilityController,
     certificate_signing_request::CertificateSigningRequestController,
+    clusterrole_aggregation::ClusterRoleAggregationController,
     cronjob::CronJobController,
     daemonset::DaemonSetController,
     deployment::DeploymentController,
@@ -764,6 +765,18 @@ async fn main() -> Result<()> {
         async move {
             if let Err(e) = controller.run().await {
                 tracing::error!("TaintEviction controller error: {}", e);
+            }
+        }
+    });
+
+    // Start ClusterRole aggregation controller (watch-based)
+    let clusterrole_aggregation_controller =
+        Arc::new(ClusterRoleAggregationController::new(storage.clone()));
+    spawn_controller!("ClusterRoleAggregator controller", leader_elector, {
+        let controller = clusterrole_aggregation_controller.clone();
+        async move {
+            if let Err(e) = controller.run().await {
+                tracing::error!("ClusterRoleAggregator controller error: {}", e);
             }
         }
     });

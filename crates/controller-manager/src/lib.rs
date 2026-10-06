@@ -5,6 +5,7 @@ pub use controllers::*;
 use controllers::{
     apiservice::APIServiceAvailabilityController,
     certificate_signing_request::CertificateSigningRequestController,
+    clusterrole_aggregation::ClusterRoleAggregationController,
     cronjob::CronJobController,
     daemonset::DaemonSetController,
     deployment::DeploymentController,
@@ -399,6 +400,14 @@ async fn run_controllers<S: Storage + Send + Sync + 'static>(
         let c = Arc::new(controllers::taint_eviction::TaintEvictionController::new(s));
         if let Err(e) = c.run().await {
             error!("TaintEviction controller error: {}", e);
+        }
+    });
+
+    let s = storage.clone();
+    tokio::spawn(async move {
+        let c = Arc::new(ClusterRoleAggregationController::new(s));
+        if let Err(e) = c.run().await {
+            error!("ClusterRoleAggregator controller error: {}", e);
         }
     });
 
