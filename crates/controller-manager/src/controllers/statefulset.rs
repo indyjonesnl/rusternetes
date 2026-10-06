@@ -1,3 +1,4 @@
+use super::replicationcontroller::slow_start_batches_capped;
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::{
@@ -9,6 +10,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, warn};
+
+/// `slowStartBatch` initial size for the StatefulSet controller's burst paths
+/// (pkg/controller/statefulset/stateful_set_control.go:544, `slowStartBatch(1, ...)`).
+const SLOW_START_INITIAL_BATCH_SIZE: usize = 1;
+
+/// `MaxBatchSize` (pkg/controller/statefulset/stateful_set_control.go:42).
+const MAX_BATCH_SIZE: usize = 500;
 
 pub struct StatefulSetController<S: Storage> {
     storage: Arc<S>,
@@ -522,112 +530,80 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             });
 
             // Upstream `processCondemned`
-            // (pkg/controller/statefulset/stateful_set_control.go:508-535) returns
-            // `shouldExit = true` from EVERY branch when `monotonic` (OrderedReady),
-            // and `runForAll` (:537-549) stops the loop on the first `shouldExit`.
-            // So exactly ONE condemned pod is processed per sync — whatever the
-            // outcome of processing it: blocked, skipped, deleted, or failed to
-            // delete.
+            // (pkg/controller/statefulset/stateful_set_control.go:508-535) and
+            // `runForAll` (:537-549):
             //
-            // (Upstream fans out over all condemned pods under the Parallel policy
-            // via `slowStartBatch`; this loop serialises there too. That divergence
-            // is pre-existing and deliberately left alone here — see #1822.)
+            // * monotonic (OrderedReady): `shouldExit = true` from EVERY branch, and
+            //   `runForAll` stops on the first one. Exactly ONE condemned pod is
+            //   processed per sync, whatever the outcome: blocked, skipped,
+            //   deleted, or failed to delete. A terminating pod blocks (:510-518).
+            //   (This used to fall through to the next, lower ordinal when the
+            //   freshly-read pod was already terminating, the delete errored or
+            //   the pod was gone; against a vanilla api-server the reconcile list
+            //   is a moment stale, so a 3->0 scale-down killed all three pods in
+            //   one second, out of order (#1821).)
+            // * Parallel (burst, `!monotonic`): `processCondemned` returns
+            //   `(false, nil)` for a terminating pod so the batch keeps going, and
+            //   `runForAll` runs `slowStartBatch(1, len(condemned), fn)` over ALL
+            //   condemned pods (#1822). A failing batch stops the rest and the
+            //   errors are aggregated (:351-356).
             //
-            // This used to be a loop that exited only on a SUCCESSFUL delete, and
-            // fell through to the next (lower) ordinal in three cases: the
-            // freshly-read pod already had a deletionTimestamp, the delete errored,
-            // or the pod was already gone. Against a vanilla api-server the reconcile list is a moment stale,
-            // so the first case fires constantly: `ss-2` looks alive in the list, the
-            // fresh GET shows it already terminating, we skip it and delete `ss-1` in
-            // the SAME pass — and `ss-0` in the next. A 3->0 scale-down killed all
-            // three pods within one second, out of order, instead of one at a time in
-            // reverse ordinal order (vanilla-swap controller-manager leg: every pod
-            // got "Killing: Stopping container webserver" at the same timestamp, and
-            // `[sig-apps] StatefulSet ... Scaling should happen in predictable order
-            // and halt if any stateful pod is unhealthy` timed out waiting on the
-            // ordered Pod DELETED events). Direct-storage mode never showed it: the
-            // list is always fresh there, so the stale branch was unreachable.
-            // Exactly one condemned pod per sync, so this is the head of the list
-            // — not a loop.
-            if let Some(pod) = condemned.first() {
-                // If pod is already terminating, wait for it (upstream :510-518).
-                let terminating = pod.metadata.deletion_timestamp.is_some();
-                if terminating {
-                    debug!(
-                        "StatefulSet {}/{}: waiting for pod {} to terminate",
-                        namespace, name, pod.metadata.name
-                    );
-                }
-
-                let mut blocked = terminating;
-                if !blocked && is_ordered_ready {
-                    let is_ready = pod
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.conditions.as_ref())
-                        .map(|conds| {
-                            conds
-                                .iter()
-                                .any(|c| c.condition_type == "Ready" && c.status == "True")
-                        })
-                        .unwrap_or(false);
-                    let is_running = matches!(
-                        pod.status.as_ref().and_then(|s| s.phase.as_ref()),
-                        Some(Phase::Running)
-                    );
-
-                    // Can only delete this pod if it's Ready+Running OR if it's the firstUnhealthyPod
-                    if !(is_ready && is_running) {
-                        let is_first_unhealthy = first_unhealthy_name
-                            .as_ref()
-                            .map(|n| n == &pod.metadata.name)
-                            .unwrap_or(false);
-                        if !is_first_unhealthy {
-                            debug!(
-                                "StatefulSet {}/{}: pod {} is unhealthy but not first unhealthy, blocking scale-down",
-                                namespace, name, pod.metadata.name
-                            );
-                            blocked = true; // Block — can't skip unhealthy pods
-                        }
+            // No expectations here: upstream's StatefulSet controller has none,
+            // and the re-read below keeps a stale list from re-deleting a pod.
+            if is_ordered_ready {
+                if let Some(pod) = condemned.first() {
+                    let blocked = Self::condemned_blocked(pod, true, first_unhealthy_name.as_ref());
+                    if let Err(e) = self
+                        .delete_condemned_pod(
+                            namespace,
+                            pod,
+                            blocked,
+                            current_replicas,
+                            desired_replicas,
+                        )
+                        .await
+                    {
+                        error!("failed to delete pod {}: {}", pod.metadata.name, e);
                     }
                 }
-
-                // Delete this condemned pod — follows K8s DeleteStatefulPod pattern.
-                // K8s calls Pods(ns).Delete(name, DeleteOptions{}) which sets
-                // deletionTimestamp and lets the kubelet handle graceful shutdown.
-                let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-                // The re-read is a safety net against a stale list (do not re-delete a
-                // pod that is already terminating). It must NOT steer control flow:
-                // this pod is the one and only one processed this sync, whatever the
-                // re-read finds.
-                match self.storage.get::<Pod>(&pod_key).await {
-                    Ok(pod_to_delete) => {
-                        if !blocked && pod_to_delete.metadata.deletion_timestamp.is_none() {
-                            // DELETE the pod; do NOT write deletionTimestamp.
-                            // Upstream scales down with
-                            // `podControl.DeleteStatefulPod` ->
-                            // `client.CoreV1().Pods(ns).Delete(...)`
-                            // (pkg/controller/statefulset/stateful_pod_control.go:97),
-                            // and for good reason: deletionTimestamp is
-                            // immutable on update, so stamping it ourselves is
-                            // rejected by any api-server that enforces that
-                            // ("Pod \"ss-2\" is invalid: metadata.deletionTimestamp:
-                            // field is immutable") and the replica never goes
-                            // away. The graceful variant keeps the server's own
-                            // termination semantics (the pod's
-                            // terminationGracePeriodSeconds).
-                            if let Err(e) = self.storage.delete_gracefully(&pod_key).await {
-                                error!("failed to delete pod {}: {}", pod_key, e);
-                            } else {
-                                info!(
-                                    "Scale down: deleted pod {} ({} -> {})",
-                                    pod.metadata.name, current_replicas, desired_replicas
-                                );
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        info!("Scale down: pod {} already gone", pod.metadata.name);
+            } else {
+                // `processCondemned` skips (not blocks) a terminating pod.
+                let targets: Vec<&Pod> = condemned
+                    .iter()
+                    .copied()
+                    .filter(|p| p.metadata.deletion_timestamp.is_none())
+                    .collect();
+                let mut next = 0usize;
+                for batch in slow_start_batches_capped(
+                    targets.len(),
+                    SLOW_START_INITIAL_BATCH_SIZE,
+                    MAX_BATCH_SIZE,
+                ) {
+                    let results =
+                        futures::future::join_all(targets[next..next + batch].iter().map(|pod| {
+                            self.delete_condemned_pod(
+                                namespace,
+                                pod,
+                                false,
+                                current_replicas,
+                                desired_replicas,
+                            )
+                        }))
+                        .await;
+                    next += batch;
+                    let errors: Vec<String> = results
+                        .into_iter()
+                        .filter_map(|r| r.err().map(|e| e.to_string()))
+                        .collect();
+                    if !errors.is_empty() {
+                        error!(
+                            "StatefulSet {}/{}: {} condemned pod delete(s) failed, stopping the batch: {}",
+                            namespace,
+                            name,
+                            errors.len(),
+                            errors.join("; ")
+                        );
+                        break;
                     }
                 }
             }
@@ -1026,6 +1002,79 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 .await;
         }
 
+        Ok(())
+    }
+
+    /// Whether `processCondemned` (stateful_set_control.go:508-535) refuses to
+    /// delete this condemned pod right now. A terminating pod blocks only under
+    /// `monotonic`; the Ready/first-unhealthy gates are monotonic-only too.
+    fn condemned_blocked(
+        pod: &Pod,
+        monotonic: bool,
+        first_unhealthy_name: Option<&String>,
+    ) -> bool {
+        if pod.metadata.deletion_timestamp.is_some() {
+            return monotonic;
+        }
+        if !monotonic {
+            return false;
+        }
+        let is_ready = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .map(|conds| {
+                conds
+                    .iter()
+                    .any(|c| c.condition_type == "Ready" && c.status == "True")
+            })
+            .unwrap_or(false);
+        let is_running = matches!(
+            pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+            Some(Phase::Running)
+        );
+        // Can only delete if Ready+Running OR the firstUnhealthyPod.
+        !(is_ready && is_running) && first_unhealthy_name != Some(&pod.metadata.name)
+    }
+
+    /// `DeleteStatefulPod` for one condemned pod
+    /// (pkg/controller/statefulset/stateful_pod_control.go:97).
+    ///
+    /// The re-read is a safety net against a stale list (never re-delete a pod
+    /// that is already terminating). It must NOT steer control flow.
+    async fn delete_condemned_pod(
+        &self,
+        namespace: &str,
+        pod: &Pod,
+        blocked: bool,
+        current_replicas: i32,
+        desired_replicas: i32,
+    ) -> Result<()> {
+        if blocked {
+            debug!(
+                "StatefulSet pod {}/{}: scale-down blocked (terminating, or waiting on an unhealthy lower pod)",
+                namespace, pod.metadata.name
+            );
+            return Ok(());
+        }
+        let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
+        match self.storage.get::<Pod>(&pod_key).await {
+            Ok(pod_to_delete) => {
+                if pod_to_delete.metadata.deletion_timestamp.is_none() {
+                    // DELETE the pod; do NOT write deletionTimestamp (it is
+                    // immutable on update; an api-server rejects us stamping it).
+                    // The graceful variant keeps terminationGracePeriodSeconds.
+                    self.storage.delete_gracefully(&pod_key).await?;
+                    info!(
+                        "Scale down: deleted pod {} ({} -> {})",
+                        pod.metadata.name, current_replicas, desired_replicas
+                    );
+                }
+            }
+            Err(_) => {
+                info!("Scale down: pod {} already gone", pod.metadata.name);
+            }
+        }
         Ok(())
     }
 
