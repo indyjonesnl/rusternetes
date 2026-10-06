@@ -677,67 +677,19 @@ impl VolumeManager {
         volume: &rusternetes_common::resources::Volume,
         fetched: &FetchedSources,
     ) -> Result<()> {
-        // Resync secret volumes
+        // Resync secret volumes (AtomicWriter re-projection, #1656).
         if let Some(secret_source) = &volume.secret {
             let secret_name = match &secret_source.secret_name {
                 Some(n) => n,
                 None => return Ok(()),
             };
             let volume_dir = self.pod_volume_dir(pod, volume);
-            if let Some(secret) = fetched.secret(secret_name) {
-                let mut expected_files: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                if let Some(data) = &secret.data {
-                    if let Some(ref items) = secret_source.items {
-                        // Only mount the specified keys at their mapped paths
-                        for item in items {
-                            if let Some(v) = data.get(&item.key) {
-                                let file_path = format!("{}/{}", volume_dir, item.path);
-                                expected_files.insert(item.path.clone());
-                                if let Ok(existing) = std::fs::read(&file_path) {
-                                    if existing == *v {
-                                        continue;
-                                    }
-                                }
-                                if let Some(parent) = std::path::Path::new(&file_path).parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                let _ = std::fs::write(&file_path, v);
-                            }
-                        }
-                    } else {
-                        // Mount all keys
-                        for (k, v) in data {
-                            let file_path = format!("{}/{}", volume_dir, k);
-                            expected_files.insert(k.clone());
-                            // Only write if content changed
-                            if let Ok(existing) = std::fs::read(&file_path) {
-                                if existing == *v {
-                                    continue;
-                                }
-                            }
-                            let _ = std::fs::write(&file_path, v);
-                        }
-                    }
-                }
-                // Remove files that are no longer expected
-                if let Ok(entries) = std::fs::read_dir(&volume_dir) {
-                    for entry in entries.flatten() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            if !expected_files.contains(name) {
-                                let _ = std::fs::remove_file(entry.path());
-                            }
-                        }
-                    }
-                }
-            } else if secret_source.optional != Some(true) {
-                // Secret was deleted entirely — remove all files if not optional
-                if let Ok(entries) = std::fs::read_dir(&volume_dir) {
-                    for entry in entries.flatten() {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
-                }
-            }
+            Self::reproject_secret(
+                &volume_dir,
+                &volume.name,
+                secret_source,
+                fetched.secret(secret_name),
+            );
         }
         // Resync configmap volumes. Re-project through the AtomicWriter
         // (same as the initial mount) so an unchanged ConfigMap is a true
@@ -943,31 +895,116 @@ impl VolumeManager {
                 }
             }
         }
-        // Resync standalone downwardAPI volumes
+        // Resync standalone downwardAPI volumes: re-project through the
+        // AtomicWriter like the initial mount (downwardapi.go SetUpAt),
+        // so unchanged content is a no-op (#1656).
         if let Some(downward_api) = &volume.downward_api {
-            if let Some(items) = &downward_api.items {
-                let volume_dir = self.pod_volume_dir(pod, volume);
-                for item in items {
-                    let file_path = format!("{}/{}", volume_dir, item.path);
-                    let value = if let Some(ref field_ref) = item.field_ref {
-                        self.get_pod_field_value(pod, &field_ref.field_path)
-                            .unwrap_or_default()
-                    } else if let Some(ref resource_ref) = item.resource_field_ref {
-                        self.get_container_resource_value(pod, resource_ref)
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    if let Ok(existing) = std::fs::read_to_string(&file_path) {
-                        if existing == value {
-                            continue;
-                        }
-                    }
-                    let _ = std::fs::write(&file_path, &value);
+            let volume_dir = self.pod_volume_dir(pod, volume);
+            let items = downward_api.items.as_deref().unwrap_or(&[]);
+            let mode = downward_api.default_mode.unwrap_or(0o644) as u32;
+            match crate::volume_plugins::downward_api::collect_data(
+                items,
+                pod,
+                &self.node_allocatable,
+                mode,
+            ) {
+                Ok(payload) => {
+                    let _ = crate::atomic_writer::write_projected_payload(
+                        std::path::Path::new(&volume_dir),
+                        &payload,
+                    );
                 }
+                Err(e) => warn!("downwardAPI volume {} resync: {}", volume.name, e),
             }
         }
         Ok(())
+    }
+
+    /// Re-project a Secret volume through the AtomicWriter (#1656).
+    ///
+    /// Upstream re-runs `secretVolumeMounter.SetUpAt` for a `RequiresRemount`
+    /// volume (`pkg/volume/secret/secret.go:85-87`, `:162-208`):
+    /// `MakePayload` then `AtomicWriter.Write`, which is a no-op for unchanged
+    /// content. A required Secret that cannot be read leaves the volume
+    /// untouched (SetUp fails, kubelet retries); an optional one projects an
+    /// empty Secret (`secret.go:167-172`).
+    ///
+    /// Rusternetes-specific (mirrors the initial mount in
+    /// `volume_plugins/secret.rs`): a service-account-token Secret volume
+    /// carries a minted bound token and an injected `ca.crt`, neither of which
+    /// lives in the stored Secret. Re-projection keeps the bytes already on
+    /// disk for those two files instead of clobbering them with the raw
+    /// Secret data.
+    fn reproject_secret(
+        volume_dir: &str,
+        volume_name: &str,
+        source: &rusternetes_common::resources::SecretVolumeSource,
+        fetched: Option<&rusternetes_common::resources::Secret>,
+    ) {
+        let Some(secret_name) = source.secret_name.as_ref() else {
+            return;
+        };
+        let optional = source.optional.unwrap_or(false);
+        let namespace = fetched
+            .and_then(|s| s.metadata.namespace.clone())
+            .unwrap_or_default();
+        let empty = rusternetes_common::resources::Secret::new(secret_name.clone(), namespace);
+        let secret = match fetched {
+            Some(s) => s,
+            None if optional => &empty,
+            None => return,
+        };
+        let mode = source.default_mode.unwrap_or(0o644) as u32;
+        let mut payload = match crate::volume_plugins::secret::make_payload(
+            source.items.as_deref(),
+            secret,
+            mode,
+            optional,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Secret {} resync: {}", secret_name, e);
+                return;
+            }
+        };
+
+        let is_sa_token_volume =
+            volume_name.contains("kube-api-access") || secret_name.ends_with("-token");
+        if is_sa_token_volume {
+            let dir = std::path::Path::new(volume_dir);
+            let token_path = match source.items.as_deref() {
+                Some(items) if !items.is_empty() => items
+                    .iter()
+                    .find(|i| i.key == "token")
+                    .map(|i| i.path.clone()),
+                _ => Some("token".to_string()),
+            };
+            if let Some(tp) = token_path {
+                if let (Some(entry), Ok(existing)) =
+                    (payload.get_mut(&tp), std::fs::read(dir.join(&tp)))
+                {
+                    entry.data = existing;
+                }
+            }
+            if !payload.contains_key("ca.crt") {
+                if let Ok(existing) = std::fs::read(dir.join("ca.crt")) {
+                    payload.insert(
+                        "ca.crt".to_string(),
+                        FileProjection {
+                            data: existing,
+                            mode,
+                        },
+                    );
+                }
+            }
+        }
+
+        if let Err(e) = crate::atomic_writer::write_projected_payload(
+            std::path::Path::new(volume_dir),
+            &payload,
+        ) {
+            warn!("Secret {} resync: {:#}", secret_name, e);
+        }
     }
 
     /// Resolve a claim-backed volume to the PersistentVolume that backs it.
@@ -1256,59 +1293,21 @@ impl VolumeManager {
         {
             let volume_dir = self.pod_volume_dir(pod, volume);
 
-            // Refresh Secret volumes
+            // Refresh Secret volumes: re-run the projection through the
+            // AtomicWriter (upstream `SetUpAt` re-runs on every remount of a
+            // RequiresRemount volume), never an in-place rewrite (#1656).
             if let Some(secret_source) = &volume.secret {
-                // Create volume dir if it doesn't exist (optional Secret that was created later)
                 let _ = std::fs::create_dir_all(&volume_dir);
                 let secret_name = match &secret_source.secret_name {
                     Some(n) => n,
                     None => return Ok(()),
                 };
-                match fetched.secret(secret_name) {
-                    Some(secret) => {
-                        if let Some(data) = &secret.data {
-                            let items = secret_source.items.as_ref();
-                            if let Some(items) = items {
-                                for item in items {
-                                    if let Some(value) = data.get(&item.key) {
-                                        let file_path = format!("{}/{}", volume_dir, item.path);
-                                        let _ = std::fs::write(&file_path, value);
-                                    }
-                                }
-                            } else {
-                                // Write all current keys
-                                for (key, value) in data {
-                                    let file_path = format!("{}/{}", volume_dir, key);
-                                    let _ = std::fs::write(&file_path, value);
-                                }
-                                // Delete files for keys that no longer exist
-                                if let Ok(entries) = std::fs::read_dir(&volume_dir) {
-                                    for entry in entries.flatten() {
-                                        if let Some(fname) = entry.file_name().to_str() {
-                                            if !data.contains_key(fname)
-                                                && fname != "..data"
-                                                && fname != "ca.crt"
-                                            {
-                                                let _ = std::fs::remove_file(entry.path());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        // Secret was deleted — if optional, remove all volume files
-                        let is_optional = secret_source.optional.unwrap_or(false);
-                        if is_optional {
-                            if let Ok(entries) = std::fs::read_dir(&volume_dir) {
-                                for entry in entries.flatten() {
-                                    let _ = std::fs::remove_file(entry.path());
-                                }
-                            }
-                        }
-                    }
-                }
+                Self::reproject_secret(
+                    &volume_dir,
+                    &volume.name,
+                    secret_source,
+                    fetched.secret(secret_name),
+                );
             }
 
             // Refresh ConfigMap volumes
@@ -1726,6 +1725,174 @@ mod projected_mode_tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Drives a volume through the initial mount then repeated
+    /// `refresh_volumes` + `resync_volumes`, asserting the visible file stays
+    /// an AtomicWriter symlink and its real inode is never rewritten (#1656).
+    #[cfg(unix)]
+    async fn assert_reproject_is_noop(
+        tag: &str,
+        pod: Pod,
+        secret: Option<Secret>,
+        plugin_dir: &str,
+        volume_name: &str,
+        file: &str,
+        expected: &str,
+    ) {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = std::env::temp_dir().join(format!("rn-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let storage = Arc::new(StorageBackend::new_memory());
+        if let Some(s) = secret {
+            Storage::create(
+                storage.as_ref(),
+                &build_key("secrets", Some("default"), &s.metadata.name),
+                &s,
+            )
+            .await
+            .unwrap();
+        }
+        let vm = VolumeManager::new(
+            tmp.to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        vm.create_pod_volumes(&pod).await.unwrap();
+        let dir = crate::pod_dirs::get_pod_volume_dir(
+            &tmp.to_string_lossy(),
+            &pod.metadata.uid,
+            plugin_dir,
+            volume_name,
+        );
+        let visible = dir.join(file);
+        assert!(
+            std::fs::symlink_metadata(&visible)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{file} must be an AtomicWriter symlink after the initial mount"
+        );
+        let real = std::fs::canonicalize(&visible).unwrap();
+        let ctime_before = std::fs::metadata(&real).unwrap().ctime();
+        let link_before = std::fs::read_link(dir.join("..data")).unwrap();
+        for _ in 0..3 {
+            vm.refresh_volumes(&pod).await.unwrap();
+            vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        }
+        assert!(std::fs::symlink_metadata(&visible)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            ctime_before,
+            std::fs::metadata(&real).unwrap().ctime(),
+            "unchanged re-projection must not rewrite {file} in place"
+        );
+        assert_eq!(link_before, std::fs::read_link(dir.join("..data")).unwrap());
+        assert_eq!(std::fs::read_to_string(&visible).unwrap(), expected);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #1656: Secret re-projection (`refresh_volumes` + `resync_volumes`) must
+    /// be a true no-op, like ConfigMap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reproject_unchanged_secret_is_a_noop() {
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-sec"},
+            "spec": {"containers": [], "volumes": [{
+                "name": "creds", "secret": {"secretName": "creds"}
+            }]}
+        }))
+        .unwrap();
+        let secret =
+            Secret::new("creds", "default").with_data(std::collections::HashMap::from([(
+                "password".to_string(),
+                b"hunter2".to_vec(),
+            )]));
+        assert_reproject_is_noop(
+            "sec-noop",
+            pod,
+            Some(secret),
+            crate::pod_dirs::plugin::SECRET,
+            "creds",
+            "password",
+            "hunter2",
+        )
+        .await;
+    }
+
+    /// #1656: a service-account-token Secret volume must not have its bound
+    /// token (or injected ca.crt) clobbered by a re-projection of the raw
+    /// Secret data.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reproject_sa_token_secret_keeps_bound_token() {
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-sat"},
+            "spec": {"containers": [], "volumes": [{
+                "name": "kube-api-access-x", "secret": {"secretName": "default-token"}
+            }]}
+        }))
+        .unwrap();
+        let secret = Secret::new("default-token", "default").with_data(
+            std::collections::HashMap::from([("token".to_string(), b"static-unbound".to_vec())]),
+        );
+        let tmp = std::env::temp_dir().join(format!("rn-sat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let storage = Arc::new(StorageBackend::new_memory());
+        Storage::create(
+            storage.as_ref(),
+            &build_key("secrets", Some("default"), "default-token"),
+            &secret,
+        )
+        .await
+        .unwrap();
+        let vm = VolumeManager::new(
+            tmp.to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        vm.create_pod_volumes(&pod).await.unwrap();
+        let token = crate::pod_dirs::get_pod_volume_dir(
+            &tmp.to_string_lossy(),
+            "uid-sat",
+            crate::pod_dirs::plugin::SECRET,
+            "kube-api-access-x",
+        )
+        .join("token");
+        let before = std::fs::read(&token).unwrap();
+        assert_ne!(before, b"static-unbound", "mount substitutes a bound token");
+        vm.refresh_volumes(&pod).await.unwrap();
+        vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        assert_eq!(std::fs::read(&token).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #1656: standalone downwardAPI resync must be a true no-op.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reproject_unchanged_downward_api_is_a_noop() {
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "dapi-pod", "namespace": "default", "uid": "uid-da"},
+            "spec": {"containers": [], "volumes": [{
+                "name": "podinfo", "downwardAPI": {"items": [
+                    {"path": "name", "fieldRef": {"fieldPath": "metadata.name"}}
+                ]}
+            }]}
+        }))
+        .unwrap();
+        assert_reproject_is_noop(
+            "da-noop",
+            pod,
+            None,
+            crate::pod_dirs::plugin::DOWNWARD_API,
+            "podinfo",
+            "name",
+            "dapi-pod",
+        )
+        .await;
     }
 
     /// Projected secret resync must honor `items` mappings. If it writes every
