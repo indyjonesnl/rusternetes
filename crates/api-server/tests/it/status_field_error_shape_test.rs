@@ -232,9 +232,11 @@ async fn invalid_shape_is_single_required_cause_for_empty_containers() {
         "field path is the real upstream breadcrumb: cause={c0}"
     );
     let msg = c0.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    // `NewInvalid` sets `Cause.Message = err.ErrorBody()` (errors.go:288-292):
+    // the type and detail without the `<field>: ` prefix, which is in `field`.
     assert!(
-        msg.contains("spec.containers"),
-        "cause.message carries the upstream `<field>: <ErrorType>: <detail>` rendering: cause={c0}"
+        msg.starts_with("Required value"),
+        "cause.message is upstream's ErrorBody(): cause={c0}"
     );
 }
 

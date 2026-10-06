@@ -347,6 +347,28 @@ pub(crate) fn internal_error(msg: impl std::fmt::Display) -> Error {
     Error::Internal(format!("Internal error occurred: {msg}"))
 }
 
+/// Upstream's `BeforeCreate`/`BeforeUpdate` return
+/// `errors.NewInvalid(kind.GroupKind(), objectMeta.GetName(), errs)`
+/// (rest/create.go:122-123, rest/update.go:163-165). The strategies here
+/// return the bare [`Error::Invalid`] list; the Store, which knows the group,
+/// adds the kind and name by rebuilding it with [`Error::new_invalid`]
+/// (apimachinery pkg/api/errors/errors.go:284-312). The kind is the object's
+/// own `kind` field; an object that serializes without one keeps the bare
+/// list rather than a made-up kind.
+pub(crate) fn with_group_kind<T: Object>(err: Error, group: &str, obj: &T) -> Error {
+    let Error::Invalid(errs) = err else {
+        return err;
+    };
+    let kind = serde_json::to_value(obj)
+        .ok()
+        .and_then(|v| v.get("kind").and_then(|k| k.as_str().map(str::to_string)))
+        .filter(|k| !k.is_empty());
+    match kind {
+        Some(kind) => Error::new_invalid(group, &kind, &obj.metadata().name, errs),
+        None => Error::Invalid(errs),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BeforeCreate / BeforeUpdate
 // ---------------------------------------------------------------------------

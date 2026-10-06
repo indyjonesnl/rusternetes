@@ -95,7 +95,8 @@ async fn failed_counter_cannot_decrease() {
 
     assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(
-        body["message"], "status.failed: Invalid value: 0: cannot decrease the failed counter",
+        body["message"],
+        "Job.batch \"j-failed\" is invalid: status.failed: Invalid value: 0: cannot decrease the failed counter",
         "the wording is the contract clients match on: {body}"
     );
 }
@@ -133,7 +134,7 @@ async fn succeeded_counter_cannot_decrease_for_non_indexed_job() {
     assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(
         body["message"],
-        "status.succeeded: Invalid value: 1: cannot decrease the succeeded counter",
+        "Job.batch \"j-succ\" is invalid: status.succeeded: Invalid value: 1: cannot decrease the succeeded counter",
         "{body}"
     );
 }
@@ -174,7 +175,8 @@ async fn failed_counter_cannot_decrease_even_for_indexed_job() {
 
     assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(
-        body["message"], "status.failed: Invalid value: 0: cannot decrease the failed counter",
+        body["message"],
+        "Job.batch \"j-idx-failed\" is invalid: status.failed: Invalid value: 0: cannot decrease the failed counter",
         "{body}"
     );
 }

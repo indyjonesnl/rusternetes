@@ -29,9 +29,9 @@ use tracing::debug;
 
 use crate::registry::rest::{
     before_create, before_delete, before_update, check_generated_name_error,
-    fill_object_meta_system_fields, zero_delete_options, GarbageCollectionPolicy, GroupResource,
-    Object, RequestContext, RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
-    TransformFunc, UpdatedObjectInfo, ValidateObject, ValidateObjectUpdate,
+    fill_object_meta_system_fields, with_group_kind, zero_delete_options, GarbageCollectionPolicy,
+    GroupResource, Object, RequestContext, RestCreateStrategy, RestDeleteStrategy,
+    RestUpdateStrategy, TransformFunc, UpdatedObjectInfo, ValidateObject, ValidateObjectUpdate,
 };
 
 /// `OptimisticLockErrorMsg` (store.go:262).
@@ -787,7 +787,8 @@ impl<T: Object, S: Storage> Store<T, S> {
         create_validation: Option<&dyn ValidateObject<T>>,
         options: &CreateOptions,
     ) -> Result<T> {
-        before_create(self.create_strategy.as_ref(), ctx, &mut obj)?;
+        before_create(self.create_strategy.as_ref(), ctx, &mut obj)
+            .map_err(|e| with_group_kind(e, &self.qualified_resource.group, &obj))?;
 
         // At this point the object is fully formed: run the validators the
         // handler chain wants to enforce.
@@ -1350,7 +1351,8 @@ impl<T: Object, S: Storage> UpdateAttempt<'_, T, S> {
     async fn create_on_update(&mut self, mut obj: T) -> std::result::Result<T, Abort<T>> {
         self.creating = true;
         self.creating_obj = Some(obj.clone());
-        before_create(self.store.create_strategy.as_ref(), self.ctx, &mut obj)?;
+        before_create(self.store.create_strategy.as_ref(), self.ctx, &mut obj)
+            .map_err(|e| with_group_kind(e, &self.store.qualified_resource.group, &obj))?;
         if let Some(v) = self.create_validation {
             v.validate(self.ctx, &obj).await?;
         }
@@ -1365,7 +1367,8 @@ impl<T: Object, S: Storage> UpdateAttempt<'_, T, S> {
             self.ctx,
             &mut obj,
             existing,
-        )?;
+        )
+        .map_err(|e| with_group_kind(e, &self.store.qualified_resource.group, &obj))?;
 
         if let Some(v) = self.update_validation {
             v.validate(self.ctx, &obj, existing).await?;
