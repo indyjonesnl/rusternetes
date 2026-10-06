@@ -45,6 +45,31 @@ async fn create_injects_the_requester_and_clears_status() {
     );
 }
 
+/// `CertificateSubjectRestriction` (subjectrestriction/admission.go:64-93):
+/// a `kube-apiserver-client` CSR may not ask for `system:masters`.
+#[tokio::test]
+async fn create_rejects_system_masters_for_apiserver_client_signer() {
+    let api = TestApiServer::new();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::OrganizationName, "system:masters");
+    let pem = params.serialize_request(&key).unwrap().pem().unwrap();
+    let mut obj = csr("pooh");
+    obj["spec"]["request"] = json!(base64::engine::general_purpose::STANDARD.encode(pem));
+    obj["spec"]["signerName"] = json!("kubernetes.io/kube-apiserver-client");
+    obj["spec"]["usages"] = json!(["client auth"]);
+    let (s, body) = api.post(CSRS, &obj).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["message"].as_str().unwrap_or_default().contains(
+            "certificatesigningrequests.certificates.k8s.io \"pooh\" is forbidden: use of kubernetes.io/kube-apiserver-client signer with system:masters group is not allowed"
+        ),
+        "{body}"
+    );
+}
+
 /// The user info reaches the strategy through the request context.
 #[tokio::test]
 async fn create_records_who_asked() {
