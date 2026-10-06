@@ -4,10 +4,6 @@
 //!
 //! Not modelled, each a gate or field this tree does not carry:
 //!
-//! * `ValidatePodSpecificAnnotations` (validation.go:6006, run on the new
-//!   annotations): the deprecated seccomp/AppArmor/tolerations annotations and
-//!   `controller.kubernetes.io/pod-deletion-cost`. The add/remove/change fence
-//!   of `ValidatePodSpecificAnnotationUpdates` is ported.
 //! * `RestartAllContainersOnContainerExits` (alpha, off): a
 //!   `RestartAllContainers` rule action is not a reason a container may leave
 //!   `Terminated`, as `podutil.ContainerShouldRestart` does with the gate off.
@@ -29,6 +25,16 @@ use crate::validation::service::{is_valid_ip_for_legacy_field, parse_ip_sloppy};
 const MIRROR_POD_ANNOTATION_KEY: &str = "kubernetes.io/config.mirror";
 /// `v1.DeprecatedAppArmorBetaContainerAnnotationKeyPrefix`.
 const APP_ARMOR_ANNOTATION_PREFIX: &str = "container.apparmor.security.beta.kubernetes.io/";
+
+/// `core.TolerationsAnnotationKey`.
+const TOLERATIONS_ANNOTATION_KEY: &str = "scheduler.alpha.kubernetes.io/tolerations";
+/// `core.PodDeletionCost`.
+const POD_DELETION_COST: &str = "controller.kubernetes.io/pod-deletion-cost";
+/// `core.SeccompPodAnnotationKey`.
+const SECCOMP_POD_ANNOTATION_KEY: &str = "seccomp.security.alpha.kubernetes.io/pod";
+/// `core.SeccompContainerAnnotationKeyPrefix`.
+const SECCOMP_CONTAINER_ANNOTATION_KEY_PREFIX: &str =
+    "container.seccomp.security.alpha.kubernetes.io/";
 
 /// `ValidatePodBinding` (validation.go:6526-6539).
 pub fn validate_pod_binding(binding: &Binding) -> ErrorList {
@@ -205,8 +211,7 @@ pub fn validate_pod_status_update(new: &Pod, old: &Pod) -> ErrorList {
     errs
 }
 
-/// `ValidatePodSpecificAnnotationUpdates` (validation.go:235-263), without
-/// the `ValidatePodSpecificAnnotations` tail (see the module doc).
+/// `ValidatePodSpecificAnnotationUpdates` (validation.go:235-263).
 fn validate_pod_specific_annotation_updates(new: &Pod, old: &Pod, fld_path: &Path) -> ErrorList {
     let mut errs = Vec::new();
     let empty = HashMap::new();
@@ -244,6 +249,204 @@ fn validate_pod_specific_annotation_updates(new: &Pod, old: &Pod, fld_path: &Pat
             errs.push(Error::forbidden(
                 &fld_path.key(k.clone()),
                 "may not add mirror pod annotation",
+            ));
+        }
+    }
+    // `GetValidationOptionsFromPodSpecAndMeta` (pkg/api/pod/util.go:414,
+    // 488-492): off with the gate, and on an update only when the old
+    // annotations were already invalid.
+    let allow_invalid_pod_deletion_cost =
+        !crate::feature_gates::enabled(crate::feature_gates::Feature::PodDeletionCost)
+            || get_deletion_cost_from_pod_annotations(old_annotations).is_err();
+    let default_spec = PodSpec::default();
+    errs.extend(validate_pod_specific_annotations(
+        new_annotations,
+        new.spec.as_ref().unwrap_or(&default_spec),
+        fld_path,
+        allow_invalid_pod_deletion_cost,
+    ));
+    errs
+}
+
+/// `ValidatePodSpecificAnnotations` (validation.go:193-217). The options
+/// are `AllowInvalidPodDeletionCost`; the tolerations annotation is checked
+/// with `AllowTaintTolerationComparisonOperators` from the spec itself.
+pub(crate) fn validate_pod_specific_annotations(
+    annotations: &HashMap<String, String>,
+    spec: &PodSpec,
+    fld_path: &Path,
+    allow_invalid_pod_deletion_cost: bool,
+) -> ErrorList {
+    let mut errs = Vec::new();
+
+    if let Some(value) = annotations.get(MIRROR_POD_ANNOTATION_KEY) {
+        if spec.node_name.as_deref().unwrap_or("").is_empty() {
+            errs.push(Error::invalid(
+                &fld_path.key(MIRROR_POD_ANNOTATION_KEY.to_string()),
+                value.clone(),
+                "must set spec.nodeName if mirror pod annotation is set",
+            ));
+        }
+    }
+
+    if annotations
+        .get(TOLERATIONS_ANNOTATION_KEY)
+        .is_some_and(|v| !v.is_empty())
+    {
+        errs.extend(validate_tolerations_in_pod_annotations(
+            annotations,
+            fld_path,
+            crate::validation::pod::allow_taint_toleration_comparison_operators(Some(spec)),
+        ));
+    }
+
+    if !allow_invalid_pod_deletion_cost
+        && get_deletion_cost_from_pod_annotations(annotations).is_err()
+    {
+        errs.push(Error::invalid(
+            &fld_path.key(POD_DELETION_COST.to_string()),
+            annotations
+                .get(POD_DELETION_COST)
+                .cloned()
+                .unwrap_or_default(),
+            "must be a 32bit integer",
+        ));
+    }
+
+    errs.extend(validate_seccomp_pod_annotations(annotations, fld_path));
+    errs.extend(validate_app_armor_pod_annotations(
+        annotations,
+        spec,
+        fld_path,
+    ));
+    errs
+}
+
+/// `ValidateTolerationsInPodAnnotations` (validation.go:219-240) over
+/// `helper.GetTolerationsFromPodAnnotations` (helper/helpers.go:398-407).
+fn validate_tolerations_in_pod_annotations(
+    annotations: &HashMap<String, String>,
+    fld_path: &Path,
+    allow_comparison_operators: bool,
+) -> ErrorList {
+    let raw = annotations
+        .get(TOLERATIONS_ANNOTATION_KEY)
+        .map(String::as_str)
+        .unwrap_or("");
+    match serde_json::from_str::<Option<Vec<crate::resources::pod::Toleration>>>(raw) {
+        Err(err) => vec![Error::invalid(
+            fld_path,
+            TOLERATIONS_ANNOTATION_KEY.to_string(),
+            err.to_string(),
+        )],
+        Ok(tolerations) => {
+            let tolerations = tolerations.unwrap_or_default();
+            if tolerations.is_empty() {
+                return Vec::new();
+            }
+            crate::validation::pod::validate_tolerations_with_options(
+                &tolerations,
+                &fld_path.child(TOLERATIONS_ANNOTATION_KEY),
+                allow_comparison_operators,
+            )
+        }
+    }
+}
+
+/// `helper.GetDeletionCostFromPodAnnotations` (helper/helpers.go:491-513):
+/// a value that starts with a plus sign or a leading zero is not valid.
+fn get_deletion_cost_from_pod_annotations(
+    annotations: &HashMap<String, String>,
+) -> Result<i32, String> {
+    let Some(value) = annotations.get(POD_DELETION_COST) else {
+        return Ok(0);
+    };
+    let valid_first_digit = match value.as_bytes().first() {
+        None => false,
+        Some(b'-') => true,
+        Some(b'0') => value == "0",
+        Some(c) => c.is_ascii_digit(),
+    };
+    if !valid_first_digit {
+        return Err(format!("invalid value {value:?}"));
+    }
+    value.parse::<i32>().map_err(|e| e.to_string())
+}
+
+/// `ValidateSeccompProfile` (validation.go:5268-5279).
+fn validate_seccomp_profile(p: &str, fld_path: &Path) -> ErrorList {
+    if matches!(p, "runtime/default" | "docker/default" | "unconfined") {
+        return Vec::new();
+    }
+    if let Some(rest) = p.strip_prefix("localhost/") {
+        return crate::validation::pod::validate_local_descending_path(rest, fld_path);
+    }
+    vec![Error::invalid(
+        fld_path,
+        p.to_string(),
+        "must be a valid seccomp profile",
+    )]
+}
+
+/// `ValidateSeccompPodAnnotations` (validation.go:5281-5293).
+fn validate_seccomp_pod_annotations(
+    annotations: &HashMap<String, String>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs = Vec::new();
+    if let Some(p) = annotations.get(SECCOMP_POD_ANNOTATION_KEY) {
+        errs.extend(validate_seccomp_profile(
+            p,
+            &fld_path.child(SECCOMP_POD_ANNOTATION_KEY),
+        ));
+    }
+    for (k, p) in annotations {
+        if k.starts_with(SECCOMP_CONTAINER_ANNOTATION_KEY_PREFIX) {
+            errs.extend(validate_seccomp_profile(p, &fld_path.child(k)));
+        }
+    }
+    errs
+}
+
+/// `ValidateAppArmorPodAnnotations` (validation.go:5349-5366) and
+/// `ValidateAppArmorProfileFormat` (:5368-5376).
+fn validate_app_armor_pod_annotations(
+    annotations: &HashMap<String, String>,
+    spec: &PodSpec,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs = Vec::new();
+    for (k, p) in annotations {
+        let Some(container_name) = k.strip_prefix(APP_ARMOR_ANNOTATION_PREFIX) else {
+            continue;
+        };
+        // podSpecHasContainer: containers, init containers, ephemeral containers.
+        let has_container = spec.containers.iter().any(|c| c.name == container_name)
+            || spec
+                .init_containers
+                .iter()
+                .flatten()
+                .any(|c| c.name == container_name)
+            || spec
+                .ephemeral_containers
+                .iter()
+                .flatten()
+                .any(|c| c.name == container_name);
+        if !has_container {
+            errs.push(Error::invalid(
+                &fld_path.key(k.clone()),
+                container_name.to_string(),
+                "container not found",
+            ));
+        }
+        let valid = p.is_empty()
+            || matches!(p.as_str(), "runtime/default" | "unconfined")
+            || p.starts_with("localhost/");
+        if !valid {
+            errs.push(Error::invalid(
+                &fld_path.key(k.clone()),
+                p.clone(),
+                format!("invalid AppArmor profile name: {p:?}"),
             ));
         }
     }
@@ -855,6 +1058,143 @@ mod tests {
         );
         assert!(!validate_pod_ips(&bad, &old).is_empty());
         assert!(validate_pod_ips(&bad, &bad).is_empty());
+    }
+
+    fn annotations_path() -> Path {
+        Path::new("metadata").child("annotations")
+    }
+
+    fn ann(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// validation.go:196-200: a mirror pod must name its node.
+    #[test]
+    fn mirror_pod_annotation_needs_node_name() {
+        let a = ann(&[(MIRROR_POD_ANNOTATION_KEY, "x")]);
+        let errs =
+            validate_pod_specific_annotations(&a, &PodSpec::default(), &annotations_path(), false);
+        assert!(
+            messages(&errs).contains("must set spec.nodeName if mirror pod annotation is set"),
+            "{errs:?}"
+        );
+    }
+
+    /// validation.go:206-210: `must be a 32bit integer`, with the helper's
+    /// canonical-form rule (helper/helpers.go:508-513).
+    #[test]
+    fn pod_deletion_cost_must_be_a_32bit_integer() {
+        let spec = PodSpec::default();
+        for bad in ["+10", "008", "", "abc", "2147483648"] {
+            let a = ann(&[(POD_DELETION_COST, bad)]);
+            let errs = validate_pod_specific_annotations(&a, &spec, &annotations_path(), false);
+            assert!(messages(&errs).contains("must be a 32bit integer"), "{bad}");
+            assert!(
+                validate_pod_specific_annotations(&a, &spec, &annotations_path(), true).is_empty()
+            );
+        }
+        for good in ["0", "-5", "2147483647"] {
+            let a = ann(&[(POD_DELETION_COST, good)]);
+            assert!(
+                validate_pod_specific_annotations(&a, &spec, &annotations_path(), false).is_empty()
+            );
+        }
+    }
+
+    /// validation.go:5268-5293.
+    #[test]
+    fn seccomp_annotations_must_name_a_valid_profile() {
+        let spec = PodSpec::default();
+        let a = ann(&[
+            ("seccomp.security.alpha.kubernetes.io/pod", "bogus"),
+            (
+                "container.seccomp.security.alpha.kubernetes.io/c",
+                "localhost/../x",
+            ),
+        ]);
+        let m = messages(&validate_pod_specific_annotations(
+            &a,
+            &spec,
+            &annotations_path(),
+            false,
+        ));
+        assert!(m.contains("must be a valid seccomp profile"), "{m}");
+        assert!(m.contains("must not contain '..'"), "{m}");
+        for ok in [
+            "runtime/default",
+            "docker/default",
+            "unconfined",
+            "localhost/p",
+        ] {
+            let a = ann(&[("seccomp.security.alpha.kubernetes.io/pod", ok)]);
+            assert!(
+                validate_pod_specific_annotations(&a, &spec, &annotations_path(), false).is_empty(),
+                "{ok}"
+            );
+        }
+    }
+
+    /// validation.go:5349-5376.
+    #[test]
+    fn apparmor_annotations_need_a_container_and_a_valid_profile() {
+        let key = |c: &str| format!("{APP_ARMOR_ANNOTATION_PREFIX}{c}");
+        let spec = PodSpec::default();
+        let a = ann(&[(&key("nope"), "bad")]);
+        let m = messages(&validate_pod_specific_annotations(
+            &a,
+            &spec,
+            &annotations_path(),
+            false,
+        ));
+        assert!(m.contains("container not found"), "{m}");
+        assert!(m.contains("invalid AppArmor profile name: \"bad\""), "{m}");
+        let p = pod(serde_json::json!({}), serde_json::json!({}));
+        let a = ann(&[(&key("c"), "localhost/p")]);
+        assert!(validate_pod_specific_annotations(
+            &a,
+            p.spec.as_ref().unwrap(),
+            &annotations_path(),
+            false
+        )
+        .is_empty());
+    }
+
+    /// validation.go:202-204, 219-240: the serialized tolerations are validated.
+    #[test]
+    fn tolerations_annotation_is_validated() {
+        let spec = PodSpec::default();
+        let key = "scheduler.alpha.kubernetes.io/tolerations";
+        let a = ann(&[(key, "{")]);
+        assert!(
+            !validate_pod_specific_annotations(&a, &spec, &annotations_path(), false).is_empty()
+        );
+        let a = ann(&[(key, r#"[{"operator":"Exists","value":"v"}]"#)]);
+        let m = messages(&validate_pod_specific_annotations(
+            &a,
+            &spec,
+            &annotations_path(),
+            false,
+        ));
+        assert!(
+            m.contains("scheduler.alpha.kubernetes.io/tolerations[0]"),
+            "{m}"
+        );
+    }
+
+    /// `/status` runs the tail on the NEW annotations (validation.go:6006).
+    #[test]
+    fn status_update_validates_the_new_annotations() {
+        let old = pod(serde_json::json!({}), serde_json::json!({}));
+        let mut new = old.clone();
+        new.metadata.annotations = Some(ann(&[(
+            "seccomp.security.alpha.kubernetes.io/pod",
+            "bogus",
+        )]));
+        let m = messages(&validate_pod_status_update(&new, &old));
+        assert!(m.contains("must be a valid seccomp profile"), "{m}");
     }
 
     #[test]
