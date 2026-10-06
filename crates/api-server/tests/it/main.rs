@@ -168,6 +168,7 @@ mod list_resource_version_router_test;
 mod minimal_body_decodes_test;
 mod mtls_client_cert_authn_test;
 mod namespace_controller_api_finalize_test;
+mod namespace_deleter_deletecollection_coverage_test;
 mod namespace_finalize_removal_test;
 mod namespace_generic_store_test;
 mod namespace_handler_test;
