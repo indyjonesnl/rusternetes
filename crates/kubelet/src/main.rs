@@ -27,6 +27,8 @@ mod events;
 mod eviction;
 #[allow(dead_code)]
 mod go_selinux;
+#[allow(dead_code)]
+mod go_selinux_label;
 mod host_port;
 #[allow(dead_code)]
 mod kubelet;
