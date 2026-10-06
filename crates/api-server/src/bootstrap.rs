@@ -1365,28 +1365,48 @@ pub async fn bootstrap_system_priority_classes<S: Storage + ?Sized>(storage: &S)
     Ok(())
 }
 
-/// The `scheduling/bootstrap-system-priority-classes` PostStartHook
-/// (storage_scheduling.go:96-139): `wait.Poll(1s, 30s)` until
-/// [`bootstrap_system_priority_classes`] succeeds. Upstream treats a failure
-/// as fatal for the apiserver ("many critical system components may fail");
-/// here the failure is logged, as the other bootstrap steps do.
-pub fn spawn_system_priority_classes_hook<S: Storage + 'static>(storage: Arc<S>) {
-    tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            match bootstrap_system_priority_classes(storage.as_ref()).await {
-                Ok(()) => {
-                    info!("all system priority classes are created successfully or already exist.");
-                    return;
-                }
-                Err(e) if tokio::time::Instant::now() >= deadline => {
-                    warn!("failed to create system priority classes: {e}");
-                    return;
-                }
-                Err(e) => warn!("unable to create system priority classes: {e}. Retrying..."),
+/// `PostStartHookName` (storage_scheduling.go:41).
+pub const SYSTEM_PRIORITY_CLASSES_HOOK: &str = "scheduling/bootstrap-system-priority-classes";
+
+/// `wait.Poll(interval, timeout, ...)` (storage_scheduling.go:104): retry
+/// `attempt` every `interval` until it succeeds or `timeout` elapses; the last
+/// error is wrapped as upstream does (:140-143,
+/// "unable to add default system priority classes: %v").
+pub async fn poll_until<F, Fut>(timeout: Duration, interval: Duration, mut attempt: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match attempt().await {
+            Ok(()) => return Ok(()),
+            Err(e) if tokio::time::Instant::now() >= deadline => {
+                return Err(anyhow::anyhow!(
+                    "unable to add default system priority classes: {e}"
+                ))
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            Err(e) => warn!("unable to create system priority classes: {e}. Retrying..."),
         }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// The `scheduling/bootstrap-system-priority-classes` PostStartHook
+/// (storage_scheduling.go:96-145): poll 1s/30s until
+/// [`bootstrap_system_priority_classes`] succeeds. A failure is returned
+/// (:140-143) and the shared runner ([`crate::post_start_hooks::spawn_hook`])
+/// treats it as fatal (hooks.go:204 `klog.Fatalf`); until it finishes the
+/// `poststarthook/<name>` check fails (hooks.go:239-246).
+pub fn spawn_system_priority_classes_hook<S: Storage + 'static>(storage: Arc<S>) {
+    crate::post_start_hooks::spawn_hook(SYSTEM_PRIORITY_CLASSES_HOOK, async move {
+        poll_until(Duration::from_secs(30), Duration::from_secs(1), || {
+            let storage = storage.clone();
+            async move { bootstrap_system_priority_classes(storage.as_ref()).await }
+        })
+        .await?;
+        info!("all system priority classes are created successfully or already exist.");
+        Ok::<(), anyhow::Error>(())
     });
 }
 
@@ -1417,6 +1437,42 @@ mod system_priority_class_tests {
             .await
             .unwrap();
         assert_eq!(cluster.value, 2_000_000_000);
+    }
+
+    /// Upstream returns the error once the 30s poll expires
+    /// (storage_scheduling.go:140-143) instead of logging and finishing.
+    #[tokio::test(start_paused = true)]
+    async fn poll_returns_error_at_deadline() {
+        let mut calls = 0;
+        let r = poll_until(Duration::from_secs(30), Duration::from_secs(1), || {
+            calls += 1;
+            async { Err::<(), _>(anyhow::anyhow!("storage down")) }
+        })
+        .await;
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("unable to add default system priority classes: storage down"),
+            "{msg}"
+        );
+        assert!(calls > 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_succeeds_after_retries() {
+        let mut calls = 0;
+        let r = poll_until(Duration::from_secs(30), Duration::from_secs(1), || {
+            calls += 1;
+            let ok = calls >= 3;
+            async move {
+                if ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("not yet"))
+                }
+            }
+        })
+        .await;
+        assert!(r.is_ok());
     }
 
     /// The hook only creates what is missing: an existing class is left alone.
