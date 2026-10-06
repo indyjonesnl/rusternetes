@@ -204,17 +204,9 @@ fn extract_field_value(resource: &Value, field_path: &str) -> Option<String> {
         }
         return Some(component.to_string());
     }
-    let resolved_path = match field_path {
-        // events.k8s.io/v1 `reportingController` is a top-level field (it
-        // serializes under that exact name), so the selector key resolves to
-        // itself via the default arm below.
-        // Event type is at top level
-        "type" => "type",
-        // Event reason
-        "reason" => "reason",
-        // involvedObject fields stay as-is (already dotted paths)
-        _ => field_path,
-    };
+    // Every other key (`type`, `reason`, `involvedObject.*`, the events.k8s.io/v1
+    // `reportingController`, ...) is a plain dotted path into the object.
+    let resolved_path = field_path;
 
     let parts: Vec<&str> = resolved_path.split('.').collect();
     let mut current = resource;
