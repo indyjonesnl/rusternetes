@@ -223,6 +223,7 @@ pub async fn get(
     OriginalUri(uri): OriginalUri,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     let out = endpoints::get_resource(
         &state,
@@ -230,6 +231,7 @@ pub async fn get(
         &auth_ctx.user,
         Some(&namespace),
         &name,
+        &params,
     )
     .await?;
     response(&uri, out).await
@@ -436,6 +438,7 @@ pub async fn get_status(
     OriginalUri(uri): OriginalUri,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     let out = endpoints::get_resource(
         &state,
@@ -443,6 +446,7 @@ pub async fn get_status(
         &auth_ctx.user,
         Some(&namespace),
         &name,
+        &params,
     )
     .await?;
     response(&uri, out).await

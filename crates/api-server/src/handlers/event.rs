@@ -200,10 +200,18 @@ pub async fn get(
     OriginalUri(uri): OriginalUri,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     let (served, scope) = scope(&state, &uri);
-    let out =
-        endpoints::get_resource(&state, &scope, &auth_ctx.user, Some(&namespace), &name).await?;
+    let out = endpoints::get_resource(
+        &state,
+        &scope,
+        &auth_ctx.user,
+        Some(&namespace),
+        &name,
+        &params,
+    )
+    .await?;
     response(served, out).await
 }
 

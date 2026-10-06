@@ -975,7 +975,13 @@ pub trait EvictionPodStore: Send + Sync {
 #[async_trait]
 impl<S: rusternetes_storage::Storage + 'static> EvictionPodStore for Store<Pod, S> {
     async fn get(&self, ctx: &RequestContext, name: &str) -> rusternetes_common::Result<Pod> {
-        Store::get(self, ctx, name).await
+        Store::get(
+            self,
+            ctx,
+            name,
+            &crate::registry::generic::GetOptions::default(),
+        )
+        .await
     }
 
     async fn update(
@@ -1075,7 +1081,11 @@ impl PdbClient for StorePdbClient {
         name: &str,
     ) -> rusternetes_common::Result<rusternetes_common::resources::PodDisruptionBudget> {
         crate::registry::policy::poddisruptionbudget::new_store(self.storage.clone())
-            .get(&Self::ctx(namespace), name)
+            .get(
+                &Self::ctx(namespace),
+                name,
+                &crate::registry::generic::GetOptions::default(),
+            )
             .await
     }
 

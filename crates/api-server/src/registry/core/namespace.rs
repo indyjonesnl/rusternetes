@@ -310,8 +310,13 @@ impl RestStorage<Namespace> for NamespaceRest {
         RestStorage::namespace_scoped(&self.store)
     }
 
-    async fn get(&self, ctx: &RequestContext, name: &str) -> Result<Namespace> {
-        RestStorage::get(&self.store, ctx, name).await
+    async fn get(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        options: &crate::registry::generic::GetOptions,
+    ) -> Result<Namespace> {
+        RestStorage::get(&self.store, ctx, name, options).await
     }
 
     async fn create(
@@ -355,7 +360,13 @@ impl RestStorage<Namespace> for NamespaceRest {
         delete_validation: Option<&dyn ValidateObject<Namespace>>,
         mut options: DeleteOptions,
     ) -> Result<(Deleted<Namespace>, bool)> {
-        let namespace = RestStorage::get(&self.store, ctx, name).await?;
+        let namespace = RestStorage::get(
+            &self.store,
+            ctx,
+            name,
+            &crate::registry::generic::GetOptions::default(),
+        )
+        .await?;
 
         // Ensure a UID precondition (:146-168).
         let preconditions = options

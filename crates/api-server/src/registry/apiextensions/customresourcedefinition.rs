@@ -320,7 +320,15 @@ impl CrdRest {
     }
 
     async fn get_crd(&self, name: &str) -> Result<Option<CustomResourceDefinition>> {
-        match self.store.get(&Self::ctx(), name).await {
+        match self
+            .store
+            .get(
+                &Self::ctx(),
+                name,
+                &crate::registry::generic::GetOptions::default(),
+            )
+            .await
+        {
             Ok(crd) => Ok(Some(crd)),
             Err(Error::NotFound(_)) => Ok(None),
             Err(e) => Err(e),
@@ -581,8 +589,13 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
         RestStorage::namespace_scoped(&self.store)
     }
 
-    async fn get(&self, ctx: &RequestContext, name: &str) -> Result<CustomResourceDefinition> {
-        RestStorage::get(&self.store, ctx, name).await
+    async fn get(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        options: &crate::registry::generic::GetOptions,
+    ) -> Result<CustomResourceDefinition> {
+        RestStorage::get(&self.store, ctx, name, options).await
     }
 
     async fn create(
@@ -641,7 +654,13 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
         delete_validation: Option<&dyn ValidateObject<CustomResourceDefinition>>,
         mut options: DeleteOptions,
     ) -> Result<(Deleted<CustomResourceDefinition>, bool)> {
-        let crd = RestStorage::get(&self.store, ctx, name).await?;
+        let crd = RestStorage::get(
+            &self.store,
+            ctx,
+            name,
+            &crate::registry::generic::GetOptions::default(),
+        )
+        .await?;
 
         // Ensure we have a UID precondition (:92-114).
         let preconditions = options

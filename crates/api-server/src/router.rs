@@ -523,6 +523,15 @@ async fn custom_resource_fallback(
                     namespace.map(|s| s.to_string()),
                     name.to_string(),
                 )),
+                axum::extract::Query(
+                    uri.query()
+                        .map(|q| {
+                            url::form_urlencoded::parse(q.as_bytes())
+                                .into_owned()
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ),
             )
             .await
             {
@@ -650,6 +659,15 @@ async fn custom_resource_fallback(
                     namespace.map(|s| s.to_string()),
                     name.to_string(),
                 )),
+                axum::extract::Query(
+                    uri.query()
+                        .map(|q| {
+                            url::form_urlencoded::parse(q.as_bytes())
+                                .into_owned()
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ),
             )
             .await
             {

@@ -89,8 +89,17 @@ pub async fn get_volumeattachment(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
-    endpoints::get_resource(&state, &scope(&state, None), &auth_ctx.user, None, &name).await
+    endpoints::get_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+    )
+    .await
 }
 
 pub async fn list_volumeattachments(
@@ -215,6 +224,7 @@ pub async fn get_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     endpoints::get_resource(
         &state,
@@ -222,6 +232,7 @@ pub async fn get_status(
         &auth_ctx.user,
         None,
         &name,
+        &params,
     )
     .await
 }

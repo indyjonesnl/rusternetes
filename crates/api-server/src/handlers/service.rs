@@ -96,6 +96,7 @@ async fn get_in(
     user: &rusternetes_common::auth::UserInfo,
     namespace: &str,
     name: &str,
+    params: &std::collections::HashMap<String, String>,
 ) -> Result<Response> {
     endpoints::get_resource(
         state,
@@ -103,6 +104,7 @@ async fn get_in(
         user,
         Some(namespace),
         name,
+        params,
     )
     .await
 }
@@ -111,8 +113,9 @@ pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
-    get_in(&state, None, &auth_ctx.user, &namespace, &name).await
+    get_in(&state, None, &auth_ctx.user, &namespace, &name, &params).await
 }
 
 pub async fn update(
@@ -221,8 +224,17 @@ pub async fn get_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
-    get_in(&state, Some("status"), &auth_ctx.user, &namespace, &name).await
+    get_in(
+        &state,
+        Some("status"),
+        &auth_ctx.user,
+        &namespace,
+        &name,
+        &params,
+    )
+    .await
 }
 
 /// PUT `/status`: `StatusREST.Update` (storage.go:186-191).

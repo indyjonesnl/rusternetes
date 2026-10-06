@@ -108,6 +108,7 @@ pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     endpoints::get_resource(
         &state,
@@ -115,6 +116,7 @@ pub async fn get(
         &auth_ctx.user,
         Some(&namespace),
         &name,
+        &params,
     )
     .await
 }
@@ -201,6 +203,7 @@ pub async fn get_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     endpoints::get_resource(
         &state,
@@ -208,6 +211,7 @@ pub async fn get_status(
         &auth_ctx.user,
         Some(&namespace),
         &name,
+        &params,
     )
     .await
 }
@@ -260,6 +264,7 @@ pub async fn get_scale(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     let response = endpoints::get_resource(
         &state,
@@ -267,6 +272,7 @@ pub async fn get_scale(
         &auth_ctx.user,
         Some(&namespace),
         &name,
+        &params,
     )
     .await?;
     Ok(endpoints::negotiate(&headers, response).await)

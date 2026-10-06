@@ -169,6 +169,7 @@ pub async fn get_custom_resource(
         Option<String>,
         String,
     )>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     info!("Getting custom resource {group}/{version}/{plural}: {name}");
     let crd = serving_crd(&state, &group, &version, &plural, None).await?;
@@ -178,6 +179,7 @@ pub async fn get_custom_resource(
         &auth_ctx.user,
         namespace.as_deref(),
         &name,
+        &params,
     )
     .await
 }
@@ -925,6 +927,7 @@ pub async fn get_custom_resource_status(
         Option<String>,
         String,
     )>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     info!("Getting custom resource status {group}/{version}/{plural}: {name}");
     let crd = serving_crd(&state, &group, &version, &plural, Some("status")).await?;
@@ -934,6 +937,7 @@ pub async fn get_custom_resource_status(
         &auth_ctx.user,
         namespace.as_deref(),
         &name,
+        &params,
     )
     .await
 }

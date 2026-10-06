@@ -50,11 +50,60 @@ pub struct CreateOptions {
     pub dry_run: bool,
 }
 
+/// The parts of `metav1.GetOptions` the Store consults.
+#[derive(Debug, Clone, Default)]
+pub struct GetOptions {
+    /// `resourceVersion`: "" and "0" accept any version; otherwise the
+    /// object returned is at least this fresh (storage.GetOptions).
+    pub resource_version: String,
+}
+
+/// `blockTimeout` (storage/cacher/watch_cache.go): how long a read waits for
+/// the storage to reach the requested resource version.
+const GET_BLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// `resourceVersionTooHighRetrySeconds` (storage/cacher/watch_cache.go).
+const RESOURCE_VERSION_TOO_HIGH_RETRY_SECONDS: i32 = 1;
+
 /// The parts of `metav1.UpdateOptions` the Store consults.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateOptions {
     /// `dryRun=All`.
     pub dry_run: bool,
+}
+
+/// The reason `strconv.ParseUint` gives for a failed parse.
+fn parse_uint_reason(e: &std::num::ParseIntError) -> &'static str {
+    use std::num::IntErrorKind::*;
+    match e.kind() {
+        PosOverflow => "value out of range",
+        _ => "invalid syntax",
+    }
+}
+
+/// `storage.NewTooLargeResourceVersionError` (storage/errors.go:229-242):
+/// `apierrors.NewTimeoutError` (apimachinery/pkg/api/errors/errors.go:399-411)
+/// with the `ResourceVersionTooLarge` cause.
+pub fn too_large_resource_version(minimum: u64, current: u64, retry_seconds: i32) -> Error {
+    let details = StatusDetails {
+        name: None,
+        group: None,
+        kind: None,
+        uid: None,
+        causes: Some(vec![rusternetes_common::StatusCause {
+            reason: Some("ResourceVersionTooLarge".to_string()),
+            message: Some("Too large resource version".to_string()),
+            field: None,
+        }]),
+        retry_after_seconds: (retry_seconds > 0).then_some(retry_seconds),
+    };
+    Error::Status(Box::new(
+        rusternetes_common::types::Status::failure_with_details(
+            format!("Timeout: Too large resource version: {minimum}, current: {current}"),
+            "Timeout",
+            504,
+            details,
+        ),
+    ))
 }
 
 /// What `Store.Delete` returns: the object itself when it still exists
@@ -370,6 +419,46 @@ impl<T: Object, S: Storage> Store<T, S> {
         msg.starts_with("/registry/")
     }
 
+    /// The `GetOptions.ResourceVersion` guarantee: the data read "will be at
+    /// least `resourceVersion`" (storage/interfaces.go GetOptions;
+    /// etcd3/store.go `validateMinimumResourceVersion` :1094-1108). Like the
+    /// watch cache's `waitUntilFreshAndBlock` (cacher/watch_cache.go:448-488,
+    /// reached via `CacheDelegator.Get`, cacher/delegator.go:139-175) it waits
+    /// up to `blockTimeout` for the storage to reach the version, then fails
+    /// with `NewTooLargeResourceVersionError` (storage/errors.go:229-242).
+    async fn wait_until_fresh(&self, resource_version: &str) -> Result<()> {
+        // `APIObjectVersioner.ParseResourceVersion`
+        // (storage/api_object_versioner.go:90-103).
+        let want: u64 = match resource_version {
+            "" | "0" => return Ok(()),
+            rv => rv.parse().map_err(|e: std::num::ParseIntError| {
+                Error::Invalid(vec![FieldError::invalid(
+                    &Path::new("resourceVersion"),
+                    rv,
+                    format!(
+                        "strconv.ParseUint: parsing {rv:?}: {}",
+                        parse_uint_reason(&e)
+                    ),
+                )])
+            })?,
+        };
+        let start = tokio::time::Instant::now();
+        loop {
+            let current = self.storage.current_revision().await?.max(0) as u64;
+            if current >= want {
+                return Ok(());
+            }
+            if start.elapsed() >= GET_BLOCK_TIMEOUT {
+                return Err(too_large_resource_version(
+                    want,
+                    current,
+                    RESOURCE_VERSION_TOO_HIGH_RETRY_SECONDS,
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// `InterpretGetError` (storage/errors/storage.go:44-57).
     fn interpret_get_error(&self, err: Error, name: &str) -> Error {
         match err {
@@ -638,8 +727,9 @@ impl<T: Object, S: Storage> Store<T, S> {
     // -- Get ---------------------------------------------------------------
 
     /// `Store.Get` (store.go:833-845).
-    pub async fn get(&self, ctx: &RequestContext, name: &str) -> Result<T> {
+    pub async fn get(&self, ctx: &RequestContext, name: &str, options: &GetOptions) -> Result<T> {
         let key = self.key_func(ctx, name)?;
+        self.wait_until_fresh(&options.resource_version).await?;
         self.storage
             .get(&key)
             .await
@@ -1516,8 +1606,8 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
         self.update_strategy.get_reset_fields()
     }
 
-    async fn get(&self, ctx: &RequestContext, name: &str) -> Result<T> {
-        Store::get(self, ctx, name).await
+    async fn get(&self, ctx: &RequestContext, name: &str, options: &GetOptions) -> Result<T> {
+        Store::get(self, ctx, name, options).await
     }
 
     async fn create(

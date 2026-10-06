@@ -2,4 +2,4 @@
 
 pub mod store;
 
-pub use store::{CreateOptions, Deleted, Store, UpdateOptions};
+pub use store::{CreateOptions, Deleted, GetOptions, Store, UpdateOptions};

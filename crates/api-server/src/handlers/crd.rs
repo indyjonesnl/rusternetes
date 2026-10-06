@@ -94,8 +94,17 @@ pub async fn get_crd(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
-    endpoints::get_resource(&state, &scope(&state, None), &auth_ctx.user, None, &name).await
+    endpoints::get_resource(
+        &state,
+        &scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+    )
+    .await
 }
 
 pub async fn update_crd(
@@ -179,6 +188,7 @@ pub async fn get_crd_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     endpoints::get_resource(
         &state,
@@ -186,6 +196,7 @@ pub async fn get_crd_status(
         &auth_ctx.user,
         None,
         &name,
+        &params,
     )
     .await
 }

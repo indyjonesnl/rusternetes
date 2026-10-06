@@ -89,6 +89,7 @@ pub async fn get_priority_level_configuration(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     endpoints::get_resource(
         &state,
@@ -96,6 +97,7 @@ pub async fn get_priority_level_configuration(
         &auth_ctx.user,
         None,
         &name,
+        &params,
     )
     .await
 }
@@ -227,6 +229,7 @@ pub async fn get_priority_level_configuration_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     endpoints::get_resource(
         &state,
@@ -234,6 +237,7 @@ pub async fn get_priority_level_configuration_status(
         &auth_ctx.user,
         None,
         &name,
+        &params,
     )
     .await
 }
@@ -328,8 +332,17 @@ pub async fn get_flow_schema(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
-    endpoints::get_resource(&state, &fs_scope(&state, None), &auth_ctx.user, None, &name).await
+    endpoints::get_resource(
+        &state,
+        &fs_scope(&state, None),
+        &auth_ctx.user,
+        None,
+        &name,
+        &params,
+    )
+    .await
 }
 
 pub async fn update_flow_schema(
@@ -452,6 +465,7 @@ pub async fn get_flow_schema_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     endpoints::get_resource(
         &state,
@@ -459,6 +473,7 @@ pub async fn get_flow_schema_status(
         &auth_ctx.user,
         None,
         &name,
+        &params,
     )
     .await
 }
