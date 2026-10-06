@@ -3,7 +3,7 @@ use crate::prometheus_client::PrometheusClient;
 use crate::registry::core::service::allocator::{storage::Etcd, AllocationBitmap};
 use crate::registry::core::service::ipallocator::cidr::MetaAllocator;
 use crate::registry::core::service::portallocator::{
-    PortAllocator, DEFAULT_SERVICE_NODE_PORT_RANGE,
+    PortAllocator, PortRange, DEFAULT_SERVICE_NODE_PORT_RANGE,
 };
 use crate::watch_cache::WatchCache;
 use rusternetes_common::auth::{BootstrapTokenManager, TokenManager};
@@ -35,6 +35,28 @@ pub struct ApiServerState {
     pub prometheus_client: Option<Arc<PrometheusClient>>,
 }
 
+/// `newServiceIPAllocators`' NodePort half (storage_core.go:484-495): one
+/// bitmap with the static-band offset, persisted under
+/// `/ranges/servicenodeports`, shared with the repair loop.
+fn new_node_port_allocator(
+    storage: &Arc<StorageBackend>,
+    pr: PortRange,
+) -> (Arc<Etcd<StorageBackend>>, Arc<PortAllocator>) {
+    let offset = crate::registry::core::service::portallocator::calculate_range_offset(pr);
+    let registry = Arc::new(Etcd::new(
+        AllocationBitmap::with_offset(pr.size, pr.to_string(), offset),
+        storage.clone(),
+        "/registry/ranges/servicenodeports",
+        "servicenodeportallocations",
+    ));
+    let backing = registry.clone();
+    let allocator = Arc::new(
+        PortAllocator::new(pr, Box::new(move |_, _, _| Ok(Box::new(backing))))
+            .expect("the NodePort allocator factory cannot fail"),
+    );
+    (registry, allocator)
+}
+
 impl ApiServerState {
     pub fn new(
         storage: Arc<StorageBackend>,
@@ -52,19 +74,8 @@ impl ApiServerState {
         // `newServiceIPAllocators` (pkg/registry/core/rest/storage_core.go:
         // 484-495): one bitmap with the static-band offset, persisted under
         // `/ranges/servicenodeports`, shared with the repair loop.
-        let pr = DEFAULT_SERVICE_NODE_PORT_RANGE;
-        let offset = crate::registry::core::service::portallocator::calculate_range_offset(pr);
-        let node_port_registry = Arc::new(Etcd::new(
-            AllocationBitmap::with_offset(pr.size, pr.to_string(), offset),
-            storage.clone(),
-            "/registry/ranges/servicenodeports",
-            "servicenodeportallocations",
-        ));
-        let backing = node_port_registry.clone();
-        let node_port_allocator = Arc::new(
-            PortAllocator::new(pr, Box::new(move |_, _, _| Ok(Box::new(backing))))
-                .expect("the NodePort allocator factory cannot fail"),
-        );
+        let (node_port_registry, node_port_allocator) =
+            new_node_port_allocator(&storage, DEFAULT_SERVICE_NODE_PORT_RANGE);
 
         // `NewMetaAllocator` for the primary family (storage_core.go:
         // 397-403); `--service-cluster-ip-range` is IPv4 here.
@@ -87,6 +98,22 @@ impl ApiServerState {
         }
     }
 
+    /// Use `pr` as the NodePort range (`--service-node-port-range`,
+    /// cmd/kube-apiserver/app/options/options.go:124), rebuilding the
+    /// allocator and the registry the repair loop shares with it
+    /// (pkg/controlplane/instance.go:397 -> storage_core.go:484-495). An
+    /// unset range (`Size == 0`) keeps the default, as
+    /// pkg/controlplane/instance.go:285-291 does.
+    pub fn with_service_node_port_range(mut self, pr: PortRange) -> Self {
+        if pr.size == 0 {
+            return self;
+        }
+        let (registry, allocator) = new_node_port_allocator(&self.storage, pr);
+        self.node_port_registry = registry;
+        self.node_port_allocator = allocator;
+        self
+    }
+
     /// Set the CA certificate PEM for distribution to service accounts
     pub fn with_ca_cert(mut self, ca_cert_pem: Option<String>) -> Self {
         self.ca_cert_pem = ca_cert_pem;
@@ -100,5 +127,44 @@ impl ApiServerState {
     ) -> Self {
         self.prometheus_client = prometheus_client;
         self
+    }
+}
+
+#[cfg(test)]
+mod node_port_range_tests {
+    use super::*;
+    use crate::registry::core::service::portallocator::PortRange;
+    use rusternetes_common::authz::AlwaysAllowAuthorizer;
+    use rusternetes_common::observability::MetricsRegistry;
+
+    fn state() -> ApiServerState {
+        ApiServerState::new(
+            Arc::new(StorageBackend::new_memory()),
+            Arc::new(TokenManager::new(b"test-secret")),
+            Arc::new(AlwaysAllowAuthorizer) as Arc<dyn Authorizer>,
+            Arc::new(MetricsRegistry::new()),
+            true,
+        )
+    }
+
+    /// `--service-node-port-range` defaults to 30000-32767
+    /// (kubeoptions.DefaultServiceNodePortRange, options.go:27).
+    #[tokio::test]
+    async fn default_node_port_range_is_30000_32767() {
+        let s = state();
+        assert_eq!(
+            s.node_port_allocator.port_range().to_string(),
+            "30000-32767"
+        );
+    }
+
+    /// The configured range reaches the allocator (storage_core.go:484-495);
+    /// the repair loop reads the same range from the allocator
+    /// (instance.go:397 hands `NodePortRange` to the REST storage).
+    #[tokio::test]
+    async fn configured_node_port_range_reaches_the_allocator() {
+        let pr = PortRange::parse("20000-20099").unwrap();
+        let s = state().with_service_node_port_range(pr);
+        assert_eq!(s.node_port_allocator.port_range(), pr);
     }
 }

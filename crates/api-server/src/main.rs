@@ -57,6 +57,14 @@ use tracing::{info, warn};
 #[command(name = "rusternetes-api-server")]
 #[command(about = "Rusternetes API Server - Kubernetes API reimplemented in Rust")]
 struct Args {
+    /// A port range to reserve for services with NodePort visibility. This
+    /// must not overlap with the ephemeral port range on nodes. Example:
+    /// '30000-32767'. Inclusive at both ends of the range
+    /// (cmd/kube-apiserver/app/options/options.go:124).
+    #[arg(long, default_value = "30000-32767")]
+    service_node_port_range:
+        rusternetes_api_server::registry::core::service::portallocator::PortRange,
+
     /// Address to bind to
     #[arg(long, default_value = "0.0.0.0:6443")]
     bind_address: String,
@@ -193,6 +201,7 @@ async fn main() -> Result<()> {
         tls_san: args.tls_san.clone(),
         skip_auth: args.skip_auth,
         client_ca_file: args.client_ca_file.clone(),
+        service_node_port_range: args.service_node_port_range,
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;
@@ -311,6 +320,10 @@ async fn main() -> Result<()> {
     let state = Arc::new(
         ApiServerState::new(storage, token_manager, authorizer, metrics, args.skip_auth)
             .with_ca_cert(ca_cert_pem)
+            .with_service_node_port_range(registry::core::service::portallocator::PortRange {
+                base: args.service_node_port_range.base,
+                size: args.service_node_port_range.size,
+            })
             .with_prometheus_client(prometheus_client),
     );
 

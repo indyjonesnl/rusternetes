@@ -71,6 +71,16 @@ impl PortRange {
     }
 }
 
+/// `PortRange.Set` as a flag value (port_range.go:78-126), so clap can parse
+/// `--service-node-port-range` the way pflag's `fs.Var` does.
+impl std::str::FromStr for PortRange {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        Self::parse(s)
+    }
+}
+
 /// `PortRange.String` (port_range.go:35-40).
 impl fmt::Display for PortRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

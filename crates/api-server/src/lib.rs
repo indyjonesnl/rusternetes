@@ -171,6 +171,11 @@ pub struct ApiServerConfig {
     /// calling [`prepare_tls_for_config`] so the CA handed to other components
     /// matches the certificate served by the API server.
     pub prepared_tls: Option<PreparedTlsConfig>,
+    /// `--service-node-port-range` (cmd/kube-apiserver/app/options/options.go:
+    /// 124): the range NodePorts are allocated from. A zero-size range means
+    /// unspecified and falls back to 30000-32767 (pkg/controlplane/
+    /// instance.go:285-291).
+    pub service_node_port_range: registry::core::service::portallocator::PortRange,
 }
 
 impl Default for ApiServerConfig {
@@ -188,6 +193,8 @@ impl Default for ApiServerConfig {
             console_dir: None,
             client_ca_file: None,
             prepared_tls: None,
+            service_node_port_range:
+                registry::core::service::portallocator::DEFAULT_SERVICE_NODE_PORT_RANGE,
         }
     }
 }
@@ -331,6 +338,7 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
             config.skip_auth,
         )
         .with_ca_cert(ca_cert_pem)
+        .with_service_node_port_range(config.service_node_port_range)
         .with_prometheus_client(prom_client),
     );
 
