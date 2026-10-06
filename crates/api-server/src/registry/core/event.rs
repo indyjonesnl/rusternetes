@@ -48,19 +48,6 @@ fn request_version(ctx: &RequestContext) -> RequestVersion {
     }
 }
 
-/// `ToSelectableFields` makes `source` fall back to the reporting controller
-/// (strategy.go:117-121). Selection here reads the stored `source.component`,
-/// so the fallback is applied to the object instead. A deliberate deviation
-/// kept from the handlers this replaces; the update path runs it before
-/// validation so `source` compares like with like against the stored object.
-fn backfill_source_component(event: &mut Event) {
-    if event.source.component.is_empty() {
-        if let Some(rc) = event.reporting_component.as_ref() {
-            event.source.component = rc.clone();
-        }
-    }
-}
-
 /// `eventStrategy` (strategy.go:35-44).
 pub struct Strategy;
 
@@ -78,10 +65,6 @@ impl RestCreateStrategy<Event> for Strategy {
     fn validate(&self, ctx: &RequestContext, obj: &Event) -> ErrorList {
         validate_event_create(obj, request_version(ctx))
     }
-
-    fn canonicalize(&self, obj: &mut Event) {
-        backfill_source_component(obj);
-    }
 }
 
 impl RestUpdateStrategy<Event> for Strategy {
@@ -90,10 +73,9 @@ impl RestUpdateStrategy<Event> for Strategy {
         true
     }
 
-    /// strategy.go:59-60: nothing to prepare beyond the source back-fill above.
-    fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut Event, _old: &Event) {
-        backfill_source_component(obj);
-    }
+    /// strategy.go:59-60: nothing to prepare. The `source` fallback lives in
+    /// field selection (`field_selector.rs`), not in the stored object.
+    fn prepare_for_update(&self, _ctx: &RequestContext, _obj: &mut Event, _old: &Event) {}
 
     /// `ValidateEventUpdate` (strategy.go:78-83).
     fn validate_update(&self, ctx: &RequestContext, obj: &Event, old: &Event) -> ErrorList {
@@ -245,13 +227,15 @@ mod tests {
         );
     }
 
+    /// The stored source.component stays as the client sent it
+    /// (strategy.go:117-121 only affects selection).
     #[test]
-    fn the_source_component_falls_back_to_the_reporting_controller() {
+    fn the_source_component_is_not_backfilled() {
         let mut e: Event = serde_json::from_value(serde_json::json!({
             "metadata": {"name": "e"}, "reportingComponent": "ctl"
         }))
         .unwrap();
         RestCreateStrategy::canonicalize(&Strategy, &mut e);
-        assert_eq!(e.source.component, "ctl");
+        assert_eq!(e.source.component, "");
     }
 }

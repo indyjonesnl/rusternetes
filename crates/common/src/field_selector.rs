@@ -179,19 +179,34 @@ impl fmt::Display for FieldOperator {
 /// Supports nested fields like "status.phase" or "metadata.namespace"
 fn extract_field_value(resource: &Value, field_path: &str) -> Option<String> {
     // K8s field selector aliases — some fields are shorthands for nested paths
-    let resolved_path = match field_path {
-        // Event source.component is queried as just "source"
-        "source" => "source.component",
-        // events.k8s.io/v1 `reportingController` is a top-level field (it
-        // serializes under that exact name), so the selector key resolves to
-        // itself via the default arm below.
-        // Event type is at top level
-        "type" => "type",
-        // Event reason
-        "reason" => "reason",
-        // involvedObject fields stay as-is (already dotted paths)
-        _ => field_path,
-    };
+    // Event `source` falls back to the reporting controller at selection time
+    // and never mutates the object: `ToSelectableFields`,
+    // pkg/registry/core/event/strategy.go:117-121 (`source := Source.Component;
+    // if source == "" { source = ReportingController }`). The core/v1 JSON name
+    // of ReportingController is `reportingComponent`.
+    if field_path == "source" {
+        let component = resource
+            .get("source")
+            .and_then(|s| s.get("component"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if component.is_empty() {
+            // The stored core Event serializes it as `reportingController`
+            // (resources/event.rs `reporting_component`).
+            return Some(
+                resource
+                    .get("reportingController")
+                    .or_else(|| resource.get("reportingComponent"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            );
+        }
+        return Some(component.to_string());
+    }
+    // Every other key (`type`, `reason`, `involvedObject.*`, the events.k8s.io/v1
+    // `reportingController`, ...) is a plain dotted path into the object.
+    let resolved_path = field_path;
 
     let parts: Vec<&str> = resolved_path.split('.').collect();
     let mut current = resource;
@@ -493,5 +508,23 @@ mod tests {
 
         let value = extract_field_value(&resource, "status.ready");
         assert_eq!(value, Some("true".to_string()));
+    }
+
+    /// strategy.go:117-121: `source` selects on the reporting controller when
+    /// `source.component` is empty; the object itself is not touched.
+    #[test]
+    fn event_source_falls_back_to_reporting_component() {
+        let ev = json!({"reportingComponent": "ctl", "source": {}});
+        assert!(FieldSelector::parse("source=ctl").unwrap().matches(&ev));
+        let ev = json!({"reportingComponent": "ctl"});
+        assert!(FieldSelector::parse("source=ctl").unwrap().matches(&ev));
+        // How the stored core Event actually serializes it.
+        let ev = json!({"reportingController": "ctl"});
+        assert!(FieldSelector::parse("source=ctl").unwrap().matches(&ev));
+        let ev = json!({"reportingComponent": "ctl", "source": {"component": "kubelet"}});
+        assert!(FieldSelector::parse("source=kubelet").unwrap().matches(&ev));
+        assert!(!FieldSelector::parse("source=ctl").unwrap().matches(&ev));
+        // Neither set: selects as the empty string.
+        assert!(FieldSelector::parse("source=").unwrap().matches(&json!({})));
     }
 }

@@ -482,3 +482,24 @@ async fn a_metadata_patch_applies_and_answers_in_the_v1_schema() {
     assert_eq!(patched["metadata"]["labels"]["k"], json!("v"));
     assert_eq!(patched["note"], json!("the note"));
 }
+
+/// `fieldValidation=Strict` judges the body as the client sent it, in the
+/// versioned type (create.go:116-148 decodes into the versioned object first),
+/// so an unknown events.k8s.io/v1 field is a 400 rather than being dropped by
+/// the conversion to core (#2111).
+#[tokio::test]
+async fn strict_field_validation_judges_the_v1_body() {
+    let api = TestApiServer::new();
+    let mut b = body("strict1");
+    b["bogusField"] = json!("x");
+    let (status, out) = api
+        .send(
+            "POST",
+            &format!("{}?fieldValidation=Strict", v1_path()),
+            Some("application/json"),
+            Some(&b),
+        )
+        .await;
+    assert_eq!(status.as_u16(), 400, "{out}");
+    assert!(out.to_string().contains("bogusField"), "{out}");
+}
