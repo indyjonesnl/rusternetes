@@ -242,24 +242,67 @@ pub trait HasMetadata {
     fn metadata(&self) -> &ObjectMeta;
 }
 
-/// Humanize a creation timestamp into kubectl's compact age string
-/// (e.g. `5d`, `3h`, `12m`, `42s`). `None` renders as `<unknown>`.
+/// Humanize a creation timestamp the way the upstream table printers do:
+/// `duration.HumanDuration(time.Since(ts))`. `None` renders as `<unknown>`
+/// (printers.go `translateTimestampSince`).
 fn humanize_age(creation: Option<chrono::DateTime<chrono::Utc>>) -> String {
     match creation {
         Some(creation_time) => {
-            let duration = chrono::Utc::now().signed_duration_since(creation_time);
-            if duration.num_days() > 0 {
-                format!("{}d", duration.num_days())
-            } else if duration.num_hours() > 0 {
-                format!("{}h", duration.num_hours())
-            } else if duration.num_minutes() > 0 {
-                format!("{}m", duration.num_minutes())
-            } else {
-                format!("{}s", duration.num_seconds().max(0))
-            }
+            human_duration(chrono::Utc::now().signed_duration_since(creation_time))
         }
         None => "<unknown>".to_string(),
     }
+}
+
+/// Port of `HumanDuration` in
+/// k8s.io/apimachinery/pkg/util/duration/duration.go:48-93: a duration
+/// rendered with at most two units, switching unit at fixed thresholds.
+fn human_duration(d: chrono::Duration) -> String {
+    let ms = d.num_milliseconds();
+    // Go: `int(d.Seconds())` truncates toward zero.
+    let seconds = ms / 1000;
+    if seconds < -1 {
+        return "<invalid>".to_string();
+    } else if seconds < 0 {
+        return "0s".to_string();
+    } else if seconds < 60 * 2 {
+        return format!("{seconds}s");
+    }
+    let minutes = ms / 60_000;
+    if minutes < 10 {
+        let s = seconds % 60;
+        if s == 0 {
+            return format!("{minutes}m");
+        }
+        return format!("{minutes}m{s}s");
+    } else if minutes < 60 * 3 {
+        return format!("{minutes}m");
+    }
+    let hours = ms / 3_600_000;
+    if hours < 8 {
+        let m = minutes % 60;
+        if m == 0 {
+            return format!("{hours}h");
+        }
+        return format!("{hours}h{m}m");
+    } else if hours < 48 {
+        return format!("{hours}h");
+    } else if hours < 24 * 8 {
+        let h = hours % 24;
+        if h == 0 {
+            return format!("{}d", hours / 24);
+        }
+        return format!("{}d{h}h", hours / 24);
+    } else if hours < 24 * 365 * 2 {
+        return format!("{}d", hours / 24);
+    } else if hours < 24 * 365 * 8 {
+        let dy = (hours / 24) % 365;
+        if dy == 0 {
+            return format!("{}y", hours / 24 / 365);
+        }
+        return format!("{}y{dy}d", hours / 24 / 365);
+    }
+    format!("{}y", hours / 24 / 365)
 }
 
 /// Format age from typed metadata.
@@ -961,5 +1004,60 @@ mod tests {
         // etcd.go:109-110: no reason is the bare status.
         assert_eq!(with("False", None), json!("False"));
         assert_eq!(with("False", Some("")), json!("False"));
+    }
+
+    // duration_test.go TestHumanDuration + TestHumanDurationBoundaries.
+    #[test]
+    fn human_duration_matches_upstream_cases() {
+        use chrono::Duration as D;
+        let h = |n: i64| D::hours(n);
+        let ms = D::milliseconds;
+        let cases: Vec<(D, &str)> = vec![
+            (D::seconds(1), "1s"),
+            (D::seconds(70), "70s"),
+            (D::seconds(190), "3m10s"),
+            (D::minutes(70), "70m"),
+            (h(47), "47h"),
+            (h(49), "2d1h"),
+            (h(8 * 24 + 2), "8d"),
+            (h(367 * 24), "367d"),
+            (h(365 * 2 * 24 + 25), "2y1d"),
+            (h(365 * 8 * 24 + 2), "8y"),
+            (D::seconds(-2), "<invalid>"),
+            (ms(-2000 + 1), "0s"),
+            (D::zero(), "0s"),
+            (ms(999), "0s"),
+            (D::minutes(2) - ms(1), "119s"),
+            (D::minutes(2), "2m"),
+            (D::minutes(2) + D::seconds(1), "2m1s"),
+            (D::minutes(10) - ms(1), "9m59s"),
+            (D::minutes(10) + D::seconds(1), "10m"),
+            (h(3) - ms(1), "179m"),
+            (h(3), "3h"),
+            (h(3) + D::minutes(1), "3h1m"),
+            (h(8) - ms(1), "7h59m"),
+            (h(8) + D::minutes(59), "8h"),
+            (h(48) - ms(1), "47h"),
+            (h(48), "2d"),
+            (h(49), "2d1h"),
+            (h(8 * 24) - ms(1), "7d23h"),
+            (h(8 * 24 + 23), "8d"),
+            (h(2 * 365 * 24) - ms(1), "729d"),
+            (h(2 * 365 * 24), "2y"),
+            (h(2 * 365 * 24 + 24), "2y1d"),
+            (h(7 * 365 * 24), "7y"),
+            (h(8 * 365 * 24) - ms(1), "7y364d"),
+            (h(8 * 365 * 24 + 364 * 24), "8y"),
+        ];
+        for (d, want) in cases {
+            assert_eq!(human_duration(d), want, "{d:?}");
+        }
+    }
+
+    #[test]
+    fn table_age_cell_is_two_unit() {
+        let ts =
+            chrono::Utc::now() - chrono::Duration::hours(24 * 5 + 3) - chrono::Duration::minutes(1);
+        assert_eq!(humanize_age(Some(ts)), "5d3h");
     }
 }

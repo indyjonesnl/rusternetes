@@ -867,6 +867,37 @@ fn get_api_group_names() -> Vec<(&'static str, &'static str)> {
 /// In v2, subresources are nested inside their parent resource's "subresources" array,
 /// NOT listed as separate top-level entries with slashes in the name.
 fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_json::Value> {
+    let mut resources = get_aggregated_resources_for_group_uncategorized(group, version);
+    for entry in resources.iter_mut() {
+        let name = entry["resource"].as_str().unwrap_or("");
+        let categories = resource_categories(group, name);
+        if !categories.is_empty() {
+            entry["categories"] = serde_json::json!(categories);
+        }
+    }
+    resources
+}
+
+/// Storage `Categories()` per resource, as installer.go:1108-1109 reads them
+/// (`rest.CategoriesProvider`) and installer.go:105 copies into the aggregated
+/// `APIResourceDiscovery.Categories`. Must agree with the typed
+/// `APIResource.categories` in the `get_*_resources` handlers.
+fn resource_categories(group: &str, resource: &str) -> &'static [&'static str] {
+    match (group, resource) {
+        ("", "pods" | "services" | "replicationcontrollers") => &["all"],
+        ("apps", "deployments" | "replicasets" | "statefulsets" | "daemonsets") => &["all"],
+        ("batch", "jobs" | "cronjobs") => &["all"],
+        ("autoscaling", "horizontalpodautoscalers") => &["all"],
+        // kube-aggregator pkg/registry/apiservice/etcd/etcd.go:75-78.
+        ("apiregistration.k8s.io", "apiservices") => &["api-extensions"],
+        _ => &[],
+    }
+}
+
+fn get_aggregated_resources_for_group_uncategorized(
+    group: &str,
+    version: &str,
+) -> Vec<serde_json::Value> {
     // Helper to build a subresource entry (nested under parent)
     let sub = |name: &str, kind: &str, verbs: &[&str]| -> serde_json::Value {
         serde_json::json!({
@@ -4358,5 +4389,57 @@ mod tests {
             .find(|r| r.name == "apiservices/status")
             .unwrap();
         assert_eq!(st.categories, None);
+    }
+
+    // installer.go:105 builds the aggregated entry from the same
+    // `r.Categories` (storage `Categories()`) as the typed APIResource.
+    #[tokio::test]
+    async fn aggregated_discovery_carries_categories_like_typed_discovery() {
+        let typed: Vec<(&str, &str, APIResourceList)> = vec![
+            ("", "v1", get_core_resources().await.1 .0),
+            ("apps", "v1", get_apps_v1_resources().await.1 .0),
+            ("batch", "v1", get_batch_v1_resources().await.1 .0),
+            (
+                "autoscaling",
+                "v2",
+                get_autoscaling_v2_resources().await.1 .0,
+            ),
+            (
+                "apiregistration.k8s.io",
+                "v1",
+                get_apiregistration_v1_resources().await.1 .0,
+            ),
+        ];
+        let mut checked = 0;
+        for (group, version, list) in typed {
+            let agg = get_aggregated_resources_for_group(group, version);
+            for r in list.resources.iter().filter(|r| !r.name.contains('/')) {
+                let entry = agg
+                    .iter()
+                    .find(|e| e["resource"].as_str() == Some(r.name.as_str()));
+                let Some(entry) = entry else { continue };
+                let want = r
+                    .categories
+                    .as_ref()
+                    .map(|c| serde_json::json!(c))
+                    .unwrap_or(serde_json::Value::Null);
+                assert_eq!(
+                    entry
+                        .get("categories")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    want,
+                    "{group}/{version} {} categories",
+                    r.name
+                );
+                if r.categories.is_some() {
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked >= 11,
+            "only {checked} categorised resources compared"
+        );
     }
 }
