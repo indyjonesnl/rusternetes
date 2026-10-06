@@ -154,7 +154,7 @@ impl Mounter for DownwardApiMounter {
 /// Deliberate deviation: upstream errors with "no defaultMode used, not even
 /// the default value for it" when `defaultMode` is nil, because the API server
 /// has defaulted it. The caller here passes 0644 for that case.
-fn collect_data(
+pub(crate) fn collect_data(
     items: &[rusternetes_common::resources::DownwardAPIVolumeFile],
     pod: &Pod,
     node_allocatable: &HashMap<String, String>,
