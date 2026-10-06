@@ -20,6 +20,7 @@ use rusternetes_middleware as middleware;
 mod openapi;
 mod patch;
 mod peer_cert_acceptor;
+mod post_start_hooks;
 mod prometheus_client;
 mod registry;
 pub use rusternetes_protobuf as protobuf;
