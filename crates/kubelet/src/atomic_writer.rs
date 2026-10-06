@@ -247,6 +247,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Upstream `newTimestampDir` (`pkg/volume/util/atomic_writer.go:399-413`)
+    /// chmods the timestamp dir to 0755 "regardless of the process' umask" so
+    /// group/other can recurse the tree; per-file modes are chmod'd likewise
+    /// (`writePayloadToDir`, `:435-439`).
+    #[tokio::test]
+    async fn timestamp_dir_is_0755_regardless_of_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aw-umask-{nanos}"));
+        // SAFETY: umask(2) is process-global; restored immediately below.
+        let old = unsafe { umask(0o077) };
+        let res = write_projected_payload(&dir, &payload(&[("a", b"x")]));
+        unsafe { umask(old) };
+        res.unwrap();
+        let ts = std::fs::read_link(dir.join("..data")).unwrap();
+        let ts_mode = std::fs::metadata(dir.join(&ts))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(ts_mode & 0o777, 0o755);
+        let f_mode = std::fs::metadata(dir.join("a"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(f_mode & 0o777, 0o644);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // Core regression: re-projecting an UNCHANGED payload must not touch the
     // user-visible file's mtime/ctime (so a kube-proxy-style config watcher
     // never fires). Also verifies the file is a symlink through `..data` and

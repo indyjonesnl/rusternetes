@@ -2242,6 +2242,16 @@ mod projected_mode_tests {
         // traversable.
         let dir_mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(dir_mode & 0o100, 0o100, "volume dir must stay traversable");
+        let ts = std::fs::read_link(format!("{path}/..data")).unwrap();
+        let ts_mode = std::fs::metadata(format!("{path}/{}", ts.display()))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            ts_mode & 0o777,
+            0o755,
+            "timestamp dir is 0755 (atomic_writer.go:399-408)"
+        );
     }
 }
 
