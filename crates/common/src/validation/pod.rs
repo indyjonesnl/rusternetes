@@ -142,10 +142,13 @@ pub fn validate_pod_create(pod: &Pod, allow_relaxed_dns_search: bool) -> ErrorLi
         return errs;
     };
 
+    // `GetValidationOptionsFromPodSpecAndMeta(spec, nil, ...)` (util.go:444):
+    // a create has no old spec, so the gate alone decides.
     errs.extend(validate_pod_spec(
         spec,
         &spec_path,
         allow_relaxed_dns_search,
+        allow_taint_toleration_comparison_operators(None),
     ));
     errs
 }
@@ -160,6 +163,7 @@ pub fn validate_pod_spec(
     spec: &PodSpec,
     fld_path: &Path,
     allow_relaxed_dns_search: bool,
+    allow_taint_toleration_comparison_operators: bool,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let containers_path = fld_path.child("containers");
@@ -340,7 +344,11 @@ pub fn validate_pod_spec(
 
     // Tolerations.
     if let Some(ref tols) = spec.tolerations {
-        errs.extend(validate_tolerations(tols, &fld_path.child("tolerations")));
+        errs.extend(validate_tolerations_with_options(
+            tols,
+            &fld_path.child("tolerations"),
+            allow_taint_toleration_comparison_operators,
+        ));
     }
 
     // topologySpreadConstraints.
@@ -3358,6 +3366,64 @@ fn validate_dns_policy(policy: Option<&str>, fld_path: &Path) -> ErrorList {
 /// - When `effect` is NoExecute, `tolerationSeconds` may be set; for other
 ///   effects it must be absent.
 pub fn validate_tolerations(tolerations: &[Toleration], fld_path: &Path) -> ErrorList {
+    validate_tolerations_with_options(tolerations, fld_path, false)
+}
+
+/// `taintTolerationComparisonOperatorsInUse` (`pkg/api/pod/util.go:1645`).
+fn taint_toleration_comparison_operators_in_use(spec: Option<&PodSpec>) -> bool {
+    spec.and_then(|s| s.tolerations.as_deref())
+        .unwrap_or(&[])
+        .iter()
+        .any(|t| matches!(t.operator.as_deref(), Some("Lt" | "Gt")))
+}
+
+/// `allowTaintTolerationComparisonOperators` (`pkg/api/pod/util.go:1654`):
+/// `PodValidationOptions.AllowTaintTolerationComparisonOperators`
+/// (`validation.go:4491`) is set when the gate is on or the old pod spec
+/// already uses `Lt`/`Gt`, so such an object stays updatable.
+pub fn allow_taint_toleration_comparison_operators(old_spec: Option<&PodSpec>) -> bool {
+    crate::feature_gates::enabled(crate::feature_gates::Feature::TaintTolerationComparisonOperators)
+        || taint_toleration_comparison_operators_in_use(old_spec)
+}
+
+/// `content.IsDecimalInteger`
+/// (`apimachinery/pkg/api/validate/content/decimal_int.go:30-62`): "0", or a
+/// non-zero integer in canonical form (no leading zeros, no plus sign).
+fn is_decimal_integer(value: &str) -> Vec<String> {
+    const MSG: &str = "must be a valid decimal integer in canonical form";
+    let b = value.as_bytes();
+    if b.is_empty() {
+        return vec!["must be non-empty".to_string()];
+    }
+    let mut i = 0;
+    if b[0] == b'-' {
+        if b.len() == 1 {
+            return vec![MSG.to_string()];
+        }
+        i = 1;
+    }
+    if b[i] == b'0' {
+        return if b.len() == 1 && i == 0 {
+            Vec::new()
+        } else {
+            vec![MSG.to_string()]
+        };
+    }
+    if b[i..].iter().all(u8::is_ascii_digit) {
+        Vec::new()
+    } else {
+        vec![MSG.to_string()]
+    }
+}
+
+/// `ValidateTolerations` (`validation.go:4366`) with
+/// `opts.AllowTaintTolerationComparisonOperators` as
+/// `allow_comparison_operators`.
+pub fn validate_tolerations_with_options(
+    tolerations: &[Toleration],
+    fld_path: &Path,
+    allow_comparison_operators: bool,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     for (i, tol) in tolerations.iter().enumerate() {
@@ -3377,6 +3443,36 @@ pub fn validate_tolerations(tolerations: &[Toleration], fld_path: &Path) -> Erro
                             op.clone(),
                             "if the operator is 'Exists', the value should be empty",
                         ));
+                    }
+                }
+                "Lt" | "Gt" => {
+                    // validation.go:4392-4408: the numeric operators need the
+                    // validation option; without it the operator is not
+                    // supported, and the list names all four.
+                    if !allow_comparison_operators {
+                        errs.push(Error::not_supported(
+                            &tpath.child("operator"),
+                            op.clone(),
+                            &["Equal", "Exists", "Lt", "Gt"],
+                        ));
+                    } else {
+                        let value = tol.value.as_deref().unwrap_or("");
+                        for msg in is_decimal_integer(value) {
+                            errs.push(Error::invalid(&tpath.child("value"), value, msg));
+                        }
+                        if let Err(e) = value.parse::<i64>() {
+                            // Go's `strconv.NumError` text.
+                            let reason = match e.kind() {
+                                std::num::IntErrorKind::PosOverflow
+                                | std::num::IntErrorKind::NegOverflow => "value out of range",
+                                _ => "invalid syntax",
+                            };
+                            errs.push(Error::invalid(
+                                &tpath.child("value"),
+                                value,
+                                format!("strconv.ParseInt: parsing \"{value}\": {reason}"),
+                            ));
+                        }
                     }
                 }
                 other => {
@@ -3835,7 +3931,17 @@ pub fn validate_pod_spec_update(
     let old_tols = old.tolerations.as_ref().unwrap_or(&empty_tols);
     let new_tols = new.tolerations.as_ref().unwrap_or(&empty_tols);
     let errs = validate_only_added_tolerations(old_tols, new_tols, &spec.child("tolerations"));
+    let added_ok = errs.is_empty();
     all_errs.extend(errs);
+    // `validateOnlyAddedTolerations` ends with `ValidateTolerations(new, opts)`
+    // (validation.go:4322), the options built from the old spec (util.go:444).
+    if added_ok {
+        all_errs.extend(validate_tolerations_with_options(
+            new_tols,
+            &spec.child("tolerations"),
+            allow_taint_toleration_comparison_operators(Some(old)),
+        ));
+    }
 
     // 3. SchedulingGates: deletions only.
     let empty_gates: Vec<PodSchedulingGate> = Vec::new();

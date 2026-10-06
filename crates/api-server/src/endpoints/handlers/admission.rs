@@ -326,6 +326,31 @@ impl Admission<'_> {
                 }
             }
         }
+
+        // PodTopologyLabels.admitPod (plugin/pkg/admission/podtopologylabels/
+        // admission.go:123-148; after RuntimeClass in plugins.go:98): a pod
+        // created with `spec.nodeName` gets the node's topology labels,
+        // overwriting its own.
+        if rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::PodTopologyLabelsAdmission,
+        ) {
+            let node_name = pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.node_name.clone())
+                .filter(|n| !n.is_empty());
+            if let Some(node_name) = node_name {
+                let labels =
+                    crate::handlers::pod::topology_labels_for_node_name(&**storage, &node_name)
+                        .await?;
+                if !labels.is_empty() {
+                    pod.metadata
+                        .labels
+                        .get_or_insert_with(Default::default)
+                        .extend(labels);
+                }
+            }
+        }
         Ok(pod)
     }
 

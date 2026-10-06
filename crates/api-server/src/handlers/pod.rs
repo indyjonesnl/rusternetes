@@ -544,11 +544,6 @@ async fn admit_binding_topology_labels(
     binding: &mut Binding,
 ) -> Result<()> {
     use rusternetes_common::feature_gates::{enabled, Feature};
-    // The plugin's default `Config.Labels`.
-    const TOPOLOGY_LABELS: [&str; 2] = [
-        "topology.kubernetes.io/zone",
-        "topology.kubernetes.io/region",
-    ];
     if !enabled(Feature::PodTopologyLabelsAdmission) {
         return Ok(());
     }
@@ -557,25 +552,41 @@ async fn admit_binding_topology_labels(
     if binding.target.kind.as_deref() != Some("Node") {
         return Ok(());
     }
-    let node_key = build_key("nodes", None::<&str>, &binding.target.name);
-    let node: Node = match state.storage.get(&node_key).await {
-        Ok(node) => node,
-        Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    let Some(node_labels) = node.metadata.labels.as_ref() else {
-        return Ok(());
-    };
-    for key in TOPOLOGY_LABELS {
-        if let Some(value) = node_labels.get(key) {
-            binding
-                .metadata
-                .labels
-                .get_or_insert_with(Default::default)
-                .insert(key.to_string(), value.clone());
-        }
+    let labels = topology_labels_for_node_name(&*state.storage, &binding.target.name).await?;
+    if !labels.is_empty() {
+        binding
+            .metadata
+            .labels
+            .get_or_insert_with(Default::default)
+            .extend(labels);
     }
     Ok(())
+}
+
+/// `Plugin.topologyLabelsForNodeName`
+/// (plugin/pkg/admission/podtopologylabels/admission.go:150-169): the node's
+/// labels the plugin is configured to copy. A node that is not there is
+/// ignored, "to avoid risking breaking compatibility/behaviour".
+pub(crate) async fn topology_labels_for_node_name<S: Storage + ?Sized>(
+    storage: &S,
+    node_name: &str,
+) -> Result<HashMap<String, String>> {
+    // The plugin's default `Config.Labels` (admission.go:41-43).
+    const TOPOLOGY_LABELS: [&str; 2] = [
+        "topology.kubernetes.io/zone",
+        "topology.kubernetes.io/region",
+    ];
+    let node_key = build_key("nodes", None::<&str>, node_name);
+    let node: Node = match storage.get(&node_key).await {
+        Ok(node) => node,
+        Err(rusternetes_common::Error::NotFound(_)) => return Ok(HashMap::new()),
+        Err(e) => return Err(e),
+    };
+    let node_labels = node.metadata.labels.unwrap_or_default();
+    Ok(TOPOLOGY_LABELS
+        .into_iter()
+        .filter_map(|k| node_labels.get(k).map(|v| (k.to_string(), v.clone())))
+        .collect())
 }
 
 pub async fn list(
