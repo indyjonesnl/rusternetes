@@ -71,9 +71,12 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         self.expectations.creation_observed(key);
     }
 
-    /// Lower the outstanding-delete count after observing a pod deletion.
-    fn observe_deletion(&self, key: &str) {
-        self.expectations.deletion_observed(key);
+    /// Lower the outstanding-delete count after observing `pod_key` being
+    /// deleted — either its deletionTimestamp being set or its final removal.
+    /// Counted once per expected pod (`UIDTrackingControllerExpectations.
+    /// DeletionObserved`, `pkg/controller/controller_utils.go:380-390`).
+    fn observe_deletion(&self, key: &str, pod_key: &str) {
+        self.expectations.deletion_observed_of(key, pod_key);
     }
 
     /// Drop all expectations for a ReplicaSet (e.g. when it is deleted).
@@ -282,12 +285,26 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             return;
         }
 
+        // `updatePod` treats a pod whose deletionTimestamp is set like a
+        // deletion (replica_set.go:468-480): a graceful delete MODIFIES the
+        // pod first and the kubelet removes it only after the grace period,
+        // yet the RS must replace it now.
+        let terminating = !is_del
+            && serde_json::from_str::<serde_json::Value>(value)
+                .ok()
+                .is_some_and(|v| {
+                    v.pointer("/metadata/deletionTimestamp")
+                        .is_some_and(|t| !t.is_null())
+                });
+        let pod_name = parts.get(2).copied().unwrap_or("");
+        let observed_key = format!("{}/{}", ns, pod_name);
+
         for owner in owners {
             let exp_key = format!("{}/{}", ns, owner);
             if is_add {
                 self.observe_creation(&exp_key);
-            } else if is_del {
-                self.observe_deletion(&exp_key);
+            } else if is_del || terminating {
+                self.observe_deletion(&exp_key, &observed_key);
             }
             queue.add(format!("replicasets/{}/{}", ns, owner)).await;
         }
@@ -342,6 +359,11 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         let replicaset_pods: Vec<Pod> = all_pods
             .into_iter()
             .filter(|p| {
+                // `FilterActivePods` (controller_utils.go:1004): a pod being
+                // gracefully deleted is no longer a replica.
+                if p.metadata.deletion_timestamp.is_some() {
+                    return false;
+                }
                 let matches = self.matches_selector(p, replicaset);
                 debug!(
                     "Pod {} matches selector: {} (labels: {:?})",
@@ -423,11 +445,25 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                 "Deleting {} excess pods for replicaset {}/{}",
                 to_delete, namespace, replicaset.metadata.name
             );
-            self.set_expectations(&exp_key, 0, to_delete as i64);
-            for pod in replicaset_pods.iter().take(to_delete as usize) {
+            // Snapshot the keys of the pods we expect to see deleted, so each
+            // is recorded exactly once whether it is observed as a
+            // deletionTimestamp update or as the delete (`ExpectDeletions`,
+            // replica_set.go:670).
+            let doomed: Vec<&Pod> = replicaset_pods.iter().take(to_delete as usize).collect();
+            let doomed_keys: Vec<String> = doomed
+                .iter()
+                .map(|p| format!("{}/{}", namespace, p.metadata.name))
+                .collect();
+            self.expectations
+                .expect_deletions_of(&exp_key, &doomed_keys);
+            for (pod, pod_key) in doomed.iter().zip(&doomed_keys) {
                 if let Err(e) = self.delete_pod(&pod.metadata.name, namespace).await {
-                    self.observe_deletion(&exp_key);
-                    return Err(e);
+                    // The informer will not observe this deletion
+                    // (replica_set.go:683-689).
+                    self.observe_deletion(&exp_key, pod_key);
+                    if !matches!(e, rusternetes_common::Error::NotFound(_)) {
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -438,6 +474,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
 
         let replicaset_pods_after: Vec<Pod> = all_pods_after
             .into_iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_none())
             .filter(|p| self.matches_selector(p, replicaset))
             .collect();
 
@@ -908,7 +945,11 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
 
     async fn delete_pod(&self, name: &str, namespace: &str) -> rusternetes_common::Result<()> {
         let key = build_key("pods", Some(namespace), name);
-        self.storage.delete(&key).await?;
+        // Upstream `RealPodControl.DeletePod` is a graceful delete,
+        // `Pods(ns).Delete(ctx, podID, metav1.DeleteOptions{})`
+        // (pkg/controller/controller_utils.go:618): the pod gets a
+        // deletionTimestamp and its grace period instead of vanishing.
+        self.storage.delete_gracefully(&key).await?;
 
         info!("Deleted pod {}/{}", namespace, name);
 
@@ -1234,9 +1275,10 @@ mod tests {
         c.observe_creation("default/rs");
         assert!(c.expectations_satisfied("default/rs"));
         // Outstanding delete → not satisfied until observed.
-        c.set_expectations("default/rs", 0, 1);
+        c.expectations
+            .expect_deletions_of("default/rs", &["default/p".to_string()]);
         assert!(!c.expectations_satisfied("default/rs"));
-        c.observe_deletion("default/rs");
+        c.observe_deletion("default/rs", "default/p");
         assert!(c.expectations_satisfied("default/rs"));
         // Clearing removes the entry (treated as satisfied).
         c.set_expectations("default/rs", 5, 0);
@@ -1285,6 +1327,121 @@ mod tests {
             pods.len(),
             2,
             "after expectations satisfied, reconcile creates the desired pods"
+        );
+    }
+
+    fn owned_pod(name: &str, labels: HashMap<String, String>, rs: &str, uid: &str) -> Pod {
+        let mut pod = make_pod(name, labels);
+        pod.metadata.owner_references = Some(vec![rusternetes_common::types::OwnerReference {
+            api_version: "apps/v1".to_string(),
+            kind: "ReplicaSet".to_string(),
+            name: rs.to_string(),
+            uid: uid.to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }]);
+        pod
+    }
+
+    /// #2458: upstream `DeletePod` issues `Delete(ctx, podID, DeleteOptions{})`
+    /// (`pkg/controller/controller_utils.go:618`), a graceful delete: the pod
+    /// is stamped with a deletionTimestamp and survives for its grace period.
+    /// The terminating pod must not count as a replica
+    /// (`FilterActivePods`, `controller_utils.go:1004`), or the next sync would
+    /// delete another pod.
+    #[tokio::test]
+    async fn test_scale_down_deletes_pods_gracefully() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let labels = make_labels(&[("app", "g")]);
+        let rs = make_replicaset("g", labels.clone(), 1);
+        storage
+            .create(&build_key("replicasets", Some("default"), "g"), &rs)
+            .await
+            .unwrap();
+        for n in ["p1", "p2", "p3"] {
+            storage
+                .create(
+                    &build_key("pods", Some("default"), n),
+                    &owned_pod(n, labels.clone(), "g", &rs.metadata.uid),
+                )
+                .await
+                .unwrap();
+        }
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert_eq!(pods.len(), 3, "graceful delete keeps the pods in storage");
+        let terminating = pods
+            .iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_some())
+            .count();
+        assert_eq!(terminating, 2);
+
+        // A second sync sees 1 active pod == desired: nothing more to delete.
+        controller.reconcile_replicaset(&rs).await.unwrap();
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert_eq!(
+            pods.iter()
+                .filter(|p| p.metadata.deletion_timestamp.is_some())
+                .count(),
+            2
+        );
+        let got: ReplicaSet = storage
+            .get(&build_key("replicasets", Some("default"), "g"))
+            .await
+            .unwrap();
+        assert_eq!(
+            got.status.unwrap().replicas,
+            1,
+            "terminating pods are not replicas"
+        );
+    }
+
+    /// #2458: a graceful delete first MODIFIES the pod (deletionTimestamp),
+    /// and upstream `updatePod` observes the deletion there
+    /// (`replica_set.go:468-480`) so the RS can create replacements without
+    /// waiting for the kubelet's final DELETE. The later DELETED event for the
+    /// same pod must not be counted twice (`UIDTrackingControllerExpectations`,
+    /// `controller_utils.go:380-390`).
+    #[tokio::test]
+    async fn test_modified_with_deletion_timestamp_observes_deletion_once() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let queue = WorkQueue::new();
+        let labels = make_labels(&[("app", "g")]);
+        controller.expectations.expect_deletions_of(
+            "default/g",
+            &["default/p1".to_string(), "default/p2".to_string()],
+        );
+
+        let mut pod = owned_pod("p1", labels, "g", "u");
+        pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        let json = serde_json::to_string(&pod).unwrap();
+        let key = "/registry/pods/default/p1".to_string();
+
+        controller
+            .enqueue_owner_replicaset(&queue, &WatchEvent::Modified(key.clone(), json.clone()))
+            .await;
+        assert_eq!(
+            controller.expectations.get_expectations("default/g"),
+            Some((0, 1))
+        );
+
+        controller
+            .enqueue_owner_replicaset(&queue, &WatchEvent::Deleted(key, json))
+            .await;
+        assert_eq!(
+            controller.expectations.get_expectations("default/g"),
+            Some((0, 1)),
+            "the DELETED event of an already-observed pod must not count again"
         );
     }
 }
