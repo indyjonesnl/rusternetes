@@ -19,6 +19,7 @@
 [![sig-auth](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-auth.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-auth.yml)
 
 [![sig-instrumentation](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-instrumentation.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-instrumentation.yml)
+[![sig-architecture](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fsig-architecture.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-sig-architecture.yml)
 
 <!-- Vanilla module swap: one rusternetes component at a time inside an otherwise
      unmodified upstream Kubernetes cluster. Each badge is that module's own

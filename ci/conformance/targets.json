@@ -61,5 +61,12 @@
     "focus": "\\[sig-instrumentation\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-instrumentation\\]",
     "skip": "\\[Flaky\\]",
     "description": "Events API lifecycle: create/patch/delete/list"
+  },
+  {
+    "name": "sig-architecture",
+    "kind": "sig",
+    "focus": "\\[sig-architecture\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-architecture\\]",
+    "skip": "\\[Flaky\\]",
+    "description": "cluster precondition: at least two untainted (schedulable) nodes"
   }
 ]
