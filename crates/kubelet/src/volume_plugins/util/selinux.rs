@@ -1,6 +1,7 @@
 //! Port of `pkg/volume/util/selinux.go` — translating a container's
 //! `v1.SELinuxOptions` into the file label a volume must be mounted with.
 
+use crate::go_selinux_label::Labeler;
 use crate::volume_plugins::plugin::Spec;
 use crate::volume_plugins::registry::VolumePluginMgr;
 use crate::volume_plugins::util::contains_access_mode;
@@ -25,26 +26,67 @@ pub trait SELinuxLabelTranslator: Send + Sync {
 /// Port of `translator` / `NewSELinuxLabelTranslator`
 /// (`pkg/volume/util/selinux.go:46-56`, `:104-106`).
 ///
-/// **Partial port, flagged.** `SELinuxEnabled` is the real
-/// `selinux.GetEnabled()` ([`crate::go_selinux::get_enabled`]), so on an
-/// SELinux-enforcing node `GetMountSELinuxLabel` proceeds past its
-/// `!SELinuxEnabled()` early return exactly as upstream. `SELinuxOptionsToFileLabel`
-/// still returns `""`: upstream's `label.InitLabels` needs the `lxc_contexts`
-/// policy reader and MCS allocator (`label_linux.go:29-80`), which is not ported
-/// yet, so no `-o context=` label is computed (tracked in a follow-up issue).
+/// `SELinuxEnabled` is the real `selinux.GetEnabled()`
+/// ([`crate::go_selinux::get_enabled`]); `SELinuxOptionsToFileLabel` runs the
+/// ported `label.InitLabels` ([`crate::go_selinux_label`]).
 pub struct Translator;
 
 impl SELinuxLabelTranslator for Translator {
     fn selinux_options_to_file_label(
         &self,
-        _opts: Option<&SELinuxOptions>,
+        opts: Option<&SELinuxOptions>,
     ) -> Result<String, SELinuxLabelError> {
-        Ok(String::new())
+        selinux_options_to_file_label_with(
+            Labeler::global(),
+            crate::go_selinux::get_enabled(),
+            opts,
+        )
     }
 
     fn selinux_enabled(&self) -> bool {
         crate::go_selinux::get_enabled()
     }
+}
+
+/// `translator.SELinuxOptionsToFileLabel` (`selinux.go:63-85`) with the
+/// labeler and `selinux.GetEnabled()` injected.
+pub fn selinux_options_to_file_label_with(
+    labeler: &Labeler,
+    enabled: bool,
+    opts: Option<&SELinuxOptions>,
+) -> Result<String, SELinuxLabelError> {
+    let Some(opts) = opts else {
+        return Ok(String::new());
+    };
+    let args = context_options(opts);
+    if args.is_empty() {
+        return Ok(String::new());
+    }
+    let (process_label, file_label) = labeler
+        .init_labels(enabled, &args)
+        .map_err(SELinuxLabelError::Translation)?;
+    // InitLabels() may allocate a new unique SELinux label in kubelet memory.
+    // The label is *not* allocated in the container runtime. Clear it to avoid
+    // memory problems. ReleaseLabel on a non-allocated label is a no-op.
+    labeler.release_label(&process_label);
+    Ok(file_label)
+}
+
+/// `contextOptions` (`selinux.go:88-103`): `SELinuxOptions` to the `[]string`
+/// `label.InitLabels` accepts.
+fn context_options(opts: &SELinuxOptions) -> Vec<String> {
+    let mut args = Vec::with_capacity(3);
+    for (k, v) in [
+        ("user", &opts.user),
+        ("role", &opts.role),
+        ("type", &opts.type_),
+        ("level", &opts.level),
+    ] {
+        if let Some(v) = v.as_deref().filter(|v| !v.is_empty()) {
+            args.push(format!("{k}:{v}"));
+        }
+    }
+    args
 }
 
 /// Port of `fakeTranslator` / `NewFakeSELinuxLabelTranslator`
@@ -288,5 +330,76 @@ mod real_translator_tests {
             Translator.selinux_enabled(),
             crate::go_selinux::get_enabled()
         );
+    }
+}
+
+#[cfg(test)]
+mod translator_tests {
+    use super::*;
+    use crate::go_selinux_label::LxcContexts;
+
+    fn labeler() -> Labeler {
+        Labeler::new(LxcContexts::parse(
+            "process = \"system_u:system_r:container_t:s0\"\n\
+             file = \"system_u:object_r:container_file_t:s0\"\n",
+        ))
+    }
+
+    fn so(user: &str, role: &str, ty: &str, level: &str) -> SELinuxOptions {
+        let f = |s: &str| (!s.is_empty()).then(|| s.to_string());
+        SELinuxOptions {
+            user: f(user),
+            role: f(role),
+            type_: f(ty),
+            level: f(level),
+        }
+    }
+
+    #[test]
+    fn level_only_fills_rest_from_system_defaults() {
+        // Ported shape of fakeTranslator's contract: empty fields come from
+        // policy defaults, process type container_t becomes file type
+        // container_file_t.
+        let got =
+            selinux_options_to_file_label_with(&labeler(), true, Some(&so("", "", "", "s0:c1,c2")))
+                .unwrap();
+        assert_eq!(got, "system_u:object_r:container_file_t:s0:c1,c2");
+    }
+
+    #[test]
+    fn user_and_type_options_apply_type_to_process_only() {
+        let got = selinux_options_to_file_label_with(
+            &labeler(),
+            true,
+            Some(&so("u_u", "r_r", "spc_t", "s0:c3,c4")),
+        )
+        .unwrap();
+        // user + level carry to the file label; role and type do not.
+        assert_eq!(got, "u_u:object_r:container_file_t:s0:c3,c4");
+    }
+
+    #[test]
+    fn nil_or_empty_options_and_disabled_selinux_give_empty() {
+        let l = labeler();
+        assert_eq!(
+            selinux_options_to_file_label_with(&l, true, None).unwrap(),
+            ""
+        );
+        assert_eq!(
+            selinux_options_to_file_label_with(&l, true, Some(&so("", "", "", ""))).unwrap(),
+            ""
+        );
+        assert_eq!(
+            selinux_options_to_file_label_with(&l, false, Some(&so("", "", "", "s0:c1,c2")))
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn does_not_leak_the_process_mcs_reservation() {
+        let l = labeler();
+        selinux_options_to_file_label_with(&l, true, Some(&so("", "", "", "s0:c1,c2"))).unwrap();
+        assert!(!l.is_reserved("s0:c1,c2"));
     }
 }
