@@ -8,6 +8,7 @@
 //! | [`escalation_check`] | `escalation_check.go`, `helpers.go` |
 //! | [`rule`] | `validation/rule.go`, `validation/internal_version_adapter.go` |
 //! | [`policy_compact`] | `validation/policy_compact.go`, `CompactString` |
+//! | [`reconciliation`] | `staging/src/k8s.io/component-helpers/auth/rbac/reconciliation/` |
 //! | [`policy_comparator`] | `staging/src/k8s.io/component-helpers/auth/rbac/validation/policy_comparator.go` |
 //!
 //! Not ported:
@@ -28,6 +29,7 @@ pub mod escalation_check;
 pub mod policy_compact;
 pub mod policy_comparator;
 pub mod policybased;
+pub mod reconciliation;
 pub mod role;
 pub mod rolebinding;
 pub mod rule;

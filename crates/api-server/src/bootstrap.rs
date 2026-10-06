@@ -31,7 +31,12 @@ const BOOTSTRAP_POLICY: &[&str] = &[
     include_str!("bootstrap_policy/namespace-role-bindings.yaml"),
 ];
 
-const AUTOUPDATE_ANNOTATION: &str = "rbac.authorization.kubernetes.io/autoupdate";
+use crate::registry::rbac::reconciliation::{
+    compute_reconciled_role, compute_reconciled_role_binding, ReconcileOperation,
+};
+
+#[cfg(test)]
+use crate::registry::rbac::reconciliation::AUTOUPDATE_ANNOTATION;
 
 /// Decode one vendored `v1.List` into its items. Mirrors nothing upstream (Go
 /// builds the objects in code); this is only the Rust-side loader for the
@@ -83,16 +88,16 @@ fn policy_key(item: &serde_json::Value) -> Option<(String, String)> {
 /// privilege-escalation check stays rule-based (NOT an authorizer
 /// short-circuit). Idempotent.
 ///
-/// Deviation: upstream's `Covers`-based rule reconciliation is approximated by
-/// "append rules not already present verbatim". `ClusterRole`s with an
-/// `aggregationRule` are seeded without rules, as upstream; the
+/// Reconciliation is `registry/rbac/reconciliation.rs`
+/// (`computeReconciledRole`, `computeReconciledRoleBinding`). `ClusterRole`s
+/// with an `aggregationRule` are seeded without rules, as upstream; the
 /// clusterroleaggregation controller (controller-manager) fills them.
 pub async fn bootstrap_default_rbac(storage: Arc<StorageBackend>) -> Result<()> {
     let mut namespaces = std::collections::BTreeSet::new();
 
     for yaml in BOOTSTRAP_POLICY {
         for mut item in load_policy_items(yaml)? {
-            let Some((key, _kind)) = policy_key(&item) else {
+            let Some((key, kind)) = policy_key(&item) else {
                 continue;
             };
             if let Some(ns) = item["metadata"]["namespace"].as_str() {
@@ -102,12 +107,40 @@ pub async fn bootstrap_default_rbac(storage: Arc<StorageBackend>) -> Result<()> 
             }
             match storage.get::<serde_json::Value>(&key).await {
                 Ok(existing) => {
-                    if let Some(updated) = reconcile_policy_object(&existing, &item) {
-                        storage
-                            .update(&key, &updated)
-                            .await
-                            .with_context(|| format!("reconcile {key}"))?;
-                        info!("Reconciled bootstrap RBAC object {key}");
+                    let result = if kind.ends_with("Binding") {
+                        compute_reconciled_role_binding(&existing, &item)
+                    } else {
+                        compute_reconciled_role(&existing, &item)
+                    };
+                    if result.protected {
+                        if result.operation != ReconcileOperation::None {
+                            warn!("skipped reconcile-protected RBAC object {key}");
+                        }
+                        continue;
+                    }
+                    match result.operation {
+                        ReconcileOperation::None => {}
+                        ReconcileOperation::Update => {
+                            storage
+                                .update(&key, &result.object)
+                                .await
+                                .with_context(|| format!("reconcile {key}"))?;
+                            info!("Reconciled bootstrap RBAC object {key}");
+                        }
+                        // reconcile_rolebindings.go:104-118: delete, then create.
+                        ReconcileOperation::Recreate => {
+                            let _ = storage.delete(&key).await;
+                            let mut fresh = result.object;
+                            fresh["metadata"]["uid"] = uuid::Uuid::new_v4().to_string().into();
+                            fresh["metadata"]["creationTimestamp"] = chrono::Utc::now()
+                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                                .into();
+                            storage
+                                .create(&key, &fresh)
+                                .await
+                                .with_context(|| format!("recreate {key}"))?;
+                            info!("Recreated bootstrap RBAC binding {key}");
+                        }
                     }
                 }
                 Err(_) => {
@@ -128,45 +161,6 @@ pub async fn bootstrap_default_rbac(storage: Arc<StorageBackend>) -> Result<()> 
     }
 
     Ok(())
-}
-
-/// `ReconcileRole` / `ReconcileRoleBinding`: for an object that has not opted
-/// out of autoupdate, return the object with any missing rules (roles) or
-/// subjects (bindings) added, or `None` when nothing needs to change.
-fn reconcile_policy_object(
-    existing: &serde_json::Value,
-    desired: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    if existing["metadata"]["annotations"][AUTOUPDATE_ANNOTATION].as_str() == Some("false") {
-        return None;
-    }
-    let mut updated = existing.clone();
-    let mut changed = false;
-    // Rules of an aggregating role belong to the aggregation, not the policy.
-    let field = if desired["kind"]
-        .as_str()
-        .is_some_and(|k| k.ends_with("Binding"))
-    {
-        "subjects"
-    } else if desired["aggregationRule"].is_null() {
-        "rules"
-    } else {
-        return None;
-    };
-    let have = updated[field].as_array().cloned().unwrap_or_default();
-    let mut merged = have.clone();
-    for want in desired[field].as_array().cloned().unwrap_or_default() {
-        if !have.contains(&want) {
-            merged.push(want);
-            changed = true;
-        }
-    }
-    if changed {
-        updated[field] = serde_json::Value::Array(merged);
-        Some(updated)
-    } else {
-        None
-    }
 }
 
 /// How often the `kubernetes` Service endpoint is re-asserted to the live
@@ -1543,6 +1537,77 @@ mod tests {
                 .any(|s| s.kind == "Group" && s.name == "system:masters"),
             "binding must target the system:masters group"
         );
+    }
+
+    /// `computeReconciledRole` (reconcile_role.go:195-232): a bootstrap rule that
+    /// an existing rule already `Covers` (here a wildcard) is not appended;
+    /// only the uncovered atomic rules are, and labels are merged with the
+    /// existing value winning.
+    #[tokio::test]
+    async fn reconcile_uses_covers_not_verbatim_match() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        bootstrap_default_rbac(storage.clone()).await.unwrap();
+        let key = "/registry/clusterroles/system:basic-user";
+        let mut role: serde_json::Value = storage.get(key).await.unwrap();
+        // Wildcard covers every bootstrap rule of the role.
+        role["rules"] = serde_json::json!([{"apiGroups":["*"],"resources":["*"],"verbs":["*"]}]);
+        role["metadata"]["labels"]["extra"] = "kept".into();
+        role["metadata"]["labels"]["kubernetes.io/bootstrapping"] = "mine".into();
+        storage.update(key, &role).await.unwrap();
+
+        bootstrap_default_rbac(storage.clone()).await.unwrap();
+        let after: serde_json::Value = storage.get(key).await.unwrap();
+        assert_eq!(after["rules"].as_array().unwrap().len(), 1, "{after}");
+        assert_eq!(after["metadata"]["labels"]["extra"], "kept");
+        assert_eq!(
+            after["metadata"]["labels"]["kubernetes.io/bootstrapping"],
+            "mine"
+        );
+
+        // A rule that is NOT covered is appended as atomic rules.
+        let mut role = after.clone();
+        role["rules"] = serde_json::json!([]);
+        storage.update(key, &role).await.unwrap();
+        bootstrap_default_rbac(storage.clone()).await.unwrap();
+        let after: serde_json::Value = storage.get(key).await.unwrap();
+        assert!(!after["rules"].as_array().unwrap().is_empty());
+    }
+
+    /// `computeReconciledRoleBinding` (reconcile_rolebindings.go:152-160): a
+    /// changed roleRef is immutable, so the binding is deleted and recreated
+    /// (`ReconcileRecreate`), dropping the stale subjects.
+    #[tokio::test]
+    async fn reconcile_recreates_binding_when_role_ref_differs() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        bootstrap_default_rbac(storage.clone()).await.unwrap();
+        let key = CLUSTER_ADMIN_BINDING_KEY;
+        let mut b: serde_json::Value = storage.get(key).await.unwrap();
+        b["roleRef"]["name"] = "view".into();
+        b["subjects"] =
+            serde_json::json!([{"apiGroup":"rbac.authorization.k8s.io","kind":"User","name":"x"}]);
+        storage.update(key, &b).await.unwrap();
+
+        bootstrap_default_rbac(storage.clone()).await.unwrap();
+        let after: serde_json::Value = storage.get(key).await.unwrap();
+        assert_eq!(after["roleRef"]["name"], "cluster-admin");
+        assert_eq!(after["subjects"].as_array().unwrap().len(), 1);
+        assert_eq!(after["subjects"][0]["name"], "system:masters");
+    }
+
+    /// A protected (`autoupdate: "false"`) object is left alone, even with a
+    /// differing roleRef (reconcile_role.go:121-123 returns before the switch).
+    #[tokio::test]
+    async fn reconcile_leaves_protected_binding_alone() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        bootstrap_default_rbac(storage.clone()).await.unwrap();
+        let key = CLUSTER_ADMIN_BINDING_KEY;
+        let mut b: serde_json::Value = storage.get(key).await.unwrap();
+        b["roleRef"]["name"] = "view".into();
+        b["metadata"]["annotations"][AUTOUPDATE_ANNOTATION] = "false".into();
+        storage.update(key, &b).await.unwrap();
+        bootstrap_default_rbac(storage.clone()).await.unwrap();
+        let after: serde_json::Value = storage.get(key).await.unwrap();
+        assert_eq!(after["roleRef"]["name"], "view");
     }
 
     /// #1753: the whole upstream bootstrap policy is seeded, not only
