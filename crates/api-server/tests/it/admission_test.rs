@@ -703,15 +703,20 @@ async fn put_quota(storage: &Arc<MemoryStorage>, name: &str, hard: &[(&str, &str
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    let quota = ResourceQuota::new(
+    let mut quota = ResourceQuota::new(
         name,
         "test-namespace",
         ResourceQuotaSpec {
-            hard: Some(hard),
+            hard: Some(hard.clone()),
             scopes: None,
             scope_selector: None,
         },
     );
+    // The quota controller has synced: status.hard mirrors spec.hard.
+    quota.status = Some(rusternetes_common::resources::ResourceQuotaStatus {
+        hard: Some(hard),
+        used: None,
+    });
     let key = build_key("resourcequotas", Some("test-namespace"), name);
     storage.create(&key, &quota).await.unwrap();
 }
@@ -985,5 +990,79 @@ async fn quota_constraints_pods_only_quota_imposes_nothing() {
             .await
             .unwrap(),
         None
+    );
+}
+
+/// Upstream `checkRequest` derives the restricted resources from
+/// `resourceQuota.Status.Hard` (`resourcequota/controller.go:464-474`), not
+/// `Spec.Hard`: a quota the controller has not synced yet constrains nothing,
+/// and a synced one constrains what its status says.
+#[tokio::test]
+async fn quota_constraints_read_status_hard_not_spec_hard() {
+    use rusternetes_api_server::admission::check_pod_quota_constraints;
+    use rusternetes_common::resources::ResourceQuotaStatus;
+
+    let storage = Arc::new(MemoryStorage::new());
+    let none = create_minimal_pod("p", "test-namespace");
+
+    // spec.hard names requests.cpu but status is not computed yet.
+    let mut spec_only = ResourceQuota::new(
+        "spec-only",
+        "test-namespace",
+        ResourceQuotaSpec {
+            hard: Some(HashMap::from([(
+                "requests.cpu".to_string(),
+                "1".to_string(),
+            )])),
+            scopes: None,
+            scope_selector: None,
+        },
+    );
+    spec_only.status = Some(ResourceQuotaStatus::default());
+    storage
+        .create(
+            &build_key("resourcequotas", Some("test-namespace"), "spec-only"),
+            &spec_only,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        check_pod_quota_constraints(&storage, "test-namespace", &none)
+            .await
+            .unwrap(),
+        None,
+        "an unsynced quota (empty status.hard) constrains nothing"
+    );
+
+    // status.hard names requests.cpu while spec.hard names only pods.
+    let mut synced = ResourceQuota::new(
+        "synced",
+        "test-namespace",
+        ResourceQuotaSpec {
+            hard: Some(HashMap::from([("pods".to_string(), "10".to_string())])),
+            scopes: None,
+            scope_selector: None,
+        },
+    );
+    synced.status = Some(ResourceQuotaStatus {
+        hard: Some(HashMap::from([(
+            "requests.cpu".to_string(),
+            "1".to_string(),
+        )])),
+        used: None,
+    });
+    storage
+        .create(
+            &build_key("resourcequotas", Some("test-namespace"), "synced"),
+            &synced,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        check_pod_quota_constraints(&storage, "test-namespace", &none)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("failed quota: synced: must specify requests.cpu for: test-container")
     );
 }
