@@ -12,5 +12,6 @@
 [sig-scheduling] SchedulerPredicates validates resource limits of pods [Conformance]
 [sig-auth] ServiceAccounts should mount an API token into pods [Conformance]
 [sig-instrumentation] Events API should ensure event lifecycle works [Conformance]
+[sig-architecture] Conformance Tests should have at least two untainted nodes [Conformance]
 [sig-node] this NON-conformance line must be ignored by the coverage scan
 [sig-storage] [Feature:Foo] non-conformance feature spec ignored too
