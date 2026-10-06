@@ -121,6 +121,11 @@ struct Args {
     #[arg(long)]
     console_dir: Option<String>,
 
+    /// ClusterIP range(s) for Services: one CIDR, or two of different IP
+    /// families (dual-stack), comma-separated (`--service-cluster-ip-range`).
+    #[arg(long, default_value = "10.96.0.0/12")]
+    service_cluster_ip_range: String,
+
     /// Client CA certificate file for mTLS client certificate authentication
     #[arg(long)]
     client_ca_file: Option<String>,
@@ -129,6 +134,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // `validateClusterIPFlags`: refuse to start on a bad range.
+    let service_ranges =
+        registry::core::service::ipranges::ServiceIpRanges::parse(&args.service_cluster_ip_range)
+            .map_err(|e| anyhow::anyhow!(e))?;
 
     rusternetes_common::tracing::init_basic_tracing("api-server", &args.log_level)?;
     rusternetes_common::dump::install_panic_hook("api-server");
@@ -254,7 +263,7 @@ async fn main() -> Result<()> {
     // `pkg/controlplane/controller/defaultservicecidr`). Reconciles rather than
     // create-once: dual-stack upgrade, flag-mismatch warning, and `Ready=True`
     // only when the persisted CIDRs match this api-server's configuration.
-    bootstrap::start_default_servicecidr_controller(storage.clone()).await;
+    bootstrap::start_default_servicecidr_controller(storage.clone(), service_ranges.cidrs()).await;
 
     // kube-system/extension-apiserver-authentication, kept by the
     // apiserver-side ClusterAuthenticationTrust controller (upstream
@@ -319,6 +328,7 @@ async fn main() -> Result<()> {
     // Create shared state with CA certificate and Prometheus client
     let state = Arc::new(
         ApiServerState::new(storage, token_manager, authorizer, metrics, args.skip_auth)
+            .with_service_cluster_ip_ranges(&service_ranges)
             .with_ca_cert(ca_cert_pem)
             .with_service_node_port_range(registry::core::service::portallocator::PortRange {
                 base: args.service_node_port_range.base,

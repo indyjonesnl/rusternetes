@@ -15,8 +15,7 @@ use rusternetes_common::validation::service::parse_ip_sloppy;
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::StorageBackend;
 
-use super::alloc::{self, ClusterIpTxn, DEFAULT_SERVICE_IP_FAMILY};
-use super::ipallocator::cidr::MetaAllocator;
+use super::alloc::{self, ClusterIpAllocators, ClusterIpTxn, DEFAULT_SERVICE_IP_FAMILY};
 use super::portallocator::operation::PortAllocationOperation;
 use super::portallocator::PortAllocator;
 use super::strategy::{StatusStrategy, Strategy};
@@ -228,7 +227,7 @@ impl Finish for AllocFinish {
 /// The `REST` of storage.go:60-68: the allocators and the Endpoints storage
 /// the hooks use.
 pub struct ServiceRest {
-    ips: Arc<MetaAllocator<StorageBackend>>,
+    ips: Arc<ClusterIpAllocators<StorageBackend>>,
     ports: Arc<PortAllocator>,
     endpoints: Store<Endpoints, StorageBackend>,
 }
@@ -236,7 +235,7 @@ pub struct ServiceRest {
 impl ServiceRest {
     /// `allocateCreate` (alloc.go:65-100).
     async fn allocate_create(&self, svc: &mut Service, dry_run: bool) -> Result<AllocFinish> {
-        alloc::init_ip_family_fields(svc, None)?;
+        alloc::init_ip_family_fields(svc, None, &self.ips.families())?;
         let ips = alloc::txn_alloc_cluster_ips(&self.ips, svc, dry_run).await?;
         let ports = match alloc::txn_alloc_node_ports(&self.ports, svc, dry_run).await {
             Ok(op) => op,
@@ -255,7 +254,7 @@ impl ServiceRest {
         old: &Service,
         dry_run: bool,
     ) -> Result<AllocFinish> {
-        alloc::init_ip_family_fields(svc, Some(old))?;
+        alloc::init_ip_family_fields(svc, Some(old), &self.ips.families())?;
         let ips = alloc::txn_update_cluster_ips(&self.ips, svc, old, dry_run).await?;
         let ports = match alloc::txn_update_node_ports(&self.ports, svc, old, dry_run).await {
             Ok(op) => op,
@@ -338,7 +337,7 @@ impl AfterDelete<Service> for ServiceRest {
 /// finalizer.
 pub fn new_stores(
     storage: Arc<StorageBackend>,
-    ips: Arc<MetaAllocator<StorageBackend>>,
+    ips: Arc<ClusterIpAllocators<StorageBackend>>,
     ports: Arc<PortAllocator>,
 ) -> (
     Store<Service, StorageBackend>,

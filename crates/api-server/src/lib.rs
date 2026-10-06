@@ -176,6 +176,9 @@ pub struct ApiServerConfig {
     /// unspecified and falls back to 30000-32767 (pkg/controlplane/
     /// instance.go:285-291).
     pub service_node_port_range: registry::core::service::portallocator::PortRange,
+    /// `--service-cluster-ip-range`: one CIDR, or two of different IP
+    /// families, comma-separated.
+    pub service_cluster_ip_range: String,
 }
 
 impl Default for ApiServerConfig {
@@ -195,6 +198,8 @@ impl Default for ApiServerConfig {
             prepared_tls: None,
             service_node_port_range:
                 registry::core::service::portallocator::DEFAULT_SERVICE_NODE_PORT_RANGE,
+            service_cluster_ip_range:
+                registry::core::service::ipranges::DEFAULT_SERVICE_CLUSTER_IP_RANGE.to_string(),
         }
     }
 }
@@ -272,7 +277,10 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     // `pkg/controlplane/controller/defaultservicecidr`). Reconciles rather than
     // create-once: dual-stack upgrade, flag-mismatch warning, and `Ready=True`
     // only when the persisted CIDRs match this api-server's configuration.
-    bootstrap::start_default_servicecidr_controller(storage.clone()).await;
+    let service_ranges =
+        registry::core::service::ipranges::ServiceIpRanges::parse(&config.service_cluster_ip_range)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    bootstrap::start_default_servicecidr_controller(storage.clone(), service_ranges.cidrs()).await;
 
     // kube-system/extension-apiserver-authentication, kept by the
     // apiserver-side ClusterAuthenticationTrust controller (upstream
@@ -337,6 +345,7 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
             metrics,
             config.skip_auth,
         )
+        .with_service_cluster_ip_ranges(&service_ranges)
         .with_ca_cert(ca_cert_pem)
         .with_service_node_port_range(config.service_node_port_range)
         .with_prometheus_client(prom_client),

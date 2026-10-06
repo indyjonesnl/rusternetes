@@ -4,6 +4,7 @@
 pub mod alloc;
 pub mod allocator;
 pub mod ipallocator;
+pub mod ipranges;
 pub mod portallocator;
 pub mod storage;
 pub mod strategy;

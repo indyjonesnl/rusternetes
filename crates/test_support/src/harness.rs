@@ -232,6 +232,7 @@ pub struct TestApiServerBuilder {
     rbac: bool,
     secret: Vec<u8>,
     ca_cert_pem: Option<String>,
+    service_cluster_ip_range: String,
 }
 
 impl Default for TestApiServerBuilder {
@@ -241,6 +242,7 @@ impl Default for TestApiServerBuilder {
             rbac: false,
             secret: b"test-secret".to_vec(),
             ca_cert_pem: None,
+            service_cluster_ip_range: String::new(),
         }
     }
 }
@@ -273,6 +275,13 @@ impl TestApiServerBuilder {
         self
     }
 
+    /// `--service-cluster-ip-range`: one CIDR, or two of different IP
+    /// families (dual-stack Services). Defaults to the single-stack range.
+    pub fn service_cluster_ip_range(mut self, range: impl Into<String>) -> Self {
+        self.service_cluster_ip_range = range.into();
+        self
+    }
+
     /// Build the configured [`TestApiServer`].
     pub fn build(self) -> TestApiServer {
         let mem = Arc::new(MemoryStorage::new());
@@ -284,8 +293,14 @@ impl TestApiServerBuilder {
             Arc::new(AlwaysAllowAuthorizer)
         };
         let metrics = Arc::new(MetricsRegistry::new());
+        let ranges =
+            rusternetes_api_server::registry::core::service::ipranges::ServiceIpRanges::parse(
+                &self.service_cluster_ip_range,
+            )
+            .expect("a valid --service-cluster-ip-range");
         let state =
             ApiServerState::new(backend, token_manager, authorizer, metrics, self.skip_auth)
+                .with_service_cluster_ip_ranges(&ranges)
                 .with_ca_cert(self.ca_cert_pem);
         // The `kubernetes` ServiceCIDR the ClusterIP allocator draws from:
         // the api-server seeds it before serving (default_servicecidr
@@ -293,10 +308,7 @@ impl TestApiServerBuilder {
         let mut cidr_controller =
             rusternetes_api_server::bootstrap::DefaultServiceCIDRController::new(
                 state.storage.clone(),
-                rusternetes_api_server::bootstrap::DEFAULT_SERVICE_CIDRS
-                    .iter()
-                    .map(|c| c.to_string())
-                    .collect(),
+                ranges.cidrs(),
             );
         futures::FutureExt::now_or_never(cidr_controller.sync())
             .expect("the default ServiceCIDR sync on MemoryStorage completes without waiting")

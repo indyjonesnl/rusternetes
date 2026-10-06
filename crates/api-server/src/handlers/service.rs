@@ -36,7 +36,7 @@ use tracing::debug;
 fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestScope<Service> {
     let (store, status_store) = service_storage::new_stores(
         state.storage.clone(),
-        state.cluster_ip_allocator.clone(),
+        state.cluster_ip_allocators.clone(),
         state.node_port_allocator.clone(),
     );
     RequestScope {
