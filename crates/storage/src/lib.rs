@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "api-client")]
 pub mod api_storage;
+pub mod busy;
 pub mod concurrency;
 pub mod etcd;
 mod event_bus;

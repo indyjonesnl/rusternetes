@@ -6,6 +6,7 @@
 //! single-node / all-in-one deployments — no external etcd or rhino server
 //! process needed.
 
+use crate::busy::{map_backend_error, retry_busy, RetryPolicy};
 use crate::concurrency;
 use crate::{Storage, WatchEvent, WatchStream};
 use async_trait::async_trait;
@@ -182,16 +183,14 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
             raw
         };
 
-        let mod_revision =
-            self.backend
-                .create(key, json.as_bytes(), 0)
-                .await
-                .map_err(|e| match e {
-                    rhino::backend::BackendError::KeyExists => {
-                        Error::AlreadyExists(key.to_string())
-                    }
-                    other => Error::Storage(format!("Failed to create resource: {}", other)),
-                })?;
+        let mod_revision = retry_busy(RetryPolicy::default(), || {
+            self.backend.create(key, json.as_bytes(), 0)
+        })
+        .await
+        .map_err(|e| match e {
+            rhino::backend::BackendError::KeyExists => Error::AlreadyExists(key.to_string()),
+            other => map_backend_error(key, "create", "create resource", &other),
+        })?;
 
         debug!("Created resource at key: {}", key);
 
@@ -239,11 +238,12 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
         if let Some(incoming_rv) = incoming_rv.as_deref() {
             let expected_mod_revision = concurrency::resource_version_to_mod_revision(incoming_rv)?;
 
-            let (rev, prev_kv, succeeded) = self
-                .backend
-                .update(key, json.as_bytes(), expected_mod_revision, 0)
-                .await
-                .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+            let (rev, prev_kv, succeeded) = retry_busy(RetryPolicy::default(), || {
+                self.backend
+                    .update(key, json.as_bytes(), expected_mod_revision, 0)
+            })
+            .await
+            .map_err(|e| map_backend_error(key, "update", "update resource", &e))?;
 
             if !succeeded {
                 let current_rv = prev_kv
@@ -276,11 +276,12 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
 
             let existing_kv = existing_kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
 
-            let (new_rev, _prev_kv, succeeded) = self
-                .backend
-                .update(key, json.as_bytes(), existing_kv.mod_revision, 0)
-                .await
-                .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+            let (new_rev, _prev_kv, succeeded) = retry_busy(RetryPolicy::default(), || {
+                self.backend
+                    .update(key, json.as_bytes(), existing_kv.mod_revision, 0)
+            })
+            .await
+            .map_err(|e| map_backend_error(key, "update", "update resource", &e))?;
 
             if !succeeded {
                 // Concurrent modification — retry once by re-reading
@@ -291,11 +292,12 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
 
                 let latest_kv = latest_kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
 
-                let (new_rev, _prev_kv, succeeded) = self
-                    .backend
-                    .update(key, json.as_bytes(), latest_kv.mod_revision, 0)
-                    .await
-                    .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+                let (new_rev, _prev_kv, succeeded) = retry_busy(RetryPolicy::default(), || {
+                    self.backend
+                        .update(key, json.as_bytes(), latest_kv.mod_revision, 0)
+                })
+                .await
+                .map_err(|e| map_backend_error(key, "update", "update resource", &e))?;
 
                 if !succeeded {
                     return Err(Error::Conflict(
@@ -327,11 +329,12 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
 
         let existing_kv = existing_kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
 
-        let (new_rev, _prev_kv, succeeded) = self
-            .backend
-            .update(key, json.as_bytes(), existing_kv.mod_revision, 0)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+        let (new_rev, _prev_kv, succeeded) = retry_busy(RetryPolicy::default(), || {
+            self.backend
+                .update(key, json.as_bytes(), existing_kv.mod_revision, 0)
+        })
+        .await
+        .map_err(|e| map_backend_error(key, "update", "update resource", &e))?;
 
         if !succeeded {
             return Err(Error::Conflict(
@@ -346,11 +349,10 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let (_rev, prev_kv, succeeded) = self
-            .backend
-            .delete(key, 0)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to delete resource: {}", e)))?;
+        let (_rev, prev_kv, succeeded) =
+            retry_busy(RetryPolicy::default(), || self.backend.delete(key, 0))
+                .await
+                .map_err(|e| map_backend_error(key, "delete", "delete resource", &e))?;
 
         // kine's `Delete` reports a key that never existed as
         // `(rev, nil, true)` and one already deleted as `(rev, nil, false)`
