@@ -110,3 +110,28 @@ async fn all_namespaces_watch_defaults_on_read() {
     assert_eq!(ev["type"], "ADDED");
     assert_defaulted(&ev["object"], "cluster-wide WATCH");
 }
+
+// Legacy `/api/v1/watch/...` prefix routes (upstream installer.go registers a
+// `watch/` variant for the namespaced and all-namespaces scopes) must
+// decorate exactly like `?watch=true` (#2192).
+#[tokio::test]
+async fn legacy_namespaced_watch_route_defaults_on_read() {
+    let api = TestApiServer::new();
+    seed_legacy(&api).await;
+    let ev = first_event(
+        api,
+        "/api/v1/watch/namespaces/default/services?resourceVersion=0",
+    )
+    .await;
+    assert_eq!(ev["type"], "ADDED");
+    assert_defaulted(&ev["object"], "legacy namespaced WATCH route");
+}
+
+#[tokio::test]
+async fn legacy_all_namespaces_watch_route_defaults_on_read() {
+    let api = TestApiServer::new();
+    seed_legacy(&api).await;
+    let ev = first_event(api, "/api/v1/watch/services?resourceVersion=0").await;
+    assert_eq!(ev["type"], "ADDED");
+    assert_defaulted(&ev["object"], "legacy all-namespaces WATCH route");
+}

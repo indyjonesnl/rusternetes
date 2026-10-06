@@ -1117,6 +1117,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             "/api/v1/watch/namespaces/:namespace/services",
             get(handlers::watch::watch_services),
         )
+        // Watch services (all namespaces, legacy /watch/ prefix)
+        .route(
+            "/api/v1/watch/services",
+            get(handlers::watch::watch_all_services),
+        )
         // Services (all namespaces)
         .route(
             "/api/v1/services",

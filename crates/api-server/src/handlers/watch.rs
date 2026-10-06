@@ -2069,6 +2069,26 @@ pub async fn watch_services(
     .await
 }
 
+/// Watch services across all namespaces via the legacy `/watch/` prefix
+/// (installer.go registers `<root>/watch/<resource>` for the all-namespaces
+/// scope too). Same decorator as `list_all_services?watch=true`.
+pub async fn watch_all_services(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<WatchParams>,
+) -> Result<Response> {
+    watch_cluster_scoped_converted::<rusternetes_common::resources::Service>(
+        state,
+        auth_ctx,
+        "services",
+        "",
+        params,
+        crate::handlers::service::default_on_read_watch_converter(),
+        None,
+    )
+    .await
+}
+
 /// Watch deployments in a namespace
 pub async fn watch_deployments(
     State(state): State<Arc<ApiServerState>>,
