@@ -745,15 +745,121 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
 /// `NewSharedInformerFactory(crdClient, 5*time.Minute)` (apiserver.go:170).
 pub const CRD_RESYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// `workqueue.DefaultTypedControllerRateLimiter`'s per-item exponential
-/// failure limiter: `NewTypedItemExponentialFailureRateLimiter(5ms, 1000s)`
-/// (client-go/util/workqueue/default_rate_limiters.go). The overall bucket
-/// limiter (10 qps) is not modelled: the loop below retries one key at a time.
-fn requeue_delay(failures: u32) -> std::time::Duration {
-    let base = std::time::Duration::from_millis(5);
-    let max = std::time::Duration::from_secs(1000);
-    base.checked_mul(1u32.checked_shl(failures).unwrap_or(u32::MAX))
-        .map_or(max, |d| d.min(max))
+/// `workqueue.TypedItemExponentialFailureRateLimiter`
+/// (client-go/util/workqueue/default_rate_limiters.go:100-141): a per-item
+/// `base * 2^failures` backoff capped at `max`; `When` counts the failure,
+/// `Forget` clears it.
+pub struct ItemExponentialFailureRateLimiter {
+    failures: std::collections::HashMap<String, u32>,
+    base: std::time::Duration,
+    max: std::time::Duration,
+}
+
+impl ItemExponentialFailureRateLimiter {
+    pub fn new(base: std::time::Duration, max: std::time::Duration) -> Self {
+        Self {
+            failures: std::collections::HashMap::new(),
+            base,
+            max,
+        }
+    }
+
+    /// `When` (:116-135). Overflow of the shift or the multiply returns `max`.
+    pub fn when(&mut self, item: &str) -> std::time::Duration {
+        let exp = self.failures.entry(item.to_string()).or_insert(0);
+        let failures = *exp;
+        *exp = exp.saturating_add(1);
+        1u32.checked_shl(failures)
+            .and_then(|m| self.base.checked_mul(m))
+            .map_or(self.max, |d| d.min(self.max))
+    }
+
+    /// `NumRequeues` (:137-141).
+    pub fn num_requeues(&self, item: &str) -> usize {
+        self.failures.get(item).map_or(0, |n| *n as usize)
+    }
+
+    /// `Forget` (:143-148).
+    pub fn forget(&mut self, item: &str) {
+        self.failures.remove(item);
+    }
+}
+
+/// `workqueue.TypedBucketRateLimiter` over `rate.NewLimiter(qps, burst)`
+/// (default_rate_limiters.go:61-80; golang.org/x/time/rate `Reserve().Delay()`):
+/// every call reserves one token, so tokens go negative once the burst is
+/// spent and the delay is the time to refill the debt.
+pub struct BucketRateLimiter {
+    qps: f64,
+    burst: f64,
+    tokens: f64,
+    last: Option<tokio::time::Instant>,
+}
+
+impl BucketRateLimiter {
+    pub fn new(qps: f64, burst: u32) -> Self {
+        Self {
+            qps,
+            burst: f64::from(burst),
+            tokens: f64::from(burst),
+            last: None,
+        }
+    }
+
+    pub fn when_at(&mut self, now: tokio::time::Instant) -> std::time::Duration {
+        if let Some(last) = self.last {
+            let elapsed = now.saturating_duration_since(last).as_secs_f64();
+            self.tokens = (self.tokens + elapsed * self.qps).min(self.burst);
+        }
+        self.last = Some(now);
+        self.tokens -= 1.0;
+        if self.tokens >= 0.0 {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs_f64(-self.tokens / self.qps)
+        }
+    }
+}
+
+/// `workqueue.DefaultTypedControllerRateLimiter` (default_rate_limiters.go:50-56):
+/// `NewTypedMaxOfRateLimiter` of the per-item exponential limiter
+/// (5ms, 1000s) and the overall bucket limiter (10 qps, burst 100). Both are
+/// consulted on every call, and the longer delay wins (`TypedMaxOfRateLimiter.When`).
+pub struct ControllerRateLimiter {
+    item: ItemExponentialFailureRateLimiter,
+    bucket: BucketRateLimiter,
+}
+
+impl Default for ControllerRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ControllerRateLimiter {
+    pub fn new() -> Self {
+        Self {
+            item: ItemExponentialFailureRateLimiter::new(
+                std::time::Duration::from_millis(5),
+                std::time::Duration::from_secs(1000),
+            ),
+            bucket: BucketRateLimiter::new(10.0, 100),
+        }
+    }
+
+    pub fn when_at(&mut self, item: &str, now: tokio::time::Instant) -> std::time::Duration {
+        let a = self.item.when(item);
+        let b = self.bucket.when_at(now);
+        a.max(b)
+    }
+
+    pub fn num_requeues(&self, item: &str) -> usize {
+        self.item.num_requeues(item)
+    }
+
+    pub fn forget(&mut self, item: &str) {
+        self.item.forget(item);
+    }
 }
 
 /// The post-start hook that starts the CRD controllers
@@ -770,7 +876,10 @@ fn requeue_delay(failures: u32) -> std::time::Duration {
 pub fn spawn_resync(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let rest = new_rest(storage);
-        let mut failing: std::collections::HashMap<String, (u32, tokio::time::Instant)> =
+        // Each controller's `workqueue.DefaultTypedControllerRateLimiter`
+        // (one per queue upstream; this timer task is the shared retry queue).
+        let mut limiter = ControllerRateLimiter::new();
+        let mut failing: std::collections::HashMap<String, tokio::time::Instant> =
             std::collections::HashMap::new();
         let mut resync = tokio::time::interval(CRD_RESYNC_PERIOD);
         let mut retry = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -779,33 +888,35 @@ pub fn spawn_resync(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()>
                 _ = resync.tick() => {
                     let failed = rest.resync().await;
                     // Forget what succeeded; back off what failed again.
-                    failing.retain(|name, _| failed.contains(name));
+                    failing.retain(|name, _| {
+                        let keep = failed.contains(name);
+                        if !keep {
+                            limiter.forget(name);
+                        }
+                        keep
+                    });
                     for name in failed {
-                        let entry = failing
-                            .entry(name)
-                            .or_insert((0, tokio::time::Instant::now()));
-                        entry.1 = tokio::time::Instant::now() + requeue_delay(entry.0);
-                        entry.0 += 1;
+                        let now = tokio::time::Instant::now();
+                        failing.insert(name.clone(), now + limiter.when_at(&name, now));
                     }
                 }
                 _ = retry.tick() => {
                     let now = tokio::time::Instant::now();
                     let due: Vec<String> = failing
                         .iter()
-                        .filter(|(_, (_, at))| *at <= now)
+                        .filter(|(_, at)| **at <= now)
                         .map(|(n, _)| n.clone())
                         .collect();
                     for name in due {
                         match rest.resync_one(&name).await {
                             Ok(()) => {
                                 failing.remove(&name);
+                                limiter.forget(&name);
                             }
                             Err(e) => {
                                 warn!("customresourcedefinition {name}: retry failed: {e}");
-                                if let Some((n, at)) = failing.get_mut(&name) {
-                                    *at = tokio::time::Instant::now() + requeue_delay(*n);
-                                    *n += 1;
-                                }
+                                let now = tokio::time::Instant::now();
+                                failing.insert(name.clone(), now + limiter.when_at(&name, now));
                             }
                         }
                     }
@@ -919,5 +1030,89 @@ mod tests {
         let t = controllers::find_crd_condition(&c, TERMINATING).unwrap();
         assert_eq!(t.reason.as_deref(), Some("InstanceDeletionPending"));
         assert_eq!(c.status.unwrap().conditions.unwrap().len(), 1);
+    }
+
+    // `TestItemExponentialFailureRateLimiter` /
+    // `TestItemExponentialFailureRateLimiterOverFlow` / `TestMaxOfRateLimiter`
+    // / `TestBucketRateLimiter`
+    // (client-go/util/workqueue/default_rate_limiters_test.go).
+    #[test]
+    fn item_exponential_limiter_doubles_per_item_and_forgets() {
+        use std::time::Duration;
+        let mut l = ItemExponentialFailureRateLimiter::new(
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        );
+        assert_eq!(l.when("one"), Duration::from_millis(1));
+        assert_eq!(l.when("one"), Duration::from_millis(2));
+        assert_eq!(l.when("one"), Duration::from_millis(4));
+        assert_eq!(l.when("one"), Duration::from_millis(8));
+        assert_eq!(l.when("one"), Duration::from_millis(16));
+        assert_eq!(l.num_requeues("one"), 5);
+        assert_eq!(l.when("two"), Duration::from_millis(1));
+        assert_eq!(l.when("two"), Duration::from_millis(2));
+        assert_eq!(l.num_requeues("two"), 2);
+        l.forget("one");
+        assert_eq!(l.num_requeues("one"), 0);
+        assert_eq!(l.when("one"), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn item_exponential_limiter_caps_and_does_not_overflow() {
+        use std::time::Duration;
+        let mut l = ItemExponentialFailureRateLimiter::new(
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        );
+        for _ in 0..5 {
+            l.when("one");
+        }
+        assert_eq!(l.when("one"), Duration::from_millis(32));
+        for _ in 0..1000 {
+            assert!(l.when("one") <= Duration::from_secs(1));
+        }
+        assert_eq!(l.when("one"), Duration::from_secs(1));
+        let day = Duration::from_secs(60 * 60 * 24);
+        let mut big = ItemExponentialFailureRateLimiter::new(day, day * 1000);
+        for _ in 0..2 {
+            big.when("one");
+        }
+        for _ in 0..1000 {
+            assert!(big.when("one") <= day * 1000);
+        }
+    }
+
+    #[test]
+    fn bucket_limiter_spends_the_burst_then_paces_at_qps() {
+        use std::time::Duration;
+        let now = tokio::time::Instant::now();
+        let mut b = BucketRateLimiter::new(10.0, 100);
+        for _ in 0..100 {
+            assert_eq!(b.when_at(now), Duration::ZERO);
+        }
+        // Burst spent: each further reservation queues 1/qps behind the last.
+        assert_eq!(b.when_at(now), Duration::from_millis(100));
+        assert_eq!(b.when_at(now), Duration::from_millis(200));
+        // 200ms later 2 tokens have refilled, paying the debt exactly.
+        let later = now + Duration::from_millis(200);
+        assert_eq!(b.when_at(later), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn default_controller_limiter_is_the_max_of_item_and_bucket() {
+        use std::time::Duration;
+        let now = tokio::time::Instant::now();
+        let mut l = ControllerRateLimiter::new();
+        // Within the burst the per-item exponential limiter dominates.
+        assert_eq!(l.when_at("a", now), Duration::from_millis(5));
+        assert_eq!(l.when_at("a", now), Duration::from_millis(10));
+        assert_eq!(l.when_at("b", now), Duration::from_millis(5));
+        // Exhaust the bucket: the overall limiter now dominates fresh items.
+        for i in 0..200 {
+            l.when_at(&format!("k{i}"), now);
+        }
+        assert!(l.when_at("fresh", now) > Duration::from_secs(5));
+        l.forget("a");
+        assert_eq!(l.num_requeues("a"), 0);
     }
 }
