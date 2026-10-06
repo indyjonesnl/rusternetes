@@ -101,8 +101,13 @@ impl RestStorage<PriorityClass> for PriorityClassRest {
         RestStorage::namespace_scoped(&self.store)
     }
 
-    async fn get(&self, ctx: &RequestContext, name: &str) -> Result<PriorityClass> {
-        RestStorage::get(&self.store, ctx, name).await
+    async fn get(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        options: &crate::registry::generic::GetOptions,
+    ) -> Result<PriorityClass> {
+        RestStorage::get(&self.store, ctx, name, options).await
     }
 
     async fn create(

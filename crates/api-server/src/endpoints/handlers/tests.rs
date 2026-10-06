@@ -49,6 +49,32 @@ fn check_name_matches_upstream() {
     );
 }
 
+/// get.go:90-110: `export` is refused unless it converts to false
+/// (runtime.Convert_Slice_string_To_bool, conversion.go:79-95); the
+/// `resourceVersion` reaches the Store.
+#[test]
+fn decode_get_options_matches_get_resource() {
+    use super::get::decode_get_options;
+
+    assert_eq!(decode_get_options(&q(&[])).unwrap().resource_version, "");
+    assert_eq!(
+        decode_get_options(&q(&[("resourceVersion", "12")]))
+            .unwrap()
+            .resource_version,
+        "12"
+    );
+    for ok in ["0", "false", "FALSE"] {
+        assert!(decode_get_options(&q(&[("export", ok)])).is_ok(), "{ok}");
+    }
+    for refused in ["true", "1", "", "yes"] {
+        assert_eq!(
+            bad_request(decode_get_options(&q(&[("export", refused)])).map(|_| ())),
+            "the export parameter, deprecated since v1.14, is no longer supported",
+            "{refused:?}"
+        );
+    }
+}
+
 fn q(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs
         .iter()

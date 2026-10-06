@@ -148,8 +148,13 @@ impl<P: Object> RestStorage<Scale> for ScaleRest<P> {
     }
 
     /// `ScaleREST.Get` (storage.go:314-326).
-    async fn get(&self, ctx: &RequestContext, name: &str) -> Result<Scale> {
-        let obj = self.store.get(ctx, name).await?;
+    async fn get(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        options: &crate::registry::generic::GetOptions,
+    ) -> Result<Scale> {
+        let obj = self.store.get(ctx, name, options).await?;
         self.to_scale(&obj)
     }
 

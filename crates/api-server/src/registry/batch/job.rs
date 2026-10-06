@@ -274,8 +274,13 @@ impl RestStorage<Job> for JobRest {
         RestStorage::namespace_scoped(&self.store)
     }
 
-    async fn get(&self, ctx: &RequestContext, name: &str) -> Result<Job> {
-        RestStorage::get(&self.store, ctx, name).await
+    async fn get(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        options: &crate::registry::generic::GetOptions,
+    ) -> Result<Job> {
+        RestStorage::get(&self.store, ctx, name, options).await
     }
 
     async fn create(

@@ -81,6 +81,9 @@ macro_rules! store_crud_handlers {
             >,
             axum::Extension(auth_ctx): axum::Extension<$crate::middleware::AuthContext>,
             axum::extract::Path(name): axum::extract::Path<String>,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
         ) -> rusternetes_common::Result<axum::response::Response> {
             $crate::endpoints::handlers::get_resource(
                 &state,
@@ -88,6 +91,7 @@ macro_rules! store_crud_handlers {
                 &auth_ctx.user,
                 None,
                 &name,
+                &params,
             )
             .await
         }
@@ -289,6 +293,7 @@ pub async fn get_validating_admission_policy_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     endpoints::get_resource(
         &state,
@@ -296,6 +301,7 @@ pub async fn get_validating_admission_policy_status(
         &auth_ctx.user,
         None,
         &name,
+        &params,
     )
     .await
 }

@@ -190,7 +190,10 @@ async fn create_admits_then_rejects_a_duplicate_and_a_name_being_deleted() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Forbidden(_)), "{err:?}");
-    assert!(registry.get(&ctx(), "foo").await.is_err());
+    assert!(registry
+        .get(&ctx(), "foo", &GetOptions::default())
+        .await
+        .is_err());
 
     let created = create(&registry, cm("foo")).await;
     assert!(!created.metadata.uid.is_empty());
@@ -200,7 +203,13 @@ async fn create_admits_then_rejects_a_duplicate_and_a_name_being_deleted() {
         "true",
         "the create strategy ran"
     );
-    assert_eq!(registry.get(&ctx(), "foo").await.unwrap(), created);
+    assert_eq!(
+        registry
+            .get(&ctx(), "foo", &GetOptions::default())
+            .await
+            .unwrap(),
+        created
+    );
 
     let err = registry
         .create(&ctx(), cm("foo"), None, &CreateOptions::default())
@@ -300,7 +309,10 @@ async fn dry_run_create_writes_nothing() {
         .await
         .unwrap();
     assert_eq!(out.metadata.name, "foo");
-    assert!(registry.get(&ctx(), "foo").await.is_err());
+    assert!(registry
+        .get(&ctx(), "foo", &GetOptions::default())
+        .await
+        .is_err());
 }
 
 // -- Update -----------------------------------------------------------------
@@ -452,7 +464,10 @@ async fn a_no_op_update_is_not_written() {
 
     let (out, _) = update(&registry, fresh).await.unwrap();
     assert_eq!(out, created);
-    let stored = registry.get(&ctx(), "foo").await.unwrap();
+    let stored = registry
+        .get(&ctx(), "foo", &GetOptions::default())
+        .await
+        .unwrap();
     assert_eq!(
         stored.metadata.resource_version,
         created.metadata.resource_version
@@ -549,7 +564,13 @@ async fn dry_run_update_writes_nothing() {
         .await
         .unwrap();
     assert_eq!(out.data.as_ref().unwrap()["node"], "machine2");
-    assert_eq!(registry.get(&ctx(), "foo").await.unwrap(), created);
+    assert_eq!(
+        registry
+            .get(&ctx(), "foo", &GetOptions::default())
+            .await
+            .unwrap(),
+        created
+    );
 }
 
 // -- Delete -----------------------------------------------------------------
@@ -581,7 +602,10 @@ async fn delete_removes_the_object_and_returns_a_status() {
     // "Yes we set Kind field to resource."
     assert_eq!(details.kind.as_deref(), Some("configmaps"));
     assert_eq!(details.uid.as_deref(), Some(created.metadata.uid.as_str()));
-    assert!(registry.get(&ctx(), "foo").await.is_err());
+    assert!(registry
+        .get(&ctx(), "foo", &GetOptions::default())
+        .await
+        .is_err());
 }
 
 /// `TestStoreGracefulDeleteWithResourceVersion` (store_test.go:1359-1417).
@@ -599,7 +623,10 @@ async fn graceless_delete_with_a_resource_version_precondition() {
     });
     let (_, deleted) = registry.delete(&ctx(), "foo", None, options).await.unwrap();
     assert!(deleted);
-    assert!(registry.get(&ctx(), "foo").await.is_err());
+    assert!(registry
+        .get(&ctx(), "foo", &GetOptions::default())
+        .await
+        .is_err());
 }
 
 /// Delete admission sees the stored object and can refuse.
@@ -612,7 +639,10 @@ async fn delete_admission_can_refuse() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Forbidden(_)), "{err:?}");
-    assert!(registry.get(&ctx(), "foo").await.is_ok());
+    assert!(registry
+        .get(&ctx(), "foo", &GetOptions::default())
+        .await
+        .is_ok());
 }
 
 fn with_finalizer(name: &str) -> ConfigMap {
@@ -639,17 +669,29 @@ async fn graceful_store_waits_for_finalizers() {
             .await
             .unwrap();
         assert!(!deleted);
-        assert!(registry.get(&ctx(), "foo").await.is_ok());
+        assert!(registry
+            .get(&ctx(), "foo", &GetOptions::default())
+            .await
+            .is_ok());
 
         // An update keeping the finalizer keeps the object.
         update(&registry, with_finalizer("foo")).await.unwrap();
-        assert!(registry.get(&ctx(), "foo").await.is_ok());
+        assert!(registry
+            .get(&ctx(), "foo", &GetOptions::default())
+            .await
+            .is_ok());
 
         // Removing it deletes the object.
         update(&registry, with_node(cm("foo"), "anothermachine"))
             .await
             .unwrap();
-        assert!(registry.get(&ctx(), "foo").await.is_err(), "gc={gc}");
+        assert!(
+            registry
+                .get(&ctx(), "foo", &GetOptions::default())
+                .await
+                .is_err(),
+            "gc={gc}"
+        );
     }
 }
 
@@ -668,7 +710,10 @@ async fn non_graceful_store_marks_as_deleting_and_bumps_generation() {
         assert!(!deleted);
         assert!(matches!(out, Deleted::Object(_)));
 
-        let stored = registry.get(&ctx(), "foo").await.unwrap();
+        let stored = registry
+            .get(&ctx(), "foo", &GetOptions::default())
+            .await
+            .unwrap();
         assert!(stored.metadata.deletion_timestamp.is_some());
         assert_eq!(stored.metadata.deletion_grace_period_seconds, Some(0));
         assert!(
@@ -678,14 +723,23 @@ async fn non_graceful_store_marks_as_deleting_and_bumps_generation() {
 
         // An update can never clear a deletion.
         update(&registry, with_finalizer("foo")).await.unwrap();
-        let still = registry.get(&ctx(), "foo").await.unwrap();
+        let still = registry
+            .get(&ctx(), "foo", &GetOptions::default())
+            .await
+            .unwrap();
         assert_eq!(
             still.metadata.deletion_timestamp,
             stored.metadata.deletion_timestamp
         );
 
         update(&registry, cm("foo")).await.unwrap();
-        assert!(registry.get(&ctx(), "foo").await.is_err(), "gc={gc}");
+        assert!(
+            registry
+                .get(&ctx(), "foo", &GetOptions::default())
+                .await
+                .is_err(),
+            "gc={gc}"
+        );
     }
 }
 
@@ -706,7 +760,10 @@ async fn propagation_policy_sets_the_gc_finalizer() {
         };
         let (_, deleted) = registry.delete(&ctx(), "foo", None, options).await.unwrap();
         assert!(!deleted);
-        let stored = registry.get(&ctx(), "foo").await.unwrap();
+        let stored = registry
+            .get(&ctx(), "foo", &GetOptions::default())
+            .await
+            .unwrap();
         assert_eq!(stored.metadata.finalizers, Some(vec![expected.to_string()]));
         assert!(stored.metadata.deletion_timestamp.is_some());
     }
@@ -739,7 +796,7 @@ async fn the_strategy_default_gc_policy_applies_without_options() {
     assert!(!deleted);
     assert_eq!(
         registry
-            .get(&ctx(), "foo")
+            .get(&ctx(), "foo", &GetOptions::default())
             .await
             .unwrap()
             .metadata
@@ -774,14 +831,23 @@ async fn dry_run_delete_writes_nothing() {
         panic!("expected the object")
     };
     assert!(out.metadata.deletion_timestamp.is_some());
-    assert_eq!(registry.get(&ctx(), "foo").await.unwrap(), created);
+    assert_eq!(
+        registry
+            .get(&ctx(), "foo", &GetOptions::default())
+            .await
+            .unwrap(),
+        created
+    );
 
     create(&registry, cm("bar")).await;
     registry
         .delete(&ctx(), "bar", None, dry_run_delete())
         .await
         .unwrap();
-    assert!(registry.get(&ctx(), "bar").await.is_ok());
+    assert!(registry
+        .get(&ctx(), "bar", &GetOptions::default())
+        .await
+        .is_ok());
 }
 
 /// `TestMarkAsDeleting` (store_test.go:2720-2773): an earlier deletion
@@ -1009,7 +1075,10 @@ async fn create_hooks_run_in_order() {
         .await;
     assert!(err.is_err());
     assert_eq!(hooks.milestones.take(), ["BeginCreate"]);
-    assert!(registry.get(&ctx(), "foo").await.is_err());
+    assert!(registry
+        .get(&ctx(), "foo", &GetOptions::default())
+        .await
+        .is_err());
 }
 
 /// `TestStoreUpdateHooks` (store_test.go:903-1038) and the fail half of
@@ -1152,7 +1221,10 @@ async fn after_delete_runs_when_the_object_is_removed() {
         .any(|m| m.starts_with("AfterDelete")));
 
     // The update that drains the finalizer removes it and runs the hook.
-    let mut current = registry.get(&ctx(), "held").await.unwrap();
+    let mut current = registry
+        .get(&ctx(), "held", &GetOptions::default())
+        .await
+        .unwrap();
     hooks.milestones.take();
     current.metadata.finalizers = None;
     update(&registry, current).await.unwrap();
@@ -1160,7 +1232,10 @@ async fn after_delete_runs_when_the_object_is_removed() {
         .milestones
         .take()
         .contains(&"AfterDelete(held)".to_string()));
-    assert!(registry.get(&ctx(), "held").await.is_err());
+    assert!(registry
+        .get(&ctx(), "held", &GetOptions::default())
+        .await
+        .is_err());
 }
 
 /// `Store.Get` (store.go:847-860) decorates what it returns.
@@ -1170,7 +1245,101 @@ async fn get_is_decorated() {
     let registry = hooked(TestStrategy::default(), &hooks);
     create(&registry, cm("foo")).await;
     hooks.milestones.take();
-    let out = registry.get(&ctx(), "foo").await.unwrap();
+    let out = registry
+        .get(&ctx(), "foo", &GetOptions::default())
+        .await
+        .unwrap();
     assert!(annotated(&out, "DecoratorWasCalled"));
     assert_eq!(hooks.milestones.take(), ["Decorator"]);
+}
+
+// -- Get with GetOptions.resourceVersion ------------------------------------
+
+fn get_rv(rv: &str) -> GetOptions {
+    GetOptions {
+        resource_version: rv.to_string(),
+    }
+}
+
+/// `etcd3 store.Get` + `validateMinimumResourceVersion`
+/// (storage/etcd3/store.go:238-262, :1094-1108): "" and "0" accept any
+/// version; a version the storage has reached is served.
+#[tokio::test]
+async fn get_serves_unset_zero_and_reached_resource_versions() {
+    let registry = store(TestStrategy::default());
+    let created = create(&registry, cm("foo")).await;
+    let rv = created.metadata.resource_version.clone().unwrap();
+
+    for opts in [GetOptions::default(), get_rv("0"), get_rv(&rv)] {
+        let got = registry.get(&ctx(), "foo", &opts).await.unwrap();
+        assert_eq!(got, created, "{opts:?}");
+    }
+}
+
+/// store.go:238-262: a version beyond the storage's is 504 Timeout with the
+/// `ResourceVersionTooLarge` cause (storage/errors.go:229-242), after the
+/// watch cache's wait (cacher/watch_cache.go:480-484) — which is retry-after 1.
+#[tokio::test]
+async fn get_rejects_a_too_large_resource_version() {
+    let registry = store(TestStrategy::default());
+    let created = create(&registry, cm("foo")).await;
+    let rv: i64 = created
+        .metadata
+        .resource_version
+        .as_deref()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let want = rv + 1000;
+
+    let err = registry
+        .get(&ctx(), "foo", &get_rv(&want.to_string()))
+        .await
+        .unwrap_err();
+    let Error::Status(status) = err else {
+        panic!("expected a Status, got {err:?}");
+    };
+    assert_eq!(status.code, Some(504));
+    assert_eq!(status.reason.as_deref(), Some("Timeout"));
+    assert_eq!(
+        status.message.as_deref(),
+        Some(format!("Timeout: Too large resource version: {want}, current: {rv}").as_str())
+    );
+    let details = status.details.as_ref().unwrap();
+    assert_eq!(details.retry_after_seconds, Some(1));
+    let causes = details.causes.as_ref().unwrap();
+    assert_eq!(causes[0].reason.as_deref(), Some("ResourceVersionTooLarge"));
+    assert_eq!(
+        causes[0].message.as_deref(),
+        Some("Too large resource version")
+    );
+}
+
+/// storage/api_object_versioner.go:90-103: an unparseable version is Invalid.
+#[tokio::test]
+async fn get_rejects_an_unparseable_resource_version() {
+    let registry = store(TestStrategy::default());
+    create(&registry, cm("foo")).await;
+    let err = registry
+        .get(&ctx(), "foo", &get_rv("abc"))
+        .await
+        .unwrap_err();
+    match err {
+        Error::Invalid(errs) => {
+            let s = format!("{}", Error::Invalid(errs));
+            assert!(s.contains("resourceVersion: Invalid value: \"abc\""), "{s}");
+        }
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+}
+
+/// A missing object is still NotFound, whatever the version asked for.
+#[tokio::test]
+async fn get_with_a_resource_version_of_a_missing_object_is_not_found() {
+    let registry = store(TestStrategy::default());
+    let err = registry
+        .get(&ctx(), "nope", &get_rv("0"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
 }

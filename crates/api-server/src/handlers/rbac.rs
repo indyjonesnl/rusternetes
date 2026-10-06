@@ -92,6 +92,7 @@ pub async fn get_role(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     endpoints::get_resource(
         &state,
@@ -99,6 +100,7 @@ pub async fn get_role(
         &auth_ctx.user,
         Some(&namespace),
         &name,
+        &params,
     )
     .await
 }
@@ -307,6 +309,7 @@ pub async fn get_rolebinding(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     endpoints::get_resource(
         &state,
@@ -314,6 +317,7 @@ pub async fn get_rolebinding(
         &auth_ctx.user,
         Some(&namespace),
         &name,
+        &params,
     )
     .await
 }
@@ -531,6 +535,7 @@ pub async fn get_clusterrole(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     endpoints::get_resource(
         &state,
@@ -538,6 +543,7 @@ pub async fn get_clusterrole(
         &auth_ctx.user,
         None,
         &name,
+        &params,
     )
     .await
 }
@@ -704,6 +710,7 @@ pub async fn get_clusterrolebinding(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     endpoints::get_resource(
         &state,
@@ -711,6 +718,7 @@ pub async fn get_clusterrolebinding(
         &auth_ctx.user,
         None,
         &name,
+        &params,
     )
     .await
 }

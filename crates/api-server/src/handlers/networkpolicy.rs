@@ -68,6 +68,7 @@ pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     endpoints::get_resource(
         &state,
@@ -75,6 +76,7 @@ pub async fn get(
         &auth_ctx.user,
         Some(&namespace),
         &name,
+        &params,
     )
     .await
 }

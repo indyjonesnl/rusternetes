@@ -73,8 +73,9 @@ pub async fn get_volumesnapshotclass(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
-    endpoints::get_resource(&state, &scope(&state), &auth_ctx.user, None, &name).await
+    endpoints::get_resource(&state, &scope(&state), &auth_ctx.user, None, &name, &params).await
 }
 
 pub async fn update_volumesnapshotclass(

@@ -738,7 +738,12 @@ pub trait RestStorage<T: Object>: Send + Sync {
     }
 
     /// `rest.Getter`.
-    async fn get(&self, ctx: &RequestContext, name: &str) -> Result<T>;
+    async fn get(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        options: &crate::registry::generic::GetOptions,
+    ) -> Result<T>;
 
     /// `rest.Creater`.
     async fn create(

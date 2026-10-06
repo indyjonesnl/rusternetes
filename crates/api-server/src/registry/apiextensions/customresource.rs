@@ -735,8 +735,13 @@ impl RestStorage<CustomResource> for CustomResourceRest {
         self.strategy.namespace_scoped()
     }
 
-    async fn get(&self, ctx: &RequestContext, name: &str) -> Result<CustomResource> {
-        let cr = self.store.get(ctx, name).await?;
+    async fn get(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        options: &crate::registry::generic::GetOptions,
+    ) -> Result<CustomResource> {
+        let cr = self.store.get(ctx, name, options).await?;
         self.serve(ctx, cr).await
     }
 
