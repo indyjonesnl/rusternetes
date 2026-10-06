@@ -127,7 +127,7 @@ pub struct ExactDeviceRequest {
 
     /// Capacity defines resource requirements against each capacity
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capacity: Option<BTreeMap<String, DeviceCapacityRequirement>>,
+    pub capacity: Option<CapacityRequirements>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -164,7 +164,7 @@ pub struct DeviceSubRequest {
     /// Capacity requirements (`DeviceSubRequest.Capacity`, types.go:1106;
     /// gated by `DRAConsumableCapacity`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capacity: Option<BTreeMap<String, DeviceCapacityRequirement>>,
+    pub capacity: Option<CapacityRequirements>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -231,11 +231,12 @@ pub enum TolerationOperator {
     Exists,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceCapacityRequirement {
-    /// Value defines the requested amount of capacity
-    pub value: String, // resource.Quantity as string
+/// `CapacityRequirements` (`staging/src/k8s.io/api/resource/v1/types.go:1110`):
+/// `{requests: map[QualifiedName]resource.Quantity}`, json `requests,omitempty`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CapacityRequirements {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub requests: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1028,6 +1029,27 @@ pub struct ListMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream wire shape: `capacity: {requests: {name: quantity}}` on both
+    /// ExactDeviceRequest and DeviceSubRequest (types.go:991, 1106).
+    #[test]
+    fn capacity_requirements_roundtrip_upstream_json() {
+        let j = serde_json::json!({"requests": {"example.com/mem": "2Gi"}});
+        let c: CapacityRequirements = serde_json::from_value(j.clone()).unwrap();
+        assert_eq!(c.requests["example.com/mem"], "2Gi");
+        assert_eq!(serde_json::to_value(&c).unwrap(), j);
+
+        let e: ExactDeviceRequest = serde_json::from_value(serde_json::json!({
+            "name": "r", "deviceClassName": "c", "capacity": j
+        }))
+        .unwrap();
+        assert_eq!(e.capacity.unwrap().requests.len(), 1);
+        let s: DeviceSubRequest = serde_json::from_value(serde_json::json!({
+            "name": "r", "deviceClassName": "c", "capacity": j
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(s.capacity.unwrap()).unwrap(), j);
+    }
 
     #[test]
     fn test_resource_claim_serialization() {

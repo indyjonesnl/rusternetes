@@ -71,7 +71,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({"devices": {
             "constraints": [{"distinctAttribute": "a.example.com/b"}],
             "requests": [{"name": "r", "firstAvailable": [
-                {"name": "s", "deviceClassName": "c", "capacity": {"m": {"value": "1"}}}]}]
+                {"name": "s", "deviceClassName": "c", "capacity": {"requests": {"m": "1"}}}]}]
         }}))
         .unwrap()
     }
