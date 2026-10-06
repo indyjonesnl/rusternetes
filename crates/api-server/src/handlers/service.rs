@@ -286,12 +286,15 @@ pub async fn patch_status(
 /// 1463-1465: `if e.Decorator != nil { return newDecoratedWatcher(ctx, w,
 /// e.Decorator), nil }`). Best-effort: an object that does not decode as a
 /// Service is passed through unchanged.
-pub(crate) fn default_on_read_watch_converter() -> crate::handlers::watch::WatchObjectConverter {
-    Arc::new(|val: serde_json::Value| {
+pub(crate) fn default_on_read_watch_converter(
+    primary: rusternetes_common::resources::IPFamily,
+) -> crate::handlers::watch::WatchObjectConverter {
+    Arc::new(move |val: serde_json::Value| {
+        let primary = primary.clone();
         Box::pin(async move {
             match serde_json::from_value::<Service>(val.clone()) {
                 Ok(mut svc) => {
-                    service_storage::default_on_read(&mut svc);
+                    service_storage::default_on_read(&mut svc, &primary);
                     serde_json::to_value(&svc).unwrap_or(val)
                 }
                 Err(_) => val,
@@ -334,12 +337,13 @@ pub async fn list(
     }
 
     let prefix = build_prefix("services", Some(&namespace));
+    let primary = state.cluster_ip_allocators.primary_family();
     let mut services = state.storage.list::<Service>(&prefix).await?;
     // `Store.Decorator` on every listed item (`Store.List` store.go:381-383;
     // `defaultOnReadServiceList` storage.go:243-252).
     services
         .iter_mut()
-        .for_each(service_storage::default_on_read);
+        .for_each(|svc| service_storage::default_on_read(svc, &primary));
 
     // Apply field and label selector filtering
     let mut params_map = HashMap::new();
@@ -388,14 +392,10 @@ pub async fn list_all_services(
     // Check if this is a watch request
     if params.watch.unwrap_or(false) {
         debug!("Watch request for all services");
+        let converter =
+            default_on_read_watch_converter(state.cluster_ip_allocators.primary_family());
         return crate::handlers::watch::watch_cluster_scoped_converted::<Service>(
-            state,
-            auth_ctx,
-            "services",
-            "",
-            params,
-            default_on_read_watch_converter(),
-            None,
+            state, auth_ctx, "services", "", params, converter, None,
         )
         .await;
     }
@@ -413,12 +413,13 @@ pub async fn list_all_services(
     }
 
     let prefix = build_prefix("services", None);
+    let primary = state.cluster_ip_allocators.primary_family();
     let mut services = state.storage.list::<Service>(&prefix).await?;
     // `Store.Decorator` on every listed item (`Store.List` store.go:381-383;
     // `defaultOnReadServiceList` storage.go:243-252).
     services
         .iter_mut()
-        .for_each(service_storage::default_on_read);
+        .for_each(|svc| service_storage::default_on_read(svc, &primary));
 
     // Apply field and label selector filtering
     let mut params_map = HashMap::new();

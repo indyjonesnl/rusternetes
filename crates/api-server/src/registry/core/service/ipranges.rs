@@ -10,10 +10,11 @@
 
 use ipnet::IpNet;
 use rusternetes_common::resources::IPFamily;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-/// Upstream's default (`cp.DefaultServiceIPCIDR`, pkg/controlplane/
-/// instance.go), and the range the `kubernetes` Service address
-/// (`10.96.0.1`) belongs to.
+/// This project's default. Upstream's `kubeoptions.DefaultServiceIPCIDR`
+/// (pkg/kubeapiserver/options/options.go:30) is 10.0.0.0/24; the
+/// Kubernetes-distribution convention 10.96.0.0/12 is kept deliberately.
 pub const DEFAULT_SERVICE_CLUSTER_IP_RANGE: &str = "10.96.0.0/12";
 
 /// The validated ranges, primary first.
@@ -67,17 +68,26 @@ impl ServiceIpRanges {
                     .into(),
             );
         }
-        // Deviation (tracked in the follow-up issue): the `kubernetes`
-        // Service address is still the fixed first address of the default
-        // range, so the primary range cannot differ from it yet.
-        let default: IpNet = DEFAULT_SERVICE_CLUSTER_IP_RANGE.parse().expect("constant");
-        if cidrs[0] != default {
-            return Err(format!(
-                "--service-cluster-ip-range[0] must be {DEFAULT_SERVICE_CLUSTER_IP_RANGE}: \
-                 the kubernetes Service address is not yet derived from the range"
-            ));
+        // `cp.ServiceIPRange` (pkg/controlplane/apiserver/options/
+        // options.go:373-376) runs on the primary range only.
+        let host_bits = match cidrs[0] {
+            IpNet::V4(n) => 32 - n.prefix_len(),
+            IpNet::V6(n) => 128 - n.prefix_len(),
+        };
+        if host_bits < 3 {
+            return Err("the service cluster IP range must be at least 8 IP addresses".into());
         }
         Ok(Self { cidrs })
+    }
+
+    /// The `kubernetes` Service address: the first usable address of the
+    /// primary range (`cp.ServiceIPRange`, options.go:378-382,
+    /// `GetIndexedIP(&serviceClusterIPRange, 1)`).
+    pub fn api_server_service_ip(&self) -> IpAddr {
+        match self.cidrs[0] {
+            IpNet::V4(n) => IpAddr::V4(Ipv4Addr::from(u32::from(n.network()).wrapping_add(1))),
+            IpNet::V6(n) => IpAddr::V6(Ipv6Addr::from(u128::from(n.network()).wrapping_add(1))),
+        }
     }
 
     /// The ranges as ServiceCIDR `spec.cidrs`, primary first.
@@ -118,6 +128,44 @@ mod tests {
         assert!(err("nope").contains("[0] is not a valid cidr"));
         assert!(err("10.96.0.0/12,nope").contains("[1] is not an ip net"));
         assert!(err("10.96.0.0/12,10.0.0.0/16").contains("must be of different IP family"));
-        assert!(err("fd00::/112").contains("must be 10.96.0.0/12"));
+        assert!(err("10.96.0.0/30").contains("at least 8 IP addresses"));
+    }
+
+    /// `TestGetServiceIPAndRanges` (cmd/kube-apiserver/app/options/
+    /// completion_test.go:23-67): (flag, apiServerServiceIP, primary, secondary).
+    #[test]
+    fn upstream_get_service_ip_and_ranges_table() {
+        let r = ServiceIpRanges::parse("192.0.2.1/24").unwrap();
+        assert_eq!(r.api_server_service_ip().to_string(), "192.0.2.1");
+        assert_eq!(r.cidrs(), vec!["192.0.2.0/24"]);
+        // (Upstream's IPv4+IPv4 row is omitted: validation.go:67-76 rejects it
+        // and the table does not exercise validation.)
+        let r = ServiceIpRanges::parse("192.0.2.1/24,2001:db2:1:3:4::1/112").unwrap();
+        assert_eq!(r.api_server_service_ip().to_string(), "192.0.2.1");
+        assert_eq!(r.cidrs(), vec!["192.0.2.0/24", "2001:db2:1:3:4::/112"]);
+        // IPv6-primary dual-stack.
+        let r = ServiceIpRanges::parse("2001:db2:1:3:4::1/112,192.0.2.1/24").unwrap();
+        assert_eq!(r.api_server_service_ip().to_string(), "2001:db2:1:3:4::1");
+        assert_eq!(r.cidrs(), vec!["2001:db2:1:3:4::/112", "192.0.2.0/24"]);
+        assert_eq!(r.families(), vec![IPFamily::IPv6, IPFamily::IPv4]);
+        assert_eq!(
+            ServiceIpRanges::parse("fd00::/112").unwrap().families()[0],
+            IPFamily::IPv6
+        );
+        for bad in [
+            "192.0.2.1/30,192.168.128.0/17",
+            "192.0.2.1/33,192.168.128.0/17",
+            "192.0.2.1/24,192.168.128.0/33",
+            "2001:db2:1:3:4::1/129,192.0.2.1/24",
+            "192.0.2.1/24,2001:db2:1:3:4::1/129",
+            "192.0.2.1,192.168.128.0/17",
+            "192.0.2.1/24,192.168.128.1",
+            "2001:db2:1:3:4::1,192.0.2.1/24",
+            "192.0.2.1/24,2001:db2:1:3:4::1",
+            "bad.ip.range,192.168.0.2/24",
+            "192.168.0.2/24,bad.ip.range",
+        ] {
+            assert!(ServiceIpRanges::parse(bad).is_err(), "{bad}");
+        }
     }
 }

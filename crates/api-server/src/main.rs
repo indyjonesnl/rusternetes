@@ -240,7 +240,13 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
 
-    if let Err(e) = bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port).await {
+    if let Err(e) = bootstrap::bootstrap_kubernetes_service(
+        storage.clone(),
+        api_port,
+        service_ranges.api_server_service_ip(),
+    )
+    .await
+    {
         warn!(
             "Failed to bootstrap kubernetes Service Endpoints: {}. Continuing anyway.",
             e
@@ -261,7 +267,11 @@ async fn main() -> Result<()> {
     bootstrap::spawn_system_priority_classes_hook(storage.clone());
     // Keep the kubernetes endpoint tracking the live api-server IP across
     // container recreates / IP changes (upstream EndpointReconciler, #1188).
-    bootstrap::spawn_endpoint_reconciler(storage.clone(), api_port);
+    bootstrap::spawn_endpoint_reconciler(
+        storage.clone(),
+        api_port,
+        service_ranges.api_server_service_ip(),
+    );
 
     // Aggregation layer: probe aggregated APIService backends and set their
     // Available condition (upstream kube-aggregator availability controller,

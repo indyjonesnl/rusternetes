@@ -2067,15 +2067,11 @@ pub async fn watch_services(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
+    let converter = crate::handlers::service::default_on_read_watch_converter(
+        state.cluster_ip_allocators.primary_family(),
+    );
     watch_namespaced_converted::<rusternetes_common::resources::Service>(
-        state,
-        auth_ctx,
-        namespace,
-        "services",
-        "",
-        params,
-        crate::handlers::service::default_on_read_watch_converter(),
-        None,
+        state, auth_ctx, namespace, "services", "", params, converter, None,
     )
     .await
 }
@@ -2088,14 +2084,11 @@ pub async fn watch_all_services(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
+    let converter = crate::handlers::service::default_on_read_watch_converter(
+        state.cluster_ip_allocators.primary_family(),
+    );
     watch_cluster_scoped_converted::<rusternetes_common::resources::Service>(
-        state,
-        auth_ctx,
-        "services",
-        "",
-        params,
-        crate::handlers::service::default_on_read_watch_converter(),
-        None,
+        state, auth_ctx, "services", "", params, converter, None,
     )
     .await
 }

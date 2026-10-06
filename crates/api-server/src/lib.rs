@@ -211,6 +211,11 @@ impl Default for ApiServerConfig {
 pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> anyhow::Result<()> {
     info!("Starting Rusternetes API Server");
 
+    // `validateClusterIPFlags`: refuse to start on a bad range.
+    let service_ranges =
+        registry::core::service::ipranges::ServiceIpRanges::parse(&config.service_cluster_ip_range)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
     let token_manager = Arc::new(TokenManager::new_auto(config.jwt_secret.as_bytes()));
 
     let authorizer: Arc<dyn rusternetes_common::authz::Authorizer> = if config.skip_auth {
@@ -250,7 +255,13 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
 
-    if let Err(e) = bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port).await {
+    if let Err(e) = bootstrap::bootstrap_kubernetes_service(
+        storage.clone(),
+        api_port,
+        service_ranges.api_server_service_ip(),
+    )
+    .await
+    {
         warn!(
             "Failed to bootstrap kubernetes Service Endpoints: {}. Continuing anyway.",
             e
@@ -261,7 +272,11 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     bootstrap::spawn_system_priority_classes_hook(storage.clone());
     // Keep the kubernetes endpoint tracking the live api-server IP across
     // container recreates / IP changes (upstream EndpointReconciler, #1188).
-    bootstrap::spawn_endpoint_reconciler(storage.clone(), api_port);
+    bootstrap::spawn_endpoint_reconciler(
+        storage.clone(),
+        api_port,
+        service_ranges.api_server_service_ip(),
+    );
 
     // Aggregation layer: probe aggregated APIService backends and set their
     // Available condition (upstream kube-aggregator availability controller,
@@ -277,9 +292,6 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     // `pkg/controlplane/controller/defaultservicecidr`). Reconciles rather than
     // create-once: dual-stack upgrade, flag-mismatch warning, and `Ready=True`
     // only when the persisted CIDRs match this api-server's configuration.
-    let service_ranges =
-        registry::core::service::ipranges::ServiceIpRanges::parse(&config.service_cluster_ip_range)
-            .map_err(|e| anyhow::anyhow!(e))?;
     bootstrap::start_default_servicecidr_controller(storage.clone(), service_ranges.cidrs()).await;
 
     // kube-system/extension-apiserver-authentication, kept by the

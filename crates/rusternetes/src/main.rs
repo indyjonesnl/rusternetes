@@ -113,6 +113,14 @@ struct Args {
     #[arg(long, default_value = "1")]
     proxy_sync_interval: u64,
 
+    /// ClusterIP range(s) for Services: one CIDR, or two of different IP
+    /// families (dual-stack), comma-separated
+    /// (`--service-cluster-ip-range`). Handed to the embedded api-server; the
+    /// `kubernetes` Service address and the kubelet's
+    /// `KUBERNETES_SERVICE_HOST` derive from its first address.
+    #[arg(long, default_value = rusternetes_api_server::registry::core::service::ipranges::DEFAULT_SERVICE_CLUSTER_IP_RANGE)]
+    service_cluster_ip_range: String,
+
     /// ClusterIP CIDR — must match the apiserver's
     /// `--service-cluster-ip-range`. Used by kube-proxy to scope its
     /// POSTROUTING MASQUERADE rule.
@@ -236,6 +244,12 @@ async fn async_main() -> Result<()> {
     info!("Storage initialized, starting components...");
 
     // --- API Server ---
+    // `validateClusterIPFlags`: refuse to start on a bad range.
+    let service_ranges =
+        rusternetes_api_server::registry::core::service::ipranges::ServiceIpRanges::parse(
+            &args.service_cluster_ip_range,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
     let api_storage = storage.clone();
     let mut api_config = rusternetes_api_server::ApiServerConfig {
         bind_address: args.bind_address.clone(),
@@ -247,6 +261,7 @@ async fn async_main() -> Result<()> {
         skip_auth: args.skip_auth,
         console_dir: args.console_dir.map(std::path::PathBuf::from),
         client_ca_file: args.client_ca_file.clone(),
+        service_cluster_ip_range: args.service_cluster_ip_range.clone(),
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;
@@ -352,7 +367,7 @@ async fn async_main() -> Result<()> {
             .kubernetes_service_host
             .clone()
             .or_else(|| std::env::var("KUBERNETES_SERVICE_HOST_OVERRIDE").ok())
-            .unwrap_or_else(|| "10.96.0.1".to_string()),
+            .unwrap_or_else(|| service_ranges.api_server_service_ip().to_string()),
     };
     tokio::spawn(async move {
         if let Err(e) = rusternetes_kubelet::run(kubelet_storage, kubelet_config).await {
