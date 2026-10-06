@@ -178,3 +178,26 @@ async fn failed_counter_cannot_decrease_even_for_indexed_job() {
         "{body}"
     );
 }
+
+/// The wider `validateJobStatus` rules are wired through the status strategy
+/// (validation.go:459-609, gated by strategy.go:349-432).
+#[tokio::test]
+async fn failed_condition_without_failure_target_is_rejected() {
+    let state = TestApiServer::new();
+    let (code, body) = seed_then_put(
+        &state,
+        "j-nft",
+        job("j-nft", None, 3, 3),
+        json!({"startTime": "2026-01-01T00:00:00Z"}),
+        json!({"startTime": "2026-01-01T00:00:00Z", "conditions": [{"type": "Failed", "status": "True"}]}),
+    )
+    .await;
+
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["message"].as_str().unwrap_or_default().contains(
+            "status.conditions: Invalid value: \"null\": cannot set Failed=True condition without the FailureTarget=true condition"
+        ) || body["message"].as_str().unwrap_or_default().contains("cannot set Failed=True condition without the FailureTarget=true condition"),
+        "{body}"
+    );
+}

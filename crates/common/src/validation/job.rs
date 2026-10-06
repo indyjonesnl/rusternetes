@@ -19,10 +19,10 @@
 
 use crate::resources::pod::{Affinity, PodSpec};
 use crate::resources::workloads::{
-    Job, JobSpec, JobTemplateSpec, PodFailurePolicyRule, SuccessPolicyRule,
+    Job, JobCondition, JobSpec, JobTemplateSpec, PodFailurePolicyRule, SuccessPolicyRule,
 };
 use crate::types::LabelSelector;
-use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::field::{BadValue, Error, ErrorList, Path};
 use crate::validation::metav1::{
     is_dns1123_label, is_dns1123_subdomain, is_qualified_name, label_selector_matches_labels,
     validate_label_selector, LabelSelectorValidationOptions,
@@ -623,10 +623,14 @@ pub fn validate_job_update(job: &Job, old_job: &Job, opts: &JobValidationOptions
 
 /// Upstream `ValidateJobUpdateStatus` (validation.go:616-620): the metadata
 /// update and [`validate_job_status_update`].
-pub fn validate_job_update_status(job: &Job, old_job: &Job) -> ErrorList {
+pub fn validate_job_update_status(
+    job: &Job,
+    old_job: &Job,
+    opts: &JobStatusValidationOptions,
+) -> ErrorList {
     let mut errs =
         validate_object_meta_update(&job.metadata, &old_job.metadata, &Path::new("metadata"));
-    errs.extend(validate_job_status_update(job, old_job));
+    errs.extend(validate_job_status_update(job, old_job, opts));
     errs
 }
 
@@ -1061,90 +1065,600 @@ fn validate_success_policy(
     errs
 }
 
-/// Which decreasing-counter rules apply to this status update.
-///
-/// Port of the two counter options upstream computes in
-/// `pkg/registry/batch/job/strategy.go:396-397`:
-///
-/// ```text
-/// // We allow to decrease the counter for succeeded pods for jobs which
-/// // have equal parallelism and completions, as they can be scaled-down.
-/// RejectDecreasingSucceededCounter: !isIndexed || !ptr.Equal(newJob.Spec.Completions, newJob.Spec.Parallelism),
-/// RejectDecreasingFailedCounter:    true,
-/// ```
-///
-/// Only these two options are ported here; the sibling options upstream builds
-/// in the same struct (completed/failed index formats, terminal-condition
-/// disabling, ...) are separate rules and are not covered by this function.
+/// Upstream `JobStatusValidationOptions`
+/// (`pkg/apis/batch/validation/validation.go:1072-1096`). Every rule that
+/// `validateJobStatus` / `ValidateJobStatusUpdate` can apply is gated by one
+/// of these; [`get_status_validation_options`] derives them from the old and
+/// new objects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JobStatusValidationOptions {
     pub reject_decreasing_succeeded_counter: bool,
     pub reject_decreasing_failed_counter: bool,
+    pub reject_disabling_terminal_condition: bool,
+    pub reject_invalid_completed_indexes: bool,
+    pub reject_invalid_failed_indexes: bool,
+    pub reject_failed_indexes_overlapping_completed: bool,
+    pub reject_completed_indexes_for_non_indexed_job: bool,
+    pub reject_failed_indexes_for_no_backoff_limit_per_index: bool,
+    pub reject_failed_job_without_failure_target: bool,
+    pub reject_complete_job_without_success_criteria_met: bool,
+    pub reject_finished_job_with_active_pods: bool,
+    pub reject_finished_job_without_start_time: bool,
+    pub reject_finished_job_with_uncounted_terminated_pods: bool,
+    pub reject_start_time_update_for_unsuspended_job: bool,
+    pub reject_completion_time_before_start_time: bool,
+    pub reject_mutating_completion_time: bool,
+    pub reject_complete_job_without_completion_time: bool,
+    pub reject_not_complete_job_with_completion_time: bool,
+    pub reject_complete_job_with_failed_condition: bool,
+    pub reject_complete_job_with_failure_target_condition: bool,
+    pub allow_for_success_criteria_met_in_extended_scope: bool,
+    pub reject_more_ready_than_active_pods: bool,
+    pub reject_finished_job_with_terminating_pods: bool,
 }
 
-impl JobStatusValidationOptions {
-    /// Derive the options from the incoming Job, as upstream's strategy does.
-    pub fn for_job(new_job: &Job) -> Self {
-        let is_indexed = new_job.spec.completion_mode.as_deref() == Some("Indexed");
-        let completions_equal_parallelism = new_job.spec.completions == new_job.spec.parallelism;
-        Self {
-            reject_decreasing_succeeded_counter: !is_indexed || !completions_equal_parallelism,
-            reject_decreasing_failed_counter: true,
-        }
+// Upstream `IsJobFinished` .. `IsConditionFalse` (validation.go:925-966).
+fn job_conditions(job: &Job) -> &[JobCondition] {
+    job.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or(&[])
+}
+
+fn is_condition_with_status(conds: &[JobCondition], c_type: &str, status: &str) -> bool {
+    conds
+        .iter()
+        .any(|c| c.condition_type == c_type && c.status == status)
+}
+
+/// Upstream `IsConditionTrue` (validation.go:950).
+fn is_condition_true(conds: &[JobCondition], c_type: &str) -> bool {
+    is_condition_with_status(conds, c_type, "True")
+}
+
+/// Upstream `IsConditionFalse` (validation.go:959).
+fn is_condition_false(conds: &[JobCondition], c_type: &str) -> bool {
+    is_condition_with_status(conds, c_type, "False")
+}
+
+/// Upstream `IsJobComplete` (validation.go:934).
+fn is_job_complete(job: &Job) -> bool {
+    is_condition_true(job_conditions(job), "Complete")
+}
+
+/// Upstream `IsJobFailed` (validation.go:938).
+fn is_job_failed(job: &Job) -> bool {
+    is_condition_true(job_conditions(job), "Failed")
+}
+
+/// Upstream `IsJobFinished` (validation.go:925).
+fn is_job_finished(job: &Job) -> bool {
+    is_job_complete(job) || is_job_failed(job)
+}
+
+/// Upstream `isJobSuccessCriteriaMet` (validation.go:942).
+fn is_job_success_criteria_met(job: &Job) -> bool {
+    is_condition_true(job_conditions(job), "SuccessCriteriaMet")
+}
+
+/// Upstream `isJobFailureTarget` (validation.go:946).
+fn is_job_failure_target(job: &Job) -> bool {
+    is_condition_true(job_conditions(job), "FailureTarget")
+}
+
+/// `metav1.Time` is serialized (and so stored and compared) at second
+/// granularity.
+fn time_secs(t: &Option<chrono::DateTime<chrono::Utc>>) -> Option<i64> {
+    t.as_ref().map(|t| t.timestamp())
+}
+
+/// The `Invalid value:` rendering of a `*metav1.Time` (RFC3339, quoted).
+fn time_bad_value(t: &chrono::DateTime<chrono::Utc>) -> String {
+    t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+type UncountedUids<'a> = Option<(&'a [String], &'a [String])>;
+
+/// `UncountedTerminatedPods` as upstream's `apiequality.Semantic.DeepEqual`
+/// sees it: nil and empty slices are equal, a nil pointer is not an empty struct.
+fn uncounted_normalized(job: &Job) -> UncountedUids<'_> {
+    job.status
+        .as_ref()
+        .and_then(|s| s.uncounted_terminated_pods.as_ref())
+        .map(|u| {
+            (
+                u.succeeded.as_deref().unwrap_or(&[]),
+                u.failed.as_deref().unwrap_or(&[]),
+            )
+        })
+}
+
+/// Upstream `getStatusValidationOptions`
+/// (`pkg/registry/batch/job/strategy.go:349-432`), the `JobManagedBy` branch
+/// (feature GA and on by default in 1.35, `features.JobManagedBy`). Each rule
+/// is switched on only when the field it guards CHANGED between `old_job` and
+/// `new_job`, so an unrelated status write is not blocked by a status that
+/// already violated a rule and the controller gets a sync to repair a status
+/// a spec edit just invalidated (strategy.go:354-367).
+pub fn get_status_validation_options(new_job: &Job, old_job: &Job) -> JobStatusValidationOptions {
+    let new_status = new_job.status.clone().unwrap_or_default();
+    let old_status = old_job.status.clone().unwrap_or_default();
+    let is_indexed = new_job.spec.completion_mode.as_deref() == Some(INDEXED_COMPLETION);
+
+    let is_job_finished_changed = is_job_finished(old_job) != is_job_finished(new_job);
+    let is_job_complete_changed = is_job_complete(old_job) != is_job_complete(new_job);
+    let is_job_failed_changed = is_job_failed(old_job) != is_job_failed(new_job);
+    let is_job_failure_target_changed =
+        is_job_failure_target(old_job) != is_job_failure_target(new_job);
+    let is_job_success_criteria_met_changed =
+        is_job_success_criteria_met(old_job) != is_job_success_criteria_met(new_job);
+    let is_completed_indexes_changed = old_status.completed_indexes.clone().unwrap_or_default()
+        != new_status.completed_indexes.clone().unwrap_or_default();
+    let is_failed_indexes_changed = old_status.failed_indexes != new_status.failed_indexes;
+    let is_active_changed = old_status.active.unwrap_or(0) != new_status.active.unwrap_or(0);
+    let is_start_time_changed =
+        time_secs(&old_status.start_time) != time_secs(&new_status.start_time);
+    let is_completion_time_changed =
+        time_secs(&old_status.completion_time) != time_secs(&new_status.completion_time);
+    let is_uncounted_terminated_pods_changed =
+        uncounted_normalized(old_job) != uncounted_normalized(new_job);
+    let is_ready_changed = old_status.ready != new_status.ready;
+    let is_terminating_changed = old_status.terminating != new_status.terminating;
+    let is_suspended_with_zero_completions =
+        new_job.spec.suspend == Some(true) && new_job.spec.completions == Some(0);
+    // strategy.go:372-376: resume detected via JobSuspended True -> False
+    // (kubernetes/kubernetes#134521).
+    let is_job_resuming = is_condition_true(job_conditions(old_job), "Suspended")
+        && is_condition_false(job_conditions(new_job), "Suspended");
+
+    JobStatusValidationOptions {
+        // We allow to decrease the counter for succeeded pods for jobs which
+        // have equal parallelism and completions, as they can be scaled-down.
+        reject_decreasing_succeeded_counter: !is_indexed
+            || new_job.spec.completions != new_job.spec.parallelism,
+        reject_decreasing_failed_counter: true,
+        reject_disabling_terminal_condition: true,
+        reject_invalid_completed_indexes: is_completed_indexes_changed,
+        reject_invalid_failed_indexes: is_failed_indexes_changed,
+        reject_completed_indexes_for_non_indexed_job: is_completed_indexes_changed,
+        reject_failed_indexes_for_no_backoff_limit_per_index: is_failed_indexes_changed,
+        reject_failed_indexes_overlapping_completed: is_failed_indexes_changed
+            || is_completed_indexes_changed,
+        reject_failed_job_without_failure_target: is_job_failed_changed
+            || is_failed_indexes_changed,
+        reject_complete_job_without_success_criteria_met: is_job_complete_changed
+            || is_job_success_criteria_met_changed,
+        reject_finished_job_with_active_pods: is_job_finished_changed || is_active_changed,
+        reject_finished_job_without_start_time: (is_job_finished_changed || is_start_time_changed)
+            && !is_suspended_with_zero_completions,
+        reject_finished_job_with_uncounted_terminated_pods: is_job_finished_changed
+            || is_uncounted_terminated_pods_changed,
+        reject_start_time_update_for_unsuspended_job: is_start_time_changed && !is_job_resuming,
+        reject_completion_time_before_start_time: is_start_time_changed
+            || is_completion_time_changed,
+        reject_mutating_completion_time: true,
+        reject_not_complete_job_with_completion_time: is_job_complete_changed
+            || is_completion_time_changed,
+        reject_complete_job_without_completion_time: is_job_complete_changed
+            || is_completion_time_changed,
+        reject_complete_job_with_failed_condition: is_job_complete_changed || is_job_failed_changed,
+        reject_complete_job_with_failure_target_condition: is_job_complete_changed
+            || is_job_failure_target_changed,
+        allow_for_success_criteria_met_in_extended_scope: true,
+        reject_more_ready_than_active_pods: is_ready_changed || is_active_changed,
+        reject_finished_job_with_terminating_pods: is_job_finished_changed
+            || is_terminating_changed,
     }
 }
 
-/// Validate a Job status update against the stored object.
-///
-/// Port of the decreasing-counter half of upstream `ValidateJobStatusUpdate`
-/// (`pkg/apis/batch/validation/validation.go:722-730`):
-///
-/// ```text
-/// if opts.RejectDecreasingFailedCounter {
-///     if job.Status.Failed < oldJob.Status.Failed {
-///         allErrs = append(allErrs, field.Invalid(statusFld.Child("failed"),
-///             job.Status.Failed, "cannot decrease the failed counter"))
-///     }
-/// }
-/// ```
-///
-/// The Job controller recomputes both counters from the live pod list, so
-/// without this rule a decreasing write is accepted here while a real
-/// api-server refuses it — which is how #1955 stayed invisible in-house and
-/// reddened only the vanilla-swap leg. The error wording is the contract:
-/// `status.failed: Invalid value: 0: cannot decrease the failed counter`.
-pub fn validate_job_status_update(new_job: &Job, old_job: &Job) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
-    let opts = JobStatusValidationOptions::for_job(new_job);
-    let status_fld = Path::new("status");
+/// Upstream `validateFailedIndexesNotOverlapCompleted` (validation.go:968-1012).
+fn validate_failed_indexes_not_overlap_completed(
+    completed: &str,
+    failed: &str,
+    completions: i32,
+) -> Result<(), String> {
+    if completed.is_empty() || failed.is_empty() {
+        return Ok(());
+    }
+    let completed_intervals: Vec<&str> = completed.split(',').collect();
+    let failed_intervals: Vec<&str> = failed.split(',').collect();
+    let (mut c_pos, mut f_pos) = (0usize, 0usize);
+    let mut c = parse_index_interval(completed_intervals[c_pos], completions);
+    let mut f = parse_index_interval(failed_intervals[f_pos], completions);
+    while c_pos < completed_intervals.len() && f_pos < failed_intervals.len() {
+        match (&c, &f) {
+            (Err(_), _) => {
+                // Failure to parse "completed" interval; the format check reports it.
+                c_pos += 1;
+                if c_pos < completed_intervals.len() {
+                    c = parse_index_interval(completed_intervals[c_pos], completions);
+                }
+            }
+            (_, Err(_)) => {
+                f_pos += 1;
+                if f_pos < failed_intervals.len() {
+                    f = parse_index_interval(failed_intervals[f_pos], completions);
+                }
+            }
+            (Ok((c_x, c_y)), Ok((f_x, f_y))) => {
+                if c_x <= f_y && f_x <= c_y {
+                    return Err(format!(
+                        "failedIndexes and completedIndexes overlap at index: {}",
+                        (*c_x).max(*f_x)
+                    ));
+                }
+                // No overlap, move to the next one.
+                if c_x <= f_x {
+                    c_pos += 1;
+                    if c_pos < completed_intervals.len() {
+                        c = parse_index_interval(completed_intervals[c_pos], completions);
+                    }
+                } else {
+                    f_pos += 1;
+                    if f_pos < failed_intervals.len() {
+                        f = parse_index_interval(failed_intervals[f_pos], completions);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
-    let new_failed = new_job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
-    let old_failed = old_job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
-    if opts.reject_decreasing_failed_counter && new_failed < old_failed {
+/// Upstream `validateJobStatus` (validation.go:459-609).
+fn validate_job_status(job: &Job, fld_path: &Path, opts: &JobStatusValidationOptions) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let status = job.status.clone().unwrap_or_default();
+    let cond_err = |detail: &str| {
+        Error::invalid(
+            &fld_path.child("conditions"),
+            BadValue::Omit,
+            detail.to_string(),
+        )
+    };
+
+    errs.extend(validate_nonnegative_field(
+        status.active.unwrap_or(0) as i64,
+        &fld_path.child("active"),
+    ));
+    errs.extend(validate_nonnegative_field(
+        status.succeeded.unwrap_or(0) as i64,
+        &fld_path.child("succeeded"),
+    ));
+    errs.extend(validate_nonnegative_field(
+        status.failed.unwrap_or(0) as i64,
+        &fld_path.child("failed"),
+    ));
+    if let Some(ready) = status.ready {
+        errs.extend(validate_nonnegative_field(
+            ready as i64,
+            &fld_path.child("ready"),
+        ));
+    }
+    if let Some(terminating) = status.terminating {
+        errs.extend(validate_nonnegative_field(
+            terminating as i64,
+            &fld_path.child("terminating"),
+        ));
+    }
+    if let Some(u) = &status.uncounted_terminated_pods {
+        let path = fld_path.child("uncountedTerminatedPods");
+        let mut seen: HashSet<&str> = HashSet::new();
+        for (name, uids) in [("succeeded", &u.succeeded), ("failed", &u.failed)] {
+            for (i, k) in uids.iter().flatten().enumerate() {
+                let p = path.child(name).index(i);
+                if k.is_empty() {
+                    errs.push(Error::invalid(&p, k.clone(), "must not be empty"));
+                } else if !seen.insert(k.as_str()) {
+                    errs.push(Error::duplicate(&p, k.clone()));
+                }
+            }
+        }
+    }
+
+    let complete = is_job_complete(job);
+    let failed = is_job_failed(job);
+    let conds = job_conditions(job);
+    if opts.reject_complete_job_with_failed_condition && complete && failed {
+        errs.push(cond_err(
+            "cannot set Complete=True and Failed=true conditions",
+        ));
+    }
+    if opts.reject_complete_job_with_failure_target_condition
+        && complete
+        && is_condition_true(conds, "FailureTarget")
+    {
+        errs.push(cond_err(
+            "cannot set Complete=True and FailureTarget=true conditions",
+        ));
+    }
+    if opts.reject_not_complete_job_with_completion_time && !complete {
+        if let Some(t) = &status.completion_time {
+            errs.push(Error::invalid(
+                &fld_path.child("completionTime"),
+                time_bad_value(t),
+                "cannot set completionTime when there is no Complete=True condition",
+            ));
+        }
+    }
+    if opts.reject_complete_job_without_completion_time
+        && status.completion_time.is_none()
+        && complete
+    {
+        errs.push(Error::required(
+            &fld_path.child("completionTime"),
+            "completionTime is required for Complete jobs",
+        ));
+    }
+    if opts.reject_completion_time_before_start_time {
+        if let (Some(start), Some(completion)) = (&status.start_time, &status.completion_time) {
+            if completion.timestamp() < start.timestamp() {
+                errs.push(Error::invalid(
+                    &fld_path.child("completionTime"),
+                    time_bad_value(completion),
+                    "must be equal to or after `startTime`",
+                ));
+            }
+        }
+    }
+    if opts.reject_failed_job_without_failure_target && failed && !is_job_failure_target(job) {
+        errs.push(cond_err(
+            "cannot set Failed=True condition without the FailureTarget=true condition",
+        ));
+    }
+    if opts.reject_complete_job_without_success_criteria_met
+        && complete
+        && !is_job_success_criteria_met(job)
+    {
+        errs.push(cond_err(
+            "cannot set Complete=True condition without the SuccessCriteriaMet=true condition",
+        ));
+    }
+    let finished = is_job_finished(job);
+    if opts.reject_finished_job_with_active_pods && status.active.unwrap_or(0) > 0 && finished {
+        errs.push(Error::invalid(
+            &fld_path.child("active"),
+            status.active.unwrap_or(0),
+            "active>0 is invalid for finished job",
+        ));
+    }
+    if opts.reject_finished_job_without_start_time && status.start_time.is_none() && finished {
+        errs.push(Error::required(
+            &fld_path.child("startTime"),
+            "startTime is required for finished job",
+        ));
+    }
+    if opts.reject_finished_job_with_uncounted_terminated_pods && finished {
+        if let Some(u) = &status.uncounted_terminated_pods {
+            let succeeded = u.succeeded.as_deref().unwrap_or(&[]);
+            let failed_uids = u.failed.as_deref().unwrap_or(&[]);
+            if !succeeded.is_empty() || !failed_uids.is_empty() {
+                // Go's `omitempty` drops empty slices from the rendered struct.
+                let mut obj = serde_json::Map::new();
+                if !succeeded.is_empty() {
+                    obj.insert("succeeded".into(), serde_json::json!(succeeded));
+                }
+                if !failed_uids.is_empty() {
+                    obj.insert("failed".into(), serde_json::json!(failed_uids));
+                }
+                errs.push(Error::invalid(
+                    &fld_path.child("uncountedTerminatedPods"),
+                    serde_json::Value::Object(obj),
+                    "must be empty for finished job",
+                ));
+            }
+        }
+    }
+    let completed_indexes = status.completed_indexes.clone().unwrap_or_default();
+    if opts.reject_invalid_completed_indexes {
+        if let Some(completions) = job.spec.completions {
+            if let Err(e) = validate_indexes_format(&completed_indexes, completions) {
+                errs.push(Error::invalid(
+                    &fld_path.child("completedIndexes"),
+                    completed_indexes.clone(),
+                    format!("error parsing completedIndexes: {e}"),
+                ));
+            }
+        }
+    }
+    if opts.reject_invalid_failed_indexes {
+        if let (Some(completions), Some(_), Some(failed_indexes)) = (
+            job.spec.completions,
+            job.spec.backoff_limit_per_index,
+            &status.failed_indexes,
+        ) {
+            if let Err(e) = validate_indexes_format(failed_indexes, completions) {
+                errs.push(Error::invalid(
+                    &fld_path.child("failedIndexes"),
+                    failed_indexes.clone(),
+                    format!("error parsing failedIndexes: {e}"),
+                ));
+            }
+        }
+    }
+    let is_indexed = job.spec.completion_mode.as_deref() == Some(INDEXED_COMPLETION);
+    if opts.reject_completed_indexes_for_non_indexed_job
+        && !completed_indexes.is_empty()
+        && !is_indexed
+    {
+        errs.push(Error::invalid(
+            &fld_path.child("completedIndexes"),
+            completed_indexes.clone(),
+            "cannot set non-empty completedIndexes when non-indexed completion mode",
+        ));
+    }
+    if opts.reject_failed_indexes_for_no_backoff_limit_per_index
+        && job.spec.backoff_limit_per_index.is_none()
+    {
+        // Also covers regular (non-indexed) jobs: backoffLimitPerIndex is nil.
+        if let Some(failed_indexes) = &status.failed_indexes {
+            errs.push(Error::invalid(
+                &fld_path.child("failedIndexes"),
+                failed_indexes.clone(),
+                "cannot set non-null failedIndexes when backoffLimitPerIndex is null",
+            ));
+        }
+    }
+    if opts.reject_failed_indexes_overlapping_completed {
+        if let (Some(completions), Some(failed_indexes)) =
+            (job.spec.completions, &status.failed_indexes)
+        {
+            if let Err(e) = validate_failed_indexes_not_overlap_completed(
+                &completed_indexes,
+                failed_indexes,
+                completions,
+            ) {
+                errs.push(Error::invalid(
+                    &fld_path.child("failedIndexes"),
+                    failed_indexes.clone(),
+                    e,
+                ));
+            }
+        }
+    }
+    if opts.reject_finished_job_with_terminating_pods && finished {
+        if let Some(t) = status.terminating.filter(|t| *t > 0) {
+            errs.push(Error::invalid(
+                &fld_path.child("terminating"),
+                t,
+                "terminating>0 is invalid for finished job",
+            ));
+        }
+    }
+    if opts.reject_more_ready_than_active_pods {
+        if let Some(ready) = status.ready {
+            if ready > status.active.unwrap_or(0) {
+                errs.push(Error::invalid(
+                    &fld_path.child("ready"),
+                    ready,
+                    "cannot set more ready pods than active",
+                ));
+            }
+        }
+    }
+    let success_criteria_met = is_job_success_criteria_met(job);
+    if !opts.allow_for_success_criteria_met_in_extended_scope && !is_indexed && success_criteria_met
+    {
+        errs.push(cond_err("cannot set SuccessCriteriaMet to NonIndexed Job"));
+    }
+    if success_criteria_met && failed {
+        errs.push(cond_err(
+            "cannot set SuccessCriteriaMet=True and Failed=true conditions",
+        ));
+    }
+    if success_criteria_met && is_job_failure_target(job) {
+        errs.push(cond_err(
+            "cannot set SuccessCriteriaMet=True and FailureTarget=true conditions",
+        ));
+    }
+    if !opts.allow_for_success_criteria_met_in_extended_scope
+        && job.spec.success_policy.is_none()
+        && success_criteria_met
+    {
+        errs.push(cond_err(
+            "cannot set SuccessCriteriaMet=True for Job without SuccessPolicy",
+        ));
+    }
+    if job.spec.success_policy.is_some() && !success_criteria_met && complete {
+        errs.push(cond_err(
+            "cannot set Complete=True for Job with SuccessPolicy unless SuccessCriteriaMet=True",
+        ));
+    }
+    errs
+}
+
+/// Upstream `ValidateJobStatusUpdate` (validation.go:710-754).
+///
+/// The Job controller recomputes the counters from the live pod list, so
+/// without the decreasing-counter rules a write a real api-server refuses is
+/// accepted here — which is how #1955 stayed invisible in-house and reddened
+/// only the vanilla-swap leg. The error wording is the contract:
+/// `status.failed: Invalid value: 0: cannot decrease the failed counter`.
+pub fn validate_job_status_update(
+    new_job: &Job,
+    old_job: &Job,
+    opts: &JobStatusValidationOptions,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let status_fld = Path::new("status");
+    errs.extend(validate_job_status(new_job, &status_fld, opts));
+
+    let new_status = new_job.status.clone().unwrap_or_default();
+    let old_status = old_job.status.clone().unwrap_or_default();
+    let cond_err = |detail: &str| {
+        Error::invalid(
+            &status_fld.child("conditions"),
+            BadValue::Omit,
+            detail.to_string(),
+        )
+    };
+
+    if opts.reject_disabling_terminal_condition {
+        for c_type in ["Failed", "Complete", "FailureTarget"] {
+            if is_condition_true(job_conditions(old_job), c_type)
+                && !is_condition_true(job_conditions(new_job), c_type)
+            {
+                errs.push(cond_err(&format!(
+                    "cannot disable the terminal {c_type}=True condition"
+                )));
+            }
+        }
+    }
+    let new_failed = new_status.failed.unwrap_or(0);
+    if opts.reject_decreasing_failed_counter && new_failed < old_status.failed.unwrap_or(0) {
         errs.push(Error::invalid(
             &status_fld.child("failed"),
             new_failed,
             "cannot decrease the failed counter",
         ));
     }
-
-    let new_succeeded = new_job
-        .status
-        .as_ref()
-        .and_then(|s| s.succeeded)
-        .unwrap_or(0);
-    let old_succeeded = old_job
-        .status
-        .as_ref()
-        .and_then(|s| s.succeeded)
-        .unwrap_or(0);
-    if opts.reject_decreasing_succeeded_counter && new_succeeded < old_succeeded {
+    let new_succeeded = new_status.succeeded.unwrap_or(0);
+    if opts.reject_decreasing_succeeded_counter && new_succeeded < old_status.succeeded.unwrap_or(0)
+    {
         errs.push(Error::invalid(
             &status_fld.child("succeeded"),
             new_succeeded,
             "cannot decrease the succeeded counter",
         ));
     }
-
+    if opts.reject_mutating_completion_time {
+        // Only checked when the new completionTime is set, so a transition to
+        // nil on an unfinished job is not blocked (validation.go:733-735).
+        if let (Some(new_t), Some(old_t)) =
+            (&new_status.completion_time, &old_status.completion_time)
+        {
+            if new_t.timestamp() != old_t.timestamp() {
+                errs.push(Error::invalid(
+                    &status_fld.child("completionTime"),
+                    time_bad_value(new_t),
+                    "field is immutable",
+                ));
+            }
+        }
+    }
+    if opts.reject_start_time_update_for_unsuspended_job
+        && old_status.start_time.is_some()
+        && time_secs(&old_status.start_time) != time_secs(&new_status.start_time)
+        && !new_job.spec.suspend.unwrap_or(false)
+    {
+        errs.push(Error::required(
+            &status_fld.child("startTime"),
+            "startTime cannot be removed for unsuspended job",
+        ));
+    }
+    if is_job_success_criteria_met(old_job) && !is_job_success_criteria_met(new_job) {
+        errs.push(cond_err(
+            "cannot disable the SuccessCriteriaMet=True condition",
+        ));
+    }
+    if is_job_complete(old_job)
+        && !is_job_success_criteria_met(old_job)
+        && is_job_success_criteria_met(new_job)
+    {
+        errs.push(cond_err(
+            "cannot set SuccessCriteriaMet=True for Job already has Complete=true conditions",
+        ));
+    }
     errs
 }
 
@@ -1624,5 +2138,474 @@ mod parity_tests {
             has_error_containing(&errs, "`selector` does not match template `labels`"),
             "matchExpressions mismatch must be caught, got: {errs:?}"
         );
+    }
+}
+
+/// Cases from upstream `TestValidateJobUpdateStatus`
+/// (`pkg/apis/batch/validation/validation_test.go`) and the
+/// `getStatusValidationOptions` gating in `pkg/registry/batch/job/strategy.go`.
+#[cfg(test)]
+mod status_validation_tests {
+    use super::*;
+    use crate::resources::workloads::{JobStatus, UncountedTerminatedPods};
+    use crate::validation::objectmeta::IS_NEGATIVE_ERROR_MSG;
+    use chrono::{DateTime, TimeZone, Utc};
+
+    fn t(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+    }
+
+    fn cond(c_type: &str) -> JobCondition {
+        JobCondition {
+            condition_type: c_type.to_string(),
+            status: "True".to_string(),
+            last_probe_time: None,
+            last_transition_time: None,
+            reason: None,
+            message: None,
+        }
+    }
+
+    fn job(mutate: impl FnOnce(&mut Job)) -> Job {
+        let mut j = Job::new(
+            "j",
+            "default",
+            JobSpec {
+                completions: Some(5),
+                parallelism: Some(2),
+                ..Default::default()
+            },
+        );
+        j.status = Some(JobStatus::default());
+        mutate(&mut j);
+        j
+    }
+
+    fn status(j: &mut Job) -> &mut JobStatus {
+        j.status.get_or_insert_with(Default::default)
+    }
+
+    fn conds(j: &mut Job, types: &[&str]) {
+        status(j).conditions = Some(types.iter().map(|c| cond(c)).collect());
+    }
+
+    fn full(new: &Job, old: &Job) -> ErrorList {
+        validate_job_status_update(new, old, &get_status_validation_options(new, old))
+    }
+
+    fn errs(new: &Job, old: &Job) -> Vec<(String, String)> {
+        full(new, old)
+            .into_iter()
+            .map(|e| (e.field, e.detail))
+            .collect()
+    }
+
+    fn one(field: &str, detail: &str) -> Vec<(String, String)> {
+        vec![(field.to_string(), detail.to_string())]
+    }
+
+    fn has(got: &[(String, String)], field: &str, detail: &str) -> bool {
+        got.contains(&(field.to_string(), detail.to_string()))
+    }
+
+    #[test]
+    fn failed_requires_failure_target() {
+        let old = job(|j| status(j).start_time = Some(t(0)));
+        let new = job(|j| {
+            status(j).start_time = Some(t(0));
+            conds(j, &["Failed"]);
+        });
+        assert_eq!(
+            errs(&new, &old),
+            one(
+                "status.conditions",
+                "cannot set Failed=True condition without the FailureTarget=true condition"
+            )
+        );
+        let ok = job(|j| {
+            status(j).start_time = Some(t(0));
+            conds(j, &["FailureTarget", "Failed"]);
+        });
+        assert!(errs(&ok, &old).is_empty());
+    }
+
+    #[test]
+    fn complete_requires_success_criteria_met_and_completion_time() {
+        let old = job(|j| status(j).start_time = Some(t(0)));
+        let new = job(|j| {
+            status(j).start_time = Some(t(0));
+            conds(j, &["Complete"]);
+        });
+        let got = errs(&new, &old);
+        assert!(has(
+            &got,
+            "status.conditions",
+            "cannot set Complete=True condition without the SuccessCriteriaMet=true condition"
+        ));
+        assert!(has(
+            &got,
+            "status.completionTime",
+            "completionTime is required for Complete jobs"
+        ));
+        let ok = job(|j| {
+            let s = status(j);
+            s.start_time = Some(t(0));
+            s.completion_time = Some(t(5));
+            conds(j, &["SuccessCriteriaMet", "Complete"]);
+        });
+        assert!(errs(&ok, &old).is_empty());
+    }
+
+    #[test]
+    fn complete_and_failed_conditions_conflict() {
+        let old = job(|j| status(j).start_time = Some(t(0)));
+        let new = job(|j| {
+            let s = status(j);
+            s.start_time = Some(t(0));
+            s.completion_time = Some(t(1));
+            conds(
+                j,
+                &["SuccessCriteriaMet", "FailureTarget", "Complete", "Failed"],
+            );
+        });
+        let got = errs(&new, &old);
+        for want in [
+            "cannot set Complete=True and Failed=true conditions",
+            "cannot set Complete=True and FailureTarget=true conditions",
+            "cannot set SuccessCriteriaMet=True and Failed=true conditions",
+            "cannot set SuccessCriteriaMet=True and FailureTarget=true conditions",
+        ] {
+            assert!(
+                has(&got, "status.conditions", want),
+                "missing {want}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_time_rules() {
+        let old = job(|j| status(j).start_time = Some(t(10)));
+        let new = job(|j| {
+            let s = status(j);
+            s.start_time = Some(t(10));
+            s.completion_time = Some(t(5));
+        });
+        let got = errs(&new, &old);
+        assert!(has(
+            &got,
+            "status.completionTime",
+            "cannot set completionTime when there is no Complete=True condition"
+        ));
+        assert!(has(
+            &got,
+            "status.completionTime",
+            "must be equal to or after `startTime`"
+        ));
+        // Mutating an already-set completionTime is rejected.
+        let old = job(|j| {
+            let s = status(j);
+            s.start_time = Some(t(0));
+            s.completion_time = Some(t(5));
+            conds(j, &["SuccessCriteriaMet", "Complete"]);
+        });
+        let mut new = old.clone();
+        status(&mut new).completion_time = Some(t(6));
+        assert_eq!(
+            errs(&new, &old),
+            one("status.completionTime", "field is immutable")
+        );
+    }
+
+    #[test]
+    fn finished_job_invariants() {
+        let old = job(|_| {});
+        let new = job(|j| {
+            let s = status(j);
+            s.active = Some(1);
+            s.terminating = Some(2);
+            s.uncounted_terminated_pods = Some(UncountedTerminatedPods {
+                succeeded: Some(vec!["a".into()]),
+                failed: None,
+            });
+            s.completion_time = Some(t(1));
+            conds(j, &["SuccessCriteriaMet", "Complete"]);
+        });
+        let got = errs(&new, &old);
+        for (f, d) in [
+            ("status.active", "active>0 is invalid for finished job"),
+            ("status.startTime", "startTime is required for finished job"),
+            (
+                "status.terminating",
+                "terminating>0 is invalid for finished job",
+            ),
+            (
+                "status.uncountedTerminatedPods",
+                "must be empty for finished job",
+            ),
+        ] {
+            assert!(has(&got, f, d), "missing {f}: {got:?}");
+        }
+    }
+
+    #[test]
+    fn suspended_with_zero_completions_may_finish_without_start_time() {
+        let old = job(|j| {
+            j.spec.suspend = Some(true);
+            j.spec.completions = Some(0);
+        });
+        let new = job(|j| {
+            j.spec.suspend = Some(true);
+            j.spec.completions = Some(0);
+            status(j).completion_time = Some(t(1));
+            conds(j, &["SuccessCriteriaMet", "Complete"]);
+        });
+        assert!(errs(&new, &old).is_empty());
+    }
+
+    #[test]
+    fn ready_cannot_exceed_active() {
+        let old = job(|_| {});
+        let new = job(|j| {
+            let s = status(j);
+            s.active = Some(1);
+            s.ready = Some(2);
+        });
+        assert_eq!(
+            errs(&new, &old),
+            one("status.ready", "cannot set more ready pods than active")
+        );
+    }
+
+    #[test]
+    fn negative_counters_and_uncounted_uids() {
+        let old = job(|_| {});
+        let new = job(|j| {
+            let s = status(j);
+            s.ready = Some(-1);
+            s.terminating = Some(-1);
+            s.uncounted_terminated_pods = Some(UncountedTerminatedPods {
+                succeeded: Some(vec!["a".into(), "".into()]),
+                failed: Some(vec!["a".into()]),
+            });
+        });
+        let got = errs(&new, &old);
+        assert!(has(&got, "status.ready", IS_NEGATIVE_ERROR_MSG));
+        assert!(has(&got, "status.terminating", IS_NEGATIVE_ERROR_MSG));
+        assert!(has(
+            &got,
+            "status.uncountedTerminatedPods.succeeded[1]",
+            "must not be empty"
+        ));
+        let dup = full(&new, &old)
+            .into_iter()
+            .find(|e| e.field == "status.uncountedTerminatedPods.failed[0]")
+            .expect("duplicate uid across the two lists");
+        assert_eq!(
+            dup.error_type,
+            crate::validation::field::ErrorType::Duplicate
+        );
+    }
+
+    #[test]
+    fn completed_indexes_format_and_mode() {
+        let old = job(|j| j.spec.completion_mode = Some("Indexed".into()));
+        let new = job(|j| {
+            j.spec.completion_mode = Some("Indexed".into());
+            status(j).completed_indexes = Some("0-9".into());
+        });
+        assert_eq!(
+            errs(&new, &old),
+            one(
+                "status.completedIndexes",
+                "error parsing completedIndexes: too large index: \"9\""
+            )
+        );
+        let old = job(|_| {});
+        let new = job(|j| status(j).completed_indexes = Some("0-2".into()));
+        assert_eq!(
+            errs(&new, &old),
+            one(
+                "status.completedIndexes",
+                "cannot set non-empty completedIndexes when non-indexed completion mode"
+            )
+        );
+    }
+
+    #[test]
+    fn unchanged_violation_does_not_block_unrelated_update() {
+        // strategy.go:354-367: a rule fires only when its field changed, so a
+        // status already outside the bounds (e.g. after a spec scale-down) can
+        // still be written by the controller.
+        let old = job(|j| {
+            j.spec.completion_mode = Some("Indexed".into());
+            status(j).completed_indexes = Some("0-9".into());
+        });
+        let mut new = old.clone();
+        status(&mut new).active = Some(1);
+        assert!(errs(&new, &old).is_empty());
+    }
+
+    #[test]
+    fn failed_indexes_rules() {
+        let old = job(|j| j.spec.completion_mode = Some("Indexed".into()));
+        let new = job(|j| {
+            j.spec.completion_mode = Some("Indexed".into());
+            status(j).failed_indexes = Some("1".into());
+        });
+        assert!(has(
+            &errs(&new, &old),
+            "status.failedIndexes",
+            "cannot set non-null failedIndexes when backoffLimitPerIndex is null"
+        ));
+        let new = job(|j| {
+            j.spec.completion_mode = Some("Indexed".into());
+            j.spec.backoff_limit_per_index = Some(1);
+            let s = status(j);
+            s.completed_indexes = Some("0-2".into());
+            s.failed_indexes = Some("2-3".into());
+        });
+        assert!(has(
+            &errs(&new, &old),
+            "status.failedIndexes",
+            "failedIndexes and completedIndexes overlap at index: 2"
+        ));
+        let new = job(|j| {
+            j.spec.completion_mode = Some("Indexed".into());
+            j.spec.backoff_limit_per_index = Some(1);
+            status(j).failed_indexes = Some("9".into());
+        });
+        assert!(has(
+            &errs(&new, &old),
+            "status.failedIndexes",
+            "error parsing failedIndexes: too large index: \"9\""
+        ));
+    }
+
+    #[test]
+    fn terminal_conditions_cannot_be_disabled() {
+        let old = job(|j| {
+            let s = status(j);
+            s.start_time = Some(t(0));
+            s.completion_time = Some(t(1));
+            conds(j, &["SuccessCriteriaMet", "Complete"]);
+        });
+        let mut new = old.clone();
+        status(&mut new).conditions = Some(vec![]);
+        let got = errs(&new, &old);
+        assert!(has(
+            &got,
+            "status.conditions",
+            "cannot disable the terminal Complete=True condition"
+        ));
+        assert!(has(
+            &got,
+            "status.conditions",
+            "cannot disable the SuccessCriteriaMet=True condition"
+        ));
+    }
+
+    #[test]
+    fn success_criteria_met_not_after_complete() {
+        let old = job(|j| {
+            let s = status(j);
+            s.start_time = Some(t(0));
+            s.completion_time = Some(t(1));
+            conds(j, &["Complete"]);
+        });
+        let mut new = old.clone();
+        conds(&mut new, &["Complete", "SuccessCriteriaMet"]);
+        assert!(has(
+            &errs(&new, &old),
+            "status.conditions",
+            "cannot set SuccessCriteriaMet=True for Job already has Complete=true conditions"
+        ));
+    }
+
+    #[test]
+    fn success_policy_job_needs_criteria_met_to_complete() {
+        let old = job(|j| {
+            j.spec.success_policy = Some(Default::default());
+            status(j).start_time = Some(t(0));
+        });
+        let new = job(|j| {
+            j.spec.success_policy = Some(Default::default());
+            let s = status(j);
+            s.start_time = Some(t(0));
+            s.completion_time = Some(t(1));
+            conds(j, &["Complete"]);
+        });
+        assert!(has(
+            &errs(&new, &old),
+            "status.conditions",
+            "cannot set Complete=True for Job with SuccessPolicy unless SuccessCriteriaMet=True"
+        ));
+    }
+
+    #[test]
+    fn start_time_cannot_be_removed_for_unsuspended_job() {
+        let old = job(|j| status(j).start_time = Some(t(0)));
+        let new = job(|_| {});
+        assert_eq!(
+            errs(&new, &old),
+            one(
+                "status.startTime",
+                "startTime cannot be removed for unsuspended job"
+            )
+        );
+        // JobSuspended True -> False (resume) is exempt (strategy.go:372-376).
+        let old = job(|j| {
+            j.spec.suspend = Some(true);
+            status(j).start_time = Some(t(0));
+            conds(j, &["Suspended"]);
+        });
+        let new = job(|j| {
+            j.spec.suspend = Some(false);
+            status(j).conditions = Some(vec![JobCondition {
+                status: "False".into(),
+                ..cond("Suspended")
+            }]);
+        });
+        assert!(errs(&new, &old).is_empty());
+    }
+
+    #[test]
+    fn counters_still_cannot_decrease() {
+        let old = job(|j| {
+            let s = status(j);
+            s.failed = Some(2);
+            s.succeeded = Some(2);
+        });
+        let new = job(|_| {});
+        assert_eq!(
+            errs(&new, &old),
+            vec![
+                (
+                    "status.failed".to_string(),
+                    "cannot decrease the failed counter".to_string()
+                ),
+                (
+                    "status.succeeded".to_string(),
+                    "cannot decrease the succeeded counter".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn option_gating_follows_changed_fields() {
+        let old = job(|_| {});
+        let opts = get_status_validation_options(&old, &old);
+        assert!(opts.reject_decreasing_failed_counter);
+        assert!(opts.reject_mutating_completion_time);
+        assert!(opts.allow_for_success_criteria_met_in_extended_scope);
+        assert!(!opts.reject_failed_job_without_failure_target);
+        assert!(!opts.reject_finished_job_without_start_time);
+        assert!(!opts.reject_invalid_completed_indexes);
+        let mut new = old.clone();
+        conds(&mut new, &["Failed"]);
+        let opts = get_status_validation_options(&new, &old);
+        assert!(opts.reject_failed_job_without_failure_target);
+        assert!(opts.reject_finished_job_with_active_pods);
+        assert!(opts.reject_finished_job_without_start_time);
     }
 }
