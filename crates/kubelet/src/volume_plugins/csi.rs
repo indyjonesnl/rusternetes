@@ -154,7 +154,7 @@ impl VolumePlugin for CsiPlugin {
         let (source, driver_name, volume_id, read_only, mode) =
             if let Some(vol_src) = spec.volume.csi.as_ref() {
                 (
-                    Source::Inline(vol_src.clone()),
+                    Source::Inline(Box::new(vol_src.clone())),
                     vol_src.driver.clone(),
                     make_volume_handle(&pod.metadata.uid, &spec_name),
                     vol_src.read_only.unwrap_or(false),
@@ -260,7 +260,7 @@ fn plugin_dir(volumes_base_path: &str) -> PathBuf {
 }
 
 enum Source {
-    Inline(rusternetes_common::resources::csi::CSIVolumeSource),
+    Inline(Box<rusternetes_common::resources::csi::CSIVolumeSource>),
     Pv(Box<PersistentVolume>),
 }
 

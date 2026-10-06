@@ -17,6 +17,7 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
 /// Generated from `proto/csi/v1/csi.proto` (package `csi.v1`).
+#[allow(clippy::result_large_err, clippy::large_enum_variant)]
 pub mod proto {
     tonic::include_proto!("csi.v1");
 }
@@ -152,6 +153,7 @@ impl CsiDriverClient {
 
     /// Run `fut` under [`CSI_TIMEOUT`], mapping a timeout to the
     /// `DeadlineExceeded` status `context.WithTimeout` produces upstream.
+    #[allow(clippy::result_large_err)] // tonic::Status is tonic's own error type
     async fn call<T>(
         &self,
         fut: impl std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
