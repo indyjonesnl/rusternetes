@@ -495,7 +495,7 @@ async fn exec_with_stdin(
     let url = url::Url::parse(&ws_url)?;
 
     // Connect WebSocket
-    let (ws_stream, _) = connect_async(url)
+    let (ws_stream, _) = connect_async(url.as_str())
         .await
         .context("Failed to connect to exec WebSocket")?;
 
@@ -575,7 +575,7 @@ async fn exec_capture_output(
     let url = url::Url::parse(&ws_url)?;
 
     // Connect WebSocket
-    let (ws_stream, _) = connect_async(url)
+    let (ws_stream, _) = connect_async(url.as_str())
         .await
         .context("Failed to connect to exec WebSocket")?;
 

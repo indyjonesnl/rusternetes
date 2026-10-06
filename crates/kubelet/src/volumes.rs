@@ -112,10 +112,9 @@ fn apply_volume_ownership(paths: &[std::path::PathBuf], fs_group: i64) -> std::i
     use rustix::fs::{chownat, AtFlags, Gid, CWD};
     use std::os::unix::fs::PermissionsExt;
 
-    // SAFETY: `from_raw` requires the value to be a valid Unix group ID; fsGroup
-    // comes straight from the pod's PodSecurityContext (an i64 GID, validated at
-    // the API layer), so the cast/wrap is a plain reinterpretation, not UB.
-    let gid = unsafe { Gid::from_raw(fs_group as u32) };
+    // rustix 1.x made `Gid::from_raw` a safe fn; fsGroup comes from the pod's
+    // PodSecurityContext (an i64 GID, validated at the API layer).
+    let gid = Gid::from_raw(fs_group as u32);
 
     fn chown_group(path: &std::path::Path, gid: Gid) -> std::io::Result<()> {
         // lchown: group only, do not follow symlinks (upstream os.Lchown).

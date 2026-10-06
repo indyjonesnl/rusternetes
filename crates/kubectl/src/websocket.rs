@@ -85,7 +85,7 @@ pub async fn exec_stream(ws_url: String, stdin_enabled: bool, _tty_enabled: bool
     let url = Url::parse(&ws_url)?;
 
     // Connect WebSocket
-    let (ws_stream, _) = connect_async(url)
+    let (ws_stream, _) = connect_async(url.as_str())
         .await
         .map_err(|e| anyhow!("Failed to connect WebSocket: {}", e))?;
 
@@ -260,7 +260,7 @@ async fn handle_port_forward_connection(
     remote_port: u16,
 ) -> Result<()> {
     // Connect WebSocket
-    let (ws_stream, _) = connect_async(ws_url).await?;
+    let (ws_stream, _) = connect_async(ws_url.as_str()).await?;
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
     // Split TCP stream

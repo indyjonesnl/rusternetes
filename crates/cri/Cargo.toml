@@ -29,7 +29,7 @@ chrono.workspace = true
 # in hyper_util's TokioIo before tonic's transport will accept it.
 hyper-util = { version = "0.1", features = ["client", "tokio"] }
 # Stream helpers (exec/attach/log): WebSocket client for CRI streaming server.
-tokio-tungstenite = "0.21"
+tokio-tungstenite = "0.24"
 url = "2.5.8"
 rusternetes-common = { path = "../common" }
 
