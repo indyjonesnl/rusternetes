@@ -307,3 +307,50 @@ async fn admin_access_needs_the_namespace_label() {
     let (s, body) = api.post(&uri("admin"), &admin_claim("admin")).await;
     assert_eq!(s, StatusCode::CREATED, "{body}");
 }
+
+/// `AuthorizedForAdminStatus` (resource/utils.go:66-101), run by the status
+/// strategy's `ValidateUpdate` (resourceclaim/strategy.go:190-198): an
+/// allocation result with `adminAccess` needs the namespace label, at
+/// `status.allocation.devices.results[0].adminAccess`.
+#[tokio::test]
+async fn admin_access_in_a_status_allocation_needs_the_namespace_label() {
+    let api = TestApiServer::new();
+    for (name, labelled) in [("plain", false), ("admin", true)] {
+        let mut n = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name}});
+        if labelled {
+            n["metadata"]["labels"] = json!({"resource.kubernetes.io/admin-access": "true"});
+        }
+        let (s, body) = api.post("/api/v1/namespaces", &n).await;
+        assert_eq!(s, StatusCode::CREATED, "{body}");
+    }
+    let uri = |ns: &str| format!("/apis/resource.k8s.io/v1/namespaces/{ns}/resourceclaims");
+    for (ns, want) in [
+        ("plain", StatusCode::UNPROCESSABLE_ENTITY),
+        ("admin", StatusCode::OK),
+    ] {
+        let mut c = claim("c1");
+        c["metadata"]["namespace"] = json!(ns);
+        let (s, created) = api.post(&uri(ns), &c).await;
+        assert_eq!(s, StatusCode::CREATED, "{created}");
+        let mut update = created.clone();
+        update["status"] = json!({"allocation": {"devices": {"results": [
+            {"request": "req", "driver": "drv.example.com", "pool": "p", "device": "d",
+             "adminAccess": true}]}}});
+        let (s, body) = api.put(&format!("{}/c1/status", uri(ns)), &update).await;
+        assert_eq!(s, want, "{ns}: {body}");
+        if want == StatusCode::UNPROCESSABLE_ENTITY {
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("status.allocation.devices.results[0].adminAccess: Forbidden"),
+                "{body}"
+            );
+        } else {
+            assert_eq!(
+                body["status"]["allocation"]["devices"]["results"][0]["adminAccess"], true,
+                "{body}"
+            );
+        }
+    }
+}

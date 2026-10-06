@@ -131,6 +131,7 @@ fn test_resourceclaim_status() {
                             driver: "gpu-driver.example.com".to_string(),
                             pool: "gpu-pool-1".to_string(),
                             device: "gpu-0".to_string(),
+                            admin_access: None,
                         },
                     ],
                     config: vec![],

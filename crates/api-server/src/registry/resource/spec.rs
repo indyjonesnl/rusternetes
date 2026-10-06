@@ -5,7 +5,7 @@
 //! dropped for them. The `DRADeviceTaints` (tolerations) and
 //! `DRAConsumableCapacity` (request capacity) gates are off. The other gated
 //! fields (`distinctAttribute`, sub-request capacity, the status
-//! `adminAccess` / `shareID` / `consumedCapacity` / binding conditions) are not
+//! `shareID` / `consumedCapacity` / binding conditions) are not
 //! in our types, so a client-supplied value is already discarded on decode.
 
 use rusternetes_common::feature_gates::{self, Feature};
