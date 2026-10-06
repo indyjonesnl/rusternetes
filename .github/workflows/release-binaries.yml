@@ -133,7 +133,8 @@ jobs:
           done
           sha256sum -c SHA256SUMS
           # Exactly four files at the release root.
-          test "$(ls | wc -l)" -eq 4 || { echo "FAIL: expected exactly 4 assets" >&2; ls; exit 1; }
+          count="$(find . -maxdepth 1 -type f | wc -l)"
+          test "$count" -eq 4 || { echo "FAIL: expected exactly 4 assets, got $count" >&2; find . -maxdepth 1 -type f >&2; exit 1; }
 
       - name: Upload workflow artifact (dry-run inspection)
         uses: actions/upload-artifact@v4
