@@ -363,9 +363,9 @@ pub fn aggregate_container_resources(pod: &Pod, requests: bool) -> ResourceList 
 /// pod-level `spec.resources.requests` overriding per name, then `spec.overhead`
 /// added.
 ///
-/// Pod-level resources are applied unconditionally — upstream gates them on
-/// `PodLevelResources`, which is beta and on by default from 1.34
-/// (`pkg/features/kube_features.go:1612-1615`).
+/// Pod-level resources are applied only when `PodLevelResources` is enabled
+/// (`SkipPodLevelResources: !Enabled(PodLevelResources)`,
+/// `pkg/quota/v1/evaluator/core/pods.go:403-404`; `helpers.go:155`).
 pub fn pod_requests(pod: &Pod) -> ResourceList {
     let mut reqs = aggregate_container_resources(pod, true);
     let Some(spec) = &pod.spec else {
@@ -375,6 +375,7 @@ pub fn pod_requests(pod: &Pod) -> ResourceList {
     if let Some(pod_level) = spec
         .resources
         .as_ref()
+        .filter(|_| crate::feature_gates::enabled(crate::feature_gates::Feature::PodLevelResources))
         .and_then(|r| r.requests.as_ref())
         .map(parse_resource_list)
     {
@@ -407,6 +408,7 @@ pub fn pod_limits(pod: &Pod) -> ResourceList {
     if let Some(pod_level) = spec
         .resources
         .as_ref()
+        .filter(|_| crate::feature_gates::enabled(crate::feature_gates::Feature::PodLevelResources))
         .and_then(|r| r.limits.as_ref())
         .map(parse_resource_list)
     {
@@ -499,10 +501,12 @@ pub fn pod_constraints(pod: &Pod, required: &[String]) -> Result<(), String> {
     let Some(spec) = &pod.spec else {
         return Ok(());
     };
-    if spec.resources.as_ref().is_some_and(|r| {
-        r.requests.as_ref().is_some_and(|m| !m.is_empty())
-            || r.limits.as_ref().is_some_and(|m| !m.is_empty())
-    }) {
+    if crate::feature_gates::enabled(crate::feature_gates::Feature::PodLevelResources)
+        && spec.resources.as_ref().is_some_and(|r| {
+            r.requests.as_ref().is_some_and(|m| !m.is_empty())
+                || r.limits.as_ref().is_some_and(|m| !m.is_empty())
+        })
+    {
         return Ok(());
     }
 
@@ -1327,5 +1331,41 @@ mod tests {
             claims: None,
         });
         assert_eq!(pod_constraints(&p, &names(&["requests.cpu"])), Ok(()));
+    }
+
+    /// With `PodLevelResources` off, `SkipPodLevelResources` is set
+    /// (`pods.go:403-404`) so `PodRequests` ignores `spec.resources`
+    /// (`helpers.go:155`).
+    #[test]
+    #[serial_test::serial]
+    fn test_pod_requests_limits_skip_pod_level_when_gate_off() {
+        use crate::feature_gates::{with_feature, Feature};
+        let mut p = pod(
+            vec![container("c1", &[("cpu", "1")], &[("cpu", "2")])],
+            vec![],
+        );
+        p.spec.as_mut().unwrap().resources = Some(ResourceRequirements {
+            requests: Some(raw(&[("cpu", "4")])),
+            limits: Some(raw(&[("cpu", "8")])),
+            claims: None,
+        });
+        let _g = with_feature(Feature::PodLevelResources, false);
+        assert_eq!(pod_requests(&p)["cpu"].canonical_string(), "1");
+        assert_eq!(pod_limits(&p)["cpu"].canonical_string(), "2");
+    }
+
+    /// `pods.go:143`: the constraints check is only skipped when the gate is on.
+    #[test]
+    #[serial_test::serial]
+    fn test_pod_constraints_not_skipped_when_gate_off() {
+        use crate::feature_gates::{with_feature, Feature};
+        let mut p = pod(vec![container("c", &[], &[])], vec![]);
+        p.spec.as_mut().unwrap().resources = Some(ResourceRequirements {
+            requests: Some(raw(&[("cpu", "1")])),
+            limits: None,
+            claims: None,
+        });
+        let _g = with_feature(Feature::PodLevelResources, false);
+        assert!(pod_constraints(&p, &names(&["requests.cpu"])).is_err());
     }
 }
