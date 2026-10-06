@@ -13,21 +13,20 @@ use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::HeaderMap,
     response::{IntoResponse, Response},
     Extension, Json,
 };
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
-    auth::ServiceAccountClaims,
     authz::{Decision, RequestAttributes},
-    resources::{Secret, ServiceAccount},
+    resources::ServiceAccount,
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// The ServiceAccount `RequestScope`: core `v1` `ServiceAccount` served as
 /// `serviceaccounts`, backed by `serviceaccount.NewREST`.
