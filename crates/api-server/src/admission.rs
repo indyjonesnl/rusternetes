@@ -175,6 +175,41 @@ pub async fn lock_namespace_quota(namespace: &str) -> tokio::sync::OwnedMutexGua
     lock.lock_owned().await
 }
 
+/// The `Constraints` half of upstream's `checkRequest`
+/// (`staging/src/k8s.io/apiserver/pkg/admission/plugin/resourcequota/
+/// controller.go:464-474`): for every quota in the namespace that matches the
+/// pod, `evaluator.Constraints(MatchingResources(ResourceNames(hard)), pod)`;
+/// the first failure is `Forbidden: failed quota: <name>: must specify ...`.
+/// Returns that message (without the `Forbidden` prefix the caller supplies), or
+/// `None` when every container covers what the quotas constrain.
+///
+/// Upstream reads `status.hard`; this reads `spec.hard`, which the quota
+/// controller mirrors into status.
+pub async fn check_pod_quota_constraints<S: Storage>(
+    storage: &Arc<S>,
+    namespace: &str,
+    pod: &Pod,
+) -> anyhow::Result<Option<String>> {
+    let quota_prefix = format!("/registry/resourcequotas/{}/", namespace);
+    let quotas: Vec<ResourceQuota> = storage.list(&quota_prefix).await?;
+    for quota_obj in quotas {
+        if !pod_matches_quota_scopes(pod, &quota_obj) {
+            continue;
+        }
+        let Some(hard) = &quota_obj.spec.hard else {
+            continue;
+        };
+        let required: Vec<String> = hard.keys().cloned().collect();
+        if let Err(msg) = quota::pod_constraints(pod, &required) {
+            return Ok(Some(format!(
+                "failed quota: {}: {}",
+                quota_obj.metadata.name, msg
+            )));
+        }
+    }
+    Ok(None)
+}
+
 /// Check if pod creation would exceed ResourceQuota limits.
 ///
 /// Delegates to [`check_resource_quota_with_old`] with `old_pod = None`

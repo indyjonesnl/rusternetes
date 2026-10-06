@@ -31,7 +31,7 @@
 //! Keeping `Quantity` end to end removes both. Only the boundary — reading
 //! `spec.hard` strings in, writing `status.used` strings out — converts.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -469,6 +469,80 @@ pub fn pod_compute_usage(requests: &ResourceList, limits: &ResourceList) -> Reso
     }
 
     result
+}
+
+/// `validationSet` (`pkg/quota/v1/evaluator/core/pods.go:97-110`): the only
+/// resources whose omission makes a container invalid under a quota. Upstream:
+/// "do not add more resources to this list!"
+const POD_VALIDATION_SET: [&str; 6] = [
+    "cpu",
+    "memory",
+    "requests.cpu",
+    "requests.memory",
+    "limits.cpu",
+    "limits.memory",
+];
+
+/// Port of `podEvaluator.Constraints` (`pkg/quota/v1/evaluator/core/pods.go:
+/// 124-168`) with `enforcePodContainerConstraints` (`:275-291`): every
+/// container and init container must cover each `required` resource that is in
+/// `validationSet`, as measured by [`pod_compute_usage`].
+///
+/// `required` is the quota's hard names the evaluator matches
+/// (`controller.go:469`). Skipped when pod-level resources are set
+/// (`IsPodLevelResourcesSet`, `component-helpers/resource/helpers.go:80-90`;
+/// `PodLevelResources` is on by default from 1.34).
+///
+/// Error text is upstream's: resources sorted, each `<resource> for:
+/// <sorted,comma-joined containers>`, joined with `"; "`.
+pub fn pod_constraints(pod: &Pod, required: &[String]) -> Result<(), String> {
+    let Some(spec) = &pod.spec else {
+        return Ok(());
+    };
+    if spec.resources.as_ref().is_some_and(|r| {
+        r.requests.as_ref().is_some_and(|m| !m.is_empty())
+            || r.limits.as_ref().is_some_and(|m| !m.is_empty())
+    }) {
+        return Ok(());
+    }
+
+    let required_set: BTreeSet<&str> = required
+        .iter()
+        .map(String::as_str)
+        .filter(|n| POD_VALIDATION_SET.contains(n))
+        .collect();
+
+    let mut missing: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for container in spec
+        .containers
+        .iter()
+        .chain(spec.init_containers.iter().flatten())
+    {
+        let usage = pod_compute_usage(
+            &side(container.resources.as_ref(), true),
+            &side(container.resources.as_ref(), false),
+        );
+        for name in &required_set {
+            if !usage.contains_key(*name) {
+                missing.entry(name).or_default().insert(&container.name);
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let messages: Vec<String> = missing
+        .iter()
+        .map(|(resource, containers)| {
+            format!(
+                "{} for: {}",
+                resource,
+                containers.iter().copied().collect::<Vec<_>>().join(",")
+            )
+        })
+        .collect();
+    Err(format!("must specify {}", messages.join("; ")))
 }
 
 /// A pod's full quota footprint: `count/pods` (charged even for a terminal pod,
@@ -1127,5 +1201,131 @@ mod tests {
         assert_eq!(terminal["count/pods"].canonical_string(), "1");
         assert!(!terminal.contains_key("requests.cpu"));
         assert!(!terminal.contains_key("pods"));
+    }
+
+    // -----------------------------------------------------------------
+    // podEvaluator.Constraints - ported from pods_test.go
+    // `TestPodConstraintsFunc` (`:44-170`)
+    // -----------------------------------------------------------------
+
+    fn names(n: &[&str]) -> Vec<String> {
+        n.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_pod_constraints_init_container_resource_missing() {
+        let p = pod(
+            vec![],
+            vec![container("dummy", &[("cpu", "1m")], &[("cpu", "2m")])],
+        );
+        assert_eq!(
+            pod_constraints(&p, &names(&["memory"])),
+            Err("must specify memory for: dummy".to_string())
+        );
+    }
+
+    #[test]
+    fn test_pod_constraints_multiple_init_containers_sorted() {
+        let p = pod(
+            vec![],
+            vec![
+                container("foo", &[("cpu", "1m")], &[("cpu", "2m")]),
+                container("bar", &[("cpu", "1m")], &[("cpu", "2m")]),
+            ],
+        );
+        assert_eq!(
+            pod_constraints(&p, &names(&["memory"])),
+            Err("must specify memory for: bar,foo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_pod_constraints_container_resource_missing() {
+        let p = pod(
+            vec![container("dummy", &[("cpu", "1m")], &[("cpu", "2m")])],
+            vec![],
+        );
+        assert_eq!(
+            pod_constraints(&p, &names(&["memory"])),
+            Err("must specify memory for: dummy".to_string())
+        );
+    }
+
+    #[test]
+    fn test_pod_constraints_requests_cpu_omitted() {
+        // The issue's case: `hard: requests.cpu` and a container with no request.
+        let p = pod(vec![container("c", &[], &[])], vec![]);
+        assert_eq!(
+            pod_constraints(&p, &names(&["requests.cpu"])),
+            Err("must specify requests.cpu for: c".to_string())
+        );
+    }
+
+    #[test]
+    fn test_pod_constraints_satisfied_by_request_or_limit() {
+        let p = pod(
+            vec![container(
+                "c",
+                &[("cpu", "1"), ("memory", "1Gi")],
+                &[("cpu", "1"), ("memory", "1Gi")],
+            )],
+            vec![],
+        );
+        assert_eq!(
+            pod_constraints(
+                &p,
+                &names(&[
+                    "cpu",
+                    "memory",
+                    "requests.cpu",
+                    "requests.memory",
+                    "limits.cpu",
+                    "limits.memory"
+                ])
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_pod_constraints_multiple_resources_joined_with_semicolon() {
+        let p = pod(vec![container("c", &[], &[])], vec![]);
+        assert_eq!(
+            pod_constraints(&p, &names(&["memory", "limits.cpu"])),
+            Err("must specify limits.cpu for: c; memory for: c".to_string())
+        );
+    }
+
+    /// `validationSet` is only cpu/memory: pods, object counts,
+    /// ephemeral-storage and extended resources never impose a requirement
+    /// (`pods.go:97-110`).
+    #[test]
+    fn test_pod_constraints_ignores_non_validation_resources() {
+        let p = pod(vec![container("c", &[], &[])], vec![]);
+        assert_eq!(
+            pod_constraints(
+                &p,
+                &names(&[
+                    "pods",
+                    "count/pods",
+                    "requests.ephemeral-storage",
+                    "requests.example.com/foo",
+                    "hugepages-2Mi"
+                ])
+            ),
+            Ok(())
+        );
+    }
+
+    /// `IsPodLevelResourcesSet` skips the check (`pods.go:131-133`).
+    #[test]
+    fn test_pod_constraints_skipped_with_pod_level_resources() {
+        let mut p = pod(vec![container("c", &[], &[])], vec![]);
+        p.spec.as_mut().unwrap().resources = Some(ResourceRequirements {
+            requests: Some(raw(&[("cpu", "1")])),
+            limits: None,
+            claims: None,
+        });
+        assert_eq!(pod_constraints(&p, &names(&["requests.cpu"])), Ok(()));
     }
 }
