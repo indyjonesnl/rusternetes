@@ -143,7 +143,7 @@ impl Mounter for EmptyDirMounter {
                 .size_limit
                 .as_deref()
                 .and_then(crate::runtime::parse_quantity_bytes);
-            crate::runtime::mount_tmpfs_for_emptydir(volume_dir, size_bytes);
+            crate::runtime::mount_tmpfs_for_emptydir(volume_dir, size_bytes)?;
         }
         info!(
             "Created emptyDir volume {} at {}",
@@ -237,5 +237,15 @@ mod tests {
         let m = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
         assert_eq!(m, 0o777);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `setupTmpfs` (`empty_dir.go:324-362`) returns the error from
+    /// `MountSensitiveWithoutSystemd`; a failed tmpfs mount fails SetUp
+    /// instead of silently degrading to a persistent directory. The mount
+    /// point does not exist, so `mount(8)` fails whether or not we are root.
+    #[test]
+    fn tmpfs_mount_failure_is_returned() {
+        let r = crate::runtime::mount_tmpfs_for_emptydir("/nonexistent/emptydir/mountpoint", None);
+        assert!(r.is_err());
     }
 }

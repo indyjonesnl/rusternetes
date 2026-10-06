@@ -57,34 +57,29 @@ fn is_mount_point(path: &str) -> bool {
 /// restarts for the pod lifetime, and reports `fs_type=tmpfs` to the
 /// conformance emptyDir-tmpfs tests. Relies on the kubelet's volume bind being
 /// `rshared` so the mount propagates to the host daemon's namespace. Idempotent
-/// (no-op if already mounted). Best-effort: logs and continues on failure so a
-/// kernel without tmpfs propagation degrades to a plain (persistent) bind dir.
-pub(crate) fn mount_tmpfs_for_emptydir(dir: &str, size_bytes: Option<u64>) {
+/// (no-op if already mounted). A failed mount is returned, as upstream does.
+pub(crate) fn mount_tmpfs_for_emptydir(dir: &str, size_bytes: Option<u64>) -> anyhow::Result<()> {
     if is_mount_point(dir) {
-        return; // already mounted (pod re-sync) — keep the existing tmpfs + data
+        return Ok(()); // already mounted (pod re-sync) — keep the existing tmpfs + data
     }
     let mut opts = String::from("mode=0777");
     if let Some(bytes) = size_bytes {
         opts.push_str(&format!(",size={}", bytes));
     }
-    match std::process::Command::new("mount")
+    // `setupTmpfs` returns the mount error (`empty_dir.go:324-362`,
+    // `return ed.mounter.MountSensitiveWithoutSystemd(...)`), so SetUp fails.
+    let out = std::process::Command::new("mount")
         .args(["-t", "tmpfs", "-o", &opts, "tmpfs", dir])
         .output()
-    {
-        Ok(out) if out.status.success() => {
-            info!("Mounted tmpfs for Memory emptyDir at {}", dir);
-        }
-        Ok(out) => {
-            warn!(
-                "Failed to mount tmpfs at {} ({}): falling back to persistent dir",
-                dir,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Err(e) => {
-            warn!("Could not exec mount for tmpfs at {}: {}", dir, e);
-        }
+        .map_err(|e| anyhow::anyhow!("could not exec mount for tmpfs at {dir}: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "failed to mount tmpfs at {dir}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
+    info!("Mounted tmpfs for Memory emptyDir at {}", dir);
+    Ok(())
 }
 
 /// Parse a Kubernetes `resource.Quantity` (e.g. `1Gi`, `512Mi`, `0.5Gi`) into a
