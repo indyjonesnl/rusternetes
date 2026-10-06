@@ -27,9 +27,16 @@ pub struct KubeletConfiguration {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_plugin_dir: Option<String>,
 
-    /// How frequently to sync pod state (in seconds)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sync_frequency: Option<u64>,
+    /// How frequently to sync pod state. A `metav1.Duration`: a Go duration
+    /// string such as `"1m0s"` or `"500ms"`; zero means "unset" (upstream
+    /// `SetDefaults_KubeletConfiguration`,
+    /// `pkg/kubelet/apis/config/v1beta1/defaults.go`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub sync_frequency: Option<std::time::Duration>,
 
     /// Port for the metrics server
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,6 +77,14 @@ impl Default for KubeletConfiguration {
 }
 
 impl KubeletConfiguration {
+    /// `syncFrequency` in whole seconds, rounded up; `None` when unset or zero
+    /// (zero is defaulted upstream, so it must not override the CLI/default).
+    pub fn sync_frequency_secs(&self) -> Option<u64> {
+        self.sync_frequency
+            .filter(|d| !d.is_zero())
+            .map(|d| d.as_secs() + u64::from(d.subsec_nanos() > 0))
+    }
+
     /// Load configuration from a YAML file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let contents = std::fs::read_to_string(path.as_ref())
@@ -122,10 +137,7 @@ impl KubeletConfiguration {
         }
 
         // Validate sync frequency
-        if let Some(sync_freq) = self.sync_frequency {
-            if sync_freq == 0 {
-                anyhow::bail!("syncFrequency must be greater than 0");
-            }
+        if let Some(sync_freq) = self.sync_frequency_secs() {
             if sync_freq > 3600 {
                 tracing::warn!(
                     "syncFrequency of {} seconds is unusually high (> 1 hour)",
@@ -278,7 +290,7 @@ impl RuntimeConfig {
 
         // Determine sync frequency
         let sync_frequency = cli_sync_frequency
-            .or_else(|| config_file.as_ref().and_then(|c| c.sync_frequency))
+            .or_else(|| config_file.as_ref().and_then(|c| c.sync_frequency_secs()))
             .unwrap_or(10);
 
         // Determine metrics port
@@ -397,6 +409,47 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    /// A standard upstream KubeletConfiguration (as k0s emits it) carries
+    /// metav1.Duration strings. Issue #1579.
+    #[test]
+    fn test_from_file_accepts_go_duration_strings() {
+        let yaml = "apiVersion: kubelet.config.k8s.io/v1beta1\n\
+                    kind: KubeletConfiguration\n\
+                    syncFrequency: 1m30s\n\
+                    fileCheckFrequency: 0s\n\
+                    cpuManagerReconcilePeriod: 0s\n";
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        let loaded = KubeletConfiguration::from_file(file.path()).unwrap();
+        assert_eq!(
+            loaded.sync_frequency,
+            Some(std::time::Duration::from_secs(90))
+        );
+    }
+
+    #[test]
+    fn test_sync_frequency_zero_means_unset_and_subsecond_rounds_up() {
+        // Upstream SetDefaults_KubeletConfiguration: zero => default.
+        let yaml = "syncFrequency: 0s\n";
+        let cfg: KubeletConfiguration = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.sync_frequency_secs(), None);
+        let cfg: KubeletConfiguration = serde_yaml::from_str("syncFrequency: 500ms\n").unwrap();
+        assert_eq!(cfg.sync_frequency_secs(), Some(1));
+    }
+
+    #[test]
+    fn test_sync_frequency_numeric_rejected_and_serialized_as_go_string() {
+        // metav1.Duration.UnmarshalJSON only accepts strings.
+        assert!(serde_yaml::from_str::<KubeletConfiguration>("syncFrequency: 15\n").is_err());
+        let cfg = KubeletConfiguration {
+            sync_frequency: Some(std::time::Duration::from_secs(90)),
+            ..Default::default()
+        };
+        assert!(serde_yaml::to_string(&cfg)
+            .unwrap()
+            .contains("syncFrequency: 1m30s"));
+    }
+
     #[test]
     fn test_default_config() {
         let config = KubeletConfiguration::default();
@@ -424,11 +477,11 @@ mod tests {
         config.kind = "KubeletConfiguration".to_string();
 
         // Invalid sync frequency
-        config.sync_frequency = Some(0);
-        assert!(config.validate().is_err());
+        config.sync_frequency = Some(std::time::Duration::ZERO);
+        assert!(config.validate().is_ok());
 
         // Reset
-        config.sync_frequency = Some(10);
+        config.sync_frequency = Some(std::time::Duration::from_secs(10));
 
         // Invalid log level
         config.log_level = Some("invalid".to_string());
@@ -449,7 +502,7 @@ mod tests {
             volume_plugin_dir: Some(
                 "/usr/libexec/kubernetes/kubelet-plugins/volume/exec".to_string(),
             ),
-            sync_frequency: Some(15),
+            sync_frequency: Some(std::time::Duration::from_secs(15)),
             metrics_bind_port: Some(10250),
             log_level: Some("info".to_string()),
             cluster_service_cidr: Some("10.96.0.0/12".to_string()),
@@ -494,7 +547,7 @@ mod tests {
             Some(KubeletConfiguration {
                 root_dir: Some(config_root.to_str().unwrap().to_string()),
                 volume_dir: Some(config_volumes.to_str().unwrap().to_string()),
-                sync_frequency: Some(30),
+                sync_frequency: Some(std::time::Duration::from_secs(30)),
                 ..Default::default()
             }),
             "test-node".to_string(),
