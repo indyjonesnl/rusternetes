@@ -93,15 +93,15 @@ impl VolumePlugin for HostPathPlugin {
     /// order only matters for fidelity to upstream, not for behaviour here.
     async fn new_mounter(&self, spec: &Spec<'_>, _pod: &Pod) -> Result<Box<dyn Mounter>> {
         let (path, path_type) = if let Some(hp) = spec.volume.host_path.as_ref() {
-            // Pre-move behaviour expanded only the inline arm's path
-            // (`991a503d:volumes.rs:961`, `expand_env_vars(&host_path.path)`).
-            // The PV arm was always a plain clone (`:1361`) and so was the
-            // ephemeral arm (`:1531`) — deliberately asymmetric, kept here.
-            // `expand_env_vars` (`crate::runtime`) resolves an unset name to
-            // the empty string via `unwrap_or_default()`, so expanding the PV
-            // arm too would silently turn a `spec.hostPath.path` typo into a
-            // different, existing directory with no error.
-            (crate::runtime::expand_env_vars(&hp.path), hp.type_.clone())
+            // The path is used verbatim, as upstream does
+            // (`host_path.go:139`: `&hostPath{path: path, ...}`
+            // from `getVolumeSource`; no `os.ExpandEnv` anywhere in
+            // `pkg/volume/` or `pkg/kubelet/`). The only upstream expansion
+            // is `subPathExpr`, in `makeMounts`
+            // (`pkg/kubelet/kubelet_pods.go:309-310`), with `$(VAR)`
+            // syntax against the container env. The earlier kubelet-env
+            // `$VAR` expansion defaulted unset names to "" (#1984).
+            (hp.path.clone(), hp.type_.clone())
         } else if let Some(hp) = spec
             .persistent_volume
             .and_then(|pv| pv.spec.host_path.as_ref())
@@ -269,14 +269,13 @@ mod tests {
         assert_eq!(m.get_path(), "/mnt/data");
     }
 
-    /// Pre-move, only the inline hostPath arm was environment-expanded
-    /// (`991a503d:volumes.rs:961`); the PV arm was a plain clone
-    /// (`:1361`). An unset var expands to "" via `expand_env_vars`'s
-    /// `unwrap_or_default()`, so this also proves the split does not
-    /// silently turn a typo'd env-var reference into a different,
-    /// existing directory.
+    /// `hostPathMounter.GetPath` returns the volume source's path verbatim
+    /// (`pkg/volume/hostpath/host_path.go:230-232`, asserted by `TestPlugin`,
+    /// `host_path_test.go:254-257`). Upstream expands environment variables
+    /// nowhere in `pkg/volume/` (#1984): an unset name used to expand to ""
+    /// and silently mount a different, existing directory.
     #[tokio::test]
-    async fn only_the_inline_arm_expands_environment_variables() {
+    async fn the_inline_arm_does_not_expand_environment_variables() {
         let v = inline_host_path("/data/$RUSTERNETES_HOSTPATH_TEST_UNSET_VAR");
         let spec = Spec {
             volume: &v,
@@ -284,7 +283,7 @@ mod tests {
         };
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
-        assert_eq!(m.get_path(), "/data/");
+        assert_eq!(m.get_path(), "/data/$RUSTERNETES_HOSTPATH_TEST_UNSET_VAR");
     }
 
     /// The PV arm's counterpart to the test above: same unset var, but

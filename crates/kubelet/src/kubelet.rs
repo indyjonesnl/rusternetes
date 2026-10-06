@@ -3128,29 +3128,21 @@ impl Kubelet {
                                     );
                                     return Ok(());
                                 }
-                                let volume_paths: std::collections::HashMap<String, String> = pod
-                                    .spec
-                                    .as_ref()
-                                    .and_then(|s| s.volumes.as_ref())
-                                    .map(|vols| {
-                                        vols.iter()
-                                            .map(|v| {
-                                                // Must agree with what
-                                                // VolumeManager::create_volume
-                                                // provisioned, so it goes
-                                                // through the same getter.
-                                                let path = crate::pod_dirs::get_pod_volume_dir(
-                                                    self.runtime.volumes_base_path(),
-                                                    &pod.metadata.uid,
-                                                    self.runtime.plugin_name_for_volume(v),
-                                                    &v.name,
-                                                )
-                                                .to_string_lossy()
-                                                .into_owned();
-                                                (v.name.clone(), path)
-                                            })
-                                            .collect()
-                                    })
+                                // Reuse what the volume manager provisions rather
+                                // than re-deriving a path per plugin: a hostPath
+                                // volume's path is the host path itself, not a
+                                // dir under the pod dir (#1983). Upstream records
+                                // the mounted path per volume and the runtime
+                                // reads that record
+                                // (`GetMountedVolumesForPod`,
+                                // `pkg/kubelet/volumemanager/volume_manager.go:320`,
+                                // consumed at `pkg/kubelet/kubelet_pods.go:643`).
+                                // `create_pod_volumes` is idempotent, as in
+                                // `reconcile_container_restarts`.
+                                let volume_paths = self
+                                    .runtime
+                                    .create_pod_volumes(pod)
+                                    .await
                                     .unwrap_or_default();
                                 let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref());
                                 if let Err(e) = self
