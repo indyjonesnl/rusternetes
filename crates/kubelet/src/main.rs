@@ -308,6 +308,11 @@ async fn main() -> Result<()> {
         None
     };
 
+    // nodeStatusUpdateFrequency from the config file (None => upstream default 10s).
+    let node_status_update_frequency = config_file
+        .as_ref()
+        .and_then(|c| c.node_status_update_frequency);
+
     // Parse etcd endpoints
     let etcd_endpoints: Vec<String> = args
         .etcd_servers
@@ -494,7 +499,8 @@ async fn main() -> Result<()> {
             args.allowed_unsafe_sysctls.clone(),
         )
         .await?
-        .with_pod_manifest_path(args.pod_manifest_path.clone()),
+        .with_pod_manifest_path(args.pod_manifest_path.clone())
+        .with_node_status_update_frequency(node_status_update_frequency),
     );
 
     let server_state = server::ServerState {
