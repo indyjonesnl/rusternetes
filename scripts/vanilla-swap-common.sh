@@ -1208,10 +1208,16 @@ vs_dump_module_logs() {
     [ -n "$node" ] || continue
     echo "--- kubelet journal on ${node} (last ${tail} lines) ---" >&2
     docker exec "$node" journalctl -u kubelet --no-pager -n "$tail" >&2 2>&1 || true
+    # The static pod's container is named after the upstream component, which
+    # spells api-server "kube-apiserver": the first version of this lookup used
+    # "kube-${VS_MODULE}" = "kube-api-server", matched nothing, and printed no
+    # api-server log in run 37467227001.
+    local cname="kube-${VS_MODULE}"
+    [ "$VS_MODULE" = "api-server" ] && cname="kube-apiserver"
     local cid
-    cid="$(docker exec "$node" crictl ps -a --name "kube-${VS_MODULE}" -q 2>/dev/null | head -n1)"
+    cid="$(docker exec "$node" crictl ps -a --name "$cname" -q 2>/dev/null | head -n1)"
     if [ -n "$cid" ]; then
-      echo "--- crictl logs kube-${VS_MODULE} on ${node} (last ${tail} lines) ---" >&2
+      echo "--- crictl logs ${cname} on ${node} (last ${tail} lines) ---" >&2
       docker exec "$node" crictl logs --tail "$tail" "$cid" >&2 2>&1 || true
     fi
   done < <(docker ps --filter "name=^${cluster}-" --format '{{.Names}}' 2>/dev/null)
@@ -1252,6 +1258,23 @@ vs_dump_test_failure_diagnostics() {
 
   echo "--- pods (all namespaces) ---" >&2
   KUBECONFIG="$kubeconfig" kubectl get pods -A -o wide >&2 2>&1 || true
+
+  # A pod that never leaves Pending while its node's kubelet runs it means the
+  # kubelet's status PATCH was rejected (run 37467227001: "invalid value: map,
+  # expected map with a single key"). Show what the API server hands back: the
+  # status block of every non-Running pod, and the pod's own events.
+  local pod
+  while IFS= read -r pod; do
+    [ -n "$pod" ] || continue
+    echo "--- pod ${pod} (status + describe) ---" >&2
+    KUBECONFIG="$kubeconfig" kubectl -n "${pod%%/*}" get pod "${pod##*/}" \
+      -o jsonpath='{.status}' >&2 2>&1 || true
+    echo >&2
+    KUBECONFIG="$kubeconfig" kubectl -n "${pod%%/*}" describe pod "${pod##*/}" \
+      2>&1 | tail -n 40 >&2 || true
+  done < <(KUBECONFIG="$kubeconfig" kubectl get pods -A \
+    --field-selector=status.phase!=Running \
+    -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null | head -n 6)
 
   # Sorted by time so the tail is what happened last, which is what a failing
   # spec's window looks like.
