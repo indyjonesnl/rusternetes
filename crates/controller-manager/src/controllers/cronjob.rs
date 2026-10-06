@@ -378,6 +378,35 @@ impl<S: Storage + 'static> CronJobController<S> {
         // Get last schedule time
         let last_schedule = cronjob.status.as_ref().and_then(|s| s.last_schedule_time);
 
+        // Inline `TZ=`/`CRON_TZ=` prefix: robfig/cron/v3 `Parser.Parse`
+        // (vendor/github.com/robfig/cron/v3/parser.go:95-103) strips it and
+        // schedules in that zone. formatSchedule
+        // (pkg/controller/cronjob/cronjob_controllerv2.go:766-773) returns such
+        // a schedule untouched, so the inline zone wins over spec.timeZone. A
+        // bad zone or a missing space is an unparseable schedule: skip, as
+        // syncCronJob does (cronjob_controllerv2.go:519-526).
+        let (schedule, inline_tz) =
+            if schedule.starts_with("TZ=") || schedule.starts_with("CRON_TZ=") {
+                let Some(i) = schedule.find(' ') else {
+                    warn!(
+                        "Unparseable schedule '{}': no space after TZ prefix",
+                        schedule
+                    );
+                    return Ok(None);
+                };
+                let eq = schedule.find('=').unwrap_or(0);
+                let name = &schedule[eq + 1..i];
+                match name.parse::<chrono_tz::Tz>() {
+                    Ok(t) => (schedule[i..].trim(), Some(t)),
+                    Err(_) => {
+                        warn!("Unparseable schedule '{}': bad location {}", schedule, name);
+                        return Ok(None);
+                    }
+                }
+            } else {
+                (schedule, None)
+            };
+
         // Handle special schedules (Kubernetes 5-field format)
         let cron_schedule = match schedule {
             "@yearly" | "@annually" => "0 0 1 1 *",
@@ -422,6 +451,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         // upstream, which records an UnknownTimeZone event and returns without
         // starting a job.
         let tz: chrono_tz::Tz = match cronjob.spec.time_zone.as_deref() {
+            _ if inline_tz.is_some() => inline_tz.unwrap(),
             None | Some("") => chrono_tz::UTC,
             Some(name) => match name.parse::<chrono_tz::Tz>() {
                 Ok(t) => t,
@@ -700,5 +730,45 @@ mod tests {
             !ctrl.should_run_now("0 0 * * *", now, &invalid).unwrap(),
             "invalid timeZone → must not schedule"
         );
+    }
+
+    /// A grandfathered inline `TZ=`/`CRON_TZ=` schedule must parse and fire in
+    /// that zone (robfig/cron v3 parser.go:95-103; formatSchedule keeps the
+    /// inline zone over spec.timeZone, cronjob_controllerv2.go:766-773).
+    /// An unknown inline zone must not schedule.
+    #[tokio::test]
+    async fn should_run_now_honours_inline_tz_prefix() {
+        use std::sync::Arc;
+        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
+        let ctrl = super::CronJobController::new(storage);
+        let now = chrono::DateTime::parse_from_rfc3339("2025-01-15T06:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let cj: rusternetes_common::resources::CronJob =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "batch/v1", "kind": "CronJob",
+                "metadata": {"name": "tz", "namespace": "default"},
+                "spec": {
+                    "schedule": "x",
+                    "jobTemplate": {"spec": {"template": {"spec": {
+                        "containers": [{"name": "c", "image": "busybox"}]
+                    }}}},
+                },
+                "status": {"lastScheduleTime": "2025-01-15T02:00:00Z"},
+            }))
+            .unwrap();
+        assert!(ctrl
+            .should_run_now("CRON_TZ=America/New_York 0 0 * * *", now, &cj)
+            .unwrap());
+        assert!(ctrl
+            .should_run_now("TZ=America/New_York @daily", now, &cj)
+            .unwrap());
+        assert!(!ctrl
+            .should_run_now("CRON_TZ=UTC 0 0 * * *", now, &cj)
+            .unwrap());
+        assert!(!ctrl
+            .should_run_now("CRON_TZ=Mars/Phobos 0 0 * * *", now, &cj)
+            .unwrap());
+        assert!(!ctrl.should_run_now("TZ=UTC", now, &cj).unwrap());
     }
 }
