@@ -175,3 +175,27 @@ async fn ttl_after_finished_runs_a_worker_pool() {
     .await;
     assert!(peak > 1, "ttl run() peaked at {peak}");
 }
+
+#[tokio::test]
+async fn csr_runs_a_worker_pool() {
+    let peak = peak_concurrency(
+        "certificatesigningrequests",
+        12,
+        |i| {
+            json!({
+                "apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+                "metadata": meta(i),
+                "spec": {"request": "", "signerName": "example.com/x", "usages": ["digital signature"]}
+            })
+        },
+        |s| async move {
+            let _ = Arc::new(
+                crate::controllers::certificate_signing_request::CertificateSigningRequestController::new(s),
+            )
+            .run()
+            .await;
+        },
+    )
+    .await;
+    assert!(peak > 1, "csr run() peaked at {peak}");
+}

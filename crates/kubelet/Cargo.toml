@@ -55,14 +55,23 @@ tar = "0.4"
 sysinfo = "0.32"
 rustix = { version = "1", features = ["fs"] }
 async-trait = { workspace = true }
+# CSI Node-service client dials the driver's unix socket (same connector shape
+# as rusternetes-cri): tonic 0.12 rides hyper 1.x, so a tokio UnixStream is
+# wrapped in hyper_util's TokioIo.
+hyper-util = { version = "0.1", features = ["client", "tokio"] }
+tower = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
 serial_test = { workspace = true }
 url = "2.5"
-tower = { workspace = true }
 http-body-util = "0.1"
 tokio = { version = "1", features = ["test-util"] }
+# Fake CSI driver gRPC server over a unix socket (volume_plugins::csi_client).
+tokio-stream = { version = "0.1", features = ["net"] }
 # Real-TLS test server for HTTPS lifecycle-hook coverage (NC prestop-https).
 rcgen = { workspace = true }
 rustls = { workspace = true }

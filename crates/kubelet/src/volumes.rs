@@ -30,13 +30,15 @@ use crate::atomic_writer::FileProjection;
 pub(crate) fn build_configmap_payload(
     configmap: &ConfigMap,
     items: Option<&Vec<KeyToPath>>,
-    configmap_name: &str,
+    _configmap_name: &str,
     is_optional: bool,
     default_mode: u32,
-) -> std::collections::BTreeMap<String, FileProjection> {
+) -> Result<std::collections::BTreeMap<String, FileProjection>> {
     let mut payload: std::collections::BTreeMap<String, FileProjection> =
         std::collections::BTreeMap::new();
-    if let Some(items) = items {
+    // `if len(mappings) == 0` (`pkg/volume/configmap/configmap.go:207`): an
+    // empty `items` list projects every key, same as an absent one.
+    if let Some(items) = items.filter(|i| !i.is_empty()) {
         for item in items {
             // `items[].mode` wins over the volume `defaultMode` for this key
             // alone — upstream carries it per file in `FileProjection.Mode`
@@ -64,7 +66,9 @@ pub(crate) fn build_configmap_payload(
                     },
                 );
             } else if !is_optional {
-                warn!("ConfigMap {} missing key {}", configmap_name, item.key);
+                // `MakePayload` (`configmap.go:222-229`): a mapped key absent
+                // from data and binaryData fails the mount unless optional.
+                anyhow::bail!("configmap references non-existent config key: {}", item.key);
             }
         }
     } else {
@@ -91,7 +95,7 @@ pub(crate) fn build_configmap_payload(
             }
         }
     }
-    payload
+    Ok(payload)
 }
 
 /// Apply fsGroup group-ownership to volume trees in-process (no fork/exec).
@@ -727,17 +731,21 @@ impl VolumeManager {
                             let volume_dir = self.pod_volume_dir(pod, volume);
                             let is_optional = cm_source.optional.unwrap_or(false);
                             let mode = cm_source.default_mode.unwrap_or(0o644) as u32;
-                            let payload = build_configmap_payload(
+                            match build_configmap_payload(
                                 &cm,
                                 cm_source.items.as_ref(),
                                 cm_name,
                                 is_optional,
                                 mode,
-                            );
-                            let _ = crate::atomic_writer::write_projected_payload(
-                                std::path::Path::new(&volume_dir),
-                                &payload,
-                            );
+                            ) {
+                                Ok(payload) => {
+                                    let _ = crate::atomic_writer::write_projected_payload(
+                                        std::path::Path::new(&volume_dir),
+                                        &payload,
+                                    );
+                                }
+                                Err(e) => warn!("ConfigMap {} resync: {}", cm_name, e),
+                            }
                         }
                     }
                 }
@@ -1322,17 +1330,21 @@ impl VolumeManager {
                         // config watcher like kube-proxy (#1652).
                         let is_optional = cm_source.optional.unwrap_or(false);
                         let mode = cm_source.default_mode.unwrap_or(0o644) as u32;
-                        let payload = build_configmap_payload(
+                        match build_configmap_payload(
                             &cm,
                             cm_source.items.as_ref(),
                             cm_name,
                             is_optional,
                             mode,
-                        );
-                        let _ = crate::atomic_writer::write_projected_payload(
-                            std::path::Path::new(&volume_dir),
-                            &payload,
-                        );
+                        ) {
+                            Ok(payload) => {
+                                let _ = crate::atomic_writer::write_projected_payload(
+                                    std::path::Path::new(&volume_dir),
+                                    &payload,
+                                );
+                            }
+                            Err(e) => warn!("ConfigMap {} refresh: {}", cm_name, e),
+                        }
                     }
                     Err(_) => {
                         // ConfigMap deleted — clean up files if optional
@@ -1435,7 +1447,8 @@ mod configmap_payload_tests {
             item("data-1", "plain", None),
         ];
 
-        let payload = build_configmap_payload(&configmap, Some(&items), "cm", false, 0o644);
+        let payload =
+            build_configmap_payload(&configmap, Some(&items), "cm", false, 0o644).unwrap();
 
         assert_eq!(
             payload.get("path/to/data-2").map(|p| p.mode),
@@ -1457,7 +1470,7 @@ mod configmap_payload_tests {
     #[test]
     fn without_items_every_key_takes_default_mode() {
         let configmap = cm(&[("a", "1"), ("b", "2")]);
-        let payload = build_configmap_payload(&configmap, None, "cm", false, 0o400);
+        let payload = build_configmap_payload(&configmap, None, "cm", false, 0o400).unwrap();
 
         assert_eq!(payload.len(), 2);
         assert!(payload.values().all(|p| p.mode == 0o400));
@@ -1931,9 +1944,13 @@ mod projected_mode_tests {
             "file mode must come from the volume's defaultMode"
         );
 
-        // secret_dir_mode = defaultMode | 0o111 (secret.rs's moved body)
-        let dir_mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(dir_mode & 0o777, 0o400 | 0o111);
+        // The volume dir's mode no longer derives from defaultMode (#1975):
+        // upstream's AtomicWriter creates the timestamped data dir 0755
+        // (atomic_writer.go) and the volume dir comes from the emptyDir
+        // wrapper, never from the Secret's defaultMode.
+        let data_dir = std::fs::canonicalize(format!("{path}/..data")).unwrap();
+        let dir_mode = std::fs::metadata(&data_dir).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o755);
     }
 
     /// Characterization test for the downwardAPI volume plugin's `set_up`

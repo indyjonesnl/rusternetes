@@ -62,6 +62,57 @@ impl VolumePlugin for EmptyDirPlugin {
     }
 }
 
+/// `perm` (`empty_dir.go:50`): `const perm os.FileMode = 0777`.
+#[cfg(unix)]
+const PERM: u32 = 0o777;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Medium {
+    Default,
+    Memory,
+    /// `v1helper.IsHugePageMedium`. Upstream mounts hugetlbfs (`setupHugepages`);
+    /// we do not yet, so it gets a plain directory as before (tracked separately).
+    HugePages,
+}
+
+/// The medium switch of `SetUpAt` (`empty_dir.go:268-277`):
+/// `default: err = fmt.Errorf("unknown storage medium %q", ed.medium)`.
+/// `IsHugePageMedium` is `HugePages` or the `HugePages-` prefix
+/// (`pkg/apis/core/v1/helper/helpers.go`).
+fn classify_medium(medium: Option<&str>) -> Result<Medium> {
+    match medium.unwrap_or("") {
+        "" => Ok(Medium::Default),
+        "Memory" => Ok(Medium::Memory),
+        m if m == "HugePages" || m.starts_with("HugePages-") => Ok(Medium::HugePages),
+        m => Err(anyhow!("unknown storage medium {:?}", m)),
+    }
+}
+
+/// `setupDir` (`empty_dir.go:447-486`): MkdirAll, Lstat, chmod to `perm` when
+/// the mode differs (umask), and return every error. The old helper swallowed
+/// them.
+fn setup_dir(dir: &str) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::symlink_metadata(dir)?.permissions().mode() & 0o777;
+        if mode != PERM {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(PERM))?;
+            let after = std::fs::symlink_metadata(dir)?.permissions().mode() & 0o777;
+            if after != PERM {
+                tracing::error!(
+                    "Expected directory {:?} permissions to be: {:o}; got: {:o}",
+                    dir,
+                    PERM,
+                    after
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 struct EmptyDirMounter {
     path: String,
     volume_name: String,
@@ -75,20 +126,19 @@ impl Mounter for EmptyDirMounter {
     }
 
     async fn set_up(&self) -> Result<()> {
-        // ---- moved verbatim from create_volume's emptyDir branch
-        //      (991a503d:crates/kubelet/src/volumes.rs:931-953) ----
         let volume_dir = &self.path;
         let empty_dir = &self.empty_dir;
-        // K8s setupDir does best-effort chmod on emptyDir directories.
-        // A failed chmod must never block the volume mount.
-        let _ = crate::runtime::setup_emptydir_dir(volume_dir);
+        // SetUpAt (empty_dir.go:268-277): the medium switch. Anything that is
+        // not Default, Memory or a huge-page medium is an error.
+        let medium = classify_medium(empty_dir.medium.as_deref())?;
+        // setupDir's errors are returned by upstream, not swallowed.
+        setup_dir(volume_dir)?;
 
         // Memory-medium emptyDir is a tmpfs. Mount it on the host volume dir
         // (propagated to the host daemon via the kubelet's rshared bind) so
         // it persists across container restarts AND reports fs_type=tmpfs.
-        // K8s ref: pkg/volume/emptydir/empty_dir.go.
-        let is_memory = empty_dir.medium.as_deref() == Some("Memory");
-        if is_memory {
+        // K8s ref: pkg/volume/emptydir/empty_dir.go setupTmpfs.
+        if medium == Medium::Memory {
             let size_bytes = empty_dir
                 .size_limit
                 .as_deref()
@@ -99,7 +149,6 @@ impl Mounter for EmptyDirMounter {
             "Created emptyDir volume {} at {}",
             self.volume_name, volume_dir
         );
-        // ---- end moved body ----
         Ok(())
     }
 }
@@ -145,5 +194,48 @@ mod tests {
     #[test]
     fn plugin_name_is_the_upstream_name() {
         assert_eq!(plugin().name(), crate::pod_dirs::plugin::EMPTY_DIR);
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("emptydir-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[test]
+    fn unknown_medium_is_an_error() {
+        let e = classify_medium(Some("Bogus")).unwrap_err().to_string();
+        assert_eq!(e, "unknown storage medium \"Bogus\"");
+        assert_eq!(classify_medium(None).unwrap(), Medium::Default);
+        assert_eq!(classify_medium(Some("")).unwrap(), Medium::Default);
+        assert_eq!(classify_medium(Some("Memory")).unwrap(), Medium::Memory);
+        assert_eq!(
+            classify_medium(Some("HugePages-2Mi")).unwrap(),
+            Medium::HugePages
+        );
+    }
+
+    #[test]
+    fn setup_dir_returns_mkdir_errors() {
+        let root = tmp("mkdirerr");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("file");
+        std::fs::write(&file, "x").unwrap();
+        let target = file.join("vol");
+        assert!(setup_dir(target.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_dir_fixes_mode_to_0777() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("mode");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        setup_dir(d.to_str().unwrap()).unwrap();
+        let m = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
+        assert_eq!(m, 0o777);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

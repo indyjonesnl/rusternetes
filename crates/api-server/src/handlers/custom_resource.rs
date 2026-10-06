@@ -1024,6 +1024,7 @@ pub async fn get_custom_resource_scale(
         Option<String>,
         String,
     )>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     info!("Getting custom resource scale {group}/{version}/{plural}: {name}");
     let crd = serving_crd(&state, &group, &version, &plural, None).await?;
@@ -1033,6 +1034,7 @@ pub async fn get_custom_resource_scale(
         &auth_ctx.user,
         namespace.as_deref(),
         &name,
+        &params,
     )
     .await
 }
