@@ -420,6 +420,17 @@ mod tests {
         assert_eq!(Strategy.warnings_on_update(&ctx(), &ss, &ss).len(), 1);
     }
 
+    /// `SetDefaults_StatefulSet` (pkg/apis/apps/v1/defaults.go:127-135): an absent
+    /// retention policy and its empty fields default to Retain, so validation
+    /// never sees an unset whenDeleted/whenScaled (#2210 item 3).
+    #[test]
+    fn absent_retention_policy_defaults_to_retain() {
+        let ss = stateful_set();
+        let p = ss.spec.persistent_volume_claim_retention_policy.unwrap();
+        assert_eq!(p.when_deleted.as_deref(), Some("Retain"));
+        assert_eq!(p.when_scaled.as_deref(), Some("Retain"));
+    }
+
     #[test]
     fn volume_claim_templates_and_the_template_warn() {
         let mut ss = stateful_set();
