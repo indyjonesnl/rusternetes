@@ -25,7 +25,6 @@ use rusternetes_common::resources::{
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::StorageBackend;
 
-use super::aggregation::materialise_aggregated_rules;
 use super::escalation_check::{
     binding_authorized, escalation_allowed, is_only_mutating_gc_fields, role_escalation_authorized,
 };
@@ -340,11 +339,8 @@ impl TransformFunc<ClusterRoleBinding> for ClusterRoleBindingPolicyBased {
 // ClusterRole (clusterrole/policybased/storage.go)
 // ---------------------------------------------------------------------------
 
-/// ClusterRole's storage also materialises `aggregationRule` (see
-/// [`super::aggregation`]), which needs storage.
 pub struct ClusterRolePolicyBased {
     pub base: PolicyBased,
-    pub storage: Arc<StorageBackend>,
 }
 
 impl ClusterRolePolicyBased {
@@ -442,7 +438,6 @@ impl BeginCreate<ClusterRole> for ClusterRolePolicyBased {
         _options: &CreateOptions,
     ) -> Result<Box<dyn Finish>> {
         self.check_create(ctx, obj).await?;
-        materialise_aggregated_rules(&*self.storage, obj).await;
         Ok(Box::new(Noop))
     }
 }
@@ -465,17 +460,16 @@ impl TransformFunc<ClusterRole> for ClusterRolePolicyBased {
 
 #[async_trait]
 impl BeginUpdate<ClusterRole> for ClusterRolePolicyBased {
-    /// Rusternetes-only: materialises an aggregated ClusterRole's rules at
-    /// write time (upstream does it in the `clusterroleaggregation`
-    /// controller). The policybased check itself is the transformer above.
+    /// No write-time work: the policybased check is the update transformer
+    /// above, and aggregated rules are filled in by the
+    /// `clusterroleaggregation` controller (as upstream does).
     async fn begin_update(
         &self,
         _ctx: &RequestContext,
-        obj: &mut ClusterRole,
+        _obj: &mut ClusterRole,
         _old: &mut ClusterRole,
         _options: &UpdateOptions,
     ) -> Result<Box<dyn Finish>> {
-        materialise_aggregated_rules(&*self.storage, obj).await;
         Ok(Box::new(Noop))
     }
 }

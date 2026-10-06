@@ -210,7 +210,9 @@ fn rule_equal(a: &PolicyRule, b: &PolicyRule) -> bool {
 mod tests {
     use super::*;
     use rusternetes_common::resources::rbac::AggregationRule;
-    use rusternetes_common::types::{LabelSelector, LabelSelectorRequirement, ObjectMeta, TypeMeta};
+    use rusternetes_common::types::{
+        LabelSelector, LabelSelectorRequirement, ObjectMeta, TypeMeta,
+    };
     use rusternetes_storage::MemoryStorage;
     use std::collections::HashMap;
 
@@ -273,7 +275,11 @@ mod tests {
     #[tokio::test]
     async fn aggregates_matching_rules_sorted_and_deduped() {
         let s = Arc::new(MemoryStorage::new());
-        put(&s, &role("b", &[("l", "x")], vec![rule(&["get"], &["pods"])])).await;
+        put(
+            &s,
+            &role("b", &[("l", "x")], vec![rule(&["get"], &["pods"])]),
+        )
+        .await;
         put(
             &s,
             &role(
@@ -283,7 +289,11 @@ mod tests {
             ),
         )
         .await;
-        put(&s, &role("c", &[("l", "y")], vec![rule(&["get"], &["secrets"])])).await;
+        put(
+            &s,
+            &role("c", &[("l", "y")], vec![rule(&["get"], &["secrets"])]),
+        )
+        .await;
         put(&s, &aggregating("parent", vec![selector("l", "x")])).await;
 
         let c = ClusterRoleAggregationController::new(s.clone());
@@ -304,9 +314,16 @@ mod tests {
         c.sync_all().await.unwrap();
         assert!(rules_of(&s, "parent").await.is_empty());
 
-        put(&s, &role("child", &[("l", "x")], vec![rule(&["get"], &["pods"])])).await;
+        put(
+            &s,
+            &role("child", &[("l", "x")], vec![rule(&["get"], &["pods"])]),
+        )
+        .await;
         c.sync_all().await.unwrap();
-        assert_eq!(rules_of(&s, "parent").await, vec![rule(&["get"], &["pods"])]);
+        assert_eq!(
+            rules_of(&s, "parent").await,
+            vec![rule(&["get"], &["pods"])]
+        );
     }
 
     /// The parent does not contribute to itself; other matching aggregating
@@ -327,7 +344,10 @@ mod tests {
             .sync_cluster_role("parent")
             .await
             .unwrap();
-        assert_eq!(rules_of(&s, "parent").await, vec![rule(&["get"], &["pods"])]);
+        assert_eq!(
+            rules_of(&s, "parent").await,
+            vec![rule(&["get"], &["pods"])]
+        );
     }
 
     /// An invalid selector operator fails the sync (retried by the queue).

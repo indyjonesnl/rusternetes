@@ -23,9 +23,8 @@
 //!   upstream `pkg/registry/rbac/clusterrole/policybased` materialises the
 //!   aggregated `rules` field by listing every `ClusterRole` whose labels
 //!   match the parent's `aggregationRule.clusterRoleSelectors`. The
-//!   rusternetes api-server currently stores the parent with empty `rules`
-//!   and does not perform aggregation, so the assertion that an aggregated
-//!   verb is granted is `#[ignore]`d.
+//!   aggregation is the clusterroleaggregation controller's job; the test
+//!   runs one controller sync.
 //! - `rolebinding_create_blocked_when_caller_lacks_escalate` — upstream
 //!   `pkg/registry/rbac/rest/rest.go` validates that the caller possesses
 //!   every PolicyRule contained in the bound Role (or the `escalate` verb)
@@ -41,6 +40,7 @@ use rusternetes_common::{
     resources::{ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject},
     types::{ObjectMeta, TypeMeta},
 };
+use rusternetes_controller_manager::controllers::clusterrole_aggregation::ClusterRoleAggregationController;
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
 use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
@@ -351,10 +351,9 @@ async fn ask_sar(
 
 /// A parent `ClusterRole` carrying an `aggregationRule.clusterRoleSelectors`
 /// must materialise the union of every child `ClusterRole`'s rules whose
-/// labels match the selector. Upstream stamps this server-side in the
-/// `clusterrole/policybased` storage layer (release-1.35). Until rusternetes
-/// performs aggregation, the parent stores empty `rules` and a SAR against the
-/// aggregated verb falls through to deny.
+/// labels match the selector. Upstream does this in the
+/// `clusterroleaggregation` controller (kube-controller-manager), not at write
+/// time; the test runs one controller sync.
 #[tokio::test]
 async fn clusterrole_aggregation_collects_rules_from_labelled_clusterroles() {
     let (state, _mem, _backend) = spawn_state().await;
@@ -424,6 +423,16 @@ async fn clusterrole_aggregation_collects_rules_from_labelled_clusterroles() {
     )
     .await;
     assert_eq!(status, 201, "create ClusterRoleBinding");
+
+    // The aggregation is the clusterroleaggregation controller's job, not the
+    // api-server's: before it runs the parent has no rules.
+    let parent_key = "/registry/clusterroles/aggregate-parent-view";
+    let before: ClusterRole = _mem.get(parent_key).await.unwrap();
+    assert!(before.rules.is_empty(), "no write-time aggregation");
+    ClusterRoleAggregationController::new(_mem.clone())
+        .sync_all()
+        .await
+        .unwrap();
 
     // The aggregated rules MUST grant "viewer" `get pods` cluster-wide.
     let (allowed, reason) = ask_sar(
