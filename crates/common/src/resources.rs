@@ -124,9 +124,9 @@ pub use custom_metrics::{
 pub use deployment::{Deployment, DeploymentCondition, DeploymentSpec, DeploymentStatus};
 pub use dra::{
     AllocatedDeviceStatus, AllocationConfigSource, AllocationResult, CELDeviceSelector,
-    CapacityRequestPolicy, CapacityRequestPolicyRange, Counter, CounterSet, Device,
-    DeviceAllocationConfiguration, DeviceAllocationMode, DeviceAllocationResult, DeviceAttribute,
-    DeviceCapacity, DeviceCapacityRequirement, DeviceClaim, DeviceClaimConfiguration, DeviceClass,
+    CapacityRequestPolicy, CapacityRequestPolicyRange, CapacityRequirements, Counter, CounterSet,
+    Device, DeviceAllocationConfiguration, DeviceAllocationMode, DeviceAllocationResult,
+    DeviceAttribute, DeviceCapacity, DeviceClaim, DeviceClaimConfiguration, DeviceClass,
     DeviceClassConfiguration, DeviceClassList, DeviceClassSpec, DeviceCondition, DeviceConstraint,
     DeviceCounterConsumption, DeviceRequest, DeviceRequestAllocationResult, DeviceSelector,
     DeviceSubRequest, DeviceTaint, DeviceTaintEffect, DeviceToleration, ExactDeviceRequest,

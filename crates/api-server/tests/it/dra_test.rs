@@ -132,6 +132,7 @@ fn test_resourceclaim_status() {
                             pool: "gpu-pool-1".to_string(),
                             device: "gpu-0".to_string(),
                             admin_access: None,
+                            ..Default::default()
                         },
                     ],
                     config: vec![],
