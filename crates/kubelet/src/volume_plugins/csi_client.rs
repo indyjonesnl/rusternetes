@@ -158,7 +158,9 @@ impl CsiDriverClient {
     ) -> Result<T, tonic::Status> {
         match tokio::time::timeout(CSI_TIMEOUT, fut).await {
             Ok(r) => r.map(|r| r.into_inner()),
-            Err(_) => Err(tonic::Status::deadline_exceeded("context deadline exceeded")),
+            Err(_) => Err(tonic::Status::deadline_exceeded(
+                "context deadline exceeded",
+            )),
         }
     }
 
