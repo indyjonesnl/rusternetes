@@ -141,7 +141,7 @@ pub fn validate_custom_resource_definition_spec_update(
 fn immutable<T: serde::Serialize>(path: &Path, value: &T) -> Error {
     Error::invalid(
         path,
-        crate::validation::field::BadValue::Json(serde_json::to_value(value).unwrap_or_default()),
+        crate::validation::field::BadValue::marshal(value),
         "field is immutable",
     )
 }

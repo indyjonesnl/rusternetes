@@ -11,6 +11,24 @@ where
     Ok(opt.unwrap_or_default())
 }
 
+pub mod sorted_opt_map {
+    //! Serialize an `Option<HashMap<String, String>>` with keys sorted, as
+    //! Go's `encoding/json` does for maps. A `HashMap` otherwise emits in
+    //! random order, which makes a marshalled bad value
+    //! (`BadValue::marshal`, #2190) nondeterministic.
+    use serde::{Serialize, Serializer};
+    use std::collections::{BTreeMap, HashMap};
+
+    pub fn serialize<S: Serializer>(
+        v: &Option<HashMap<String, String>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        v.as_ref()
+            .map(|m| m.iter().collect::<BTreeMap<_, _>>())
+            .serialize(s)
+    }
+}
+
 /// Serde for `metav1.Time` fields (creationTimestamp, deletionTimestamp, ...).
 ///
 /// Upstream `metav1.Time.MarshalJSON` formats as RFC3339 with **second**
@@ -356,17 +374,16 @@ pub struct ObjectMeta {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub uid: String,
 
-    /// Generation is a sequence number representing a specific generation of the desired state
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub generation: Option<i64>,
-
+    // NOTE: field order mirrors Go's `metav1.ObjectMeta` declaration order
+    // (`staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go`), because
+    // a marshalled bad value renders struct fields in that order (#2190).
     /// ResourceVersion is an opaque value for concurrency control
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_version: Option<String>,
 
-    /// ManagedFields maps workflow-id and version to the set of fields that are managed by that workflow
+    /// Generation is a sequence number representing a specific generation of the desired state
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub managed_fields: Option<Vec<ManagedFieldsEntry>>,
+    pub generation: Option<i64>,
 
     /// CreationTimestamp is the creation time
     #[serde(
@@ -391,20 +408,30 @@ pub struct ObjectMeta {
     pub deletion_grace_period_seconds: Option<i64>,
 
     /// Labels are key-value pairs for categorization
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "sorted_opt_map::serialize"
+    )]
     pub labels: Option<HashMap<String, String>>,
 
     /// Annotations are key-value pairs for arbitrary metadata
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "sorted_opt_map::serialize"
+    )]
     pub annotations: Option<HashMap<String, String>>,
+
+    /// OwnerReferences are references to objects that own this object
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_references: Option<Vec<OwnerReference>>,
 
     /// Finalizers are pre-deletion hooks that must complete before deletion
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finalizers: Option<Vec<String>>,
 
-    /// OwnerReferences are references to objects that own this object
+    /// ManagedFields maps workflow-id and version to the set of fields that are managed by that workflow
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner_references: Option<Vec<OwnerReference>>,
+    pub managed_fields: Option<Vec<ManagedFieldsEntry>>,
 }
 
 impl ObjectMeta {
@@ -556,7 +583,10 @@ pub enum Phase {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LabelSelector {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "sorted_opt_map::serialize"
+    )]
     pub match_labels: Option<HashMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
