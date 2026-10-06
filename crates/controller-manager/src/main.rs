@@ -143,19 +143,30 @@ struct Args {
     /// Per-node pod-CIDR subnet mask size (IPv4). Default 24 (matches upstream).
     #[arg(long, default_value = "24")]
     node_cidr_mask_size: u8,
+
+    /// Service CIDR (e.g. `10.96.0.0/12`). When it overlaps `--cluster-cidr`,
+    /// the overlapping subnets are never allocated to nodes (upstream
+    /// `--service-cluster-ip-range`, `filterOutServiceRange`). Only used when
+    /// `--allocate-node-cidrs` is set.
+    #[arg(long)]
+    service_cluster_ip_range: Option<String>,
 }
 
 /// Resolve node-IPAM flags into `(cluster_cidr, node_mask)`, or `None` when
 /// `--allocate-node-cidrs` is off. Errors if the flag is set without
 /// `--cluster-cidr` (mirrors upstream `node_ipam_controller.go`).
-fn node_ipam_params(args: &Args) -> Result<Option<(String, u8)>> {
+fn node_ipam_params(args: &Args) -> Result<Option<(String, u8, Option<String>)>> {
     if !args.allocate_node_cidrs {
         return Ok(None);
     }
     let cidr = args.cluster_cidr.clone().ok_or_else(|| {
         anyhow::anyhow!("--cluster-cidr is required when --allocate-node-cidrs is set")
     })?;
-    Ok(Some((cidr, args.node_cidr_mask_size)))
+    Ok(Some((
+        cidr,
+        args.node_cidr_mask_size,
+        args.service_cluster_ip_range.clone(),
+    )))
 }
 
 /// Run the controller-manager as an api-server client (in-cluster static pod).
@@ -229,9 +240,11 @@ async fn run_api_mode(args: Args) -> Result<()> {
         // Lib-qualified NodeIpamConfig (distinct from the bin's `mod controllers`
         // copy), so it matches the type ControllerManagerConfig expects.
         node_ipam: match node_ipam_params(&args)? {
-            Some((cidr, mask)) => Some(
-                rusternetes_controller_manager::controllers::node_ipam::NodeIpamConfig::new(
-                    &cidr, mask,
+            Some((cidr, mask, svc)) => Some(
+                rusternetes_controller_manager::controllers::node_ipam::NodeIpamConfig::from_flags(
+                    &cidr,
+                    mask,
+                    svc.as_deref(),
                 )
                 .map_err(|e| anyhow::anyhow!(e))?,
             ),
@@ -804,8 +817,9 @@ async fn main() -> Result<()> {
 
     // Start Node IPAM (range allocator: 30 dedicated workers over an in-memory
     // CidrSet; upstream pkg/controller/nodeipam/ipam/range_allocator.go).
-    if let Some((cidr, mask)) = ipam_params.clone() {
-        let cfg = NodeIpamConfig::new(&cidr, mask).map_err(|e| anyhow::anyhow!(e))?;
+    if let Some((cidr, mask, svc)) = ipam_params.clone() {
+        let cfg = NodeIpamConfig::from_flags(&cidr, mask, svc.as_deref())
+            .map_err(|e| anyhow::anyhow!(e))?;
         info!("Node IPAM enabled: cluster-cidr={cidr}, node-mask=/{mask}");
         let ipam_storage = storage.clone();
         spawn_controller!("Node IPAM controller", leader_elector, {

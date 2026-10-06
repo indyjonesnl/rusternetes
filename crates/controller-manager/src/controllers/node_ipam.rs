@@ -21,7 +21,7 @@
 //! Gated by `--allocate-node-cidrs` (which upstream requires be paired with
 //! `--cluster-cidr`); IPv4 single-stack only for now.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -79,6 +79,23 @@ impl NodeIpamConfig {
             node_mask,
             service_cidr: None,
         })
+    }
+
+    /// Like [`Self::new`], additionally parsing the optional
+    /// `--service-cluster-ip-range`.
+    pub fn from_flags(
+        cluster_cidr: &str,
+        node_mask: u8,
+        service_cidr: Option<&str>,
+    ) -> Result<Self, String> {
+        let mut cfg = Self::new(cluster_cidr, node_mask)?;
+        if let Some(svc) = service_cidr {
+            let svc: Ipv4Net = svc
+                .parse()
+                .map_err(|e| format!("invalid --service-cluster-ip-range {svc:?}: {e}"))?;
+            cfg = cfg.with_service_cidr(svc);
+        }
+        Ok(cfg)
     }
 
     /// Keep `service_cidr` out of the allocatable range
@@ -179,11 +196,13 @@ impl CidrSet {
     }
 
     /// Maximum number of CIDRs that can be allocated.
+    #[cfg(test)]
     pub fn max_cidrs(&self) -> u64 {
         self.max_cidrs
     }
 
     /// Number of CIDRs currently marked used.
+    #[cfg(test)]
     pub fn allocated(&self) -> u64 {
         self.inner.lock().expect("cidr set poisoned").allocated
     }
@@ -703,6 +722,7 @@ mod tests {
     use rusternetes_common::resources::Event;
     use rusternetes_storage::memory::MemoryStorage;
     use rusternetes_storage::{build_key, build_prefix};
+    use std::collections::HashSet;
 
     fn net(s: &str) -> Ipv4Net {
         s.parse().unwrap()
@@ -959,7 +979,7 @@ mod tests {
     async fn release_cidr_returns_it_to_the_pool() {
         let storage = Arc::new(MemoryStorage::new());
         let n = node_with_cidr("node0", Some("10.10.0.0/24"));
-        let ra = allocator(&storage, "10.10.0.0/16", 24, &[n.clone()]).unwrap();
+        let ra = allocator(&storage, "10.10.0.0/16", 24, std::slice::from_ref(&n)).unwrap();
         ra.release_cidr(&n).unwrap();
         assert_eq!(ra.cidr_set.allocate_next().unwrap(), net("10.10.0.0/24"));
         // A node without CIDRs releases nothing.
@@ -972,7 +992,7 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let mut n = node_with_cidr("node0", Some("10.10.0.0/24"));
         put(&storage, &n).await;
-        let ra = allocator(&storage, "10.10.0.0/16", 24, &[n.clone()]).unwrap();
+        let ra = allocator(&storage, "10.10.0.0/16", 24, std::slice::from_ref(&n)).unwrap();
         ra.sync_node("nodes/node0").await.unwrap();
         assert_eq!(ra.cidr_set.allocate_next().unwrap(), net("10.10.1.0/24"));
 
@@ -1062,6 +1082,19 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("condition not reached in 5s");
+    }
+
+    #[test]
+    fn from_flags_parses_service_range() {
+        let cfg = NodeIpamConfig::from_flags("10.0.0.0/16", 24, Some("10.0.0.0/23")).unwrap();
+        assert_eq!(cfg.service_cidr, Some(net("10.0.0.0/23")));
+        assert!(NodeIpamConfig::from_flags("10.0.0.0/16", 24, Some("nope")).is_err());
+        assert_eq!(
+            NodeIpamConfig::from_flags("10.0.0.0/16", 24, None)
+                .unwrap()
+                .service_cidr,
+            None
+        );
     }
 
     #[test]
