@@ -1,4 +1,6 @@
-use crate::volume_plugins::plugin::{BlockVolumePlugin, Spec, VolumePlugin};
+use crate::volume_plugins::plugin::{
+    BlockVolumePlugin, NodeExpandableVolumePlugin, Spec, VolumePlugin,
+};
 
 /// Port of `ErrNoPluginMatched` (`pkg/volume/plugins.go:71-72`) plus the
 /// multiple-match error (`plugins.go:662`). A typed error, not a string,
@@ -118,20 +120,24 @@ impl VolumePluginMgr {
         Ok(self.find_plugin_by_name(name)?.as_block_volume_plugin())
     }
 
-    /// Port of `FindNodeExpandablePluginBySpec`(`pkg/volume/plugins.go:926-935`).
+    /// Port of `FindNodeExpandablePluginBySpec` (`pkg/volume/plugins.go:926-935`).
     ///
-    /// Upstream returns `(nil, nil)` when a plugin matched but is not
-    /// node-expandable and `(nil, err)` when none matched; both collapse to
-    /// `None` here because the sole caller,
-    /// `ActualStateOfWorld::volume_needs_expansion`
-    /// (`actual_state_of_world.go:981-985`), logs and treats either as "no
-    /// expansion". The `NodeExpandableVolumePlugin` type assertion is folded
-    /// into [`VolumePlugin::requires_fs_resize`]; see its comment.
+    /// `Ok(None)` is upstream's `(nil, nil)` — a plugin matched but is not a
+    /// `NodeExpandableVolumePlugin`; the type assertion is
+    /// [`VolumePlugin::as_node_expandable_plugin`].
     pub fn find_node_expandable_plugin_by_spec(
         &self,
         spec: &Spec<'_>,
-    ) -> Option<&dyn VolumePlugin> {
-        self.find_plugin_by_spec(spec).ok()
+    ) -> Result<Option<&dyn NodeExpandableVolumePlugin>, PluginLookupError> {
+        Ok(self.find_plugin_by_spec(spec)?.as_node_expandable_plugin())
+    }
+
+    /// Port of `FindNodeExpandablePluginByName` (`pkg/volume/plugins.go:937-949`).
+    pub fn find_node_expandable_plugin_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<&dyn NodeExpandableVolumePlugin>, PluginLookupError> {
+        Ok(self.find_plugin_by_name(name)?.as_node_expandable_plugin())
     }
 }
 
@@ -139,8 +145,8 @@ impl VolumePluginMgr {
 mod tests {
     use super::*;
     use crate::volume_plugins::plugin::{
-        BlockVolumeMapper, BlockVolumePlugin, BlockVolumeUnmapper, Mounter, OwnedSpec, Spec,
-        VolumePlugin,
+        BlockVolumeMapper, BlockVolumePlugin, BlockVolumeUnmapper, Mounter,
+        NodeExpandableVolumePlugin, NodeResizeOptions, OwnedSpec, Spec, VolumePlugin,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -356,6 +362,114 @@ mod tests {
             .is_none());
         assert!(matches!(
             m.find_mapper_plugin_by_name("kubernetes.io/nope"),
+            Err(PluginLookupError::NoPluginMatched)
+        ));
+    }
+
+    /// A plugin that is also a [`NodeExpandableVolumePlugin`] — the Rust
+    /// spelling of `volumePlugin.(NodeExpandableVolumePlugin)`
+    /// (`pkg/volume/plugins.go:931`).
+    struct ExpandPlugin;
+
+    #[async_trait]
+    impl VolumePlugin for ExpandPlugin {
+        fn name(&self) -> &'static str {
+            "kubernetes.io/expand"
+        }
+        fn get_volume_name(&self, spec: &Spec<'_>) -> Result<String> {
+            Ok(spec.volume.name.clone())
+        }
+        fn can_support(&self, spec: &Spec<'_>) -> bool {
+            spec.volume.name.starts_with("exp")
+        }
+        fn requires_remount(&self, _spec: &Spec<'_>) -> bool {
+            false
+        }
+        fn supports_selinux_context_mount(&self, _spec: &Spec<'_>) -> Result<bool> {
+            Ok(false)
+        }
+        fn as_node_expandable_plugin(&self) -> Option<&dyn NodeExpandableVolumePlugin> {
+            Some(self)
+        }
+        async fn new_mounter(&self, _spec: &Spec<'_>, _pod: &Pod) -> Result<Box<dyn Mounter>> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl NodeExpandableVolumePlugin for ExpandPlugin {
+        fn requires_fs_resize(&self) -> bool {
+            true
+        }
+        async fn node_expand(&self, _opts: NodeResizeOptions<'_>) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn expand_mgr() -> VolumePluginMgr {
+        VolumePluginMgr::new(vec![
+            Box::new(PrefixPlugin {
+                name: "kubernetes.io/a",
+                prefix: "a",
+            }),
+            Box::new(ExpandPlugin),
+        ])
+    }
+
+    /// `FindNodeExpandablePluginBySpec` (`plugins.go:926-935`): a matched
+    /// plugin that is not node-expandable is `(nil, nil)`, a matched
+    /// expandable plugin is returned, an unmatched spec is `(nil, err)`.
+    #[test]
+    fn find_node_expandable_plugin_by_spec() {
+        let m = expand_mgr();
+        let e = volume("exp-1");
+        let spec = Spec {
+            volume: &e,
+            persistent_volume: None,
+        };
+        let found = m
+            .find_node_expandable_plugin_by_spec(&spec)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.name(), "kubernetes.io/expand");
+        assert!(found.requires_fs_resize());
+
+        let a = volume("a-1");
+        let spec = Spec {
+            volume: &a,
+            persistent_volume: None,
+        };
+        assert!(m
+            .find_node_expandable_plugin_by_spec(&spec)
+            .unwrap()
+            .is_none());
+
+        let z = volume("zzz");
+        let spec = Spec {
+            volume: &z,
+            persistent_volume: None,
+        };
+        assert!(matches!(
+            m.find_node_expandable_plugin_by_spec(&spec),
+            Err(PluginLookupError::NoPluginMatched)
+        ));
+    }
+
+    /// `FindNodeExpandablePluginByName` (`plugins.go:937-949`).
+    #[test]
+    fn find_node_expandable_plugin_by_name() {
+        let m = expand_mgr();
+        let found = m
+            .find_node_expandable_plugin_by_name("kubernetes.io/expand")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.name(), "kubernetes.io/expand");
+        assert!(m
+            .find_node_expandable_plugin_by_name("kubernetes.io/a")
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            m.find_node_expandable_plugin_by_name("kubernetes.io/nope"),
             Err(PluginLookupError::NoPluginMatched)
         ));
     }
