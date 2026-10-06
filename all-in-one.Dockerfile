@@ -124,6 +124,10 @@ COPY rusternetes/crates/api-server/proto    ./rusternetes/crates/api-server/prot
 COPY rusternetes/crates/common/build.rs     ./rusternetes/crates/common/build.rs
 COPY rusternetes/crates/cri/build.rs        ./rusternetes/crates/cri/build.rs
 COPY rusternetes/crates/cri/proto           ./rusternetes/crates/cri/proto
+# kubelet/build.rs runs tonic-build over the CSI v1 proto (#2313); without both
+# in Pass-1 the generated `proto` module is empty and kubelet fails to compile.
+COPY rusternetes/crates/kubelet/build.rs     ./rusternetes/crates/kubelet/build.rs
+COPY rusternetes/crates/kubelet/proto        ./rusternetes/crates/kubelet/proto
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate.
 #   - lib only:   common, storage, cloud-providers, protobuf,

@@ -88,6 +88,12 @@ COPY crates/test_support/Cargo.toml       crates/test_support/Cargo.toml
 
 COPY crates/api-server/build.rs crates/api-server/build.rs
 COPY crates/api-server/proto    crates/api-server/proto
+COPY crates/cri/build.rs        crates/cri/build.rs
+COPY crates/cri/proto           crates/cri/proto
+# kubelet/build.rs runs tonic-build over the CSI v1 proto (#2313); without both
+# in Pass-1 the generated `proto` module is empty and kubelet fails to compile.
+COPY crates/kubelet/build.rs     crates/kubelet/build.rs
+COPY crates/kubelet/proto        crates/kubelet/proto
 COPY crates/common/build.rs     crates/common/build.rs
 
 # Dummy sources so `cargo build` can resolve the workspace before the
