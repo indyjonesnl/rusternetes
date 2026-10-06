@@ -70,6 +70,36 @@ use self::merge::{
     CONFIGMAP_SCHEMA, SECRET_SCHEMA,
 };
 
+/// `map[fieldpath.APIVersion]*fieldpath.Set`: what a strategy resets on write,
+/// per `group/version` (`rest.ResetFieldsStrategy.GetResetFields`,
+/// apiserver/pkg/registry/rest/rest.go:385-389). Each set is a list of field
+/// paths (`fieldpath.MakePathOrDie("status")` is `["status"]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResetFields(BTreeMap<String, Vec<Vec<String>>>);
+
+impl ResetFields {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add the set reset in `api_version` (`"networking.k8s.io/v1"`).
+    pub fn with(mut self, api_version: &str, paths: &[&[&str]]) -> Self {
+        self.0.insert(
+            api_version.to_string(),
+            paths
+                .iter()
+                .map(|p| p.iter().map(|s| s.to_string()).collect())
+                .collect(),
+        );
+        self
+    }
+
+    /// `GetResetFields()[version]`: empty when the version has no entry.
+    pub fn for_version(&self, api_version: &str) -> &[Vec<String>] {
+        self.0.get(api_version).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
 /// Per-request SSA options sourced from query parameters.
 ///
 /// `fieldManager` is required by upstream when `Content-Type` is
@@ -81,6 +111,10 @@ pub struct ApplyOptions {
     pub field_manager: String,
     /// Whether to force-resolve conflicts (`?force=true`).
     pub force: bool,
+    /// The serving endpoint's `GetResetFields()` — upstream's
+    /// `NewDefaultFieldManager(..., resetFields)` argument
+    /// (`endpoints/installer.go:697-722`).
+    pub reset_fields: ResetFields,
 }
 
 impl ApplyOptions {
@@ -88,7 +122,13 @@ impl ApplyOptions {
         Self {
             field_manager: field_manager.into(),
             force: false,
+            reset_fields: ResetFields::new(),
         }
+    }
+
+    pub fn with_reset_fields(mut self, reset_fields: ResetFields) -> Self {
+        self.reset_fields = reset_fields;
+        self
     }
 
     pub fn with_force(mut self, force: bool) -> Self {
@@ -180,6 +220,14 @@ pub fn apply_legacy<T: Serialize + DeserializeOwned>(
         .map_err(|e| ApplyError::Internal(e.to_string()))?;
     let mut params = ApplyParams::new(opts.field_manager.clone());
     params.force = opts.force;
+    // The set for the version being applied (`f.groupVersion`; the apply body
+    // must carry it, structuredmerge.go Apply).
+    let version = desired
+        .get("apiVersion")
+        .or_else(|| current.as_ref().and_then(|c| c.get("apiVersion")))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    params.reset_fields = opts.reset_fields.for_version(version).to_vec();
     match server_side_apply(current.as_ref(), desired, &params)
         .map_err(|e| ApplyError::Internal(e.to_string()))?
     {

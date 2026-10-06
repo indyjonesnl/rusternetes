@@ -4,6 +4,7 @@ use crate::registry::rest::{
     reset_object_meta_for_status, GroupResource, NamespaceScopedStrategy, RequestContext,
     RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
 };
+use crate::ssa::ResetFields;
 use rusternetes_common::resources::ServiceCIDR;
 use rusternetes_common::validation::field::ErrorList;
 use rusternetes_common::validation::servicecidr::{
@@ -62,9 +63,26 @@ impl RestUpdateStrategy<ServiceCIDR> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+
+    /// `GetResetFields` (strategy.go:55-66): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        reset_fields("status")
+    }
 }
 
 impl RestDeleteStrategy<ServiceCIDR> for Strategy {}
+
+/// The versions ServiceCIDR is served in. Upstream's sets are keyed
+/// `networking/v1` and `networking/v1beta1` (strategy.go:57, :60, :131, :134):
+/// the group is misspelt (`networking.k8s.io`), so the field manager — which
+/// looks the set up by `GroupVersion.String()` — never finds them and upstream's
+/// reset is inert (`reset_fields_test.go:92` skips servicecidrs). Deliberate
+/// deviation: key the real group/versions, which is what the sets intend.
+fn reset_fields(path: &'static str) -> ResetFields {
+    ResetFields::new()
+        .with("networking.k8s.io/v1", &[&[path]])
+        .with("networking.k8s.io/v1beta1", &[&[path]])
+}
 
 /// `serviceCIDRStatusStrategy` (strategy.go:120-158): the update strategy of
 /// `/status`.
@@ -100,6 +118,11 @@ impl RestUpdateStrategy<ServiceCIDR> for StatusStrategy {
 
     fn allow_unconditional_update(&self) -> bool {
         true
+    }
+
+    /// `GetResetFields` (strategy.go:129-139): `spec`.
+    fn get_reset_fields(&self) -> ResetFields {
+        reset_fields("spec")
     }
 }
 

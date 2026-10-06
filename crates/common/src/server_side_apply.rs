@@ -56,6 +56,19 @@ pub struct ApplyParams {
 
     /// Force apply (override conflicts)
     pub force: bool,
+
+    /// The strategy's reset fields for the applied apiVersion
+    /// (`ResetFieldsStrategy.GetResetFields()[version]`): fields the registry
+    /// strategy resets on write, so the applier neither owns them nor
+    /// conflicts on them. Upstream hands them to the field manager as
+    /// `merge.Updater.IgnoreFilter` (structured-merge-diff `merge/update.go`:
+    /// `Apply` filters the applier's set at :234, `update` filters the
+    /// comparison at :92 / :127).
+    ///
+    /// This engine tracks ownership per top-level key only, so only a
+    /// one-segment path (`["status"]`) can be honoured; a deeper path would
+    /// have to exclude part of a key and is ignored.
+    pub reset_fields: Vec<Vec<String>>,
 }
 
 impl ApplyParams {
@@ -64,7 +77,15 @@ impl ApplyParams {
         Self {
             field_manager,
             force: false,
+            reset_fields: Vec::new(),
         }
+    }
+
+    /// Whether the top-level `key` is a reset field (a one-segment path).
+    fn resets(&self, key: &str) -> bool {
+        self.reset_fields
+            .iter()
+            .any(|p| p.len() == 1 && p[0] == key)
     }
 
     /// Enable force mode
@@ -109,7 +130,7 @@ pub fn server_side_apply(
         None => {
             // New resource - add managed fields
             let mut result = desired.clone();
-            add_managed_fields(&mut result, &params.field_manager, Operation::Apply)?;
+            add_managed_fields(&mut result, params, Operation::Apply)?;
             return Ok(ApplyResult::Success(result));
         }
     };
@@ -121,11 +142,13 @@ pub fn server_side_apply(
     let modified_fields = compute_modified_fields(&current, desired)?;
 
     // Check for conflicts
-    let conflicts = detect_conflicts(
-        &current_managed_fields,
-        &modified_fields,
-        &params.field_manager,
-    );
+    // Reset fields are ignored when comparing (`compare.FilterFields`).
+    let comparable: HashMap<String, Value> = modified_fields
+        .iter()
+        .filter(|(k, _)| !params.resets(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let conflicts = detect_conflicts(&current_managed_fields, &comparable, &params.field_manager);
 
     if !conflicts.is_empty() && !params.force {
         return Ok(ApplyResult::Conflicts(conflicts));
@@ -136,11 +159,14 @@ pub fn server_side_apply(
     merge_fields(&mut result, desired, &modified_fields)?;
 
     // Update managed fields
+    // The applier's set is filtered through the reset fields
+    // (`set = ignoreFilter.Filter(set)`, update.go:234); the values were
+    // merged above regardless, as upstream's `liveObject.Merge(configObject)`.
     update_managed_fields(
         &mut result,
         &params.field_manager,
         Operation::Apply,
-        &modified_fields,
+        &comparable,
     )?;
 
     Ok(ApplyResult::Success(result))
@@ -149,12 +175,13 @@ pub fn server_side_apply(
 /// Add managed fields to a new resource
 fn add_managed_fields(
     resource: &mut Value,
-    manager: &str,
+    params: &ApplyParams,
     operation: Operation,
 ) -> Result<(), ApplyError> {
+    let manager = params.field_manager.as_str();
     // Compute fields_v1 before borrowing metadata mutably
     let api_version = extract_api_version(resource).unwrap_or_else(|| "v1".to_string());
-    let fields_v1 = compute_fields_v1(resource)?;
+    let fields_v1 = compute_fields_v1(resource, params)?;
 
     let metadata = resource
         .get_mut("metadata")
@@ -370,14 +397,14 @@ fn extract_api_version(resource: &Value) -> Option<String> {
 }
 
 /// Compute fields_v1 representation from the entire resource
-fn compute_fields_v1(resource: &Value) -> Result<Value, ApplyError> {
+fn compute_fields_v1(resource: &Value, params: &ApplyParams) -> Result<Value, ApplyError> {
     // Simplified - just track top-level fields
     // Real implementation would create a structured field set
     let mut fields = serde_json::Map::new();
 
     if let Some(obj) = resource.as_object() {
         for key in obj.keys() {
-            if key != "metadata" {
+            if key != "metadata" && !params.resets(key) {
                 fields.insert(key.clone(), Value::Bool(true));
             }
         }

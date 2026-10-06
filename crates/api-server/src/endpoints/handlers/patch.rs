@@ -110,8 +110,10 @@ pub async fn patch_resource<T: Object>(
             let field_manager = options.field_manager.clone().unwrap_or_default();
             Mechanism::Apply {
                 apply,
+                // NewDefaultFieldManager's `resetFields` (installer.go:697-722).
                 options: ApplyOptions::new(field_manager)
-                    .with_force(options.force.unwrap_or(false)),
+                    .with_force(options.force.unwrap_or(false))
+                    .with_reset_fields(scope.store.get_reset_fields()),
             }
         }
     };
