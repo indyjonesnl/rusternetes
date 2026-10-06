@@ -150,13 +150,6 @@ fn succeeded_status() -> PodStatus {
     }
 }
 
-fn failed_status() -> PodStatus {
-    PodStatus {
-        phase: Some(Phase::Failed),
-        ..Default::default()
-    }
-}
-
 /// A Failed status whose container finished `secs_ago` seconds ago. Upstream
 /// delays counting/releasing the last failed pod of an index until its
 /// per-index backoff has elapsed and a replacement exists
