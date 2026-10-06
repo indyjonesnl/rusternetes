@@ -36,6 +36,9 @@ mod kubelet;
 mod labels;
 #[allow(dead_code)]
 mod lifecycle;
+// Wired in main below; the full surface is only reachable from lib users/tests.
+#[allow(dead_code)]
+mod pluginmanager;
 mod pod_dirs;
 mod poll;
 mod removeall;
@@ -504,6 +507,32 @@ async fn main() -> Result<()> {
         .with_pod_manifest_path(args.pod_manifest_path.clone())
         .with_node_status_update_frequency(node_status_update_frequency),
     );
+
+    // Plugin manager (`pkg/kubelet/pluginmanager`): watch
+    // `<root>/plugins_registry` for CSI node-driver-registrar sockets and run
+    // the registration handshake, which fills the CSI driver store. Upstream
+    // wires it in `kubelet.go` (`pluginManager.AddHandler(pluginwatcherapi.CSIPlugin,
+    // plugincache.PluginHandler(csi.PluginHandler))`).
+    {
+        let registry_dir = pluginmanager::plugins_registry_dir(&runtime_config.root_dir);
+        let plugin_manager = pluginmanager::PluginManager::new(registry_dir);
+        plugin_manager.add_handler(
+            pluginmanager::csi_handler::CSI_PLUGIN,
+            Arc::new(pluginmanager::csi_handler::RegistrationHandler::new()),
+        );
+        // The kubelet runs for the life of the process, so the stop channel's
+        // sender is parked in a task that never finishes.
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        match plugin_manager.run(stop_rx) {
+            Ok(()) => {
+                tokio::spawn(async move {
+                    let _keep = (plugin_manager, stop_tx);
+                    std::future::pending::<()>().await;
+                });
+            }
+            Err(e) => warn!("Failed to start the kubelet plugin manager: {e}"),
+        }
+    }
 
     let server_state = server::ServerState {
         node_name: runtime_config.node_name.clone(),
