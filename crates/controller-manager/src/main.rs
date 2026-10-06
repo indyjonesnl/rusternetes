@@ -128,11 +128,13 @@ struct Args {
     kubeconfig: Option<String>,
 
     /// Sustained requests/second EACH controller's api client may send
-    /// (upstream `--kube-api-qps`; default from
+    /// (upstream `--kube-api-qps`; upstream's default is 20,
     /// `pkg/controller/apis/config/v1alpha1/defaults.go:59`). Applied per
     /// controller, not shared: every controller gets its own limiter (#1863).
-    /// `<= 0` disables client-side throttling. API mode only.
-    #[arg(long, default_value_t = rusternetes_client::ratelimit::CONTROLLER_MANAGER_QPS)]
+    /// `<= 0` disables client-side throttling, and that is the DEFAULT here:
+    /// opt-in until the kine sig-api-machinery gate passes (#1863/#2308), then
+    /// the default flips to `CONTROLLER_MANAGER_QPS`. API mode only.
+    #[arg(long, default_value_t = 0.0)]
     kube_api_qps: f64,
 
     /// Burst each controller's api client may send at once (upstream
@@ -931,4 +933,25 @@ async fn main() -> Result<()> {
     info!("Shutting down controller manager");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod default_rate_limit_tests {
+    use super::*;
+    use rusternetes_client::http::ApiClient;
+
+    /// Opt-in until the kine sig-api-machinery gate in #1863 passes: the
+    /// default configuration must build UNLIMITED per-controller clients.
+    #[test]
+    fn default_args_build_unlimited_per_controller_clients() {
+        let args = Args::try_parse_from(["controller-manager"]).unwrap();
+        assert_eq!(args.kube_api_qps, 0.0, "limiter must be off by default");
+        assert_eq!(args.kube_api_burst, 30.0);
+
+        let skeleton = ApiClient::new("http://127.0.0.1:1", true, None)
+            .unwrap()
+            .with_rate_limit(args.kube_api_qps, args.kube_api_burst);
+        let c = skeleton.for_controller("x");
+        assert!(c.qps() <= 0.0, "per-controller client must be unlimited");
+    }
 }

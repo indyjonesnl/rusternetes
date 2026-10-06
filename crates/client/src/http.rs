@@ -215,6 +215,11 @@ impl ApiClient {
         self
     }
 
+    /// This client's configured sustained QPS (`<= 0` means unthrottled).
+    pub fn qps(&self) -> f64 {
+        self.limiter.qps()
+    }
+
     /// True when both clients draw from the same token bucket. Lets callers
     /// (and tests) assert the per-controller independence #1863 depends on.
     pub fn shares_limiter_with(&self, other: &ApiClient) -> bool {
