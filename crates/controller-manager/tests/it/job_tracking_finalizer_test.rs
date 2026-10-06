@@ -617,3 +617,65 @@ async fn suspending_an_indexed_job_keeps_its_completed_indexes() {
         "a suspend pass must not erase an index that already completed"
     );
 }
+
+/// A Job must never be written finished while UIDs are still parked in
+/// `.status.uncountedTerminatedPods`.
+///
+/// Upstream `enactJobFinished` (`job_controller.go:1509-1519`) returns without
+/// adding the terminal condition while `len(uncounted.Succeeded) +
+/// len(uncounted.Failed) > 0` ("Delaying marking the Job as finished, because
+/// there are still uncounted pod(s)"); only the interim `FailureTarget` /
+/// `SuccessCriteriaMet` condition is written first. The kube-apiserver enforces
+/// the same thing in `ValidateJobUpdateStatus` ("must be empty for finished
+/// job"), so a controller that writes both at once is rejected by a vanilla
+/// apiserver and the Job never finishes.
+#[tokio::test]
+async fn a_job_is_never_written_finished_while_uids_are_still_uncounted() {
+    use futures::StreamExt;
+    let storage = setup().await;
+    let mut job = make_job("done-once", "default", 2, 2);
+    job.spec.backoff_limit = Some(0);
+    let key = build_key("jobs", Some("default"), "done-once");
+    storage.create(&key, &job).await.unwrap();
+    let controller = JobController::new(storage.clone());
+    controller.reconcile_all().await.unwrap();
+
+    let mut watch = storage.watch("/registry/jobs/").await.unwrap();
+
+    let pods = job_pods(&storage, "default").await;
+    set_phase(&storage, "default", &pods[0], Phase::Failed).await;
+    set_phase(&storage, "default", &pods[1], Phase::Running).await;
+    controller.reconcile_all().await.unwrap();
+
+    let mut writes = 0;
+    while let Ok(Some(Ok(ev))) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), watch.next()).await
+    {
+        let rusternetes_storage::WatchEvent::Modified(_, v) = ev else {
+            continue;
+        };
+        let j: Job = serde_json::from_str(&v).unwrap();
+        let Some(s) = j.status else { continue };
+        writes += 1;
+        let terminal = s.conditions.unwrap_or_default().iter().any(|c| {
+            (c.condition_type == "Complete" || c.condition_type == "Failed") && c.status == "True"
+        });
+        let uncounted = s.uncounted_terminated_pods.map_or(0, |u| {
+            u.succeeded.map_or(0, |v| v.len()) + u.failed.map_or(0, |v| v.len())
+        });
+        assert!(
+            !(terminal && uncounted > 0),
+            "write #{writes} marks the Job finished with {uncounted} uncounted UID(s)"
+        );
+    }
+    assert!(writes > 0, "expected the controller to write status");
+    let done = storage.get::<Job>(&key).await.unwrap();
+    assert!(
+        status_of(&done)
+            .conditions
+            .unwrap_or_default()
+            .iter()
+            .any(|c| c.condition_type == "Failed" && c.status == "True"),
+        "the Job must still end up Failed"
+    );
+}
