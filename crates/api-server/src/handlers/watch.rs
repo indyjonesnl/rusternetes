@@ -356,6 +356,56 @@ async fn open_watch_stream(
     }
 }
 
+/// Highest `metadata.resourceVersion` among the objects a watch's initial
+/// snapshot lists: a lower bound on the revision the snapshot was read at.
+///
+/// Upstream stamps the whole snapshot with the cache's revision under its lock
+/// and continues the interval from exactly there (`newCacheIntervalFromStore`,
+/// `staging/src/k8s.io/apiserver/pkg/storage/cacher/watch_cache_interval.go:
+/// 139-179`). We cannot read the revision atomically with the list, so the
+/// highest listed object revision stands in: it can only under-cut, never
+/// drop an event the client has not seen.
+pub fn snapshot_resource_version(snapshot: &[serde_json::Value]) -> Option<u64> {
+    snapshot
+        .iter()
+        .filter_map(|v| {
+            v.pointer("/metadata/resourceVersion")
+                .and_then(|rv| rv.as_str())
+                .and_then(|rv| rv.parse::<u64>().ok())
+        })
+        .max()
+}
+
+/// Drop live `ADDED` events at or below the snapshot's resourceVersion.
+///
+/// The watch subscribes before it lists (so a write in the gap is not lost),
+/// which means a write between the two is in the snapshot AND on the live
+/// stream. Upstream's `cacheWatcher.processInterval` skips every event with
+/// `event.ResourceVersion <= resourceVersion`
+/// (`staging/src/k8s.io/apiserver/pkg/storage/cacher/cache_watcher.go`); the
+/// snapshot already reflects such an event. Only ADDED is filtered here:
+/// MODIFIED/DELETED duplicates are idempotent for a reflector, and filtering
+/// them would endanger the selector-transition bookkeeping.
+pub fn skip_added_covered_by_snapshot(
+    stream: rusternetes_storage::WatchStream,
+    cutoff: Option<u64>,
+) -> rusternetes_storage::WatchStream {
+    let Some(cutoff) = cutoff else {
+        return stream;
+    };
+    stream
+        .filter(move |event| {
+            let covered = match event {
+                Ok(WatchEvent::Added(_, value)) => extract_rv_from_json(value)
+                    .and_then(|rv| rv.parse::<u64>().ok())
+                    .is_some_and(|rv| rv <= cutoff),
+                _ => false,
+            };
+            futures::future::ready(!covered)
+        })
+        .boxed()
+}
+
 /// Generic watch handler for namespaced resources.
 pub async fn watch_namespaced<T>(
     state: Arc<ApiServerState>,
@@ -495,6 +545,7 @@ where
     } else {
         raw_existing
     };
+    let snapshot_rv = snapshot_resource_version(&raw_existing);
     let existing_resources: Vec<T> = raw_existing
         .into_iter()
         .filter_map(|v| match serde_json::from_value::<T>(v) {
@@ -525,6 +576,13 @@ where
     // resourceVersion (> 1) is served by the replay above instead.
     let should_send_initial =
         opens_with_current_state(send_initial_events, requested_rv.as_deref());
+    // Cut the live stream at the snapshot (#2038): see
+    // `skip_added_covered_by_snapshot`. A resumed watch has no snapshot.
+    let watch_stream = if should_send_initial {
+        skip_added_covered_by_snapshot(watch_stream, snapshot_rv)
+    } else {
+        watch_stream
+    };
 
     // PRE-BUFFER initial events BEFORE returning the Response.
     // K8s sends headers + first events synchronously (watch.go:237-282).
@@ -1046,6 +1104,7 @@ where
     } else {
         raw_existing
     };
+    let snapshot_rv = snapshot_resource_version(&raw_existing);
     let existing_resources: Vec<T> = raw_existing
         .into_iter()
         .filter_map(|v| match serde_json::from_value::<T>(v) {
@@ -1074,6 +1133,13 @@ where
     // resourceVersion (> 1) is served by the replay above instead.
     let should_send_initial =
         opens_with_current_state(send_initial_events, requested_rv.as_deref());
+    // Cut the live stream at the snapshot (#2038): see
+    // `skip_added_covered_by_snapshot`. A resumed watch has no snapshot.
+    let watch_stream = if should_send_initial {
+        skip_added_covered_by_snapshot(watch_stream, snapshot_rv)
+    } else {
+        watch_stream
+    };
 
     // Spawn task to convert watch events to HTTP response
     tokio::spawn(async move {
@@ -2788,6 +2854,7 @@ pub async fn watch_cluster_scoped_json(
         Err(expired) => return Ok(expired),
     };
     let existing_resources: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
+    let snapshot_rv = snapshot_resource_version(&existing_resources);
 
     let current_rev = state.storage.current_revision().await.unwrap_or(1);
     let current_rev_str = current_rev.to_string();
@@ -2809,6 +2876,13 @@ pub async fn watch_cluster_scoped_json(
 
     let should_send_initial =
         opens_with_current_state(send_initial_events, requested_rv.as_deref());
+    // Cut the live stream at the snapshot (#2038): see
+    // `skip_added_covered_by_snapshot`. A resumed watch has no snapshot.
+    let watch_stream = if should_send_initial {
+        skip_added_covered_by_snapshot(watch_stream, snapshot_rv)
+    } else {
+        watch_stream
+    };
 
     let label_selector = params.label_selector.clone();
     let field_selector = params.field_selector.clone();
@@ -3009,6 +3083,7 @@ pub async fn watch_namespaced_json(
         Err(expired) => return Ok(expired),
     };
     let existing_resources: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
+    let snapshot_rv = snapshot_resource_version(&existing_resources);
     let current_rev = state.storage.current_revision().await.unwrap_or(1);
     let current_rev_str = current_rev.to_string();
 
@@ -3030,6 +3105,13 @@ pub async fn watch_namespaced_json(
     // A specific resourceVersion (> 1) is served by the replay above.
     let should_send_initial =
         opens_with_current_state(send_initial_events, requested_rv.as_deref());
+    // Cut the live stream at the snapshot (#2038): see
+    // `skip_added_covered_by_snapshot`. A resumed watch has no snapshot.
+    let watch_stream = if should_send_initial {
+        skip_added_covered_by_snapshot(watch_stream, snapshot_rv)
+    } else {
+        watch_stream
+    };
 
     let label_selector = params.label_selector.clone();
     let field_selector = params.field_selector.clone();
