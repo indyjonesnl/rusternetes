@@ -104,7 +104,7 @@ async fn get_in(
         user,
         Some(namespace),
         name,
-        &params,
+        params,
     )
     .await
 }
