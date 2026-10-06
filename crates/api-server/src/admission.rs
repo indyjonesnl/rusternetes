@@ -1014,6 +1014,52 @@ pub async fn inject_service_account_token<S: Storage>(
     Ok(())
 }
 
+/// `ignoredPodSubresources` (pod-security-admission/admission/admission.go:316-325).
+/// Any other subresource is expected to be a Pod and is evaluated.
+const IGNORED_POD_SUBRESOURCES: [&str; 8] = [
+    "exec",
+    "attach",
+    "binding",
+    "eviction",
+    "log",
+    "portforward",
+    "proxy",
+    "status",
+];
+
+/// `isSignificantPodUpdate` (pod-security-admission/admission/admission.go:632-666):
+/// a pod update triggers policy evaluation only if a container or init
+/// container was added or removed, an image changed, or an ephemeral
+/// container was added or its image changed. Relevant mutable pod fields
+/// are the image fields (`isSignificantContainerUpdate`, :669-671).
+pub fn is_significant_pod_update(pod: &Pod, old_pod: &Pod) -> bool {
+    use rusternetes_common::resources::pod::Container;
+    let empty = Vec::new();
+    let (spec, old_spec) = match (&pod.spec, &old_pod.spec) {
+        (Some(s), Some(o)) => (s, o),
+        // No spec on either side: nothing to evaluate against.
+        (None, None) => return false,
+        _ => return true,
+    };
+    let init = spec.init_containers.as_ref().unwrap_or(&empty);
+    let old_init = old_spec.init_containers.as_ref().unwrap_or(&empty);
+    if spec.containers.len() != old_spec.containers.len() || init.len() != old_init.len() {
+        return true;
+    }
+    let image_changed =
+        |new: &[Container], old: &[Container]| new.iter().zip(old).any(|(c, o)| c.image != o.image);
+    if image_changed(&spec.containers, &old_spec.containers) || image_changed(init, old_init) {
+        return true;
+    }
+    let old_eph = old_spec.ephemeral_containers.as_deref().unwrap_or(&[]);
+    spec.ephemeral_containers.iter().flatten().any(|c| {
+        match old_eph.iter().find(|o| o.name == c.name) {
+            None => true, // EphemeralContainer added
+            Some(o) => c.image != o.image,
+        }
+    })
+}
+
 /// PodSecurityAdmission — stub for the Kubernetes Pod Security Admission
 /// (PSA) plugin.
 ///
@@ -1044,6 +1090,21 @@ impl PodSecurityAdmission {
     /// Create a new PSA admission plugin instance.
     pub const fn new() -> Self {
         Self
+    }
+
+    /// Whether a pod CREATE/UPDATE reaches policy evaluation at all: the
+    /// gates of `Admission.ValidatePod`
+    /// (staging/src/k8s.io/pod-security-admission/admission/admission.go:329-389).
+    ///
+    /// A request on an ignored subresource (`ignoredPodSubresources`, :316)
+    /// is allowed; an UPDATE is evaluated only when
+    /// [`is_significant_pod_update`] says so (:383-386). Every other
+    /// subresource (`ephemeralcontainers`, `resize`, ...) is evaluated.
+    pub fn should_evaluate(subresource: Option<&str>, old: Option<&Pod>, pod: &Pod) -> bool {
+        if subresource.is_some_and(|s| IGNORED_POD_SUBRESOURCES.contains(&s)) {
+            return false;
+        }
+        old.is_none_or(|old| is_significant_pod_update(pod, old))
     }
 
     /// Evaluate a pod against the namespace's enforced Pod Security
@@ -1103,9 +1164,16 @@ impl PodSecurityAdmission {
         // checks apply uniformly.
         let regular = spec.containers.iter();
         let init = spec.init_containers.iter().flatten();
+        // `policy.VisitContainers` also visits ephemeral containers.
+        let ephemeral = spec
+            .ephemeral_containers
+            .iter()
+            .flatten()
+            .map(|c| (c.name.as_str(), c.security_context.as_ref()));
         let all_security_contexts = regular
             .chain(init)
-            .map(|c| (c.name.as_str(), c.security_context.as_ref()));
+            .map(|c| (c.name.as_str(), c.security_context.as_ref()))
+            .chain(ephemeral);
 
         // --- Baseline: privileged containers ---
         for (name, sc) in all_security_contexts.clone() {
@@ -1787,6 +1855,71 @@ mod tests {
             .admit(&storage, "ns", &pod)
             .await
             .expect("privileged namespace must admit everything");
+    }
+
+    fn psa_pod(spec: serde_json::Value) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p"}, "spec": spec
+        }))
+        .unwrap()
+    }
+
+    /// admission_test.go `TestValidatePodAndController` update cases /
+    /// `isSignificantPodUpdate` (admission.go:632-666).
+    #[test]
+    fn psa_is_significant_pod_update() {
+        let base = psa_pod(serde_json::json!({
+            "containers": [{"name": "a", "image": "i1"}],
+            "initContainers": [{"name": "i", "image": "j1"}]
+        }));
+        assert!(!is_significant_pod_update(&base, &base));
+        let image = psa_pod(serde_json::json!({
+            "containers": [{"name": "a", "image": "i2"}],
+            "initContainers": [{"name": "i", "image": "j1"}]
+        }));
+        assert!(is_significant_pod_update(&image, &base));
+        let init_image = psa_pod(serde_json::json!({
+            "containers": [{"name": "a", "image": "i1"}],
+            "initContainers": [{"name": "i", "image": "j2"}]
+        }));
+        assert!(is_significant_pod_update(&init_image, &base));
+        let added = psa_pod(serde_json::json!({
+            "containers": [{"name": "a", "image": "i1"}, {"name": "b", "image": "i1"}],
+            "initContainers": [{"name": "i", "image": "j1"}]
+        }));
+        assert!(is_significant_pod_update(&added, &base));
+        let eph = psa_pod(serde_json::json!({
+            "containers": [{"name": "a", "image": "i1"}],
+            "initContainers": [{"name": "i", "image": "j1"}],
+            "ephemeralContainers": [{"name": "e", "image": "x"}]
+        }));
+        assert!(is_significant_pod_update(&eph, &base));
+        assert!(!is_significant_pod_update(&eph, &eph));
+        let eph_image = psa_pod(serde_json::json!({
+            "containers": [{"name": "a", "image": "i1"}],
+            "initContainers": [{"name": "i", "image": "j1"}],
+            "ephemeralContainers": [{"name": "e", "image": "y"}]
+        }));
+        assert!(is_significant_pod_update(&eph_image, &eph));
+    }
+
+    /// `ignoredPodSubresources` (admission.go:316-325).
+    #[test]
+    fn psa_ignored_subresources_are_not_evaluated() {
+        let pod = psa_pod(serde_json::json!({"containers": [{"name": "a", "image": "i"}]}));
+        for s in IGNORED_POD_SUBRESOURCES {
+            assert!(!PodSecurityAdmission::should_evaluate(Some(s), None, &pod));
+        }
+        for s in [None, Some("ephemeralcontainers"), Some("resize")] {
+            assert!(PodSecurityAdmission::should_evaluate(s, None, &pod));
+        }
+        // An insignificant update is allowed unevaluated.
+        assert!(!PodSecurityAdmission::should_evaluate(
+            None,
+            Some(&pod),
+            &pod
+        ));
     }
 
     #[tokio::test]
