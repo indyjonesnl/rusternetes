@@ -90,7 +90,7 @@ fn scope(state: &ApiServerState, uri: &Uri) -> (Served, RequestScope<Event>) {
 /// `involvedObject.namespace`, the message length and requires `source`,
 /// `firstTimestamp`, `lastTimestamp` and `count` -- which arrive as
 /// `deprecated*` on this version -- to be unset (#1914).
-fn request_body(served: Served, body: &Bytes) -> Result<Bytes> {
+fn request_body(served: Served, params: &HashMap<String, String>, body: &Bytes) -> Result<Bytes> {
     if served == Served::Core {
         return Ok(body.clone());
     }
@@ -114,6 +114,11 @@ fn request_body(served: Served, body: &Bytes) -> Result<Bytes> {
         }
     }
     let v1: EventV1 = decode_request_body(body)?;
+    // Strictness judges the body in the versioned type, before conversion drops
+    // any of its fields: staging/src/k8s.io/apiserver/pkg/endpoints/handlers/
+    // create.go:116-148 decodes into the versioned object first. Warn-mode
+    // warnings are not carried through (#2111).
+    crate::handlers::validation::validate_strict_fields(params, body, &v1)?;
     let mut core = serde_json::to_value(v1.into_core())
         .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
     // The scope's decode checks the body's apiVersion against the served one;
@@ -177,7 +182,7 @@ pub async fn create(
     body: Bytes,
 ) -> Result<Response> {
     let (served, scope) = scope(&state, &uri);
-    let body = request_body(served, &body)?;
+    let body = request_body(served, &params, &body)?;
     let out = endpoints::create_resource(
         &state,
         &scope,
@@ -211,7 +216,7 @@ pub async fn update(
     body: Bytes,
 ) -> Result<Response> {
     let (served, scope) = scope(&state, &uri);
-    let body = request_body(served, &body)?;
+    let body = request_body(served, &params, &body)?;
     let out = endpoints::update_resource(
         &state,
         &scope,

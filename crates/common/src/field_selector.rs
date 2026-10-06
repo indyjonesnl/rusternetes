@@ -191,9 +191,12 @@ fn extract_field_value(resource: &Value, field_path: &str) -> Option<String> {
             .and_then(Value::as_str)
             .unwrap_or("");
         if component.is_empty() {
+            // The stored core Event serializes it as `reportingController`
+            // (resources/event.rs `reporting_component`).
             return Some(
                 resource
-                    .get("reportingComponent")
+                    .get("reportingController")
+                    .or_else(|| resource.get("reportingComponent"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
@@ -202,7 +205,6 @@ fn extract_field_value(resource: &Value, field_path: &str) -> Option<String> {
         return Some(component.to_string());
     }
     let resolved_path = match field_path {
-        "source" => "source.component",
         // events.k8s.io/v1 `reportingController` is a top-level field (it
         // serializes under that exact name), so the selector key resolves to
         // itself via the default arm below.
@@ -523,6 +525,9 @@ mod tests {
         let ev = json!({"reportingComponent": "ctl", "source": {}});
         assert!(FieldSelector::parse("source=ctl").unwrap().matches(&ev));
         let ev = json!({"reportingComponent": "ctl"});
+        assert!(FieldSelector::parse("source=ctl").unwrap().matches(&ev));
+        // How the stored core Event actually serializes it.
+        let ev = json!({"reportingController": "ctl"});
         assert!(FieldSelector::parse("source=ctl").unwrap().matches(&ev));
         let ev = json!({"reportingComponent": "ctl", "source": {"component": "kubelet"}});
         assert!(FieldSelector::parse("source=kubelet").unwrap().matches(&ev));
