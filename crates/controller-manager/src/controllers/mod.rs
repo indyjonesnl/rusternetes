@@ -2,6 +2,7 @@ pub mod apiservice;
 pub mod cascade_tests;
 pub mod cert_authority;
 pub mod certificate_signing_request;
+pub mod clusterrole_aggregation;
 pub mod cronjob;
 pub mod daemonset;
 pub mod deployment;

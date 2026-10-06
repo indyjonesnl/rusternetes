@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use rusternetes_common::resources::rbac::ClusterRole;
 use rusternetes_common::resources::{EndpointSlice, Endpoints};
 use rusternetes_storage::Storage;
 use rusternetes_storage::StorageBackend;
@@ -84,18 +83,16 @@ fn policy_key(item: &serde_json::Value) -> Option<(String, String)> {
 /// privilege-escalation check stays rule-based (NOT an authorizer
 /// short-circuit). Idempotent.
 ///
-/// Deviations: upstream's `Covers`-based rule reconciliation is approximated by
-/// "append rules not already present verbatim", and `ClusterRole`s with an
-/// `aggregationRule` are materialised once at seed time (no
-/// clusterroleaggregation controller exists here; see
-/// `registry/rbac/aggregation.rs`).
+/// Deviation: upstream's `Covers`-based rule reconciliation is approximated by
+/// "append rules not already present verbatim". `ClusterRole`s with an
+/// `aggregationRule` are seeded without rules, as upstream; the
+/// clusterroleaggregation controller (controller-manager) fills them.
 pub async fn bootstrap_default_rbac(storage: Arc<StorageBackend>) -> Result<()> {
     let mut namespaces = std::collections::BTreeSet::new();
-    let mut aggregated: Vec<String> = Vec::new();
 
     for yaml in BOOTSTRAP_POLICY {
         for mut item in load_policy_items(yaml)? {
-            let Some((key, kind)) = policy_key(&item) else {
+            let Some((key, _kind)) = policy_key(&item) else {
                 continue;
             };
             if let Some(ns) = item["metadata"]["namespace"].as_str() {
@@ -125,25 +122,11 @@ pub async fn bootstrap_default_rbac(storage: Arc<StorageBackend>) -> Result<()> 
                                 .with_context(|| format!("create {key}"))
                         }
                     }
-                    if kind == "ClusterRole" && !item["aggregationRule"].is_null() {
-                        aggregated.push(key);
-                    }
                 }
             }
         }
     }
 
-    // Aggregating roles (admin/edit/view) are filled from the leaf roles, which
-    // now all exist.
-    for key in aggregated {
-        let mut role: ClusterRole = storage.get(&key).await?;
-        crate::registry::rbac::aggregation::materialise_aggregated_rules(
-            storage.as_ref(),
-            &mut role,
-        )
-        .await;
-        storage.update(&key, &role).await?;
-    }
     Ok(())
 }
 
@@ -1501,7 +1484,7 @@ mod system_priority_class_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::resources::rbac::ClusterRoleBinding;
+    use rusternetes_common::resources::rbac::{ClusterRole, ClusterRoleBinding};
     use rusternetes_storage::memory::MemoryStorage;
 
     #[tokio::test]
@@ -1650,12 +1633,26 @@ mod tests {
             )
             .await
             .expect("kube-system leader-locking Role");
-        // admin aggregates the aggregate-to-admin roles, so it must not be empty.
+        // admin/edit/view are seeded with an aggregationRule and no rules, as
+        // upstream; the clusterroleaggregation controller fills them from the
+        // aggregate-to-* roles.
         let admin: ClusterRole = storage.get("/registry/clusterroles/admin").await.unwrap();
-        assert!(
-            !admin.rules.is_empty(),
-            "aggregated admin rules materialised"
-        );
+        assert!(admin.aggregation_rule.is_some());
+        assert!(admin.rules.is_empty(), "seeded without rules");
+        rusternetes_controller_manager::controllers::clusterrole_aggregation::ClusterRoleAggregationController::new(storage.clone())
+            .sync_all()
+            .await
+            .unwrap();
+        for name in ["admin", "edit", "view"] {
+            let role: ClusterRole = storage
+                .get(&format!("/registry/clusterroles/{name}"))
+                .await
+                .unwrap();
+            assert!(
+                !role.rules.is_empty(),
+                "{name} aggregated by the controller"
+            );
+        }
     }
 
     /// The api-server must own the `default/kubernetes` Service, as upstream's

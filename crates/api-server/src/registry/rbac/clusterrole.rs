@@ -3,7 +3,8 @@
 //! `pkg/registry/rbac/clusterrole/storage/storage.go` and the policybased
 //! wrapper (`pkg/registry/rbac/rest/storage_rbac.go:118-121`).
 //!
-//! `aggregationRule` is materialised on write; see [`super::aggregation`].
+//! The rules of an `aggregationRule` ClusterRole are filled by the
+//! clusterroleaggregation controller, not on write.
 
 use std::sync::Arc;
 
@@ -113,7 +114,6 @@ pub fn new_store(
             authorizer,
             resolver: Arc::new(DefaultRuleResolver::new(storage.clone())),
         },
-        storage,
     });
     store.begin_create = Some(hook.clone());
     store.begin_update = Some(hook.clone());

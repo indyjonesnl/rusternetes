@@ -15,13 +15,13 @@
 //! * `ValidateDeclarativelyWithMigrationChecks` (declarative validation of
 //!   RoleBinding and ClusterRole): the hand-written validators already cover
 //!   what the `+k8s:` tags declare.
-//! * The `clusterroleaggregation` controller: [`aggregation`] recomputes an
-//!   aggregated ClusterRole's rules when that ClusterRole is written instead.
+//! * The `clusterroleaggregation` controller lives in the controller-manager
+//!   (`controllers/clusterrole_aggregation.rs`); a ClusterRole's `rules` are
+//!   never recomputed at write time, as upstream.
 //! * Upstream wraps `Create`/`Update` of the standard storage; here the
 //!   policybased checks are the Store's `BeginCreate` hook and its
 //!   `update_transformers` (`rest.WrapUpdatedObjectInfo`), see [`policybased`].
 
-pub mod aggregation;
 pub mod clusterrole;
 pub mod clusterrolebinding;
 pub mod escalation_check;
