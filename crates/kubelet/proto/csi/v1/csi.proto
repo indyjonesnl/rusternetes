@@ -1,0 +1,129 @@
+// Node-service subset of the Container Storage Interface (CSI) v1 protocol.
+//
+// Source of truth: the CSI spec repository (container-storage-interface/spec),
+// csi.proto, package `csi.v1`. The message and service names, field numbers and
+// enum values below are copied from that definition and were checked against
+// the generated Go bindings Kubernetes v1.35 vendors
+// (`vendor/<spec repo>/lib/go/csi/csi.pb.go`). Protobuf is wire-compatible on
+// field numbers, so every conformant CSI driver interoperates unmodified.
+//
+// DEVIATION: this is a SUBSET, not a verbatim copy. The upstream spec repo is
+// not available on this machine (only its generated Go code is, under the
+// kubernetes vendor tree), so the file is reconstructed from those bindings and
+// holds exactly the Node-service RPCs the kubelet's volume plugin calls
+// (`pkg/volume/csi/csi_client.go`). The `csi_secret` field option is omitted: it
+// only drives log redaction in Go's `protosanitizer` and has no wire effect.
+// Replace with the verbatim file when the spec repo is vendored.
+
+syntax = "proto3";
+package csi.v1;
+
+service Node {
+  rpc NodeStageVolume (NodeStageVolumeRequest) returns (NodeStageVolumeResponse) {}
+  rpc NodeUnstageVolume (NodeUnstageVolumeRequest) returns (NodeUnstageVolumeResponse) {}
+  rpc NodePublishVolume (NodePublishVolumeRequest) returns (NodePublishVolumeResponse) {}
+  rpc NodeUnpublishVolume (NodeUnpublishVolumeRequest) returns (NodeUnpublishVolumeResponse) {}
+  rpc NodeGetCapabilities (NodeGetCapabilitiesRequest) returns (NodeGetCapabilitiesResponse) {}
+}
+
+message VolumeCapability {
+  // Indicate that the volume will be accessed via the block device API.
+  message BlockVolume {}
+
+  // Indicate that the volume will be accessed via the filesystem API.
+  message MountVolume {
+    string fs_type = 1;
+    repeated string mount_flags = 2;
+    // If SP has VOLUME_MOUNT_GROUP node capability and CO provides this field
+    // then SP MUST ensure that the volume_mount_group parameter is passed as
+    // the group identifier to the underlying operating system mount system call.
+    string volume_mount_group = 3;
+  }
+
+  // Specify how a volume can be accessed.
+  message AccessMode {
+    enum Mode {
+      UNKNOWN = 0;
+      SINGLE_NODE_WRITER = 1;
+      SINGLE_NODE_READER_ONLY = 2;
+      MULTI_NODE_READER_ONLY = 3;
+      MULTI_NODE_SINGLE_WRITER = 4;
+      MULTI_NODE_MULTI_WRITER = 5;
+      SINGLE_NODE_SINGLE_WRITER = 6;
+      SINGLE_NODE_MULTI_WRITER = 7;
+    }
+    Mode mode = 1;
+  }
+
+  // Specifies what API the volume will be accessed using. One of the following
+  // fields MUST be specified.
+  oneof access_type {
+    BlockVolume block = 1;
+    MountVolume mount = 2;
+  }
+
+  AccessMode access_mode = 3;
+}
+
+message NodeStageVolumeRequest {
+  string volume_id = 1;
+  map<string, string> publish_context = 2;
+  string staging_target_path = 3;
+  VolumeCapability volume_capability = 4;
+  map<string, string> secrets = 5;
+  map<string, string> volume_context = 6;
+}
+
+message NodeStageVolumeResponse {}
+
+message NodeUnstageVolumeRequest {
+  string volume_id = 1;
+  string staging_target_path = 2;
+}
+
+message NodeUnstageVolumeResponse {}
+
+message NodePublishVolumeRequest {
+  string volume_id = 1;
+  map<string, string> publish_context = 2;
+  string staging_target_path = 3;
+  string target_path = 4;
+  VolumeCapability volume_capability = 5;
+  bool readonly = 6;
+  map<string, string> secrets = 7;
+  map<string, string> volume_context = 8;
+}
+
+message NodePublishVolumeResponse {}
+
+message NodeUnpublishVolumeRequest {
+  string volume_id = 1;
+  string target_path = 2;
+}
+
+message NodeUnpublishVolumeResponse {}
+
+message NodeGetCapabilitiesRequest {}
+
+message NodeGetCapabilitiesResponse {
+  repeated NodeServiceCapability capabilities = 1;
+}
+
+message NodeServiceCapability {
+  message RPC {
+    enum Type {
+      UNKNOWN = 0;
+      STAGE_UNSTAGE_VOLUME = 1;
+      GET_VOLUME_STATS = 2;
+      EXPAND_VOLUME = 3;
+      VOLUME_CONDITION = 4;
+      SINGLE_NODE_MULTI_WRITER = 5;
+      VOLUME_MOUNT_GROUP = 6;
+    }
+    Type type = 1;
+  }
+
+  oneof type {
+    RPC rpc = 1;
+  }
+}
