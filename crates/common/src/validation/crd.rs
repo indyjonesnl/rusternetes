@@ -327,8 +327,20 @@ fn tokenize_field_path(json_path: &str) -> Vec<String> {
 
 /// `validateCustomResourceDefinitionSpec` (`validation.go:353`), minus the
 /// schema-structural half (see the module doc).
+///
+/// The create-time form: `allowInvalidCABundle: true` (`validation.go:96-97`).
 pub fn validate_custom_resource_definition_spec(
     spec: &CustomResourceDefinitionSpec,
+    fld_path: &Path,
+) -> ErrorList {
+    validate_custom_resource_definition_spec_opts(spec, true, fld_path)
+}
+
+/// [`validate_custom_resource_definition_spec`] with
+/// `validationOptions.allowInvalidCABundle` (`validation.go:146`) supplied.
+fn validate_custom_resource_definition_spec_opts(
+    spec: &CustomResourceDefinitionSpec,
+    allow_invalid_ca_bundle: bool,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -419,7 +431,11 @@ pub fn validate_custom_resource_definition_spec(
     }
 
     errs.extend(validate_names(&spec.names, &fld_path.child("names")));
-    errs.extend(validate_conversion(spec, &fld_path.child("conversion")));
+    errs.extend(validate_conversion(
+        spec,
+        allow_invalid_ca_bundle,
+        &fld_path.child("conversion"),
+    ));
 
     errs
 }
@@ -639,7 +655,11 @@ fn validate_simple_json_path(value: &str, fld_path: &Path) -> ErrorList {
 /// The paths are upstream's internal ones — a v1 client's
 /// `spec.conversion.webhook.clientConfig` is `spec.conversion.webhookClientConfig`
 /// after conversion, and that is what upstream reports.
-fn validate_conversion(spec: &CustomResourceDefinitionSpec, fld_path: &Path) -> ErrorList {
+fn validate_conversion(
+    spec: &CustomResourceDefinitionSpec,
+    allow_invalid_ca_bundle: bool,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let Some(conversion) = &spec.conversion else {
         return errs;
@@ -679,6 +699,15 @@ fn validate_conversion(spec: &CustomResourceDefinitionSpec, fld_path: &Path) -> 
                             "exactly one of url or service is required",
                         )),
                     }
+                    // `validation.go:631-633`.
+                    if let Some(bundle) = cc.ca_bundle.as_deref().filter(|b| !b.is_empty()) {
+                        if !allow_invalid_ca_bundle {
+                            errs.extend(validate_ca_bundle_field(
+                                bundle,
+                                &client_config_path.child("caBundle"),
+                            ));
+                        }
+                    }
                     errs.extend(validate_conversion_review_versions(
                         &webhook.conversion_review_versions,
                         &review_versions_path,
@@ -708,6 +737,85 @@ fn validate_conversion(spec: &CustomResourceDefinitionSpec, fld_path: &Path) -> 
         }
     }
     errs
+}
+
+/// `allowInvalidCABundle` (`validation.go:557-569`): an invalid CA bundle may
+/// be written only while the CRD is not yet Established, or when the stored
+/// bundle is itself already invalid.
+fn allow_invalid_ca_bundle(old: &CustomResourceDefinition) -> bool {
+    if !is_crd_condition_true(old, "Established") {
+        return true;
+    }
+    let Some(bundle) = old
+        .spec
+        .conversion
+        .as_ref()
+        .and_then(|c| c.webhook.as_ref())
+        .and_then(|w| w.client_config.ca_bundle.as_deref())
+        .filter(|b| !b.is_empty())
+    else {
+        return false;
+    };
+    !validate_ca_bundle_field(bundle, &Path::new("caBundle")).is_empty()
+}
+
+/// `caBundle` is a Go `[]byte`, so it is base64 on the wire. A value that is
+/// not valid base64 is taken as the raw bytes (the same leniency as
+/// `api-server/src/conversion.rs`); it then fails the PEM check below.
+fn validate_ca_bundle_field(bundle: &str, path: &Path) -> ErrorList {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(bundle)
+        .unwrap_or_else(|_| bundle.as_bytes().to_vec());
+    validate_ca_bundle_with_value(path, &bytes, bundle)
+}
+
+/// `webhook.ValidateCABundle` (`apiserver/pkg/util/webhook/validation.go:29-36`).
+/// The bad value is the `[]byte`, which upstream marshals to JSON as base64.
+#[cfg(test)]
+fn validate_ca_bundle(path: &Path, ca_bundle: &[u8]) -> ErrorList {
+    use base64::Engine;
+    let shown = base64::engine::general_purpose::STANDARD.encode(ca_bundle);
+    validate_ca_bundle_with_value(path, ca_bundle, &shown)
+}
+
+fn validate_ca_bundle_with_value(path: &Path, ca_bundle: &[u8], shown: &str) -> ErrorList {
+    match root_cert_pool(ca_bundle) {
+        Ok(()) => Vec::new(),
+        Err(msg) => vec![Error::invalid(
+            path,
+            serde_json::Value::String(shown.to_string()),
+            format!("unable to load root certificates: {msg}"),
+        )],
+    }
+}
+
+/// `rootCertPool` + `createErrorParsingCAData`
+/// (`client-go/transport/transport.go:252-286`): `AppendCertsFromPEM` succeeds
+/// when at least one `CERTIFICATE` block (no headers) parses; otherwise the
+/// error names the first failure.
+fn root_cert_pool(ca_data: &[u8]) -> Result<(), String> {
+    if ca_data.is_empty() {
+        return Ok(());
+    }
+    let blocks = pem::parse_many(ca_data).unwrap_or_default();
+    let is_cert = |b: &pem::Pem| b.tag() == "CERTIFICATE" && b.headers().iter().next().is_none();
+    if blocks
+        .iter()
+        .filter(|b| is_cert(b))
+        .any(|b| x509_parser::parse_x509_certificate(b.contents()).is_ok())
+    {
+        return Ok(());
+    }
+    if blocks.is_empty() {
+        return Err("unable to parse bytes as PEM block".to_string());
+    }
+    for b in blocks.iter().filter(|b| is_cert(b)) {
+        if let Err(e) = x509_parser::parse_x509_certificate(b.contents()) {
+            return Err(format!("failed to parse certificate: {e}"));
+        }
+    }
+    Err("no valid certificate authority data seen".to_string())
 }
 
 /// `validateConversionReviewVersions` (`validation.go:527-555`).
@@ -1007,8 +1115,10 @@ pub fn validate_custom_resource_definition_update(
         &Path::new("metadata"),
     );
     let spec_path = Path::new("spec");
-    errs.extend(validate_custom_resource_definition_spec(
-        &crd.spec, &spec_path,
+    errs.extend(validate_custom_resource_definition_spec_opts(
+        &crd.spec,
+        allow_invalid_ca_bundle(old),
+        &spec_path,
     ));
     errs.extend(validate_custom_resource_definition_spec_update(
         &crd.spec,
@@ -1153,5 +1263,131 @@ mod whole_object_tests {
         assert!(required_name_errors(&c).is_empty());
         c.metadata.name = "other.example.com".into();
         assert_eq!(required_name_errors(&c).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod ca_bundle_tests {
+    use super::*;
+    use base64::Engine;
+
+    const CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBbzCCARWgAwIBAgIUNlw6NuSK77Vukti6ud7ET7GhqoEwCgYIKoZIzj0EAwIw
+DDEKMAgGA1UEAwwBdDAgFw0yNjEwMDYxMDAwMjZaGA8yMTI2MDkxMjEwMDAyNlow
+DDEKMAgGA1UEAwwBdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABAyxwlFXhKv2
+VrRugTxQF05QRdxMCwi9imsVkTzmSbFhY08oQcY7rE0p32un+8/2/RlclBghXdsk
+JoOVsn1LB16jUzBRMB0GA1UdDgQWBBT0iCEcLVCXeTKArrq89VZNNHkTqjAfBgNV
+HSMEGDAWgBT0iCEcLVCXeTKArrq89VZNNHkTqjAPBgNVHRMBAf8EBTADAQH/MAoG
+CCqGSM49BAMCA0gAMEUCIGaiWFbeacTzpGuCBN2CeZq9GsKKNp4ii/lsWwWDxF7s
+AiEAhWF2/JiVNXisqXic1Dfy761y8wW/Io2IJoBMvcYxo4E=
+-----END CERTIFICATE-----"#;
+
+    fn b64(b: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(b)
+    }
+
+    fn crd_with_bundle(bundle: Option<String>, established: bool) -> CustomResourceDefinition {
+        let mut c = CustomResourceDefinition::new("widget", "example.com", "Widget", "widgets");
+        c.spec.versions = vec![serde_json::from_value(serde_json::json!({
+            "name": "v1", "served": true, "storage": true
+        }))
+        .unwrap()];
+        c.spec.conversion = Some(crate::resources::CustomResourceConversion {
+            strategy: Some(ConversionStrategyType::Webhook),
+            webhook: Some(crate::resources::WebhookConversion {
+                client_config: crate::resources::WebhookClientConfig {
+                    url: Some("https://example.com/convert".into()),
+                    service: None,
+                    ca_bundle: bundle,
+                },
+                conversion_review_versions: vec!["v1".into()],
+            }),
+        });
+        set_defaults_custom_resource_definition(&mut c);
+        c.metadata.resource_version = Some("42".into());
+        if established {
+            let status = c.status.get_or_insert_with(Default::default);
+            status.conditions = Some(vec![serde_json::from_value(serde_json::json!({
+                "type": "Established", "status": "True"
+            }))
+            .unwrap()]);
+        }
+        c
+    }
+
+    /// `TestValidateCABundle` (apiserver/pkg/util/webhook/validation_test.go).
+    #[test]
+    fn validate_ca_bundle_cases() {
+        let p = Path::new("caBundle");
+        assert!(validate_ca_bundle(&p, b"").is_empty());
+        assert!(validate_ca_bundle(&p, CERT.as_bytes()).is_empty());
+        let errs = validate_ca_bundle(&p, b"bogus");
+        assert_eq!(errs.len(), 1);
+        assert!(
+            errs[0]
+                .error_body()
+                .contains("unable to load root certificates: unable to parse bytes as PEM block"),
+            "{errs:?}"
+        );
+        assert_eq!(validate_ca_bundle(&p, b"Cg==").len(), 1);
+    }
+
+    /// "invalid CABundle should be allowed on Create" (validation_test.go:260).
+    #[test]
+    fn invalid_ca_bundle_allowed_on_create() {
+        let c = crd_with_bundle(Some(b64(b"Cg==")), false);
+        assert!(validate_custom_resource_definition(&c).is_empty());
+    }
+
+    /// "update to invalid CABundle should fail if existing is valid"
+    /// (validation_test.go:5958) -- error at
+    /// `spec.conversion.webhookClientConfig.caBundle`.
+    #[test]
+    fn update_to_invalid_ca_bundle_fails_if_existing_valid_and_established() {
+        let old = crd_with_bundle(Some(b64(CERT.as_bytes())), true);
+        let mut new = old.clone();
+        new.spec
+            .conversion
+            .as_mut()
+            .unwrap()
+            .webhook
+            .as_mut()
+            .unwrap()
+            .client_config
+            .ca_bundle = Some(b64(b"Cg=="));
+        let errs = validate_custom_resource_definition_update(&new, &old);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0]
+                .to_string()
+                .starts_with("spec.conversion.webhookClientConfig.caBundle: Invalid value"),
+            "{errs:?}"
+        );
+    }
+
+    /// "existing valid CABundle should be able to transition to invalid
+    /// pre-serving" (validation_test.go:5844): not Established.
+    #[test]
+    fn invalid_ca_bundle_allowed_before_established() {
+        let old = crd_with_bundle(Some(b64(CERT.as_bytes())), false);
+        let mut new = old.clone();
+        new.spec
+            .conversion
+            .as_mut()
+            .unwrap()
+            .webhook
+            .as_mut()
+            .unwrap()
+            .client_config
+            .ca_bundle = Some(b64(b"Cg=="));
+        assert!(validate_custom_resource_definition_update(&new, &old).is_empty());
+    }
+
+    /// "existing invalid CABundle update should pass" (validation_test.go:5724).
+    #[test]
+    fn existing_invalid_ca_bundle_update_passes() {
+        let old = crd_with_bundle(Some(b64(b"Cg==")), true);
+        let new = old.clone();
+        assert!(validate_custom_resource_definition_update(&new, &old).is_empty());
     }
 }
