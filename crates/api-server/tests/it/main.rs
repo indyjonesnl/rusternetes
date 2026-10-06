@@ -317,6 +317,7 @@ mod watch_event_proto_envelope_test;
 mod watch_handler_test;
 mod watch_labelselector_create_test;
 mod watch_namespaced_json_replay_test;
+mod watch_pod_name_selector_after_rvless_watch_test;
 mod watch_send_initial_events_test;
 mod watch_skips_undeserializable_test;
 mod watch_snapshot_cutoff_test;
