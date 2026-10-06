@@ -76,17 +76,15 @@ async fn delete_returns_the_deleted_object() {
     assert_eq!(body["metadata"]["name"], "s1", "{body}");
 }
 
-/// The created ServiceAccount gets its token Secret straight away (a
-/// Rusternetes shortcut kept across the migration).
+/// Creating a ServiceAccount writes no token Secret: upstream's registry
+/// (`pkg/registry/core/serviceaccount/storage/storage.go`, a plain
+/// `genericregistry.Store`) never mints one since 1.24
+/// (`LegacyServiceAccountTokenNoAutoGeneration`, GA). #2106.
 #[tokio::test]
-async fn create_makes_the_token_secret() {
+async fn create_does_not_make_a_token_secret() {
     let api = TestApiServer::new();
     let (s, created) = api.post(SAS, &sa("s1")).await;
     assert_eq!(s, StatusCode::CREATED, "{created}");
     let (s, body) = api.get("/api/v1/namespaces/default/secrets/s1-token").await;
-    assert_eq!(s, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["type"], "kubernetes.io/service-account-token",
-        "{body}"
-    );
+    assert_eq!(s, StatusCode::NOT_FOUND, "{body}");
 }

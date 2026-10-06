@@ -61,92 +61,6 @@ fn patch_content_type(headers: &HeaderMap) -> &str {
         .unwrap_or("")
 }
 
-/// Rusternetes-specific (upstream stopped auto-generating token Secrets in
-/// 1.24, `LegacyServiceAccountTokenNoAutoGeneration`): a created ServiceAccount
-/// gets a long-lived token Secret right away rather than at the next
-/// serviceaccount-controller pass. A failure here never fails the create.
-async fn create_token_secret(state: &ApiServerState, namespace: &str, created: &ServiceAccount) {
-    let namespace = namespace.to_string();
-    // Generate ServiceAccount token and store it in a Secret
-    let sa_uid = created.metadata.uid.clone();
-    let sa_name = created.metadata.name.clone();
-    info!("ServiceAccount UID: {}, Name: {}", sa_uid, sa_name);
-
-    // Generate JWT token (valid for 10 years - Kubernetes default for static tokens)
-    let claims = ServiceAccountClaims::new(
-        sa_name.clone(),
-        namespace.clone(),
-        sa_uid.clone(),
-        87600, // 10 years in hours
-    );
-
-    let token = match state.token_manager.generate_token(claims) {
-        Ok(token) => token,
-        Err(e) => {
-            info!("Warning: Failed to generate ServiceAccount token {sa_name}: {e}");
-            return;
-        }
-    };
-
-    // Create Secret to store the token
-    let secret_name = format!("{}-token", sa_name);
-    let mut string_data = HashMap::new();
-    string_data.insert("token".to_string(), token.clone());
-    string_data.insert("namespace".to_string(), namespace.clone());
-
-    // Add CA certificate if available
-    if let Some(ref ca_cert) = state.ca_cert_pem {
-        string_data.insert("ca.crt".to_string(), ca_cert.clone());
-    }
-
-    let mut secret =
-        Secret::new(&secret_name, &namespace).with_type("kubernetes.io/service-account-token");
-
-    // Add labels and annotations
-    secret.metadata.labels = Some({
-        let mut labels = HashMap::new();
-        labels.insert(
-            "kubernetes.io/service-account.name".to_string(),
-            sa_name.clone(),
-        );
-        labels
-    });
-    secret.metadata.annotations = Some({
-        let mut annotations = HashMap::new();
-        annotations.insert(
-            "kubernetes.io/service-account.uid".to_string(),
-            sa_uid.clone(),
-        );
-        annotations
-    });
-    secret.string_data = Some(string_data);
-
-    // Normalize: convert stringData to base64-encoded data before storing
-    secret.normalize();
-
-    // Store the secret
-    let secret_key = build_key("secrets", Some(&namespace), &secret_name);
-    info!(
-        "Attempting to create ServiceAccount token secret: {}",
-        secret_name
-    );
-    match state.storage.create(&secret_key, &secret).await {
-        Ok(_) => {
-            info!(
-                "Successfully created ServiceAccount token secret: {}",
-                secret_name
-            );
-        }
-        Err(e) => {
-            info!(
-                "Warning: Failed to create ServiceAccount token secret {}: {}",
-                secret_name, e
-            );
-            // Don't fail the ServiceAccount creation if secret creation fails
-        }
-    }
-}
-
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -154,7 +68,11 @@ pub async fn create(
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Response> {
-    let response = endpoints::create_resource(
+    // No token Secret is minted here: upstream's registry is a plain
+    // `genericregistry.Store` (pkg/registry/core/serviceaccount/storage/
+    // storage.go) and has not auto-generated one since 1.24
+    // (`LegacyServiceAccountTokenNoAutoGeneration`). #2106.
+    endpoints::create_resource(
         &state,
         &scope(&state),
         &auth_ctx.user,
@@ -162,18 +80,7 @@ pub async fn create(
         &params,
         &body,
     )
-    .await?;
-    if response.status() != StatusCode::CREATED || crate::handlers::dryrun::is_dry_run(&params) {
-        return Ok(response);
-    }
-    let (parts, resp_body) = response.into_parts();
-    let bytes = axum::body::to_bytes(resp_body, usize::MAX)
-        .await
-        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
-    if let Ok(created) = serde_json::from_slice::<ServiceAccount>(&bytes) {
-        create_token_secret(&state, &namespace, &created).await;
-    }
-    Ok(Response::from_parts(parts, axum::body::Body::from(bytes)))
+    .await
 }
 
 pub async fn get(
