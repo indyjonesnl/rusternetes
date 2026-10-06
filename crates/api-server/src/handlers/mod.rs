@@ -21,7 +21,6 @@ pub mod external_metrics;
 pub use rusternetes_discovery as discovery;
 pub mod aggregator;
 pub mod apiservice;
-pub mod dryrun;
 pub mod endpoints;
 pub mod endpointslice;
 pub mod event;
