@@ -24,7 +24,9 @@ jobs:
     # (best-effort; never fails the run).
     permissions:
       contents: write
-    timeout-minutes: 45
+    # The image build alone has taken 27 min on a cold runner (run 37300860462
+    # reached the old 45 min cap during step 7 and was reported "cancelled").
+    timeout-minutes: 75
     steps:
       - name: Checkout repository
         # rhino is an in-tree submodule (./rhino) that the storage crate's
