@@ -82,6 +82,14 @@ macro_rules! contract_suite {
             }
 
             #[tokio::test]
+            async fn watch_replays_from_revision() {
+                let Some(fixture) = $setup.await else {
+                    return;
+                };
+                watcher::run_test_watch_replays_from_revision(&fixture.storage).await;
+            }
+
+            #[tokio::test]
             async fn list_paging() {
                 let Some(fixture) = $setup.await else {
                     return;
