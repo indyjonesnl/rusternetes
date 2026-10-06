@@ -1,8 +1,10 @@
+use crate::atomic_writer::FileProjection;
 use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::{Pod, Secret, SecretVolumeSource};
+use rusternetes_common::resources::{KeyToPath, Pod, Secret, SecretVolumeSource};
 use rusternetes_storage::{build_key, Storage, StorageBackend};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -84,6 +86,54 @@ impl VolumePlugin for SecretPlugin {
             token_manager: self.host.get_service_account_token_func().clone(),
         }))
     }
+}
+
+/// `MakePayload` (`pkg/volume/secret/secret.go:210-247`).
+///
+/// With no `items`, every Secret key becomes a file at `defaultMode`. With
+/// `items`, only the listed keys are projected, at `items[].path`, with
+/// `items[].mode` or else `defaultMode`. A listed key the Secret lacks is
+/// an error unless the volume is optional (secret.go:228-233).
+pub(crate) fn make_payload(
+    mappings: Option<&[KeyToPath]>,
+    secret: &Secret,
+    default_mode: u32,
+    optional: bool,
+) -> Result<BTreeMap<String, FileProjection>> {
+    let empty = Default::default();
+    let data = secret.data.as_ref().unwrap_or(&empty);
+    let mut payload = BTreeMap::new();
+    match mappings {
+        None | Some([]) => {
+            for (name, bytes) in data {
+                payload.insert(
+                    name.clone(),
+                    FileProjection {
+                        data: bytes.clone(),
+                        mode: default_mode,
+                    },
+                );
+            }
+        }
+        Some(items) => {
+            for ktp in items {
+                let Some(content) = data.get(&ktp.key) else {
+                    if optional {
+                        continue;
+                    }
+                    return Err(anyhow!("references non-existent secret key: {}", ktp.key));
+                };
+                payload.insert(
+                    ktp.path.clone(),
+                    FileProjection {
+                        data: content.clone(),
+                        mode: ktp.mode.map(|m| m as u32).unwrap_or(default_mode),
+                    },
+                );
+            }
+        }
+    }
+    Ok(payload)
 }
 
 struct SecretMounter {
@@ -200,10 +250,6 @@ impl Mounter for SecretMounter {
         let volume_dir = &self.path;
         std::fs::create_dir_all(volume_dir).context("Failed to create Secret volume directory")?;
 
-        // Compute final directory permissions (will be applied after files are written)
-        #[cfg(unix)]
-        let secret_dir_mode = secret_source.default_mode.unwrap_or(0o644) as u32 | 0o111;
-
         let secret = match secret_result {
             Ok(s) => Some(s),
             Err(e) => {
@@ -228,124 +274,78 @@ impl Mounter for SecretMounter {
             }
         };
 
-        // Determine the default file mode: spec defaultMode, or 0644 (Kubernetes default)
+        // Upstream's API defaulting always fills `defaultMode` (0644); a
+        // volume that reaches us without it takes the same default.
         let secret_default_mode = secret_source.default_mode.unwrap_or(0o644);
 
-        // Write secret data as files
-        if let Some(data) = secret.as_ref().and_then(|s| s.data.as_ref()) {
-            if let Some(ref items) = secret_source.items {
-                // Only mount the specified keys
-                for item in items {
-                    if let Some(value) = data.get(&item.key) {
-                        let file_path = format!("{}/{}", volume_dir, item.path);
-                        // Create parent directories if needed
-                        if let Some(parent) = std::path::Path::new(&file_path).parent() {
-                            std::fs::create_dir_all(parent).with_context(|| {
-                                format!("Failed to create directory for Secret item {}", item.path)
-                            })?;
-                        }
-                        // For SA token volumes, substitute the bound token
-                        let write_value: &[u8] = if item.key == "token" {
-                            if let Some(ref bt) = bound_token {
-                                bt.as_bytes()
-                            } else {
-                                value
-                            }
-                        } else {
-                            value
-                        };
-                        std::fs::write(&file_path, write_value).with_context(|| {
-                            format!("Failed to write Secret key {} to file", item.key)
-                        })?;
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            let mode = item.mode.unwrap_or(secret_default_mode) as u32;
-                            std::fs::set_permissions(
-                                &file_path,
-                                std::fs::Permissions::from_mode(mode),
-                            )?;
-                        }
-                        if bound_token.is_some() && item.key == "token" {
-                            info!(
-                                "Wrote bound SA token for pod {} to {}",
-                                self.pod_name, file_path
-                            );
-                        } else {
-                            info!("Wrote Secret key {} to {}", item.key, file_path);
-                        }
+        // `SetUpAt` (secret.go:167-172): an optional Secret that is not found
+        // is replaced by an empty one, so the volume is still projected.
+        let empty = Secret::new(secret_name.clone(), self.namespace.clone());
+        let secret_ref = secret.as_ref().unwrap_or(&empty);
+
+        // `MakePayload` (secret.go:210-247).
+        let mut payload = make_payload(
+            secret_source.items.as_deref(),
+            secret_ref,
+            secret_default_mode as u32,
+            is_optional,
+        )?;
+
+        // Rusternetes-specific (no upstream equivalent in this plugin): the
+        // SA-token Secret volume substitutes a freshly minted bound token.
+        if let Some(bt) = &bound_token {
+            for (path, projection) in payload.iter_mut() {
+                let key_is_token = match secret_source.items.as_deref() {
+                    Some(items) if !items.is_empty() => {
+                        items.iter().any(|i| i.key == "token" && &i.path == path)
                     }
-                }
-            } else {
-                // Mount all keys
-                for (key, value) in data {
-                    let file_path = format!("{}/{}", volume_dir, key);
-                    // For SA token volumes, substitute the bound token
-                    let write_value: &[u8] = if key == "token" {
-                        if let Some(ref bt) = bound_token {
-                            bt.as_bytes()
-                        } else {
-                            value.as_slice()
-                        }
-                    } else {
-                        value.as_slice()
-                    };
-                    std::fs::write(&file_path, write_value)
-                        .with_context(|| format!("Failed to write Secret key {} to file", key))?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(
-                            &file_path,
-                            std::fs::Permissions::from_mode(secret_default_mode as u32),
-                        )?;
-                    }
-                    info!("Wrote Secret key {} to {}", key, file_path);
+                    _ => path == "token",
+                };
+                if key_is_token {
+                    projection.data = bt.as_bytes().to_vec();
                 }
             }
         }
 
-        // Special handling for service account token secrets - add ca.crt
-        // Service account secrets are identified by having a "token" key or by name pattern
-        let is_service_account_secret = secret
+        // Rusternetes-specific: service account token secrets also get the
+        // cluster CA injected as ca.crt.
+        let is_service_account_secret = secret_ref
+            .data
             .as_ref()
-            .and_then(|s| s.data.as_ref())
             .map(|data| data.contains_key("token"))
             .unwrap_or(false)
             || secret_name.ends_with("-token");
 
         if is_service_account_secret {
-            // Check if ca.crt already exists in the secret data
-            let has_ca_cert = secret
+            let has_ca_cert = secret_ref
+                .data
                 .as_ref()
-                .and_then(|s| s.data.as_ref())
                 .map(|data| data.contains_key("ca.crt"))
                 .unwrap_or(false);
-
-            if !has_ca_cert {
-                // Inject ca.crt from the cluster CA certificate
+            if !has_ca_cert && !payload.contains_key("ca.crt") {
                 // Try multiple locations: environment variable, volumes/_certs, then fallback to .rusternetes/certs
                 let ca_cert_source = std::env::var("CA_CERT_PATH").unwrap_or_else(|_| {
-                    // First try volumes/_certs (accessible from kubelet container)
                     let volumes_cert_path = format!("{}/_certs/ca.crt", self.volumes_base_path);
                     if std::path::Path::new(&volumes_cert_path).exists() {
                         volumes_cert_path
                     } else {
-                        // Fallback to .rusternetes/certs (for host-based kubelet)
                         format!(
                             "{}/.rusternetes/certs/ca.crt",
                             std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
                         )
                     }
                 });
-
-                let ca_path = format!("{}/ca.crt", volume_dir);
                 if let Ok(ca_content) = std::fs::read(&ca_cert_source) {
-                    std::fs::write(&ca_path, ca_content)
-                        .context("Failed to write CA certificate")?;
+                    payload.insert(
+                        "ca.crt".to_string(),
+                        FileProjection {
+                            data: ca_content,
+                            mode: secret_default_mode as u32,
+                        },
+                    );
                     info!(
-                        "Injected CA certificate into service account secret volume at {} (from {})",
-                        ca_path, ca_cert_source
+                        "Injected CA certificate into service account secret volume (from {})",
+                        ca_cert_source
                     );
                 } else {
                     warn!(
@@ -356,13 +356,10 @@ impl Mounter for SecretMounter {
             }
         }
 
-        // Set directory permissions after files are written so that restrictive
-        // defaultMode values (e.g., 0o400) don't prevent file creation.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(volume_dir, std::fs::Permissions::from_mode(secret_dir_mode))?;
-        }
+        // `writer.Write(payload, setPerms)` (secret.go:196-204) via the
+        // upstream AtomicWriter port: unchanged content is a no-op.
+        crate::atomic_writer::write_projected_payload(std::path::Path::new(volume_dir), &payload)
+            .with_context(|| format!("failed to project Secret {secret_name}"))?;
 
         info!(
             "Created Secret volume {} at {}",
@@ -447,5 +444,116 @@ mod tests {
             m.get_path(),
             "/var/lib/rusternetes/pods/uid-1/volumes/kubernetes.io~secret/sec"
         );
+    }
+
+    // ---- set_up behaviour, ported from upstream secret_test.go ----
+
+    /// Build a plugin whose host serves `secret` from an in-memory store,
+    /// rooted at `base`.
+    async fn plugin_with_secret(base: &str, secret: Option<Secret>) -> SecretPlugin {
+        let storage = Arc::new(StorageBackend::new_memory());
+        if let Some(s) = secret {
+            let key = build_key("secrets", Some("default"), &s.metadata.name);
+            storage.create(&key, &s).await.unwrap();
+        }
+        SecretPlugin::new(Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
+            base.to_string(),
+            Some(storage),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            std::collections::HashMap::new(),
+        )))
+    }
+
+    fn opaque(name: &str, data: &[(&str, &[u8])]) -> Secret {
+        let mut s = Secret::new(name, "default");
+        s.data = Some(
+            data.iter()
+                .map(|(k, v)| (k.to_string(), v.to_vec()))
+                .collect(),
+        );
+        s
+    }
+
+    fn volume_with_items(items: serde_json::Value, optional: bool) -> Volume {
+        serde_json::from_value(json!({"name": "sec", "secret": {
+            "secretName": "s", "items": items, "optional": optional}}))
+        .unwrap()
+    }
+
+    /// `MakePayload` (secret.go:219-232): a key named in `items` that the
+    /// Secret lacks is an error unless the volume is optional.
+    /// `TestPluginOptionalKeys` / `TestMakePayload` "no defaultMode" family.
+    #[tokio::test]
+    async fn required_item_missing_from_secret_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let p = plugin_with_secret(base, Some(opaque("s", &[("a", b"1")]))).await;
+        let v = volume_with_items(json!([{"key": "nope", "path": "p"}]), false);
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+        };
+        let m = p.new_mounter(&spec, &test_pod()).await.unwrap();
+        let err = m.set_up().await.unwrap_err().to_string();
+        assert!(
+            err.contains("references non-existent secret key: nope"),
+            "{err}"
+        );
+    }
+
+    /// Same, but optional: the missing key is skipped, setup succeeds
+    /// (`TestPluginOptionalKeys`).
+    #[tokio::test]
+    async fn optional_item_missing_from_secret_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let p = plugin_with_secret(base, Some(opaque("s", &[("a", b"1")]))).await;
+        let v = volume_with_items(
+            json!([{"key": "nope", "path": "p"}, {"key": "a", "path": "a"}]),
+            true,
+        );
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+        };
+        let m = p.new_mounter(&spec, &test_pod()).await.unwrap();
+        m.set_up().await.unwrap();
+        let dir = std::path::PathBuf::from(m.get_path());
+        assert_eq!(std::fs::read(dir.join("a")).unwrap(), b"1");
+        assert!(!dir.join("p").exists());
+    }
+
+    /// `AtomicWriter` layout (atomic_writer.go): user-visible files are
+    /// symlinks through `..data`, and re-running SetUp on unchanged content
+    /// is a no-op, so the `..data` target must not change.
+    #[tokio::test]
+    async fn set_up_projects_through_atomic_writer_and_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let p = plugin_with_secret(base, Some(opaque("s", &[("a", b"1")]))).await;
+        let v = volume_with_items(json!([{"key": "a", "path": "a", "mode": 256}]), false);
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+        };
+        let m = p.new_mounter(&spec, &test_pod()).await.unwrap();
+        m.set_up().await.unwrap();
+        let dir = std::path::PathBuf::from(m.get_path());
+        let first = std::fs::read_link(dir.join("..data")).expect("..data symlink");
+        assert!(std::fs::symlink_metadata(dir.join("a"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::metadata(dir.join("a"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
+        );
+        m.set_up().await.unwrap();
+        assert_eq!(std::fs::read_link(dir.join("..data")).unwrap(), first);
     }
 }
