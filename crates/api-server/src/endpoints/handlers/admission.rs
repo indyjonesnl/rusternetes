@@ -94,6 +94,15 @@ impl Admission<'_> {
             && self.subresource == Some("resize")
     }
 
+    /// PodSecurity evaluates every pod subresource not in
+    /// `ignoredPodSubresources` (admission.go:316), `ephemeralcontainers`
+    /// being the one that adds containers.
+    fn is_pod_ephemeralcontainers(&self) -> bool {
+        self.resource.group.is_empty()
+            && self.resource.resource == "pods"
+            && self.subresource == Some("ephemeralcontainers")
+    }
+
     /// Whether the request is for the core-group `resource` itself, not a
     /// subresource of it.
     fn is_core(&self, resource: &str) -> bool {
@@ -145,7 +154,7 @@ impl Admission<'_> {
         if let (Operation::Update, Some(obj), Some(old)) = (op, obj, old) {
             self.validate_csr_signer(obj, old).await?;
         }
-        if self.is_core("pods") || self.is_pod_resize() {
+        if self.is_core("pods") || self.is_pod_resize() || self.is_pod_ephemeralcontainers() {
             let obj: Option<Pod> = obj.map(recast).transpose()?;
             let old: Option<Pod> = old.map(recast).transpose()?;
             return self.validate_pod(ctx, op, obj.as_ref(), old.as_ref()).await;
@@ -417,22 +426,41 @@ impl Admission<'_> {
             }
             Operation::Create => {
                 if let (Some(pod), Some(namespace)) = (obj, self.namespace) {
-                    crate::admission::PodSecurityAdmission::new()
-                        .admit(storage, namespace, pod)
-                        .await?;
+                    if crate::admission::PodSecurityAdmission::should_evaluate(
+                        self.subresource,
+                        None,
+                        pod,
+                    ) {
+                        crate::admission::PodSecurityAdmission::new()
+                            .admit(storage, namespace, pod)
+                            .await?;
+                    }
                 }
             }
             // KEP-5328 + KEP-1287: a Guaranteed-QoS CPU resize against a node
             // that has not declared `GuaranteedQoSPodCPUResize` is refused
             // (the NodeDeclaredFeatureValidator plugin, off with its gate).
-            Operation::Update if self.subresource == Some("resize") => {
-                if let (Some(pod), Some(old)) = (obj, old) {
-                    crate::handlers::pod_subresources::check_node_declared_features_for_resize(
-                        storage.as_ref(),
-                        old,
+            Operation::Update => {
+                // PodSecurity `ValidatePod` on UPDATE
+                // (pod-security-admission/admission/admission.go:370-388).
+                if let (Some(pod), Some(old), Some(namespace)) = (obj, old, self.namespace) {
+                    if crate::admission::PodSecurityAdmission::should_evaluate(
+                        self.subresource,
+                        Some(old),
                         pod,
-                    )
-                    .await?;
+                    ) {
+                        crate::admission::PodSecurityAdmission::new()
+                            .admit(storage, namespace, pod)
+                            .await?;
+                    }
+                    if self.subresource == Some("resize") {
+                        crate::handlers::pod_subresources::check_node_declared_features_for_resize(
+                            storage.as_ref(),
+                            old,
+                            pod,
+                        )
+                        .await?;
+                    }
                 }
             }
             _ => {}

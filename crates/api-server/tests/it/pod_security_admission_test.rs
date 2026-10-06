@@ -348,3 +348,120 @@ async fn psp_restricted_forbids_privilege_escalation() {
     )
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// UPDATE evaluation: `ValidatePod` (admission.go:329-389) evaluates an update
+// only when `isSignificantPodUpdate` (admission.go:632-666) says an image
+// changed or a container was added; otherwise "nothing we care about
+// changed, so always allow the update".
+// ---------------------------------------------------------------------------
+
+/// A pod admitted into a privileged namespace, which is then labelled
+/// `restricted` — the pod now violates the enforced level.
+async fn pod_violating_restricted_namespace(router: TestApiServer, ns: &str) -> Value {
+    let (s, b) = send(
+        router.clone(),
+        Method::POST,
+        "/api/v1/namespaces",
+        Some(&json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b:?}");
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "p", "namespace": ns },
+        "spec": { "containers": [{ "name": "main", "image": "registry.k8s.io/pause:3.10" }] },
+    });
+    let (s, b) = send(
+        router.clone(),
+        Method::POST,
+        &format!("/api/v1/namespaces/{ns}/pods"),
+        Some(&pod),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b:?}");
+    let (s, b) = send(
+        router.clone(),
+        Method::PUT,
+        &format!("/api/v1/namespaces/{ns}"),
+        Some(&json!({
+            "apiVersion": "v1", "kind": "Namespace",
+            "metadata": {"name": ns, "labels": {
+                "pod-security.kubernetes.io/enforce": "restricted",
+                "pod-security.kubernetes.io/enforce-version": "latest"}},
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b:?}");
+    let (s, pod) = send(
+        router,
+        Method::GET,
+        &format!("/api/v1/namespaces/{ns}/pods/p"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{pod:?}");
+    pod
+}
+
+#[tokio::test]
+async fn psa_update_without_significant_change_is_allowed() {
+    let (router, _mem) = spawn_router();
+    let ns = "psa-upd-insignificant";
+    let mut pod = pod_violating_restricted_namespace(router.clone(), ns).await;
+    pod["metadata"]["labels"] = json!({"touched": "yes"});
+    let (s, b) = send(
+        router,
+        Method::PUT,
+        &format!("/api/v1/namespaces/{ns}/pods/p"),
+        Some(&pod),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "label-only update must be allowed: {b:?}"
+    );
+}
+
+#[tokio::test]
+async fn psa_update_changing_image_is_evaluated() {
+    let (router, _mem) = spawn_router();
+    let ns = "psa-upd-image";
+    let mut pod = pod_violating_restricted_namespace(router.clone(), ns).await;
+    pod["spec"]["containers"][0]["image"] = json!("registry.k8s.io/pause:3.9");
+    let (s, b) = send(
+        router,
+        Method::PUT,
+        &format!("/api/v1/namespaces/{ns}/pods/p"),
+        Some(&pod),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "image change must be evaluated: {b:?}"
+    );
+}
+
+#[tokio::test]
+async fn psa_ephemeralcontainers_update_is_evaluated() {
+    let (router, _mem) = spawn_router();
+    let ns = "psa-upd-ephemeral";
+    let mut pod = pod_violating_restricted_namespace(router.clone(), ns).await;
+    pod["spec"]["ephemeralContainers"] =
+        json!([{ "name": "dbg", "image": "busybox", "terminationMessagePolicy": "File" }]);
+    let (s, b) = send(
+        router,
+        Method::PUT,
+        &format!("/api/v1/namespaces/{ns}/pods/p/ephemeralcontainers"),
+        Some(&pod),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "an added ephemeral container must be evaluated: {b:?}"
+    );
+}
