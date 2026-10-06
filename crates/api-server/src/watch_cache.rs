@@ -602,12 +602,115 @@ impl WatchCache {
         let rx = self
             .subscribe_with_floor(prefix, Some(since_revision))
             .await;
-        let floor = self.floors.read().await.get(prefix).copied().unwrap_or(0);
+        let mut floor = self.floors.read().await.get(prefix).copied().unwrap_or(0);
         if since_revision < floor {
-            return Err(floor);
+            // Upstream's cache is per RESOURCE and lives from apiserver start,
+            // so every RV >= its list RV is served
+            // (`watch_cache.go:getAllEventsSinceLocked`, "too old" only when
+            // `resourceVersion < oldest-1`). Ours is per on-demand PREFIX, so
+            // a ring that started later than the client's RV is a gap the
+            // backend can still fill: extend the ring downward from the
+            // backend's retained history instead of 410ing (#2383).
+            floor = self.backfill_ring(prefix, since_revision, floor).await;
+            if since_revision < floor {
+                return Err(floor);
+            }
         }
         let history = self.get_events_since(prefix, since_revision).await;
         Ok((history, rx))
+    }
+
+    /// Extend the prefix's ring downward so it is complete for revisions >
+    /// `since`, by replaying the backend's retained history `(since, floor]`.
+    /// Returns the (possibly lowered) floor; unchanged when the backend cannot
+    /// serve `since` (compacted, replay failed, or the gap would not fit the
+    /// ring).
+    async fn backfill_ring(&self, prefix: &str, since: i64, floor: i64) -> i64 {
+        use futures::StreamExt;
+        if self.storage.is_revision_compacted(since + 1).await {
+            return floor;
+        }
+        let Ok(mut stream) = self.storage.watch_since(prefix, since + 1).await else {
+            return floor;
+        };
+        let mut gap: Vec<CachedWatchEvent> = Vec::new();
+        // The replay is delivered ahead of live events; there is no
+        // "caught up" marker on the stream, so stop at the first event past
+        // the floor, or when the replay goes quiet.
+        let deadline = tokio::time::Instant::now() + BACKFILL_MAX;
+        loop {
+            let next = tokio::time::timeout_at(
+                deadline.min(tokio::time::Instant::now() + BACKFILL_IDLE),
+                stream.next(),
+            )
+            .await;
+            let Ok(Some(Ok(ev))) = next else { break };
+            let cached = cache_event(ev);
+            if cached.revision > floor {
+                break;
+            }
+            if cached.revision > since {
+                gap.push(cached);
+            }
+            if gap.len() > HISTORY_CAPACITY {
+                return floor;
+            }
+        }
+        gap.sort_by_key(|e| e.revision);
+        let mut hist = self.history.write().await;
+        let mut floors = self.floors.write().await;
+        let current = floors.get(prefix).copied().unwrap_or(0);
+        if current <= since {
+            return current; // someone else already extended it
+        }
+        let buf = hist.entry(prefix.to_string()).or_default();
+        if buf.len() + gap.len() > HISTORY_CAPACITY {
+            return current;
+        }
+        for ev in gap.into_iter().rev() {
+            if ev.revision <= current {
+                buf.push_front(ev);
+            }
+        }
+        floors.insert(prefix.to_string(), since);
+        since
+    }
+}
+
+/// How long a ring backfill waits for the backend's replay to produce the next
+/// event before concluding the replay is complete.
+const BACKFILL_IDLE: std::time::Duration = std::time::Duration::from_millis(150);
+/// Upper bound on one ring backfill.
+const BACKFILL_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Revision of a stored object's JSON, from `"resourceVersion":"<digits>"`.
+fn extract_rv(value: &str) -> i64 {
+    const NEEDLE: &str = "\"resourceVersion\":\"";
+    if let Some(start) = value.find(NEEDLE) {
+        let num_start = start + NEEDLE.len();
+        if let Some(end) = value[num_start..].find('"') {
+            return value[num_start..num_start + end]
+                .parse::<i64>()
+                .unwrap_or(0);
+        }
+    }
+    0
+}
+
+fn cache_event(ev: WatchEvent) -> CachedWatchEvent {
+    match ev {
+        WatchEvent::Added(key, value) => CachedWatchEvent {
+            revision: extract_rv(&value),
+            event: WatchEventData::Added(key, Arc::new(value)),
+        },
+        WatchEvent::Modified(key, value) => CachedWatchEvent {
+            revision: extract_rv(&value),
+            event: WatchEventData::Modified(key, Arc::new(value)),
+        },
+        WatchEvent::Deleted(key, prev) => CachedWatchEvent {
+            revision: extract_rv(&prev),
+            event: WatchEventData::Deleted(key, Arc::new(prev)),
+        },
     }
 }
 
@@ -751,6 +854,9 @@ mod tests {
         since_revs: std::sync::Mutex<Vec<i64>>,
     }
 
+    // Backend history is compacted up to and including this revision.
+    const COMPACTED_THROUGH: i64 = 30;
+
     #[async_trait]
     impl WatchSource for FloorSource {
         async fn watch_from_now(&self, _prefix: &str) -> rusternetes_common::Result<WatchStream> {
@@ -772,13 +878,19 @@ mod tests {
         async fn head_revision(&self) -> i64 {
             100
         }
+
+        async fn is_revision_compacted(&self, revision: i64) -> bool {
+            revision <= COMPACTED_THROUGH
+        }
     }
 
     // The FIRST checked subscriber of a prefix defines the ring floor (its
     // list RV) and the backend replay starts from rv+1 — an on-demand prefix
     // (fresh namespace) must serve its very first watch instead of 410ing it
     // just because the GLOBAL head is newer. Later subscribers below the floor
-    // get Err(floor) → 410 → relist.
+    // are served by backfilling the ring from the backend when it still holds
+    // that history (#2383), and get Err(floor) → 410 → relist only when it
+    // does not.
     #[tokio::test]
     async fn subscribe_from_checked_gates_on_ring_floor() {
         let source = Arc::new(FloorSource {
@@ -809,12 +921,25 @@ mod tests {
         .await
         .expect("shared loop must start from watch_since(first_rv+1)");
 
-        // A LATER subscriber below the established floor must 410-relist.
+        // A LATER subscriber below the floor whose history the backend has
+        // compacted must 410-relist.
         let err = cache
-            .subscribe_from_checked("/registry/pods/", 30)
+            .subscribe_from_checked("/registry/pods/", 20)
             .await
             .expect_err("RV below the ring floor must 410, not silently under-replay");
         assert_eq!(err, 50);
+
+        // A later subscriber below the floor whose history is still retained
+        // is served: the ring is backfilled and the floor lowered (#2383).
+        assert!(cache
+            .subscribe_from_checked("/registry/pods/", 40)
+            .await
+            .is_ok());
+        let err = cache
+            .subscribe_from_checked("/registry/pods/", 25)
+            .await
+            .expect_err("a compacted RV below the lowered floor must 410");
+        assert_eq!(err, 40);
 
         // At/above the floor → served.
         assert!(cache
