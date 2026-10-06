@@ -88,6 +88,7 @@ pub fn validate_pod_template_spec(
         &template.spec,
         &fld_path.child("spec"),
         allow_relaxed_dns_search,
+        crate::validation::pod::allow_taint_toleration_comparison_operators(None),
     ));
 
     errs

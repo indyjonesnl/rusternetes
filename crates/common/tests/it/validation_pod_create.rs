@@ -1256,3 +1256,118 @@ fn host_network_requires_hostport_matches_containerport() {
     // No hostNetwork -> the rule does not apply even with an unset hostPort.
     check(&make(None, None), true, "no hostNetwork, unset hostPort");
 }
+
+// ---------------------------------------------------------------------------
+// ValidateTolerations: `AllowTaintTolerationComparisonOperators`
+// (validation.go:4393-4408, PodValidationOptions at :4491; gate off by
+// default at 1.35, kube_features.go:1859).
+// ---------------------------------------------------------------------------
+
+fn pod_with_toleration(op: &str, value: &str) -> Pod {
+    pod_with_spec(PodSpec {
+        containers: vec![minimal_container("c", "nginx")],
+        tolerations: Some(vec![Toleration {
+            key: Some("foo".to_string()),
+            operator: Some(op.to_string()),
+            value: Some(value.to_string()),
+            effect: None,
+            toleration_seconds: None,
+        }]),
+        ..PodSpec::default()
+    })
+}
+
+#[test]
+#[serial_test::serial]
+fn comparison_operator_is_not_supported_while_the_gate_is_off() {
+    use rusternetes_common::feature_gates::{with_feature, Feature};
+    let _g = with_feature(Feature::TaintTolerationComparisonOperators, false);
+    let errs = validate_pod_create(&pod_with_toleration("Lt", "100"), true);
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert_eq!(errs[0].field, "spec.tolerations[0].operator");
+    // validValues lists all four operators (validation.go:4394).
+    assert_eq!(
+        errs[0].detail, "supported values: \"Equal\", \"Exists\", \"Lt\", \"Gt\"",
+        "{errs:?}"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn comparison_operator_is_valid_with_a_decimal_integer_when_the_gate_is_on() {
+    use rusternetes_common::feature_gates::{with_feature, Feature};
+    let _g = with_feature(Feature::TaintTolerationComparisonOperators, true);
+    for (op, v) in [
+        ("Lt", "100"),
+        ("Gt", "-5"),
+        ("Gt", "0"),
+        ("Lt", "9223372036854775807"),
+        ("Gt", "-9223372036854775808"),
+    ] {
+        let errs = validate_pod_create(&pod_with_toleration(op, v), true);
+        assert!(errs.is_empty(), "{op} {v}: {errs:?}");
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn comparison_operator_value_must_be_a_canonical_int64_when_the_gate_is_on() {
+    use rusternetes_common::feature_gates::{with_feature, Feature};
+    let _g = with_feature(Feature::TaintTolerationComparisonOperators, true);
+    for (v, detail) in [
+        ("", "must be non-empty"),
+        ("abc", "must be a valid decimal integer in canonical form"),
+        ("007", "must be a valid decimal integer in canonical form"),
+        ("-", "must be a valid decimal integer in canonical form"),
+        ("+1", "must be a valid decimal integer in canonical form"),
+        ("1.5", "must be a valid decimal integer in canonical form"),
+        (
+            "9223372036854775808",
+            "strconv.ParseInt: parsing \"9223372036854775808\": value out of range",
+        ),
+    ] {
+        let errs = validate_pod_create(&pod_with_toleration("Lt", v), true);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "spec.tolerations[0].value" && e.detail == detail),
+            "{v:?}: {errs:?}"
+        );
+    }
+}
+
+/// `validateOnlyAddedTolerations` (validation.go:4303-4324) validates the new
+/// tolerations with the options built from the OLD spec (util.go:444): an
+/// object already using `Lt`/`Gt` stays updatable with the gate off, and
+/// adding one to an object that does not is refused.
+#[test]
+#[serial_test::serial]
+fn update_with_comparison_operator_follows_the_old_spec_when_the_gate_is_off() {
+    use rusternetes_common::feature_gates::{with_feature, Feature};
+    use rusternetes_common::validation::pod::validate_pod_spec_update;
+    let _g = with_feature(Feature::TaintTolerationComparisonOperators, false);
+    let spec = |tols: Vec<Toleration>| PodSpec {
+        containers: vec![minimal_container("c", "nginx")],
+        tolerations: Some(tols),
+        ..PodSpec::default()
+    };
+    let tol = |op: &str, v: &str| Toleration {
+        key: Some("foo".to_string()),
+        operator: Some(op.to_string()),
+        value: Some(v.to_string()),
+        effect: None,
+        toleration_seconds: None,
+    };
+
+    // Old spec has none: adding `Lt` is not supported.
+    let errs = validate_pod_spec_update(&spec(vec![]), &spec(vec![tol("Lt", "5")]), false);
+    assert!(
+        errs.iter()
+            .any(|e| e.field == "spec.tolerations[0].operator"),
+        "{errs:?}"
+    );
+
+    // Old spec already uses it: the update is allowed.
+    let old = spec(vec![tol("Lt", "5")]);
+    let errs = validate_pod_spec_update(&old, &spec(vec![tol("Lt", "5"), tol("Gt", "7")]), false);
+    assert!(errs.is_empty(), "{errs:?}");
+}

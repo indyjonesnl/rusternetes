@@ -1365,3 +1365,98 @@ async fn test_pod_generation_increments_per_update_conformance() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// podtopologylabels `Plugin.admitPod`
+// (plugin/pkg/admission/podtopologylabels/admission.go:123-148): a pod
+// created with `spec.nodeName` gets the node's topology labels, overwriting
+// the pod's own.
+// ---------------------------------------------------------------------------
+
+async fn create_topology_node(router: &TestApiServer, name: &str) {
+    let node = json!({
+        "apiVersion": "v1",
+        "kind": "Node",
+        "metadata": {
+            "name": name,
+            "labels": {
+                "topology.kubernetes.io/zone":   "zone",
+                "topology.kubernetes.io/region": "region",
+                "topology.kubernetes.io/custom": "ignored",
+            },
+        },
+    });
+    let (st, body) = post_json(router, "/api/v1/nodes", &node).await;
+    assert!(st == 201 || st == 200, "node create: {st} {body}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn pod_created_with_node_name_gets_the_nodes_topology_labels() {
+    let (_, router) = spawn_router();
+    let ns = "pod-topology-create";
+    create_namespace(&router, ns).await;
+    create_topology_node(&router, "topo-create-node").await;
+
+    let mut pod = prototype_pod("with-node");
+    pod["spec"]["nodeName"] = json!("topo-create-node");
+    // admitPod overwrites existing labels on the pod (mergeLabels).
+    pod["metadata"]["labels"] = json!({
+        "topology.kubernetes.io/zone": "pod-zone",
+        "app": "x",
+    });
+    let (st, body) = post_json(&router, &format!("/api/v1/namespaces/{ns}/pods"), &pod).await;
+    assert!(st == 201 || st == 200, "pod create: {st} {body}");
+
+    let labels = &body["metadata"]["labels"];
+    assert_eq!(labels["topology.kubernetes.io/zone"], "zone", "{body}");
+    assert_eq!(labels["topology.kubernetes.io/region"], "region", "{body}");
+    assert_eq!(labels["app"], "x", "{body}");
+    assert!(
+        labels.get("topology.kubernetes.io/custom").is_none(),
+        "only the plugin's configured keys are copied: {body}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn pod_created_without_node_name_or_with_unknown_node_is_untouched() {
+    let (_, router) = spawn_router();
+    let ns = "pod-topology-create-skip";
+    create_namespace(&router, ns).await;
+    create_topology_node(&router, "topo-skip-node").await;
+
+    // Not scheduled yet: nothing to copy.
+    let (st, body) = post_json(
+        &router,
+        &format!("/api/v1/namespaces/{ns}/pods"),
+        &prototype_pod("no-node"),
+    )
+    .await;
+    assert!(st == 201 || st == 200, "{st} {body}");
+    assert!(body["metadata"].get("labels").is_none(), "{body}");
+
+    // A node that is not there is ignored (NotFound is swallowed).
+    let mut pod = prototype_pod("ghost-node");
+    pod["spec"]["nodeName"] = json!("no-such-node");
+    let (st, body) = post_json(&router, &format!("/api/v1/namespaces/{ns}/pods"), &pod).await;
+    assert!(st == 201 || st == 200, "{st} {body}");
+    assert!(body["metadata"].get("labels").is_none(), "{body}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn pod_created_with_node_name_gate_off_gets_no_topology_labels() {
+    use rusternetes_common::feature_gates::{with_feature, Feature};
+    let _guard = with_feature(Feature::PodTopologyLabelsAdmission, false);
+    let (_, router) = spawn_router();
+    let ns = "pod-topology-create-off";
+    create_namespace(&router, ns).await;
+    create_topology_node(&router, "topo-off-node").await;
+
+    let mut pod = prototype_pod("with-node");
+    pod["spec"]["nodeName"] = json!("topo-off-node");
+    let (st, body) = post_json(&router, &format!("/api/v1/namespaces/{ns}/pods"), &pod).await;
+    assert!(st == 201 || st == 200, "{st} {body}");
+    assert!(body["metadata"].get("labels").is_none(), "{body}");
+}
