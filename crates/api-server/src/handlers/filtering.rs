@@ -42,9 +42,8 @@ pub fn apply_label_selector<T: Serialize>(
     params: &HashMap<String, String>,
 ) -> Result<(), rusternetes_common::Error> {
     if let Some(label_selector_str) = params.get("labelSelector") {
-        let selector = LabelSelector::parse(label_selector_str).map_err(|e| {
-            rusternetes_common::Error::InvalidResource(format!("Invalid label selector: {}", e))
-        })?;
+        let selector = LabelSelector::parse(label_selector_str)
+            .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?;
 
         if !selector.is_empty() {
             resources.retain(|resource| {
@@ -66,9 +65,8 @@ pub fn apply_label_selector_direct(
     labels_list: &mut Vec<(usize, &Option<HashMap<String, String>>)>,
     label_selector_str: &str,
 ) -> Result<Vec<usize>, rusternetes_common::Error> {
-    let selector = LabelSelector::parse(label_selector_str).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("Invalid label selector: {}", e))
-    })?;
+    let selector = LabelSelector::parse(label_selector_str)
+        .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?;
 
     let mut keep = Vec::new();
     for (idx, labels) in labels_list {
@@ -115,9 +113,8 @@ pub fn apply_selectors<T: Serialize>(
 
     let label_selector = if has_label_selector {
         Some(
-            LabelSelector::parse(params.get("labelSelector").unwrap()).map_err(|e| {
-                rusternetes_common::Error::InvalidResource(format!("Invalid label selector: {}", e))
-            })?,
+            LabelSelector::parse(params.get("labelSelector").unwrap())
+                .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?,
         )
     } else {
         None
@@ -310,5 +307,26 @@ mod tests {
         assert_eq!(resources.len(), 1);
         assert_eq!(resources[0].metadata.name, "test1");
         assert_eq!(resources[0].status.phase, "Running");
+    }
+
+    /// #2181: a malformed labelSelector is a 400 BadRequest carrying
+    /// upstream's labels.Parse message (selector.go `parse`), not a 422.
+    #[test]
+    fn malformed_label_selector_is_bad_request() {
+        for bad in ["!!!", "app in ("] {
+            let mut params = HashMap::new();
+            params.insert("labelSelector".to_string(), bad.to_string());
+            let mut resources: Vec<serde_json::Value> = Vec::new();
+            let err = apply_label_selector(&mut resources, &params).unwrap_err();
+            assert!(
+                matches!(&err, rusternetes_common::Error::BadRequest(m) if m.starts_with("unable to parse requirement: ")),
+                "{bad:?}: {err:?}"
+            );
+            let err = apply_selectors(&mut resources, &params).unwrap_err();
+            assert!(
+                matches!(err, rusternetes_common::Error::BadRequest(_)),
+                "{bad:?}"
+            );
+        }
     }
 }
