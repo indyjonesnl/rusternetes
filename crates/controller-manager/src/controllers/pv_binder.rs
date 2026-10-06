@@ -15,6 +15,8 @@ use tokio::time;
 use tracing::{debug, error, info};
 
 pub const ANN_BOUND_BY_CONTROLLER: &str = "pv.kubernetes.io/bound-by-controller";
+/// `storagehelpers.AnnBindCompleted` (component-helpers pv_helpers.go:39).
+pub const ANN_BIND_COMPLETED: &str = "pv.kubernetes.io/bind-completed";
 pub const ANN_DYNAMICALLY_PROVISIONED: &str = "pv.kubernetes.io/provisioned-by";
 /// `storagehelpers.AnnMigratedTo` (component-helpers pv_helpers.go).
 const ANN_MIGRATED_TO: &str = "pv.kubernetes.io/migrated-to";
@@ -623,7 +625,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
         self.storage.update(&pv_key, &pv).await?;
         self.storage.update_status(&pv_key, &pv).await?;
 
-        pvc.spec.volume_name = Some(pv_name.clone());
+        bind_claim_to_volume(pvc, &pv_name);
         pvc.status = Some(PersistentVolumeClaimStatus {
             phase: PersistentVolumeClaimPhase::Bound,
             access_modes: Some(pv_access_modes),
@@ -744,6 +746,29 @@ impl<S: Storage + 'static> PVBinderController<S> {
 /// `storagehelpers.CheckVolumeModeMismatches`
 /// (`staging/src/k8s.io/component-helpers/storage/volume/pv_helpers.go:331-343`):
 /// a nil volumeMode defaults to Filesystem on both sides.
+/// Claim-side metadata of `bindClaimToVolume`
+/// (`pv_controller.go:1037-1092`): when the claim is not yet bound to this
+/// volume (`:1044-1047`) set `spec.volumeName` and, unless already present,
+/// `pv.kubernetes.io/bound-by-controller: "yes"` (`:1058-1066`); then set
+/// `pv.kubernetes.io/bind-completed: "yes"` unless already present
+/// (`:1064-1068`), which is what `syncClaim` (`:251`) and the scheduler's
+/// `isPVCBound` (`volumebinding/binder.go:776`) key on.
+fn bind_claim_to_volume(pvc: &mut PersistentVolumeClaim, volume_name: &str) {
+    if pvc.spec.volume_name.as_deref() != Some(volume_name) {
+        pvc.spec.volume_name = Some(volume_name.to_string());
+        pvc.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .entry(ANN_BOUND_BY_CONTROLLER.to_string())
+            .or_insert_with(|| "yes".to_string());
+    }
+    pvc.metadata
+        .annotations
+        .get_or_insert_with(Default::default)
+        .entry(ANN_BIND_COMPLETED.to_string())
+        .or_insert_with(|| "yes".to_string());
+}
+
 fn volume_mode_mismatches(claim: &PersistentVolumeClaimSpec, pv: &PersistentVolumeSpec) -> bool {
     let requested = claim
         .volume_mode
@@ -1416,5 +1441,40 @@ mod tests {
         c.bind_pvc(&mut pvc).await.unwrap();
         let got = get_pv(&storage, "pre").await.unwrap();
         assert!(got.metadata.annotations.is_none());
+    }
+
+    /// binder_test.go claim expectations (newClaimArray with
+    /// annBoundByController + annBindCompleted): a claim the controller binds
+    /// carries both annotations, persisted via the main resource.
+    #[tokio::test]
+    async fn binding_sets_claim_bound_by_controller_and_bind_completed() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let mut free = make_prebound_pv("free", "x", "x");
+        free.spec.claim_ref = None;
+        put_pv(&storage, &free).await;
+        let mut pvc = make_pvc("c", "u");
+        put_pvc(&storage, &pvc).await;
+        c.bind_pvc(&mut pvc).await.unwrap();
+        let key = build_key("persistentvolumeclaims", Some("sstest"), "c");
+        let got: PersistentVolumeClaim = storage.get(&key).await.unwrap();
+        let ann = got.metadata.annotations.unwrap();
+        assert_eq!(
+            ann.get(ANN_BOUND_BY_CONTROLLER).map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(ann.get(ANN_BIND_COMPLETED).map(String::as_str), Some("yes"));
+    }
+
+    /// bindClaimToVolume: a claim already pointing at the volume (user
+    /// pre-bound) is not marked bound-by-controller, only bind-completed.
+    #[test]
+    fn bind_claim_to_volume_skips_bound_by_controller_when_prebound() {
+        let mut pvc = make_pvc("c", "u");
+        pvc.spec.volume_name = Some("pv".into());
+        bind_claim_to_volume(&mut pvc, "pv");
+        let ann = pvc.metadata.annotations.unwrap();
+        assert!(!ann.contains_key(ANN_BOUND_BY_CONTROLLER));
+        assert_eq!(ann.get(ANN_BIND_COMPLETED).map(String::as_str), Some("yes"));
     }
 }
