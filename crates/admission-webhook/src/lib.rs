@@ -489,39 +489,48 @@ impl AdmissionWebhookClient {
         // bridge network from the api-server). Works for both ClusterIP and
         // headless services.
         let es_prefix = format!("/registry/endpointslices/{}/", svc_namespace);
-        if let Ok(slices) = storage
-            .list::<rusternetes_common::resources::EndpointSlice>(&es_prefix)
-            .await
-        {
-            for slice in &slices {
-                let matches = slice
-                    .metadata
-                    .labels
-                    .as_ref()
-                    .and_then(|l| l.get("kubernetes.io/service-name"))
-                    .map(|n| n == svc_name)
-                    .unwrap_or(false);
-                if !matches {
-                    continue;
-                }
-                // Prefer the EndpointSlice port (already resolved to the
-                // container port), then the service targetPort, then the
-                // requested service port.
-                let ep_port = slice
-                    .ports
-                    .first()
-                    .and_then(|p| p.port)
-                    .map(|p| p as u16)
-                    .or(target_port)
-                    .unwrap_or(want_port);
-                for ep in &slice.endpoints {
-                    if ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true) {
-                        if let Some(addr) = ep.addresses.first() {
-                            return format!("https://{}:{}{}", addr, ep_port, path);
-                        }
+        match storage.list::<serde_json::Value>(&es_prefix).await {
+            Ok(raw) => {
+                // Decode per item: one undecodable slice must not hide the good
+                // ones (a typed list fails as a whole) — #2374.
+                let mut slices = Vec::with_capacity(raw.len());
+                for v in raw {
+                    match serde_json::from_value::<rusternetes_common::resources::EndpointSlice>(
+                        v.clone(),
+                    ) {
+                        Ok(s) => slices.push(s),
+                        Err(e) => warn!(
+                            "Webhook service {}/{}: skipping undecodable EndpointSlice {}: {}",
+                            svc_namespace,
+                            svc_name,
+                            v.pointer("/metadata/name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("?"),
+                            e
+                        ),
                     }
                 }
+                match select_slice_endpoint(&slices, svc_name, target_port, want_port) {
+                    Ok((addr, ep_port)) => {
+                        return format!("https://{}:{}{}", addr, ep_port, path);
+                    }
+                    Err(reasons) => warn!(
+                        "Webhook service {}/{}: no usable EndpointSlice endpoint ({} slices listed): {}",
+                        svc_namespace,
+                        svc_name,
+                        slices.len(),
+                        if reasons.is_empty() {
+                            "no slices in namespace".to_string()
+                        } else {
+                            reasons.join("; ")
+                        }
+                    ),
+                }
             }
+            Err(e) => warn!(
+                "Webhook service {}/{}: listing EndpointSlices failed: {}",
+                svc_namespace, svc_name, e
+            ),
         }
 
         // Fallback: route through ClusterIP like the real apiserver. This only
@@ -552,6 +561,61 @@ impl AdmissionWebhookClient {
         );
         url.to_string()
     }
+}
+
+/// Pick a ready endpoint address and port for `svc_name` from `slices`.
+///
+/// `ready` follows discovery.k8s.io semantics: a nil value is ready
+/// (staging/src/k8s.io/api/discovery/v1/types.go, EndpointConditions.Ready).
+/// On failure returns one human-readable reason per rejected slice so the
+/// caller can log why the ClusterIP fallback was taken (#2374).
+fn select_slice_endpoint(
+    slices: &[rusternetes_common::resources::EndpointSlice],
+    svc_name: &str,
+    target_port: Option<u16>,
+    want_port: u16,
+) -> std::result::Result<(String, u16), Vec<String>> {
+    let mut reasons = Vec::new();
+    for slice in slices {
+        let sname = &slice.metadata.name;
+        let matches = slice
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("kubernetes.io/service-name"))
+            .map(|n| n == svc_name)
+            .unwrap_or(false);
+        if !matches {
+            reasons.push(format!("slice {sname} not labelled for service {svc_name}"));
+            continue;
+        }
+        // Prefer the EndpointSlice port (already resolved to the container
+        // port), then the service targetPort, then the requested service port.
+        let ep_port = slice
+            .ports
+            .first()
+            .and_then(|p| p.port)
+            .map(|p| p as u16)
+            .or(target_port)
+            .unwrap_or(want_port);
+        if slice.endpoints.is_empty() {
+            reasons.push(format!("slice {sname} has no endpoints"));
+        }
+        for ep in &slice.endpoints {
+            if !ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true) {
+                reasons.push(format!(
+                    "slice {sname} endpoint {:?} not ready",
+                    ep.addresses
+                ));
+                continue;
+            }
+            match ep.addresses.first() {
+                Some(addr) => return Ok((addr.clone(), ep_port)),
+                None => reasons.push(format!("slice {sname} ready endpoint has no addresses")),
+            }
+        }
+    }
+    Err(reasons)
 }
 
 impl Default for AdmissionWebhookClient {
@@ -3055,6 +3119,96 @@ mod tests {
         .await;
 
         assert_eq!(resolved, "https://10.96.1.5:443/mutating");
+    }
+
+    // #2374: one undecodable EndpointSlice in the namespace made the typed
+    // `list::<EndpointSlice>` fail as a whole, silently skipping every good slice
+    // and falling back to the unroutable ClusterIP.
+    #[tokio::test]
+    async fn test_resolve_service_url_survives_one_undecodable_slice() {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create(
+                "/registry/services/cert-manager/webhook",
+                &webhook_service("webhook", "cert-manager", "10.107.189.222"),
+            )
+            .await
+            .unwrap();
+        // Sorts first; endpoints is the wrong JSON type so it cannot decode.
+        storage
+            .create(
+                "/registry/endpointslices/cert-manager/aaa-bad",
+                &json!({
+                    "metadata": {"name": "aaa-bad", "namespace": "cert-manager"},
+                    "addressType": "IPv4",
+                    "endpoints": "garbage"
+                }),
+            )
+            .await
+            .unwrap();
+        storage
+            .create(
+                "/registry/endpointslices/cert-manager/webhook-abc",
+                &webhook_endpointslice("webhook", "cert-manager", "10.244.0.2", true),
+            )
+            .await
+            .unwrap();
+
+        let resolved = AdmissionWebhookClient::resolve_service_url(
+            "https://webhook.cert-manager.svc:443/validate",
+            &storage,
+        )
+        .await;
+        assert_eq!(resolved, "https://10.244.0.2:8443/validate");
+    }
+
+    // discovery.k8s.io EndpointConditions: "A nil value should be interpreted
+    // as true" for ready (staging/src/k8s.io/api/discovery/v1/types.go).
+    #[test]
+    fn test_select_slice_endpoint_nil_ready_is_ready() {
+        let mut slice = webhook_endpointslice("webhook", "ns", "10.244.0.2", true);
+        slice.endpoints[0].conditions = None;
+        let got = select_slice_endpoint(&[slice], "webhook", Some(8443), 443);
+        assert_eq!(got, Ok(("10.244.0.2".to_string(), 8443)));
+        let mut slice = webhook_endpointslice("webhook", "ns", "10.244.0.2", true);
+        slice.endpoints[0].conditions = Some(EndpointConditions {
+            ready: None,
+            serving: None,
+            terminating: None,
+        });
+        let got = select_slice_endpoint(&[slice], "webhook", Some(8443), 443);
+        assert_eq!(got, Ok(("10.244.0.2".to_string(), 8443)));
+    }
+
+    #[test]
+    fn test_select_slice_endpoint_reports_why_rejected() {
+        let other = webhook_endpointslice("other", "ns", "10.244.0.9", true);
+        let unready = webhook_endpointslice("webhook", "ns", "10.244.0.2", false);
+        let mut noaddr = webhook_endpointslice("webhook", "ns", "x", true);
+        noaddr.metadata.name = "noaddr".into();
+        noaddr.endpoints[0].addresses.clear();
+        let err =
+            select_slice_endpoint(&[other, unready, noaddr], "webhook", None, 443).unwrap_err();
+        assert!(
+            err.iter().any(|r| r.contains("not labelled for service")),
+            "{err:?}"
+        );
+        assert!(err.iter().any(|r| r.contains("not ready")), "{err:?}");
+        assert!(err.iter().any(|r| r.contains("no addresses")), "{err:?}");
+    }
+
+    #[test]
+    fn test_select_slice_endpoint_falls_back_to_service_port_when_slice_port_missing() {
+        let mut slice = webhook_endpointslice("webhook", "ns", "10.244.0.2", true);
+        slice.ports[0].port = None; // named port left unresolved
+        assert_eq!(
+            select_slice_endpoint(&[slice.clone()], "webhook", Some(8443), 443),
+            Ok(("10.244.0.2".to_string(), 8443))
+        );
+        assert_eq!(
+            select_slice_endpoint(&[slice], "webhook", None, 443),
+            Ok(("10.244.0.2".to_string(), 443))
+        );
     }
 
     #[tokio::test]
