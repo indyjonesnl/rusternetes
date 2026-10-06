@@ -786,6 +786,9 @@ impl CriContainerRuntime {
                     container_path,
                     host_path: term_host,
                     readonly: false,
+                    // `selinuxRelabel := selinux.GetEnabled()`
+                    // (kuberuntime_container.go:525-529).
+                    selinux_relabel: crate::go_selinux::get_enabled(),
                     ..Default::default()
                 });
             }
@@ -845,6 +848,12 @@ impl CriContainerRuntime {
                     container_path: "/etc/hosts".to_string(),
                     host_path: hosts_path,
                     readonly: false,
+                    // kubelet_pods.go:469 sets SELinuxRelabel: true; makeMounts
+                    // ANDs it with selinux.GetEnabled() (:484).
+                    selinux_relabel: crate::go_selinux::relabel_if_enabled(
+                        true,
+                        crate::go_selinux::get_enabled(),
+                    ),
                     ..Default::default()
                 }),
                 Err(e) => warn!(
