@@ -775,6 +775,7 @@ impl ItemExponentialFailureRateLimiter {
     }
 
     /// `NumRequeues` (:137-141).
+    #[cfg(test)]
     pub fn num_requeues(&self, item: &str) -> usize {
         self.failures.get(item).map_or(0, |n| *n as usize)
     }
@@ -853,6 +854,7 @@ impl ControllerRateLimiter {
         a.max(b)
     }
 
+    #[cfg(test)]
     pub fn num_requeues(&self, item: &str) -> usize {
         self.item.num_requeues(item)
     }
