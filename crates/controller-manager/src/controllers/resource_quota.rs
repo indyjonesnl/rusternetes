@@ -1,3 +1,4 @@
+use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use chrono::Utc;
 use rusternetes_common::quantity::{Format, Quantity};
@@ -84,6 +85,10 @@ async fn next_aux_event(
     }
 }
 
+/// Workers draining this controller's queue: upstream `ConcurrentResourceQuotaSyncs` default,
+/// pkg/controller/resourcequota/config/v1alpha1/defaults.go:37-38, launched at cmd/kube-controller-manager/app/core.go:621.
+const CONCURRENT_RESOURCE_QUOTA_SYNCS: usize = 5;
+
 /// ResourceQuotaController tracks resource usage per namespace and enforces quota limits.
 /// It:
 /// 1. Watches ResourceQuotas across all namespaces
@@ -105,10 +110,14 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // Upstream launches `ConcurrentResourceQuotaSyncs` workers over one shared queue
+        // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);
+        // a key in flight is never handed to a second worker.
+        spawn_workers(CONCURRENT_RESOURCE_QUOTA_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {

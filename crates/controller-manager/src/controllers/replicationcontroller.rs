@@ -1,4 +1,5 @@
 use super::expectations::ControllerExpectations;
+use crate::controllers::worker_pool::spawn_workers;
 use chrono::Utc;
 use futures::StreamExt;
 use rusternetes_common::{
@@ -8,6 +9,10 @@ use rusternetes_common::{
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
+
+/// Workers draining this controller's queue: upstream `ConcurrentRCSyncs` default,
+/// pkg/controller/replication/config/v1alpha1/defaults.go:33-34, launched at cmd/kube-controller-manager/app/core.go:551.
+const CONCURRENT_RC_SYNCS: usize = 5;
 
 /// ReplicationControllerController reconciles ReplicationController resources
 pub struct ReplicationControllerController<S: Storage> {
@@ -38,10 +43,14 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // Upstream launches `ConcurrentRCSyncs` workers over one shared queue
+        // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);
+        // a key in flight is never handed to a second worker.
+        spawn_workers(CONCURRENT_RC_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {

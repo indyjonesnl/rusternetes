@@ -1,3 +1,4 @@
+use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::node::Taint;
@@ -45,6 +46,10 @@ fn pod_tolerates_node_taints(tolerations: &[Toleration], taints: &[Taint]) -> bo
     true
 }
 
+/// Workers draining this controller's queue: upstream `ConcurrentDaemonSetSyncs` default,
+/// pkg/controller/daemon/config/v1alpha1/defaults.go:33-34, launched at cmd/kube-controller-manager/app/apps.go:63.
+const CONCURRENT_DAEMONSET_SYNCS: usize = 2;
+
 pub struct DaemonSetController<S: Storage> {
     storage: Arc<S>,
 }
@@ -60,10 +65,14 @@ impl<S: Storage + 'static> DaemonSetController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // Upstream launches `ConcurrentDaemonSetSyncs` workers over one shared queue
+        // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);
+        // a key in flight is never handed to a second worker.
+        spawn_workers(CONCURRENT_DAEMONSET_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {

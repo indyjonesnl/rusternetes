@@ -1,3 +1,4 @@
+use crate::controllers::worker_pool::spawn_workers;
 use chrono::Utc;
 use futures::StreamExt;
 use rusternetes_common::{
@@ -33,6 +34,10 @@ fn compute_rolling_update_counts(
     (surge, unavailable)
 }
 
+/// Workers draining this controller's queue: upstream `ConcurrentDeploymentSyncs` default,
+/// pkg/controller/deployment/config/v1alpha1/defaults.go:33-34, launched at cmd/kube-controller-manager/app/apps.go:146.
+const CONCURRENT_DEPLOYMENT_SYNCS: usize = 5;
+
 /// DeploymentController reconciles Deployment resources by creating and managing ReplicaSets
 /// This follows the Kubernetes pattern: Deployment -> ReplicaSet -> Pods
 pub struct DeploymentController<S: Storage> {
@@ -53,10 +58,14 @@ impl<S: Storage + 'static> DeploymentController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // Upstream launches `ConcurrentDeploymentSyncs` workers over one shared queue
+        // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);
+        // a key in flight is never handed to a second worker.
+        spawn_workers(CONCURRENT_DEPLOYMENT_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {

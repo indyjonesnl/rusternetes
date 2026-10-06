@@ -1,3 +1,4 @@
+use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::{
@@ -129,6 +130,10 @@ fn split_subsets_by_node(subsets: Vec<EndpointSubset>) -> Vec<EndpointSubset> {
         .collect()
 }
 
+/// Workers draining this controller's queue: upstream `ConcurrentEndpointSyncs` default,
+/// pkg/controller/endpoint/config/v1alpha1/defaults.go:33-34, launched at cmd/kube-controller-manager/app/core.go:524.
+const CONCURRENT_ENDPOINT_SYNCS: usize = 5;
+
 /// EndpointsController watches Services and Pods to automatically maintain Endpoints resources.
 /// It creates/updates Endpoints based on:
 /// 1. Service selector matching pod labels
@@ -149,10 +154,14 @@ impl<S: Storage + 'static> EndpointsController<S> {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // Upstream launches `ConcurrentEndpointSyncs` workers over one shared queue
+        // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);
+        // a key in flight is never handed to a second worker.
+        spawn_workers(CONCURRENT_ENDPOINT_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {
