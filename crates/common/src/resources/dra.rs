@@ -160,6 +160,11 @@ pub struct DeviceSubRequest {
     /// Tolerations for device taints
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tolerations: Vec<DeviceToleration>,
+
+    /// Capacity requirements (`DeviceSubRequest.Capacity`, types.go:1106;
+    /// gated by `DRAConsumableCapacity`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<BTreeMap<String, DeviceCapacityRequirement>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -247,6 +252,15 @@ pub struct DeviceConstraint {
         skip_serializing_if = "Option::is_none"
     )]
     pub match_attribute: Option<FullyQualifiedName>,
+
+    /// `DeviceConstraint.DistinctAttribute` (types.go:1313; gated by
+    /// `DRAConsumableCapacity`).
+    #[serde(
+        rename = "distinctAttribute",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub distinct_attribute: Option<FullyQualifiedName>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -328,7 +342,7 @@ pub struct DeviceAllocationResult {
     pub config: Vec<DeviceAllocationConfiguration>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceRequestAllocationResult {
     /// Request is the name of the request in the claim
@@ -362,6 +376,36 @@ pub struct DeviceRequestAllocationResult {
     /// namespace label by `AuthorizedForAdminStatus`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_access: Option<bool>,
+
+    /// `BindingConditions` (types.go:1662; gated by
+    /// `DRADeviceBindingConditions` and `DRAResourceClaimDeviceStatus`).
+    #[serde(
+        rename = "bindingConditions",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub binding_conditions: Vec<String>,
+
+    /// `BindingFailureConditions` (types.go:1675; same gates).
+    #[serde(
+        rename = "bindingFailureConditions",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub binding_failure_conditions: Vec<String>,
+
+    /// `ShareID` (types.go:1686; gated by `DRAConsumableCapacity`).
+    #[serde(rename = "shareID", default, skip_serializing_if = "Option::is_none")]
+    pub share_id: Option<String>,
+
+    /// `ConsumedCapacity` (types.go:1699; gated by `DRAConsumableCapacity`).
+    /// Quantities are kept as strings, like the rest of this module.
+    #[serde(
+        rename = "consumedCapacity",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub consumed_capacity: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -411,6 +455,11 @@ pub struct AllocatedDeviceStatus {
     /// Pool is the name of the device pool
     #[serde(default)]
     pub pool: String,
+
+    /// `AllocatedDeviceStatus.ShareID` (types.go:1954; gated by
+    /// `DRAConsumableCapacity`).
+    #[serde(rename = "shareID", default, skip_serializing_if = "Option::is_none")]
+    pub share_id: Option<String>,
 
     /// Conditions represents the latest observation of the device
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1066,5 +1115,53 @@ mod tests {
         let json = serde_json::to_string(&slice).unwrap();
         let deserialized: ResourceSlice = serde_json::from_str(&json).unwrap();
         assert_eq!(slice, deserialized);
+    }
+    /// Upstream JSON names (staging/src/k8s.io/api/resource/v1/types.go:
+    /// `shareID` :1686, `consumedCapacity` :1699, `bindingConditions` :1662,
+    /// `bindingFailureConditions` :1675, `distinctAttribute` :1313).
+    #[test]
+    fn gated_dra_fields_use_upstream_json_names() {
+        let r: DeviceRequestAllocationResult = serde_json::from_value(serde_json::json!({
+            "request": "r", "driver": "d.example.com", "pool": "p", "device": "x",
+            "shareID": "11111111-1111-1111-1111-111111111111",
+            "consumedCapacity": {"memory": "1Gi"},
+            "bindingConditions": ["a"],
+            "bindingFailureConditions": ["b"]
+        }))
+        .unwrap();
+        assert_eq!(
+            r.share_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(r.consumed_capacity.as_ref().unwrap()["memory"], "1Gi");
+        assert_eq!(r.binding_conditions, vec!["a"]);
+        assert_eq!(r.binding_failure_conditions, vec!["b"]);
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["shareID"], "11111111-1111-1111-1111-111111111111");
+        assert_eq!(v["consumedCapacity"]["memory"], "1Gi");
+        assert_eq!(v["bindingConditions"][0], "a");
+        assert_eq!(v["bindingFailureConditions"][0], "b");
+
+        let s: AllocatedDeviceStatus = serde_json::from_value(
+            serde_json::json!({"driver": "d", "pool": "p", "device": "x", "shareID": "u"}),
+        )
+        .unwrap();
+        assert_eq!(s.share_id.as_deref(), Some("u"));
+        assert_eq!(serde_json::to_value(&s).unwrap()["shareID"], "u");
+
+        let c: DeviceConstraint =
+            serde_json::from_value(serde_json::json!({"distinctAttribute": "a.example.com/b"}))
+                .unwrap();
+        assert_eq!(c.distinct_attribute.as_deref(), Some("a.example.com/b"));
+        assert_eq!(
+            serde_json::to_value(&c).unwrap()["distinctAttribute"],
+            "a.example.com/b"
+        );
+
+        let sub: DeviceSubRequest = serde_json::from_value(
+            serde_json::json!({"name": "n", "deviceClassName": "c", "capacity": {"memory": {"value": "1"}}}),
+        )
+        .unwrap();
+        assert!(sub.capacity.is_some());
     }
 }
