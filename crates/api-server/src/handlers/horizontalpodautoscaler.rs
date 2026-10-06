@@ -198,6 +198,34 @@ fn hpa_watch_gvk(
     )
 }
 
+/// `/apis/autoscaling/{v1,v2}/watch/namespaces/:ns/horizontalpodautoscalers`.
+/// Every event, the initial-list `ADDED`s, `DELETED` and `BOOKMARK` included,
+/// is encoded for the requested version, as upstream's `serveWatchHandler`
+/// does with `scope.Serializer.EncoderForVersion`
+/// (staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go:123-144).
+pub async fn watch_namespace(
+    State(state): State<Arc<ApiServerState>>,
+    OriginalUri(uri): OriginalUri,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<crate::handlers::watch::WatchParams>,
+) -> Result<Response> {
+    let (converter, bookmark_gvk) = hpa_watch_gvk(&uri);
+    crate::handlers::watch::watch_namespaced_converted::<
+        rusternetes_common::resources::CustomResource,
+    >(
+        state,
+        auth_ctx,
+        namespace,
+        "horizontalpodautoscalers",
+        "autoscaling",
+        params,
+        converter,
+        bookmark_gvk,
+    )
+    .await
+}
+
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     OriginalUri(uri): OriginalUri,
@@ -332,7 +360,9 @@ pub async fn list(
     if crate::handlers::watch::is_watch_request(&params) {
         let watch_params = crate::handlers::watch::watch_params_from_query(&params);
         let (converter, bookmark_gvk) = hpa_watch_gvk(&uri);
-        return crate::handlers::watch::watch_namespaced_converted::<HorizontalPodAutoscaler>(
+        return crate::handlers::watch::watch_namespaced_converted::<
+            rusternetes_common::resources::CustomResource,
+        >(
             state,
             auth_ctx,
             namespace,
@@ -389,7 +419,9 @@ pub async fn list_all(
     if crate::handlers::watch::is_watch_request(&params) {
         let watch_params = crate::handlers::watch::watch_params_from_query(&params);
         let (converter, bookmark_gvk) = hpa_watch_gvk(&uri);
-        return crate::handlers::watch::watch_cluster_scoped_converted::<HorizontalPodAutoscaler>(
+        return crate::handlers::watch::watch_cluster_scoped_converted::<
+            rusternetes_common::resources::CustomResource,
+        >(
             state,
             auth_ctx,
             "horizontalpodautoscalers",

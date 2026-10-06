@@ -2512,11 +2512,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/apis/autoscaling/v1/watch/namespaces/:namespace/horizontalpodautoscalers",
-            get(handlers::watch::watch_horizontalpodautoscalers),
+            get(handlers::horizontalpodautoscaler::watch_namespace),
         )
         .route(
             "/apis/autoscaling/v2/watch/namespaces/:namespace/horizontalpodautoscalers",
-            get(handlers::watch::watch_horizontalpodautoscalers),
+            get(handlers::horizontalpodautoscaler::watch_namespace),
         )
         .route(
             "/apis/rbac.authorization.k8s.io/v1/watch/clusterroles",
