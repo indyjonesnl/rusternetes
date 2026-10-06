@@ -28,7 +28,7 @@ use controllers::{
     namespace::NamespaceController,
     network_policy::NetworkPolicyController,
     node::NodeController,
-    node_ipam::NodeIpamConfig,
+    node_ipam::{self, NodeIpamConfig},
     pod_disruption_budget::{PodDisruptionBudgetController, StalePodDisruptionController},
     priorityclass::PriorityClassController,
     pv_binder::PVBinderController,
@@ -792,15 +792,7 @@ async fn main() -> Result<()> {
     });
 
     // Start Node controller (watch-based)
-    let node_controller = {
-        let mut nc = NodeController::new(storage.clone());
-        if let Some((cidr, mask)) = ipam_params.clone() {
-            nc = nc
-                .with_node_ipam(NodeIpamConfig::new(&cidr, mask).map_err(|e| anyhow::anyhow!(e))?);
-            info!("Node IPAM enabled: cluster-cidr={cidr}, node-mask=/{mask}");
-        }
-        Arc::new(nc)
-    };
+    let node_controller = Arc::new(NodeController::new(storage.clone()));
     spawn_controller!("Node controller", leader_elector, {
         let controller = node_controller.clone();
         async move {
@@ -809,6 +801,23 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // Start Node IPAM (range allocator: 30 dedicated workers over an in-memory
+    // CidrSet; upstream pkg/controller/nodeipam/ipam/range_allocator.go).
+    if let Some((cidr, mask)) = ipam_params.clone() {
+        let cfg = NodeIpamConfig::new(&cidr, mask).map_err(|e| anyhow::anyhow!(e))?;
+        info!("Node IPAM enabled: cluster-cidr={cidr}, node-mask=/{mask}");
+        let ipam_storage = storage.clone();
+        spawn_controller!("Node IPAM controller", leader_elector, {
+            let storage = ipam_storage.clone();
+            let cfg = cfg.clone();
+            async move {
+                if let Err(e) = node_ipam::run_node_ipam(storage, cfg).await {
+                    tracing::error!("Node IPAM controller error: {}", e);
+                }
+            }
+        });
+    }
 
     // Start PriorityClass controller
     let priorityclass_controller = Arc::new(PriorityClassController::new(storage.clone()));

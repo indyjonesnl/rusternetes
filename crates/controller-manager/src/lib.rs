@@ -420,17 +420,21 @@ async fn run_controllers<S: Storage + Send + Sync + 'static>(
     });
 
     let s = storage.clone();
-    let node_ipam = config.node_ipam.clone();
+    let c = Arc::new(NodeController::new(s));
     tokio::spawn(async move {
-        let mut nc = NodeController::new(s);
-        if let Some(ipam) = node_ipam {
-            nc = nc.with_node_ipam(ipam);
-        }
-        let c = Arc::new(nc);
         if let Err(e) = c.run().await {
             error!("Node controller error: {}", e);
         }
     });
+
+    if let Some(ipam) = config.node_ipam.clone() {
+        let s = storage.clone();
+        tokio::spawn(async move {
+            if let Err(e) = controllers::node_ipam::run_node_ipam(s, ipam).await {
+                error!("Node IPAM controller error: {}", e);
+            }
+        });
+    }
 
     let s = storage.clone();
     tokio::spawn(async move {
