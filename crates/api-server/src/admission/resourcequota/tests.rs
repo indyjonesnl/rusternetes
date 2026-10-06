@@ -315,12 +315,11 @@ fn scoped_quotas_do_not_match() {
     check_request(&[q], &attrs(Operation::Create, &cm, None), &*ev).unwrap();
 }
 
-/// `NewEvaluators`: pods and claims have their own evaluators, which are not
-/// on this path.
+/// `NewEvaluators`: pods have their own evaluator, which is not on this path.
 #[test]
 fn registry_skips_unported_evaluators() {
     assert!(evaluator_for(&GroupResource::new("", "pods")).is_none());
-    assert!(evaluator_for(&GroupResource::new("", "persistentvolumeclaims")).is_none());
+    assert!(evaluator_for(&GroupResource::new("", "persistentvolumeclaims")).is_some());
 }
 
 /// `checkQuotas` retries on a conflicting status write against the
@@ -353,4 +352,128 @@ async fn a_conflicting_status_write_is_retried() {
     .await
     .unwrap();
     assert_eq!(used(&storage).await["configmaps"], "3");
+}
+
+fn pvc(rv: &str, storage: &str, class: Option<&str>) -> Value {
+    let mut spec = json!({"resources": {"requests": {"storage": storage}}});
+    if let Some(c) = class {
+        spec["storageClassName"] = json!(c);
+    }
+    json!({
+        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "pvc-to-update", "namespace": "test", "resourceVersion": rv},
+        "spec": spec,
+    })
+}
+
+fn pvc_quota() -> ResourceQuota {
+    quota(
+        &[
+            ("persistentvolumeclaims", "3"),
+            ("requests.storage", "100Gi"),
+        ],
+        &[
+            ("persistentvolumeclaims", "1"),
+            ("requests.storage", "10Gi"),
+        ],
+    )
+}
+
+fn pvc_evaluator() -> Box<dyn super::evaluator::Evaluator> {
+    evaluator_for(&GroupResource::new("", "persistentvolumeclaims")).unwrap()
+}
+
+/// `TestAdmitHandlesPVCUpdates`: growing a claim charges the difference,
+/// and the claim count stays put.
+#[tokio::test]
+async fn admit_handles_pvc_updates() {
+    let storage = MemoryStorage::new();
+    stored(&storage, &pvc_quota()).await;
+    let old = pvc("1", "10Gi", None);
+    let new = pvc("", "15Gi", None);
+    evaluate(
+        &storage,
+        &*pvc_evaluator(),
+        &attrs(Operation::Update, &new, Some(&old)),
+    )
+    .await
+    .unwrap();
+    let used = used(&storage).await;
+    assert_eq!(used["persistentvolumeclaims"], "1");
+    assert_eq!(used["requests.storage"], "15Gi");
+}
+
+/// `TestAdmitHandlesNegativePVCUpdates`: shrinking a claim writes nothing.
+#[tokio::test]
+async fn admit_handles_negative_pvc_updates() {
+    let storage = MemoryStorage::new();
+    stored(&storage, &pvc_quota()).await;
+    let old = pvc("1", "10Gi", None);
+    let new = pvc("", "5Gi", None);
+    evaluate(
+        &storage,
+        &*pvc_evaluator(),
+        &attrs(Operation::Update, &new, Some(&old)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(used(&storage).await["requests.storage"], "10Gi");
+}
+
+/// A created claim is charged, and one over the storage limit is refused.
+#[tokio::test]
+async fn pvc_create_is_charged_and_limited() {
+    let storage = MemoryStorage::new();
+    stored(&storage, &pvc_quota()).await;
+    let ok = pvc("", "20Gi", None);
+    evaluate(
+        &storage,
+        &*pvc_evaluator(),
+        &attrs(Operation::Create, &ok, None),
+    )
+    .await
+    .unwrap();
+    let used_now = used(&storage).await;
+    assert_eq!(used_now["persistentvolumeclaims"], "2");
+    assert_eq!(used_now["requests.storage"], "30Gi");
+
+    let big = pvc("", "80Gi", None);
+    let err = evaluate(
+        &storage,
+        &*pvc_evaluator(),
+        &attrs(Operation::Create, &big, None),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, QuotaError::Forbidden(m) if m.contains("requests.storage")));
+}
+
+/// Per-storage-class keys are charged only for a claim of that class.
+#[tokio::test]
+async fn pvc_storage_class_quota() {
+    let storage = MemoryStorage::new();
+    stored(
+        &storage,
+        &quota(
+            &[("gold.storageclass.storage.k8s.io/requests.storage", "10Gi")],
+            &[("gold.storageclass.storage.k8s.io/requests.storage", "0")],
+        ),
+    )
+    .await;
+    let silver = pvc("", "50Gi", Some("silver"));
+    evaluate(
+        &storage,
+        &*pvc_evaluator(),
+        &attrs(Operation::Create, &silver, None),
+    )
+    .await
+    .unwrap();
+    let gold = pvc("", "50Gi", Some("gold"));
+    assert!(evaluate(
+        &storage,
+        &*pvc_evaluator(),
+        &attrs(Operation::Create, &gold, None)
+    )
+    .await
+    .is_err());
 }
