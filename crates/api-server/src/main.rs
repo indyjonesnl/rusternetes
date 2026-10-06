@@ -61,7 +61,8 @@ struct Args {
     /// '30000-32767'. Inclusive at both ends of the range
     /// (cmd/kube-apiserver/app/options/options.go:124).
     #[arg(long, default_value = "30000-32767")]
-    service_node_port_range: registry::core::service::portallocator::PortRange,
+    service_node_port_range:
+        rusternetes_api_server::registry::core::service::portallocator::PortRange,
 
     /// Address to bind to
     #[arg(long, default_value = "0.0.0.0:6443")]
@@ -318,7 +319,10 @@ async fn main() -> Result<()> {
     let state = Arc::new(
         ApiServerState::new(storage, token_manager, authorizer, metrics, args.skip_auth)
             .with_ca_cert(ca_cert_pem)
-            .with_service_node_port_range(args.service_node_port_range)
+            .with_service_node_port_range(registry::core::service::portallocator::PortRange {
+                base: args.service_node_port_range.base,
+                size: args.service_node_port_range.size,
+            })
             .with_prometheus_client(prometheus_client),
     );
 
