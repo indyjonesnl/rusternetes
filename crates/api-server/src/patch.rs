@@ -475,15 +475,38 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
         }
         _ => {
             // Default merge strategy
+
+            // Upstream `mergePatchIntoOriginal` (patch.go:1110-1230): a
+            // `$setElementOrder/<field>` directive merges the `<field>` list
+            // together with its order list, then drops both from the patch.
+            let consumed = merge_set_element_order_lists(result_obj, patch_obj)?;
+
             for (key, patch_value) in patch_obj {
                 // Skip directive keys
                 if key.starts_with('$') {
+                    continue;
+                }
+                if consumed.contains(key) {
                     continue;
                 }
 
                 if patch_value.is_null() {
                     // Null deletes the key
                     result_obj.remove(key);
+                } else if patch_value.is_array()
+                    && result_obj.get(key).is_some_and(|v| v.is_array())
+                    && patch_obj.contains_key(&format!("{DELETE_FROM_PRIMITIVE_LIST}/{key}"))
+                    && is_scalar_list(patch_value.as_array().unwrap())
+                    && is_scalar_list(result_obj[key].as_array().unwrap())
+                {
+                    // A parallel `$deleteFromPrimitiveList/<key>` marks a
+                    // merge-strategy list of primitives: `mergeSlice`
+                    // (patch.go:1510-1540) appends + deduplicates + orders.
+                    let merged = merge_scalar_lists(
+                        result_obj[key].as_array().unwrap(),
+                        patch_value.as_array().unwrap(),
+                    );
+                    result_obj.insert(key.clone(), Value::Array(merged));
                 } else if patch_value.is_array()
                     && result_obj.get(key).is_some_and(|v| v.is_array())
                 {
@@ -543,6 +566,25 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
                 }
             }
 
+            // `$deleteFromPrimitiveList/<field>` (patch.go:1349-1420,
+            // `preprocessDeletionListForMerging` + `deleteFromSlice`): remove
+            // the listed values from the original `<field>` list. Absent or
+            // non-list originals are left alone (patch_test.go:681-730).
+            for (key, patch_value) in patch_obj {
+                let Some(field) = key.strip_prefix(&format!("{DELETE_FROM_PRIMITIVE_LIST}/"))
+                else {
+                    continue;
+                };
+                let to_delete = patch_value.as_array().ok_or_else(|| {
+                    PatchError::InvalidPatch(format!(
+                        "strategic merge: {key} must be a list of primitives"
+                    ))
+                })?;
+                if let Some(Value::Array(current)) = result_obj.get_mut(field) {
+                    current.retain(|v| !to_delete.contains(v));
+                }
+            }
+
             // Upstream parity: `$retainKeys` is also honored in a merge
             // context (not just under `$patch: replace`). After the
             // normal merge, drop any pre-existing key that is neither
@@ -559,6 +601,146 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
     }
 
     Ok(result)
+}
+
+const DELETE_FROM_PRIMITIVE_LIST: &str = "$deleteFromPrimitiveList";
+const SET_ELEMENT_ORDER: &str = "$setElementOrder";
+
+fn is_scalar_list(list: &[Value]) -> bool {
+    list.iter().all(|v| !v.is_object() && !v.is_array())
+}
+
+/// Ported from `deduplicateScalars` (patch.go:1846) followed by
+/// `normalizeElementOrder` (patch.go:404-416): union of two scalar lists,
+/// patch-listed items ordered by `patch_order`, server-only items by the
+/// original order, then interleaved by `mergeSortedSlice`.
+fn merge_scalar_lists(original: &[Value], patch: &[Value]) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::new();
+    for v in original.iter().chain(patch.iter()) {
+        if !merged.contains(v) {
+            merged.push(v.clone());
+        }
+    }
+    normalize_scalar_order(&merged, patch, original)
+}
+
+fn index_of(list: &[Value], v: &Value) -> Option<usize> {
+    list.iter().position(|x| x == v)
+}
+
+/// `partitionPrimitivesByPresentInList` (patch.go:1236) + `normalizeSliceOrder`
+/// (patch.go:521) + `mergeSortedSlice` (patch.go:427).
+fn normalize_scalar_order(
+    merged: &[Value],
+    patch_order: &[Value],
+    server_order: &[Value],
+) -> Vec<Value> {
+    let (mut patch_items, mut server_only): (Vec<Value>, Vec<Value>) = merged
+        .iter()
+        .cloned()
+        .partition(|v| patch_order.contains(v));
+    patch_items.sort_by_key(|v| index_of(patch_order, v));
+    server_only.sort_by_key(|v| index_of(server_order, v));
+    let (left, right) = (server_only, patch_items);
+    let less = |l: &Value, r: &Value| match (index_of(server_order, l), index_of(server_order, r)) {
+        (Some(li), Some(ri)) => li < ri,
+        _ => false,
+    };
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    let (mut i, mut j) = (0, 0);
+    while i < left.len() || j < right.len() {
+        if i >= left.len() {
+            out.push(right[j].clone());
+            j += 1;
+        } else if j >= right.len() || less(&left[i], &right[j]) {
+            out.push(left[i].clone());
+            i += 1;
+        } else {
+            out.push(right[j].clone());
+            j += 1;
+        }
+    }
+    out
+}
+
+/// `validatePatchWithSetOrderList` (patch.go:977-1021), primitives only.
+fn validate_patch_with_set_order_list(
+    patch_list: &[Value],
+    order: &[Value],
+) -> Result<(), PatchError> {
+    if patch_list.is_empty() || order.is_empty() {
+        return Ok(());
+    }
+    let (mut p, mut o) = (0, 0);
+    while p < patch_list.len() && o < order.len() {
+        if patch_list[p] == order[o] {
+            p += 1;
+        }
+        o += 1;
+    }
+    if p < patch_list.len() && o >= order.len() {
+        return Err(PatchError::InvalidPatch(format!(
+            "The order in patch list:\n{patch_list:?}\n doesn't match {SET_ELEMENT_ORDER} list:\n{order:?}\n"
+        )));
+    }
+    Ok(())
+}
+
+/// Port of `mergePatchIntoOriginal` (patch.go:1110-1230) for lists of
+/// primitives: merge `<field>` with its `$setElementOrder/<field>` list and
+/// enforce the order (precedence: `$setElementOrder` > patch list > live
+/// list). Returns the fields it consumed so the caller skips them. Lists of
+/// maps are not handled here (no schema to find the merge key).
+fn merge_set_element_order_lists(
+    result_obj: &mut serde_json::Map<String, Value>,
+    patch_obj: &serde_json::Map<String, Value>,
+) -> Result<std::collections::HashSet<String>, PatchError> {
+    let mut consumed = std::collections::HashSet::new();
+    let prefix = format!("{SET_ELEMENT_ORDER}/");
+    for (key, order_v) in patch_obj {
+        let Some(field) = key.strip_prefix(&prefix) else {
+            continue;
+        };
+        let order = order_v.as_array().ok_or_else(|| {
+            PatchError::InvalidPatch(format!("strategic merge: {key} must be a list"))
+        })?;
+        let original = match result_obj.get(field) {
+            Some(Value::Array(a)) => Some(a.clone()),
+            Some(Value::Null) | None => None,
+            Some(_) => continue,
+        };
+        let patch_list = match patch_obj.get(field) {
+            Some(Value::Array(a)) => Some(a.clone()),
+            Some(Value::Null) | None => None,
+            Some(_) => continue,
+        };
+        let all_scalar = original.as_deref().is_none_or(is_scalar_list)
+            && patch_list.as_deref().is_none_or(is_scalar_list)
+            && is_scalar_list(order);
+        if !all_scalar {
+            continue;
+        }
+        validate_patch_with_set_order_list(patch_list.as_deref().unwrap_or(&[]), order)?;
+        let merged = match (&original, &patch_list) {
+            (None, None) => continue,
+            (Some(o), None) => o.clone(),
+            (None, Some(p)) => p.clone(),
+            (Some(o), Some(p)) => {
+                let mut m: Vec<Value> = Vec::new();
+                for v in o.iter().chain(p.iter()) {
+                    if !m.contains(v) {
+                        m.push(v.clone());
+                    }
+                }
+                m
+            }
+        };
+        let server_order = original.unwrap_or_default();
+        let ordered = normalize_scalar_order(&merged, order, &server_order);
+        result_obj.insert(field.to_string(), Value::Array(ordered));
+        consumed.insert(field.to_string());
+    }
+    Ok(consumed)
 }
 
 /// Strategy used to compute the merge key for every item in an array
@@ -1117,6 +1299,85 @@ mod tests {
         let finalizers = result["spec"]["finalizers"].as_array().unwrap();
         assert_eq!(finalizers.len(), 1);
         assert_eq!(finalizers[0], "kubernetes.io/pv-protection");
+    }
+
+    #[test]
+    fn test_smp_delete_from_primitive_list_parallel_key() {
+        // Wire form used by kube-controller-manager (servicecidrs controller).
+        let original = json!({"metadata": {"finalizers": ["a", "b", "c"]}});
+        let patch = json!({"metadata": {"$deleteFromPrimitiveList/finalizers": ["b"]}});
+        let r = apply_strategic_merge_patch(&original, &patch).unwrap();
+        assert_eq!(r, json!({"metadata": {"finalizers": ["a", "c"]}}));
+    }
+
+    #[test]
+    fn test_smp_delete_from_primitive_list_nonexistent_item_and_list() {
+        // patch_test.go:681-731
+        let r = apply_strategic_merge_patch(
+            &json!({"l": [1, 2]}),
+            &json!({"$deleteFromPrimitiveList/l": [3]}),
+        )
+        .unwrap();
+        assert_eq!(r, json!({"l": [1, 2]}));
+        let r = apply_strategic_merge_patch(
+            &json!({"foo": ["bar"]}),
+            &json!({"$deleteFromPrimitiveList/l": [3]}),
+        )
+        .unwrap();
+        assert_eq!(r, json!({"foo": ["bar"]}));
+        let r = apply_strategic_merge_patch(
+            &json!({"l": null}),
+            &json!({"$deleteFromPrimitiveList/l": [3]}),
+        )
+        .unwrap();
+        assert_eq!(r, json!({"l": null}));
+    }
+
+    #[test]
+    fn test_smp_delete_all_duplicates_with_set_element_order() {
+        // patch_test.go:1360-1395 "delete all duplicate items in lists of scalars"
+        let original = json!({"l": [1, 2, 3, 3, 4]});
+        let patch = json!({
+            "$setElementOrder/l": [1, 2],
+            "$deleteFromPrimitiveList/l": [3]
+        });
+        let r = apply_strategic_merge_patch(&original, &patch).unwrap();
+        assert_eq!(r, json!({"l": [1, 2, 4]}));
+    }
+
+    #[test]
+    fn test_smp_add_and_delete_with_set_element_order() {
+        // patch_test.go:1397-1440 "add and delete items in lists of scalars"
+        let original = json!({"l": [1, 2, 3]});
+        let patch = json!({
+            "$setElementOrder/l": [1, 2, 4],
+            "$deleteFromPrimitiveList/l": [3],
+            "l": [4]
+        });
+        let r = apply_strategic_merge_patch(&original, &patch).unwrap();
+        assert_eq!(r, json!({"l": [1, 2, 4]}));
+    }
+
+    #[test]
+    fn test_smp_set_element_order_reorders_primitives_keeping_server_only() {
+        let original = json!({"l": ["a", "b", "x", "c"]});
+        let patch = json!({"$setElementOrder/l": ["c", "a", "b"], "l": ["c"]});
+        let r = apply_strategic_merge_patch(&original, &patch).unwrap();
+        // patch items follow the order list; server-only "x" is kept.
+        let l = r["l"].as_array().unwrap();
+        let pos = |s: &str| l.iter().position(|v| v == s).unwrap();
+        assert!(pos("c") < pos("a") && pos("a") < pos("b"));
+        assert_eq!(l.len(), 4);
+        assert!(r.get("$setElementOrder/l").is_none());
+    }
+
+    #[test]
+    fn test_smp_set_element_order_mismatch_errors() {
+        let r = apply_strategic_merge_patch(
+            &json!({"l": [1, 2]}),
+            &json!({"$setElementOrder/l": [1, 2], "l": [3]}),
+        );
+        assert!(r.is_err());
     }
 
     #[test]
