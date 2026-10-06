@@ -475,6 +475,59 @@ impl<S: Storage + 'static> JobController<S> {
         pods_to_release: &[Pod],
         job_pods: &[Pod],
     ) -> Result<()> {
+        // Upstream's `enactJobFinished` (`job_controller.go:1509-1519`) refuses
+        // to add the terminal condition while `.status.uncountedTerminatedPods`
+        // is non-empty: only the interim `FailureTarget` / `SuccessCriteriaMet`
+        // condition goes out with the first flush, and Complete/Failed follows
+        // once the UIDs are folded into the counters. The kube-apiserver
+        // enforces the same ("must be empty for finished job",
+        // `validateJobStatus`), so writing both at once is rejected and the
+        // Job never finishes.
+        let uncounted_len = |j: &Job| {
+            j.status
+                .as_ref()
+                .and_then(|s| s.uncounted_terminated_pods.as_ref())
+                .map_or(0, |u| {
+                    u.succeeded.as_ref().map_or(0, |v| v.len())
+                        + u.failed.as_ref().map_or(0, |v| v.len())
+                })
+        };
+        let was_finished = job_is_finished(job);
+        let mut deferred_terminal: Option<(
+            Vec<JobCondition>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        )> = None;
+        if was_finished && uncounted_len(job) > 0 {
+            if let Some(status) = job.status.as_mut() {
+                let conds = status.conditions.take().unwrap_or_default();
+                let (terminal, interim): (Vec<_>, Vec<_>) = conds
+                    .into_iter()
+                    .partition(|c| c.condition_type == "Complete" || c.condition_type == "Failed");
+                status.conditions = Some(interim);
+                deferred_terminal = Some((terminal, status.completion_time.take()));
+            }
+        }
+        // Re-attach the delayed terminal condition once nothing is uncounted.
+        let restore_terminal =
+            |j: &mut Job,
+             deferred: &mut Option<(Vec<JobCondition>, Option<chrono::DateTime<chrono::Utc>>)>|
+             -> bool {
+                if uncounted_len(j) > 0 {
+                    return false;
+                }
+                let Some((terminal, completion_time)) = deferred.take() else {
+                    return false;
+                };
+                if let Some(status) = j.status.as_mut() {
+                    status
+                        .conditions
+                        .get_or_insert_with(Vec::new)
+                        .extend(terminal);
+                    status.completion_time = completion_time;
+                }
+                true
+            };
+
         self.write_status(key, job).await?;
 
         // Upstream's `canRemoveFinalizer` (`job_controller.go:1359`) short-
@@ -482,7 +535,7 @@ impl<S: Storage + 'static> JobController<S> {
         // terminal condition: nothing more will ever be counted, so holding the
         // pods back only wedges them in `Terminating`.
         let mut to_release: Vec<Pod> = pods_to_release.to_vec();
-        if job.metadata.is_being_deleted() || job_is_finished(job) {
+        if job.metadata.is_being_deleted() || was_finished {
             let already: HashSet<&str> = pods_to_release
                 .iter()
                 .map(|p| p.metadata.uid.as_str())
@@ -524,6 +577,9 @@ impl<S: Storage + 'static> JobController<S> {
                     == 0;
                 status.uncounted_terminated_pods = if empty { None } else { Some(uncounted) };
             }
+        }
+        if restore_terminal(job, &mut deferred_terminal) {
+            folded = true;
         }
         if folded {
             self.write_status(key, job).await?;
