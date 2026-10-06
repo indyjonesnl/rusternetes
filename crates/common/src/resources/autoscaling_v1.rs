@@ -132,7 +132,7 @@ fn ref_v2_to_v1(r: &Value) -> Value {
     Value::Object(out)
 }
 
-fn metric_ident<'a>(src: &'a Value) -> (Value, Option<&'a Value>) {
+fn metric_ident(src: &Value) -> (Value, Option<&Value>) {
     let metric = src.get("metric").cloned().unwrap_or(json!({}));
     let name = metric.get("name").cloned().unwrap_or(json!(""));
     let selector = src.get("metric").and_then(|m| present(m, "selector"));
@@ -763,7 +763,7 @@ pub fn hpa_v1_to_v2(v1: &Value) -> Value {
     {
         let mut all: Vec<Value> = other.iter().map(metric_spec_v1_to_v2).collect();
         // The normal spec conversion could have produced one metric: it goes last.
-        all.extend(metrics.drain(..));
+        all.append(&mut metrics);
         metrics = all;
     }
     if let Some(behavior) =
