@@ -126,6 +126,28 @@ async fn recycle_warns() {
     );
 }
 
+/// `warningsForPersistentVolumeSpecAndMeta`
+/// (pkg/api/persistentvolume/util.go:84-90) through
+/// `GetWarningsForNodeSelectorTerm` (pkg/api/node/util.go:95-125): a deprecated
+/// node label in `spec.nodeAffinity.required.nodeSelectorTerms` warns.
+#[tokio::test]
+async fn deprecated_node_label_in_node_affinity_warns() {
+    let api = TestApiServer::new();
+    let mut body = pv("pv-nodeaffinity");
+    body["spec"]["nodeAffinity"] = json!({"required": {"nodeSelectorTerms": [
+        {"matchExpressions": [{"key": "ok", "operator": "Exists"}]},
+        {"matchExpressions": [
+            {"key": "ok", "operator": "Exists"},
+            {"key": "beta.kubernetes.io/arch", "operator": "In", "values": ["amd64"]}
+        ]}
+    ]}});
+    let (status, warnings, out) = send(&api, "POST", PVS, Some(&body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+    let want = r#"spec.nodeAffinity.required.nodeSelectorTerms[1].matchExpressions[1].key: beta.kubernetes.io/arch is deprecated since v1.14; use \"kubernetes.io/arch\" instead"#;
+    assert!(warnings.iter().any(|w| w.contains(want)), "{warnings:?}");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+}
+
 /// `ValidatePersistentVolumeUpdate` (validation.go:2271-2306) holds a PATCH:
 /// the volume source is immutable.
 #[tokio::test]

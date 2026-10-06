@@ -463,23 +463,59 @@ fn format_container_port(port: &ContainerPort) -> String {
     )
 }
 
-/// `GetWarningsForNodeSelectorTerm` (pkg/api/node/util.go:95-125).
+/// `GetWarningsForNodeSelectorTerm` (pkg/api/node/util.go:95-125) over a
+/// pod's term. The pod and PV types are distinct in this tree, so both
+/// funnel into [`warnings_for_node_selector_expressions`].
 fn warnings_for_node_selector_term(
     term: &crate::resources::pod::NodeSelectorTerm,
     check_label_value: bool,
     path: &Path,
 ) -> Vec<String> {
+    warnings_for_node_selector_expressions(
+        term.match_expressions
+            .iter()
+            .flatten()
+            .map(|e| (e.key.as_str(), e.values.as_deref().unwrap_or_default())),
+        check_label_value,
+        path,
+    )
+}
+
+/// `GetWarningsForNodeSelectorTerm` (pkg/api/node/util.go:95-125) over a
+/// PersistentVolume's term, as `warningsForPersistentVolumeSpecAndMeta` calls
+/// it (pkg/api/persistentvolume/util.go:84-90).
+pub fn warnings_for_volume_node_selector_term(
+    term: &crate::resources::volume::NodeSelectorTerm,
+    check_label_value: bool,
+    path: &Path,
+) -> Vec<String> {
+    warnings_for_node_selector_expressions(
+        term.match_expressions
+            .iter()
+            .flatten()
+            .map(|e| (e.key.as_str(), e.values.as_deref().unwrap_or_default())),
+        check_label_value,
+        path,
+    )
+}
+
+/// Body of `GetWarningsForNodeSelectorTerm` (pkg/api/node/util.go:95-125) on
+/// `(key, values)` pairs of the term's `matchExpressions`.
+fn warnings_for_node_selector_expressions<'a>(
+    expressions: impl Iterator<Item = (&'a str, &'a [String])>,
+    check_label_value: bool,
+    path: &Path,
+) -> Vec<String> {
     let mut warnings = Vec::new();
-    for (i, expression) in term.match_expressions.iter().flatten().enumerate() {
-        if let Some(msg) = get_node_label_deprecated_message(&expression.key) {
+    for (i, (key, values)) in expressions.enumerate() {
+        if let Some(msg) = get_node_label_deprecated_message(key) {
             warnings.push(format!(
-                "{}: {} is {msg}",
+                "{}: {key} is {msg}",
                 path.child("matchExpressions").index(i).child("key"),
-                expression.key
             ));
         }
         if check_label_value {
-            for (index, value) in expression.values.iter().flatten().enumerate() {
+            for (index, value) in values.iter().enumerate() {
                 for msg in is_valid_label_value(value) {
                     warnings.push(format!(
                         "{}: {value} is invalid, {msg}",

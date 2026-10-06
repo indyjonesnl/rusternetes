@@ -5,11 +5,12 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use rusternetes_common::pod_warnings::warnings_for_volume_node_selector_term;
 use rusternetes_common::resources::volume::{PersistentVolumeMode, PersistentVolumeReclaimPolicy};
 use rusternetes_common::resources::{
     PersistentVolume, PersistentVolumePhase, PersistentVolumeStatus,
 };
-use rusternetes_common::validation::field::ErrorList;
+use rusternetes_common::validation::field::{ErrorList, Path};
 use rusternetes_common::validation::persistentvolume::{
     validate_persistent_volume, validate_persistent_volume_plugin,
     validate_persistent_volume_status_update, validate_persistent_volume_update,
@@ -46,7 +47,7 @@ pub fn convert_to_internal(pv: &mut PersistentVolume) {
 
 /// `GetWarningsForPersistentVolume` (pkg/api/persistentvolume/util.go:40-110).
 /// Of the deprecated-plugin warnings it carries, none applies to a volume
-/// source modelled here. Node-affinity label warnings are not ported (#2065).
+/// source modelled here.
 fn warnings_for_persistent_volume(pv: &PersistentVolume) -> Vec<String> {
     let mut warnings = Vec::new();
     let annotations = pv.metadata.annotations.as_ref();
@@ -57,6 +58,25 @@ fn warnings_for_persistent_volume(pv: &PersistentVolume) -> Vec<String> {
     }
     if pv.spec.persistent_volume_reclaim_policy == Some(PersistentVolumeReclaimPolicy::Recycle) {
         warnings.push("spec.persistentVolumeReclaimPolicy: The Recycle reclaim policy is deprecated. Instead, the recommended approach is to use dynamic provisioning.".to_string());
+    }
+    // pkg/api/persistentvolume/util.go:84-90
+    if let Some(required) = pv
+        .spec
+        .node_affinity
+        .as_ref()
+        .and_then(|a| a.required.as_ref())
+    {
+        let term_path = Path::new("spec")
+            .child("nodeAffinity")
+            .child("required")
+            .child("nodeSelectorTerms");
+        for (i, term) in required.node_selector_terms.iter().enumerate() {
+            warnings.extend(warnings_for_volume_node_selector_term(
+                term,
+                false,
+                &term_path.index(i),
+            ));
+        }
     }
     warnings
 }
