@@ -19,16 +19,18 @@
 //! Get -> Update window (#1887).
 //!
 //! Gated by `--allocate-node-cidrs` (which upstream requires be paired with
-//! `--cluster-cidr`); IPv4 single-stack only for now.
+//! `--cluster-cidr`). [`CidrSet`] is IPv4+IPv6; the [`RangeAllocator`] still
+//! drives a single IPv4 set (multi-set dual-stack: #2409).
 
 use std::collections::HashMap;
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use futures::StreamExt;
-use ipnet::Ipv4Net;
+use ipnet::{IpNet, Ipv4Net};
 use rusternetes_common::resources::{EventSource, EventType, Node, NodeSpec, ObjectReference};
 use rusternetes_common::Error;
 use rusternetes_storage::{
@@ -112,6 +114,8 @@ impl NodeIpamConfig {
 pub enum CidrSetError {
     /// `ErrCIDRRangeNoCIDRsRemaining`.
     NoCidrsRemaining,
+    /// `ErrCIDRSetSubNetTooBig`.
+    SubnetTooBig,
     /// The node mask does not fit the cluster CIDR.
     InvalidMask(String),
     /// The CIDR lies outside the cluster CIDR.
@@ -125,12 +129,39 @@ impl fmt::Display for CidrSetError {
                 f,
                 "CIDR allocation failed; there are no remaining CIDRs left to allocate in the accepted range"
             ),
+            Self::SubnetTooBig => {
+                f.write_str("New CIDR set failed; the node CIDR size is too big")
+            }
             Self::InvalidMask(m) | Self::OutOfRange(m) => f.write_str(m),
         }
     }
 }
 
 impl std::error::Error for CidrSetError {}
+
+/// The subnet mask size cannot be greater than 16 more than the cluster mask
+/// size for an IPv6 cluster CIDR. Upstream `clusterSubnetMaxDiff`
+/// (`cidrset/cidr_set.go:57`; limited by the uncompressed bitmap).
+const CLUSTER_SUBNET_MAX_DIFF: u8 = 16;
+
+/// A point-in-time read of one set's `node_ipam_controller_cidrset_*` series
+/// (upstream `cidrset/metrics.go`: `cidrset_cidrs_allocations_total`,
+/// `cidrset_cidrs_releases_total`, `cirdset_max_cidrs`, `cidrset_usage_cidrs`,
+/// `cidrset_allocation_tries_per_request`), keyed by the `clusterCIDR` label.
+#[allow(dead_code)] // exposition on /metrics: #2410 (the series are tracked and tested)
+#[derive(Debug, Clone, PartialEq)]
+pub struct CidrSetMetrics {
+    /// The `clusterCIDR` label.
+    pub label: String,
+    pub allocations: u64,
+    pub releases: u64,
+    pub max_cidrs: u64,
+    /// Fraction of blocks in use, `allocatedCIDRs / maxCIDRs`.
+    pub usage: f64,
+    /// Sum and count of the `allocation_tries_per_request` histogram.
+    pub allocation_tries_sum: f64,
+    pub allocation_tries_count: u64,
+}
 
 struct CidrSetInner {
     /// Bitmap of allocated blocks, grown lazily (upstream `used big.Int`).
@@ -139,6 +170,10 @@ struct CidrSetInner {
     allocated: u64,
     /// Next CIDR index that should be free (upstream `nextCandidate`).
     next_candidate: u64,
+    allocations: u64,
+    releases: u64,
+    tries_sum: f64,
+    tries_count: u64,
 }
 
 impl CidrSetInner {
@@ -164,19 +199,40 @@ impl CidrSetInner {
     }
 }
 
+/// An address as a big-endian integer; an IPv4 address occupies the low 32
+/// bits (the arithmetic below is generic over the 32/128-bit width).
+fn addr_bits(a: IpAddr) -> u128 {
+    match a {
+        IpAddr::V4(v4) => u128::from(u32::from(v4)),
+        IpAddr::V6(v6) => u128::from(v6),
+    }
+}
+
 /// Manages a set of CIDR ranges from which blocks of IPs can be allocated.
-/// Port of upstream `cidrset.CidrSet` (`cidr_set.go`), IPv4 only.
+/// Port of upstream `cidrset.CidrSet` (`cidr_set.go`), IPv4 and IPv6.
 pub struct CidrSet {
-    cluster: Ipv4Net,
+    cluster: IpNet,
+    /// Address width in bits: 32 or 128.
+    width: u32,
     node_mask: u8,
     max_cidrs: u64,
+    /// Upstream `label` (`clusterCIDR.String()`), identifies the metrics.
+    #[allow(dead_code)] // read by `metrics()`, see above
+    label: String,
     inner: Mutex<CidrSetInner>,
 }
 
 impl CidrSet {
     /// Upstream `NewCIDRSet`. `cluster` must be network-aligned.
-    pub fn new(cluster: Ipv4Net, node_mask: u8) -> Result<Self, CidrSetError> {
-        if node_mask > 32 || node_mask < cluster.prefix_len() {
+    pub fn new(cluster: IpNet, node_mask: u8) -> Result<Self, CidrSetError> {
+        let width: u32 = if cluster.addr().is_ipv4() { 32 } else { 128 };
+        // `!cluster.IP.To4() && subNetMaskSize-clusterMaskSize > clusterSubnetMaxDiff`
+        // (`cidr_set.go:74`); written without underflow.
+        if width == 128 && node_mask > cluster.prefix_len().saturating_add(CLUSTER_SUBNET_MAX_DIFF)
+        {
+            return Err(CidrSetError::SubnetTooBig);
+        }
+        if u32::from(node_mask) > width || node_mask < cluster.prefix_len() {
             return Err(CidrSetError::InvalidMask(format!(
                 "node CIDR mask /{node_mask} does not fit cluster CIDR {cluster}"
             )));
@@ -184,13 +240,19 @@ impl CidrSet {
         // getMaxCIDRs
         let max_cidrs = 1u64 << (node_mask - cluster.prefix_len());
         Ok(Self {
-            cluster,
+            width,
             node_mask,
             max_cidrs,
+            label: cluster.to_string(),
+            cluster,
             inner: Mutex::new(CidrSetInner {
                 used: Vec::new(),
                 allocated: 0,
                 next_candidate: 0,
+                allocations: 0,
+                releases: 0,
+                tries_sum: 0.0,
+                tries_count: 0,
             }),
         })
     }
@@ -207,61 +269,117 @@ impl CidrSet {
         self.inner.lock().expect("cidr set poisoned").allocated
     }
 
-    fn node_netmask(&self) -> u32 {
-        Ipv4Net::new(std::net::Ipv4Addr::UNSPECIFIED, self.node_mask)
-            .expect("mask validated in new")
-            .netmask()
-            .into()
+    /// The set's metric series (upstream `cidrset/metrics.go`).
+    #[allow(dead_code)] // exposition on /metrics is a follow-up
+    pub fn metrics(&self) -> CidrSetMetrics {
+        let s = self.inner.lock().expect("cidr set poisoned");
+        CidrSetMetrics {
+            label: self.label.clone(),
+            allocations: s.allocations,
+            releases: s.releases,
+            max_cidrs: self.max_cidrs,
+            usage: s.allocated as f64 / self.max_cidrs as f64,
+            allocation_tries_sum: s.tries_sum,
+            allocation_tries_count: s.tries_count,
+        }
+    }
+
+    /// All-ones of the address width.
+    fn full(&self) -> u128 {
+        if self.width == 128 {
+            u128::MAX
+        } else {
+            (1u128 << self.width) - 1
+        }
+    }
+
+    /// The host bits of a `prefix`-length mask.
+    fn host_mask(&self, prefix: u8) -> u128 {
+        match 1u128.checked_shl(self.width - u32::from(prefix)) {
+            Some(v) => v - 1,
+            None => u128::MAX,
+        }
+    }
+
+    fn net_mask(&self, prefix: u8) -> u128 {
+        self.full() & !self.host_mask(prefix)
     }
 
     /// Upstream `indexToCIDRBlock`.
-    fn index_to_cidr_block(&self, index: u64) -> Ipv4Net {
-        let shifted = (index << (32 - u32::from(self.node_mask))) as u32;
-        let ip = u32::from(self.cluster.network()) | shifted;
-        Ipv4Net::new(ip.into(), self.node_mask).expect("mask validated in new")
+    fn index_to_cidr_block(&self, index: u64) -> IpNet {
+        let shifted = u128::from(index)
+            .checked_shl(self.width - u32::from(self.node_mask))
+            .unwrap_or(0);
+        let ip = addr_bits(self.cluster.network()) | shifted;
+        let addr = if self.width == 32 {
+            IpAddr::V4(Ipv4Addr::from(ip as u32))
+        } else {
+            IpAddr::V6(Ipv6Addr::from(ip))
+        };
+        IpNet::new(addr, self.node_mask).expect("mask validated in new")
     }
 
     /// Allocates the next free CIDR range, marking it occupied (upstream
     /// `AllocateNext`).
-    pub fn allocate_next(&self) -> Result<Ipv4Net, CidrSetError> {
+    pub fn allocate_next(&self) -> Result<IpNet, CidrSetError> {
         let mut s = self.inner.lock().expect("cidr set poisoned");
         if s.allocated == self.max_cidrs {
             return Err(CidrSetError::NoCidrsRemaining);
         }
         let mut candidate = s.next_candidate;
-        for _ in 0..self.max_cidrs {
+        let mut tries = 0u64;
+        while tries < self.max_cidrs {
             if !s.bit(candidate) {
                 break;
             }
             candidate = (candidate + 1) % self.max_cidrs;
+            tries += 1;
         }
         s.next_candidate = (candidate + 1) % self.max_cidrs;
         s.set_bit(candidate, true);
         s.allocated += 1;
+        // Update metrics
+        s.allocations += 1;
+        s.tries_sum += tries as f64;
+        s.tries_count += 1;
         Ok(self.index_to_cidr_block(candidate))
     }
 
     /// Upstream `getIndexForIP`.
-    fn index_for_ip(&self, ip: u32) -> Result<u64, CidrSetError> {
-        let idx =
-            u64::from(u32::from(self.cluster.network()) ^ ip) >> (32 - u32::from(self.node_mask));
-        if idx >= self.max_cidrs {
+    fn index_for_ip(&self, ip: u128) -> Result<u64, CidrSetError> {
+        let x = addr_bits(self.cluster.network()) ^ ip;
+        let idx = x
+            .checked_shr(self.width - u32::from(self.node_mask))
+            .unwrap_or(0);
+        if idx >= u128::from(self.max_cidrs) {
+            let addr = if self.width == 32 {
+                IpAddr::V4(Ipv4Addr::from(ip as u32))
+            } else {
+                IpAddr::V6(Ipv6Addr::from(ip))
+            };
             return Err(CidrSetError::OutOfRange(format!(
-                "CIDR: {}/{} is out of the range of CIDR allocator",
-                std::net::Ipv4Addr::from(ip),
+                "CIDR: {addr}/{} is out of the range of CIDR allocator",
                 self.node_mask
             )));
         }
-        Ok(idx)
+        Ok(idx as u64)
     }
 
     /// Upstream `getBeginningAndEndIndices`: the inclusive range of node-sized
     /// blocks that `cidr` covers.
-    fn get_indices(&self, cidr: Ipv4Net) -> Result<(u64, u64), CidrSetError> {
-        let cluster_ip = u32::from(self.cluster.network());
-        let cluster_mask = u32::from(self.cluster.netmask());
-        let cidr_ip = u32::from(cidr.network());
-        let cidr_mask = u32::from(cidr.netmask());
+    fn get_indices(&self, cidr: IpNet) -> Result<(u64, u64), CidrSetError> {
+        // A CIDR of the other address family cannot lie in this cluster CIDR
+        // (Go's `IPNet.Contains` is false across families).
+        if cidr.addr().is_ipv4() != self.cluster.addr().is_ipv4() {
+            return Err(CidrSetError::OutOfRange(format!(
+                "cidr {cidr} is out the range of cluster cidr {}",
+                self.cluster
+            )));
+        }
+        let cluster_ip = addr_bits(self.cluster.network());
+        let cluster_mask = self.net_mask(self.cluster.prefix_len());
+        let cidr_ip = addr_bits(cidr.network());
+        let cidr_mask = self.net_mask(cidr.prefix_len());
         let cluster_contains = cidr_ip & cluster_mask == cluster_ip;
         let cidr_contains = cluster_ip & cidr_mask == cidr_ip;
         if !cluster_contains && !cidr_contains {
@@ -272,15 +390,15 @@ impl CidrSet {
         }
         let (mut begin, mut end) = (0, self.max_cidrs - 1);
         if self.cluster.prefix_len() < cidr.prefix_len() {
-            let node_mask = self.node_netmask();
+            let node_mask = self.net_mask(self.node_mask);
             begin = self.index_for_ip(cidr_ip & node_mask)?;
-            end = self.index_for_ip((cidr_ip | !cidr_mask) & node_mask)?;
+            end = self.index_for_ip((cidr_ip | !cidr_mask & self.full()) & node_mask)?;
         }
         Ok((begin, end))
     }
 
     /// Releases the given CIDR range (upstream `Release`).
-    pub fn release(&self, cidr: Ipv4Net) -> Result<(), CidrSetError> {
+    pub fn release(&self, cidr: IpNet) -> Result<(), CidrSetError> {
         let (begin, end) = self.get_indices(cidr)?;
         let mut s = self.inner.lock().expect("cidr set poisoned");
         for i in begin..=end {
@@ -289,6 +407,7 @@ impl CidrSet {
             if s.bit(i) {
                 s.set_bit(i, false);
                 s.allocated -= 1;
+                s.releases += 1;
             }
         }
         Ok(())
@@ -296,13 +415,14 @@ impl CidrSet {
 
     /// Marks the given CIDR range as used. Succeeds even if it was previously
     /// used (upstream `Occupy`).
-    pub fn occupy(&self, cidr: Ipv4Net) -> Result<(), CidrSetError> {
+    pub fn occupy(&self, cidr: IpNet) -> Result<(), CidrSetError> {
         let (begin, end) = self.get_indices(cidr)?;
         let mut s = self.inner.lock().expect("cidr set poisoned");
         for i in begin..=end {
             if !s.bit(i) {
                 s.set_bit(i, true);
                 s.allocated += 1;
+                s.allocations += 1;
             }
         }
         Ok(())
@@ -337,7 +457,8 @@ impl<S: Storage + 'static> RangeAllocator<S> {
     /// (garbage in `podCIDRs`, or a CIDR outside the cluster range) is fatal,
     /// as upstream ("This error will keep crashing controller-manager").
     pub fn new(storage: Arc<S>, cfg: NodeIpamConfig, nodes: &[Node]) -> Result<Self, String> {
-        let cidr_set = CidrSet::new(cfg.cluster_cidr, cfg.node_mask).map_err(|e| e.to_string())?;
+        let cidr_set =
+            CidrSet::new(IpNet::V4(cfg.cluster_cidr), cfg.node_mask).map_err(|e| e.to_string())?;
         let ra = Self {
             recorder: EventRecorder::new(Arc::clone(&storage)),
             storage,
@@ -361,6 +482,7 @@ impl<S: Storage + 'static> RangeAllocator<S> {
     /// used so it is never assignable (upstream `filterOutServiceRange`).
     fn filter_out_service_range(&self, service_cidr: Ipv4Net) {
         let cluster = self.cidr_set.cluster;
+        let service_cidr = IpNet::V4(service_cidr);
         let overlaps =
             cluster.contains(&service_cidr.network()) || service_cidr.contains(&cluster.network());
         if !overlaps {
@@ -376,7 +498,7 @@ impl<S: Storage + 'static> RangeAllocator<S> {
     /// Marks `node.spec.podCIDRs` as used (upstream `occupyCIDRs`).
     fn occupy_cidrs(&self, node: &Node) -> Result<()> {
         for (idx, cidr) in node_pod_cidrs(node).iter().enumerate() {
-            let pod_cidr: Ipv4Net = cidr.parse().map_err(|_| {
+            let pod_cidr: IpNet = cidr.parse().map_err(|_| {
                 anyhow::anyhow!("failed to parse node {}, CIDR {}", node.metadata.name, cidr)
             })?;
             // Upstream: an index beyond the configured cluster CIDRs cannot be
@@ -424,7 +546,7 @@ impl<S: Storage + 'static> RangeAllocator<S> {
     /// Marks `node.spec.podCIDRs` as unused (upstream `ReleaseCIDR`).
     pub fn release_cidr(&self, node: &Node) -> Result<()> {
         for (idx, cidr) in node_pod_cidrs(node).iter().enumerate() {
-            let pod_cidr: Ipv4Net = cidr.parse().map_err(|_| {
+            let pod_cidr: IpNet = cidr.parse().map_err(|_| {
                 anyhow::anyhow!(
                     "failed to parse CIDR {} on Node {}",
                     cidr,
@@ -447,7 +569,7 @@ impl<S: Storage + 'static> RangeAllocator<S> {
         Ok(())
     }
 
-    fn release_allocated(&self, allocated: Ipv4Net) {
+    fn release_allocated(&self, allocated: IpNet) {
         if let Err(e) = self.cidr_set.release(allocated) {
             error!("Error releasing allocated CIDR {allocated}: {e}");
         }
@@ -455,7 +577,7 @@ impl<S: Storage + 'static> RangeAllocator<S> {
 
     /// Assigns `allocated` to the node and writes it (upstream
     /// `updateCIDRsAllocation`).
-    async fn update_cidrs_allocation(&self, node_name: &str, allocated: Ipv4Net) -> Result<()> {
+    async fn update_cidrs_allocation(&self, node_name: &str, allocated: IpNet) -> Result<()> {
         let key = build_key("nodes", None, node_name);
         let cidrs = vec![allocated.to_string()];
         let node: Node = match self.storage.get(&key).await {
@@ -728,8 +850,12 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn ipn(s: &str) -> IpNet {
+        s.parse::<IpNet>().unwrap().trunc()
+    }
+
     fn set(cluster: &str, mask: u8) -> CidrSet {
-        CidrSet::new(net(cluster).trunc(), mask).unwrap()
+        CidrSet::new(ipn(cluster), mask).unwrap()
     }
 
     // ---- CidrSet: ported from ipam/cidrset/cidr_set_test.go ----
@@ -746,10 +872,10 @@ mod tests {
     #[test]
     fn cidr_set_fully_allocated() {
         let a = set("127.123.234.0/30", 30);
-        assert_eq!(a.allocate_next().unwrap(), net("127.123.234.0/30"));
+        assert_eq!(a.allocate_next().unwrap(), ipn("127.123.234.0/30"));
         assert_eq!(a.allocate_next(), Err(CidrSetError::NoCidrsRemaining));
-        a.release(net("127.123.234.0/30")).unwrap();
-        assert_eq!(a.allocate_next().unwrap(), net("127.123.234.0/30"));
+        a.release(ipn("127.123.234.0/30")).unwrap();
+        assert_eq!(a.allocate_next().unwrap(), ipn("127.123.234.0/30"));
         assert!(a.allocate_next().is_err());
     }
 
@@ -757,11 +883,11 @@ mod tests {
     #[test]
     fn cidr_set_index_to_cidr_block() {
         let a = set("127.123.3.0/16", 24);
-        assert_eq!(a.index_to_cidr_block(0), net("127.123.0.0/24"));
-        assert_eq!(a.index_to_cidr_block(15), net("127.123.15.0/24"));
-        assert_eq!(a.index_to_cidr_block(255), net("127.123.255.0/24"));
+        assert_eq!(a.index_to_cidr_block(0), ipn("127.123.0.0/24"));
+        assert_eq!(a.index_to_cidr_block(15), ipn("127.123.15.0/24"));
+        assert_eq!(a.index_to_cidr_block(255), ipn("127.123.255.0/24"));
         let b = set("10.0.0.0/8", 26);
-        assert_eq!(b.index_to_cidr_block(1), net("10.0.0.64/26"));
+        assert_eq!(b.index_to_cidr_block(1), ipn("10.0.0.64/26"));
     }
 
     // TestCIDRSet_RandomishAllocation
@@ -811,9 +937,9 @@ mod tests {
         ];
         for (cidr, occupy, want) in ops {
             if occupy {
-                a.occupy(net(cidr)).unwrap();
+                a.occupy(ipn(cidr)).unwrap();
             } else {
-                a.release(net(cidr)).unwrap();
+                a.release(ipn(cidr)).unwrap();
             }
             assert_eq!(a.allocated(), want, "after {cidr} occupy={occupy}");
         }
@@ -829,29 +955,192 @@ mod tests {
     fn cidr_set_occupy_ranges_and_out_of_range() {
         let a = set("127.0.0.0/8", 16);
         // Whole cluster, and a shorter prefix that contains it, occupy every bit.
-        a.occupy(net("127.0.0.0/8")).unwrap();
+        a.occupy(ipn("127.0.0.0/8")).unwrap();
         assert_eq!(a.allocated(), 256);
         let b = set("127.0.0.0/8", 16);
-        b.occupy(net("127.0.0.0/2")).unwrap();
+        b.occupy(ipn("127.0.0.0/2")).unwrap();
         assert_eq!(b.allocated(), 256);
         // A /16 at index 123.
         let c = set("127.0.0.0/8", 16);
-        c.occupy(net("127.123.0.0/16")).unwrap();
+        c.occupy(ipn("127.123.0.0/16")).unwrap();
         assert_eq!(c.allocated(), 1);
-        assert_eq!(c.get_indices(net("127.123.0.0/16")).unwrap(), (123, 123));
+        assert_eq!(c.get_indices(ipn("127.123.0.0/16")).unwrap(), (123, 123));
         // A /12 spans 16 /16s.
-        assert_eq!(c.get_indices(net("127.16.0.0/12")).unwrap(), (16, 31));
+        assert_eq!(c.get_indices(ipn("127.16.0.0/12")).unwrap(), (16, 31));
         // Out of the cluster range.
-        assert!(c.occupy(net("128.0.0.0/16")).is_err());
-        assert!(c.release(net("10.0.0.0/16")).is_err());
+        assert!(c.occupy(ipn("128.0.0.0/16")).is_err());
+        assert!(c.release(ipn("10.0.0.0/16")).is_err());
     }
 
     // Test_getMaxCIDRs
     #[test]
     fn cidr_set_max_cidrs() {
         assert_eq!(set("10.0.0.0/16", 24).max_cidrs(), 256);
-        assert!(CidrSet::new(net("10.0.0.0/16"), 8).is_err());
-        assert!(CidrSet::new(net("10.0.0.0/16"), 33).is_err());
+        assert!(CidrSet::new(ipn("10.0.0.0/16"), 8).is_err());
+        assert!(CidrSet::new(ipn("10.0.0.0/16"), 33).is_err());
+    }
+
+    // TestIndexToCIDRBlock (IPv4 /32 and every IPv6 row)
+    #[test]
+    fn cidr_set_index_to_cidr_block_v6() {
+        // (cluster, mask, index, want) verbatim from cidr_set_test.go:86-196.
+        let rows = [
+            ("192.168.5.219/28", 32, 5, "192.168.5.213/32"),
+            ("2001:0db8:1234:3::/48", 64, 0, "2001:db8:1234::/64"),
+            ("2001:0db8:1234::/48", 64, 15, "2001:db8:1234:f::/64"),
+            (
+                "2001:0db8:85a3::8a2e:0370:7334/50",
+                63,
+                6425,
+                "2001:db8:85a3:3232::/63",
+            ),
+            ("2001:0db8::/32", 48, 0, "2001:db8::/48"),
+            ("2001:0db8::/32", 48, 15, "2001:db8:f::/48"),
+            (
+                "2001:0db8:85a3::8a2e:0370:7334/32",
+                48,
+                6425,
+                "2001:db8:1919::/48",
+            ),
+            ("2001:0db8:1234:ff00::/56", 72, 0, "2001:db8:1234:ff00::/72"),
+            (
+                "2001:0db8:1234:ff00::/56",
+                72,
+                15,
+                "2001:db8:1234:ff00:f00::/72",
+            ),
+            (
+                "2001:0db8:1234:ff00::0370:7334/56",
+                72,
+                6425,
+                "2001:db8:1234:ff19:1900::/72",
+            ),
+            (
+                "2001:0db8:1234:0:1234::/80",
+                96,
+                0,
+                "2001:db8:1234:0:1234::/96",
+            ),
+            (
+                "2001:0db8:1234:0:1234::/80",
+                96,
+                15,
+                "2001:db8:1234:0:1234:f::/96",
+            ),
+            (
+                "2001:0db8:1234:ff00::0370:7334/80",
+                96,
+                6425,
+                "2001:db8:1234:ff00:0:1919::/96",
+            ),
+        ];
+        for (cluster, mask, index, want) in rows {
+            let a = set(cluster, mask);
+            assert_eq!(
+                a.index_to_cidr_block(index).to_string(),
+                want,
+                "{cluster} /{mask} #{index}"
+            );
+        }
+    }
+
+    // TestCIDRSetv6
+    #[test]
+    fn cidr_set_v6_allocation_and_subnet_too_big() {
+        let a = set("127.0.0.0/8", 32);
+        assert_eq!(a.allocate_next().unwrap(), ipn("127.0.0.0/32"));
+        assert_eq!(a.allocate_next().unwrap(), ipn("127.0.0.1/32"));
+        // "Max cluster subnet size with IPv6": 49 - 32 > clusterSubnetMaxDiff (16).
+        let err = CidrSet::new(ipn("beef:1234::/32"), 49).err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "New CIDR set failed; the node CIDR size is too big"
+        );
+        let b = set("2001:beef:1234:369b::/60", 64);
+        assert_eq!(b.allocate_next().unwrap(), ipn("2001:beef:1234:3690::/64"));
+        assert_eq!(b.allocate_next().unwrap(), ipn("2001:beef:1234:3691::/64"));
+    }
+
+    // TestGetBitforCIDR / TestOccupy (IPv6 rows)
+    #[test]
+    fn cidr_set_v6_indices_and_occupy() {
+        let a = set("be00::/8", 16);
+        assert_eq!(a.get_indices(ipn("be00::/16")).unwrap(), (0, 0));
+        let b = set("2001:beef:1200::/40", 48);
+        b.occupy(ipn("2001:beef:1200::/40")).unwrap();
+        assert_eq!(b.allocated(), 256);
+        let c = set("2001:beef:1200::/40", 48);
+        c.occupy(ipn("2001:beef:1234::/34")).unwrap();
+        assert_eq!(c.allocated(), 256);
+        // A v4 CIDR is out of range of a v6 cluster, and vice versa.
+        assert!(c.occupy(ipn("10.0.0.0/16")).is_err());
+        assert!(set("10.0.0.0/8", 16).occupy(ipn("be00::/16")).is_err());
+        // Outside the cluster.
+        assert!(c.release(ipn("2001:beef:3400::/48")).is_err());
+    }
+
+    // Test_getMaxCIDRs (IPv6 row)
+    #[test]
+    fn cidr_set_max_cidrs_v6() {
+        assert_eq!(set("2001:db8::/48", 64).max_cidrs(), 65536);
+    }
+
+    fn expect_metrics(a: &CidrSet, usage: f64, allocs: u64, releases: u64, tries: f64, max: u64) {
+        let m = a.metrics();
+        assert_eq!(
+            (
+                m.usage,
+                m.allocations,
+                m.releases,
+                m.allocation_tries_sum,
+                m.max_cidrs
+            ),
+            (usage, allocs, releases, tries, max)
+        );
+    }
+
+    // TestCidrSetMetrics
+    #[test]
+    fn cidr_set_metrics() {
+        let a = set("10.0.0.0/16", 24);
+        assert_eq!(a.metrics().label, "10.0.0.0/16");
+        expect_metrics(&a, 0.0, 0, 0, 0.0, 256);
+        for i in 1..=256u64 {
+            a.allocate_next().unwrap();
+            expect_metrics(&a, i as f64 / 256.0, i, 0, 0.0, 256);
+        }
+        a.release(ipn("10.0.0.0/16")).unwrap();
+        expect_metrics(&a, 0.0, 256, 256, 0.0, 256);
+        a.occupy(ipn("10.0.0.0/16")).unwrap();
+        expect_metrics(&a, 1.0, 512, 256, 0.0, 256);
+    }
+
+    // TestCidrSetMetricsHistogram
+    #[test]
+    fn cidr_set_metrics_histogram() {
+        let a = set("10.0.0.0/16", 24);
+        a.occupy(ipn("10.0.0.0/17")).unwrap();
+        expect_metrics(&a, 0.5, 128, 0, 0.0, 256);
+        // Occupy does not move nextCandidate, so AllocateNext walks 128 bits.
+        a.allocate_next().unwrap();
+        expect_metrics(&a, 129.0 / 256.0, 129, 0, 128.0, 256);
+    }
+
+    // TestCidrSetMetricsDual
+    #[test]
+    fn cidr_set_metrics_dual() {
+        let a = set("10.0.0.0/16", 24);
+        let b = set("2001:db8::/48", 64);
+        expect_metrics(&a, 0.0, 0, 0, 0.0, 256);
+        expect_metrics(&b, 0.0, 0, 0, 0.0, 65536);
+        a.occupy(ipn("10.0.0.0/16")).unwrap();
+        expect_metrics(&a, 1.0, 256, 0, 0.0, 256);
+        b.occupy(ipn("2001:db8::/48")).unwrap();
+        expect_metrics(&b, 1.0, 65536, 0, 0.0, 65536);
+        a.release(ipn("10.0.0.0/16")).unwrap();
+        expect_metrics(&a, 0.0, 256, 256, 0.0, 256);
+        b.release(ipn("2001:db8::/48")).unwrap();
+        expect_metrics(&b, 0.0, 65536, 65536, 0.0, 65536);
     }
 
     // ---- RangeAllocator: ported from ipam/range_allocator_test.go ----
@@ -902,7 +1191,7 @@ mod tests {
             node_with_cidr("b", None),
         ];
         let ra = allocator(&storage, "10.244.0.0/16", 24, &nodes).unwrap();
-        assert_eq!(ra.cidr_set.allocate_next().unwrap(), net("10.244.1.0/24"));
+        assert_eq!(ra.cidr_set.allocate_next().unwrap(), ipn("10.244.1.0/24"));
     }
 
     #[tokio::test]
@@ -981,7 +1270,7 @@ mod tests {
         let n = node_with_cidr("node0", Some("10.10.0.0/24"));
         let ra = allocator(&storage, "10.10.0.0/16", 24, std::slice::from_ref(&n)).unwrap();
         ra.release_cidr(&n).unwrap();
-        assert_eq!(ra.cidr_set.allocate_next().unwrap(), net("10.10.0.0/24"));
+        assert_eq!(ra.cidr_set.allocate_next().unwrap(), ipn("10.10.0.0/24"));
         // A node without CIDRs releases nothing.
         ra.release_cidr(&node_with_cidr("x", None)).unwrap();
     }
@@ -994,7 +1283,7 @@ mod tests {
         put(&storage, &n).await;
         let ra = allocator(&storage, "10.10.0.0/16", 24, std::slice::from_ref(&n)).unwrap();
         ra.sync_node("nodes/node0").await.unwrap();
-        assert_eq!(ra.cidr_set.allocate_next().unwrap(), net("10.10.1.0/24"));
+        assert_eq!(ra.cidr_set.allocate_next().unwrap(), ipn("10.10.1.0/24"));
 
         n.metadata.deletion_timestamp = Some(chrono::Utc::now());
         storage
@@ -1002,7 +1291,7 @@ mod tests {
             .await
             .unwrap();
         ra.sync_node("nodes/node0").await.unwrap();
-        assert_eq!(ra.cidr_set.allocate_next().unwrap(), net("10.10.2.0/24"));
+        assert_eq!(ra.cidr_set.allocate_next().unwrap(), ipn("10.10.2.0/24"));
         // A key for a node that no longer exists is a no-op, not an error.
         ra.sync_node("nodes/gone").await.unwrap();
     }
@@ -1044,7 +1333,7 @@ mod tests {
             .unwrap()
             .with_service_cidr(net("10.0.0.0/23"));
         let ra = RangeAllocator::new(storage, cfg, &[]).unwrap();
-        assert_eq!(ra.cidr_set.allocate_next().unwrap(), net("10.0.2.0/24"));
+        assert_eq!(ra.cidr_set.allocate_next().unwrap(), ipn("10.0.2.0/24"));
     }
 
     // The issue #1887 race: assignment must not serialise behind one worker.
