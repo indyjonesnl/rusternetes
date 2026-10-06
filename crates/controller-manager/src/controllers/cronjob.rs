@@ -1,3 +1,4 @@
+use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::service_account::ObjectReference;
@@ -15,6 +16,11 @@ use tracing::{debug, error, info, warn};
 fn job_name_for(cronjob_name: &str, scheduled_time: chrono::DateTime<chrono::Utc>) -> String {
     format!("{}-{}", cronjob_name, scheduled_time.timestamp() / 60)
 }
+
+/// Upstream `ConcurrentCronJobSyncs` default, workers launched by `Run`
+/// (pkg/controller/cronjob/config/v1alpha1/defaults.go:34;
+/// pkg/controller/cronjob/cronjob_controllerv2.go:156-159).
+const CONCURRENT_CRONJOB_SYNCS: usize = 5;
 
 pub struct CronJobController<S: Storage> {
     storage: Arc<S>,
@@ -71,10 +77,12 @@ impl<S: Storage + 'static> CronJobController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // Upstream starts `workers` goroutines over one queue (cronjob_controllerv2.go:156-159).
+        spawn_workers(CONCURRENT_CRONJOB_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {

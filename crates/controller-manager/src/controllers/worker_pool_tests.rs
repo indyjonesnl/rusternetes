@@ -199,3 +199,69 @@ async fn csr_runs_a_worker_pool() {
     .await;
     assert!(peak > 1, "csr run() peaked at {peak}");
 }
+
+#[tokio::test]
+async fn statefulset_runs_a_worker_pool() {
+    let peak = peak_concurrency(
+        "statefulsets",
+        12,
+        |i| {
+            let mut o = workload("StatefulSet", "apps/v1", i, match_labels());
+            o["spec"]["serviceName"] = json!("svc");
+            o
+        },
+        |s| async move {
+            let _ = Arc::new(crate::controllers::statefulset::StatefulSetController::new(
+                s,
+            ))
+            .run()
+            .await;
+        },
+    )
+    .await;
+    assert!(peak > 1, "statefulset run() peaked at {peak}");
+}
+
+#[tokio::test]
+async fn job_runs_a_worker_pool() {
+    let peak = peak_concurrency(
+        "jobs",
+        12,
+        |i| {
+            json!({
+                "apiVersion": "batch/v1", "kind": "Job", "metadata": meta(i),
+                "spec": {"selector": match_labels(), "template": template()}
+            })
+        },
+        |s| async move {
+            let _ = Arc::new(crate::controllers::job::JobController::new(s))
+                .run()
+                .await;
+        },
+    )
+    .await;
+    // Job's startup path also `get`s each Job outside the worker (the orphan
+    // sweep), so one worker can already show a peak of 2; a pool shows more.
+    assert!(peak > 2, "job run() peaked at {peak}");
+}
+
+#[tokio::test]
+async fn cronjob_runs_a_worker_pool() {
+    let peak = peak_concurrency(
+        "cronjobs",
+        12,
+        |i| {
+            json!({
+                "apiVersion": "batch/v1", "kind": "CronJob", "metadata": meta(i),
+                "spec": {"schedule": "0 0 1 1 *", "jobTemplate": {"spec": {"template": template()}}}
+            })
+        },
+        |s| async move {
+            let _ = Arc::new(crate::controllers::cronjob::CronJobController::new(s))
+                .run()
+                .await;
+        },
+    )
+    .await;
+    assert!(peak > 1, "cronjob run() peaked at {peak}");
+}

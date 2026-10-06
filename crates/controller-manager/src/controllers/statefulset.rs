@@ -1,4 +1,5 @@
 use super::replicationcontroller::slow_start_batches_capped;
+use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::{
@@ -18,6 +19,11 @@ const SLOW_START_INITIAL_BATCH_SIZE: usize = 1;
 /// `MaxBatchSize` (pkg/controller/statefulset/stateful_set_control.go:42).
 const MAX_BATCH_SIZE: usize = 500;
 
+/// Upstream `ConcurrentStatefulSetSyncs` default, workers launched by `Run`
+/// (pkg/controller/statefulset/config/v1alpha1/defaults.go:34;
+/// pkg/controller/statefulset/stateful_set.go:193-196).
+const CONCURRENT_STATEFULSET_SYNCS: usize = 5;
+
 pub struct StatefulSetController<S: Storage> {
     storage: Arc<S>,
 }
@@ -33,10 +39,12 @@ impl<S: Storage + 'static> StatefulSetController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // Upstream starts `workers` goroutines over one queue (stateful_set.go:193-196).
+        spawn_workers(CONCURRENT_STATEFULSET_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {
