@@ -18,8 +18,8 @@
 //! * The `clusterroleaggregation` controller: [`aggregation`] recomputes an
 //!   aggregated ClusterRole's rules when that ClusterRole is written instead.
 //! * Upstream wraps `Create`/`Update` of the standard storage; here the
-//!   policybased checks are the Store's `BeginCreate`/`BeginUpdate` hooks (see
-//!   [`policybased`] for the one ordering difference that causes).
+//!   policybased checks are the Store's `BeginCreate` hook and its
+//!   `update_transformers` (`rest.WrapUpdatedObjectInfo`), see [`policybased`].
 
 pub mod aggregation;
 pub mod clusterrole;

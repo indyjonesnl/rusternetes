@@ -116,6 +116,7 @@ pub fn new_store(
         storage,
     });
     store.begin_create = Some(hook.clone());
-    store.begin_update = Some(hook);
+    store.begin_update = Some(hook.clone());
+    store.update_transformers = vec![hook];
     store
 }

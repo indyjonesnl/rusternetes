@@ -548,6 +548,68 @@ async fn gc_only_update_skips_the_escalation_check() {
     assert_escalation_denied(s, &body);
 }
 
+/// `rest.WrapUpdatedObjectInfo` (rest/update.go:241-269) runs the policybased
+/// check on the object as the client sent it, BEFORE `Store.Update` copies the
+/// stored resourceVersion into an unconditional update
+/// (registry/generic/store.go:~713-721). `IsOnlyMutatingGCFields` compares
+/// resourceVersion (helpers.go:29-50), so an unconditional PUT with no
+/// resourceVersion that changes only finalizers is NOT GC-only and is checked
+/// (role/policybased/storage.go:76-99, and the three siblings).
+#[tokio::test]
+async fn unconditional_gc_only_update_is_escalation_checked_on_all_four_kinds() {
+    let api = rbac_api().await;
+    let (s, _) = api
+        .post(&roles("default"), &role("pods", pod_reader()))
+        .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, _) = api
+        .post(&clusterroles(), &clusterrole("pods", pod_reader()))
+        .await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    let mut cases = Vec::new();
+    let (s, v) = api.post(&roles("default"), &role("r1", pod_reader())).await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    cases.push((format!("{}/r1", roles("default")), v));
+    let (s, v) = api
+        .post(&clusterroles(), &clusterrole("cr1", pod_reader()))
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    cases.push((format!("{}/cr1", clusterroles()), v));
+    let (s, v) = api
+        .post(
+            &rolebindings("default"),
+            &rolebinding("rb1", "Role", "pods"),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    cases.push((format!("{}/rb1", rolebindings("default")), v));
+    let (s, v) = api
+        .post(&clusterrolebindings(), &clusterrolebinding("crb1", "pods"))
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    cases.push((format!("{}/crb1", clusterrolebindings()), v));
+
+    for (uri, created) in cases {
+        // With the resourceVersion the change is GC-only: allowed.
+        let mut gc = created.clone();
+        gc["metadata"]["finalizers"] = json!(["example.com/f"]);
+        let (s, body) = as_user(&api, "alice", "PUT", &uri, Some(&gc)).await;
+        assert_eq!(s, StatusCode::OK, "{uri}: {body}");
+
+        // Without it (unconditional) the object differs from the stored one in
+        // resourceVersion, so it is not GC-only and is checked.
+        let mut unconditional = body.clone();
+        unconditional["metadata"]["finalizers"] = json!(["example.com/g"]);
+        unconditional["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resourceVersion");
+        let (s, body) = as_user(&api, "alice", "PUT", &uri, Some(&unconditional)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
+}
+
 /// rolebinding/policybased/storage.go:62-95: binding a role needs its rules
 /// or the `bind` verb on it.
 #[tokio::test]
