@@ -20,7 +20,7 @@ use rusternetes_common::{Error, Result};
 
 use super::admission::{Admission, CreateValidation, MutatingAdmission, UpdateValidation};
 use super::rest::{
-    authorize, check_name, dry_run_param, is_dry_run, respond, ApplyFn, RequestScope,
+    authorize, check_name, dry_run_param, is_dry_run, respond_object, ApplyFn, RequestScope,
 };
 use crate::patch::{apply_patch, PatchType};
 use crate::registry::generic;
@@ -179,7 +179,7 @@ pub async fn patch_resource<T: Object>(
     } else {
         StatusCode::OK
     };
-    Ok(respond(status, &out, &ctx))
+    Ok(respond_object(scope, status, &out, &ctx))
 }
 
 /// `patchMechanism`: `jsonPatcher` / `smpPatcher` / `applyPatcher`.

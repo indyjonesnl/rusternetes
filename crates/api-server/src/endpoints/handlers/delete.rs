@@ -11,7 +11,7 @@ use rusternetes_common::validation::metav1::validate_delete_options;
 use rusternetes_common::{Error, List, Result, Status};
 
 use super::admission::{Admission, DeleteValidation};
-use super::rest::{authorize, dry_run_param, is_dry_run, respond, RequestScope};
+use super::rest::{authorize, dry_run_param, is_dry_run, respond, respond_object, RequestScope};
 use crate::registry::generic::Deleted;
 use crate::registry::rest::{zero_delete_options, Object, RequestContext};
 use crate::state::ApiServerState;
@@ -108,7 +108,7 @@ pub async fn delete_resource<T: Object>(
         StatusCode::OK
     };
     Ok(match result {
-        Deleted::Object(obj) => respond(status, &obj, &ctx),
+        Deleted::Object(obj) => respond_object(scope, status, &obj, &ctx),
         Deleted::Status(details) => {
             let mut body = Status::success();
             body.details = Some(details);
