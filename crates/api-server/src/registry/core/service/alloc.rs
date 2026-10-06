@@ -2,10 +2,8 @@
 //! update claims and frees node ports through a [`PortAllocationOperation`]
 //! and ClusterIPs through the [`MetaAllocator`].
 //!
-//! Only the primary family is allocated: this api-server configures one
-//! (IPv4) ClusterIP allocator, so [`init_ip_family_fields`] rejects a
-//! dual-stack requirement and the dual-stack cases of `updateClusterIPs`
-//! cannot be reached.
+//! One ClusterIP allocator per configured family, primary first
+//! (`--service-cluster-ip-range`).
 //!
 //! Every entry point hands back the operation. The caller commits it once the
 //! Service is persisted (`callbackTransaction.commit`, alloc.go:485-491) and
@@ -340,11 +338,6 @@ pub async fn settle<T>(mut op: PortAllocationOperation, result: &Result<T>) {
 // IP families
 // ---------------------------------------------------------------------------
 
-/// `Allocators.defaultServiceIPFamily`: the primary family. The primary
-/// range is IPv4 (see `ipranges::ServiceIpRanges::parse`), so the
-/// read-time defaulting of `default_on_read` can name it statically.
-pub const DEFAULT_SERVICE_IP_FAMILY: IPFamily = IPFamily::IPv4;
-
 fn other_family(fam: &IPFamily) -> IPFamily {
     match fam {
         IPFamily::IPv4 => IPFamily::IPv6,
@@ -630,6 +623,12 @@ impl<S: Storage> ClusterIpAllocators<S> {
                 })
                 .collect(),
         }
+    }
+
+    /// The primary family, `Allocators.defaultServiceIPFamily`
+    /// (alloc.go:41-48), i.e. `REST.primaryIPFamily` (storage.go:115-124).
+    pub fn primary_family(&self) -> IPFamily {
+        self.by_family[0].0.clone()
     }
 
     /// The configured families, primary first.

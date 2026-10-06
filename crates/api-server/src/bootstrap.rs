@@ -170,11 +170,16 @@ pub const ENDPOINT_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
 const SERVICE_KEY: &str = "/registry/services/default/kubernetes";
 
-/// ClusterIP of the `default/kubernetes` Service: the first address of the
-/// service range this api-server bootstraps as the `kubernetes` ServiceCIDR
-/// (10.96.0.0/12, see main.rs / lib.rs). Upstream derives it the same way, from
-/// the first IP of `--service-cluster-ip-range`.
+/// The `kubernetes` Service address under the default range. At runtime it is
+/// `ServiceIpRanges::api_server_service_ip` (the first address of the primary
+/// `--service-cluster-ip-range`, as upstream derives it).
+#[cfg(test)]
 const KUBERNETES_SERVICE_IP: &str = "10.96.0.1";
+
+#[cfg(test)]
+fn test_service_ip() -> std::net::IpAddr {
+    KUBERNETES_SERVICE_IP.parse().unwrap()
+}
 
 const ENDPOINTS_KEY: &str = "/registry/endpoints/default/kubernetes";
 const ENDPOINTSLICE_KEY: &str = "/registry/endpointslices/default/kubernetes";
@@ -412,6 +417,7 @@ async fn reconcile_endpointslice<S: Storage + ?Sized>(
 pub async fn reconcile_kubernetes_service<S: Storage + ?Sized>(
     storage: &S,
     api_server_port: u16,
+    service_ip: std::net::IpAddr,
 ) -> Result<()> {
     use rusternetes_common::resources::policy::IntOrString;
     use rusternetes_common::resources::{Service, ServicePort, ServiceSpec, ServiceType};
@@ -421,6 +427,14 @@ pub async fn reconcile_kubernetes_service<S: Storage + ?Sized>(
         return Ok(());
     }
 
+    // `cp.ServiceIPRange` (pkg/controlplane/apiserver/options/options.go:
+    // 378-382): the first address of the primary range; the family follows.
+    let service_ip_str = service_ip.to_string();
+    let family = if service_ip.is_ipv6() {
+        rusternetes_common::resources::service::IPFamily::IPv6
+    } else {
+        rusternetes_common::resources::service::IPFamily::IPv4
+    };
     let mut metadata = ObjectMeta::new("kubernetes");
     metadata.namespace = Some("default".to_string());
     metadata.ensure_uid();
@@ -438,7 +452,7 @@ pub async fn reconcile_kubernetes_service<S: Storage + ?Sized>(
         },
         metadata,
         spec: ServiceSpec {
-            cluster_ip: Some(KUBERNETES_SERVICE_IP.to_string()),
+            cluster_ip: Some(service_ip_str.clone()),
             ports: vec![ServicePort {
                 name: Some("https".to_string()),
                 port: 443,
@@ -470,8 +484,8 @@ pub async fn reconcile_kubernetes_service<S: Storage + ?Sized>(
             // in (pkg/registry/core/service/storage/alloc.go:239). We write
             // straight to storage, bypassing that allocator, so they have to be
             // set here or nothing sets them at all.
-            cluster_ips: Some(vec![KUBERNETES_SERVICE_IP.to_string()]),
-            ip_families: Some(vec![rusternetes_common::resources::service::IPFamily::IPv4]),
+            cluster_ips: Some(vec![service_ip_str.clone()]),
+            ip_families: Some(vec![family]),
             ip_family_policy: Some(
                 rusternetes_common::resources::service::IPFamilyPolicy::SingleStack,
             ),
@@ -487,7 +501,7 @@ pub async fn reconcile_kubernetes_service<S: Storage + ?Sized>(
         .context("Failed to create kubernetes Service")?;
     info!(
         "Created default/kubernetes Service ({} :443 -> :{})",
-        KUBERNETES_SERVICE_IP, api_server_port
+        service_ip_str, api_server_port
     );
     Ok(())
 }
@@ -509,6 +523,7 @@ pub async fn reconcile_kubernetes_endpoint<S: Storage + ?Sized>(
 pub async fn bootstrap_kubernetes_service(
     storage: Arc<StorageBackend>,
     api_server_port: u16,
+    service_ip: std::net::IpAddr,
 ) -> Result<()> {
     info!("Bootstrapping kubernetes Service and Endpoints");
     let api_server_ip = get_api_server_ip().context("Failed to discover API server IP address")?;
@@ -516,7 +531,7 @@ pub async fn bootstrap_kubernetes_service(
         "API server IP: {}, Port: {}",
         api_server_ip, api_server_port
     );
-    reconcile_kubernetes_service(storage.as_ref(), api_server_port).await?;
+    reconcile_kubernetes_service(storage.as_ref(), api_server_port, service_ip).await?;
     reconcile_kubernetes_endpoint(storage.as_ref(), &api_server_ip, api_server_port).await
 }
 
@@ -529,6 +544,7 @@ pub async fn bootstrap_kubernetes_service(
 pub fn spawn_endpoint_reconciler(
     storage: Arc<StorageBackend>,
     api_server_port: u16,
+    service_ip: std::net::IpAddr,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(ENDPOINT_RECONCILE_INTERVAL);
@@ -546,7 +562,9 @@ pub fn spawn_endpoint_reconciler(
                     continue;
                 }
             };
-            if let Err(e) = reconcile_kubernetes_service(storage.as_ref(), api_server_port).await {
+            if let Err(e) =
+                reconcile_kubernetes_service(storage.as_ref(), api_server_port, service_ip).await
+            {
                 warn!("endpoint reconciler: service reconcile failed: {}", e);
             }
             if let Err(e) =
@@ -597,7 +615,7 @@ const DEFAULT_SERVICE_CIDR_CONTROLLER: &str = "kubernetes-service-cidr-controlle
 /// [`crate::registry::core::service::ipranges::ServiceIpRanges`]. The
 /// `kubernetes` ServiceCIDR is seeded from the configured range, and
 /// ClusterIPs are allocated from the ServiceCIDRs. Must stay in step with
-/// [`KUBERNETES_SERVICE_IP`] (the range's first address).
+/// the `kubernetes` Service address (the range's first address).
 #[cfg(test)]
 const DEFAULT_SERVICE_CIDRS: &[&str] = &["10.96.0.0/12"];
 
@@ -1725,6 +1743,33 @@ mod tests {
         }
     }
 
+    /// An IPv6-primary range: the `kubernetes` Service takes the range's first
+    /// address (`cp.ServiceIPRange`, options.go:378-382) and its family.
+    #[tokio::test]
+    async fn kubernetes_service_follows_an_ipv6_primary_range() {
+        use rusternetes_common::resources::service::IPFamily;
+
+        let storage = MemoryStorage::new();
+        let ip =
+            crate::registry::core::service::ipranges::ServiceIpRanges::parse("fd00:10:96::/112")
+                .unwrap()
+                .api_server_service_ip();
+        reconcile_kubernetes_service(&storage, 6443, ip)
+            .await
+            .unwrap();
+        let svc: rusternetes_common::resources::Service =
+            storage.get(SERVICE_KEY).await.expect("kubernetes Service");
+        assert_eq!(svc.spec.cluster_ip.as_deref(), Some("fd00:10:96::1"));
+        assert_eq!(
+            svc.spec.cluster_ips.as_deref(),
+            Some(["fd00:10:96::1".to_string()].as_slice())
+        );
+        assert_eq!(
+            svc.spec.ip_families.as_deref(),
+            Some([IPFamily::IPv6].as_slice())
+        );
+    }
+
     /// The api-server must own the `default/kubernetes` Service, as upstream's
     /// kubernetesservice controller does (`pkg/controlplane/instance.go:349`,
     /// which creates AND repairs it on every reconcile tick).
@@ -1744,7 +1789,9 @@ mod tests {
     #[tokio::test]
     async fn creates_the_kubernetes_service_when_absent() {
         let storage = MemoryStorage::new();
-        reconcile_kubernetes_service(&storage, 6443).await.unwrap();
+        reconcile_kubernetes_service(&storage, 6443, test_service_ip())
+            .await
+            .unwrap();
 
         let svc: rusternetes_common::resources::Service =
             storage.get(SERVICE_KEY).await.expect("kubernetes Service");
@@ -1788,7 +1835,9 @@ mod tests {
         use rusternetes_common::resources::service::{IPFamily, IPFamilyPolicy};
 
         let storage = MemoryStorage::new();
-        reconcile_kubernetes_service(&storage, 6443).await.unwrap();
+        reconcile_kubernetes_service(&storage, 6443, test_service_ip())
+            .await
+            .unwrap();
         let svc: rusternetes_common::resources::Service =
             storage.get(SERVICE_KEY).await.expect("kubernetes Service");
 
@@ -1820,9 +1869,13 @@ mod tests {
     #[tokio::test]
     async fn reconciling_the_service_twice_is_stable() {
         let storage = MemoryStorage::new();
-        reconcile_kubernetes_service(&storage, 6443).await.unwrap();
+        reconcile_kubernetes_service(&storage, 6443, test_service_ip())
+            .await
+            .unwrap();
         let first: rusternetes_common::resources::Service = storage.get(SERVICE_KEY).await.unwrap();
-        reconcile_kubernetes_service(&storage, 6443).await.unwrap();
+        reconcile_kubernetes_service(&storage, 6443, test_service_ip())
+            .await
+            .unwrap();
         let second: rusternetes_common::resources::Service =
             storage.get(SERVICE_KEY).await.unwrap();
         assert_eq!(first.metadata.uid, second.metadata.uid, "must not recreate");
@@ -1836,9 +1889,13 @@ mod tests {
     #[tokio::test]
     async fn recreates_the_service_after_deletion() {
         let storage = MemoryStorage::new();
-        reconcile_kubernetes_service(&storage, 6443).await.unwrap();
+        reconcile_kubernetes_service(&storage, 6443, test_service_ip())
+            .await
+            .unwrap();
         storage.delete(SERVICE_KEY).await.unwrap();
-        reconcile_kubernetes_service(&storage, 6443).await.unwrap();
+        reconcile_kubernetes_service(&storage, 6443, test_service_ip())
+            .await
+            .unwrap();
         let svc: rusternetes_common::resources::Service = storage
             .get(SERVICE_KEY)
             .await

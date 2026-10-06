@@ -15,7 +15,7 @@ use rusternetes_common::validation::service::parse_ip_sloppy;
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::StorageBackend;
 
-use super::alloc::{self, ClusterIpAllocators, ClusterIpTxn, DEFAULT_SERVICE_IP_FAMILY};
+use super::alloc::{self, ClusterIpAllocators, ClusterIpTxn};
 use super::portallocator::operation::PortAllocationOperation;
 use super::portallocator::PortAllocator;
 use super::strategy::{StatusStrategy, Strategy};
@@ -154,23 +154,22 @@ fn other_family(fam: &IPFamily) -> IPFamily {
 }
 
 /// `defaultOnReadIPFamilies` (storage.go:281-330).
-fn default_on_read_ip_families(svc: &mut Service) {
+fn default_on_read_ip_families(svc: &mut Service, primary: &IPFamily) {
     if !needs_cluster_ip(svc) {
         return;
     }
     if svc.spec.ip_families.as_ref().is_some_and(|f| !f.is_empty()) {
         return;
     }
-    let primary = DEFAULT_SERVICE_IP_FAMILY;
     if cluster_ip(svc) == "None" {
         if svc.spec.selector.as_ref().is_none_or(|s| s.is_empty()) {
             // Headless + selectorless.
             svc.spec.ip_family_policy = Some(IPFamilyPolicy::RequireDualStack);
-            let other = other_family(&primary);
-            svc.spec.ip_families = Some(vec![primary, other]);
+            let other = other_family(primary);
+            svc.spec.ip_families = Some(vec![primary.clone(), other]);
         } else {
             svc.spec.ip_family_policy = Some(IPFamilyPolicy::SingleStack);
-            svc.spec.ip_families = Some(vec![primary]);
+            svc.spec.ip_families = Some(vec![primary.clone()]);
         }
     } else {
         // Headful: families from clusterIPs.
@@ -195,10 +194,10 @@ fn default_on_read_ip_families(svc: &mut Service) {
 }
 
 /// `defaultOnReadService` (storage.go:255-274): the `Decorator`.
-pub fn default_on_read(svc: &mut Service) {
+pub fn default_on_read(svc: &mut Service, primary: &IPFamily) {
     // Services written before ClusterIP became plural.
     normalize_cluster_ips(svc, None);
-    default_on_read_ip_families(svc);
+    default_on_read_ip_families(svc, primary);
     // `defaultOnReadInternalTrafficPolicy`.
     if is_type(svc, ServiceType::ExternalName) {
         svc.spec.internal_traffic_policy = None;
@@ -293,7 +292,7 @@ impl BeginUpdate<Service> for ServiceRest {
     ) -> Result<Box<dyn Finish>> {
         // The Decorator is not called on the stored object in the update
         // path.
-        default_on_read(old);
+        default_on_read(old, &self.ips.primary_family());
         patch_allocated_values(svc, old);
         normalize_cluster_ips(svc, Some(old));
         Ok(Box::new(
@@ -308,7 +307,7 @@ impl AfterDelete<Service> for ServiceRest {
     /// name, then release what the Service held.
     async fn after_delete(&self, obj: &Service, options: &DeleteOptions) {
         let mut svc = obj.clone();
-        default_on_read(&mut svc);
+        default_on_read(&mut svc, &self.ips.primary_family());
         if options.dry_run.as_ref().is_some_and(|d| !d.is_empty()) {
             return;
         }
@@ -343,6 +342,7 @@ pub fn new_stores(
     Store<Service, StorageBackend>,
     Store<Service, StorageBackend>,
 ) {
+    let primary = ips.primary_family();
     let rest = Arc::new(ServiceRest {
         ips,
         ports,
@@ -359,7 +359,9 @@ pub fn new_stores(
     let mut status = store.with_update_strategy(Arc::new(StatusStrategy));
     status.after_delete = Some(rest.clone());
 
-    store.decorator = Some(Arc::new(default_on_read));
+    store.decorator = Some(Arc::new(move |svc: &mut Service| {
+        default_on_read(svc, &primary)
+    }));
     store.after_delete = Some(rest.clone());
     store.begin_create = Some(rest.clone());
     store.begin_update = Some(rest);
@@ -521,9 +523,34 @@ mod tests {
     #[test]
     fn default_on_read_infers_families() {
         let mut s = svc("10.0.0.10", None);
-        default_on_read(&mut s);
+        default_on_read(&mut s, &IPFamily::IPv4);
         assert_eq!(cluster_ips(&s), &["10.0.0.10"]);
         assert_eq!(s.spec.ip_families, Some(vec![IPFamily::IPv4]));
         assert_eq!(s.spec.ip_family_policy, Some(IPFamilyPolicy::SingleStack));
+    }
+
+    /// `defaultOnReadIPFamilies` on an IPv6-primary cluster
+    /// (storage.go:281-330 uses `r.primaryIPFamily`, not a fixed IPv4).
+    #[test]
+    fn default_on_read_headless_uses_the_primary_family() {
+        let mut selectorless = svc("None", None);
+        default_on_read(&mut selectorless, &IPFamily::IPv6);
+        assert_eq!(
+            selectorless.spec.ip_families,
+            Some(vec![IPFamily::IPv6, IPFamily::IPv4])
+        );
+        assert_eq!(
+            selectorless.spec.ip_family_policy,
+            Some(IPFamilyPolicy::RequireDualStack)
+        );
+
+        let mut with_selector = svc("None", None);
+        with_selector.spec.selector = Some([("a".to_string(), "b".to_string())].into());
+        default_on_read(&mut with_selector, &IPFamily::IPv6);
+        assert_eq!(with_selector.spec.ip_families, Some(vec![IPFamily::IPv6]));
+        assert_eq!(
+            with_selector.spec.ip_family_policy,
+            Some(IPFamilyPolicy::SingleStack)
+        );
     }
 }
