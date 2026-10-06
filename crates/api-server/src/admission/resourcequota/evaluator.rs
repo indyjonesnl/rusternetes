@@ -5,17 +5,21 @@
 //! `pkg/quota/v1/evaluator/core/services.go` (`serviceEvaluator`), with the
 //! registry of `pkg/quota/v1/evaluator/core/registry.go`.
 //!
-//! The pod and PersistentVolumeClaim evaluators (`pods.go`,
-//! `persistent_volume_claims.go`) are not ported here: pods are admitted by
-//! the pod handler's own quota check (`crate::admission::check_resource_quota`),
-//! and the quota controller does not yet compute the PVC evaluator's
-//! `requests.storage` usage, so enforcing it would reject every claim with
-//! `status unknown for quota` (#2081).
+//! and `pkg/quota/v1/evaluator/core/persistent_volume_claims.go`
+//! (`pvcEvaluator`; its `Usage` is `rusternetes_common::quota::pvc_usage`,
+//! shared with the quota controller's `UsageStats`). Not ported yet: the
+//! VolumeAttributesClass scope, and `Handles` for the `status` subresource
+//! (`RequiresQuotaReplenish`).
+//!
+//! The pod evaluator (`pods.go`) is not ported here: pods are admitted by
+//! the pod handler's own quota check (`crate::admission::check_resource_quota`)
+//! until Pods move onto the Store (#1990).
 
 use rusternetes_common::admission::Operation;
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::quota::ResourceList;
-use rusternetes_common::resources::{ResourceQuota, Service, ServiceType};
+use rusternetes_common::quota::{pvc_matches_resource_name, pvc_usage};
+use rusternetes_common::resources::{PersistentVolumeClaim, ResourceQuota, Service, ServiceType};
 use serde_json::Value;
 
 use crate::registry::rest::GroupResource;
@@ -186,6 +190,35 @@ impl Evaluator for ServiceEvaluator {
     }
 }
 
+/// `pvcEvaluator` (persistent_volume_claims.go:73-160).
+pub struct PersistentVolumeClaimEvaluator;
+
+impl Evaluator for PersistentVolumeClaimEvaluator {
+    /// persistent_volume_claims.go:93-96: create and update of the claim
+    /// itself.
+    fn handles(&self, operation: &Operation, subresource: Option<&str>) -> bool {
+        subresource.is_none() && matches!(operation, Operation::Create | Operation::Update)
+    }
+
+    fn matching_resources(&self, input: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = input
+            .iter()
+            .filter(|n| pvc_matches_resource_name(n))
+            .cloned()
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn usage(&self, obj: &Value) -> Result<ResourceList, String> {
+        let pvc: PersistentVolumeClaim = serde_json::from_value(obj.clone()).map_err(|e| {
+            format!("expect *api.PersistentVolumeClaim or *v1.PersistentVolumeClaim, got {e}")
+        })?;
+        Ok(pvc_usage(&pvc))
+    }
+}
+
 /// `legacyObjectCountAliases` (registry.go:33-38).
 fn legacy_object_count_alias(gr: &GroupResource) -> Option<&'static str> {
     if !gr.group.is_empty() {
@@ -204,12 +237,13 @@ fn legacy_object_count_alias(gr: &GroupResource) -> Option<&'static str> {
 /// (registry.go:41-70), falling back to an object-count evaluator as
 /// `quotaEvaluator.Evaluate` does for an unregistered resource
 /// (plugin/resourcequota/controller.go:667-674). `None` for the resources
-/// whose evaluator is not ported (see the module docs).
+/// whose evaluator is not ported (pods; see the module docs).
 pub fn evaluator_for(gr: &GroupResource) -> Option<Box<dyn Evaluator>> {
     if gr.group.is_empty() {
         match gr.resource.as_str() {
             "services" => return Some(Box::new(ServiceEvaluator)),
-            "pods" | "persistentvolumeclaims" => return None,
+            "persistentvolumeclaims" => return Some(Box::new(PersistentVolumeClaimEvaluator)),
+            "pods" => return None,
             _ => {}
         }
     }

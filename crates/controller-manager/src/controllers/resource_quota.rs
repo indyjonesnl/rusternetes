@@ -588,7 +588,7 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
         });
         let needs_pvcs = hard_keys
             .iter()
-            .any(|k| k == "persistentvolumeclaims" || k == "count/persistentvolumeclaims");
+            .any(|k| quota::pvc_matches_resource_name(k));
         let needs_rcs = hard_keys
             .iter()
             .any(|k| k == "replicationcontrollers" || k == "count/replicationcontrollers");
@@ -707,14 +707,32 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
         }
 
         if needs_pvcs {
-            let pvc_prefix = format!("/registry/persistentvolumeclaims/{}/", namespace);
-            let pvcs: Vec<serde_json::Value> =
-                self.storage.list(&pvc_prefix).await.unwrap_or_default();
-            usage.insert("persistentvolumeclaims".to_string(), pvcs.len().to_string());
-            usage.insert(
-                "count/persistentvolumeclaims".to_string(),
-                pvcs.len().to_string(),
-            );
+            // `pvcEvaluator.UsageStats` (persistent_volume_claims.go:226-232):
+            // `CalculateUsageStats` seeds every tracked key with zero, then
+            // adds each scope-matching claim's `Usage` - the same
+            // `pvc_usage` quota admission charges, so `status.used` carries
+            // `requests.storage` and the per-class keys admission reads.
+            // `pvcMatchesScopeFunc` matches only the VolumeAttributesClass
+            // scope (not ported yet), so a scoped quota matches no claim.
+            let scoped = !scopes.is_empty()
+                || scope_selector.is_some_and(|s| !s.match_expressions.is_empty());
+            let zero = Quantity::from_value(0, Format::DecimalSI);
+            let mut totals = quota::ResourceList::new();
+            for key in hard_keys
+                .iter()
+                .filter(|k| quota::pvc_matches_resource_name(k))
+            {
+                totals.insert(key.clone(), zero);
+            }
+            if !scoped {
+                let pvc_prefix = format!("/registry/persistentvolumeclaims/{}/", namespace);
+                let pvcs: Vec<rusternetes_common::resources::PersistentVolumeClaim> =
+                    self.storage.list(&pvc_prefix).await.unwrap_or_default();
+                for pvc in &pvcs {
+                    totals = quota::add(&totals, &quota::pvc_usage(pvc));
+                }
+            }
+            usage.extend(quota::to_string_map(&totals));
         }
 
         if needs_rcs {
@@ -1232,6 +1250,61 @@ mod tests {
         // Upstream charges an extended resource only under `requests.<name>`
         // (`podComputeUsageHelper`, `pods.go:324-328`).
         assert!(!usage.contains_key("example.com/dongle"));
+    }
+
+    /// `pvcEvaluator.UsageStats` (persistent_volume_claims.go:226): the
+    /// controller reports `requests.storage` and the per-class keys quota
+    /// admission reads, and a tracked key with no claims is zero, not absent.
+    #[tokio::test]
+    async fn test_calculate_usage_pvc_storage_and_class() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ResourceQuotaController::new(storage.clone());
+        for (name, class, size) in [
+            ("a", "gold", "10Gi"),
+            ("b", "gold", "5Gi"),
+            ("c", "tin", "1Gi"),
+        ] {
+            let pvc: serde_json::Value = serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": {"name": name, "namespace": "test-ns"},
+                "spec": {"storageClassName": class,
+                         "resources": {"requests": {"storage": size}}},
+            });
+            storage
+                .create(
+                    &format!("/registry/persistentvolumeclaims/test-ns/{name}"),
+                    &pvc,
+                )
+                .await
+                .unwrap();
+        }
+        let hard: Vec<String> = [
+            "persistentvolumeclaims",
+            "requests.storage",
+            "gold.storageclass.storage.k8s.io/requests.storage",
+            "gold.storageclass.storage.k8s.io/persistentvolumeclaims",
+            "bronze.storageclass.storage.k8s.io/requests.storage",
+        ]
+        .map(String::from)
+        .to_vec();
+        let usage = controller
+            .calculate_usage("test-ns", &[], None, &hard)
+            .await
+            .unwrap();
+        assert_eq!(usage["persistentvolumeclaims"], "3");
+        assert_eq!(usage["requests.storage"], "16Gi");
+        assert_eq!(
+            usage["gold.storageclass.storage.k8s.io/requests.storage"],
+            "15Gi"
+        );
+        assert_eq!(
+            usage["gold.storageclass.storage.k8s.io/persistentvolumeclaims"],
+            "2"
+        );
+        assert_eq!(
+            usage["bronze.storageclass.storage.k8s.io/requests.storage"],
+            "0"
+        );
     }
 
     /// A pod's peak footprint includes its init containers: upstream

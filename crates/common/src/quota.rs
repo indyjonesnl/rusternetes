@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use chrono::{DateTime, Duration, Utc};
 
 use crate::quantity::{Format, Quantity};
-use crate::resources::Pod;
+use crate::resources::{PersistentVolumeClaim, Pod};
 use crate::types::{Phase, ResourceRequirements};
 
 /// A resource name → quantity map. Upstream `corev1.ResourceList`.
@@ -591,6 +591,90 @@ pub fn is_quota_charged(pod: &Pod, now: DateTime<Utc>) -> bool {
         }
     }
     true
+}
+
+/// `storageClassSuffix` (`pkg/quota/v1/evaluator/core/persistent_volume_claims.go:47`).
+pub const STORAGE_CLASS_SUFFIX: &str = ".storageclass.storage.k8s.io/";
+
+/// `corev1.BetaStorageClassAnnotation`.
+const BETA_STORAGE_CLASS_ANNOTATION: &str = "volume.beta.kubernetes.io/storage-class";
+
+/// `GetPersistentVolumeClaimClass`
+/// (`staging/src/k8s.io/component-helpers/storage/volume/helpers.go:43-54`):
+/// the beta annotation first, then `spec.storageClassName`.
+pub fn persistent_volume_claim_class(pvc: &PersistentVolumeClaim) -> String {
+    if let Some(class) = pvc
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(BETA_STORAGE_CLASS_ANNOTATION))
+    {
+        return class.clone();
+    }
+    pvc.spec.storage_class_name.clone().unwrap_or_default()
+}
+
+/// `pvcEvaluator.getStorageUsage`
+/// (`persistent_volume_claims.go:195-224`): the storage request rounded up
+/// to whole bytes (issue 94313), or a larger `status.allocatedResources`
+/// (`RecoverVolumeExpansionFailure`, beta and on by default in 1.35).
+fn pvc_storage_usage(pvc: &PersistentVolumeClaim) -> Option<Quantity> {
+    let round_up = |q: Quantity| Quantity::from_value(q.value() as i64, q.format());
+    let request = pvc
+        .spec
+        .resources
+        .requests
+        .as_ref()
+        .and_then(|r| r.get("storage"))
+        .and_then(|v| Quantity::parse(v.trim()).ok())?;
+    let mut result = round_up(request);
+    if let Some(allocated) = pvc
+        .status
+        .as_ref()
+        .and_then(|s| s.allocated_resources.as_ref())
+        .and_then(|r| r.get("storage"))
+        .and_then(|v| Quantity::parse(v.trim()).ok())
+    {
+        if allocated.cmp_value(&result) == std::cmp::Ordering::Greater {
+            result = round_up(allocated);
+        }
+    }
+    Some(result)
+}
+
+/// `pvcEvaluator.Usage` (`persistent_volume_claims.go:164-193`): what one
+/// claim is charged, under its own keys and the per-storage-class ones.
+pub fn pvc_usage(pvc: &PersistentVolumeClaim) -> ResourceList {
+    let one = || Quantity::from_value(1, Format::DecimalSI);
+    let mut result = ResourceList::new();
+    result.insert("persistentvolumeclaims".to_string(), one());
+    result.insert("count/persistentvolumeclaims".to_string(), one());
+    let class = persistent_volume_claim_class(pvc);
+    if !class.is_empty() {
+        result.insert(
+            format!("{class}{STORAGE_CLASS_SUFFIX}persistentvolumeclaims"),
+            one(),
+        );
+    }
+    if let Some(storage) = pvc_storage_usage(pvc) {
+        result.insert("requests.storage".to_string(), storage);
+        if !class.is_empty() {
+            result.insert(
+                format!("{class}{STORAGE_CLASS_SUFFIX}requests.storage"),
+                storage,
+            );
+        }
+    }
+    result
+}
+
+/// `pvcEvaluator.MatchingResources` (`persistent_volume_claims.go:129-151`).
+pub fn pvc_matches_resource_name(name: &str) -> bool {
+    matches!(
+        name,
+        "persistentvolumeclaims" | "requests.storage" | "count/persistentvolumeclaims"
+    ) || name.ends_with(&format!("{STORAGE_CLASS_SUFFIX}persistentvolumeclaims"))
+        || name.ends_with(&format!("{STORAGE_CLASS_SUFFIX}requests.storage"))
 }
 
 #[cfg(test)]
@@ -1367,5 +1451,87 @@ mod tests {
         });
         let _g = with_feature(Feature::PodLevelResources, false);
         assert!(pod_constraints(&p, &names(&["requests.cpu"])).is_err());
+    }
+
+    fn pvc(
+        spec: serde_json::Value,
+        status: serde_json::Value,
+        ann: serde_json::Value,
+    ) -> crate::resources::PersistentVolumeClaim {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": {"name": "c", "namespace": "ns", "annotations": ann},
+            "spec": spec, "status": status,
+        }))
+        .unwrap()
+    }
+
+    fn s(list: &ResourceList, k: &str) -> String {
+        list[k].canonical_string()
+    }
+
+    /// `pvcEvaluator.Usage`: claim count, request, and the per-class keys.
+    #[test]
+    fn pvc_usage_charges_claim_storage_and_class() {
+        let c = pvc(
+            serde_json::json!({"storageClassName": "gold", "resources": {"requests": {"storage": "10Gi"}}}),
+            serde_json::json!({"phase": "Pending"}),
+            serde_json::json!({}),
+        );
+        let u = pvc_usage(&c);
+        assert_eq!(s(&u, "persistentvolumeclaims"), "1");
+        assert_eq!(s(&u, "count/persistentvolumeclaims"), "1");
+        assert_eq!(s(&u, "requests.storage"), "10Gi");
+        assert_eq!(
+            s(
+                &u,
+                "gold.storageclass.storage.k8s.io/persistentvolumeclaims"
+            ),
+            "1"
+        );
+        assert_eq!(
+            s(&u, "gold.storageclass.storage.k8s.io/requests.storage"),
+            "10Gi"
+        );
+    }
+
+    /// The beta annotation wins over `spec.storageClassName`
+    /// (`GetPersistentVolumeClaimClass`), and a claim with no request
+    /// charges no `requests.storage`.
+    #[test]
+    fn pvc_usage_beta_annotation_and_no_request() {
+        let c = pvc(
+            serde_json::json!({"storageClassName": "gold"}),
+            serde_json::json!({}),
+            serde_json::json!({"volume.beta.kubernetes.io/storage-class": "bronze"}),
+        );
+        let u = pvc_usage(&c);
+        assert!(u.contains_key("bronze.storageclass.storage.k8s.io/persistentvolumeclaims"));
+        assert!(!u.contains_key("requests.storage"));
+        assert!(!u.contains_key("gold.storageclass.storage.k8s.io/persistentvolumeclaims"));
+    }
+
+    /// `getStorageUsage`: rounded up to whole bytes (issue 94313), and a
+    /// larger `status.allocatedResources` wins.
+    #[test]
+    fn pvc_usage_rounds_up_and_prefers_larger_allocated() {
+        let c = pvc(
+            serde_json::json!({"resources": {"requests": {"storage": "1500m"}}}),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        assert_eq!(s(&pvc_usage(&c), "requests.storage"), "2");
+        let c = pvc(
+            serde_json::json!({"resources": {"requests": {"storage": "1Gi"}}}),
+            serde_json::json!({"allocatedResources": {"storage": "2Gi"}}),
+            serde_json::json!({}),
+        );
+        assert_eq!(s(&pvc_usage(&c), "requests.storage"), "2Gi");
+        let c = pvc(
+            serde_json::json!({"resources": {"requests": {"storage": "3Gi"}}}),
+            serde_json::json!({"allocatedResources": {"storage": "2Gi"}}),
+            serde_json::json!({}),
+        );
+        assert_eq!(s(&pvc_usage(&c), "requests.storage"), "3Gi");
     }
 }
