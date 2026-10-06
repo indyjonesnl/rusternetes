@@ -37,7 +37,7 @@ use crate::resources::policy::IntOrString;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
     is_dns1123_label, is_dns1123_subdomain, is_dns1123_subdomain_with_underscore,
-    is_qualified_name, validate_label_name, validate_label_selector,
+    is_qualified_name, is_valid_label_value, validate_label_name, validate_label_selector,
     LabelSelectorValidationOptions,
 };
 use once_cell::sync::Lazy;
@@ -3428,93 +3428,101 @@ pub fn validate_tolerations_with_options(
 
     for (i, tol) in tolerations.iter().enumerate() {
         let tpath = fld_path.index(i);
+        let key = tol.key.as_deref().unwrap_or("");
+        let value = tol.value.as_deref().unwrap_or("");
+        let operator = tol.operator.as_deref().unwrap_or("");
+        let effect = tol.effect.as_deref().unwrap_or("");
 
-        // operator enum.
-        if let Some(ref op) = tol.operator {
-            match op.as_str() {
-                "Equal" => {
-                    // value may or may not be set — upstream allows any value.
-                }
-                "Exists" => {
-                    // Exists operator must not have a value.
-                    if tol.value.as_ref().is_some_and(|v| !v.is_empty()) {
-                        errs.push(Error::invalid(
-                            &tpath.child("operator"),
-                            op.clone(),
-                            "if the operator is 'Exists', the value should be empty",
-                        ));
-                    }
-                }
-                "Lt" | "Gt" => {
-                    // validation.go:4392-4408: the numeric operators need the
-                    // validation option; without it the operator is not
-                    // supported, and the list names all four.
-                    if !allow_comparison_operators {
-                        errs.push(Error::not_supported(
-                            &tpath.child("operator"),
-                            op.clone(),
-                            &["Equal", "Exists", "Lt", "Gt"],
-                        ));
-                    } else {
-                        let value = tol.value.as_deref().unwrap_or("");
-                        for msg in is_decimal_integer(value) {
-                            errs.push(Error::invalid(&tpath.child("value"), value, msg));
-                        }
-                        if let Err(e) = value.parse::<i64>() {
-                            // Go's `strconv.NumError` text.
-                            let reason = match e.kind() {
-                                std::num::IntErrorKind::PosOverflow
-                                | std::num::IntErrorKind::NegOverflow => "value out of range",
-                                _ => "invalid syntax",
-                            };
-                            errs.push(Error::invalid(
-                                &tpath.child("value"),
-                                value,
-                                format!("strconv.ParseInt: parsing \"{value}\": {reason}"),
-                            ));
-                        }
-                    }
-                }
-                other => {
-                    errs.push(Error::not_supported(
+        // validation.go:4364-4367: validate the toleration key.
+        if !key.is_empty() {
+            errs.extend(validate_label_name(key, &tpath.child("key")));
+        }
+
+        // validation.go:4370-4373: empty key needs the Exists operator.
+        if key.is_empty() && operator != "Exists" {
+            errs.push(Error::invalid(
+                &tpath.child("operator"),
+                operator,
+                "operator must be Exists when `key` is empty, which means \"match all values and all keys\"",
+            ));
+        }
+
+        // validation.go:4375-4378: tolerationSeconds needs NoExecute (an empty
+        // effect also fails), reported on the effect path.
+        if tol.toleration_seconds.is_some() && effect != "NoExecute" {
+            errs.push(Error::invalid(
+                &tpath.child("effect"),
+                effect,
+                "effect must be 'NoExecute' when `tolerationSeconds` is set",
+            ));
+        }
+
+        // validation.go:4380-4412: operator and value.
+        match operator {
+            // An empty operator means Equal.
+            "Equal" | "" => {
+                let msgs = is_valid_label_value(value);
+                if !msgs.is_empty() {
+                    errs.push(Error::invalid(
                         &tpath.child("operator"),
-                        other.to_string(),
-                        &["Equal", "Exists"],
+                        value,
+                        msgs.join(";"),
                     ));
                 }
+            }
+            "Exists" => {
+                if !value.is_empty() {
+                    errs.push(Error::invalid(
+                        &tpath.child("operator"),
+                        value,
+                        "value must be empty when `operator` is 'Exists'",
+                    ));
+                }
+            }
+            "Lt" | "Gt" => {
+                // Numeric comparison operators need the validation option.
+                if !allow_comparison_operators {
+                    errs.push(Error::not_supported(
+                        &tpath.child("operator"),
+                        operator.to_string(),
+                        &["Equal", "Exists", "Lt", "Gt"],
+                    ));
+                } else {
+                    for msg in is_decimal_integer(value) {
+                        errs.push(Error::invalid(&tpath.child("value"), value, msg));
+                    }
+                    if let Err(e) = value.parse::<i64>() {
+                        // Go's `strconv.NumError` text.
+                        let reason = match e.kind() {
+                            std::num::IntErrorKind::PosOverflow
+                            | std::num::IntErrorKind::NegOverflow => "value out of range",
+                            _ => "invalid syntax",
+                        };
+                        errs.push(Error::invalid(
+                            &tpath.child("value"),
+                            value,
+                            format!("strconv.ParseInt: parsing \"{value}\": {reason}"),
+                        ));
+                    }
+                }
+            }
+            other => {
+                errs.push(Error::not_supported(
+                    &tpath.child("operator"),
+                    other.to_string(),
+                    &["Equal", "Exists"],
+                ));
             }
         }
 
-        // effect enum.
-        if let Some(ref effect) = tol.effect {
-            match effect.as_str() {
-                "NoSchedule" | "PreferNoSchedule" => {
-                    // tolerationSeconds must be absent for these effects.
-                    if let Some(secs) = tol.toleration_seconds {
-                        errs.push(Error::invalid(
-                            &tpath.child("tolerationSeconds"),
-                            secs,
-                            "effect must be 'NoExecute' when `tolerationSeconds` is set",
-                        ));
-                    }
-                }
-                "NoExecute" => {
-                    // tolerationSeconds may be set — any value is valid.
-                }
-                other => {
-                    errs.push(Error::not_supported(
-                        &tpath.child("effect"),
-                        other.to_string(),
-                        &["NoSchedule", "PreferNoSchedule", "NoExecute"],
-                    ));
-                }
-            }
-        } else if let Some(secs) = tol.toleration_seconds {
-            // No effect but tolerationSeconds set → only valid for NoExecute.
-            errs.push(Error::invalid(
-                &tpath.child("tolerationSeconds"),
-                secs,
-                "effect must be 'NoExecute' when `tolerationSeconds` is set",
+        // validation.go:4414-4416 / validateTaintEffect (:4277): an empty
+        // effect matches all taint effects.
+        if !effect.is_empty() && !matches!(effect, "NoSchedule" | "PreferNoSchedule" | "NoExecute")
+        {
+            errs.push(Error::not_supported(
+                &tpath.child("effect"),
+                effect.to_string(),
+                &["NoSchedule", "PreferNoSchedule", "NoExecute"],
             ));
         }
     }
@@ -3657,7 +3665,10 @@ pub fn validate_pod_dns_config(
     errs
 }
 
-/// Mirrors upstream `validateOnlyAddedTolerations` (validation.go:5630).
+/// Mirrors upstream `validateOnlyAddedTolerations`
+/// (`validation.go:4303-4324`, release-1.35): an existing toleration may only
+/// change its `tolerationSeconds`. The trailing `ValidateTolerations` call is
+/// made by the caller (`validate_pod_update`).
 pub fn validate_only_added_tolerations(
     old: &[Toleration],
     new: &[Toleration],
@@ -3665,10 +3676,15 @@ pub fn validate_only_added_tolerations(
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     for ot in old {
-        if !new.iter().any(|nt| nt == ot) {
+        let found = new.iter().any(|nt| {
+            let mut clone = ot.clone();
+            clone.toleration_seconds = nt.toleration_seconds;
+            clone == *nt
+        });
+        if !found {
             errs.push(Error::forbidden(
                 path,
-                "existing tolerations may not be modified or removed",
+                "existing toleration can not be modified except its tolerationSeconds",
             ));
             return errs;
         }
@@ -4268,7 +4284,92 @@ mod tests {
         assert_eq!(errs.len(), 1);
         assert!(errs[0]
             .to_string()
-            .contains("existing tolerations may not be modified or removed"));
+            .contains("existing toleration can not be modified except its tolerationSeconds"));
+    }
+
+    // Upstream: validation.go:4303-4324 (release-1.35) - tolerationSeconds may
+    // change on an existing toleration.
+    #[test]
+    fn tolerations_update_allows_toleration_seconds_change() {
+        let p = Path::new("spec").child("tolerations");
+        let mk = |secs: Option<i64>| Toleration {
+            key: Some("key1".into()),
+            operator: Some("Equal".into()),
+            value: Some("value1".into()),
+            effect: Some("NoExecute".into()),
+            toleration_seconds: secs,
+        };
+        assert!(validate_only_added_tolerations(&[mk(Some(10))], &[mk(Some(20))], &p).is_empty());
+        assert!(validate_only_added_tolerations(&[mk(None)], &[mk(Some(20))], &p).is_empty());
+        let mut changed = mk(Some(10));
+        changed.value = Some("other".into());
+        let errs = validate_only_added_tolerations(&[mk(Some(10))], &[changed], &p);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0]
+            .to_string()
+            .contains("existing toleration can not be modified except its tolerationSeconds"));
+    }
+
+    fn tol(
+        key: &str,
+        op: Option<&str>,
+        value: &str,
+        effect: Option<&str>,
+        secs: Option<i64>,
+    ) -> Toleration {
+        Toleration {
+            key: (!key.is_empty()).then(|| key.to_string()),
+            operator: op.map(String::from),
+            value: (!value.is_empty()).then(|| value.to_string()),
+            effect: effect.map(String::from),
+            toleration_seconds: secs,
+        }
+    }
+
+    // validation.go:4360-4414 ValidateTolerations.
+    #[test]
+    fn tolerations_validate_key_value_and_empty_key_rules() {
+        let p = Path::new("spec").child("tolerations");
+        // invalid key -> ValidateLabelName at tolerations[0].key
+        let errs = validate_tolerations(
+            &[tol(
+                "nospecialchars^=@",
+                Some("Equal"),
+                "bar",
+                Some("NoSchedule"),
+                None,
+            )],
+            &p,
+        );
+        assert!(errs.iter().any(|e| e.field == "spec.tolerations[0].key"));
+        // empty key requires Exists (operator "" / Equal both rejected)
+        for op in [Some("Equal"), None] {
+            let errs = validate_tolerations(&[tol("", op, "bar", Some("NoSchedule"), None)], &p);
+            assert!(errs.iter().any(|e| e.field == "spec.tolerations[0].operator"
+                && e.to_string().contains(
+                    "operator must be Exists when `key` is empty, which means \"match all values and all keys\""
+                )));
+        }
+        assert!(
+            validate_tolerations(&[tol("", Some("Exists"), "", Some("NoSchedule"), None)], &p)
+                .is_empty()
+        );
+        // Equal value is label-value validated, reported on the operator path.
+        let errs = validate_tolerations(&[tol("foo", Some("Equal"), "bad value!", None, None)], &p);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "spec.tolerations[0].operator");
+        // Exists with value: exact wording.
+        let errs = validate_tolerations(&[tol("foo", Some("Exists"), "bar", None, None)], &p);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0]
+            .to_string()
+            .contains("value must be empty when `operator` is 'Exists'"));
+        // tolerationSeconds with non-NoExecute (incl. empty effect) -> effect path.
+        for eff in [Some("NoSchedule"), None] {
+            let errs = validate_tolerations(&[tol("foo", Some("Exists"), "", eff, Some(20))], &p);
+            assert_eq!(errs.len(), 1, "{errs:?}");
+            assert_eq!(errs[0].field, "spec.tolerations[0].effect");
+        }
     }
 
     #[test]

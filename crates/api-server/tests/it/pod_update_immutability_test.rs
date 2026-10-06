@@ -348,7 +348,7 @@ async fn test_update_toleration_removal_rejected() {
     assert_rejected(
         status,
         &body,
-        "existing tolerations may not be modified or removed",
+        "existing toleration can not be modified except its tolerationSeconds",
     );
 }
 
