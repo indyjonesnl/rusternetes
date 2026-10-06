@@ -121,6 +121,27 @@ pub fn validate_volume_snapshot_content_update(
         &src,
         "volumeHandle",
     ));
+    // CRD `…_volumesnapshotcontents.yaml` (kubernetes-csi/external-snapshotter,
+    // v1): `sourceVolumeMode` carries `self == oldSelf` ("sourceVolumeMode is
+    // immutable", a transition rule that runs only when both sides have the
+    // field) and the spec carries `!has(oldSelf.sourceVolumeMode) ||
+    // has(self.sourceVolumeMode)` ("sourceVolumeMode is required once set").
+    match (
+        old.spec.source_volume_mode.as_deref(),
+        new.spec.source_volume_mode.as_deref(),
+    ) {
+        (Some(_), None) => errs.push(Error::invalid(
+            &Path::new("spec"),
+            String::new(),
+            "sourceVolumeMode is required once set",
+        )),
+        (Some(o), Some(n)) if o != n => errs.push(Error::invalid(
+            &Path::new("spec").child("sourceVolumeMode"),
+            n.to_string(),
+            "sourceVolumeMode is immutable",
+        )),
+        _ => {}
+    }
     errs
 }
 

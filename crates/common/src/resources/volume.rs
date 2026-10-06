@@ -747,6 +747,15 @@ pub struct VolumeSnapshotContentSpec {
     /// `Required`.
     #[serde(default)]
     pub driver: String,
+
+    /// Mode of the volume whose snapshot is taken ("Filesystem" or "Block").
+    ///
+    /// Optional alpha field of external-snapshotter's
+    /// `VolumeSnapshotContentSpec.SourceVolumeMode`
+    /// (client/apis/volumesnapshot/v1/types.go); immutable once set — see
+    /// `validate_volume_snapshot_content_update`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_volume_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
