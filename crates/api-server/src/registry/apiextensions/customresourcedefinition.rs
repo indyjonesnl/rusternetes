@@ -6,9 +6,9 @@
 //! [`super::controllers`].
 //!
 //! Not modelled:
-//! - `WarningsOnCreate` / `WarningsOnUpdate` (strategy.go:125-196): the
-//!   `unrecognized format "..."` warnings need the format registry of
-//!   `apiserver/validation.GetUnrecognizedFormats`.
+//! - The deprecated top-level `spec.validation` schema that
+//!   `getUnrecognizedFormatsInCRD` (strategy.go:203-206) also checks:
+//!   `CustomResourceDefinitionSpec` is v1-only and has no such field.
 //! - `dropDisabledFields` (strategy.go:322-341): every gate it consults is
 //!   GA or default-on except `CRDObservedGenerationTracking`, whose fields
 //!   [`CustomResourceDefinitionStatus`] does not have.
@@ -24,7 +24,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rusternetes_common::deletion::{DeleteOptions, Preconditions};
-use rusternetes_common::resources::CustomResourceDefinition;
+use rusternetes_common::resources::{
+    CustomResourceDefinition, JSONSchemaProps, JSONSchemaPropsOrArray, JSONSchemaPropsOrBool,
+    JSONSchemaPropsOrStringArray,
+};
 use rusternetes_common::validation::crd::{
     is_crd_condition_true, validate_custom_resource_definition,
     validate_custom_resource_definition_update, validate_update_custom_resource_definition_status,
@@ -105,6 +108,113 @@ fn schema_rule_errors(crd: &CustomResourceDefinition) -> ErrorList {
     errs
 }
 
+/// `supportedVersionedFormats` (apiserver/validation/formats.go:32-71) as
+/// recognised at `DefaultCompatibilityVersion()`.
+///
+/// That version is `EffectiveVersion.MinCompatibilityVersion()`
+/// (apiserver/pkg/cel/environment/base.go:52-58), i.e. one minor below the
+/// 1.35 target: 1.34, which includes both the 1.0 set and the 1.34 additions
+/// (`k8s-short-name`, `k8s-long-name`). Names are stored normalised
+/// (`-` removed, formats.go:85, 141-147).
+const RECOGNIZED_FORMATS: &[&str] = &[
+    "bsonobjectid",
+    "uri",
+    "email",
+    "hostname",
+    "ipv4",
+    "ipv6",
+    "cidr",
+    "mac",
+    "uuid",
+    "uuid3",
+    "uuid4",
+    "uuid5",
+    "isbn",
+    "isbn10",
+    "isbn13",
+    "creditcard",
+    "ssn",
+    "hexcolor",
+    "rgbcolor",
+    "byte",
+    "password",
+    "date",
+    "duration",
+    "datetime",
+    "k8sshortname",
+    "k8slongname",
+];
+
+/// `GetUnrecognizedFormats` (formats.go:104-119) for one schema node: only a
+/// `type: string` schema with a non-empty format outside the recognised set
+/// is reported.
+fn unrecognized_format(s: &JSONSchemaProps) -> Option<&str> {
+    let format = s.format.as_deref().filter(|f| !f.is_empty())?;
+    if s.type_.as_deref() != Some("string") {
+        return None;
+    }
+    let normalized = format.replace('-', "");
+    (!RECOGNIZED_FORMATS.contains(&normalized.as_str())).then_some(format)
+}
+
+/// The traversal of `SchemaHas` (validation.go:1659-1728) with the predicate
+/// of `getUnrecognizedFormatsInSchema` (strategy.go:219-235), which never
+/// stops the walk: collects every unrecognized format below `s`.
+fn collect_unrecognized_formats<'a>(s: &'a JSONSchemaProps, out: &mut Vec<&'a str>) {
+    if let Some(f) = unrecognized_format(s) {
+        out.push(f);
+    }
+    match s.items.as_deref() {
+        Some(JSONSchemaPropsOrArray::Schema(i)) => collect_unrecognized_formats(i, out),
+        Some(JSONSchemaPropsOrArray::Schemas(is)) => {
+            is.iter().for_each(|i| collect_unrecognized_formats(i, out))
+        }
+        None => {}
+    }
+    for list in [&s.all_of, &s.any_of, &s.one_of].into_iter().flatten() {
+        list.iter()
+            .for_each(|i| collect_unrecognized_formats(i, out));
+    }
+    if let Some(n) = &s.not {
+        collect_unrecognized_formats(n, out);
+    }
+    for map in [&s.properties, &s.pattern_properties, &s.definitions]
+        .into_iter()
+        .flatten()
+    {
+        map.values()
+            .for_each(|i| collect_unrecognized_formats(i, out));
+    }
+    for or_bool in [&s.additional_properties, &s.additional_items]
+        .into_iter()
+        .flatten()
+    {
+        if let JSONSchemaPropsOrBool::Schema(i) = or_bool.as_ref() {
+            collect_unrecognized_formats(i, out);
+        }
+    }
+    for d in s.dependencies.iter().flat_map(|m| m.values()) {
+        if let JSONSchemaPropsOrStringArray::Schema(i) = d {
+            collect_unrecognized_formats(i, out);
+        }
+    }
+}
+
+/// `getUnrecognizedFormatsInCRD` (strategy.go:199-216), per-version schemas.
+fn unrecognized_formats_in_crd(crd: &CustomResourceDefinition) -> Vec<String> {
+    let mut out = Vec::new();
+    for v in &crd.spec.versions {
+        if let Some(schema) = &v.schema {
+            collect_unrecognized_formats(&schema.open_apiv3_schema, &mut out);
+        }
+    }
+    out.into_iter().map(str::to_string).collect()
+}
+
+fn unrecognized_format_warning(format: &str) -> String {
+    format!("unrecognized format {format:?}")
+}
+
 /// `strategy` (strategy.go:42-48).
 pub struct Strategy;
 
@@ -129,6 +239,18 @@ impl RestCreateStrategy<CustomResourceDefinition> for Strategy {
         let mut errs = validate_custom_resource_definition(obj);
         errs.extend(schema_rule_errors(obj));
         errs
+    }
+
+    /// `WarningsOnCreate` (strategy.go:125-142).
+    fn warnings_on_create(
+        &self,
+        _ctx: &RequestContext,
+        obj: &CustomResourceDefinition,
+    ) -> Vec<String> {
+        unrecognized_formats_in_crd(obj)
+            .iter()
+            .map(|f| unrecognized_format_warning(f))
+            .collect()
     }
 }
 
@@ -164,6 +286,23 @@ impl RestUpdateStrategy<CustomResourceDefinition> for Strategy {
         let mut errs = validate_custom_resource_definition_update(obj, old);
         errs.extend(schema_rule_errors(obj));
         errs
+    }
+
+    /// `WarningsOnUpdate` (strategy.go:165-197): only formats the old object
+    /// did not already carry warn (ratcheting).
+    fn warnings_on_update(
+        &self,
+        _ctx: &RequestContext,
+        obj: &CustomResourceDefinition,
+        old: &CustomResourceDefinition,
+    ) -> Vec<String> {
+        let old_formats: std::collections::HashSet<String> =
+            unrecognized_formats_in_crd(old).into_iter().collect();
+        unrecognized_formats_in_crd(obj)
+            .iter()
+            .filter(|f| !old_formats.contains(*f))
+            .map(|f| unrecognized_format_warning(f))
+            .collect()
     }
 
     /// strategy.go:151-153.
@@ -850,6 +989,93 @@ mod tests {
 
     fn ctx() -> RequestContext {
         RequestContext::new(None)
+    }
+
+    fn crd_with_props(props: serde_json::Value) -> CustomResourceDefinition {
+        crd(serde_json::json!({"spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {"plural": "widgets", "kind": "Widget"},
+            "versions": [{"name": "v1", "served": true, "storage": true,
+                "schema": {"openAPIV3Schema": {"type": "object", "properties": props}}}]
+        }}))
+    }
+
+    fn sorted(mut w: Vec<String>) -> Vec<String> {
+        w.sort();
+        w
+    }
+
+    /// `TestWarningsOnCreate` (strategy_test.go:1428-1584).
+    #[test]
+    fn warnings_on_create_name_unrecognized_formats() {
+        let ok =
+            crd_with_props(serde_json::json!({"f": {"type": "string", "format": "date-time"}}));
+        assert!(Strategy.warnings_on_create(&ctx(), &ok).is_empty());
+
+        let bad =
+            crd_with_props(serde_json::json!({"f": {"type": "string", "format": "invalidformat"}}));
+        assert_eq!(
+            Strategy.warnings_on_create(&ctx(), &bad),
+            vec![r#"unrecognized format "invalidformat""#.to_string()]
+        );
+
+        let nested = crd_with_props(serde_json::json!({"nested": {"type": "object",
+            "properties": {"e": {"type": "string", "format": "invalidformat"}}}}));
+        assert_eq!(
+            Strategy.warnings_on_create(&ctx(), &nested),
+            vec![r#"unrecognized format "invalidformat""#.to_string()]
+        );
+
+        let many = crd_with_props(serde_json::json!({
+            "field1": {"type": "string", "format": "unknownformat1"},
+            "field2": {"type": "string", "format": "unknownformat2"},
+            "nested": {"type": "object",
+                "properties": {"field3": {"type": "string", "format": "unknownformat3"}}}}));
+        assert_eq!(
+            sorted(Strategy.warnings_on_create(&ctx(), &many)),
+            vec![
+                r#"unrecognized format "unknownformat1""#.to_string(),
+                r#"unrecognized format "unknownformat2""#.to_string(),
+                r#"unrecognized format "unknownformat3""#.to_string(),
+            ]
+        );
+    }
+
+    /// `GetUnrecognizedFormats` (formats.go:104-119) only judges `type: string`
+    /// schemas, and the k8s-short-name/k8s-long-name formats are recognised
+    /// at 1.34+ (formats.go:36-52).
+    #[test]
+    fn warnings_only_judge_string_schemas_and_know_k8s_names() {
+        let c = crd_with_props(serde_json::json!({
+            "n": {"type": "integer", "format": "whatever"},
+            "s": {"type": "string", "format": "k8s-short-name"},
+            "l": {"type": "string", "format": "k8s-long-name"},
+            "u": {"type": "string", "format": "uuid4"},
+            "a": {"type": "array", "items": {"type": "string", "format": "nope"}}}));
+        assert_eq!(
+            Strategy.warnings_on_create(&ctx(), &c),
+            vec![r#"unrecognized format "nope""#.to_string()]
+        );
+    }
+
+    /// `TestWarningsOnUpdate`: only newly introduced formats warn (ratcheting,
+    /// strategy.go:178-194).
+    #[test]
+    fn warnings_on_update_ratchet() {
+        let old = crd_with_props(serde_json::json!({"a": {"type": "string", "format": "oldbad"}}));
+        let new = crd_with_props(serde_json::json!({
+            "a": {"type": "string", "format": "oldbad"},
+            "b": {"type": "string", "format": "newbad"}}));
+        assert_eq!(
+            Strategy.warnings_on_update(&ctx(), &new, &old),
+            vec![r#"unrecognized format "newbad""#.to_string()]
+        );
+        assert!(Strategy.warnings_on_update(&ctx(), &old, &old).is_empty());
+        // statusStrategy.WarningsOnUpdate (strategy.go:292-294) is nil.
+        assert!(StatusStrategy
+            .warnings_on_update(&ctx(), &new, &old)
+            .is_empty());
     }
 
     #[test]
