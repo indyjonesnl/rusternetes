@@ -5,7 +5,10 @@
 //! strategies and storage hooks ([`crate::registry::core::service`]) —
 //! upstream's `pkg/registry/core/service/storage` wired into
 //! `endpoints/handlers/{create,update,patch,delete}.go`. Lists and watches are
-//! still served here directly.
+//! still served here directly, but every item they emit runs through the
+//! Store's `Decorator` ([`service_storage::default_on_read`]) as upstream's
+//! `Store.List` and `Store.WatchPredicate` do (store.go:381-383, :1463-1465;
+//! `defaultOnReadServiceList` storage.go:243-252).
 
 use crate::endpoints::handlers::{self as endpoints, RequestScope};
 use crate::registry::core::service::storage as service_storage;
@@ -264,6 +267,27 @@ pub async fn patch_status(
     .await
 }
 
+/// The Store `Decorator` as a watch converter: every streamed Service (initial
+/// ADDED, live events, delete `prev` values) is decoded, run through
+/// `defaultOnReadService` (storage.go:255-274) and re-encoded. Ported from
+/// `Store.WatchPredicate` (staging/.../registry/generic/registry/store.go:
+/// 1463-1465: `if e.Decorator != nil { return newDecoratedWatcher(ctx, w,
+/// e.Decorator), nil }`). Best-effort: an object that does not decode as a
+/// Service is passed through unchanged.
+pub(crate) fn default_on_read_watch_converter() -> crate::handlers::watch::WatchObjectConverter {
+    Arc::new(|val: serde_json::Value| {
+        Box::pin(async move {
+            match serde_json::from_value::<Service>(val.clone()) {
+                Ok(mut svc) => {
+                    service_storage::default_on_read(&mut svc);
+                    serde_json::to_value(&svc).unwrap_or(val)
+                }
+                Err(_) => val,
+            }
+        })
+    })
+}
+
 pub async fn list(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -299,6 +323,11 @@ pub async fn list(
 
     let prefix = build_prefix("services", Some(&namespace));
     let mut services = state.storage.list::<Service>(&prefix).await?;
+    // `Store.Decorator` on every listed item (`Store.List` store.go:381-383;
+    // `defaultOnReadServiceList` storage.go:243-252).
+    services
+        .iter_mut()
+        .for_each(service_storage::default_on_read);
 
     // Apply field and label selector filtering
     let mut params_map = HashMap::new();
@@ -347,8 +376,14 @@ pub async fn list_all_services(
     // Check if this is a watch request
     if params.watch.unwrap_or(false) {
         debug!("Watch request for all services");
-        return crate::handlers::watch::watch_cluster_scoped::<Service>(
-            state, auth_ctx, "services", "", params,
+        return crate::handlers::watch::watch_cluster_scoped_converted::<Service>(
+            state,
+            auth_ctx,
+            "services",
+            "",
+            params,
+            default_on_read_watch_converter(),
+            None,
         )
         .await;
     }
@@ -367,6 +402,11 @@ pub async fn list_all_services(
 
     let prefix = build_prefix("services", None);
     let mut services = state.storage.list::<Service>(&prefix).await?;
+    // `Store.Decorator` on every listed item (`Store.List` store.go:381-383;
+    // `defaultOnReadServiceList` storage.go:243-252).
+    services
+        .iter_mut()
+        .for_each(service_storage::default_on_read);
 
     // Apply field and label selector filtering
     let mut params_map = HashMap::new();
