@@ -1378,29 +1378,37 @@ fn build_ingress_backend(svc_name: &str, svc_port: &str) -> Value {
 
 // ── Legacy inline creation ──────────────────────────────────────────────────
 
-/// Execute inline resource creation (e.g., kubectl create namespace foo)
-pub async fn execute_inline(_client: &ApiClient, args: &[String], namespace: &str) -> Result<()> {
-    if args.is_empty() {
-        anyhow::bail!("Resource type required");
-    }
-
-    let resource_type = &args[0];
-    match resource_type.as_str() {
-        "namespace" | "ns" => {
-            if args.len() < 2 {
-                anyhow::bail!("Namespace name required");
+/// Map positional `kubectl create <kind> <name>` arguments onto the matching
+/// `create` subcommand.
+///
+/// Upstream has no free-form inline create: every `kubectl create <kind>` is a
+/// cobra subcommand registered in `NewCmdCreate`
+/// (staging/src/k8s.io/kubectl/pkg/cmd/create/create.go:136-152,
+/// `cmd.AddCommand(NewCmdCreateNamespace(f, ioStreams))`). `create` itself has
+/// a parent, so cobra's `legacyArgs` (cobra args.go:35, `!cmd.HasParent()`)
+/// does not reject unknown words; they fall into `Run` ->
+/// `o.Validate()` -> `RequireFilenameOrKustomize`
+/// (cli-runtime/pkg/resource/builder.go:161-166), which returns
+/// `must specify one of -f and -k`. Anything that is not a known subcommand
+/// therefore reports exactly that.
+fn inline_to_subcommand(args: &[String]) -> Result<CreateCommands> {
+    match args.first().map(String::as_str) {
+        Some("namespace" | "ns") => {
+            // NameFromCommandArgs (kubectl/pkg/cmd/util/helpers.go)
+            match &args[1..] {
+                [] => anyhow::bail!("NAME is required"),
+                [name] => Ok(CreateCommands::Namespace { name: name.clone() }),
+                rest => anyhow::bail!("exactly one NAME is required, got {}", rest.len()),
             }
-            let name = &args[1];
-            println!("Creating namespace: {}", name);
-            println!("Note: Inline resource creation not yet fully implemented");
         }
-        _ => {
-            println!("Creating {} in namespace {}", resource_type, namespace);
-            println!("Note: Inline resource creation not yet fully implemented");
-        }
+        _ => anyhow::bail!("must specify one of -f and -k"),
     }
+}
 
-    Ok(())
+/// Execute inline resource creation (e.g., kubectl create namespace foo)
+pub async fn execute_inline(client: &ApiClient, args: &[String], namespace: &str) -> Result<()> {
+    let cmd = inline_to_subcommand(args)?;
+    execute_subcommand(client, &cmd, namespace).await
 }
 
 pub async fn execute(client: &ApiClient, file: &str, namespace: Option<&str>) -> Result<()> {
@@ -1877,29 +1885,50 @@ mod tests {
         assert!(build_subjects(&[], &[], &sas).is_err());
     }
 
-    #[tokio::test]
-    async fn test_execute_inline_namespace() {
-        let client = ApiClient::new("https://127.0.0.1:1", false, None).unwrap();
-        let args = vec!["namespace".to_string(), "test-ns".to_string()];
-        // This doesn't make API calls, just prints
-        let result = execute_inline(&client, &args, "default").await;
-        assert!(result.is_ok());
+    #[test]
+    fn test_inline_namespace_maps_to_subcommand() {
+        for kind in ["namespace", "ns"] {
+            let args = vec![kind.to_string(), "test-ns".to_string()];
+            match inline_to_subcommand(&args).unwrap() {
+                CreateCommands::Namespace { name } => assert_eq!(name, "test-ns"),
+                _ => panic!("expected Namespace subcommand"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_inline_namespace_requires_exactly_one_name() {
+        let none = vec!["namespace".to_string()];
+        assert_eq!(
+            inline_to_subcommand(&none).err().unwrap().to_string(),
+            "NAME is required"
+        );
+        let two = vec!["ns".to_string(), "a".to_string(), "b".to_string()];
+        assert_eq!(
+            inline_to_subcommand(&two).err().unwrap().to_string(),
+            "exactly one NAME is required, got 2"
+        );
     }
 
     #[tokio::test]
     async fn test_execute_inline_empty_args() {
         let client = ApiClient::new("https://127.0.0.1:1", false, None).unwrap();
         let result = execute_inline(&client, &[], "default").await;
-        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "must specify one of -f and -k"
+        );
     }
 
     #[tokio::test]
     async fn test_execute_inline_unknown_resource() {
         let client = ApiClient::new("https://127.0.0.1:1", false, None).unwrap();
-        let args = vec!["deployment".to_string()];
-        // This doesn't fail, just prints a message
+        let args = vec!["widget".to_string(), "x".to_string()];
         let result = execute_inline(&client, &args, "default").await;
-        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "must specify one of -f and -k"
+        );
     }
 
     #[test]

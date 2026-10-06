@@ -12,9 +12,12 @@
 # scheduler to bind them to node-1 every test pod sits Pending forever and the
 # suite times out (only ~8 of 191 [NodeConformance] specs ever started). The
 # per-namespace `kube-root-ca.crt` ConfigMap and default ServiceAccount that the
-# pods' projected `kube-api-access` volume needs are created by the api-server
-# on namespace creation (handlers/namespace.rs), so the controller-manager is
-# not needed here.
+# pods' projected `kube-api-access` volume needs are NOT created by the
+# api-server on namespace creation (the Namespace Store port, #2073, follows
+# upstream): the controller-manager's ServiceAccount controller and root-CA
+# publisher own them, so the controller-manager runs here and must read the
+# cluster CA (mounted below at /etc/kubernetes/pki, as startRootCACertPublisher
+# in cmd/kube-controller-manager/app/certificates.go requires --root-ca-file).
 #
 # Used by scripts/run-node-conformance.sh.
 
@@ -193,6 +196,8 @@ services:
       - api-server
     networks:
       - nc-net
+    volumes:
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
     environment:
       - RUST_LOG=info
     command: ["--etcd-servers", "http://rhino:2379", "--sync-interval", "2"]

@@ -126,6 +126,16 @@ impl VolumePlugin for HostPathPlugin {
     }
 }
 
+/// Port of `ValidatePathNoBacksteps`
+/// (`pkg/volume/validation/pv_validation.go:62-71`): rejects any `/`-separated
+/// element equal to `..`.
+fn validate_path_no_backsteps(target_path: &str) -> std::result::Result<(), &'static str> {
+    if target_path.split('/').any(|item| item == "..") {
+        return Err("must not contain '..'");
+    }
+    Ok(())
+}
+
 struct HostPathMounter {
     path: String,
     path_type: Option<String>,
@@ -143,6 +153,12 @@ impl Mounter for HostPathMounter {
     /// `create_volume`'s PVC branch did not check it. Sanctioned delta, see
     /// the plan.
     async fn set_up(&self) -> Result<()> {
+        // `validation.ValidatePathNoBacksteps(b.GetPath())` runs BEFORE the
+        // type check (`host_path.go:242-245`), so a path with a backstep is
+        // rejected with this error, never a type error. #1973.
+        if let Err(e) = validate_path_no_backsteps(&self.path) {
+            return Err(anyhow!("invalid HostPath `{}`: {}", self.path, e));
+        }
         // ---- moved verbatim from create_volume's hostPath branch
         //      (991a503d:crates/kubelet/src/volumes.rs:959-988) ----
         let path = &self.path;
@@ -284,6 +300,30 @@ mod tests {
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
         assert_eq!(m.get_path(), "/data/$RUSTERNETES_HOSTPATH_TEST_UNSET_VAR");
+    }
+
+    /// `host_path.go:242-245`: the backstep check precedes the type check, so
+    /// even with an unsatisfiable type the validation error wins.
+    #[tokio::test]
+    async fn set_up_rejects_a_backstep_before_checking_the_type() {
+        let v: Volume = serde_json::from_value(
+            json!({"name": "hp", "hostPath": {"path": "/tmp/../etc", "type": "File"}}),
+        )
+        .unwrap();
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+        };
+        let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
+        let err = m.set_up().await.unwrap_err().to_string();
+        assert_eq!(err, "invalid HostPath `/tmp/../etc`: must not contain '..'");
+    }
+
+    #[test]
+    fn backstep_validation_only_rejects_whole_dotdot_elements() {
+        assert!(validate_path_no_backsteps("/a/..b/c..").is_ok());
+        assert!(validate_path_no_backsteps("/a/b/..").is_err());
+        assert!(validate_path_no_backsteps("../a").is_err());
     }
 
     /// The PV arm's counterpart to the test above: same unset var, but

@@ -1171,9 +1171,8 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             } else {
-                anyhow::bail!(
-                    "Either --file, a subcommand, or resource arguments must be provided"
-                );
+                // create.go Validate -> RequireFilenameOrKustomize
+                anyhow::bail!("must specify one of -f and -k");
             }
         }
         Commands::Delete {

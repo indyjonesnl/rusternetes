@@ -7,6 +7,7 @@
 pub mod operation_executor;
 pub mod selinux;
 pub mod types;
+pub mod volumepathhandler;
 
 use crate::volume_plugins::plugin::{Spec, VolumePlugin};
 use crate::volume_plugins::registry::VolumePluginMgr;
