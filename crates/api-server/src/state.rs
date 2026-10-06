@@ -1,7 +1,8 @@
 use crate::admission_webhook::AdmissionWebhookManager;
 use crate::prometheus_client::PrometheusClient;
+use crate::registry::core::service::alloc::ClusterIpAllocators;
 use crate::registry::core::service::allocator::{storage::Etcd, AllocationBitmap};
-use crate::registry::core::service::ipallocator::cidr::MetaAllocator;
+use crate::registry::core::service::ipranges::ServiceIpRanges;
 use crate::registry::core::service::portallocator::{
     PortAllocator, PortRange, DEFAULT_SERVICE_NODE_PORT_RANGE,
 };
@@ -22,7 +23,7 @@ pub struct ApiServerState {
     pub skip_auth: bool,
     /// The ClusterIP allocator of the primary (IPv4) family: IPAddress
     /// objects out of the ServiceCIDRs.
-    pub cluster_ip_allocator: Arc<MetaAllocator<StorageBackend>>,
+    pub cluster_ip_allocators: Arc<ClusterIpAllocators<StorageBackend>>,
     /// The service NodePort allocator, persisted as the
     /// `/registry/ranges/servicenodeports` RangeAllocation.
     pub node_port_allocator: Arc<PortAllocator>,
@@ -77,9 +78,13 @@ impl ApiServerState {
         let (node_port_registry, node_port_allocator) =
             new_node_port_allocator(&storage, DEFAULT_SERVICE_NODE_PORT_RANGE);
 
-        // `NewMetaAllocator` for the primary family (storage_core.go:
-        // 397-403); `--service-cluster-ip-range` is IPv4 here.
-        let cluster_ip_allocator = Arc::new(MetaAllocator::new(storage.clone(), false));
+        // `NewMetaAllocator` per configured family (storage_core.go:
+        // 397-403, 469-481); the default `--service-cluster-ip-range` is
+        // single-stack IPv4, see `with_service_cluster_ip_ranges`.
+        let cluster_ip_allocators = Arc::new(ClusterIpAllocators::new(
+            storage.clone(),
+            &ServiceIpRanges::default().families(),
+        ));
 
         Self {
             storage,
@@ -88,7 +93,7 @@ impl ApiServerState {
             authorizer,
             metrics,
             skip_auth,
-            cluster_ip_allocator,
+            cluster_ip_allocators,
             node_port_allocator,
             node_port_registry,
             webhook_manager,
@@ -111,6 +116,16 @@ impl ApiServerState {
         let (registry, allocator) = new_node_port_allocator(&self.storage, pr);
         self.node_port_registry = registry;
         self.node_port_allocator = allocator;
+        self
+    }
+
+    /// Allocate ClusterIPs from `ranges` (`--service-cluster-ip-range`): one
+    /// allocator per family, primary first.
+    pub fn with_service_cluster_ip_ranges(mut self, ranges: &ServiceIpRanges) -> Self {
+        self.cluster_ip_allocators = Arc::new(ClusterIpAllocators::new(
+            self.storage.clone(),
+            &ranges.families(),
+        ));
         self
     }
 

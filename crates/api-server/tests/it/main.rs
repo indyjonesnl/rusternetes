@@ -265,6 +265,7 @@ mod secret_generic_store_test;
 mod secret_handler_test;
 mod secret_update_type_validation_test;
 mod service_cluster_ip_allocation_test;
+mod service_dual_stack_test;
 mod service_externalname_transition_test;
 mod service_handler_test;
 mod service_list_watch_default_on_read_test;

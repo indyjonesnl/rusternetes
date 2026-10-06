@@ -593,12 +593,13 @@ pub const DEFAULT_SERVICE_CIDR_NAME: &str = "kubernetes";
 /// the event source component.
 const DEFAULT_SERVICE_CIDR_CONTROLLER: &str = "kubernetes-service-cidr-controller";
 
-/// The service range this api-server allocates ClusterIPs from — upstream's
-/// `--service-cluster-ip-range`, which this api-server does not expose as a
-/// flag. The `kubernetes` ServiceCIDR is seeded from it, and ClusterIPs are
-/// allocated from the ServiceCIDRs. Must stay in step with
+/// The default `--service-cluster-ip-range`; the flag itself is
+/// [`crate::registry::core::service::ipranges::ServiceIpRanges`]. The
+/// `kubernetes` ServiceCIDR is seeded from the configured range, and
+/// ClusterIPs are allocated from the ServiceCIDRs. Must stay in step with
 /// [`KUBERNETES_SERVICE_IP`] (the range's first address).
-pub const DEFAULT_SERVICE_CIDRS: &[&str] = &["10.96.0.0/12"];
+#[cfg(test)]
+const DEFAULT_SERVICE_CIDRS: &[&str] = &["10.96.0.0/12"];
 
 /// Upstream's controller interval (`default_servicecidr_controller.go:61`,
 /// "same as DefaultEndpointReconcilerInterval", 10s).
@@ -892,11 +893,8 @@ impl<S: Storage + ?Sized> DefaultServiceCIDRController<S> {
 /// which likewise blocks on a first successful sync before returning.
 pub async fn start_default_servicecidr_controller(
     storage: Arc<StorageBackend>,
+    cidrs: Vec<String>,
 ) -> tokio::task::JoinHandle<()> {
-    let cidrs: Vec<String> = DEFAULT_SERVICE_CIDRS
-        .iter()
-        .map(|c| c.to_string())
-        .collect();
     let mut controller = DefaultServiceCIDRController::new(storage, cidrs);
     if let Err(e) = controller.sync().await {
         warn!("error initializing the default ServiceCIDR: {}", e);

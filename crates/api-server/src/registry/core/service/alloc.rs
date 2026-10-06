@@ -340,11 +340,9 @@ pub async fn settle<T>(mut op: PortAllocationOperation, result: &Result<T>) {
 // IP families
 // ---------------------------------------------------------------------------
 
-/// The families this api-server allocates ClusterIPs from
-/// (`Allocators.serviceIPAllocatorsByFamily`): one IPv4 allocator.
-pub const CONFIGURED_IP_FAMILIES: &[IPFamily] = &[IPFamily::IPv4];
-
-/// `Allocators.defaultServiceIPFamily`.
+/// `Allocators.defaultServiceIPFamily`: the primary family. The primary
+/// range is IPv4 (see `ipranges::ServiceIpRanges::parse`), so the
+/// read-time defaulting of `default_on_read` can name it statically.
 pub const DEFAULT_SERVICE_IP_FAMILY: IPFamily = IPFamily::IPv4;
 
 fn other_family(fam: &IPFamily) -> IPFamily {
@@ -442,7 +440,12 @@ fn invalid_service(errs: field::ErrorList) -> Error {
 /// `initIPFamilyFields` (alloc.go:104-303): default `ipFamilyPolicy` and
 /// `ipFamilies`, and reject families and policies this cluster cannot
 /// serve. `old` is `None` on create.
-pub fn init_ip_family_fields(service: &mut Service, old: Option<&Service>) -> Result<()> {
+pub fn init_ip_family_fields(
+    service: &mut Service,
+    old: Option<&Service>,
+    configured: &[IPFamily],
+) -> Result<()> {
+    let default_family = configured[0].clone();
     if matches!(service.spec.service_type, Some(ServiceType::ExternalName)) {
         return Ok(());
     }
@@ -525,7 +528,7 @@ pub fn init_ip_family_fields(service: &mut Service, old: Option<&Service>) -> Re
         }
         if i >= spec_ip_families(service).len() {
             match family_of(ip) {
-                Some(fam) if CONFIGURED_IP_FAMILIES.contains(&fam) => {
+                Some(fam) if configured.contains(&fam) => {
                     service
                         .spec
                         .ip_families
@@ -556,7 +559,7 @@ pub fn init_ip_family_fields(service: &mut Service, old: Option<&Service>) -> Re
     if headless_selectorless {
         let fams = service.spec.ip_families.get_or_insert_with(Vec::new);
         if fams.is_empty() {
-            fams.push(DEFAULT_SERVICE_IP_FAMILY);
+            fams.push(default_family.clone());
         }
         if fams.len() < 2
             && service.spec.ip_family_policy.as_ref() != Some(&IPFamilyPolicy::SingleStack)
@@ -567,7 +570,7 @@ pub fn init_ip_family_fields(service: &mut Service, old: Option<&Service>) -> Re
         return Ok(());
     }
 
-    if is_policy(service, IPFamilyPolicy::RequireDualStack) && CONFIGURED_IP_FAMILIES.len() < 2 {
+    if is_policy(service, IPFamilyPolicy::RequireDualStack) && configured.len() < 2 {
         el.push(field::Error::invalid(
             &policy_path,
             policy_value(service),
@@ -575,7 +578,7 @@ pub fn init_ip_family_fields(service: &mut Service, old: Option<&Service>) -> Re
         ));
     }
     for (i, fam) in spec_ip_families(service).iter().enumerate() {
-        if !CONFIGURED_IP_FAMILIES.contains(fam) {
+        if !configured.contains(fam) {
             el.push(field::Error::invalid(
                 &field::Path::new("spec").child("ipFamilies").index(i),
                 serde_json::to_value(fam).unwrap_or_default(),
@@ -589,11 +592,11 @@ pub fn init_ip_family_fields(service: &mut Service, old: Option<&Service>) -> Re
 
     let fams = service.spec.ip_families.get_or_insert_with(Vec::new);
     if fams.is_empty() {
-        fams.push(DEFAULT_SERVICE_IP_FAMILY);
+        fams.push(default_family.clone());
     }
     if service.spec.ip_family_policy.as_ref() != Some(&IPFamilyPolicy::SingleStack)
         && fams.len() == 1
-        && CONFIGURED_IP_FAMILIES.len() == 2
+        && configured.len() == 2
     {
         let alt = other_family(&fams[0]);
         fams.push(alt);
@@ -605,18 +608,55 @@ pub fn init_ip_family_fields(service: &mut Service, old: Option<&Service>) -> Re
 // ClusterIPs
 // ---------------------------------------------------------------------------
 
+/// `Allocators.serviceIPAllocatorsByFamily`
+/// (pkg/registry/core/rest/storage_core.go:329-490): one [`MetaAllocator`]
+/// per configured family, primary first.
+pub struct ClusterIpAllocators<S: Storage> {
+    by_family: Vec<(IPFamily, Arc<MetaAllocator<S>>)>,
+}
+
+impl<S: Storage> ClusterIpAllocators<S> {
+    /// One allocator per family of `families` (`--service-cluster-ip-range`,
+    /// primary first).
+    pub fn new(storage: Arc<S>, families: &[IPFamily]) -> Self {
+        Self {
+            by_family: families
+                .iter()
+                .map(|f| {
+                    (
+                        f.clone(),
+                        Arc::new(MetaAllocator::new(storage.clone(), *f == IPFamily::IPv6)),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The configured families, primary first.
+    pub fn families(&self) -> Vec<IPFamily> {
+        self.by_family.iter().map(|(f, _)| f.clone()).collect()
+    }
+
+    fn get(&self, family: &IPFamily) -> Option<&Arc<MetaAllocator<S>>> {
+        self.by_family
+            .iter()
+            .find(|(f, _)| f == family)
+            .map(|(_, a)| a)
+    }
+}
+
 /// The ClusterIP half of a `callbackTransaction` (alloc.go:305-338,
 /// 628-675): what to release if the write fails, and what to release once
 /// it succeeds.
 pub struct ClusterIpTxn<S: Storage> {
-    pa: Arc<MetaAllocator<S>>,
-    allocated: Vec<IpAddr>,
-    release_on_commit: Vec<IpAddr>,
+    pa: Arc<ClusterIpAllocators<S>>,
+    allocated: Vec<(IPFamily, IpAddr)>,
+    release_on_commit: Vec<(IPFamily, IpAddr)>,
     dry_run: bool,
 }
 
 impl<S: Storage> ClusterIpTxn<S> {
-    fn new(pa: &Arc<MetaAllocator<S>>, dry_run: bool) -> Self {
+    fn new(pa: &Arc<ClusterIpAllocators<S>>, dry_run: bool) -> Self {
         Self {
             pa: pa.clone(),
             allocated: Vec::new(),
@@ -625,10 +665,19 @@ impl<S: Storage> ClusterIpTxn<S> {
         }
     }
 
-    async fn release_all(&self, ips: &[IpAddr]) {
-        for ip in ips {
-            if let Err(e) = self.pa.release(*ip, false).await {
+    /// `releaseIPs` (alloc.go:446-475): a family this cluster does not serve
+    /// is skipped, and the first failed release ends the pass.
+    async fn release_all(&self, ips: &[(IPFamily, IpAddr)]) {
+        for (family, ip) in ips {
+            let Some(allocator) = self.pa.get(family) else {
+                tracing::info!(
+                    "Not releasing ClusterIP {ip} because related family {family:?} is not enabled"
+                );
+                continue;
+            };
+            if let Err(e) = allocator.release(*ip, false).await {
                 tracing::error!("failed to release ClusterIP {ip}: {e}");
+                return;
             }
         }
     }
@@ -682,8 +731,64 @@ fn invalid_cluster_ips(service: &Service, detail: String) -> Error {
     )])
 }
 
-/// `allocClusterIPs` + `allocIPs` (alloc.go:340-451) for the primary
-/// family: a named address is claimed, an empty one allocated.
+/// `allocIPs` (alloc.go:395-451): claim a named address, or allocate the
+/// next one, for each `(family, ip)`. Each success is recorded in
+/// `txn.allocated` at once, so a failure part-way leaves the caller able to
+/// roll back what was taken.
+async fn alloc_ips<S: Storage>(
+    txn: &mut ClusterIpTxn<S>,
+    service: &Service,
+    to_alloc: Vec<(IPFamily, String)>,
+) -> Result<Vec<(IPFamily, IpAddr)>> {
+    let pa = txn.pa.clone();
+    let mut allocated = Vec::new();
+    for (family, requested) in to_alloc {
+        // Always there: the families are validated against the
+        // configuration first.
+        let Some(allocator) = pa.get(&family) else {
+            return Err(internal_error(format!(
+                "no ClusterIP allocator for family {family:?}"
+            )));
+        };
+        let ip = if requested.is_empty() {
+            match allocator
+                .allocate_next_service(Some(service), txn.dry_run)
+                .await
+            {
+                Ok(ip) => ip,
+                Err(IpError::Full) => {
+                    return Err(internal_error(format!(
+                        "failed to allocate a serviceIP: {}",
+                        IpError::Full
+                    )))
+                }
+                Err(e) => {
+                    return Err(invalid_cluster_ips(
+                        service,
+                        format!("failed to allocate IP: {e}"),
+                    ))
+                }
+            }
+        } else {
+            let ip: IpAddr = parse_ip_sloppy(&requested).ok_or_else(|| {
+                internal_error(format!("failed to parse service IP {requested:?}"))
+            })?;
+            allocator
+                .allocate_service(Some(service), ip, txn.dry_run)
+                .await
+                .map_err(|e| {
+                    invalid_cluster_ips(service, format!("failed to allocate IP {requested}: {e}"))
+                })?;
+            ip
+        };
+        txn.allocated.push((family.clone(), ip));
+        allocated.push((family, ip));
+    }
+    Ok(allocated)
+}
+
+/// `allocClusterIPs` (alloc.go:340-393): one address per entry of
+/// `spec.ipFamilies`; a named address is claimed, an empty one allocated.
 async fn alloc_cluster_ips<S: Storage>(
     txn: &mut ClusterIpTxn<S>,
     service: &mut Service,
@@ -693,65 +798,89 @@ async fn alloc_cluster_ips<S: Storage>(
     {
         return Ok(());
     }
-    let requested = cluster_ips(service).into_iter().next().unwrap_or_default();
-    let pa = txn.pa.clone();
-    let ip = if requested.is_empty() {
-        match pa.allocate_next_service(Some(service), txn.dry_run).await {
-            Ok(ip) => ip,
-            Err(IpError::Full) => {
-                return Err(internal_error(format!(
-                    "failed to allocate a serviceIP: {}",
-                    IpError::Full
-                )))
-            }
-            Err(e) => {
-                return Err(invalid_cluster_ips(
-                    service,
-                    format!("failed to allocate IP: {e}"),
-                ))
-            }
-        }
-    } else {
-        let ip: IpAddr = requested
-            .parse()
-            .map_err(|_| internal_error(format!("failed to parse service IP {requested:?}")))?;
-        pa.allocate_service(Some(service), ip, txn.dry_run)
-            .await
-            .map_err(|e| {
-                invalid_cluster_ips(service, format!("failed to allocate IP {requested}: {e}"))
-            })?;
-        ip
-    };
-    txn.allocated.push(ip);
-    service.spec.cluster_ip = Some(ip.to_string());
-    match service.spec.cluster_ips.as_mut() {
-        Some(ips) if !ips.is_empty() => ips[0] = ip.to_string(),
-        _ => service.spec.cluster_ips = Some(vec![ip.to_string()]),
+    // The Service has correct ipFamilies; it may carry only some of its
+    // clusterIPs (an upgrade to dual-stack), or none.
+    let mut families = spec_ip_families(service).to_vec();
+    if families.is_empty() {
+        families.push(txn.pa.families()[0].clone());
     }
+    let mut ips = cluster_ips(service);
+    while ips.len() < families.len() {
+        ips.push(String::new()); // the marker
+    }
+    let to_alloc: Vec<(IPFamily, String)> =
+        families.iter().cloned().zip(ips.iter().cloned()).collect();
+    let allocated = alloc_ips(txn, service, to_alloc).await?;
+    for (family, ip) in allocated {
+        if let Some(i) = families.iter().position(|f| *f == family) {
+            ips[i] = ip.to_string();
+        }
+    }
+    service.spec.cluster_ip = Some(ips[0].clone());
+    service.spec.cluster_ips = Some(ips);
     Ok(())
 }
 
-/// `txnAllocClusterIPs` (alloc.go:305-338).
+/// `txnAllocClusterIPs` (alloc.go:305-338). Unlike upstream, an allocation
+/// that fails after the first family was taken gives that one back rather
+/// than leaving it to the repair loop.
 pub async fn txn_alloc_cluster_ips<S: Storage>(
-    pa: &Arc<MetaAllocator<S>>,
+    pa: &Arc<ClusterIpAllocators<S>>,
     service: &mut Service,
     dry_run: bool,
 ) -> Result<ClusterIpTxn<S>> {
     let mut txn = ClusterIpTxn::new(pa, dry_run);
-    alloc_cluster_ips(&mut txn, service).await?;
+    if let Err(e) = alloc_cluster_ips(&mut txn, service).await {
+        txn.revert().await;
+        return Err(e);
+    }
     Ok(txn)
 }
 
-/// `txnUpdateClusterIPs` + `updateClusterIPs` (alloc.go:628-752), cases A
-/// (from ExternalName: allocate) and B (to ExternalName: release on
-/// commit). Cases C and D are dual-stack upgrades and downgrades.
+/// The family of each entry of `old`'s `spec.clusterIPs`
+/// (`oldService.Spec.IPFamilies[i]`).
+fn old_family_ips(old: &Service) -> Vec<(IPFamily, String)> {
+    let fams = spec_ip_families(old);
+    cluster_ips(old)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, ip)| {
+            fams.get(i)
+                .cloned()
+                .or_else(|| family_of(&ip))
+                .map(|f| (f, ip))
+        })
+        .collect()
+}
+
+/// `txnUpdateClusterIPs` + `updateClusterIPs` (alloc.go:628-752): A (from
+/// ExternalName: allocate), B (to ExternalName: release on commit), C
+/// (upgrade to dual-stack: allocate the secondary) and D (downgrade:
+/// release the secondary on commit).
 pub async fn txn_update_cluster_ips<S: Storage>(
-    pa: &Arc<MetaAllocator<S>>,
+    pa: &Arc<ClusterIpAllocators<S>>,
     service: &mut Service,
     old_service: &Service,
     dry_run: bool,
 ) -> Result<ClusterIpTxn<S>> {
     let mut txn = ClusterIpTxn::new(pa, dry_run);
+    if let Err(e) = update_cluster_ips(&mut txn, service, old_service).await {
+        txn.revert().await;
+        return Err(e);
+    }
+    Ok(txn)
+}
+
+async fn update_cluster_ips<S: Storage>(
+    txn: &mut ClusterIpTxn<S>,
+    service: &mut Service,
+    old_service: &Service,
+) -> Result<()> {
+    // A PreferDualStack Service is not auto-upgraded or downgraded when the
+    // cluster gains or loses dual-stackness (alloc.go:660-668).
+    if is_matching_prefer_dual_stack_cluster_ip_fields(service, Some(old_service)) {
+        return Ok(());
+    }
     let was_external = matches!(
         old_service.spec.service_type,
         Some(ServiceType::ExternalName)
@@ -759,41 +888,69 @@ pub async fn txn_update_cluster_ips<S: Storage>(
     let is_external = matches!(service.spec.service_type, Some(ServiceType::ExternalName));
     // CASE A.
     if was_external && !is_external {
-        alloc_cluster_ips(&mut txn, service).await?;
-        return Ok(txn);
+        return alloc_cluster_ips(txn, service).await;
     }
     // Headless: no ClusterIP to manage.
     if is_headless(old_service) {
-        return Ok(txn);
+        return Ok(());
     }
     // CASE B.
     if !was_external && is_external {
-        txn.release_on_commit = cluster_ips(old_service)
-            .iter()
-            .filter_map(|ip| ip.parse().ok())
+        txn.release_on_commit = old_family_ips(old_service)
+            .into_iter()
+            .filter_map(|(f, ip)| parse_ip_sloppy(&ip).map(|ip| (f, ip)))
             .collect();
+        return Ok(());
     }
-    Ok(txn)
+    let old_len = spec_ip_families(old_service).len();
+    let new_len = spec_ip_families(service).len();
+    // CASE C.
+    if old_len == 1 && new_len == 2 {
+        let mut ips = cluster_ips(service);
+        // If the secondary was named, take it; if not add a marker.
+        if ips.len() < 2 {
+            ips.push(String::new());
+        }
+        let family = spec_ip_families(service)[1].clone();
+        let allocated = alloc_ips(txn, service, vec![(family, ips[1].clone())]).await?;
+        if let Some((_, ip)) = allocated.first() {
+            ips[1] = ip.to_string();
+        }
+        service.spec.cluster_ips = Some(ips);
+        return Ok(());
+    }
+    // CASE D: the clusterIP itself is left to the action.
+    if old_len == 2 && new_len == 1 {
+        if let Some((f, ip)) = old_family_ips(old_service).get(1) {
+            if let Some(ip) = parse_ip_sloppy(ip) {
+                txn.release_on_commit = vec![(f.clone(), ip)];
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The ClusterIP half of `releaseAllocatedResources` (`releaseClusterIPs`,
 /// alloc.go:910-930), run once a Service is gone.
-pub async fn release_cluster_ips<S: Storage>(pa: &MetaAllocator<S>, service: &Service) {
+pub async fn release_cluster_ips<S: Storage>(pa: &Arc<ClusterIpAllocators<S>>, service: &Service) {
     if matches!(service.spec.service_type, Some(ServiceType::ExternalName)) || is_headless(service)
     {
         return;
     }
+    let mut txn = ClusterIpTxn::new(pa, false);
     for ip in cluster_ips(service) {
-        let Ok(addr) = ip.parse::<IpAddr>() else {
+        let Some(addr) = parse_ip_sloppy(&ip) else {
             continue;
         };
-        if let Err(e) = pa.release(addr, false).await {
-            tracing::error!(
-                "Error releasing service {} ClusterIP {ip}: {e}",
-                service.metadata.name
-            );
-        }
+        // `netutils.IsIPv6String`.
+        let family = if addr.is_ipv6() {
+            IPFamily::IPv6
+        } else {
+            IPFamily::IPv4
+        };
+        txn.allocated.push((family, addr));
     }
+    txn.revert().await;
 }
 
 /// Settle both halves against the storage write (`metaTransaction`,
