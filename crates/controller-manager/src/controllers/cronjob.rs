@@ -327,7 +327,9 @@ impl<S: Storage + 'static> CronJobController<S> {
         }
 
         // Create new Job
-        self.create_job(cronjob, namespace, scheduled_time).await?;
+        if !self.create_job(cronjob, namespace, scheduled_time).await? {
+            return Ok(());
+        }
 
         // Build active job references from all active jobs for this cronjob.
         // Sort by name so the active list is deterministic across reconciles
@@ -548,10 +550,10 @@ impl<S: Storage + 'static> CronJobController<S> {
         };
         let now_tz = now.with_timezone(&tz);
 
-        // Start of the window: the last scheduled run, else one minute ago so
-        // a fresh CronJob does not fire everything at startup.
-        let start = match last_schedule {
-            Some(last) => last.with_timezone(&tz),
+        // mostRecentScheduleTime (utils.go:101-105): earliestTime is the
+        // CronJob's creationTimestamp, replaced by status.lastScheduleTime.
+        let start = match last_schedule.or(cronjob.metadata.creation_timestamp) {
+            Some(t) => t.with_timezone(&tz),
             None => (now - chrono::Duration::minutes(1)).with_timezone(&tz),
         };
         // Walk every scheduled time in (start, now]; the latest wins. Capped
@@ -572,7 +574,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         cronjob: &CronJob,
         namespace: &str,
         scheduled_time: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let cronjob_name = &cronjob.metadata.name;
         let job_name = job_name_for(cronjob_name, scheduled_time);
 
@@ -585,12 +587,27 @@ impl<S: Storage + 'static> CronJobController<S> {
             .unwrap_or_default();
         labels.insert("cronjob-name".to_string(), cronjob_name.clone());
 
-        let annotations = cronjob
+        let mut annotations = cronjob
             .spec
             .job_template
             .metadata
             .as_ref()
-            .and_then(|m| m.annotations.clone());
+            .and_then(|m| m.annotations.clone())
+            .unwrap_or_default();
+        // getJobFromTemplate2 (utils.go:254): CronJobScheduledTimestampAnnotation
+        // = scheduledTime.In(spec.timeZone).Format(time.RFC3339).
+        let tz: chrono_tz::Tz = cronjob
+            .spec
+            .time_zone
+            .as_deref()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(chrono_tz::UTC);
+        let local = scheduled_time.with_timezone(&tz);
+        annotations.insert(
+            "batch.kubernetes.io/cronjob-scheduled-timestamp".to_string(),
+            local.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
+        let annotations = Some(annotations);
 
         let job = Job {
             type_meta: rusternetes_common::types::TypeMeta {
@@ -641,14 +658,16 @@ impl<S: Storage + 'static> CronJobController<S> {
                     "Job {} already exists for CronJob {} (controlled by it: {})",
                     job_name, cronjob_name, ours
                 );
-                return Ok(());
+                // `if !metav1.IsControlledBy(job, cronJob) { return nil,
+                // updateStatus, nil }` (cronjob_controllerv2.go:628-631).
+                return Ok(ours);
             }
             Err(e) => return Err(e.into()),
         }
 
         info!("Created Job {} from CronJob {}", job_name, cronjob_name);
 
-        Ok(())
+        Ok(true)
     }
 
     async fn cleanup_old_jobs(&self, cronjob: &CronJob, namespace: &str) -> Result<()> {
@@ -946,5 +965,130 @@ mod tests {
         let cj = mk("0 0 * * *", serde_json::Value::Null);
         ctrl.should_run_now("0 0 * * *", now, &cj).await.unwrap();
         assert!(events(&storage).await.is_empty());
+    }
+
+    fn cj_fixture(extra: serde_json::Value) -> rusternetes_common::resources::CronJob {
+        let mut v = serde_json::json!({
+            "apiVersion": "batch/v1", "kind": "CronJob",
+            "metadata": {"name": "cj", "namespace": "default", "uid": "u1",
+                "creationTimestamp": "2025-01-15T05:50:00Z"},
+            "spec": {
+                "schedule": "0 6 * * *",
+                "jobTemplate": {"spec": {"template": {"spec": {
+                    "containers": [{"name": "c", "image": "busybox"}]
+                }}}},
+            },
+        });
+        for (k, val) in extra.as_object().unwrap() {
+            v["spec"][k] = val.clone();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// utils.go:101 `earliestTime := cj.ObjectMeta.CreationTimestamp.Time`:
+    /// with no lastScheduleTime the walk starts at creationTimestamp, not a
+    /// "within the past minute" window. Created 05:50, now 06:02: the 06:00
+    /// run is due.
+    #[tokio::test]
+    async fn first_run_starts_from_creation_timestamp() {
+        use std::sync::Arc;
+        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
+        let ctrl = super::CronJobController::new(storage);
+        let now = chrono::DateTime::parse_from_rfc3339("2025-01-15T06:02:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let cj = cj_fixture(serde_json::json!({}));
+        let due = ctrl
+            .scheduled_run_time("0 6 * * *", now, &cj)
+            .await
+            .unwrap();
+        assert_eq!(
+            due.unwrap().to_rfc3339(),
+            "2025-01-15T06:00:00+00:00",
+            "must fire the 06:00 run created after creationTimestamp"
+        );
+        // A run before creationTimestamp is never due.
+        let early = chrono::DateTime::parse_from_rfc3339("2025-01-15T05:55:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(ctrl
+            .scheduled_run_time("0 5 * * *", early, &cj)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// getJobFromTemplate2 (utils.go:254) sets
+    /// batch.kubernetes.io/cronjob-scheduled-timestamp = scheduledTime.In(tz)
+    /// formatted RFC3339 (`Z` for a zero offset).
+    #[tokio::test]
+    async fn job_gets_scheduled_timestamp_annotation() {
+        use rusternetes_common::resources::Job;
+        use rusternetes_storage::Storage;
+        use std::sync::Arc;
+        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let t = chrono::DateTime::parse_from_rfc3339("2025-01-15T06:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let key = |cj: &str| format!("/registry/jobs/default/{}", super::job_name_for(cj, t));
+        const ANN: &str = "batch.kubernetes.io/cronjob-scheduled-timestamp";
+
+        let cj = cj_fixture(serde_json::json!({}));
+        assert!(ctrl.create_job(&cj, "default", t).await.unwrap());
+        let job: Job = storage.get(&key("cj")).await.unwrap();
+        assert_eq!(
+            job.metadata.annotations.unwrap().get(ANN).unwrap(),
+            "2025-01-15T06:00:00Z"
+        );
+
+        let mut cj = cj_fixture(serde_json::json!({"timeZone": "America/New_York"}));
+        cj.metadata.name = "ny".into();
+        ctrl.create_job(&cj, "default", t).await.unwrap();
+        let job: Job = storage.get(&key("ny")).await.unwrap();
+        assert_eq!(
+            job.metadata.annotations.unwrap().get(ANN).unwrap(),
+            "2025-01-15T01:00:00-05:00"
+        );
+    }
+
+    /// cronjob_controllerv2.go:628-631: on AlreadyExists, a Job not
+    /// controlled by this CronJob means another actor owns it and updates the
+    /// status; we must NOT update the status (`return nil, updateStatus, nil`).
+    #[tokio::test]
+    async fn already_exists_uncontrolled_job_skips_status_update() {
+        use rusternetes_common::resources::Job;
+        use rusternetes_storage::Storage;
+        use std::sync::Arc;
+        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let t = chrono::DateTime::parse_from_rfc3339("2025-01-15T06:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let cj = cj_fixture(serde_json::json!({}));
+        // Foreign Job with the deterministic name, no ownerReference.
+        let foreign: Job = serde_json::from_value(serde_json::json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": super::job_name_for("cj", t), "namespace": "default", "uid": "foreign"},
+            "spec": {"template": {"spec": {"containers": [{"name": "c", "image": "busybox"}]}}},
+        }))
+        .unwrap();
+        storage
+            .create(
+                &format!("/registry/jobs/default/{}", foreign.metadata.name),
+                &foreign,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !ctrl.create_job(&cj, "default", t).await.unwrap(),
+            "uncontrolled existing Job: no status update"
+        );
+
+        // Our own Job (controlled by uid u1) -> status update proceeds.
+        let mut cj2 = cj_fixture(serde_json::json!({}));
+        cj2.metadata.name = "mine".into();
+        assert!(ctrl.create_job(&cj2, "default", t).await.unwrap());
+        assert!(ctrl.create_job(&cj2, "default", t).await.unwrap());
     }
 }
