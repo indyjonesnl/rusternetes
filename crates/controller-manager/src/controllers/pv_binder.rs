@@ -21,6 +21,15 @@ pub const ANN_DYNAMICALLY_PROVISIONED: &str = "pv.kubernetes.io/provisioned-by";
 /// `storagehelpers.AnnMigratedTo` (component-helpers pv_helpers.go).
 const ANN_MIGRATED_TO: &str = "pv.kubernetes.io/migrated-to";
 
+/// `FindRecyclablePluginBySpec` (`pkg/volume/plugins.go:751`): the in-tree
+/// plugins kube-controller-manager registers a recycler for are hostPath and
+/// NFS (`cmd/kube-controller-manager/app/plugins.go:67-120`). Their
+/// recycler-pod execution is not ported, so those volumes are left Released;
+/// every other source has no recycler.
+fn has_recyclable_plugin(spec: &PersistentVolumeSpec) -> bool {
+    spec.host_path.is_some() || spec.nfs.is_some()
+}
+
 pub struct PVBinderController<S: Storage> {
     storage: Arc<S>,
     recorder: EventRecorder<S>,
@@ -349,15 +358,45 @@ impl<S: Storage + 'static> PVBinderController<S> {
     /// `status.message` cleared. Plain `updateVolumePhase` records no event.
     async fn update_volume_phase(
         &self,
+        pv: PersistentVolume,
+        phase: PersistentVolumePhase,
+    ) -> Result<PersistentVolume> {
+        self.update_volume_phase_with_message(pv, phase, None).await
+    }
+
+    /// `updateVolumePhaseWithEvent` (`pv_controller.go:942-962`): set the
+    /// phase and message, and emit a Warning event only when the phase
+    /// actually changes ("not every time syncClaim is called").
+    async fn update_volume_phase_with_event(
+        &self,
+        pv: PersistentVolume,
+        phase: PersistentVolumePhase,
+        reason: &str,
+        message: &str,
+    ) -> Result<PersistentVolume> {
+        if pv.status.as_ref().map(|s| &s.phase) == Some(&phase) {
+            return Ok(pv);
+        }
+        let new_pv = self
+            .update_volume_phase_with_message(pv, phase, Some(message.to_string()))
+            .await?;
+        self.warn(object_ref_for_pv(&new_pv), reason, message).await;
+        Ok(new_pv)
+    }
+
+    /// `updateVolumePhase` with an explicit `message` (`:912-937`).
+    async fn update_volume_phase_with_message(
+        &self,
         mut pv: PersistentVolume,
         phase: PersistentVolumePhase,
+        message: Option<String>,
     ) -> Result<PersistentVolume> {
         if pv.status.as_ref().map(|s| &s.phase) == Some(&phase) {
             return Ok(pv);
         }
         let mut status = pv.status.take().unwrap_or_default();
         status.phase = phase.clone();
-        status.message = None;
+        status.message = message;
         pv.status = Some(status);
         let pv_key = build_key("persistentvolumes", None, &pv.metadata.name);
         // Phase-only write -> status subresource (pv_controller.go:925).
@@ -385,9 +424,9 @@ impl<S: Storage + 'static> PVBinderController<S> {
     }
 
     /// `reclaimVolume` (`pv_controller.go:1180-1230`). `Retain` does nothing;
-    /// `Delete` removes the PV. `Recycle` is deprecated and its recycler
-    /// plugins (`recycleVolumeOperation`) are not ported, so it leaves the
-    /// volume `Released` like `Retain`. A PV carrying the
+    /// `Delete` removes the PV. `Recycle` on a volume with no recycler
+    /// plugin fails it (`recycleVolumeOperation`, `:1279-1286`); the hostPath/NFS
+    /// recycler pods are not ported, so those stay `Released` like `Retain`. A PV carrying the
     /// `pv.kubernetes.io/migrated-to` annotation is left to the external
     /// provisioner (`:1183-1187`).
     async fn reclaim_volume(&self, pv: &PersistentVolume) -> Result<()> {
@@ -398,6 +437,22 @@ impl<S: Storage + 'static> PVBinderController<S> {
             .and_then(|a| a.get(ANN_MIGRATED_TO))
             .is_some_and(|v| !v.is_empty())
         {
+            return Ok(());
+        }
+        if pv.spec.persistent_volume_reclaim_policy == Some(PersistentVolumeReclaimPolicy::Recycle)
+            && !has_recyclable_plugin(&pv.spec)
+        {
+            // recycleVolumeOperation, "No recycler found" branch
+            // (`pv_controller.go:1279-1286`): Failed phase + Warning event.
+            // Upstream: "the controller will retry
+            // recycling the volume in every syncVolume() call".
+            self.update_volume_phase_with_event(
+                pv.clone(),
+                PersistentVolumePhase::Failed,
+                "VolumeFailedRecycle",
+                "No recycler plugin found for the volume!",
+            )
+            .await?;
             return Ok(());
         }
         if pv.spec.persistent_volume_reclaim_policy == Some(PersistentVolumeReclaimPolicy::Delete) {
@@ -1264,6 +1319,43 @@ mod tests {
         put_pv(&storage, &pv).await;
         c.sync_volumes(&WorkQueue::new()).await.unwrap();
         assert!(get_pv(&storage, "pv").await.is_none());
+    }
+
+    /// recycle_test.go "6-3": a Recycle volume with no recycler plugin goes
+    /// Failed with message "No recycler plugin found for the volume!" and a
+    /// `Warning VolumeFailedRecycle` event (pv_controller.go:1279-1286).
+    #[tokio::test]
+    async fn recycle_policy_without_recycler_plugin_fails_volume() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let mut pv = bound_pv("pv");
+        pv.spec.persistent_volume_reclaim_policy = Some(PersistentVolumeReclaimPolicy::Recycle);
+        put_pv(&storage, &pv).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let status = get_pv(&storage, "pv").await.unwrap().status.unwrap();
+        assert_eq!(status.phase, PersistentVolumePhase::Failed);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("No recycler plugin found for the volume!")
+        );
+        let events: Vec<rusternetes_common::resources::Event> =
+            storage.list("/registry/events/").await.unwrap();
+        let ev: Vec<_> = events
+            .iter()
+            .filter(|e| e.reason == "VolumeFailedRecycle")
+            .collect();
+        assert_eq!(ev.len(), 1);
+        // Already Failed: a further sync must not emit another event.
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let events: Vec<rusternetes_common::resources::Event> =
+            storage.list("/registry/events/").await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.reason == "VolumeFailedRecycle")
+                .count(),
+            1
+        );
     }
 
     /// "Do not overwrite previous Failed state" (pv_controller.go:672-681).
