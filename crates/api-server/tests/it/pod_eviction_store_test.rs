@@ -1521,7 +1521,7 @@ async fn the_pdb_status_write_runs_the_status_strategy() {
     let mut bad = client.get("default", "b").await.unwrap();
     bad.status.as_mut().unwrap().disruptions_allowed = -1;
     let err = client.update_status("default", &bad).await.unwrap_err();
-    assert!(matches!(err, Error::Invalid(_)), "{err:?}");
+    assert_eq!(err.reason(), "Invalid", "{err:?}");
 
     // PrepareForUpdate: a spec change rides along but is dropped.
     let mut changed = client.get("default", "b").await.unwrap();

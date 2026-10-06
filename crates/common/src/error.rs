@@ -107,6 +107,57 @@ fn format_error_list(errs: &ErrorList) -> String {
 }
 
 impl Error {
+    /// `errors.NewInvalid(qualifiedKind, name, errs)`
+    /// (`apimachinery/pkg/api/errors/errors.go:284-312`, release-1.35): a 422
+    /// Status whose message is `<Kind> "<name>" is invalid: <aggregate>` (the
+    /// qualified kind renders as `Kind.group` for a non-core group), whose
+    /// `details` carry group/kind/name, and whose causes carry the error
+    /// type, `ErrorBody()` as the message and the field path.
+    pub fn new_invalid(group: &str, kind: &str, name: &str, errs: ErrorList) -> Error {
+        let qualified = if group.is_empty() {
+            kind.to_string()
+        } else {
+            format!("{kind}.{group}")
+        };
+        let message = if errs.is_empty() {
+            format!("{qualified} \"{name}\" is invalid")
+        } else {
+            // `ErrorList.ToAggregate()` dedups identical messages and renders
+            // one error as itself, several as `[a, b]`.
+            let mut msgs: Vec<String> = Vec::new();
+            for e in &errs {
+                let m = e.to_string();
+                if !msgs.contains(&m) {
+                    msgs.push(m);
+                }
+            }
+            if msgs.len() == 1 {
+                format!("{qualified} \"{name}\" is invalid: {}", msgs[0])
+            } else {
+                format!("{qualified} \"{name}\" is invalid: [{}]", msgs.join(", "))
+            }
+        };
+        let causes: Vec<crate::types::StatusCause> = errs
+            .iter()
+            .map(|e| crate::types::StatusCause {
+                reason: Some(e.error_type.cause_reason().to_string()),
+                message: Some(e.error_body()),
+                field: Some(e.field.clone()),
+            })
+            .collect();
+        let details = crate::types::StatusDetails {
+            name: Some(name.to_string()),
+            group: Some(group.to_string()).filter(|g| !g.is_empty()),
+            kind: Some(kind.to_string()),
+            uid: None,
+            causes: Some(causes).filter(|c| !c.is_empty()),
+            retry_after_seconds: None,
+        };
+        Error::Status(Box::new(crate::types::Status::failure_with_details(
+            message, "Invalid", 422, details,
+        )))
+    }
+
     /// Returns the machine-readable reason string matching Kubernetes StatusReason values
     pub fn reason(&self) -> &str {
         match self {
@@ -469,6 +520,68 @@ fn extract_resource_details_for_invalid(msg: &str) -> Option<crate::types::Statu
 mod tests {
     use super::*;
     use crate::validation::field::{ErrorType, Path};
+
+    /// `TestNewInvalid` (apimachinery pkg/api/errors/errors_test.go:124-220).
+    #[test]
+    fn new_invalid_matches_upstream_test_new_invalid() {
+        let path = Path::new("field[0].name");
+        let cases: Vec<(crate::validation::field::Error, &str, &str)> = vec![
+            (
+                crate::validation::field::Error::duplicate(&path, "bar"),
+                "FieldValueDuplicate",
+                r#"Kind "name" is invalid: field[0].name: Duplicate value: "bar""#,
+            ),
+            (
+                crate::validation::field::Error::invalid(&path, "bar", "detail"),
+                "FieldValueInvalid",
+                r#"Kind "name" is invalid: field[0].name: Invalid value: "bar": detail"#,
+            ),
+            (
+                crate::validation::field::Error::required(&path, ""),
+                "FieldValueRequired",
+                r#"Kind "name" is invalid: field[0].name: Required value"#,
+            ),
+        ];
+        for (err, reason, msg) in cases {
+            let body = err.error_body();
+            let Error::Status(st) = Error::new_invalid("", "Kind", "name", vec![err]) else {
+                panic!("not a Status")
+            };
+            assert_eq!(st.code, Some(422));
+            assert_eq!(st.reason.as_deref(), Some("Invalid"));
+            assert_eq!(st.message.as_deref(), Some(msg));
+            let d = st.details.unwrap();
+            assert_eq!(d.kind.as_deref(), Some("Kind"));
+            assert_eq!(d.name.as_deref(), Some("name"));
+            let c = &d.causes.unwrap()[0];
+            assert_eq!(c.reason.as_deref(), Some(reason));
+            assert_eq!(c.field.as_deref(), Some("field[0].name"));
+            assert_eq!(c.message.as_deref(), Some(body.as_str()));
+        }
+    }
+
+    #[test]
+    fn new_invalid_with_no_errors_and_with_several() {
+        let Error::Status(st) = Error::new_invalid("", "Kind", "name", vec![]) else {
+            panic!()
+        };
+        assert_eq!(st.message.as_deref(), Some(r#"Kind "name" is invalid"#));
+        let p = Path::new("a");
+        let e1 = crate::validation::field::Error::required(&p, "");
+        let e2 = crate::validation::field::Error::required(&Path::new("b"), "");
+        // Duplicate messages are dropped by `ToAggregate`; several render in
+        // brackets, `, `-joined (util/errors/errors.go:70-94).
+        let Error::Status(st) =
+            Error::new_invalid("apps", "Deployment", "d", vec![e1.clone(), e1, e2])
+        else {
+            panic!()
+        };
+        assert_eq!(
+            st.message.as_deref(),
+            Some(r#"Deployment.apps "d" is invalid: [a: Required value, b: Required value]"#)
+        );
+        assert_eq!(st.details.unwrap().group.as_deref(), Some("apps"));
+    }
 
     #[test]
     fn parse_legacy_required() {

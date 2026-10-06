@@ -63,6 +63,36 @@ async fn create_validates_the_name_as_a_dns_subdomain() {
     assert!(message(&out).contains("metadata.name"), "{out}");
 }
 
+/// `BeforeCreate` returns `errors.NewInvalid(kind.GroupKind(), name, errs)`
+/// (rest/create.go:122-123), whose Status message is
+/// `<Kind> "<name>" is invalid: <aggregate>`, whose details name the kind and
+/// the object, and whose cause message is `ErrorBody()` (no `field: ` prefix)
+/// (apimachinery pkg/api/errors/errors.go:284-312; errors_test.go
+/// `TestNewInvalid`). Issue #2215.
+#[tokio::test]
+async fn create_invalid_is_upstream_new_invalid() {
+    let api = TestApiServer::new();
+    let (status, out) = api.post(CMS, &cm("Not_A_Subdomain")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
+    assert!(
+        message(&out).starts_with("ConfigMap \"Not_A_Subdomain\" is invalid: metadata.name: Invalid value: \"Not_A_Subdomain\""),
+        "{out}"
+    );
+    assert_eq!(out["details"]["kind"], "ConfigMap", "{out}");
+    assert_eq!(out["details"]["name"], "Not_A_Subdomain", "{out}");
+    assert_eq!(
+        out["details"]["causes"][0]["field"], "metadata.name",
+        "{out}"
+    );
+    let cause = out["details"]["causes"][0]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        cause.starts_with("Invalid value: \"Not_A_Subdomain\""),
+        "{out}"
+    );
+}
+
 /// `dryRun=All` validates without writing; any other value is rejected by
 /// `ValidateCreateOptions` (validation.go:174-180).
 #[tokio::test]
