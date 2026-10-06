@@ -51,6 +51,24 @@ pub async fn readyz(State(state): State<Arc<ApiServerState>>) -> (StatusCode, Js
         }
     }
 
+    for (name, res) in crate::post_start_hooks::global().checks() {
+        match res {
+            Ok(()) => checks.push(ComponentHealth {
+                name,
+                status: "ok".to_string(),
+                message: None,
+            }),
+            Err(e) => {
+                all_healthy = false;
+                checks.push(ComponentHealth {
+                    name,
+                    status: "failed".to_string(),
+                    message: Some(e.to_string()),
+                });
+            }
+        }
+    }
+
     let status = if all_healthy {
         HealthStatus {
             status: "ok".to_string(),
@@ -70,6 +88,30 @@ pub async fn readyz(State(state): State<Arc<ApiServerState>>) -> (StatusCode, Js
     };
 
     (status_code, Json(status))
+}
+
+/// `/healthz/poststarthook/<name>` and `/readyz/poststarthook/<name>`: the
+/// per-hook check `postStartHookHealthz` (hooks.go:222-246). 200 `ok` once the
+/// hook finished, 500 `internal server error: not finished` before (upstream
+/// healthz handler's failure body), 404 for an unregistered hook.
+pub async fn post_start_hook_check(
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> (StatusCode, String) {
+    post_start_hook_response(crate::post_start_hooks::global(), &name)
+}
+
+fn post_start_hook_response(
+    reg: &crate::post_start_hooks::PostStartHooks,
+    name: &str,
+) -> (StatusCode, String) {
+    match reg.check(name) {
+        None => (StatusCode::NOT_FOUND, "404 page not found".to_string()),
+        Some(Ok(())) => (StatusCode::OK, "ok".to_string()),
+        Some(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("internal server error: {e}"),
+        ),
+    }
 }
 
 /// Detailed health check endpoint
@@ -410,5 +452,31 @@ fn skip_length(der: &[u8], pos: usize) -> Option<usize> {
     } else {
         let num_bytes = (der[pos] & 0x7f) as usize;
         Some(pos + 1 + num_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::post_start_hooks::PostStartHooks;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn poststarthook_check_fails_until_finished() {
+        let reg = PostStartHooks::new();
+        let n = "scheduling/bootstrap-system-priority-classes";
+        let done = reg.register(n);
+        let (code, body) = post_start_hook_response(&reg, n);
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("not finished"));
+        done.store(true, Ordering::SeqCst);
+        assert_eq!(
+            post_start_hook_response(&reg, n),
+            (StatusCode::OK, "ok".into())
+        );
+        assert_eq!(
+            post_start_hook_response(&reg, "missing").0,
+            StatusCode::NOT_FOUND
+        );
     }
 }

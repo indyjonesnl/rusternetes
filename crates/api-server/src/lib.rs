@@ -14,6 +14,7 @@ pub use rusternetes_middleware as middleware;
 pub mod openapi;
 pub mod patch;
 pub mod peer_cert_acceptor;
+pub mod post_start_hooks;
 pub mod prometheus_client;
 pub mod registry;
 pub use rusternetes_protobuf as protobuf;
