@@ -1,5 +1,6 @@
 pub mod certificates;
 pub mod resourcequota;
+pub mod storage_object_in_use_protection;
 
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection
 use chrono::Utc;

@@ -32,6 +32,24 @@ fn label(body: &Value, key: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// Emulate upstream's pvprotection/pvcprotection controllers
+/// (pkg/controller/volume/...), which release the protection finalizer that
+/// StorageObjectInUseProtection admission added once the object is unused.
+/// No controller runs in this in-process harness.
+async fn release_protection(state: &TestApiServer, uris: &[String]) {
+    for uri in uris {
+        let (s, _) = send(
+            state,
+            "PATCH",
+            uri,
+            Some("application/merge-patch+json"),
+            Some(&json!({"metadata": {"finalizers": null}})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "release protection finalizer {uri}");
+    }
+}
+
 const NS: &str = "pv-csi-lifecycle";
 
 fn pv_body(name: &str) -> Value {
@@ -181,6 +199,19 @@ async fn pv_pvc_csi_lifecycle_over_http() {
     );
 
     // 7. Delete PVC and PV MUST succeed and MUST be confirmed.
+    //
+    // StorageObjectInUseProtection admission put the pv-/pvc-protection
+    // finalizer on both at create. Upstream's pvprotection/pvcprotection
+    // controllers (pkg/controller/volume/...) release it once the object is
+    // unused; none runs in this in-process harness, so emulate that release.
+    release_protection(
+        &state,
+        &[
+            format!("{pvc_uri}/pvc-csi-1"),
+            "/api/v1/persistentvolumes/pv-csi-1".to_string(),
+        ],
+    )
+    .await;
     let (s, _) = send(
         &state,
         "DELETE",
@@ -276,6 +307,14 @@ async fn pv_pvc_csi_lifecycle_over_http() {
     );
 
     // 11. deleteCollection PVC and PV MUST succeed and MUST be confirmed.
+    release_protection(
+        &state,
+        &[
+            format!("{pvc_uri}/pvc-csi-2"),
+            "/api/v1/persistentvolumes/pv-csi-2".to_string(),
+        ],
+    )
+    .await;
     let (s, _) = send(&state, "DELETE", &pvc_uri, None, None).await;
     assert!(s.is_success(), "deleteCollection PVC status: {s}");
     let (s, _) = send(&state, "DELETE", "/api/v1/persistentvolumes", None, None).await;

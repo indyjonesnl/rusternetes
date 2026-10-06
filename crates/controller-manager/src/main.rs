@@ -33,6 +33,8 @@ use controllers::{
     pod_disruption_budget::{PodDisruptionBudgetController, StalePodDisruptionController},
     priorityclass::PriorityClassController,
     pv_binder::PVBinderController,
+    pv_protection::PvProtectionController,
+    pvc_protection::PvcProtectionController,
     replicaset::ReplicaSetController,
     replicationcontroller::ReplicationControllerController,
     resource_quota::ResourceQuotaController,
@@ -552,6 +554,28 @@ async fn main() -> Result<()> {
         async move {
             if let Err(e) = controller.run().await {
                 tracing::error!("PV/PVC Binder controller error: {}", e);
+            }
+        }
+    });
+
+    // Start PVC protection controller (pvcprotection.NewPVCProtectionController)
+    let pvc_protection_controller = Arc::new(PvcProtectionController::new(storage.clone()));
+    spawn_controller!("PVC protection controller", leader_elector, {
+        let controller = pvc_protection_controller.clone();
+        async move {
+            if let Err(e) = controller.run().await {
+                tracing::error!("PVC protection controller error: {}", e);
+            }
+        }
+    });
+
+    // Start PV protection controller (pvprotection.NewPVProtectionController)
+    let pv_protection_controller = Arc::new(PvProtectionController::new(storage.clone()));
+    spawn_controller!("PV protection controller", leader_elector, {
+        let controller = pv_protection_controller.clone();
+        async move {
+            if let Err(e) = controller.run().await {
+                tracing::error!("PV protection controller error: {}", e);
             }
         }
     });

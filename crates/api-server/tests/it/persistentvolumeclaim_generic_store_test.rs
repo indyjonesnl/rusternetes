@@ -221,3 +221,23 @@ async fn delete_returns_the_object_and_no_cluster_wide_deletecollection() {
     assert_eq!(out["kind"], "PersistentVolumeClaim", "{out}");
     assert_eq!(out["metadata"]["name"], "c-del", "{out}");
 }
+
+/// `StorageObjectInUseProtection` (storageobjectinuseprotection/admission.go
+/// `admitPVC`): a created claim carries `kubernetes.io/pvc-protection`, and
+/// deleting it only marks it terminating until the pvc-protection controller
+/// releases it.
+#[tokio::test]
+async fn create_adds_the_pvc_protection_finalizer() {
+    let api = TestApiServer::new();
+    let out = create(&api, &pvc("c-protected", "1Gi")).await;
+    assert_eq!(
+        out["metadata"]["finalizers"],
+        json!(["kubernetes.io/pvc-protection"]),
+        "{out}"
+    );
+    let (status, _) = api.delete(&format!("{PVCS}/c-protected")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, out) = api.get(&format!("{PVCS}/c-protected")).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["metadata"]["deletionTimestamp"].is_string(), "{out}");
+}
