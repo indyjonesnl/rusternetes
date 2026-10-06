@@ -12,11 +12,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::stream::BoxStream;
 use rusternetes_client::http::ApiClient;
-use rusternetes_client::reflector::{ApiListWatch, ListWatch, Reflector};
+use rusternetes_client::reflector::{ApiListWatch, ListWatch, Reflector, WatchItem};
 use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 /// Boot the real router on 127.0.0.1:0 and return (client, storage-backed
 /// harness). The serve task runs for the lifetime of the test process.
@@ -32,6 +34,46 @@ async fn serve() -> (Arc<ApiClient>, TestApiServer) {
         ApiClient::new(&format!("http://{addr}"), false, None).expect("build test ApiClient"),
     );
     (client, ts)
+}
+
+/// [`ApiListWatch`] plus a "watch established" signal and an optional delay
+/// before the watch is opened (to widen the list->watch window in tests).
+///
+/// The TestApiServer runs on the in-memory backend, whose
+/// `watch_from_revision` ignores the revision (no replay,
+/// `crates/storage/src/memory.rs`), so a write landing between the reflector's
+/// LIST and the server subscribing the watch is lost for good. Real
+/// client-go tests never mutate in that window: `reflector_test.go` drives a
+/// `FakeControllerSource` and `TestReflectorWatchHandler`-style tests
+/// synchronise on the watcher having been handed to the reflector
+/// (`staging/src/k8s.io/client-go/tools/cache/reflector_test.go`,
+/// `TestReflectorListAndWatch`: `go r.ListAndWatch(...)`, then `fw :=
+/// <-createdFakes` blocks until `watchFunc` has run before any
+/// `fw.Add`/`fw.Modify`). A store populated by the initial LIST says nothing
+/// about the WATCH being live, so we wait on the same signal: `watch()`
+/// returning means the response headers arrived, and the server subscribes
+/// (`open_watch_stream`) before it answers.
+struct SignalingListWatch {
+    inner: ApiListWatch,
+    established: watch::Sender<u32>,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl ListWatch<Value> for SignalingListWatch {
+    async fn list(&self) -> anyhow::Result<(Vec<Value>, String)> {
+        ListWatch::<Value>::list(&self.inner).await
+    }
+
+    async fn watch<'a>(
+        &'a self,
+        rv: Option<String>,
+    ) -> anyhow::Result<BoxStream<'a, WatchItem<Value>>> {
+        tokio::time::sleep(self.delay).await;
+        let stream = ListWatch::<Value>::watch(&self.inner, rv).await?;
+        self.established.send_modify(|n| *n += 1);
+        Ok(stream)
+    }
 }
 
 /// Poll `cond` every 100ms up to `secs` seconds. Returns true if it ever held.
@@ -74,8 +116,14 @@ async fn reflector_lists_then_streams_live_mutations() {
         .expect("create cm-a");
 
     // Start a reflector over the configmaps collection.
-    let lw: Arc<dyn ListWatch<Value>> =
-        Arc::new(ApiListWatch::new(client.clone(), CMS.to_string()));
+    let (established_tx, mut established) = watch::channel(0u32);
+    let lw: Arc<dyn ListWatch<Value>> = Arc::new(SignalingListWatch {
+        inner: ApiListWatch::new(client.clone(), CMS.to_string()),
+        established: established_tx,
+        // Widen the LIST->WATCH window so the race is hit on every run, not
+        // 1 in 3 on a loaded CI box: without the gate below this test fails.
+        delay: Duration::from_millis(200),
+    });
     let reflector = Arc::new(Reflector::new(lw, |v: &Value| {
         v["metadata"]["name"]
             .as_str()
@@ -92,6 +140,13 @@ async fn reflector_lists_then_streams_live_mutations() {
         wait_until(10, || store.get("cm-a").is_some()).await,
         "reflector must populate cm-a from the initial list"
     );
+
+    // The list populating the store does NOT mean the watch is live; creating
+    // cm-b before it is lost on the no-replay in-memory backend (#2218).
+    tokio::time::timeout(Duration::from_secs(10), established.wait_for(|n| *n >= 1))
+        .await
+        .expect("reflector must open its watch")
+        .expect("watch signal sender dropped");
 
     // 2) A ConfigMap created AFTER the list arrives over the live WATCH (ADDED).
     let _: Value = client
