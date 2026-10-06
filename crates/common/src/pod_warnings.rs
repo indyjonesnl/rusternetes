@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::quantity::Quantity;
 use crate::resources::pod::{Container, ContainerPort, EnvVar, VolumeProjection};
-use crate::resources::{Pod, PodSpec};
+use crate::resources::{Pod, PodSpec, PodTemplateSpec};
 use crate::validation::field::Path;
 use crate::validation::metav1::{get_warnings_for_ip, is_valid_label_value};
 use crate::validation::runtimeclass::get_node_label_deprecated_message;
@@ -59,10 +59,10 @@ struct Visited<'a> {
     resources: Option<&'a crate::types::ResourceRequirements>,
     env: &'a [EnvVar],
     ports: &'a [ContainerPort],
+    app_armor_profile_set: bool,
 }
 
-fn visit_containers<'a>(spec: &'a PodSpec) -> Vec<Visited<'a>> {
-    let spec_path = Path::new("spec");
+fn visit_containers<'a>(spec: &'a PodSpec, spec_path: &Path) -> Vec<Visited<'a>> {
     let from = |path: Path, c: &'a Container| Visited {
         path,
         name: &c.name,
@@ -70,6 +70,10 @@ fn visit_containers<'a>(spec: &'a PodSpec) -> Vec<Visited<'a>> {
         resources: c.resources.as_ref(),
         env: c.env.as_deref().unwrap_or(&[]),
         ports: c.ports.as_deref().unwrap_or(&[]),
+        app_armor_profile_set: c
+            .security_context
+            .as_ref()
+            .is_some_and(|sc| sc.app_armor_profile.is_some()),
     };
     let mut out = Vec::new();
     for (i, c) in spec.containers.iter().enumerate() {
@@ -86,6 +90,10 @@ fn visit_containers<'a>(spec: &'a PodSpec) -> Vec<Visited<'a>> {
             resources: c.resources.as_ref(),
             env: c.env.as_deref().unwrap_or(&[]),
             ports: &[],
+            app_armor_profile_set: c
+                .security_context
+                .as_ref()
+                .is_some_and(|sc| sc.app_armor_profile.is_some()),
         });
     }
     out
@@ -115,11 +123,66 @@ pub fn warnings_for_pod_spec_and_meta(
     spec: &PodSpec,
     annotations: Option<&HashMap<String, String>>,
 ) -> Vec<String> {
+    warnings_for_pod_spec_and_meta_at(None, spec, annotations)
+}
+
+/// `GetWarningsForPodTemplate(ctx, fieldPath, podTemplate, oldPodTemplate)`
+/// (warnings.go:54-68). `field_path` is where the template sits in its owner
+/// (`spec.template` for a Deployment); the old template goes unused upstream
+/// as well, `warningsForPodSpecAndMeta` only receives it.
+pub fn get_warnings_for_pod_template(
+    field_path: &Path,
+    template: &PodTemplateSpec,
+    _old: Option<&PodTemplateSpec>,
+) -> Vec<String> {
+    warnings_for_pod_spec_and_meta_at(
+        Some(field_path),
+        &template.spec,
+        template
+            .metadata
+            .as_ref()
+            .and_then(|m| m.annotations.as_ref()),
+    )
+}
+
+/// `fieldPath.Child(name)`, where a `nil` `fieldPath` makes `name` the root.
+fn under(prefix: Option<&Path>, name: &str) -> Path {
+    match prefix {
+        Some(p) => p.child(name),
+        None => Path::new(name),
+    }
+}
+
+/// `ApparmorFieldForAnnotation` (pkg/api/pod/util.go:1770-1792), reduced to
+/// the (type, localhostProfile) pair the caller compares.
+fn apparmor_field_for_annotation(annotation: &str) -> Option<(&'static str, Option<&str>)> {
+    match annotation {
+        "unconfined" => return Some(("Unconfined", None)),
+        "runtime/default" => return Some(("RuntimeDefault", None)),
+        _ => {}
+    }
+    match annotation.strip_prefix("localhost/") {
+        Some(profile) if !profile.is_empty() => Some(("Localhost", Some(profile))),
+        _ => None,
+    }
+}
+
+/// `api.DeprecatedAppArmorAnnotationKeyPrefix`
+/// (pkg/apis/core/annotation_key_constants.go:57).
+const DEPRECATED_APPARMOR_ANNOTATION_KEY_PREFIX: &str =
+    "container.apparmor.security.beta.kubernetes.io/";
+
+fn warnings_for_pod_spec_and_meta_at(
+    prefix: Option<&Path>,
+    spec: &PodSpec,
+    annotations: Option<&HashMap<String, String>>,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     let empty = HashMap::new();
     let annotations = annotations.unwrap_or(&empty);
-    let spec_path = Path::new("spec");
-    let meta_annotations = Path::new("metadata").child("annotations");
+    let spec_path = under(prefix, "spec");
+    let meta_annotations = under(prefix, "metadata").child("annotations");
+    let is_pod_template = prefix.is_some();
 
     // use of deprecated node labels in selectors/affinity/topology
     for key in spec.node_selector.iter().flat_map(|m| m.keys()) {
@@ -260,7 +323,11 @@ pub fn warnings_for_pod_spec_and_meta(
         ));
     }
 
-    let visited = visit_containers(spec);
+    let visited = visit_containers(spec, &spec_path);
+    let pod_app_armor = spec
+        .security_context
+        .as_ref()
+        .and_then(|sc| sc.app_armor_profile.as_ref());
     for c in &visited {
         // use of container seccomp annotation without accompanying field
         let has_seccomp = c
@@ -272,6 +339,26 @@ pub fn warnings_for_pod_spec_and_meta(
                 r#"{}: non-functional in v1.27+; use the "seccompProfile" field instead"#,
                 meta_annotations.key(key)
             ));
+        }
+
+        // use of container AppArmor annotation without accompanying field; a
+        // Pod's own warning is emitted through applyAppArmorVersionSkew
+        // instead (warnings.go:243).
+        if is_pod_template && !c.app_armor_profile_set {
+            let key = format!("{DEPRECATED_APPARMOR_ANNOTATION_KEY_PREFIX}{}", c.name);
+            if let Some(annotation) = annotations.get(&key) {
+                // Only warn if the annotation doesn't match the pod profile.
+                let matches_pod = pod_app_armor.is_some_and(|p| {
+                    apparmor_field_for_annotation(annotation)
+                        == Some((p.type_.as_str(), p.localhost_profile.as_deref()))
+                });
+                if !matches_pod {
+                    warnings.push(format!(
+                        r#"{}: deprecated since v1.30; use the "appArmorProfile" field instead"#,
+                        meta_annotations.key(key)
+                    ));
+                }
+            }
         }
 
         // fractional memory/ephemeral-storage requests/limits
