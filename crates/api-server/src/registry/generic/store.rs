@@ -31,7 +31,7 @@ use crate::registry::rest::{
     before_create, before_delete, before_update, check_generated_name_error,
     fill_object_meta_system_fields, zero_delete_options, GarbageCollectionPolicy, GroupResource,
     Object, RequestContext, RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
-    UpdatedObjectInfo, ValidateObject, ValidateObjectUpdate,
+    TransformFunc, UpdatedObjectInfo, ValidateObject, ValidateObjectUpdate,
 };
 
 /// `OptimisticLockErrorMsg` (store.go:262).
@@ -161,6 +161,36 @@ pub struct Store<T: Object, S: Storage> {
     pub begin_update: Option<Arc<dyn BeginUpdate<T>>>,
     /// `AfterDelete`.
     pub after_delete: Option<Arc<dyn AfterDelete<T>>>,
+    /// The transformers a storage wrapper applies with
+    /// `rest.WrapUpdatedObjectInfo(obj, transformers...)` before delegating to
+    /// `Store.Update` (rest/update.go:241-269; the RBAC `policybased`
+    /// storages, pkg/registry/rbac/*/policybased/storage.go). They run on the
+    /// object exactly as the request produced it, i.e. before `Store.Update`
+    /// copies the stored resourceVersion into an unconditional update, which
+    /// `BeginUpdate` cannot see.
+    pub update_transformers: Vec<Arc<dyn TransformFunc<T>>>,
+}
+
+/// `wrappedUpdatedObjectInfo` (rest/update.go:230-269): delegates to the
+/// wrapped info, then passes its result through each transformer.
+struct WrappedUpdatedObjectInfo<'a, T> {
+    inner: &'a dyn UpdatedObjectInfo<T>,
+    transformers: &'a [Arc<dyn TransformFunc<T>>],
+}
+
+#[async_trait]
+impl<T: Object> UpdatedObjectInfo<T> for WrappedUpdatedObjectInfo<'_, T> {
+    fn preconditions(&self) -> Option<Preconditions> {
+        self.inner.preconditions()
+    }
+
+    async fn updated_object(&self, ctx: &RequestContext, old: Option<&T>) -> Result<T> {
+        let mut new = self.inner.updated_object(ctx, old).await?;
+        for transformer in self.transformers {
+            new = transformer.transform(ctx, Some(new), old).await?;
+        }
+        Ok(new)
+    }
 }
 
 impl<T: Object, S: Storage> Clone for Store<T, S> {
@@ -180,6 +210,7 @@ impl<T: Object, S: Storage> Clone for Store<T, S> {
             begin_create: self.begin_create.clone(),
             begin_update: self.begin_update.clone(),
             after_delete: self.after_delete.clone(),
+            update_transformers: self.update_transformers.clone(),
         }
     }
 }
@@ -244,6 +275,7 @@ impl<T: Object, S: Storage> Store<T, S> {
             begin_create: None,
             begin_update: None,
             after_delete: None,
+            update_transformers: Vec::new(),
         }
     }
 
@@ -729,6 +761,15 @@ impl<T: Object, S: Storage> Store<T, S> {
         options: &UpdateOptions,
     ) -> Result<(T, bool)> {
         let key = self.key_func(ctx, name)?;
+        let wrapped = WrappedUpdatedObjectInfo {
+            inner: obj_info,
+            transformers: &self.update_transformers,
+        };
+        let obj_info: &dyn UpdatedObjectInfo<T> = if self.update_transformers.is_empty() {
+            obj_info
+        } else {
+            &wrapped
+        };
         let preconditions = obj_info.preconditions();
         let allow_create = self.update_strategy.allow_create_on_update() || force_allow_create;
 

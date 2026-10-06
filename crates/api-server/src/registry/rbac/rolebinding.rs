@@ -126,6 +126,6 @@ pub fn new_store(
         resolver: Arc::new(DefaultRuleResolver::new(storage)),
     }));
     store.begin_create = Some(hook.clone());
-    store.begin_update = Some(hook);
+    store.update_transformers = vec![hook];
     store
 }

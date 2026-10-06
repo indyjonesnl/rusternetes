@@ -3,20 +3,17 @@
 //! — which wrap each RBAC REST storage so that a request cannot grant
 //! permissions the requester does not hold.
 //!
-//! Upstream wraps `Create` and `Update` of the standard storage; the Store's
-//! `BeginCreate` / `BeginUpdate` hooks are the equivalent seam here. They run
-//! at the same point: after the new object is computed (for an update, after
-//! mutating admission has been applied by the `UpdatedObjectInfo` chain), and
-//! before the strategy's preparation, validation and the write.
-//!
-//! Where this differs from upstream:
-//!
-//! * Upstream's `Update` check runs against the object *as the client sent
-//!   it*, in the wrapped `UpdatedObjectInfo`, before the Store copies the
-//!   stored `resourceVersion` into an unconditional update. The `BeginUpdate`
-//!   hook sees the object after that copy, so an unconditional PUT whose only
-//!   change is the GC fields (ownerReferences, finalizers) is treated as
-//!   GC-only here and as an escalation upstream.
+//! Upstream wraps `Create` and `Update` of the standard storage. `Create` is
+//! the Store's `BeginCreate` hook here. `Update` wraps the `UpdatedObjectInfo`
+//! with `rest.WrapUpdatedObjectInfo` (rest/update.go:241-269), so the check
+//! runs on the object as the client sent it, BEFORE `Store.Update` copies the
+//! stored `resourceVersion` into an unconditional update
+//! (`AllowUnconditionalUpdate` is true for all four kinds). That ordering
+//! matters: `IsOnlyMutatingGCFields` (pkg/registry/rbac/helpers.go:29-50)
+//! compares `resourceVersion` too, so an unconditional PUT that changes only
+//! finalizers/ownerReferences is not GC-only and is escalation-checked. Here
+//! the wrapper is the Store's `update_transformers`
+//! (`TransformFunc`s applied before the resourceVersion handling).
 
 use std::sync::Arc;
 
@@ -36,7 +33,13 @@ use super::rule::{confirm_no_escalation, AuthorizationRuleResolver};
 use crate::registry::generic::store::{
     BeginCreate, BeginUpdate, CreateOptions, Finish, UpdateOptions,
 };
-use crate::registry::rest::{GroupResource, RequestContext};
+use crate::registry::rest::{GroupResource, RequestContext, TransformFunc};
+
+/// A transformer reached without an object: `rest.WrapUpdatedObjectInfo`'s
+/// inner info always produces one.
+fn missing_object() -> Error {
+    Error::Internal("no object was supplied to the update transformer".to_string())
+}
 
 /// A `FinishFunc` that has nothing to commit or revert.
 pub struct Noop;
@@ -169,25 +172,26 @@ impl BeginCreate<Role> for RolePolicyBased {
 }
 
 #[async_trait]
-impl BeginUpdate<Role> for RolePolicyBased {
-    /// `Storage.Update` (:76-99).
-    async fn begin_update(
+impl TransformFunc<Role> for RolePolicyBased {
+    /// `Storage.Update` (:76-99): the `WrapUpdatedObjectInfo` transformer.
+    async fn transform(
         &self,
         ctx: &RequestContext,
-        obj: &mut Role,
-        old: &mut Role,
-        _options: &UpdateOptions,
-    ) -> Result<Box<dyn Finish>> {
+        new: Option<Role>,
+        old: Option<&Role>,
+    ) -> Result<Role> {
+        let obj = new.ok_or_else(missing_object)?;
+        let Some(old) = old else { return Ok(obj) };
         if !self.0.escalation_bypassed(ctx, "roles").await
             // If we're only mutating fields needed for the GC to eventually
             // delete this obj, return.
-            && !is_only_mutating_gc_fields(obj, old)
+            && !is_only_mutating_gc_fields(&obj, old)
         {
             self.0
                 .confirm_rules(ctx, &rbac_resource("roles"), &obj.metadata.name, &obj.rules)
                 .await?;
         }
-        Ok(Box::new(Noop))
+        Ok(obj)
     }
 }
 
@@ -238,23 +242,24 @@ impl BeginCreate<RoleBinding> for RoleBindingPolicyBased {
 }
 
 #[async_trait]
-impl BeginUpdate<RoleBinding> for RoleBindingPolicyBased {
-    /// `Storage.Update` (:98-140).
-    async fn begin_update(
+impl TransformFunc<RoleBinding> for RoleBindingPolicyBased {
+    /// `Storage.Update` (:98-140): the `WrapUpdatedObjectInfo` transformer.
+    async fn transform(
         &self,
         ctx: &RequestContext,
-        obj: &mut RoleBinding,
-        old: &mut RoleBinding,
-        _options: &UpdateOptions,
-    ) -> Result<Box<dyn Finish>> {
+        new: Option<RoleBinding>,
+        old: Option<&RoleBinding>,
+    ) -> Result<RoleBinding> {
+        let obj = new.ok_or_else(missing_object)?;
+        let Some(old) = old else { return Ok(obj) };
         if escalation_allowed(ctx) {
-            return Ok(Box::new(Noop));
+            return Ok(obj);
         }
         let namespace = Self::request_namespace(ctx)?;
         // If we're only mutating fields needed for the GC to eventually delete
         // this obj, return.
-        if is_only_mutating_gc_fields(obj, old) {
-            return Ok(Box::new(Noop));
+        if is_only_mutating_gc_fields(&obj, old) {
+            return Ok(obj);
         }
         self.0
             .confirm_binding(
@@ -265,7 +270,7 @@ impl BeginUpdate<RoleBinding> for RoleBindingPolicyBased {
                 &namespace,
             )
             .await?;
-        Ok(Box::new(Noop))
+        Ok(obj)
     }
 }
 
@@ -305,17 +310,18 @@ impl BeginCreate<ClusterRoleBinding> for ClusterRoleBindingPolicyBased {
 }
 
 #[async_trait]
-impl BeginUpdate<ClusterRoleBinding> for ClusterRoleBindingPolicyBased {
-    /// `Storage.Update` (:92-126).
-    async fn begin_update(
+impl TransformFunc<ClusterRoleBinding> for ClusterRoleBindingPolicyBased {
+    /// `Storage.Update` (:94-126): the `WrapUpdatedObjectInfo` transformer.
+    async fn transform(
         &self,
         ctx: &RequestContext,
-        obj: &mut ClusterRoleBinding,
-        old: &mut ClusterRoleBinding,
-        _options: &UpdateOptions,
-    ) -> Result<Box<dyn Finish>> {
-        if escalation_allowed(ctx) || is_only_mutating_gc_fields(obj, old) {
-            return Ok(Box::new(Noop));
+        new: Option<ClusterRoleBinding>,
+        old: Option<&ClusterRoleBinding>,
+    ) -> Result<ClusterRoleBinding> {
+        let obj = new.ok_or_else(missing_object)?;
+        let Some(old) = old else { return Ok(obj) };
+        if escalation_allowed(ctx) || is_only_mutating_gc_fields(&obj, old) {
+            return Ok(obj);
         }
         self.0
             .confirm_binding(
@@ -326,7 +332,7 @@ impl BeginUpdate<ClusterRoleBinding> for ClusterRoleBindingPolicyBased {
                 "",
             )
             .await?;
-        Ok(Box::new(Noop))
+        Ok(obj)
     }
 }
 
@@ -442,15 +448,33 @@ impl BeginCreate<ClusterRole> for ClusterRolePolicyBased {
 }
 
 #[async_trait]
-impl BeginUpdate<ClusterRole> for ClusterRolePolicyBased {
-    async fn begin_update(
+impl TransformFunc<ClusterRole> for ClusterRolePolicyBased {
+    /// `Storage.Update`: the `WrapUpdatedObjectInfo` transformer.
+    async fn transform(
         &self,
         ctx: &RequestContext,
+        new: Option<ClusterRole>,
+        old: Option<&ClusterRole>,
+    ) -> Result<ClusterRole> {
+        let obj = new.ok_or_else(missing_object)?;
+        let Some(old) = old else { return Ok(obj) };
+        self.check_update(ctx, &obj, old).await?;
+        Ok(obj)
+    }
+}
+
+#[async_trait]
+impl BeginUpdate<ClusterRole> for ClusterRolePolicyBased {
+    /// Rusternetes-only: materialises an aggregated ClusterRole's rules at
+    /// write time (upstream does it in the `clusterroleaggregation`
+    /// controller). The policybased check itself is the transformer above.
+    async fn begin_update(
+        &self,
+        _ctx: &RequestContext,
         obj: &mut ClusterRole,
-        old: &mut ClusterRole,
+        _old: &mut ClusterRole,
         _options: &UpdateOptions,
     ) -> Result<Box<dyn Finish>> {
-        self.check_update(ctx, obj, old).await?;
         materialise_aggregated_rules(&*self.storage, obj).await;
         Ok(Box::new(Noop))
     }
