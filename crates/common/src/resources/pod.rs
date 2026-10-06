@@ -759,7 +759,7 @@ pub struct ContainerResizePolicy {
     pub restart_policy: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecurityContext {
     #[serde(skip_serializing_if = "Option::is_none")]
