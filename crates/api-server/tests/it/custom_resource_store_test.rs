@@ -594,3 +594,167 @@ async fn objects_stored_by_the_old_handler_still_update() {
     assert_eq!(status, StatusCode::OK, "{out}");
     assert_eq!(out["spec"]["size"], 2, "{out}");
 }
+
+fn scalable_crd(plural: &str) -> Value {
+    let mut c = crd(plural, "Widget", "Namespaced", true, open_schema());
+    c["spec"]["versions"][0]["subresources"]["scale"] = json!({
+        "specReplicasPath": ".spec.replicas",
+        "statusReplicasPath": ".status.replicas",
+        "labelSelectorPath": ".status.selector"
+    });
+    c
+}
+
+fn scaled_widget(name: &str) -> Value {
+    json!({
+        "apiVersion": format!("{GROUP}/v1"), "kind": "Widget",
+        "metadata": { "name": name, "labels": { "keep": "me" } },
+        "spec": { "replicas": 2 }
+    })
+}
+
+/// #2134: `ScaleREST.Get` serves the CR as an `autoscaling/v1` `Scale`
+/// (etcd.go:157-177, `scaleFromCustomResource` etcd.go:262-309).
+#[tokio::test]
+async fn get_scale_serves_an_autoscaling_v1_scale() {
+    let api = TestApiServer::new();
+    install(&api, &scalable_crd("widgets")).await;
+    create(&api, &ns_path("widgets"), &scaled_widget("w1")).await;
+    let path = format!("{}/w1", ns_path("widgets"));
+    let (status, out) = api
+        .patch(
+            &format!("{path}/status"),
+            &json!({ "status": { "replicas": 5, "selector": "app=w" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+
+    let (status, scale) = api.get(&format!("{path}/scale")).await;
+    assert_eq!(status, StatusCode::OK, "{scale}");
+    assert_eq!(scale["apiVersion"], "autoscaling/v1", "{scale}");
+    assert_eq!(scale["kind"], "Scale", "{scale}");
+    assert_eq!(scale["metadata"]["name"], "w1", "{scale}");
+    assert_eq!(scale["metadata"]["namespace"], "default", "{scale}");
+    // scaleFromCustomResource copies name, namespace, uid, resourceVersion and
+    // creationTimestamp only.
+    assert!(scale["metadata"].get("labels").is_none(), "{scale}");
+    assert_eq!(scale["spec"]["replicas"], 2, "{scale}");
+    assert_eq!(scale["status"]["replicas"], 5, "{scale}");
+    assert_eq!(scale["status"]["selector"], "app=w", "{scale}");
+}
+
+/// etcd.go:170-172: a CR without the spec replicas field is an internal error.
+#[tokio::test]
+async fn get_scale_without_the_spec_replicas_field_is_an_internal_error() {
+    let api = TestApiServer::new();
+    install(&api, &scalable_crd("widgets")).await;
+    create(&api, &ns_path("widgets"), &widget("w1")).await;
+    let (status, out) = api.get(&format!("{}/w1/scale", ns_path("widgets"))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{out}");
+    assert!(
+        message(&out).contains("the spec replicas field \".spec.replicas\" does not exist"),
+        "{out}"
+    );
+}
+
+/// `ScaleREST.Update` runs the main update strategy through `Store.Update`
+/// (etcd.go:179-216), so a scale is a spec change: the generation moves, the
+/// rest of the object is untouched, and the answer is a `Scale`.
+#[tokio::test]
+async fn put_scale_updates_the_replicas_through_the_store() {
+    let api = TestApiServer::new();
+    install(&api, &scalable_crd("widgets")).await;
+    create(&api, &ns_path("widgets"), &scaled_widget("w1")).await;
+    let path = format!("{}/w1", ns_path("widgets"));
+    let (_, mut scale) = api.get(&format!("{path}/scale")).await;
+    scale["spec"]["replicas"] = json!(7);
+    let (status, out) = api.put(&format!("{path}/scale"), &scale).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["kind"], "Scale", "{out}");
+    assert_eq!(out["spec"]["replicas"], 7, "{out}");
+
+    let (_, cr) = api.get(&path).await;
+    assert_eq!(cr["spec"]["replicas"], 7, "{cr}");
+    assert_eq!(cr["metadata"]["labels"]["keep"], "me", "{cr}");
+    assert_eq!(cr["metadata"]["generation"], 2, "{cr}");
+}
+
+/// etcd.go:249-255: the Scale's resourceVersion becomes the precondition.
+#[tokio::test]
+async fn put_scale_with_a_stale_resource_version_conflicts() {
+    let api = TestApiServer::new();
+    install(&api, &scalable_crd("widgets")).await;
+    create(&api, &ns_path("widgets"), &scaled_widget("w1")).await;
+    let path = format!("{}/w1", ns_path("widgets"));
+    let (_, scale) = api.get(&format!("{path}/scale")).await;
+    let mut stale = scale.clone();
+    stale["spec"]["replicas"] = json!(3);
+    let (status, out) = api.put(&format!("{path}/scale"), &stale).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let (status, out) = api.put(&format!("{path}/scale"), &stale).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{out}");
+}
+
+/// `AllowCreateOnUpdate` is false for a subresource (etcd.go:211), so a scale
+/// of an absent object is NotFound.
+#[tokio::test]
+async fn put_scale_of_an_absent_object_is_not_found() {
+    let api = TestApiServer::new();
+    install(&api, &scalable_crd("widgets")).await;
+    let scale = json!({
+        "apiVersion": "autoscaling/v1", "kind": "Scale",
+        "metadata": { "name": "nope" }, "spec": { "replicas": 1 }
+    });
+    let (status, out) = api
+        .put(&format!("{}/nope/scale", ns_path("widgets")), &scale)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{out}");
+}
+
+/// A scale write is validated as the CR it produces: replicas must be
+/// non-negative (validator.go:134-180 ValidateScaleSpec).
+#[tokio::test]
+async fn put_scale_with_negative_replicas_is_invalid() {
+    let api = TestApiServer::new();
+    install(&api, &scalable_crd("widgets")).await;
+    create(&api, &ns_path("widgets"), &scaled_widget("w1")).await;
+    let path = format!("{}/w1/scale", ns_path("widgets"));
+    let (_, mut scale) = api.get(&path).await;
+    scale["spec"]["replicas"] = json!(-1);
+    let (status, out) = api.put(&path, &scale).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
+}
+
+/// PATCH of the Scale goes into `ScaleREST.Update` too.
+#[tokio::test]
+async fn patch_scale_updates_the_replicas() {
+    let api = TestApiServer::new();
+    install(&api, &scalable_crd("widgets")).await;
+    create(&api, &ns_path("widgets"), &scaled_widget("w1")).await;
+    let path = format!("{}/w1", ns_path("widgets"));
+    let (status, out) = api
+        .patch(
+            &format!("{path}/scale"),
+            &json!({ "spec": { "replicas": 4 } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["kind"], "Scale", "{out}");
+    assert_eq!(out["spec"]["replicas"], 4, "{out}");
+    let (_, cr) = api.get(&path).await;
+    assert_eq!(cr["spec"]["replicas"], 4, "{cr}");
+}
+
+/// customresource_handler.go:349: no `scale` subresource, no `/scale` route.
+#[tokio::test]
+async fn scale_not_enabled_is_not_found() {
+    let api = TestApiServer::new();
+    install(
+        &api,
+        &crd("widgets", "Widget", "Namespaced", true, open_schema()),
+    )
+    .await;
+    create(&api, &ns_path("widgets"), &scaled_widget("w1")).await;
+    let (status, out) = api.get(&format!("{}/w1/scale", ns_path("widgets"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{out}");
+}
