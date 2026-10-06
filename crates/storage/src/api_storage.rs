@@ -60,6 +60,10 @@ const SHARED_WATCH_BUFFER: usize = 256;
 /// Registry of live shared upstream watches, keyed by resolved collection path.
 type SharedWatches = Arc<Mutex<HashMap<String, broadcast::Sender<Arc<WatchEvent>>>>>;
 
+/// Discovery-resolved `plural -> (api_root, namespaced)` cache, shared between
+/// the per-controller clones of one [`ApiStorage`].
+type DynamicResources = Arc<RwLock<Option<HashMap<String, (String, bool)>>>>;
+
 /// A [`Storage`] implementation that proxies to the api-server over REST.
 pub struct ApiStorage {
     client: Arc<ApiClient>,
@@ -67,7 +71,7 @@ pub struct ApiStorage {
     /// the built-in [`static_resource_info`] table (CRDs, aggregated APIs, and
     /// the arbitrary types the garbage collector traverses). `None` until the
     /// first miss triggers a one-shot discovery load; `Some` thereafter.
-    dynamic: RwLock<Option<HashMap<String, (String, bool)>>>,
+    dynamic: DynamicResources,
     /// One shared upstream `?watch=true` stream per resolved collection path,
     /// fanned out to every controller watching that type via a broadcast — so
     /// the ~50 controller watch() calls collapse to ~one HTTP connection per
@@ -79,8 +83,22 @@ impl ApiStorage {
     pub fn new(client: Arc<ApiClient>) -> Self {
         Self {
             client,
-            dynamic: RwLock::new(None),
+            dynamic: Arc::new(RwLock::new(None)),
             shared_watches: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// A view of this storage that sends its CRUD requests through `client`,
+    /// sharing the discovery cache and the shared watch fan-out (#1138).
+    ///
+    /// The controller-manager gives each controller its own `ApiClient` (hence
+    /// its own rate limiter, #1863) but must not give up the one-connection-
+    /// per-resource-type watch sharing, so only the client differs.
+    pub fn with_client(&self, client: Arc<ApiClient>) -> Self {
+        Self {
+            client,
+            dynamic: Arc::clone(&self.dynamic),
+            shared_watches: Arc::clone(&self.shared_watches),
         }
     }
 

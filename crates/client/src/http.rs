@@ -215,6 +215,12 @@ impl ApiClient {
         self
     }
 
+    /// True when both clients draw from the same token bucket. Lets callers
+    /// (and tests) assert the per-controller independence #1863 depends on.
+    pub fn shares_limiter_with(&self, other: &ApiClient) -> bool {
+        Arc::ptr_eq(&self.limiter, &other.limiter)
+    }
+
     /// A client for one controller, cloned from this skeleton.
     ///
     /// Ported from upstream's `SimpleControllerClientBuilder.Config`
