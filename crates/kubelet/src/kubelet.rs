@@ -4498,7 +4498,19 @@ impl Kubelet {
                             // conditions are supplied via the status subresource.
                             // ContainersReady ignores the gates; only Ready ANDs
                             // them in.
-                            let all_ready = containers_ready && readiness_gates_satisfied(pod);
+                            //
+                            // Evaluate against `readiness_pod` (re-read above), NOT
+                            // the cycle-start `pod` snapshot: a gate condition
+                            // patched via /status mid-cycle is only on the fresh
+                            // object. Upstream evaluates the gates against the
+                            // latest status conditions it is building on
+                            // (pkg/kubelet/status/generate.go
+                            // `GeneratePodReadyCondition`, `GetPodConditionFromList(
+                            // conditions, rg.ConditionType)`, fed from the status
+                            // manager's cached status, status_manager.go ~L577-585
+                            // `oldStatus = &cachedStatus.status`). #2384
+                            let all_ready =
+                                containers_ready && readiness_gates_satisfied(&readiness_pod);
 
                             // Check if all containers have terminated (for Never/OnFailure restart policies)
                             let restart_policy = pod
@@ -7004,6 +7016,21 @@ mod tests {
             vec![cond("www.example.com/feature-1", "True", now)],
         );
         assert!(super::readiness_gates_satisfied(&gate_true));
+
+        // #2384: the verdict depends on WHICH snapshot is evaluated. The
+        // cycle-start pod (stale) lacks a gate condition patched mid-cycle;
+        // the re-read pod has it. The readiness cycle must evaluate the
+        // re-read one (`readiness_pod`), so the stale verdict must differ.
+        let stale = with_status(gated_spec(), vec![cond("ContainersReady", "True", now)]);
+        let fresh = with_status(
+            gated_spec(),
+            vec![
+                cond("ContainersReady", "True", now),
+                cond("www.example.com/feature-1", "True", now),
+            ],
+        );
+        assert!(!super::readiness_gates_satisfied(&stale));
+        assert!(super::readiness_gates_satisfied(&fresh));
     }
 
     #[test]
