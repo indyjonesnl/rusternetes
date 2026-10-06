@@ -2525,6 +2525,17 @@ impl CriContainerRuntime {
         }
     }
 
+    /// NodeUnpublish the CSI volumes of pods that are gone. No-op when no
+    /// VolumeManager is attached.
+    pub async fn unmount_orphaned_csi_volumes(
+        &self,
+        live_pod_uids: &std::collections::HashSet<String>,
+    ) {
+        if let Some(volumes) = self.volumes.as_ref() {
+            volumes.unmount_orphaned_csi_volumes(live_pod_uids).await;
+        }
+    }
+
     /// Refresh a pod's volumes (re-render configMap/secret/projected content).
     /// No-op when no VolumeManager is attached.
     pub async fn refresh_volumes(&self, pod: &Pod) -> Result<()> {

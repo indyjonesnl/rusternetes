@@ -183,6 +183,10 @@ pub struct VolumeManager {
     /// `CriContainerRuntime` clones it per attach — and `VolumePluginMgr`'s
     /// `Vec<Box<dyn VolumePlugin>>` cannot itself derive `Clone`.
     pub plugin_mgr: Arc<crate::volume_plugins::VolumePluginMgr>,
+    /// A CSI plugin over the same host, used to build unmounters
+    /// (`NewUnmounter`) for volumes found on disk. `plugin_mgr` holds the
+    /// plugin as a `dyn VolumePlugin`, which has no unmounter method yet.
+    pub(crate) csi_plugin: Arc<crate::volume_plugins::csi::CsiPlugin>,
 }
 
 impl VolumeManager {
@@ -228,6 +232,7 @@ impl VolumeManager {
             token_manager,
             node_allocatable,
             plugin_mgr,
+            csi_plugin: Arc::new(crate::volume_plugins::csi::CsiPlugin::new(host)),
         }
     }
 
@@ -369,6 +374,64 @@ impl VolumeManager {
         }
 
         errors
+    }
+
+    /// NodeUnpublish the CSI volumes of pods that are gone.
+    ///
+    /// Drives `csiMountMgr.TearDownAt` (`pkg/volume/csi/csi_mounter.go:432-466`)
+    /// the way upstream's volume manager does: the reconciler's
+    /// `unmountVolumes` (`pkg/kubelet/volumemanager/reconciler/reconciler.go`)
+    /// runs `UnmountVolume` -> `plugin.NewUnmounter(volName, podUID)`
+    /// (`csi_plugin.go:540-567`) -> `TearDown`, for every volume of a pod that
+    /// no longer wants it. Without a desired/actual state of world, the volumes
+    /// are found the way upstream's post-restart reconstruction finds them: by
+    /// walking `<pod>/volumes/kubernetes.io~csi/*` on disk.
+    ///
+    /// Runs before [`Self::cleanup_orphaned_pod_dirs`], which refuses to touch a
+    /// still-mounted volume. A failure (including the transient "driver not
+    /// registered" error) is logged and left for the next sync, as the
+    /// reconciler retries a failed operation.
+    ///
+    /// Not covered (tracked separately): `NodeUnstageVolume` /
+    /// `csiAttacher.UnmountDevice`, and unmounting for a pod that is deleted
+    /// while the kubelet stays up.
+    pub async fn unmount_orphaned_csi_volumes(
+        &self,
+        live_pod_uids: &std::collections::HashSet<String>,
+    ) {
+        let root = &self.volumes_base_path;
+        let pods = match crate::pod_dirs::list_pods_from_disk(root) {
+            Ok(uids) => uids,
+            Err(e) => {
+                warn!("Could not list pods from disk: {}", e);
+                return;
+            }
+        };
+        for uid in pods {
+            if live_pod_uids.contains(&uid) {
+                continue;
+            }
+            let csi_dir = crate::pod_dirs::get_pod_volumes_dir(root, &uid).join(
+                crate::pod_dirs::escape_qualified_name(crate::pod_dirs::plugin::CSI),
+            );
+            let Ok(entries) = std::fs::read_dir(&csi_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                // The directory name is the escaped spec name.
+                let spec_name = entry.file_name().to_string_lossy().replace('~', "/");
+                let unmounter = match self.csi_plugin.new_unmounter(&spec_name, &uid) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        warn!("Orphaned pod {uid}: cannot unmount CSI volume {spec_name}: {e:#}");
+                        continue;
+                    }
+                };
+                if let Err(e) = unmounter.tear_down().await {
+                    warn!("Orphaned pod {uid}: CSI TearDown of {spec_name} failed: {e:#}");
+                }
+            }
+        }
     }
 
     /// Remove the directories of pods that should not be running and have no
