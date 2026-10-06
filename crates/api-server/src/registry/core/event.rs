@@ -98,13 +98,59 @@ impl RestDeleteStrategy<Event> for Strategy {
     }
 }
 
-/// `NewREST` (storage/storage.go:40-60).
-pub fn new_store(storage: Arc<StorageBackend>) -> Store<Event, StorageBackend> {
+/// `--event-ttl`'s default, 1h (`pkg/controlplane/apiserver/options/options.go:129`),
+/// in seconds.
+pub const DEFAULT_EVENT_TTL_SECONDS: u64 = 3600;
+
+/// `NewREST(optsGetter, ttl)` (storage/storage.go:40-60): events expire `ttl`
+/// seconds after they are written. The `TTLFunc` ignores the existing TTL and
+/// the operation (storage.go:42-44):
+///
+/// ```go
+/// TTLFunc: func(runtime.Object, uint64, bool) (uint64, error) { return ttl, nil },
+/// ```
+pub fn new_store(storage: Arc<StorageBackend>, ttl: u64) -> Store<Event, StorageBackend> {
     Store::new(
         storage,
         GroupResource::new("", "events"),
         Arc::new(Strategy),
     )
+    .with_ttl_func(Arc::new(move |_, _, _| Ok(ttl)))
+}
+
+/// `--event-ttl`: a Go `time.Duration` (`1h`, `90m`, `1h30m`, `45s`) as whole
+/// seconds, which is what `uint64(c.EventTTL.Seconds())` hands `NewREST`
+/// (pkg/registry/core/rest/storage_core_generic.go:90). `0` disables expiry.
+/// Only the `h`, `m` and `s` units, with integer values, are accepted.
+pub fn parse_event_ttl(text: &str) -> Result<u64, String> {
+    let bad = || format!("invalid duration {text:?}: want e.g. 1h, 90m, 1h30m or 45s");
+    if text == "0" {
+        return Ok(0);
+    }
+    let mut rest = text;
+    let mut total: u64 = 0;
+    if rest.is_empty() {
+        return Err(bad());
+    }
+    while !rest.is_empty() {
+        let digits = rest.find(|c: char| !c.is_ascii_digit()).ok_or_else(bad)?;
+        if digits == 0 {
+            return Err(bad());
+        }
+        let value: u64 = rest[..digits].parse().map_err(|_| bad())?;
+        let unit: u64 = match rest[digits..].chars().next() {
+            Some('h') => 3600,
+            Some('m') => 60,
+            Some('s') => 1,
+            _ => return Err(bad()),
+        };
+        total = value
+            .checked_mul(unit)
+            .and_then(|n| total.checked_add(n))
+            .ok_or_else(bad)?;
+        rest = &rest[digits + 1..];
+    }
+    Ok(total)
 }
 
 /// Stored (core) Event JSON in the `events.k8s.io/v1` shape
@@ -194,6 +240,45 @@ mod tests {
 
     fn ctx(group: &str, version: &str) -> RequestContext {
         RequestContext::new(Some("default")).with_group_version(group, version)
+    }
+
+    /// storage.go:42-44: every write carries the one TTL, whatever the
+    /// operation and the existing TTL.
+    #[test]
+    fn the_event_store_expires_every_write_after_the_event_ttl() {
+        let store = new_store(
+            Arc::new(StorageBackend::Memory(Arc::new(
+                rusternetes_storage::MemoryStorage::new(),
+            ))),
+            DEFAULT_EVENT_TTL_SECONDS,
+        );
+        let ttl_func = store.ttl_func.as_ref().expect("events have a TTLFunc");
+        let event: Event =
+            serde_json::from_value(serde_json::json!({"metadata": {"name": "e"}})).unwrap();
+        assert_eq!(ttl_func(&event, 0, false).unwrap(), 3600);
+        assert_eq!(ttl_func(&event, 7, true).unwrap(), 3600);
+    }
+
+    /// `--event-ttl` is a Go duration.
+    #[test]
+    fn event_ttl_parses_as_a_go_duration() {
+        assert_eq!(parse_event_ttl("1h"), Ok(3600));
+        assert_eq!(parse_event_ttl("90m"), Ok(5400));
+        assert_eq!(parse_event_ttl("1h30m15s"), Ok(5415));
+        assert_eq!(parse_event_ttl("0"), Ok(0));
+        assert_eq!(parse_event_ttl("0s"), Ok(0));
+        for bad in [
+            "",
+            "h",
+            "1",
+            "1x",
+            "-1h",
+            "1.5h",
+            "1h 1m",
+            "99999999999999999999h",
+        ] {
+            assert!(parse_event_ttl(bad).is_err(), "{bad:?} must not parse");
+        }
     }
 
     /// strategy.go:46-92.

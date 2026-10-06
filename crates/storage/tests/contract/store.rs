@@ -428,3 +428,102 @@ where
         );
     }
 }
+
+/// Whether `key` is gone, polling up to `within`. Expiry is asynchronous in
+/// every backend (an etcd lease sweep, rhino's one-second TTL loop).
+async fn gone_within<S: Storage>(storage: &S, key: &str, within: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if matches!(
+            storage.get::<Value>(key).await,
+            Err(rusternetes_common::Error::NotFound(_))
+        ) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// An open watch for the length of a TTL test. rhino starts its background
+/// loops, the TTL reaper among them, on the first watch subscription
+/// (`SqliteBackend::watch` -> "background tasks started (first watch
+/// subscription)"), so a store nobody watches never expires anything. The
+/// api-server always holds watches, so this is the production condition.
+async fn hold_a_watch<S: Storage>(storage: &S) -> rusternetes_storage::WatchStream {
+    storage
+        .watch("/registry/")
+        .await
+        .expect("open a watch to start the backend's background loops")
+}
+
+/// Ported from `RunTestCreateWithTTL` (`store_tests.go`): an object created
+/// with a TTL is readable, then evicted once the TTL expires; one created
+/// with TTL 0 never is.
+pub async fn run_test_create_with_ttl<S: Storage>(storage: &S) {
+    let _watch = hold_a_watch(storage).await;
+    let ttl_key = pod_key("test-ns", "ephemeral");
+    let keep_key = pod_key("test-ns", "permanent");
+
+    storage
+        .create_with_ttl::<Value>(&ttl_key, &pod("test-ns", "ephemeral"), 1)
+        .await
+        .expect("create with ttl failed");
+    storage
+        .create_with_ttl::<Value>(&keep_key, &pod("test-ns", "permanent"), 0)
+        .await
+        .expect("create without ttl failed");
+    storage
+        .get::<Value>(&ttl_key)
+        .await
+        .expect("object must be readable before its TTL expires");
+
+    assert!(
+        gone_within(storage, &ttl_key, std::time::Duration::from_secs(15)).await,
+        "object created with ttl=1 was not evicted"
+    );
+    storage
+        .get::<Value>(&keep_key)
+        .await
+        .expect("an object created with ttl=0 must not expire");
+}
+
+/// Ported from the TTL rows of `RunTestGuaranteedUpdate`: an update replaces
+/// the key's TTL. ttl=0 makes the object permanent, a TTL on a permanent
+/// object makes it expire.
+pub async fn run_test_update_with_ttl<S: Storage>(storage: &S) {
+    let _watch = hold_a_watch(storage).await;
+    let detach_key = pod_key("test-ns", "detached");
+    let attach_key = pod_key("test-ns", "attached");
+
+    let created: Value = storage
+        .create_with_ttl(&detach_key, &pod("test-ns", "detached"), 1)
+        .await
+        .expect("create with ttl failed");
+    storage
+        .update_with_ttl::<Value>(&detach_key, &created, 0)
+        .await
+        .expect("update with ttl=0 failed");
+
+    let created: Value = storage
+        .create(&attach_key, &pod("test-ns", "attached"))
+        .await
+        .expect("create failed");
+    storage
+        .update_with_ttl::<Value>(&attach_key, &created, 1)
+        .await
+        .expect("update with ttl failed");
+
+    assert!(
+        gone_within(storage, &attach_key, std::time::Duration::from_secs(15)).await,
+        "update with ttl=1 did not make the object expire"
+    );
+    // Well past the 1s TTL the first object was created with.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    storage
+        .get::<Value>(&detach_key)
+        .await
+        .expect("update with ttl=0 must detach the TTL");
+}
