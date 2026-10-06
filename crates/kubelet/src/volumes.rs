@@ -1842,6 +1842,31 @@ mod projected_mode_tests {
     /// `991a503d` (the pre-move commit) to confirm it characterizes the OLD
     /// behaviour too, not just whatever the new code happens to do — see the
     /// task-6 report for both runs.
+    /// #1983: the map `create_pod_volumes` returns — which both container
+    /// start paths now consume, init-container restart included — holds a
+    /// hostPath volume's host path itself, never a dir under the pod dir.
+    /// Upstream records the mounted path per volume and the runtime reads
+    /// that (`GetMountedVolumesForPod`, `volume_manager.go:320`).
+    #[tokio::test]
+    async fn create_pod_volumes_maps_a_host_path_volume_to_the_host_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {"containers": [], "volumes": [
+                {"name": "hp", "hostPath": {"path": host.path(), "type": "Directory"}}
+            ]}
+        }))
+        .unwrap();
+        let paths = vm.create_pod_volumes(&pod).await.unwrap();
+        assert_eq!(paths["hp"], host.path().to_string_lossy());
+    }
+
     #[tokio::test]
     async fn create_volume_writes_secret_data_to_disk() {
         let storage = Arc::new(StorageBackend::new_memory());

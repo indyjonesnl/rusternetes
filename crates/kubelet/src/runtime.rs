@@ -463,47 +463,6 @@ pub fn decide_next_init_action(pod: &Pod, observed: &[InitContainerObserved]) ->
     }
 }
 
-/// Expand environment variables in a string (e.g., ${VAR_NAME} or $VAR_NAME)
-pub(crate) fn expand_env_vars(input: &str) -> String {
-    let mut result = input.to_string();
-
-    // Expand ${VAR_NAME} format
-    while let Some(start) = result.find("${") {
-        if let Some(end) = result[start..].find('}') {
-            let var_name = &result[start + 2..start + end];
-            let var_value = std::env::var(var_name).unwrap_or_default();
-            result.replace_range(start..start + end + 1, &var_value);
-        } else {
-            break;
-        }
-    }
-
-    // Expand $VAR_NAME format (word boundary based)
-    let mut i = 0;
-    while i < result.len() {
-        if result[i..].starts_with('$') && i + 1 < result.len() {
-            let rest = &result[i + 1..];
-            let var_len = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .count();
-
-            if var_len > 0 {
-                let var_name = &rest[..var_len];
-                let var_value = std::env::var(var_name).unwrap_or_default();
-                result.replace_range(i..i + 1 + var_len, &var_value);
-                i += var_value.len();
-            } else {
-                i += 1;
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    result
-}
-
 /// Parse a Kubernetes memory quantity string (e.g. `"128Mi"`, `"0.5Gi"`,
 /// `"1000000"`) into bytes. Input that upstream `ParseQuantity` rejects reads
 /// as 0; the callers (`downward_api.rs`, `volumes.rs`, `kubelet.rs`) substitute
