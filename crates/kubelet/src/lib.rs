@@ -99,7 +99,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         root_dir: None,
         volume_dir: Some(config.volume_dir.clone()),
         volume_plugin_dir: None,
-        sync_frequency: Some(config.sync_interval),
+        sync_frequency: Some(std::time::Duration::from_secs(config.sync_interval)),
         metrics_bind_port: Some(config.metrics_port),
         log_level: Some("info".to_string()),
         cluster_service_cidr: None,

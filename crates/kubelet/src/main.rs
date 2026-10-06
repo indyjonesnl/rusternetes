@@ -457,7 +457,9 @@ async fn main() -> Result<()> {
                 .to_string_lossy()
                 .to_string(),
         ),
-        sync_frequency: Some(runtime_config.sync_frequency),
+        sync_frequency: Some(std::time::Duration::from_secs(
+            runtime_config.sync_frequency,
+        )),
         metrics_bind_port: Some(runtime_config.metrics_bind_port),
         log_level: Some(runtime_config.log_level.clone()),
         cluster_service_cidr: None, // Not exposed in config endpoint
