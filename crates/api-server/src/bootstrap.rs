@@ -995,6 +995,7 @@ pub async fn start_service_ip_repair_controllers(
     use crate::registry::core::service::portallocator::repair::Repair;
 
     let ip_repair = Arc::new(RepairIpAddress::new(state.storage.clone()));
+    let ip_repair_workers = ip_repair.clone();
     let (ip_handle, ip_first) = spawn_repair_loop("service ClusterIP repair", move || {
         let ip_repair = ip_repair.clone();
         async move {
@@ -1021,7 +1022,13 @@ pub async fn start_service_ip_repair_controllers(
         a.is_ok() && b.is_ok()
     };
     match tokio::time::timeout(INITIAL_REPAIR_TIMEOUT, both).await {
-        Ok(true) => Ok(vec![ip_handle, port_handle]),
+        Ok(true) => {
+            // RunUntil starts the event-driven workers once the first
+            // pass succeeded (repairip.go:208-216).
+            let mut handles = vec![ip_handle, port_handle];
+            handles.extend(ip_repair_workers.spawn_workers());
+            Ok(handles)
+        }
         _ => {
             ip_handle.abort();
             port_handle.abort();

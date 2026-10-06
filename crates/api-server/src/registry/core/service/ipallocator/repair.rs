@@ -7,19 +7,23 @@
 //!
 //! Upstream runs `runOnce` once and then reacts to Service and IPAddress
 //! informer events, with a resync every interval. Rusternetes has no
-//! informers in the api-server, so the loop runs `run_once` every interval
-//! instead. That is the resync alone, without the event-driven workers.
+//! informers in the api-server: `run_once` runs every interval (the
+//! resync), and `spawn_workers` adds the event-driven workers over the
+//! storage watch, with the same queues, 5 workers each, `maxRetries` and
+//! `AddAfter` requeue of a leaked IPAddress.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use ipnet::IpNet;
 use rusternetes_common::resources::{
     EventSource, EventType, IPAddress, ObjectReference, Service, ServiceCIDR,
 };
 use rusternetes_common::{Error, Result};
+use rusternetes_storage::workqueue::{extract_key, WorkQueue};
 use rusternetes_storage::{build_key, EventRecorder, Storage};
 use tracing::{error, warn};
 
@@ -27,6 +31,13 @@ use super::{
     family_of, ip_address_key, new_ip_address, prefix_contains_ip, CONTROLLER_NAME,
     IP_ADDRESS_PREFIX, LABEL_IP_ADDRESS_FAMILY, LABEL_MANAGED_BY,
 };
+
+/// `maxRetries` (repairip.go:57): a key is retried this many times before
+/// it is dropped out of the queue.
+const MAX_RETRIES: u32 = 15;
+
+/// `workers` (repairip.go:58): workers per queue.
+const WORKERS: usize = 5;
 
 /// The recorder's component (repairip.go:118).
 const COMPONENT: &str = "ipallocator-repair-controller";
@@ -361,17 +372,18 @@ impl<S: Storage + 'static> RepairIpAddress<S> {
     }
 
     /// `syncIPAddress` (repairip.go:465-585).
-    async fn sync_ip_address(&self, ip_address: &IPAddress) -> Result<()> {
+    async fn sync_ip_address(&self, ip_address: &IPAddress) -> Result<Option<Duration>> {
         // Not managed by this controller.
         if !managed_by_controller(ip_address) {
-            return Ok(());
+            return Ok(None);
         }
         let name = &ip_address.metadata.name;
         let spec_ref = ip_address.spec.as_ref().and_then(|s| s.parent_ref.as_ref());
         if !references_a_service(ip_address) {
             error!("IPAddress {name} appears to have been modified, not referencing a Service {spec_ref:?}: cleaning up");
             self.ip_event(ip_address, "IPAddressNotAllocated", format!("IPAddress {name} appears to have been modified, not referencing a Service {spec_ref:?}: cleaning up")).await;
-            return self.delete_ip_address(name).await;
+            self.delete_ip_address(name).await?;
+            return Ok(None);
         }
 
         let (ref_ns, ref_name) = parent(ip_address);
@@ -390,8 +402,11 @@ impl<S: Storage + 'static> RepairIpAddress<S> {
                     error!("IPAddress {name} appears to have leaked: cleaning up");
                     self.ip_event(ip_address, "IPAddressNotAllocated", format!("IPAddress: {name} for Service {ref_ns}/{ref_name} appears to have leaked: cleaning up")).await;
                     self.delete_ip_address(name).await?;
+                    return Ok(None);
                 }
-                return Ok(());
+                // `r.ipQueue.AddAfter(key, gracePeriod-ipLifetime)`
+                // (repairip.go:553).
+                return Ok(Some(LEAK_GRACE_PERIOD - lifetime));
             }
             Err(e) => {
                 error!("unable to get parent Service for IPAddress {name} due to an unknown error: {e}");
@@ -409,14 +424,15 @@ impl<S: Storage + 'static> RepairIpAddress<S> {
 
         // The Service loop checked Service -> IPAddress; check the reverse.
         if cluster_ips(&svc).contains(name) {
-            return Ok(());
+            return Ok(None);
         }
 
         // A create that is being reverted: its IPAddress is newer than the
         // Service it names (repairip.go:560-575).
         let svc_created = svc.metadata.creation_timestamp.unwrap_or(now);
         if created > svc_created && lifetime < REVERT_GRACE_PERIOD {
-            return Ok(());
+            // `r.ipQueue.AddAfter(key, 5*time.Second)` (repairip.go:572).
+            return Ok(Some(REVERT_GRACE_PERIOD));
         }
         error!("the IPAddress: {name} for Service {ref_name}/{ref_ns} has a wrong reference {spec_ref:?}; cleaning up");
         self.ip_event(
@@ -425,7 +441,122 @@ impl<S: Storage + 'static> RepairIpAddress<S> {
             format!("IPAddress: {name} for Service {ref_ns}/{ref_name} has a wrong reference; cleaning up"),
         )
         .await;
-        self.delete_ip_address(name).await
+        self.delete_ip_address(name).await?;
+        Ok(None)
+    }
+
+    /// `syncService(key)` for one queue key (`namespace/name`): the
+    /// lister read (a deleted Service is nothing to do), then
+    /// `syncService`.
+    async fn sync_service_key(&self, key: &str) -> Result<()> {
+        let (ns, name) = key.split_once('/').unwrap_or(("", key));
+        let svc = match self.storage.get::<Service>(&svc_key(ns, name)).await {
+            Ok(svc) => svc,
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let service_cidrs: Vec<ServiceCIDR> = self.storage.list("/registry/servicecidrs/").await?;
+        self.sync_service(&svc, &service_cidrs).await
+    }
+
+    /// `syncIPAddress(key)` for one queue key (the IPAddress name): the
+    /// lister read (gone is nothing to do), then `syncIPAddress`.
+    async fn sync_ip_address_key(&self, key: &str) -> Result<Option<Duration>> {
+        match self.storage.get::<IPAddress>(&ip_address_key(key)).await {
+            Ok(ip) => self.sync_ip_address(&ip).await,
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// The event-driven half of `RunUntil` (repairip.go:208-216): the
+    /// Service and IPAddress event handlers feeding `svcQueue` /
+    /// `ipQueue` (:130-178) and `workers` workers on each. The caller has
+    /// already run `run_once`. Rusternetes has no informers in the
+    /// api-server, so the handlers read the storage watch instead.
+    pub fn spawn_workers(self: &Arc<Self>) -> Vec<tokio::task::JoinHandle<()>> {
+        let svc_queue = WorkQueue::new();
+        let ip_queue = WorkQueue::new();
+        let mut handles = vec![
+            self.clone()
+                .spawn_event_handler("/registry/services/", svc_queue.clone()),
+            self.clone()
+                .spawn_event_handler(IP_ADDRESS_PREFIX, ip_queue.clone()),
+        ];
+        for _ in 0..WORKERS {
+            handles.push(tokio::spawn(self.clone().svc_worker(svc_queue.clone())));
+            handles.push(tokio::spawn(self.clone().ip_worker(ip_queue.clone())));
+        }
+        handles
+    }
+
+    /// `AddFunc` / `UpdateFunc` / `DeleteFunc` (repairip.go:130-178): every
+    /// event enqueues the object's key. A broken watch is re-opened.
+    fn spawn_event_handler(
+        self: Arc<Self>,
+        prefix: &'static str,
+        queue: WorkQueue,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                match self.storage.watch(prefix).await {
+                    Ok(mut stream) => {
+                        while let Some(event) = stream.next().await {
+                            if let Ok(event) = event {
+                                let key = extract_key(&event);
+                                let key = key
+                                    .strip_prefix(prefix.trim_start_matches("/registry/"))
+                                    .unwrap_or(&key);
+                                queue.add(key.to_string()).await;
+                            }
+                        }
+                    }
+                    Err(e) => warn!("{COMPONENT}: could not watch {prefix}: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    }
+
+    /// `svcWorker` / `processNextWorkSvc` / `handleSvcErr`
+    /// (repairip.go:327-363).
+    async fn svc_worker(self: Arc<Self>, queue: WorkQueue) {
+        while let Some(key) = queue.get().await {
+            let result = self.sync_service_key(&key).await;
+            handle_err(&queue, "Service", &key, result.map(|()| None)).await;
+            queue.done(&key).await;
+        }
+    }
+
+    /// `ipWorker` / `processNextWorkIP` / `handleIPErr`
+    /// (repairip.go:435-463), plus the `AddAfter` requeues of
+    /// `syncIPAddress`.
+    async fn ip_worker(self: Arc<Self>, queue: WorkQueue) {
+        while let Some(key) = queue.get().await {
+            let result = self.sync_ip_address_key(&key).await;
+            handle_err(&queue, "IPAddress", &key, result).await;
+            queue.done(&key).await;
+        }
+    }
+}
+
+/// `handleSvcErr` / `handleIPErr`: forget on success (re-adding after
+/// the requested delay), rate-limited retry up to `MAX_RETRIES`, then drop.
+async fn handle_err(queue: &WorkQueue, kind: &str, key: &str, result: Result<Option<Duration>>) {
+    match result {
+        Ok(requeue_after) => {
+            queue.forget(key).await;
+            if let Some(after) = requeue_after {
+                queue.add_after(key.to_string(), after).await;
+            }
+        }
+        Err(e) if queue.num_requeues(key).await < MAX_RETRIES => {
+            tracing::debug!("{COMPONENT}: error syncing {kind} {key}, retrying: {e}");
+            queue.requeue_rate_limited(key.to_string()).await;
+        }
+        Err(e) => {
+            warn!("{COMPONENT}: dropping {kind} {key:?} out of the queue: {e}");
+            queue.forget(key).await;
+        }
     }
 }
 
@@ -799,5 +930,94 @@ mod tests {
             .get::<IPAddress>(&ip_address_key("2001:db8::11"))
             .await
             .is_ok());
+    }
+
+    /// A leaked IPAddress still inside its grace period is requeued for
+    /// when the grace ends (`ipQueue.AddAfter(key, gracePeriod-ipLifetime)`,
+    /// repairip.go:553).
+    #[tokio::test]
+    async fn a_young_leaked_ip_address_is_requeued_after_the_grace_period() {
+        let storage = Arc::new(MemoryStorage::new());
+        let ip = ip_address("2001:db8::12", "gone", t0());
+        storage
+            .create(&ip_address_key("2001:db8::12"), &ip)
+            .await
+            .unwrap();
+        let r = RepairIpAddress::new(storage.clone()).with_clock(secs(20));
+        assert_eq!(
+            r.sync_ip_address(&ip).await.unwrap(),
+            Some(Duration::from_secs(40))
+        );
+        assert!(storage
+            .get::<IPAddress>(&ip_address_key("2001:db8::12"))
+            .await
+            .is_ok());
+    }
+
+    async fn eventually<F, Fut>(what: &str, mut cond: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..100 {
+            if cond().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    /// The workers react to an IPAddress event without a `run_once`
+    /// (repairip.go:208-216): a leaked IPAddress is deleted.
+    #[tokio::test]
+    async fn workers_delete_a_leaked_ip_address_on_its_event() {
+        let storage = Arc::new(MemoryStorage::new());
+        let r = Arc::new(RepairIpAddress::new(storage.clone()).with_clock(secs(3600)));
+        let handles = r.spawn_workers();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        storage
+            .create(
+                &ip_address_key("2001:db8::13"),
+                &ip_address("2001:db8::13", "gone", t0()),
+            )
+            .await
+            .unwrap();
+        eventually("leaked IPAddress deleted", || async {
+            storage
+                .get::<IPAddress>(&ip_address_key("2001:db8::13"))
+                .await
+                .is_err()
+        })
+        .await;
+        handles.iter().for_each(|h| h.abort());
+    }
+
+    /// ...and a Service event creates its missing IPAddress.
+    #[tokio::test]
+    async fn workers_create_a_missing_ip_address_on_the_service_event() {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create(
+                &build_key("servicecidrs", None, DEFAULT_SERVICE_CIDR_NAME),
+                &cidr(DEFAULT_SERVICE_CIDR_NAME, &[V4]),
+            )
+            .await
+            .unwrap();
+        let r = Arc::new(RepairIpAddress::new(storage.clone()));
+        let handles = r.spawn_workers();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        storage
+            .create(&svc_key("bar", "foo"), &svc("foo", &["10.0.0.7"], t0()))
+            .await
+            .unwrap();
+        eventually("IPAddress created", || async {
+            storage
+                .get::<IPAddress>(&ip_address_key("10.0.0.7"))
+                .await
+                .is_ok()
+        })
+        .await;
+        handles.iter().for_each(|h| h.abort());
     }
 }

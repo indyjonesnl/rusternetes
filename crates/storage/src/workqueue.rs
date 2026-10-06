@@ -307,6 +307,13 @@ impl WorkQueue {
         self.add_after(key, delay).await;
     }
 
+    /// `NumRequeues`: how many times the key has been rate-limit requeued
+    /// since the last `forget`.
+    pub async fn num_requeues(&self, key: &str) -> u32 {
+        let inner = self.inner.lock().await;
+        inner.failures.get(key).copied().unwrap_or(0)
+    }
+
     /// Clear the failure counter for a key. Called after successful
     /// reconciliation.
     pub async fn forget(&self, key: &str) {
