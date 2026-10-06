@@ -151,6 +151,29 @@ fn rule(verbs: &[&str], groups: &[&str], resources: &[&str]) -> PolicyRule {
     }
 }
 
+/// PUT `body` to `uri` as the bearer `token`.
+async fn put_json_bearer(
+    state: &TestApiServer,
+    uri: &str,
+    token: &str,
+    body: &Value,
+) -> (u16, Value) {
+    let auth = format!("Bearer {token}");
+    let bytes = serde_json::to_vec(body).unwrap();
+    let (status, _h, _b, value) = state
+        .send_with_headers(
+            "PUT",
+            uri,
+            &[
+                ("content-type", "application/json"),
+                ("authorization", &auth),
+            ],
+            Some(bytes),
+        )
+        .await;
+    (status.as_u16(), value)
+}
+
 const CSRS: &str = "/apis/certificates.k8s.io/v1/certificatesigningrequests";
 const SIGNER: &str = "example.com/serving";
 
@@ -168,11 +191,7 @@ fn csr_body(name: &str) -> Value {
 /// A server with a `csr-user` who holds `update` on the approval and status
 /// subresources plus `extra` rules, and one CSR created by the test.
 async fn setup(extra: Vec<PolicyRule>) -> (TestApiServer, String) {
-    let state = TestApiServer::builder()
-        .secret(TOKEN_SECRET)
-        .rbac()
-        .skip_auth(false)
-        .build();
+    let state = spawn_state();
     let uid = seed_sa(&state, "kube-system", "csr-user").await;
     let token = mint_sa_token("kube-system", "csr-user", &uid);
     let mut rules = vec![
@@ -299,7 +318,13 @@ async fn a_status_certificate_without_the_sign_verb_is_forbidden() {
             None,
         )
         .await;
-    csr["status"] = json!({"certificate": base64::engine::general_purpose::STANDARD.encode("x")});
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["example.com".to_string()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    csr["status"] =
+        json!({"certificate": base64::engine::general_purpose::STANDARD.encode(cert.pem())});
     let (status, body) = put_json_bearer(&state, &format!("{CSRS}/c1/status"), &token, &csr).await;
     assert_eq!(status, 403, "{body}");
     assert_eq!(

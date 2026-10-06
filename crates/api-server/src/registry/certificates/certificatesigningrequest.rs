@@ -3,9 +3,9 @@
 //! `pkg/registry/certificates/certificates/storage/storage.go`.
 //!
 //! Not modelled: declarative validation
-//! (`ValidateDeclarativelyWithMigrationChecks`), and the `approve` check on
-//! the signer that upstream's `certificates/approval` admission plugin makes
-//! for the `/approval` subresource.
+//! (`ValidateDeclarativelyWithMigrationChecks`). The `approve`/`sign` checks
+//! on the signer are admission plugins, in
+//! [`crate::admission::certificates`].
 
 use std::sync::Arc;
 
