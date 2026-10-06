@@ -1856,7 +1856,17 @@ mod tests {
     /// Stands in for whatever `plugin.NewBlockVolumeMapper` returns upstream.
     struct FakeBlockVolumeMapper;
 
+    impl crate::volume_plugins::plugin::MetricsProvider for FakeBlockVolumeMapper {
+        fn get_metrics(&self) -> Result<crate::volume_plugins::plugin::Metrics> {
+            Ok(Default::default())
+        }
+    }
+
     impl BlockVolumeMapper for FakeBlockVolumeMapper {
+        fn supports_metrics(&self) -> bool {
+            false
+        }
+
         fn get_global_map_path(&self, _spec: &Spec<'_>) -> Result<String> {
             Ok("fake/global/map/path".to_string())
         }

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use rusternetes_common::quantity::Quantity;
 use rusternetes_common::resources::{PersistentVolume, Pod, Volume};
 
 /// Port of `volume.Spec` (`pkg/volume/plugins.go:434`).
@@ -151,6 +152,14 @@ pub trait VolumePlugin: Send + Sync {
         false
     }
 
+    /// Rust spelling of the type assertion
+    /// `volumePlugin.(volume.BlockVolumePlugin)` (`plugins.go:906`, `:919`),
+    /// which `FindMapperPluginBy{Spec,Name}` perform. `None` is a failed
+    /// assertion — every plugin registered today, as upstream's seven.
+    fn as_block_volume_plugin(&self) -> Option<&dyn BlockVolumePlugin> {
+        None
+    }
+
     /// `NewMounter` (`plugins.go:162`).
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>>;
 }
@@ -185,23 +194,212 @@ pub trait Mounter: Send + Sync {
 /// Port of `volume.BlockVolumeMapper` (`pkg/volume/volume.go:200-203`), which
 /// is `volume.BlockVolume` (`volume.go:45-62`) under another name.
 ///
-/// `ActualStateOfWorld` only ever stores this value and hands it back out in a
-/// `MountedVolume`; it never calls a method on it. Following the convention
-/// this module already set for [`Mounter`] and [`VolumePlugin`], only the
-/// methods that identify the mapping are ported — `SupportsMetrics` and the
-/// embedded `MetricsProvider` arrive with the sub-project that reports volume
-/// metrics, and `CustomBlockVolumeMapper`'s `SetUpDevice` / `MapPodDevice` /
-/// `GetStagingPath` (`volume.go:205-225`) with the block-volume reconciler.
+/// The whole of `BlockVolume` is ported: `GetGlobalMapPath`,
+/// `GetPodDeviceMapPath`, `SupportsMetrics` and the embedded
+/// [`MetricsProvider`]. The raw device a mapper maps is handed to the runtime
+/// as a CRI `Device` in `ContainerConfig.devices` (CRI v1), never as a mount.
 ///
-/// No plugin in this crate implements it yet — block volumes are not
-/// supported — but the field exists so the reconciler can thread a mapper
-/// through without reshaping the cache. `Send + Sync` for the same reason as
-/// [`Mounter`].
-pub trait BlockVolumeMapper: Send + Sync {
-    /// `BlockVolume::GetGlobalMapPath` (`volume.go:49`).
+/// `Send + Sync` for the same reason as [`Mounter`].
+pub trait BlockVolumeMapper: Send + Sync + MetricsProvider {
+    /// `BlockVolume::GetGlobalMapPath` (`volume.go:49`). Global map path
+    /// containing the bind mount associated with a block device, e.g.
+    /// `plugins/kubernetes.io/{PluginName}/{DefaultKubeletVolumeDevicesDirName}/{volumePluginDependentPath}/{pod uuid}`.
     fn get_global_map_path(&self, spec: &Spec<'_>) -> Result<String>;
 
     /// `BlockVolume::GetPodDeviceMapPath` (`volume.go:53`). Returns the pod
-    /// device map path and the name of the symlink to the block device.
+    /// device map path and the name of the symlink to the block device, e.g.
+    /// `pods/{podUid}/{DefaultKubeletVolumeDevicesDirName}/{escapeQualifiedPluginName}/`, `{volumeName}`.
     fn get_pod_device_map_path(&self) -> (String, String);
+
+    /// `BlockVolume::SupportsMetrics` (`volume.go:57`): true if the
+    /// [`MetricsProvider`] is initialized.
+    fn supports_metrics(&self) -> bool;
+
+    /// Rust spelling of the type assertion
+    /// `mapper.(volume.CustomBlockVolumeMapper)` (`volume.go:205`), which the
+    /// operation generator performs to decide whether the plugin needs a
+    /// plugin-specific `SetUpDevice`/`MapPodDevice`. `None` is a failed
+    /// assertion.
+    fn as_custom_block_volume_mapper(&self) -> Option<&dyn CustomBlockVolumeMapper> {
+        None
+    }
+}
+
+/// Port of `volume.BlockVolumeUnmapper` (`pkg/volume/volume.go:228-230`),
+/// which is `BlockVolume` under another name.
+pub trait BlockVolumeUnmapper: Send + Sync + MetricsProvider {
+    /// `BlockVolume::GetGlobalMapPath` (`volume.go:49`).
+    fn get_global_map_path(&self, spec: &Spec<'_>) -> Result<String>;
+
+    /// `BlockVolume::GetPodDeviceMapPath` (`volume.go:53`).
+    fn get_pod_device_map_path(&self) -> (String, String);
+
+    /// `BlockVolume::SupportsMetrics` (`volume.go:57`).
+    fn supports_metrics(&self) -> bool;
+
+    /// Rust spelling of the type assertion
+    /// `unmapper.(volume.CustomBlockVolumeUnmapper)` (`volume.go:233`).
+    fn as_custom_block_volume_unmapper(&self) -> Option<&dyn CustomBlockVolumeUnmapper> {
+        None
+    }
+}
+
+/// Port of `volume.CustomBlockVolumeMapper` (`pkg/volume/volume.go:205-225`):
+/// the plugin-specific set-up/map steps. Idempotent, like every upstream
+/// volume method.
+pub trait CustomBlockVolumeMapper: BlockVolumeMapper {
+    /// `SetUpDevice` (`volume.go:211`). Prepares the volume on the node the
+    /// plugin-specific way; may be called more than once. Returns the staging
+    /// path if device setup succeeded.
+    fn set_up_device(&self) -> Result<String>;
+
+    /// `MapPodDevice` (`volume.go:218`). Maps the block device to a path and
+    /// returns it. A unique device path across a kubelet node reboot is
+    /// required to avoid unexpected block-volume destruction. An empty string
+    /// means "use the path the attacher returned".
+    fn map_pod_device(&self) -> Result<String>;
+
+    /// `GetStagingPath` (`volume.go:224`): the path used for staging the
+    /// volume, mainly used by CSI plugins.
+    fn get_staging_path(&self) -> String;
+}
+
+/// Port of `volume.CustomBlockVolumeUnmapper` (`pkg/volume/volume.go:233-243`).
+pub trait CustomBlockVolumeUnmapper: BlockVolumeUnmapper {
+    /// `TearDownDevice` (`volume.go:238`). Removes traces of `SetUpDevice`;
+    /// for a non-attachable plugin this detaches the volume from the node.
+    fn tear_down_device(&self, map_path: &str, device_path: &str) -> Result<()>;
+
+    /// `UnmapPodDevice` (`volume.go:242`). Removes traces of `MapPodDevice`.
+    fn unmap_pod_device(&self) -> Result<()>;
+}
+
+/// Port of `volume.MetricsProvider` (`pkg/volume/volume.go:64-68`).
+pub trait MetricsProvider {
+    /// `GetMetrics`. May be expensive for some implementations.
+    fn get_metrics(&self) -> Result<Metrics>;
+}
+
+/// Port of `volume.Metrics` (`pkg/volume/volume.go:73-110`). Each quantity is
+/// `Option` because upstream's are nilable pointers (nil = not reported).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Metrics {
+    /// The time at which these stats were updated.
+    pub time: Option<chrono::DateTime<chrono::Utc>>,
+    /// Total bytes used by the volume. For block devices this may exceed the
+    /// total size of the files.
+    pub used: Option<Quantity>,
+    /// Total capacity (bytes) of the volume's underlying storage.
+    pub capacity: Option<Quantity>,
+    /// Storage space available (bytes) for the volume.
+    pub available: Option<Quantity>,
+    /// Total inodes used by the volume.
+    pub inodes_used: Option<Quantity>,
+    /// Total inodes available in the volume.
+    pub inodes: Option<Quantity>,
+    /// Free inodes in the volume.
+    pub inodes_free: Option<Quantity>,
+    /// Non-empty when the stats could not be collected.
+    pub error: String,
+}
+
+/// Port of `volume.BlockVolumePlugin` (`pkg/volume/plugins.go:265-283`), the
+/// extension of [`VolumePlugin`] for block-volume support. A plugin opts in by
+/// returning itself from [`VolumePlugin::as_block_volume_plugin`].
+pub trait BlockVolumePlugin: VolumePlugin {
+    /// `NewBlockVolumeMapper` (`plugins.go:272`): create a mapper from an API
+    /// specification. Ownership of the spec is not transferred.
+    fn new_block_volume_mapper(
+        &self,
+        spec: &Spec<'_>,
+        pod: &Pod,
+    ) -> Result<Box<dyn BlockVolumeMapper>>;
+
+    /// `NewBlockVolumeUnmapper` (`plugins.go:276`): create an unmapper from
+    /// recoverable state. `name` is the volume name as per the `v1.Volume`
+    /// spec, `pod_uid` the UID of the enclosing pod.
+    fn new_block_volume_unmapper(
+        &self,
+        name: &str,
+        pod_uid: &str,
+    ) -> Result<Box<dyn BlockVolumeUnmapper>>;
+
+    /// `ConstructBlockVolumeSpec` (`plugins.go:282`): reconstruct a spec from
+    /// the pod UID, volume name and pod device map path read off disk. The
+    /// spec may be incomplete. Returns an [`OwnedSpec`] because a borrowed
+    /// [`Spec`] cannot outlive the call.
+    fn construct_block_volume_spec(
+        &self,
+        pod_uid: &str,
+        volume_name: &str,
+        volume_path: &str,
+    ) -> Result<OwnedSpec>;
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    struct Plain;
+    impl MetricsProvider for Plain {
+        fn get_metrics(&self) -> Result<Metrics> {
+            Ok(Metrics::default())
+        }
+    }
+    impl BlockVolumeMapper for Plain {
+        fn get_global_map_path(&self, _s: &Spec<'_>) -> Result<String> {
+            Ok("g".into())
+        }
+        fn get_pod_device_map_path(&self) -> (String, String) {
+            ("p".into(), "n".into())
+        }
+        fn supports_metrics(&self) -> bool {
+            false
+        }
+    }
+
+    struct Custom;
+    impl MetricsProvider for Custom {
+        fn get_metrics(&self) -> Result<Metrics> {
+            Ok(Metrics::default())
+        }
+    }
+    impl BlockVolumeMapper for Custom {
+        fn get_global_map_path(&self, _s: &Spec<'_>) -> Result<String> {
+            Ok("g".into())
+        }
+        fn get_pod_device_map_path(&self) -> (String, String) {
+            ("p".into(), "n".into())
+        }
+        fn supports_metrics(&self) -> bool {
+            true
+        }
+        fn as_custom_block_volume_mapper(&self) -> Option<&dyn CustomBlockVolumeMapper> {
+            Some(self)
+        }
+    }
+    impl CustomBlockVolumeMapper for Custom {
+        fn set_up_device(&self) -> Result<String> {
+            Ok("/staging".into())
+        }
+        fn map_pod_device(&self) -> Result<String> {
+            Ok(String::new())
+        }
+        fn get_staging_path(&self) -> String {
+            "/staging".into()
+        }
+    }
+
+    /// The operation generator type-asserts a mapper to
+    /// `CustomBlockVolumeMapper`; a plain mapper must fail that assertion.
+    #[test]
+    fn custom_mapper_assertion() {
+        assert!(Plain.as_custom_block_volume_mapper().is_none());
+        let c = Custom;
+        let custom = c.as_custom_block_volume_mapper().unwrap();
+        assert_eq!(custom.set_up_device().unwrap(), "/staging");
+        assert_eq!(custom.map_pod_device().unwrap(), "");
+        assert_eq!(custom.get_staging_path(), "/staging");
+        assert!(c.supports_metrics());
+    }
 }
