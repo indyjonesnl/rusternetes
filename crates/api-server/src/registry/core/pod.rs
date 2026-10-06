@@ -642,7 +642,12 @@ impl RestUpdateStrategy<Pod> for EphemeralContainersStrategy {
                         old_container.name
                     ),
                 )),
-                Some(new_container) if !semantic_equal(old_container, new_container) => {
+                Some(new_container)
+                    if !semantic_equal(
+                        &with_plain_bools_unset(old_container),
+                        &with_plain_bools_unset(new_container),
+                    ) =>
+                {
                     errs.push(FieldError::forbidden(
                         &spec_path,
                         format!(
@@ -660,6 +665,23 @@ impl RestUpdateStrategy<Pod> for EphemeralContainersStrategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+}
+
+/// `Stdin`, `StdinOnce` and `TTY` are plain `bool`s in `v1.EphemeralContainerCommon`
+/// and `core.EphemeralContainerCommon` (core/v1/types.go), so `false` and
+/// absent are one value to `apiequality.Semantic.DeepEqual`. They are
+/// `Option<bool>` here, and the protobuf client writes every one of them
+/// (`stdinOnce: false`), so an unchanged container reads back different (#2382).
+fn with_plain_bools_unset(
+    c: &rusternetes_common::resources::pod::EphemeralContainer,
+) -> rusternetes_common::resources::pod::EphemeralContainer {
+    let mut c = c.clone();
+    for b in [&mut c.stdin, &mut c.stdin_once, &mut c.tty] {
+        if *b == Some(false) {
+            *b = None;
+        }
+    }
+    c
 }
 
 /// `podResizeStrategy` (strategy.go:357-): the update strategy of `/resize`.
