@@ -1459,7 +1459,7 @@ fn validate_app_armor_profile(profile: &AppArmorProfile, fld_path: &Path) -> Err
 
 /// Port of upstream `validateLocalDescendingPath`: a `subPath`/`subPathExpr`
 /// must be relative and contain no `..` component.
-fn validate_local_descending_path(target: &str, fld_path: &Path) -> ErrorList {
+pub(crate) fn validate_local_descending_path(target: &str, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if target.starts_with('/') {
         errs.push(Error::invalid(
