@@ -184,8 +184,9 @@ pub async fn lock_namespace_quota(namespace: &str) -> tokio::sync::OwnedMutexGua
 /// Returns that message (without the `Forbidden` prefix the caller supplies), or
 /// `None` when every container covers what the quotas constrain.
 ///
-/// Upstream reads `status.hard`; this reads `spec.hard`, which the quota
-/// controller mirrors into status.
+/// Like upstream (`controller.go:464`: `ResourceNames(resourceQuota.Status.Hard)`)
+/// this reads `status.hard`, so a quota the controller has not synced yet
+/// constrains nothing.
 pub async fn check_pod_quota_constraints<S: Storage>(
     storage: &Arc<S>,
     namespace: &str,
@@ -197,7 +198,7 @@ pub async fn check_pod_quota_constraints<S: Storage>(
         if !pod_matches_quota_scopes(pod, &quota_obj) {
             continue;
         }
-        let Some(hard) = &quota_obj.spec.hard else {
+        let Some(hard) = quota_obj.status.as_ref().and_then(|s| s.hard.as_ref()) else {
             continue;
         };
         let required: Vec<String> = hard.keys().cloned().collect();
