@@ -2,8 +2,12 @@
 //! `pkg/registry/flowcontrol/prioritylevelconfiguration/strategy.go` and
 //! `pkg/registry/flowcontrol/prioritylevelconfiguration/storage/storage.go`.
 //!
-//! Not modelled: the mandatory-object spec equality checks of
-//! `pkg/apis/flowcontrol/validation` (`internalbootstrap.Mandatory*`).
+//! The mandatory-object spec equality checks of
+//! `pkg/apis/flowcontrol/validation` (`internalbootstrap.Mandatory*`) live in
+//! `rusternetes_common::validation::flowcontrol_bootstrap` and the validators.
+//!
+//! Not modelled: `getRequestGroupVersion` (strategy.go:192) only selects the
+//! v1beta1/v1beta2 field name `assuredConcurrencyShares`; only v1 is served.
 
 use std::sync::Arc;
 

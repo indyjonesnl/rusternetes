@@ -23,6 +23,9 @@ use crate::resources::flowcontrol::{
     QueuingConfiguration,
 };
 use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::flowcontrol_bootstrap::{
+    mandatory_priority_level_configuration, semantic_equal,
+};
 
 const MAX_QUEUES: i32 = 10 * 1000 * 1000; // 10^7
 
@@ -267,11 +270,51 @@ pub fn validate_priority_level_configuration(plc: &PriorityLevelConfiguration) -
         }
     }
 
+    errs.extend(validate_if_mandatory_priority_level_configuration_object(
+        plc, &spec_path,
+    ));
+
     if let Some(status) = &plc.status {
         errs.extend(validate_status(status, &Path::new("status")));
     }
 
     errs
+}
+
+/// `ValidateIfMandatoryPriorityLevelConfigurationObject` (validation.go:364-390).
+fn validate_if_mandatory_priority_level_configuration_object(
+    plc: &PriorityLevelConfiguration,
+    fld_path: &Path,
+) -> ErrorList {
+    let name = &plc.metadata.name;
+    let Some(mand) = mandatory_priority_level_configuration(name) else {
+        return Vec::new();
+    };
+    let spec_value = || serde_json::to_value(&plc.spec).unwrap_or_default();
+    if name == "exempt" {
+        // The admin may change `spec.exempt` of the singleton 'exempt' level;
+        // every other field of the spec must equal the fixed value.
+        let mut have = plc.spec.clone();
+        have.exempt = mand.spec.exempt.clone();
+        if !semantic_equal(&mand.spec, &have) {
+            return vec![Error::invalid(
+                fld_path,
+                spec_value(),
+                format!(
+                    "spec of '{name}' except the 'spec.exempt' field must equal the fixed value"
+                ),
+            )];
+        }
+        return Vec::new();
+    }
+    if !semantic_equal(&plc.spec, &mand.spec) {
+        return vec![Error::invalid(
+            fld_path,
+            spec_value(),
+            format!("spec of '{name}' must equal the fixed value"),
+        )];
+    }
+    Vec::new()
 }
 
 #[cfg(test)]

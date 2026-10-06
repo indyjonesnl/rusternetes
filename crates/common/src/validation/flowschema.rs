@@ -19,6 +19,7 @@ use crate::resources::flowcontrol::{
     SubjectKind,
 };
 use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::flowcontrol_bootstrap::{mandatory_flow_schema, semantic_equal};
 use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
 
 const MAX_MATCHING_PRECEDENCE: i32 = 10000;
@@ -435,6 +436,17 @@ pub fn validate_flow_schema(fs: &FlowSchema) -> ErrorList {
     if let Some(rules) = &spec.rules {
         for (i, rule) in rules.iter().enumerate() {
             errs.extend(validate_rule(rule, &spec_path.child("rules").index(i)));
+        }
+    }
+
+    // `internalbootstrap.MandatoryFlowSchemas` equality (validation.go:86-94).
+    if let Some(mand) = mandatory_flow_schema(&fs.metadata.name) {
+        if !semantic_equal(&fs.spec, &mand.spec) {
+            errs.push(Error::invalid(
+                &spec_path,
+                serde_json::to_value(&fs.spec).unwrap_or_default(),
+                format!("spec of '{}' must equal the fixed value", fs.metadata.name),
+            ));
         }
     }
 

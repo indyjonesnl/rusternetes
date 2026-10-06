@@ -253,3 +253,55 @@ fn exempt_lendable_percent_out_of_range_rejected() {
         "errs={errs:?}"
     );
 }
+
+// ---- mandatory-object spec equality (validation.go:364-390) ----
+
+use rusternetes_common::validation::flowcontrol_bootstrap::{
+    mandatory_priority_level_configuration, MANDATORY_PRIORITY_LEVEL_NAMES,
+};
+
+#[test]
+fn mandatory_plcs_validate_clean() {
+    for name in MANDATORY_PRIORITY_LEVEL_NAMES {
+        let p = mandatory_priority_level_configuration(name).expect("mandatory");
+        let errs = validate_priority_level_configuration(&p);
+        assert!(errs.is_empty(), "{name}: {errs:?}");
+    }
+}
+
+#[test]
+fn mandatory_catch_all_with_changed_spec_rejected() {
+    let mut p = mandatory_priority_level_configuration("catch-all").unwrap();
+    p.spec.limited.as_mut().unwrap().nominal_concurrency_shares = Some(6);
+    let errs = validate_priority_level_configuration(&p);
+    assert!(
+        errs.iter().any(|e| e.field == "spec"
+            && e.error_type == ErrorType::Invalid
+            && e.detail == "spec of 'catch-all' must equal the fixed value"),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn mandatory_exempt_allows_changing_only_the_exempt_field() {
+    let mut p = mandatory_priority_level_configuration("exempt").unwrap();
+    p.spec.exempt = Some(ExemptPriorityLevelConfiguration {
+        nominal_concurrency_shares: Some(7),
+        lending_concurrency_limit: None,
+        lendable_percent: Some(10),
+    });
+    assert!(validate_priority_level_configuration(&p).is_empty());
+}
+
+#[test]
+fn mandatory_exempt_rejects_other_spec_changes() {
+    let mut p = mandatory_priority_level_configuration("exempt").unwrap();
+    p.spec.limited = Some(limited_reject());
+    let errs = validate_priority_level_configuration(&p);
+    assert!(
+        errs.iter().any(|e| e.field == "spec"
+            && e.detail
+                == "spec of 'exempt' except the 'spec.exempt' field must equal the fixed value"),
+        "{errs:?}"
+    );
+}
