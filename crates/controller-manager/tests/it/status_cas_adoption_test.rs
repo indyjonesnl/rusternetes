@@ -373,7 +373,9 @@ async fn cronjob_status_write_conflicts_without_duplicating_the_job() {
         key,
         json!({
             "apiVersion": "batch/v1", "kind": "CronJob",
-            "metadata": {"name": "cj", "namespace": "default", "uid": "u-cj"},
+            "metadata": {"name": "cj", "namespace": "default", "uid": "u-cj",
+                         // utils.go:101: the first run walks from creationTimestamp.
+                         "creationTimestamp": (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339()},
             "spec": {"schedule": "* * * * *",
                      "jobTemplate": {"spec": {"template": {"spec": {
                          "restartPolicy": "Never",
