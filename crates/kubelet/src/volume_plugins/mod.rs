@@ -7,6 +7,8 @@
 
 pub mod config_map;
 pub mod csi;
+pub mod csi_client;
+pub mod csi_drivers_store;
 pub mod downward_api;
 pub mod empty_dir;
 pub mod host;
