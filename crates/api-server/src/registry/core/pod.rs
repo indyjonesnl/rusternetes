@@ -6,9 +6,6 @@
 //!
 //! * `podutil.DropDisabledPodFields`: every gate it covers is either on by
 //!   default in 1.35 or has no field in our types.
-//! * `applySchedulingGatedCondition`, `mutatePodAffinity`,
-//!   `mutateTopologySpreadConstraints` and `applyAppArmorVersionSkew`
-//!   (strategy.go:92-97): the api-server never ran them.
 //! * `podutil.DropDisabledPodFields` on `/status` (as above).
 
 use std::collections::{HashMap, VecDeque};
@@ -19,8 +16,10 @@ use async_trait::async_trait;
 use rusternetes_common::equality::semantic_equal;
 use rusternetes_common::podutil::update_pod_condition;
 use rusternetes_common::resources::pod::PodSpec;
+use rusternetes_common::resources::pod::{AppArmorProfile, PodAffinityTerm, SecurityContext};
 use rusternetes_common::resources::{Binding, Container, Pod, PodCondition, PodStatus};
 use rusternetes_common::types::Phase;
+use rusternetes_common::types::{LabelSelector, LabelSelectorRequirement};
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use rusternetes_common::validation::metav1::{get_warnings_for_ip, is_dns1123_label};
 use rusternetes_common::validation::objectmeta::{
@@ -125,6 +124,212 @@ fn validate_node_name_immutable(old: &PodSpec, new: &PodSpec) -> ErrorList {
     Vec::new()
 }
 
+/// `applyLabelKeysToLabelSelector` (strategy.go:862-872).
+fn apply_label_keys_to_label_selector(
+    selector: &mut LabelSelector,
+    label_keys: &[String],
+    operator: &str,
+    pod_labels: Option<&HashMap<String, String>>,
+) {
+    for key in label_keys {
+        if let Some(value) = pod_labels.and_then(|l| l.get(key)) {
+            selector
+                .match_expressions
+                .get_or_insert_with(Vec::new)
+                .push(LabelSelectorRequirement {
+                    key: key.clone(),
+                    operator: operator.to_string(),
+                    values: Some(vec![value.clone()]),
+                });
+        }
+    }
+}
+
+/// `applyMatchLabelKeysAndMismatchLabelKeys` (strategy.go:878-887). A nil
+/// selector matches nothing, so there is nothing to merge into.
+fn apply_match_label_keys_and_mismatch_label_keys(
+    term: &mut PodAffinityTerm,
+    labels: Option<&HashMap<String, String>>,
+) {
+    let match_keys = term.match_label_keys.clone().unwrap_or_default();
+    let mismatch_keys = term.mismatch_label_keys.clone().unwrap_or_default();
+    if (match_keys.is_empty() && mismatch_keys.is_empty()) || term.label_selector.is_none() {
+        return;
+    }
+    if let Some(selector) = term.label_selector.as_mut() {
+        apply_label_keys_to_label_selector(selector, &match_keys, "In", labels);
+        apply_label_keys_to_label_selector(selector, &mismatch_keys, "NotIn", labels);
+    }
+}
+
+/// `mutatePodAffinity` (strategy.go:889-908). Upstream gates it on
+/// `MatchLabelKeysInPodAffinity`, GA and `LockToDefault: true` since 1.33
+/// (kube_features.go:1500-1504), so it is unconditional here.
+fn mutate_pod_affinity(pod: &mut Pod) {
+    let labels = pod.metadata.labels.clone();
+    let Some(affinity) = pod.spec.as_mut().and_then(|s| s.affinity.as_mut()) else {
+        return;
+    };
+    if let Some(a) = affinity.pod_affinity.as_mut() {
+        for t in a
+            .preferred_during_scheduling_ignored_during_execution
+            .iter_mut()
+            .flatten()
+        {
+            apply_match_label_keys_and_mismatch_label_keys(
+                &mut t.pod_affinity_term,
+                labels.as_ref(),
+            );
+        }
+        for t in a
+            .required_during_scheduling_ignored_during_execution
+            .iter_mut()
+            .flatten()
+        {
+            apply_match_label_keys_and_mismatch_label_keys(t, labels.as_ref());
+        }
+    }
+    if let Some(a) = affinity.pod_anti_affinity.as_mut() {
+        for t in a
+            .preferred_during_scheduling_ignored_during_execution
+            .iter_mut()
+            .flatten()
+        {
+            apply_match_label_keys_and_mismatch_label_keys(
+                &mut t.pod_affinity_term,
+                labels.as_ref(),
+            );
+        }
+        for t in a
+            .required_during_scheduling_ignored_during_execution
+            .iter_mut()
+            .flatten()
+        {
+            apply_match_label_keys_and_mismatch_label_keys(t, labels.as_ref());
+        }
+    }
+}
+
+/// `mutateTopologySpreadConstraints` (strategy.go:925-935) with
+/// `applyMatchLabelKeys` (strategy.go:912-921): both gates must be on.
+fn mutate_topology_spread_constraints(pod: &mut Pod) {
+    use rusternetes_common::feature_gates::{enabled, Feature};
+    if !enabled(Feature::MatchLabelKeysInPodTopologySpread)
+        || !enabled(Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge)
+    {
+        return;
+    }
+    let labels = pod.metadata.labels.clone();
+    let Some(constraints) = pod
+        .spec
+        .as_mut()
+        .and_then(|s| s.topology_spread_constraints.as_mut())
+    else {
+        return;
+    };
+    for c in constraints {
+        let keys = c.match_label_keys.clone().unwrap_or_default();
+        if keys.is_empty() {
+            continue;
+        }
+        if let Some(selector) = c.label_selector.as_mut() {
+            apply_label_keys_to_label_selector(selector, &keys, "In", labels.as_ref());
+        }
+    }
+}
+
+/// `api.DeprecatedAppArmorAnnotationKeyPrefix`.
+const DEPRECATED_APPARMOR_ANNOTATION_KEY_PREFIX: &str =
+    "container.apparmor.security.beta.kubernetes.io/";
+
+/// `ApparmorFieldForAnnotation` (pkg/api/pod/util.go:1770-1792).
+fn apparmor_field_for_annotation(annotation: &str) -> Option<AppArmorProfile> {
+    match annotation {
+        "unconfined" => {
+            return Some(AppArmorProfile {
+                type_: "Unconfined".into(),
+                localhost_profile: None,
+            })
+        }
+        "runtime/default" => {
+            return Some(AppArmorProfile {
+                type_: "RuntimeDefault".into(),
+                localhost_profile: None,
+            })
+        }
+        _ => {}
+    }
+    match annotation.strip_prefix("localhost/") {
+        Some(p) if !p.is_empty() => Some(AppArmorProfile {
+            type_: "Localhost".into(),
+            localhost_profile: Some(p.to_string()),
+        }),
+        _ => None,
+    }
+}
+
+/// `apiequality.Semantic.DeepEqual` on two `*AppArmorProfile`s.
+fn app_armor_profile_eq(a: &AppArmorProfile, b: Option<&AppArmorProfile>) -> bool {
+    b.is_some_and(|b| a.type_ == b.type_ && a.localhost_profile == b.localhost_profile)
+}
+
+/// `applyAppArmorVersionSkew` (strategy.go:951-1005): sync a deprecated
+/// per-container annotation into the container's `appArmorProfile`.
+fn apply_app_armor_version_skew(ctx: &RequestContext, pod: &mut Pod) {
+    let annotations = pod.metadata.annotations.clone().unwrap_or_default();
+    let Some(spec) = pod.spec.as_mut() else {
+        return;
+    };
+    if spec.os.as_ref().is_some_and(|os| os.name == "windows") {
+        return;
+    }
+    let pod_profile = spec
+        .security_context
+        .as_ref()
+        .and_then(|sc| sc.app_armor_profile.clone());
+
+    // `podutil.VisitContainers(.., AllFeatureEnabledContainers(), ..)`.
+    let visit = |name: &str, sc: &mut Option<SecurityContext>| {
+        let key = format!("{DEPRECATED_APPARMOR_ANNOTATION_KEY_PREFIX}{name}");
+        let Some(annotation) = annotations.get(&key) else {
+            return;
+        };
+        if sc.as_ref().is_some_and(|s| s.app_armor_profile.is_some()) {
+            return;
+        }
+        let mut new_field = apparmor_field_for_annotation(annotation);
+        if let Some(f) = &new_field {
+            if !rusternetes_common::validation::pod::validate_app_armor_profile(f, &Path::new(""))
+                .is_empty()
+            {
+                new_field = None;
+            }
+        }
+        let mut deprecation_warning = new_field.is_none();
+        if let Some(f) = new_field {
+            if !app_armor_profile_eq(&f, pod_profile.as_ref()) {
+                sc.get_or_insert_with(Default::default).app_armor_profile = Some(f);
+                deprecation_warning = true;
+            }
+        }
+        if deprecation_warning {
+            let fld_path = Path::new("metadata").child("annotations").key(&key);
+            ctx.add_warning(format!(
+                r#"{fld_path}: deprecated since v1.30; use the "appArmorProfile" field instead"#
+            ));
+        }
+    };
+    for c in spec.init_containers.iter_mut().flatten() {
+        visit(&c.name.clone(), &mut c.security_context);
+    }
+    for c in spec.containers.iter_mut() {
+        visit(&c.name.clone(), &mut c.security_context);
+    }
+    for c in spec.ephemeral_containers.iter_mut().flatten() {
+        visit(&c.name.clone(), &mut c.security_context);
+    }
+}
+
 /// `podStrategy` (strategy.go:60-72).
 pub struct Strategy;
 
@@ -137,7 +342,7 @@ impl NamespaceScopedStrategy for Strategy {
 impl RestCreateStrategy<Pod> for Strategy {
     /// strategy.go:84-100: a new pod is `Pending` with its QoS class, at
     /// generation 1, whatever the client sent as status.
-    fn prepare_for_create(&self, _ctx: &RequestContext, obj: &mut Pod) {
+    fn prepare_for_create(&self, ctx: &RequestContext, obj: &mut Pod) {
         obj.metadata.generation = Some(1);
         // The api-server is the authoritative writer of the QoS class
         // (strategy.go:92); the kubelet recomputes the same value
@@ -150,6 +355,9 @@ impl RestCreateStrategy<Pod> for Strategy {
         });
         rusternetes_common::pod_drop_disabled::drop_disabled_pod_fields(obj, None);
         apply_scheduling_gated_condition(obj);
+        mutate_pod_affinity(obj);
+        mutate_topology_spread_constraints(obj);
+        apply_app_armor_version_skew(ctx, obj);
     }
 
     /// strategy.go:111-116: `ValidatePodCreate`.
@@ -1800,5 +2008,346 @@ mod tests {
         assert_eq!(spec.containers[0].image, "busybox");
         assert!(spec.active_deadline_seconds.is_none());
         assert!(spec.containers[0].resources.is_some());
+    }
+
+    // ---- #2162: mutatePodAffinity / mutateTopologySpreadConstraints /
+    // applyAppArmorVersionSkew, ported from strategy_test.go
+    // (Test_mutateTopologySpreadConstraints:1804, Test_mutatePodAffinity:1442,
+    // TestApplyAppArmorVersionSkew:2318).
+
+    fn created(mut p: Pod, ctx: &RequestContext) -> Pod {
+        Strategy.prepare_for_create(ctx, &mut p);
+        p
+    }
+
+    fn with_meta(
+        extra: serde_json::Value,
+        labels: serde_json::Value,
+        ann: serde_json::Value,
+    ) -> Pod {
+        let mut p = pod(extra);
+        p.metadata.labels = serde_json::from_value(labels).unwrap();
+        p.metadata.annotations = serde_json::from_value(ann).unwrap();
+        p
+    }
+
+    fn exprs(
+        sel: &Option<rusternetes_common::types::LabelSelector>,
+    ) -> Vec<(String, String, Vec<String>)> {
+        sel.as_ref()
+            .unwrap()
+            .match_expressions
+            .iter()
+            .flatten()
+            .map(|r| (r.key.clone(), r.operator.clone(), r.values.clone().unwrap()))
+            .collect()
+    }
+
+    fn tsc_pod(constraint: serde_json::Value) -> Pod {
+        with_meta(
+            serde_json::json!({"topologySpreadConstraints": [constraint]}),
+            serde_json::json!({"country": "Japan", "city": "Tokyo"}),
+            serde_json::json!(null),
+        )
+    }
+
+    fn tsc(p: Pod) -> rusternetes_common::resources::pod::TopologySpreadConstraint {
+        p.spec
+            .unwrap()
+            .topology_spread_constraints
+            .unwrap()
+            .remove(0)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn match_label_keys_merged_into_topology_spread_selector_with_in() {
+        let p = created(
+            tsc_pod(
+                serde_json::json!({"maxSkew": 1, "topologyKey": "kubernetes.io/hostname",
+                "whenUnsatisfiable": "DoNotSchedule", "labelSelector": {},
+                "matchLabelKeys": ["country", "city"]}),
+            ),
+            &ctx(),
+        );
+        let c = tsc(p);
+        assert_eq!(
+            exprs(&c.label_selector),
+            vec![
+                ("country".into(), "In".into(), vec!["Japan".into()]),
+                ("city".into(), "In".into(), vec!["Tokyo".into()]),
+            ]
+        );
+        assert_eq!(c.match_label_keys.unwrap(), vec!["country", "city"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn topology_spread_keys_not_in_pod_labels_are_ignored() {
+        let p = created(
+            tsc_pod(
+                serde_json::json!({"maxSkew": 1, "topologyKey": "kubernetes.io/hostname",
+                "whenUnsatisfiable": "DoNotSchedule", "labelSelector": {},
+                "matchLabelKeys": ["country", "not-found"]}),
+            ),
+            &ctx(),
+        );
+        assert_eq!(
+            exprs(&tsc(p).label_selector),
+            vec![("country".into(), "In".into(), vec!["Japan".into()])]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn topology_spread_keys_ignored_when_selector_is_nil() {
+        let p = created(
+            tsc_pod(
+                serde_json::json!({"maxSkew": 1, "topologyKey": "kubernetes.io/hostname",
+                "whenUnsatisfiable": "DoNotSchedule", "matchLabelKeys": ["country"]}),
+            ),
+            &ctx(),
+        );
+        assert!(tsc(p).label_selector.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn topology_spread_keys_not_merged_without_selector_merge_gate() {
+        use rusternetes_common::feature_gates::{with_feature, Feature};
+        let _g = with_feature(
+            Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge,
+            false,
+        );
+        let p = created(
+            tsc_pod(
+                serde_json::json!({"maxSkew": 1, "topologyKey": "kubernetes.io/hostname",
+                "whenUnsatisfiable": "DoNotSchedule", "labelSelector": {},
+                "matchLabelKeys": ["country", "city"]}),
+            ),
+            &ctx(),
+        );
+        assert!(exprs(&tsc(p).label_selector).is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pod_affinity_label_keys_merge_into_all_four_term_lists() {
+        let term = serde_json::json!({"topologyKey": "zone", "labelSelector": {},
+            "matchLabelKeys": ["country", "absent"], "mismatchLabelKeys": ["city"]});
+        let nil = serde_json::json!({"topologyKey": "zone", "matchLabelKeys": ["country"]});
+        let weighted =
+            |t: &serde_json::Value| serde_json::json!({"weight": 1, "podAffinityTerm": t});
+        let p = created(
+            with_meta(
+                serde_json::json!({"affinity": {
+                    "podAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": [term, nil],
+                        "preferredDuringSchedulingIgnoredDuringExecution": [weighted(&term)]},
+                    "podAntiAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": [term],
+                        "preferredDuringSchedulingIgnoredDuringExecution": [weighted(&term)]}}}),
+                serde_json::json!({"country": "Japan", "city": "Tokyo"}),
+                serde_json::json!(null),
+            ),
+            &ctx(),
+        );
+        let want = vec![
+            (
+                "country".to_string(),
+                "In".to_string(),
+                vec!["Japan".to_string()],
+            ),
+            (
+                "city".to_string(),
+                "NotIn".to_string(),
+                vec!["Tokyo".to_string()],
+            ),
+        ];
+        let a = p.spec.unwrap().affinity.unwrap();
+        let (pa, anti) = (a.pod_affinity.unwrap(), a.pod_anti_affinity.unwrap());
+        let req = pa
+            .required_during_scheduling_ignored_during_execution
+            .unwrap();
+        assert_eq!(exprs(&req[0].label_selector), want);
+        assert!(req[1].label_selector.is_none(), "nil selector stays nil");
+        let pref = pa
+            .preferred_during_scheduling_ignored_during_execution
+            .unwrap();
+        assert_eq!(exprs(&pref[0].pod_affinity_term.label_selector), want);
+        let req = anti
+            .required_during_scheduling_ignored_during_execution
+            .unwrap();
+        assert_eq!(exprs(&req[0].label_selector), want);
+        let pref = anti
+            .preferred_during_scheduling_ignored_during_execution
+            .unwrap();
+        assert_eq!(exprs(&pref[0].pod_affinity_term.label_selector), want);
+    }
+
+    const AA: &str = "container.apparmor.security.beta.kubernetes.io/";
+
+    fn aa_pod(spec: serde_json::Value, ann: serde_json::Value) -> Pod {
+        with_meta(spec, serde_json::json!(null), ann)
+    }
+
+    fn aa_type(c: &rusternetes_common::resources::Container) -> Option<(String, Option<String>)> {
+        c.security_context
+            .as_ref()?
+            .app_armor_profile
+            .as_ref()
+            .map(|p| (p.type_.clone(), p.localhost_profile.clone()))
+    }
+
+    const WARN: &str = r#"deprecated since v1.30; use the "appArmorProfile" field instead"#;
+
+    #[test]
+    fn apparmor_annotation_unconfined_syncs_to_field_with_warning() {
+        let c = ctx();
+        let key = format!("{AA}ctr");
+        let p = created(
+            aa_pod(
+                serde_json::json!({"containers": [{"name": "ctr", "image": "i"}]}),
+                serde_json::json!({ key.clone(): "unconfined" }),
+            ),
+            &c,
+        );
+        let s = p.spec.unwrap();
+        assert_eq!(aa_type(&s.containers[0]), Some(("Unconfined".into(), None)));
+        assert!(s.security_context.is_none());
+        let w = c.warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].starts_with(&format!("metadata.annotations[{key}]: ")) && w[0].contains(WARN),
+            "{w:?}"
+        );
+    }
+
+    #[test]
+    fn apparmor_annotations_on_init_and_localhost_containers() {
+        let c = ctx();
+        let p = created(
+            aa_pod(
+                serde_json::json!({
+                    "securityContext": {"appArmorProfile": {"type": "RuntimeDefault"}},
+                    "initContainers": [{"name": "init", "image": "i"}],
+                    "containers": [{"name": "a", "image": "i"}, {"name": "b", "image": "i"},
+                                   {"name": "c", "image": "i"}]}),
+                serde_json::json!({
+                    format!("{AA}init"): "unconfined",
+                    format!("{AA}a"): "localhost/test",
+                    format!("{AA}c"): "runtime/default"}),
+            ),
+            &c,
+        );
+        let s = p.spec.unwrap();
+        assert_eq!(
+            aa_type(&s.init_containers.unwrap()[0]),
+            Some(("Unconfined".into(), None))
+        );
+        assert_eq!(
+            aa_type(&s.containers[0]),
+            Some(("Localhost".into(), Some("test".into())))
+        );
+        assert!(s.containers[1].security_context.is_none());
+        // Equal to the pod-level profile: not copied, and no warning for it.
+        assert!(s.containers[2].security_context.is_none());
+        assert!(!c.warnings().is_empty());
+    }
+
+    #[test]
+    fn apparmor_annotation_loses_to_existing_container_field() {
+        let c = ctx();
+        let p = created(
+            aa_pod(
+                serde_json::json!({"containers": [{"name": "ctr", "image": "i",
+                    "securityContext": {"appArmorProfile": {"type": "RuntimeDefault"}}}]}),
+                serde_json::json!({format!("{AA}ctr"): "localhost/test"}),
+            ),
+            &c,
+        );
+        assert_eq!(
+            aa_type(&p.spec.unwrap().containers[0]),
+            Some(("RuntimeDefault".into(), None))
+        );
+        assert!(c.warnings().is_empty());
+    }
+
+    #[test]
+    fn apparmor_annotation_matching_pod_field_is_not_synced_nor_warned() {
+        let c = ctx();
+        let p = created(
+            aa_pod(
+                serde_json::json!({
+                    "securityContext": {"appArmorProfile": {"type": "RuntimeDefault"}},
+                    "containers": [{"name": "ctr", "image": "i"}]}),
+                serde_json::json!({format!("{AA}ctr"): "runtime/default"}),
+            ),
+            &c,
+        );
+        assert!(p.spec.unwrap().containers[0].security_context.is_none());
+        assert!(c.warnings().is_empty());
+    }
+
+    #[test]
+    fn apparmor_annotation_overrides_pod_field() {
+        let c = ctx();
+        let p = created(
+            aa_pod(
+                serde_json::json!({
+                    "securityContext": {"appArmorProfile": {"type": "RuntimeDefault"}},
+                    "containers": [{"name": "ctr", "image": "i"}]}),
+                serde_json::json!({format!("{AA}ctr"): "unconfined"}),
+            ),
+            &c,
+        );
+        assert_eq!(
+            aa_type(&p.spec.unwrap().containers[0]),
+            Some(("Unconfined".into(), None))
+        );
+        assert_eq!(c.warnings().len(), 1);
+    }
+
+    #[test]
+    fn apparmor_annotation_for_unknown_container_is_ignored() {
+        let c = ctx();
+        let p = created(
+            aa_pod(
+                serde_json::json!({"containers": [{"name": "ctr", "image": "i"}]}),
+                serde_json::json!({format!("{AA}foo-bar"): "unconfined"}),
+            ),
+            &c,
+        );
+        assert!(p.spec.unwrap().containers[0].security_context.is_none());
+        assert!(c.warnings().is_empty());
+    }
+
+    #[test]
+    fn apparmor_invalid_annotation_warns_and_copies_nothing() {
+        let c = ctx();
+        let p = created(
+            aa_pod(
+                serde_json::json!({"containers": [{"name": "ctr", "image": "i"}]}),
+                serde_json::json!({format!("{AA}ctr"): format!("localhost/{}", "a".repeat(4096))}),
+            ),
+            &c,
+        );
+        assert!(p.spec.unwrap().containers[0].security_context.is_none());
+        assert_eq!(c.warnings().len(), 1);
+    }
+
+    #[test]
+    fn apparmor_annotations_ignored_on_windows() {
+        let c = ctx();
+        let p = created(
+            aa_pod(
+                serde_json::json!({"os": {"name": "windows"},
+                    "containers": [{"name": "ctr", "image": "i"}]}),
+                serde_json::json!({format!("{AA}ctr"): "runtime/default"}),
+            ),
+            &c,
+        );
+        assert!(p.spec.unwrap().containers[0].security_context.is_none());
+        assert!(c.warnings().is_empty());
     }
 }

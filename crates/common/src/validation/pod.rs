@@ -1405,7 +1405,7 @@ fn validate_seccomp_profile(sp: &SeccompProfile, fld_path: &Path) -> ErrorList {
 
 /// Port of upstream `ValidateAppArmorProfileField`
 /// (`pkg/apis/core/validation/validation.go:5307-5346`).
-fn validate_app_armor_profile(profile: &AppArmorProfile, fld_path: &Path) -> ErrorList {
+pub fn validate_app_armor_profile(profile: &AppArmorProfile, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let localhost_path = fld_path.child("localhostProfile");
 
