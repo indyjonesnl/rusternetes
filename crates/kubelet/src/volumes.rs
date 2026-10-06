@@ -1945,9 +1945,13 @@ mod projected_mode_tests {
             "file mode must come from the volume's defaultMode"
         );
 
-        // secret_dir_mode = defaultMode | 0o111 (secret.rs's moved body)
-        let dir_mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(dir_mode & 0o777, 0o400 | 0o111);
+        // The volume dir's mode no longer derives from defaultMode (#1975):
+        // upstream's AtomicWriter creates the timestamped data dir 0755
+        // (atomic_writer.go) and the volume dir comes from the emptyDir
+        // wrapper, never from the Secret's defaultMode.
+        let data_dir = std::fs::canonicalize(format!("{path}/..data")).unwrap();
+        let dir_mode = std::fs::metadata(&data_dir).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o755);
     }
 
     /// Characterization test for the downwardAPI volume plugin's `set_up`
