@@ -9,6 +9,7 @@
 //! Add a new test file as `tests/it/<name>.rs` plus a `mod <name>;` line
 //! below. A stray `tests/<name>.rs` still compiles -- it just silently
 //! reintroduces a separate binary, which is what this layout avoids.
+mod admission_invalid_value_rejected_test;
 mod admission_test;
 mod admission_webhook_e2e_test;
 mod admissionregistration_store_test;
