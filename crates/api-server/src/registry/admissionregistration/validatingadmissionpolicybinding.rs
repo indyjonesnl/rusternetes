@@ -4,6 +4,10 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use rusternetes_common::authz::Authorizer;
+use rusternetes_common::{Error, Result};
+
 use rusternetes_common::resources::ValidatingAdmissionPolicyBinding;
 use rusternetes_common::validation::field::{ErrorList, Path};
 use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
@@ -12,7 +16,12 @@ use rusternetes_common::validation::validating_admission_policy::{
 };
 use rusternetes_storage::StorageBackend;
 
+use super::authz::authorize_param_ref;
+use crate::registry::generic::store::{
+    BeginCreate, BeginUpdate, CreateOptions, Finish, UpdateOptions,
+};
 use crate::registry::generic::Store;
+use crate::registry::rbac::policybased::Noop;
 use crate::registry::rest::{
     GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
     RestUpdateStrategy,
@@ -101,17 +110,73 @@ impl RestUpdateStrategy<ValidatingAdmissionPolicyBinding> for Strategy {
 
 impl RestDeleteStrategy<ValidatingAdmissionPolicyBinding> for Strategy {}
 
+/// `Validate` / `ValidateUpdate` (strategy.go:80-88, :109-117): the `paramRef`
+/// read-access check, run once the object is well-formed. See [`super::authz`]
+/// for why it is a Store hook.
+pub struct ParamRefAuthz {
+    authorizer: Arc<dyn Authorizer>,
+    storage: Arc<StorageBackend>,
+}
+
+#[async_trait]
+impl BeginCreate<ValidatingAdmissionPolicyBinding> for ParamRefAuthz {
+    async fn begin_create(
+        &self,
+        ctx: &RequestContext,
+        obj: &mut ValidatingAdmissionPolicyBinding,
+        _options: &CreateOptions,
+    ) -> Result<Box<dyn Finish>> {
+        if validate(obj).is_empty() {
+            let errs = authorize_param_ref(ctx, self.authorizer.as_ref(), &self.storage, obj, None)
+                .await?;
+            if !errs.is_empty() {
+                return Err(Error::Invalid(errs));
+            }
+        }
+        Ok(Box::new(Noop))
+    }
+}
+
+#[async_trait]
+impl BeginUpdate<ValidatingAdmissionPolicyBinding> for ParamRefAuthz {
+    async fn begin_update(
+        &self,
+        ctx: &RequestContext,
+        obj: &mut ValidatingAdmissionPolicyBinding,
+        old: &mut ValidatingAdmissionPolicyBinding,
+        _options: &UpdateOptions,
+    ) -> Result<Box<dyn Finish>> {
+        if validate(obj).is_empty() {
+            let errs =
+                authorize_param_ref(ctx, self.authorizer.as_ref(), &self.storage, obj, Some(old))
+                    .await?;
+            if !errs.is_empty() {
+                return Err(Error::Invalid(errs));
+            }
+        }
+        Ok(Box::new(Noop))
+    }
+}
+
 /// `NewREST` (storage/storage.go:46-69).
 pub fn new_store(
     storage: Arc<StorageBackend>,
+    authorizer: Arc<dyn Authorizer>,
 ) -> Store<ValidatingAdmissionPolicyBinding, StorageBackend> {
-    Store::new(
-        storage,
+    let mut store = Store::new(
+        storage.clone(),
         GroupResource::new(
             "admissionregistration.k8s.io",
             "validatingadmissionpolicybindings",
         ),
         Arc::new(Strategy),
     )
-    .with_decode_defaulter(convert_to_internal)
+    .with_decode_defaulter(convert_to_internal);
+    let hook = Arc::new(ParamRefAuthz {
+        authorizer,
+        storage,
+    });
+    store.begin_create = Some(hook.clone());
+    store.begin_update = Some(hook);
+    store
 }

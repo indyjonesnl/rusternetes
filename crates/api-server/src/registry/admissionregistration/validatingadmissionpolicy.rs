@@ -4,6 +4,10 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use rusternetes_common::authz::Authorizer;
+use rusternetes_common::{Error, Result};
+
 use rusternetes_common::resources::validating_admission_policy::ValidatingAdmissionPolicyStatus;
 use rusternetes_common::resources::ValidatingAdmissionPolicy;
 use rusternetes_common::validation::field::{ErrorList, Path};
@@ -14,7 +18,12 @@ use rusternetes_common::validation::validating_admission_policy::{
 };
 use rusternetes_storage::StorageBackend;
 
+use super::authz::authorize_param_kind;
+use crate::registry::generic::store::{
+    BeginCreate, BeginUpdate, CreateOptions, Finish, UpdateOptions,
+};
 use crate::registry::generic::Store;
+use crate::registry::rbac::policybased::Noop;
 use crate::registry::rest::{
     reset_object_meta_for_status, GroupResource, NamespaceScopedStrategy, RequestContext,
     RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
@@ -153,15 +162,64 @@ impl RestUpdateStrategy<ValidatingAdmissionPolicy> for StatusStrategy {
     }
 }
 
+/// `Validate` / `ValidateUpdate` (strategy.go:79-87, :104-112): the `paramKind`
+/// read-access check, run once the object is well-formed. See [`super::authz`]
+/// for why it is a Store hook.
+pub struct ParamKindAuthz {
+    authorizer: Arc<dyn Authorizer>,
+    storage: Arc<StorageBackend>,
+}
+
+#[async_trait]
+impl BeginCreate<ValidatingAdmissionPolicy> for ParamKindAuthz {
+    async fn begin_create(
+        &self,
+        ctx: &RequestContext,
+        obj: &mut ValidatingAdmissionPolicy,
+        _options: &CreateOptions,
+    ) -> Result<Box<dyn Finish>> {
+        if validate(obj).is_empty() {
+            let errs =
+                authorize_param_kind(ctx, self.authorizer.as_ref(), &self.storage, obj, None).await;
+            if !errs.is_empty() {
+                return Err(Error::Invalid(errs));
+            }
+        }
+        Ok(Box::new(Noop))
+    }
+}
+
+#[async_trait]
+impl BeginUpdate<ValidatingAdmissionPolicy> for ParamKindAuthz {
+    async fn begin_update(
+        &self,
+        ctx: &RequestContext,
+        obj: &mut ValidatingAdmissionPolicy,
+        old: &mut ValidatingAdmissionPolicy,
+        _options: &UpdateOptions,
+    ) -> Result<Box<dyn Finish>> {
+        if validate(obj).is_empty() {
+            let errs =
+                authorize_param_kind(ctx, self.authorizer.as_ref(), &self.storage, obj, Some(old))
+                    .await;
+            if !errs.is_empty() {
+                return Err(Error::Invalid(errs));
+            }
+        }
+        Ok(Box::new(Noop))
+    }
+}
+
 /// `NewREST` (storage/storage.go:49-80): the main store and the status store.
 pub fn new_stores(
     storage: Arc<StorageBackend>,
+    authorizer: Arc<dyn Authorizer>,
 ) -> (
     Store<ValidatingAdmissionPolicy, StorageBackend>,
     Store<ValidatingAdmissionPolicy, StorageBackend>,
 ) {
-    let store = Store::new(
-        storage,
+    let mut store = Store::new(
+        storage.clone(),
         GroupResource::new(
             "admissionregistration.k8s.io",
             "validatingadmissionpolicies",
@@ -169,6 +227,14 @@ pub fn new_stores(
         Arc::new(Strategy),
     )
     .with_decode_defaulter(convert_to_internal);
+    // The status strategy has no authorization (strategy.go:147-180), so the
+    // status store is derived before the hooks are set.
     let status = store.with_update_strategy(Arc::new(StatusStrategy));
+    let hook = Arc::new(ParamKindAuthz {
+        authorizer,
+        storage,
+    });
+    store.begin_create = Some(hook.clone());
+    store.begin_update = Some(hook);
     (store, status)
 }
