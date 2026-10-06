@@ -43,6 +43,7 @@ mod serving_tls;
 // call directly.
 #[allow(dead_code)]
 mod runtime;
+mod runtime_state;
 mod server;
 mod static_pods;
 mod streaming_server;

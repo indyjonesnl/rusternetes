@@ -399,6 +399,13 @@ impl CriContainerRuntime {
         Ok(format_runtime_version(&v))
     }
 
+    /// CRI v1 `Status` RPC (kuberuntime_manager.go:424 `Status`): the runtime's
+    /// `RuntimeReady`/`NetworkReady` conditions feeding the node's Ready state.
+    pub async fn runtime_status(&self) -> Result<v1::StatusResponse> {
+        let mut cri = self.cri.clone();
+        Ok(cri.runtime_status(false).await?)
+    }
+
     /// Set the `kubernetes` Service host:port injected as KUBERNETES_SERVICE_*
     /// env into pods (defaults to 10.96.0.1:443).
     #[must_use]
