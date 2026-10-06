@@ -104,3 +104,68 @@ fn delete_options_errors() {
         Err(Error::Invalid(_))
     ));
 }
+
+fn owner(uid: &str, controller: Option<bool>) -> rusternetes_common::types::OwnerReference {
+    rusternetes_common::types::OwnerReference {
+        api_version: "v1".into(),
+        kind: "Kind".into(),
+        name: "name".into(),
+        uid: uid.into(),
+        block_owner_deletion: controller,
+        controller,
+    }
+}
+
+/// rest_test.go `TestDedupOwnerReferences`: an entry is dropped only when it
+/// is wholly equal to an earlier one; same UID with other fields differing
+/// is kept.
+#[test]
+fn dedup_owner_references_matches_upstream() {
+    use super::rest::dedup_owner_references;
+
+    let refs = vec![owner("1", None), owner("2", None), owner("1", None)];
+    let (deduped, dups) = dedup_owner_references(&refs);
+    assert_eq!(deduped, vec![owner("1", None), owner("2", None)]);
+    assert_eq!(dups, vec!["1".to_string()]);
+
+    let refs = vec![owner("1", Some(false)), owner("1", None)];
+    let (deduped, dups) = dedup_owner_references(&refs);
+    assert_eq!(deduped, refs, "semantic-different entries are kept");
+    assert!(dups.is_empty());
+}
+
+/// rest.go:332-353: duplicates are removed from the object and a warning is
+/// recorded; the text differs after mutating admission.
+#[test]
+fn dedup_owner_references_and_add_warning_matches_upstream() {
+    use super::rest::dedup_owner_references_and_add_warning;
+    use crate::registry::rest::RequestContext;
+
+    for (after, needle) in [
+        (
+            false,
+            ".metadata.ownerReferences contains duplicate entries; API server dedups",
+        ),
+        (
+            true,
+            ".metadata.ownerReferences contains duplicate entries after mutating admission happens; API server dedups",
+        ),
+    ] {
+        let mut c = cm("a", Some("ns"));
+        c.metadata.owner_references = Some(vec![owner("u1", None), owner("u1", None)]);
+        let ctx = RequestContext::new(Some("ns"));
+        dedup_owner_references_and_add_warning(&mut c, &ctx, after);
+        assert_eq!(c.metadata.owner_references, Some(vec![owner("u1", None)]));
+        let w = ctx.warnings();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].starts_with(needle), "{}", w[0]);
+        assert!(w[0].ends_with("please fix your requests; duplicate UID(s) observed: u1"));
+    }
+
+    // No duplicates: nothing recorded, object untouched.
+    let mut c = cm("a", Some("ns"));
+    c.metadata.owner_references = Some(vec![owner("u1", None), owner("u2", None)]);
+    let ctx = RequestContext::new(Some("ns"));
+    dedup_owner_references_and_add_warning(&mut c, &ctx, false);
+    assert!(ctx.warnings().is_empty());
+}

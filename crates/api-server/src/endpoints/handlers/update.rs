@@ -10,7 +10,8 @@ use rusternetes_common::{Error, Result};
 
 use super::admission::{Admission, CreateValidation, MutatingAdmission, UpdateValidation};
 use super::rest::{
-    authorize, check_name, decode, dry_run_param, is_dry_run, respond, RequestScope,
+    authorize, check_name, decode, dedup_owner_references_and_add_warning, dry_run_param,
+    is_dry_run, respond, RequestScope,
 };
 use crate::registry::generic;
 use crate::registry::rest::{
@@ -67,6 +68,10 @@ pub async fn update_resource<T: Object>(
         obj.metadata_mut(),
     )?;
     check_name(&obj, name, namespace)?;
+
+    // update.go:225-226: dedup owner references before the transformers; the
+    // post-admission dedup (:185-189) is in `MutatingAdmission`.
+    dedup_owner_references_and_add_warning(&mut obj, &ctx, false);
 
     let admission = Admission {
         state,
