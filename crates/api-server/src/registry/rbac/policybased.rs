@@ -23,7 +23,6 @@ use rusternetes_common::resources::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef,
 };
 use rusternetes_common::{Error, Result};
-use rusternetes_storage::StorageBackend;
 
 use super::escalation_check::{
     binding_authorized, escalation_allowed, is_only_mutating_gc_fields, role_escalation_authorized,

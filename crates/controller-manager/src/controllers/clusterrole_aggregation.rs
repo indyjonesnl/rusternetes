@@ -123,6 +123,7 @@ impl<S: Storage + 'static> ClusterRoleAggregationController<S> {
     /// Sync every ClusterRole that has an `aggregationRule` once, in order.
     /// Used by tests and one-shot callers; the controller itself goes through
     /// the queue.
+    #[allow(dead_code)] // used by tests and one-shot callers outside this bin
     pub async fn sync_all(&self) -> Result<()> {
         let all: Vec<ClusterRole> = self
             .storage
