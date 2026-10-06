@@ -164,10 +164,22 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             rusternetes_storage::WatchEvent::Deleted(_, previous) => {
                 for owner in rc_owner_names(previous) {
                     self.expectations
-                        .deletion_observed(&format!("{ns}/{owner}"));
+                        .deletion_observed_of(&format!("{ns}/{owner}"), &pod_key_of(&pod_key));
                 }
             }
-            rusternetes_storage::WatchEvent::Modified(..) => {}
+            // A graceful delete first MODIFIES the pod (deletionTimestamp);
+            // upstream `updatePod` observes the deletion right there
+            // (replica_set.go:468-480) so replacements are not delayed until
+            // the kubelet removes the pod. Counted once per pod via the UID
+            // set (controller_utils.go:380-390).
+            rusternetes_storage::WatchEvent::Modified(_, value) => {
+                if pod_is_terminating(value) {
+                    for owner in rc_owner_names(value) {
+                        self.expectations
+                            .deletion_observed_of(&format!("{ns}/{owner}"), &pod_key_of(&pod_key));
+                    }
+                }
+            }
         }
 
         let storage_key = format!("/registry/{}", pod_key);
@@ -514,10 +526,24 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 // Need to delete excess pods
                 let to_delete =
                     ((current_replicas - desired_replicas) as usize).min(BURST_REPLICAS);
-                self.expectations
-                    .expect_deletions(&rc_key, to_delete as i64);
-                for pod in rc_pods.iter().take(to_delete) {
-                    self.delete_pod(&pod.metadata.name, namespace).await?;
+                // Snapshot the doomed pods' keys so each is observed exactly
+                // once, as a deletionTimestamp update or as the delete
+                // (`ExpectDeletions`, replica_set.go:670).
+                let doomed: Vec<&&Pod> = active_rc_pods.iter().take(to_delete).collect();
+                let doomed_keys: Vec<String> = doomed
+                    .iter()
+                    .map(|p| format!("{}/{}", namespace, p.metadata.name))
+                    .collect();
+                self.expectations.expect_deletions_of(&rc_key, &doomed_keys);
+                for (pod, pod_key) in doomed.iter().zip(&doomed_keys) {
+                    if let Err(e) = self.delete_pod(&pod.metadata.name, namespace).await {
+                        // The informer will not observe this deletion
+                        // (replica_set.go:683-689).
+                        self.expectations.deletion_observed_of(&rc_key, pod_key);
+                        if !matches!(e, rusternetes_common::Error::NotFound(_)) {
+                            return Err(e);
+                        }
+                    }
                 }
             }
         }
@@ -894,7 +920,10 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 
     async fn delete_pod(&self, name: &str, namespace: &str) -> rusternetes_common::Result<()> {
         let key = build_key("pods", Some(namespace), name);
-        self.storage.delete(&key).await?;
+        // Upstream `RealPodControl.DeletePod` is a graceful delete,
+        // `Pods(ns).Delete(ctx, podID, metav1.DeleteOptions{})`
+        // (pkg/controller/controller_utils.go:618).
+        self.storage.delete_gracefully(&key).await?;
 
         info!("Deleted pod {}/{}", namespace, name);
 
@@ -1027,6 +1056,27 @@ pub(crate) fn slow_start_batches_capped(
         batch = (2 * batch).min(remaining).min(max_batch_size);
     }
     batches
+}
+
+/// "ns/name" for a watch key of the form "/registry/pods/ns/name" or
+/// "pods/ns/name" (as returned by `extract_key`).
+fn pod_key_of(watch_key: &str) -> String {
+    let parts: Vec<&str> = watch_key.splitn(3, '/').collect();
+    format!(
+        "{}/{}",
+        parts.get(1).copied().unwrap_or(""),
+        parts.get(2).copied().unwrap_or("")
+    )
+}
+
+/// Whether a serialised pod has a deletionTimestamp.
+fn pod_is_terminating(serialised_pod: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(serialised_pod)
+        .ok()
+        .is_some_and(|v| {
+            v.pointer("/metadata/deletionTimestamp")
+                .is_some_and(|t| !t.is_null())
+        })
 }
 
 /// Names of the ReplicationControllers owning a serialised pod.
@@ -2542,6 +2592,93 @@ mod tests {
         assert!(
             !has_replica_failure,
             "a retried name collision is not a ReplicaFailure"
+        );
+    }
+
+    /// #2458: upstream `DeletePod` is a graceful delete
+    /// (`pkg/controller/controller_utils.go:618`, `DeleteOptions{}`): the pod
+    /// keeps living, stamped with a deletionTimestamp, for its grace period.
+    /// Terminating pods are not replicas, so the follow-up sync must not take
+    /// another pod down.
+    #[tokio::test]
+    async fn rc_scale_down_deletes_pods_gracefully() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "g".to_string());
+        let rc = make_rc("g", "default", 3, selector.clone(), None);
+        let rc_key = "/registry/replicationcontrollers/default/g";
+        storage.create(rc_key, &rc).await.unwrap();
+        controller.reconcile_all().await.unwrap();
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(pods.len(), 3);
+
+        let mut rc: ReplicationController = storage.get(rc_key).await.unwrap();
+        rc.spec.replicas = Some(1);
+        storage.update(rc_key, &rc).await.unwrap();
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(pods.len(), 3, "graceful delete keeps the pods in storage");
+        assert_eq!(
+            pods.iter()
+                .filter(|p| p.metadata.deletion_timestamp.is_some())
+                .count(),
+            2
+        );
+
+        // Terminating pods are not replicas: nothing further is deleted.
+        controller.reconcile_all().await.unwrap();
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(
+            pods.iter()
+                .filter(|p| p.metadata.deletion_timestamp.is_some())
+                .count(),
+            2
+        );
+    }
+
+    /// #2458: the deletion is observed on the MODIFIED event that sets the
+    /// deletionTimestamp (`replica_set.go:468-480`), once per pod
+    /// (`controller_utils.go:380-390`).
+    #[tokio::test]
+    async fn rc_observes_deletion_on_deletion_timestamp_once() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let queue = WorkQueue::new();
+        controller.expectations.expect_deletions_of(
+            "default/g",
+            &["default/p1".to_string(), "default/p2".to_string()],
+        );
+        let pod = serde_json::json!({
+            "metadata": {
+                "name": "p1",
+                "namespace": "default",
+                "deletionTimestamp": "2026-10-07T00:00:00Z",
+                "ownerReferences": [{"apiVersion": "v1", "kind": "ReplicationController",
+                    "name": "g", "uid": "u"}]
+            }
+        })
+        .to_string();
+        let key = "/registry/pods/default/p1".to_string();
+
+        controller
+            .enqueue_owner_rc(
+                &queue,
+                &rusternetes_storage::WatchEvent::Modified(key.clone(), pod.clone()),
+            )
+            .await;
+        assert_eq!(
+            controller.expectations.get_expectations("default/g"),
+            Some((0, 1)),
+            "the deletionTimestamp update is the observation"
+        );
+        controller
+            .enqueue_owner_rc(&queue, &rusternetes_storage::WatchEvent::Deleted(key, pod))
+            .await;
+        assert_eq!(
+            controller.expectations.get_expectations("default/g"),
+            Some((0, 1))
         );
     }
 }

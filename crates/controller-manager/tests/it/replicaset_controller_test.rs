@@ -194,9 +194,15 @@ async fn test_replicaset_scales_down() {
     // Run controller again
     controller.reconcile_all().await.unwrap();
 
-    // Verify 2 pods remain
+    // Verify 2 pods remain active. The excess pods are deleted gracefully
+    // (upstream `DeletePod`, controller_utils.go:618), so they linger with a
+    // deletionTimestamp until the kubelet removes them.
     let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
-    assert_eq!(pods.len(), 2, "Should scale down to 2 pods");
+    let active = pods
+        .iter()
+        .filter(|p| p.metadata.deletion_timestamp.is_none())
+        .count();
+    assert_eq!(active, 2, "Should scale down to 2 pods");
 }
 
 #[tokio::test]
