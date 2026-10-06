@@ -1,3 +1,4 @@
+use crate::controllers::worker_pool::spawn_workers;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusternetes_common::resources::{
@@ -9,6 +10,11 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use super::cert_authority::CertificateAuthority;
+
+/// Workers draining this controller's queue: upstream runs the signers and the
+/// approver with `Run(ctx, 5)` (cmd/kube-controller-manager/app/certificates.go:81,94,107,120,206).
+/// The csr-cleaner and root-ca-cert-publisher run at 1 (:251,:228) and are not this controller.
+const CONCURRENT_CSR_SYNCS: usize = 5;
 
 /// CertificateSigningRequestController manages certificate signing requests.
 ///
@@ -54,10 +60,14 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // Upstream launches 5 workers per signer/approver over one shared queue
+        // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);
+        // a key in flight is never handed to a second worker.
+        spawn_workers(CONCURRENT_CSR_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {
