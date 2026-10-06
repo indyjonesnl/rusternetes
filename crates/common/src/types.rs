@@ -11,13 +11,6 @@ where
     Ok(opt.unwrap_or_default())
 }
 
-/// Serde for `metav1.Time` fields (creationTimestamp, deletionTimestamp, ...).
-///
-/// Upstream `metav1.Time.MarshalJSON` formats as RFC3339 with **second**
-/// precision (`time.RFC3339`, no fractional seconds), e.g. `2026-05-31T08:00:43Z`.
-/// We emit the same so responses match k8s exactly (sub-second precision is a
-/// non-conformance and breaks proto Timestamp round-tripping). Deserialize is
-/// lenient and accepts timestamps with or without fractional seconds.
 pub mod sorted_opt_map {
     //! Serialize an `Option<HashMap<String, String>>` with keys sorted, as
     //! Go's `encoding/json` does for maps. A `HashMap` otherwise emits in
@@ -36,6 +29,13 @@ pub mod sorted_opt_map {
     }
 }
 
+/// Serde for `metav1.Time` fields (creationTimestamp, deletionTimestamp, ...).
+///
+/// Upstream `metav1.Time.MarshalJSON` formats as RFC3339 with **second**
+/// precision (`time.RFC3339`, no fractional seconds), e.g. `2026-05-31T08:00:43Z`.
+/// We emit the same so responses match k8s exactly (sub-second precision is a
+/// non-conformance and breaks proto Timestamp round-tripping). Deserialize is
+/// lenient and accepts timestamps with or without fractional seconds.
 pub mod k8s_time {
     use chrono::{DateTime, Utc};
     use serde::{self, Deserialize, Deserializer, Serializer};
