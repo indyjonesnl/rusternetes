@@ -303,6 +303,7 @@ mod volumeattachment_update_immutable_test;
 mod volumesnapshot_decode_when_absent_test;
 mod volumesnapshot_handler_test;
 mod volumesnapshot_store_test;
+mod vsc_source_volume_mode_test;
 mod watch_all_rolebindings_test;
 mod watch_delete_test;
 mod watch_delivery_exhaustive_test;

@@ -683,6 +683,7 @@ async fn test_restores_pvc_from_snapshot() {
             volume_snapshot_class_name: Some("hostpath-snapclass".to_string()),
             deletion_policy: DeletionPolicy::Delete,
             driver: "rusternetes.io/hostpath-snapshotter".to_string(),
+            source_volume_mode: None,
         },
         status: Some(VolumeSnapshotContentStatus {
             snapshot_handle: Some("snapshot-handle-12345".to_string()),

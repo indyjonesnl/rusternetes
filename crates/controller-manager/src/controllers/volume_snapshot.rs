@@ -519,6 +519,7 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
                 volume_snapshot_class_name: Some(vsc.metadata.name.clone()),
                 deletion_policy: vsc.deletion_policy.clone(),
                 driver: vsc.driver.clone(),
+                source_volume_mode: None,
             },
             status: Some(VolumeSnapshotContentStatus {
                 snapshot_handle: Some(snapshot_handle.clone()),
