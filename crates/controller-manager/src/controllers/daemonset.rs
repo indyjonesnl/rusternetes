@@ -4,6 +4,7 @@ use futures::StreamExt;
 use rusternetes_common::resources::node::Taint;
 use rusternetes_common::resources::pod::{SecretVolumeSource, Toleration, Volume, VolumeMount};
 use rusternetes_common::resources::policy::IntOrString;
+use rusternetes_common::resources::workloads::DEPRECATED_TEMPLATE_GENERATION;
 use rusternetes_common::resources::{
     ControllerRevision, DaemonSet, DaemonSetStatus, Node, Pod, PodStatus,
 };
@@ -13,6 +14,43 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, warn};
+
+/// `extensions.DaemonSetTemplateGenerationKey`
+/// (pkg/apis/extensions/types.go).
+const TEMPLATE_GENERATION_LABEL: &str = "pod-template-generation";
+/// `extensions.DefaultDaemonSetUniqueLabelKey` (pkg/apis/extensions/types.go).
+const UNIQUE_LABEL: &str = "controller-revision-hash";
+
+/// Port of `util.GetTemplateGeneration`
+/// (pkg/controller/daemon/util/daemonset_util.go:35-46): reads the deprecated
+/// annotation; absent or unparseable yields `None` (callers in
+/// daemon_controller.go:1176-1179 and update.go:271-274 treat a parse error
+/// as nil and rely on the hash).
+fn get_template_generation(ds: &DaemonSet) -> Option<i64> {
+    ds.metadata
+        .annotations
+        .as_ref()?
+        .get(DEPRECATED_TEMPLATE_GENERATION)?
+        .parse::<i64>()
+        .ok()
+}
+
+/// Port of `util.IsPodUpdated` (daemonset_util.go:165-171): a pod is updated
+/// when its template-generation label OR its controller-revision-hash label
+/// matches.
+fn is_pod_updated(pod: &Pod, hash: &str, ds_template_generation: Option<i64>) -> bool {
+    let labels = pod.metadata.labels.as_ref();
+    let template_matches = ds_template_generation.is_some_and(|g| {
+        labels
+            .and_then(|l| l.get(TEMPLATE_GENERATION_LABEL))
+            .is_some_and(|v| *v == g.to_string())
+    });
+    let hash_matches = !hash.is_empty()
+        && labels
+            .and_then(|l| l.get(UNIQUE_LABEL))
+            .is_some_and(|v| v == hash);
+    hash_matches || template_matches
+}
 
 /// Check whether a set of tolerations tolerates all NoSchedule and NoExecute taints on a node.
 fn pod_tolerates_node_taints(tolerations: &[Toleration], taints: &[Taint]) -> bool {
@@ -315,6 +353,8 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         //   {"spec":{"template":{...,"$patch":"replace"}}}
         let template_hash = Self::compute_template_hash(&daemonset.spec.template);
         let cr_name = format!("{}-{}", name, template_hash);
+        // A parse error is treated as nil (daemon_controller.go:1176-1179).
+        let template_generation = get_template_generation(daemonset);
 
         // Check if ControllerRevision already exists before creating
         let cr_key =
@@ -682,15 +722,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 let mut old_pod: Option<Pod> = None;
 
                 for pod in &node_pods {
-                    let pod_hash = pod
-                        .metadata
-                        .labels
-                        .as_ref()
-                        .and_then(|l| l.get("controller-revision-hash"))
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-
-                    if pod_hash == template_hash {
+                    if is_pod_updated(pod, &template_hash, template_generation) {
                         // New pod
                         if is_pod_available(pod) {
                             has_new_available = true;
@@ -840,14 +872,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         // Use final_pods_by_node (re-fetched after create/delete) for accurate count
         let updated_count = final_pods_by_node
             .values()
-            .filter(|pod| {
-                pod.metadata
-                    .labels
-                    .as_ref()
-                    .and_then(|l| l.get("controller-revision-hash"))
-                    .map(|h| h == &template_hash)
-                    .unwrap_or(false)
-            })
+            .filter(|pod| is_pod_updated(pod, &template_hash, template_generation))
             .count() as i32;
 
         // Garbage-collect old ControllerRevisions beyond revisionHistoryLimit.
@@ -1117,6 +1142,14 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         // Add controller-revision-hash label (computed from template)
         let template_hash = { Self::compute_template_hash(&daemonset.spec.template) };
         labels.insert("controller-revision-hash".to_string(), template_hash);
+        // CreatePodTemplate (daemonset_util.go:104-120): label the pod with the
+        // template generation when the DaemonSet carries one.
+        if let Some(generation) = get_template_generation(daemonset) {
+            labels.insert(
+                TEMPLATE_GENERATION_LABEL.to_string(),
+                generation.to_string(),
+            );
+        }
 
         let mut spec = template.spec.clone();
 
@@ -2279,5 +2312,153 @@ mod tests {
             resolve_max_unavailable(Some(&IntOrString::String("25%".to_string())), 3),
             1
         );
+    }
+
+    // --- Ports of pkg/controller/daemon/util/daemonset_util_test.go ---
+
+    fn pod_with_labels(labels: &[(&str, &str)]) -> Pod {
+        let mut pod = Pod::new("p", rusternetes_common::resources::PodSpec::default());
+        pod.metadata.labels = Some(
+            labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        pod
+    }
+
+    /// TestIsPodUpdated (daemonset_util_test.go:53-143).
+    #[test]
+    fn test_is_pod_updated() {
+        let gen = Some(12345);
+        let bad = Some(12350);
+        let hash = "55555";
+        let both = [(TEMPLATE_GENERATION_LABEL, "12345"), (UNIQUE_LABEL, hash)];
+        let no_hash = [(TEMPLATE_GENERATION_LABEL, "12345")];
+        let longer = format!("{}123", hash);
+        let cases: Vec<(&str, Option<i64>, Pod, &str, bool)> = vec![
+            ("both match", gen, pod_with_labels(&both), hash, true),
+            (
+                "gen matches, hash doesn't",
+                gen,
+                pod_with_labels(&both),
+                &longer,
+                true,
+            ),
+            (
+                "gen matches, no hash label, has hash",
+                gen,
+                pod_with_labels(&no_hash),
+                hash,
+                true,
+            ),
+            (
+                "gen matches, no hash label, no hash",
+                gen,
+                pod_with_labels(&no_hash),
+                "",
+                true,
+            ),
+            (
+                "gen matches, has hash label, no hash",
+                gen,
+                pod_with_labels(&both),
+                "",
+                true,
+            ),
+            (
+                "gen doesn't match, hash does",
+                bad,
+                pod_with_labels(&both),
+                hash,
+                true,
+            ),
+            ("neither match", bad, pod_with_labels(&both), &longer, false),
+            (
+                "empty labels, no hash",
+                gen,
+                pod_with_labels(&[]),
+                "",
+                false,
+            ),
+            ("empty labels", gen, pod_with_labels(&[]), hash, false),
+            (
+                "nil generation, hash matches",
+                None,
+                pod_with_labels(&both),
+                hash,
+                true,
+            ),
+            (
+                "nil generation, hash doesn't",
+                None,
+                pod_with_labels(&both),
+                &longer,
+                false,
+            ),
+        ];
+        for (name, g, pod, h, want) in cases {
+            assert_eq!(is_pod_updated(&pod, h, g), want, "{}", name);
+        }
+    }
+
+    /// GetTemplateGeneration (daemonset_util.go:35-46).
+    #[test]
+    fn test_get_template_generation() {
+        let mut ds = make_test_daemonset("g", "default");
+        assert_eq!(get_template_generation(&ds), None);
+        let mut ann = HashMap::new();
+        ann.insert(DEPRECATED_TEMPLATE_GENERATION.to_string(), "7".to_string());
+        ds.metadata.annotations = Some(ann.clone());
+        assert_eq!(get_template_generation(&ds), Some(7));
+        ann.insert(DEPRECATED_TEMPLATE_GENERATION.to_string(), "x".to_string());
+        ds.metadata.annotations = Some(ann);
+        assert_eq!(get_template_generation(&ds), None, "parse error => nil");
+    }
+
+    /// TestCreatePodTemplate (daemonset_util_test.go:145-169), via the
+    /// labels create_pod applies.
+    #[tokio::test]
+    async fn test_create_pod_sets_template_generation_label() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DaemonSetController::new(storage.clone());
+        let node = make_test_node("n1");
+        storage.create("/registry/nodes/n1", &node).await.unwrap();
+        let mut ds = make_test_daemonset("tg", "default");
+        let mut ann = HashMap::new();
+        ann.insert(DEPRECATED_TEMPLATE_GENERATION.to_string(), "3".to_string());
+        ds.metadata.annotations = Some(ann);
+        storage
+            .create("/registry/daemonsets/default/tg", &ds)
+            .await
+            .unwrap();
+        controller.reconcile(&mut ds).await.unwrap();
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(pods.len(), 1);
+        let labels = pods[0].metadata.labels.as_ref().unwrap();
+        assert_eq!(
+            labels.get(TEMPLATE_GENERATION_LABEL).map(String::as_str),
+            Some("3")
+        );
+        assert!(labels.contains_key(UNIQUE_LABEL));
+
+        // No annotation => no label (generation == nil in CreatePodTemplate).
+        let mut ds2 = make_test_daemonset("tg2", "default");
+        storage
+            .create("/registry/daemonsets/default/tg2", &ds2)
+            .await
+            .unwrap();
+        controller.reconcile(&mut ds2).await.unwrap();
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        let p2 = pods
+            .iter()
+            .find(|p| p.metadata.name.starts_with("tg2-"))
+            .unwrap();
+        assert!(!p2
+            .metadata
+            .labels
+            .as_ref()
+            .unwrap()
+            .contains_key(TEMPLATE_GENERATION_LABEL));
     }
 }
