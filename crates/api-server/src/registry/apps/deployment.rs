@@ -5,12 +5,13 @@
 use std::sync::Arc;
 
 use rusternetes_common::equality::semantic_equal;
+use rusternetes_common::pod_warnings::get_warnings_for_pod_template;
 use rusternetes_common::resources::{Deployment, DeploymentStatus, Scale, ScaleSpec, ScaleStatus};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_common::validation::apps::{
     validate_deployment, validate_deployment_status_update, validate_deployment_update,
 };
-use rusternetes_common::validation::field::ErrorList;
+use rusternetes_common::validation::field::{ErrorList, Path};
 use rusternetes_common::validation::metav1::is_dns1123_label;
 use rusternetes_storage::StorageBackend;
 
@@ -49,17 +50,23 @@ impl RestCreateStrategy<Deployment> for Strategy {
         validate_deployment(obj)
     }
 
-    /// strategy.go:88-96. `GetWarningsForPodTemplate` is not ported (#1990
-    /// follow-up); the name warning is.
+    /// strategy.go:88-96: the name warning, then
+    /// `GetWarningsForPodTemplate(spec.template)`.
     fn warnings_on_create(&self, _ctx: &RequestContext, obj: &Deployment) -> Vec<String> {
         let msgs = is_dns1123_label(&obj.metadata.name);
-        if msgs.is_empty() {
-            return Vec::new();
+        let mut warnings = Vec::new();
+        if !msgs.is_empty() {
+            warnings.push(format!(
+                "metadata.name: this is used in Pod names and hostnames, which can result in surprising behavior; a DNS label is recommended: [{}]",
+                msgs.join(" ")
+            ));
         }
-        vec![format!(
-            "metadata.name: this is used in Pod names and hostnames, which can result in surprising behavior; a DNS label is recommended: [{}]",
-            msgs.join(" ")
-        )]
+        warnings.extend(get_warnings_for_pod_template(
+            &Path::new("spec").child("template"),
+            &obj.spec.template,
+            None,
+        ));
+        warnings
     }
 }
 
@@ -87,6 +94,24 @@ impl RestUpdateStrategy<Deployment> for Strategy {
         old: &Deployment,
     ) -> ErrorList {
         validate_deployment_update(obj, old)
+    }
+
+    /// strategy.go:133-140: only a generation change (a spec or annotation
+    /// change) re-evaluates the pod template.
+    fn warnings_on_update(
+        &self,
+        _ctx: &RequestContext,
+        obj: &Deployment,
+        old: &Deployment,
+    ) -> Vec<String> {
+        if obj.metadata.generation == old.metadata.generation {
+            return Vec::new();
+        }
+        get_warnings_for_pod_template(
+            &Path::new("spec").child("template"),
+            &obj.spec.template,
+            Some(&old.spec.template),
+        )
     }
 
     fn allow_unconditional_update(&self) -> bool {
@@ -308,6 +333,69 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].starts_with("metadata.name: this is used in Pod names and hostnames"),
+            "{warnings:?}"
+        );
+    }
+
+    fn with_template_node_selector(d: &mut Deployment) {
+        d.spec.template.spec.node_selector = Some(HashMap::from([(
+            "beta.kubernetes.io/os".to_string(),
+            "linux".to_string(),
+        )]));
+    }
+
+    /// strategy.go:93: `GetWarningsForPodTemplate` at `spec.template`.
+    #[test]
+    fn create_warns_about_the_pod_template_under_spec_template() {
+        let mut d = deployment();
+        with_template_node_selector(&mut d);
+        let warnings = Strategy.warnings_on_create(&ctx(), &d);
+        assert_eq!(
+            warnings,
+            vec![
+                r#"spec.template.spec.nodeSelector[beta.kubernetes.io/os]: deprecated since v1.14; use "kubernetes.io/os" instead"#
+            ]
+        );
+    }
+
+    /// pkg/api/pod/warnings.go:243-255: a template (not a Pod) warns about
+    /// the deprecated container AppArmor annotation.
+    #[test]
+    fn create_warns_about_the_template_apparmor_annotation() {
+        let mut d = deployment();
+        d.spec
+            .template
+            .metadata
+            .as_mut()
+            .unwrap()
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                "container.apparmor.security.beta.kubernetes.io/c".to_string(),
+                "runtime/default".to_string(),
+            );
+        let warnings = Strategy.warnings_on_create(&ctx(), &d);
+        assert_eq!(
+            warnings,
+            vec![
+                r#"spec.template.metadata.annotations[container.apparmor.security.beta.kubernetes.io/c]: deprecated since v1.30; use the "appArmorProfile" field instead"#
+            ]
+        );
+    }
+
+    /// strategy.go:133-140: only a generation change (spec or annotations)
+    /// re-evaluates the template.
+    #[test]
+    fn update_warns_only_when_the_generation_changed() {
+        let old = deployment();
+        let mut new = old.clone();
+        with_template_node_selector(&mut new);
+        assert!(Strategy.warnings_on_update(&ctx(), &new, &old).is_empty());
+        new.metadata.generation = Some(old.metadata.generation.unwrap() + 1);
+        let warnings = Strategy.warnings_on_update(&ctx(), &new, &old);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("spec.template.spec.nodeSelector["),
             "{warnings:?}"
         );
     }
