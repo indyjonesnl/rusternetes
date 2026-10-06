@@ -48,13 +48,14 @@ enum IpFamily {
     V6,
 }
 
+/// `netutils.ParseCIDRSloppy` (k8s.io/utils/net), which both
+/// `IsValidCIDRForLegacyField` (validation.go:7200) and
+/// `IsDualStackCIDRStrings` -> `ParseCIDRs` (validation.go:7205) use, so a
+/// leading-zero IPv4 CIDR parses; `nodeWarnings` warns about it instead.
 fn parse_cidr(cidr: &str) -> Option<IpFamily> {
-    let (ip, prefix) = cidr.split_once('/')?;
-    let prefix: u8 = prefix.parse().ok()?;
-    match ip.parse::<IpAddr>().ok()? {
-        IpAddr::V4(_) if prefix <= 32 => Some(IpFamily::V4),
-        IpAddr::V6(_) if prefix <= 128 => Some(IpFamily::V6),
-        _ => None,
+    match crate::validation::service::parse_cidr_sloppy(cidr)?.0 {
+        IpAddr::V4(_) => Some(IpFamily::V4),
+        IpAddr::V6(_) => Some(IpFamily::V6),
     }
 }
 
@@ -752,5 +753,39 @@ mod avoid_pods_tests {
     fn undecodable_annotation_is_invalid_at_avoid_pods() {
         let f = fields("not json");
         assert_eq!(f, vec!["metadata.annotations.AvoidPods".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod pod_cidr_tests {
+    use super::*;
+
+    fn node_with_cidrs(cidrs: &[&str]) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "abc-123"},
+            "spec": {"podCIDRs": cidrs},
+        }))
+        .expect("node decodes")
+    }
+
+    // validation.go:7200 validates each podCIDR with IsValidCIDRForLegacyField
+    // (ParseCIDRSloppy), so a leading-zero IPv4 CIDR is accepted (and only
+    // warned about by nodeWarnings -> GetWarningsForCIDR).
+    #[test]
+    fn leading_zero_ipv4_cidr_is_accepted() {
+        assert!(validate_node(&node_with_cidrs(&["010.009.008.0/24"])).is_empty());
+    }
+
+    // validation.go:7205: IsDualStackCIDRStrings -> ParseCIDRs -> ParseCIDRSloppy.
+    #[test]
+    fn leading_zero_ipv4_cidr_dual_stack_is_accepted() {
+        assert!(validate_node(&node_with_cidrs(&["010.009.008.0/24", "2001:db8::/64"])).is_empty());
+    }
+
+    #[test]
+    fn garbage_cidr_is_still_invalid() {
+        let errs = validate_node(&node_with_cidrs(&["10.9.8.0/33"]));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].field, "spec.podCIDRs[0]");
     }
 }

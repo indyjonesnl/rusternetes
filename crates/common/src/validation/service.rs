@@ -80,7 +80,7 @@ pub fn parse_ip_sloppy(value: &str) -> Option<IpAddr> {
 
 /// `netutils.ParseCIDRSloppy`: `ip/prefix` with a sloppy IP and a decimal
 /// prefix no longer than the address.
-fn parse_cidr_sloppy(value: &str) -> Option<(IpAddr, u8)> {
+pub(crate) fn parse_cidr_sloppy(value: &str) -> Option<(IpAddr, u8)> {
     let (ip, prefix) = value.split_once('/')?;
     let ip = parse_ip_sloppy(ip)?;
     if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
