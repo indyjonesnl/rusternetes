@@ -162,6 +162,24 @@ async fn run_case(case: &Case) -> Vec<String> {
     let (_, mut current) = send(&router, Method::GET, &item, None).await;
     if current.is_object() {
         current["metadata"]["labels"] = json!({"watch-test": "updated"});
+        // StorageObjectInUseProtection admission adds the pv-/pvc-protection
+        // finalizer on create; upstream's pvprotection/pvcprotection
+        // controllers (pkg/controller/volume/...) remove it once the object is
+        // unused. No controller runs in this harness, so emulate that release
+        // here, otherwise the DELETE only marks the object and no DELETED
+        // event is delivered.
+        if let Some(f) = current["metadata"]["finalizers"].as_array().cloned() {
+            let kept: Vec<_> = f
+                .into_iter()
+                .filter(|x| {
+                    !matches!(
+                        x.as_str(),
+                        Some("kubernetes.io/pv-protection" | "kubernetes.io/pvc-protection")
+                    )
+                })
+                .collect();
+            current["metadata"]["finalizers"] = json!(kept);
+        }
         let (us, ub) = send(&router, Method::PUT, &item, Some(&current)).await;
         if !us.is_success() {
             problems.push(format!(
