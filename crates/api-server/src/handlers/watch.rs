@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{interval, timeout};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Kubernetes watch event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +322,10 @@ async fn open_watch_stream(
         .await
         .unwrap_or(false)
     {
+        warn!(
+            "watch {}: resourceVersion {} is compacted (head {}) — answering 410 Expired",
+            prefix, since_rev, current_rev
+        );
         return build_watch_error_response(resource_expired_status(since_rev, current_rev))
             .map(Err);
     }
@@ -351,6 +355,12 @@ async fn open_watch_stream(
             )))
         }
         Err(floor) => {
+            // A client-go RetryWatcher stops for good after a 410 and the
+            // caller sees only "watch closed" (#2383): record why we sent it.
+            warn!(
+                "watch {}: resourceVersion {} is below the replay floor {} (head {}) — answering 410 Expired",
+                prefix, since_rev, floor, current_rev
+            );
             build_watch_error_response(resource_expired_status(since_rev, floor)).map(Err)
         }
     }
@@ -872,6 +882,7 @@ where
                                 // Upstream ends the watch; the client relists
                                 // with a fresh resourceVersion. Send 410 so
                                 // reflectors relist immediately.
+                                warn!("watch stream ended for a subscriber — sending 410 so the client relists");
                                 let _ = tx.send(Ok(watch_lagged_error_line(
                                     "watch stream ended; please relist",
                                 ))).await;
