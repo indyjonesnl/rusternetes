@@ -8,11 +8,9 @@
 //! process-wide store, so the CSI volume plugin needs no extra plumbing to see
 //! drivers registered elsewhere in the kubelet.
 //!
-//! NOTE: nothing in this crate populates the store yet — the kubelet
-//! plugin-registration watcher (`pkg/kubelet/pluginmanager`, the
-//! `node-driver-registrar` handshake) is not ported. Until it is, a CSI-backed
-//! volume fails loudly with "driver name X not found in the list of registered
-//! CSI drivers" rather than mounting nothing.
+//! The store is populated by `pluginmanager::csi_handler::RegistrationHandler`
+//! when a `node-driver-registrar` socket in `<root>/plugins_registry` completes
+//! the plugin-registration handshake.
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
