@@ -12,7 +12,9 @@
 #![allow(dead_code)]
 
 use crate::endpoints::handlers::{self as endpoints, RequestScope};
-use crate::registry::apiextensions::customresource::{CustomResourceRest, StrictMode};
+use crate::registry::apiextensions::customresource::{
+    new_scale_rest, CustomResourceRest, StrictMode,
+};
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     body::Bytes,
@@ -21,10 +23,9 @@ use axum::{
     Extension, Json,
 };
 use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
-    resources::{CustomResource, CustomResourceDefinition},
+    resources::{CustomResource, CustomResourceDefinition, Scale},
     schema_validation::SchemaValidator,
     List, Result,
 };
@@ -974,7 +975,41 @@ pub async fn update_custom_resource_status(
     .await
 }
 
-/// Get the scale subresource of a custom resource
+/// The `/scale` `RequestScope`: `autoscaling/v1` `Scale` served as
+/// `<plural>/scale` over `ScaleREST` (customresource_handler.go:1005-1040,
+/// registry/customresource/etcd.go:129-256). `NotFound` when the version
+/// does not enable `scale` (customresource_handler.go:349).
+fn scale_scope(
+    state: &ApiServerState,
+    crd: &Arc<CustomResourceDefinition>,
+    version: &str,
+) -> Result<RequestScope<Scale>> {
+    let store = new_scale_rest(state.storage.clone(), crd.clone(), version).ok_or_else(|| {
+        rusternetes_common::Error::NotFound(
+            "the server could not find the requested resource".to_string(),
+        )
+    })?;
+    Ok(RequestScope {
+        kind: GroupVersionKind {
+            group: "autoscaling".to_string(),
+            version: "v1".to_string(),
+            kind: "Scale".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: crd.spec.group.clone(),
+            version: version.to_string(),
+            resource: crd.spec.names.plural.clone(),
+        },
+        subresource: Some("scale"),
+        store: Box::new(store),
+        apply: Some(crate::ssa::apply_legacy::<Scale>),
+        convert_to_internal: None,
+        patch_conversion: None,
+    })
+}
+
+/// Get the scale subresource of a custom resource: `ScaleREST.Get`
+/// (etcd.go:157-177).
 pub async fn get_custom_resource_scale(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -985,115 +1020,21 @@ pub async fn get_custom_resource_scale(
         Option<String>,
         String,
     )>,
-) -> Result<Json<Scale>> {
-    info!(
-        "Getting custom resource scale {}/{}/{}: {}",
-        group, version, plural, name
-    );
-
-    // Find the CRD for this resource type
-    let crd_name = format!("{}.{}", plural, group);
-    let crd = get_crd_for_resource(&state, &crd_name).await?;
-
-    // Check if scale subresource is enabled and get the configuration
-    let version_spec = crd
-        .spec
-        .versions
-        .iter()
-        .find(|v| v.name == version)
-        .ok_or_else(|| {
-            rusternetes_common::Error::InvalidResource(format!(
-                "Version {} not found in CRD",
-                version
-            ))
-        })?;
-
-    let scale_config = version_spec
-        .subresources
-        .as_ref()
-        .and_then(|s| s.scale.as_ref())
-        .ok_or_else(|| {
-            rusternetes_common::Error::InvalidResource(
-                "Scale subresource not enabled for this CRD".to_string(),
-            )
-        })?;
-
-    // Check authorization
-    let attrs = if let Some(ref ns) = namespace {
-        RequestAttributes::new(auth_ctx.user.clone(), "get", &plural)
-            .with_api_group(&group)
-            .with_namespace(ns)
-            .with_name(&name)
-            .with_subresource("scale")
-    } else {
-        RequestAttributes::new(auth_ctx.user, "get", &plural)
-            .with_api_group(&group)
-            .with_name(&name)
-            .with_subresource("scale")
-    };
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Get the existing resource
-    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
-    let key = if let Some(ref ns) = namespace {
-        build_key(&resource_type, Some(ns), &name)
-    } else {
-        build_key(&resource_type, None, &name)
-    };
-
-    let cr: CustomResource = state.storage.get(&key).await?;
-
-    // Per apiextensions.k8s.io/v1 CustomResourceSubresourceScale:
-    //   specReplicasPath   MUST be a JSONPath under .spec
-    //   statusReplicasPath MUST be a JSONPath under .status
-    //   labelSelectorPath  MUST be a JSONPath under .status
-    // Strip the root segment so we can resolve against the already-narrowed
-    // cr.spec / cr.status objects.
-    let spec_replicas = extract_json_path(
-        &cr.spec,
-        strip_root_prefix(&scale_config.spec_replicas_path, "spec"),
+) -> Result<Response> {
+    info!("Getting custom resource scale {group}/{version}/{plural}: {name}");
+    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    endpoints::get_resource(
+        &state,
+        &scale_scope(&state, &crd, &version)?,
+        &auth_ctx.user,
+        namespace.as_deref(),
+        &name,
     )
-    .and_then(|v| v.as_i64())
-    .unwrap_or(0) as i32;
-
-    let status_replicas = extract_json_path(
-        &cr.status,
-        strip_root_prefix(&scale_config.status_replicas_path, "status"),
-    )
-    .and_then(|v| v.as_i64())
-    .unwrap_or(0) as i32;
-
-    let label_selector = if let Some(ref selector_path) = scale_config.label_selector_path {
-        extract_json_path(&cr.status, strip_root_prefix(selector_path, "status"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    } else {
-        None
-    };
-
-    let scale = Scale {
-        api_version: "autoscaling/v1".to_string(),
-        kind: "Scale".to_string(),
-        metadata: cr.metadata.clone(),
-        spec: ScaleSpec {
-            replicas: spec_replicas,
-        },
-        status: Some(ScaleStatus {
-            replicas: status_replicas,
-            selector: label_selector,
-        }),
-    };
-
-    Ok(Json(scale))
+    .await
 }
 
-/// Update the scale subresource of a custom resource
+/// Update the scale subresource of a custom resource: `ScaleREST.Update`
+/// (etcd.go:179-216).
 pub async fn update_custom_resource_scale(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -1104,193 +1045,51 @@ pub async fn update_custom_resource_scale(
         Option<String>,
         String,
     )>,
-    DumpingJson(scale): DumpingJson<Scale>,
-) -> Result<Json<Scale>> {
-    info!(
-        "Updating custom resource scale {}/{}/{}: {}",
-        group, version, plural, name
-    );
-
-    // Find the CRD for this resource type
-    let crd_name = format!("{}.{}", plural, group);
-    let crd = get_crd_for_resource(&state, &crd_name).await?;
-
-    // Check if scale subresource is enabled and get the configuration
-    let version_spec = crd
-        .spec
-        .versions
-        .iter()
-        .find(|v| v.name == version)
-        .ok_or_else(|| {
-            rusternetes_common::Error::InvalidResource(format!(
-                "Version {} not found in CRD",
-                version
-            ))
-        })?;
-
-    let scale_config = version_spec
-        .subresources
-        .as_ref()
-        .and_then(|s| s.scale.as_ref())
-        .ok_or_else(|| {
-            rusternetes_common::Error::InvalidResource(
-                "Scale subresource not enabled for this CRD".to_string(),
-            )
-        })?;
-
-    // Check authorization
-    let attrs = if let Some(ref ns) = namespace {
-        RequestAttributes::new(auth_ctx.user.clone(), "update", &plural)
-            .with_api_group(&group)
-            .with_namespace(ns)
-            .with_name(&name)
-            .with_subresource("scale")
-    } else {
-        RequestAttributes::new(auth_ctx.user.clone(), "update", &plural)
-            .with_api_group(&group)
-            .with_name(&name)
-            .with_subresource("scale")
-    };
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
-    }
-
-    // Get the existing resource
-    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
-    let key = if let Some(ref ns) = namespace {
-        build_key(&resource_type, Some(ns), &name)
-    } else {
-        build_key(&resource_type, None, &name)
-    };
-
-    // Upstream serves a subresource from the same `genericregistry.Store` as
-    // its parent, with only the strategy swapped, so `Store.Update`'s
-    // create-on-update gate applies to a scale write exactly as it does to a
-    // spec write (`registry/generic/registry/store.go:646-650`). Custom
-    // resources never opt in -- `apiextensions-apiserver/pkg/registry/
-    // customresource/strategy.go:262-266` returns false unconditionally --
-    // so a write to an absent object is always `NewNotFound(qualifiedResource,
-    // name)` (#1932). The read below is that gate: `AllowCreateOnUpdate()` is
-    // false, so there is no create fallback.
-    let mut cr: CustomResource = state.storage.get(&key).await.map_err(|e| match e {
-        rusternetes_common::Error::NotFound(_) => {
-            rusternetes_common::Error::NotFound(format!("{plural} \"{name}\" not found"))
-        }
-        other => other,
-    })?;
-
-    // Update the replica count in the spec using JSONPath.
-    // specReplicasPath is rooted at .spec (see GET path above) — strip the
-    // root segment before writing into the narrowed cr.spec object.
-    if let Some(ref mut spec) = cr.spec {
-        set_json_path(
-            spec,
-            strip_root_prefix(&scale_config.spec_replicas_path, "spec"),
-            scale.spec.replicas,
-        );
-    }
-
-    // Save the updated resource
-    let _updated = state.storage.update(&key, &cr).await?;
-
-    // Return the updated scale representation
-    get_custom_resource_scale(
-        State(state),
-        Extension(auth_ctx),
-        Path((group, version, plural, namespace, name)),
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response> {
+    info!("Updating custom resource scale {group}/{version}/{plural}: {name}");
+    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    endpoints::update_resource(
+        &state,
+        &scale_scope(&state, &crd, &version)?,
+        &auth_ctx.user,
+        namespace.as_deref(),
+        &name,
+        &params,
+        &body,
     )
     .await
 }
 
-/// Strip the CRD scale subresource root segment (`spec` or `status`) from a
-/// JSONPath so it can be resolved against the already-narrowed `cr.spec` /
-/// `cr.status` value. Handles both `.spec.replicas` and `spec.replicas`
-/// input forms. Returns the path **unchanged** if the prefix isn't present
-/// or doesn't form a full path segment, so a caller passing the wrong root
-/// surfaces the mismatch instead of silently rewriting the path.
-fn strip_root_prefix<'a>(path: &'a str, root: &str) -> &'a str {
-    let trimmed = path.strip_prefix('.').unwrap_or(path);
-    match trimmed.strip_prefix(root) {
-        Some(rest) if rest.starts_with('.') => &rest[1..],
-        Some("") => "",
-        _ => path,
-    }
-}
-
-/// Helper to extract a value from a JSON object using a simple JSONPath
-fn extract_json_path<'a>(
-    json: &'a Option<serde_json::Value>,
-    path: &str,
-) -> Option<&'a serde_json::Value> {
-    let json = json.as_ref()?;
-    let parts: Vec<&str> = path.trim_start_matches('.').split('.').collect();
-
-    let mut current = json;
-    for part in parts {
-        current = current.get(part)?;
-    }
-
-    Some(current)
-}
-
-/// Helper to set a value in a JSON object using a simple JSONPath
-fn set_json_path(json: &mut serde_json::Value, path: &str, value: i32) {
-    let parts: Vec<&str> = path.trim_start_matches('.').split('.').collect();
-
-    if parts.is_empty() {
-        return;
-    }
-
-    // Ensure we're working with an object
-    if !json.is_object() {
-        *json = serde_json::json!({});
-    }
-
-    let mut current = json;
-    for (i, part) in parts.iter().enumerate() {
-        if i == parts.len() - 1 {
-            // Last part - set the value
-            if let Some(obj) = current.as_object_mut() {
-                obj.insert(part.to_string(), serde_json::Value::Number(value.into()));
-            }
-        } else {
-            // Intermediate part - navigate or create
-            let obj = current.as_object_mut().unwrap();
-            current = obj
-                .entry(part.to_string())
-                .or_insert_with(|| serde_json::json!({}));
-        }
-    }
-}
-
-/// Scale represents the scale subresource of a custom resource
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Scale {
-    pub api_version: String,
-    pub kind: String,
-    pub metadata: rusternetes_common::types::ObjectMeta,
-    pub spec: ScaleSpec,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<ScaleStatus>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScaleSpec {
-    pub replicas: i32,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScaleStatus {
-    pub replicas: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selector: Option<String>,
+/// Patch the scale subresource of a custom resource: a patch of the Scale
+/// into `ScaleREST.Update`.
+pub async fn patch_custom_resource_scale(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((group, version, plural, namespace, name)): Path<(
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+    )>,
+    req: axum::extract::Request,
+) -> Result<Response> {
+    info!("Patching custom resource scale {group}/{version}/{plural}: {name}");
+    let (params, content_type, body) = patch_request(req).await?;
+    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    endpoints::patch_resource(
+        &state,
+        &scale_scope(&state, &crd, &version)?,
+        &auth_ctx.user,
+        namespace.as_deref(),
+        &name,
+        &params,
+        &content_type,
+        &body,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1598,55 +1397,5 @@ mod tests {
             "Strict validation should pass for valid CR: {:?}",
             result
         );
-    }
-
-    /// Regression: `get_custom_resource_scale` resolved `.spec.replicas`
-    /// against the already-narrowed `cr.spec` object, ending up at the
-    /// non-existent `spec.spec.replicas` path → replicas always 0.
-    #[test]
-    fn strip_root_prefix_resolves_scale_subresource_paths() {
-        // K8s-conventional CRD paths
-        assert_eq!(strip_root_prefix(".spec.replicas", "spec"), "replicas");
-        assert_eq!(strip_root_prefix(".status.replicas", "status"), "replicas");
-        assert_eq!(strip_root_prefix(".status.selector", "status"), "selector");
-
-        // Nested paths under .spec / .status
-        assert_eq!(
-            strip_root_prefix(".spec.scaling.replicas", "spec"),
-            "scaling.replicas"
-        );
-
-        // Tolerate missing leading dot
-        assert_eq!(strip_root_prefix("spec.replicas", "spec"), "replicas");
-
-        // Tolerate already-stripped path (no-op)
-        assert_eq!(strip_root_prefix("replicas", "spec"), "replicas");
-
-        // Wrong root prefix is left untouched (caller mismatch — surfaces as
-        // empty lookup, not silent rewrite)
-        assert_eq!(
-            strip_root_prefix(".status.replicas", "spec"),
-            ".status.replicas"
-        );
-    }
-
-    /// End-to-end: a `.spec.replicas`-pathed scale subresource read through
-    /// `extract_json_path` after `strip_root_prefix` returns the actual
-    /// replicas count, not the pre-fix `0` it produced before.
-    #[test]
-    fn extract_scale_replicas_after_strip_returns_expected_value() {
-        let spec = Some(serde_json::json!({ "replicas": 7 }));
-        let path = strip_root_prefix(".spec.replicas", "spec");
-        let got = extract_json_path(&spec, path).and_then(|v| v.as_i64());
-        assert_eq!(got, Some(7));
-    }
-
-    /// And the symmetric write path: setting `.spec.replicas` after strip
-    /// stamps `replicas` on the spec root, not `spec.replicas` underneath it.
-    #[test]
-    fn set_scale_replicas_after_strip_writes_at_spec_root() {
-        let mut spec = serde_json::json!({});
-        set_json_path(&mut spec, strip_root_prefix(".spec.replicas", "spec"), 5);
-        assert_eq!(spec, serde_json::json!({ "replicas": 5 }));
     }
 }

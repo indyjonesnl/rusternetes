@@ -7,7 +7,6 @@ use axum::{
     routing::{any, get, post, put},
     Extension, Router,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::resources::CustomResourceDefinition;
 use rusternetes_storage::{build_key, Storage};
 use std::path::Path;
@@ -736,7 +735,7 @@ async fn custom_resource_fallback(
             )
             .await
             {
-                Ok(json) => json.into_response(),
+                Ok(resp) => resp,
                 Err(e) => {
                     warn!("Error getting custom resource scale: {}", e);
                     e.into_response()
@@ -747,8 +746,14 @@ async fn custom_resource_fallback(
             let body = axum::body::to_bytes(req.into_body(), usize::MAX)
                 .await
                 .map_err(|_| StatusCode::BAD_REQUEST)?;
-            let scale: handlers::custom_resource::Scale =
-                serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+            let query_params: std::collections::HashMap<String, String> = uri
+                .query()
+                .map(|q| {
+                    url::form_urlencoded::parse(q.as_bytes())
+                        .into_owned()
+                        .collect()
+                })
+                .unwrap_or_default();
 
             match handlers::custom_resource::update_custom_resource_scale(
                 State(state.clone()),
@@ -760,13 +765,39 @@ async fn custom_resource_fallback(
                     namespace.map(|s| s.to_string()),
                     name.to_string(),
                 )),
-                DumpingJson(scale),
+                axum::extract::Query(query_params),
+                body,
             )
             .await
             {
-                Ok(json) => json.into_response(),
+                Ok(resp) => resp,
                 Err(e) => {
                     warn!("Error updating custom resource scale: {}", e);
+                    e.into_response()
+                }
+            }
+        }
+        (Method::PATCH, Some(name), Some("scale")) => {
+            let (parts, body) = req.into_parts();
+            let reconstructed_req = Request::from_parts(parts, body);
+
+            match handlers::custom_resource::patch_custom_resource_scale(
+                State(state.clone()),
+                Extension(auth_ctx.clone()),
+                axum::extract::Path((
+                    group.to_string(),
+                    version.to_string(),
+                    plural.to_string(),
+                    namespace.map(|s| s.to_string()),
+                    name.to_string(),
+                )),
+                reconstructed_req,
+            )
+            .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    warn!("Error patching custom resource scale: {}", e);
                     e.into_response()
                 }
             }
