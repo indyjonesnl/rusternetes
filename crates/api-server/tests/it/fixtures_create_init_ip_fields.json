@@ -1,0 +1,8094 @@
+[
+ {
+  "name": "singlestack:v4",
+  "clusterFamilies": [
+   "IPv4"
+  ],
+  "cases": [
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:unset_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   }
+  ]
+ },
+ {
+  "name": "singlestack:v6",
+  "clusterFamilies": [
+   "IPv6"
+  ],
+  "cases": [
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:unset_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   }
+  ]
+ },
+ {
+  "name": "dualstack:v4v6",
+  "clusterFamilies": [
+   "IPv4",
+   "IPv6"
+  ],
+  "cases": [
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:unset_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   }
+  ]
+ },
+ {
+  "name": "dualstack:v6v4",
+  "clusterFamilies": [
+   "IPv6",
+   "IPv4"
+  ],
+  "cases": [
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:unset_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v4v6_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "10.0.0.1",
+     "2000::1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:unset_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:SingleStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:PreferDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:unset",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v4v6",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "ClusterIPs:v6v4_Policy:RequireDualStack_Families:v6v4",
+    "headless": false,
+    "selector": true,
+    "clusterIPs": [
+     "2000::1",
+     "10.0.0.1"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:unset_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:unset_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:SingleStack_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:PreferDualStack_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:unset",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v4v6",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "Headless_Policy:RequireDualStack_Families:v6v4",
+    "headless": true,
+    "selector": true,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:unset_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "SingleStack",
+    "expectFamilies": [
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:SingleStack_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "SingleStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": true,
+    "expectHeadless": false
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:PreferDualStack_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "PreferDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "PreferDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:unset",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v4v6",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv4",
+     "IPv6"
+    ],
+    "expectHeadless": true
+   },
+   {
+    "name": "HeadlessSelectorless_Policy:RequireDualStack_Families:v6v4",
+    "headless": true,
+    "selector": false,
+    "clusterIPs": [
+     "None"
+    ],
+    "policy": "RequireDualStack",
+    "families": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectError": false,
+    "expectPolicy": "RequireDualStack",
+    "expectFamilies": [
+     "IPv6",
+     "IPv4"
+    ],
+    "expectHeadless": true
+   }
+  ]
+ }
+]
