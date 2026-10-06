@@ -136,46 +136,57 @@ impl Mounter for ConfigMapMounter {
         // Determine the default file mode: spec defaultMode, or 0644 (Kubernetes default)
         let cm_default_mode = self.config_map.default_mode.unwrap_or(0o644);
 
-        match configmap_result {
-            Ok(configmap) => {
-                // Build the projection payload (relative path -> bytes),
-                // honoring `items` (specific keys → mapped paths) or all keys
-                // from data + binaryData, then project it via the upstream
-                // AtomicWriter. Re-projecting an unchanged payload is a no-op
-                // (no write, no chmod, no symlink swap), so a running pod's
-                // config watcher (kube-proxy) is never disturbed by the
-                // kubelet's periodic re-SetUp. Each entry carries its own
-                // mode: `items[].mode` when set, else the volume defaultMode.
-                let payload = build_configmap_payload(
-                    &configmap,
-                    self.config_map.items.as_ref(),
-                    configmap_name,
-                    is_optional,
-                    cm_default_mode as u32,
-                )?;
-                crate::atomic_writer::write_projected_payload(
-                    std::path::Path::new(volume_dir),
-                    &payload,
-                )
-                .with_context(|| format!("failed to project ConfigMap {configmap_name}"))?;
+        // `configmap.go:166-181`: a NotFound on an optional ConfigMap is
+        // replaced by an empty ConfigMap and setup CONTINUES into MakePayload
+        // and the AtomicWriter (so `..data` exists, pointing at an empty dir);
+        // it does not return early.
+        let configmap = match configmap_result {
+            Ok(configmap) => configmap,
+            Err(e) if tolerate_get_error(&e, is_optional) => {
+                info!(
+                    "Optional ConfigMap {} not found in namespace {}, creating empty volume",
+                    configmap_name, &self.namespace
+                );
+                serde_json::from_value(serde_json::json!({
+                    "metadata": {"name": configmap_name, "namespace": &self.namespace}
+                }))
+                .context("building empty ConfigMap")?
             }
             Err(e) => {
-                if tolerate_get_error(&e, is_optional) {
-                    info!(
-                        "Optional ConfigMap {} not found in namespace {}, creating empty volume",
-                        configmap_name, &self.namespace
-                    );
-                } else {
-                    // Required ConfigMap not found — abort pod start so kubelet
-                    // retries on next reconciliation (when the ConfigMap exists).
-                    return Err(anyhow::anyhow!(
-                        "ConfigMap {} not found in namespace {}: {}",
-                        configmap_name,
-                        self.namespace,
-                        e
-                    ));
-                }
+                // Required ConfigMap not found — abort pod start so kubelet
+                // retries on next reconciliation (when the ConfigMap exists).
+                return Err(anyhow::anyhow!(
+                    "ConfigMap {} not found in namespace {}: {}",
+                    configmap_name,
+                    self.namespace,
+                    e
+                ));
             }
+        };
+
+        // Build the projection payload (relative path -> bytes), honoring
+        // `items` or all keys from data + binaryData, then project it via the
+        // upstream AtomicWriter. Re-projecting an unchanged payload is a no-op
+        // so a running pod's config watcher (kube-proxy) is never disturbed.
+        let payload = build_configmap_payload(
+            &configmap,
+            self.config_map.items.as_ref(),
+            configmap_name,
+            is_optional,
+            cm_default_mode as u32,
+        )?;
+        // `defer` at `configmap.go:222-237`: if the AtomicWriter fails after
+        // the wrapped emptyDir SetUpAt, `unmounter.TearDown()` runs, and
+        // emptyDir `TearDownAt` removes the volume directory.
+        if let Err(e) = crate::atomic_writer::write_projected_payload(
+            std::path::Path::new(volume_dir),
+            &payload,
+        ) {
+            if let Err(td) = std::fs::remove_dir_all(volume_dir) {
+                tracing::error!("Error tearing down volume {}: {}", self.volume_name, td);
+            }
+            return Err(anyhow::Error::new(e)
+                .context(format!("failed to project ConfigMap {configmap_name}")));
         }
 
         info!(
@@ -283,5 +294,48 @@ mod tests {
         assert!(tolerate_get_error(&Error::NotFound("x".into()), true));
         assert!(!tolerate_get_error(&Error::NotFound("x".into()), false));
         assert!(!tolerate_get_error(&Error::Storage("boom".into()), true));
+    }
+
+    fn mounter(dir: &std::path::Path, optional: bool) -> ConfigMapMounter {
+        ConfigMapMounter {
+            path: dir.to_string_lossy().into_owned(),
+            volume_name: "cfg".into(),
+            namespace: "ns".into(),
+            config_map: serde_json::from_value(json!({"name": "missing", "optional": optional}))
+                .unwrap(),
+            storage: Some(Arc::new(StorageBackend::Memory(Arc::new(
+                rusternetes_storage::MemoryStorage::new(),
+            )))),
+        }
+    }
+
+    /// `TestPluginOptional` (`configmap_test.go:447-537`): an optional
+    /// ConfigMap that is NotFound still runs the AtomicWriter over an empty
+    /// payload, so `..data` exists and points at an empty directory
+    /// (`configmap.go:168-176` builds an empty ConfigMap, no early return).
+    #[tokio::test]
+    async fn optional_missing_configmap_still_creates_data_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("vol");
+        mounter(&dir, true).set_up().await.unwrap();
+        let target = std::fs::read_link(dir.join("..data")).expect("..data symlink");
+        let entries: Vec<_> = std::fs::read_dir(dir.join(target)).unwrap().collect();
+        assert!(entries.is_empty());
+    }
+
+    /// `SetUpAt`'s deferred cleanup (`configmap.go:222-237`): when the
+    /// AtomicWriter fails after the wrapped emptyDir SetUp, the volume is torn
+    /// down (emptyDir `TearDownAt` removes the directory).
+    #[tokio::test]
+    async fn failed_write_tears_the_volume_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("vol");
+        // A non-empty `..data_tmp` directory makes the writer's symlink step fail.
+        std::fs::create_dir_all(dir.join("..data_tmp/x")).unwrap();
+        assert!(mounter(&dir, true).set_up().await.is_err());
+        assert!(
+            !dir.exists(),
+            "volume dir must be removed after a failed write"
+        );
     }
 }

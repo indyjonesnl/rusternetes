@@ -1650,7 +1650,7 @@ impl ActualStateOfWorld {
 
         if desired_volume_size.cmp_value(&persistent_volume_size) == std::cmp::Ordering::Greater {
             let spec = volume_obj.spec.as_spec();
-            let Some(volume_plugin) = self
+            let Ok(Some(volume_plugin)) = self
                 .volume_plugin_mgr
                 .find_node_expandable_plugin_by_spec(&spec)
             else {
@@ -1662,7 +1662,7 @@ impl ActualStateOfWorld {
                 );
                 return (current_size, false);
             };
-            if volume_plugin.requires_fs_resize(&spec) {
+            if volume_plugin.requires_fs_resize() {
                 return (current_size, true);
             }
         }
@@ -1760,7 +1760,9 @@ mod tests {
     //!    returns these values, so where they came from is immaterial.
 
     use super::*;
-    use crate::volume_plugins::plugin::{Mounter, Spec, VolumePlugin};
+    use crate::volume_plugins::plugin::{
+        Mounter, NodeExpandableVolumePlugin, NodeResizeOptions, Spec, VolumePlugin,
+    };
     use crate::volume_plugins::util::get_unique_pod_name;
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
@@ -1826,12 +1828,23 @@ mod tests {
             self.device_mountable
         }
 
-        fn requires_fs_resize(&self, _spec: &Spec<'_>) -> bool {
-            self.requires_fs_resize
+        fn as_node_expandable_plugin(&self) -> Option<&dyn NodeExpandableVolumePlugin> {
+            self.requires_fs_resize.then_some(self)
         }
 
         async fn new_mounter(&self, _spec: &Spec<'_>, _pod: &Pod) -> Result<Box<dyn Mounter>> {
             Err(anyhow!("ASW tests build mounters directly"))
+        }
+    }
+
+    #[async_trait]
+    impl NodeExpandableVolumePlugin for FakeVolumePlugin {
+        fn requires_fs_resize(&self) -> bool {
+            true
+        }
+
+        async fn node_expand(&self, _opts: NodeResizeOptions<'_>) -> Result<bool> {
+            Ok(true)
         }
     }
 

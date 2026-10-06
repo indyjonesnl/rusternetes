@@ -290,6 +290,86 @@ async fn ephemeral_containers_are_add_only_through_their_subresource() {
         .contains("may not be changed"));
 }
 
+/// The conformance spec "should update the ephemeral containers in an
+/// existing pod" (test/e2e/common/node/ephemeral_containers.go:104): add one
+/// container with a strategic-merge PATCH, read the pod back, append a second
+/// container to what was read and PUT it. The existing container comes back
+/// unchanged, so `ValidatePodEphemeralContainersUpdate` must accept it.
+#[tokio::test]
+async fn an_ephemeral_container_added_by_patch_survives_a_read_modify_put() {
+    let api = TestApiServer::new();
+    create(&api, &pod("p1")).await;
+    let patch = json!({"spec": {"$setElementOrder/ephemeralContainers": [{"name": "debugger"}], "ephemeralContainers": [{
+        "name": "debugger", "image": "busybox",
+        "command": ["/bin/sh", "-c", "while true; do echo polo; sleep 2; done"],
+        "stdin": true, "tty": true
+    }]}});
+    let (s, body) = api
+        .send(
+            "PATCH",
+            &format!("{PODS}/p1/ephemeralcontainers"),
+            Some("application/strategic-merge-patch+json"),
+            Some(&patch),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
+    let (s, mut read) = api.get(&format!("{PODS}/p1")).await;
+    // client-go serializes the non-pointer `resources` struct as `{}`.
+    read["spec"]["ephemeralContainers"][0]["resources"] = json!({});
+    assert_eq!(s, StatusCode::OK, "{read}");
+    read["spec"]["ephemeralContainers"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "name": "debugger2", "image": "busybox",
+            "imagePullPolicy": "IfNotPresent", "terminationMessagePolicy": "File"
+        }));
+    let (s, body) = api
+        .put(&format!("{PODS}/p1/ephemeralcontainers"), &read)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["spec"]["ephemeralContainers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+/// The conformance spec "should support pod readiness gates"
+/// (test/e2e/common/node/pods.go:779) patches `status.conditions` twice with a
+/// strategic-merge PATCH naming one condition each. `PodStatus.conditions` is
+/// `patchStrategy:"merge" patchMergeKey:"type"` (core/v1/types.go), so the
+/// second patch must add to the first rather than replace the list.
+#[tokio::test]
+async fn status_condition_patches_merge_by_type() {
+    let api = TestApiServer::new();
+    create(&api, &pod("p1")).await;
+    for ty in ["k8s.io/test-condition1", "k8s.io/test-condition2"] {
+        let patch = json!({"status": {"conditions": [{"type": ty, "status": "True"}]}});
+        let (s, body) = api
+            .send(
+                "PATCH",
+                &format!("{PODS}/p1/status"),
+                Some("application/strategic-merge-patch+json"),
+                Some(&patch),
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+    }
+    let (_, got) = api.get(&format!("{PODS}/p1")).await;
+    let types: Vec<&str> = got["status"]["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["type"].as_str().unwrap())
+        .collect();
+    assert!(types.contains(&"k8s.io/test-condition1"), "{types:?}");
+    assert!(types.contains(&"k8s.io/test-condition2"), "{types:?}");
+}
+
 /// `Priority.Admit` (plugin/pkg/admission/priority/admission.go:162-201): an
 /// unknown PriorityClass is refused.
 #[tokio::test]

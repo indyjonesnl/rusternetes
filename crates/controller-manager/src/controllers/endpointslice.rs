@@ -15,10 +15,151 @@ use tracing::{debug, error, info};
 /// driven, and only its informers resync, every `MinResyncPeriod`
 /// (`staging/src/k8s.io/controller-manager/config/v1alpha1/defaults.go:31-33`,
 /// 12h; `ResyncPeriod` in `cmd/kube-controller-manager/app/controllermanager.go:176-181`
-/// multiplies it by a random 1-2 factor, which we do not replicate). Each
+/// multiplies it by a random 1-2 factor, see [`resync_period`]). Each
 /// resync re-fires the service handler, `onServiceUpdate`
 /// (`endpointslice_controller.go:122-126`). This replaces a 5s sweep (#2208).
 const INFORMER_RESYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
+
+/// Port of `ResyncPeriod` (`cmd/kube-controller-manager/app/controllermanager.go:176-181`):
+/// `MinResyncPeriod * (rand.Float64() + 1)`, so controllers do not resync in
+/// lock-step. Drawn once per informer start, as upstream calls the returned
+/// function once per informer.
+fn resync_period() -> std::time::Duration {
+    use rand::Rng;
+    INFORMER_RESYNC_PERIOD.mul_f64(rand::rng().random::<f64>() + 1.0)
+}
+
+type LabelSet = HashMap<String, String>;
+
+/// Port of `endpointsliceutil.PodProjectionKey`
+/// (`staging/src/k8s.io/endpointslice/util/controller_utils.go:48-53`): all pod
+/// information needed to find the services that may need an update.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct PodProjectionKey {
+    namespace: String,
+    /// The pod's current labels.
+    labels: LabelSet,
+    /// Set if the pod's labels changed (an Update event).
+    old_labels: Option<LabelSet>,
+    /// Set if the pod changed in a way that may affect endpoint membership.
+    pod_changed: bool,
+}
+
+/// Port of `podEndpointsChanged` (`controller_utils.go`, same file): returns
+/// `(podChanged, labelsChanged)`.
+fn pod_endpoints_changed(old: &Pod, new: &Pod) -> (bool, bool) {
+    let hostname = |p: &Pod| p.spec.as_ref().and_then(|s| s.hostname.clone());
+    let subdomain = |p: &Pod| p.spec.as_ref().and_then(|s| s.subdomain.clone());
+    // `reflect.DeepEqual(newPod.Labels, oldPod.Labels)`: nil and empty maps
+    // are unequal in Go; here both decode alike, so treat them as equal.
+    let labels = |p: &Pod| p.metadata.labels.clone().unwrap_or_default();
+    let labels_changed = labels(new) != labels(old)
+        || hostname(new) != hostname(old)
+        || subdomain(new) != subdomain(old);
+
+    // `newPod.DeletionTimestamp != oldPod.DeletionTimestamp` compares
+    // *pointers*, and informer objects are distinct allocations, so it is true
+    // whenever either timestamp is set.
+    if new.metadata.deletion_timestamp.is_some() || old.metadata.deletion_timestamp.is_some() {
+        return (true, labels_changed);
+    }
+    if rusternetes_common::podutil::is_pod_ready(old)
+        != rusternetes_common::podutil::is_pod_ready(new)
+    {
+        return (true, labels_changed);
+    }
+    let ips = |p: &Pod| -> Vec<String> {
+        p.status
+            .as_ref()
+            .and_then(|s| s.pod_i_ps.as_ref())
+            .map(|v| v.iter().map(|i| i.ip.clone()).collect())
+            .unwrap_or_default()
+    };
+    if ips(old) != ips(new) {
+        return (true, labels_changed);
+    }
+    (false, labels_changed)
+}
+
+/// Port of `GetPodUpdateProjectionKey` (`controller_utils.go:58-103`).
+/// `old` is `None` for an add, `new` is `None` for a delete.
+fn get_pod_update_projection_key(old: Option<&Pod>, new: Option<&Pod>) -> Option<PodProjectionKey> {
+    let key_of = |p: &Pod| PodProjectionKey {
+        namespace: p.metadata.namespace.clone().unwrap_or_default(),
+        labels: p.metadata.labels.clone().unwrap_or_default(),
+        ..Default::default()
+    };
+    let (old, new) = match (old, new) {
+        (None, None) => return None,
+        (None, Some(n)) => return Some(key_of(n)),
+        (Some(o), None) => return Some(key_of(o)),
+        (Some(o), Some(n)) => (o, n),
+    };
+    // "Safe to ignore pod informer resync events as service informer already
+    // handles resync for all services." Two unset resourceVersions are not
+    // treated as equal: a deliberate, conservative deviation.
+    if old.metadata.resource_version.is_some()
+        && old.metadata.resource_version == new.metadata.resource_version
+    {
+        return None;
+    }
+    let (pod_changed, labels_changed) = pod_endpoints_changed(old, new);
+    if !pod_changed && !labels_changed {
+        return None;
+    }
+    if !labels_changed {
+        return Some(key_of(new));
+    }
+    Some(PodProjectionKey {
+        old_labels: Some(old.metadata.labels.clone().unwrap_or_default()),
+        pod_changed,
+        ..key_of(new)
+    })
+}
+
+/// Port of `determineNeededServiceUpdates` (`controller_utils.go:268-278`).
+fn determine_needed_service_updates(
+    old_services: &std::collections::HashSet<String>,
+    services: &std::collections::HashSet<String>,
+    pod_changed: bool,
+) -> std::collections::HashSet<String> {
+    if pod_changed {
+        // the labels and pod changed: all services need to be updated
+        services.union(old_services).cloned().collect()
+    } else {
+        // only the labels changed: the symmetric difference
+        services
+            .symmetric_difference(old_services)
+            .cloned()
+            .collect()
+    }
+}
+
+/// Port of `GetServicesToUpdate` + `getServicesForPod` (`controller_utils.go`),
+/// over an already-listed namespace's services. Returns work-queue keys.
+fn get_services_to_update(
+    services: &[Service],
+    key: &PodProjectionKey,
+) -> std::collections::HashSet<String> {
+    let matching = |labels: &LabelSet| -> std::collections::HashSet<String> {
+        services
+            .iter()
+            .filter_map(|svc| {
+                // "a nil selector means selectors match nothing, not everything"
+                let selector = svc.spec.selector.as_ref()?;
+                selector
+                    .iter()
+                    .all(|(k, v)| labels.get(k) == Some(v))
+                    .then(|| format!("services/{}/{}", key.namespace, svc.metadata.name))
+            })
+            .collect()
+    };
+    let current = matching(&key.labels);
+    match &key.old_labels {
+        Some(old) => determine_needed_service_updates(&matching(old), &current, key.pod_changed),
+        None => current,
+    }
+}
 
 /// Pods by namespace then name: the stand-in for upstream's shared pod
 /// informer cache (`c.podLister`, `endpointslice_controller.go:137,208-210`).
@@ -57,6 +198,10 @@ pub struct EndpointSliceController<S: Storage> {
     /// own LIST (direct callers such as tests, and the window before sync --
     /// upstream instead blocks workers on `WaitForNamedCacheSync`, :294).
     pod_cache: Arc<std::sync::RwLock<Option<PodSnapshot>>>,
+    /// `c.podsSynced` (`endpointslice_controller.go:294`): flips to `true`
+    /// once the first pod LIST has landed and never goes back, like
+    /// `HasSynced`. `run` workers do not start syncing before it.
+    pods_synced: tokio::sync::watch::Sender<bool>,
 }
 
 impl<S: Storage + 'static> EndpointSliceController<S> {
@@ -64,12 +209,13 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
         Self {
             storage,
             pod_cache: Arc::new(std::sync::RwLock::new(None)),
+            pods_synced: tokio::sync::watch::channel(false).0,
         }
     }
 
     /// Initial/relist half of the pod informer: replace the snapshot with one
     /// LIST of every pod.
-    async fn sync_pod_cache(&self) {
+    async fn sync_pod_cache(&self) -> bool {
         match self.storage.list::<Pod>(&build_prefix("pods", None)).await {
             Ok(pods) => {
                 let mut snapshot = PodSnapshot::new();
@@ -81,10 +227,13 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                         .insert(pod.metadata.name.clone(), pod);
                 }
                 *self.pod_cache.write().unwrap() = Some(snapshot);
+                self.pods_synced.send_replace(true);
+                true
             }
             Err(e) => {
                 tracing::error!("Failed to list pods for the pod snapshot: {}", e);
                 *self.pod_cache.write().unwrap() = None;
+                false
             }
         }
     }
@@ -93,17 +242,30 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
     /// Must run before the event is turned into service enqueues, so a worker
     /// woken by it sees the new pod (the informer indexer is updated before
     /// handlers fire).
-    fn apply_pod_event(&self, event: &rusternetes_storage::WatchEvent) {
+    ///
+    /// Returns `(old, new)` as the informer's update handler sees them: `old`
+    /// is the snapshot's previous copy (`None` for an add), `new` is `None`
+    /// for a delete.
+    fn apply_pod_event(
+        &self,
+        event: &rusternetes_storage::WatchEvent,
+    ) -> (Option<Pod>, Option<Pod>) {
         use rusternetes_storage::WatchEvent;
         let (value, deleted) = match event {
             WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) => (v, false),
             WatchEvent::Deleted(_, v) => (v, true),
         };
         let Ok(pod) = serde_json::from_str::<Pod>(value) else {
-            return;
+            return (None, None);
         };
         let ns = pod.metadata.namespace.clone().unwrap_or_default();
-        if let Some(snapshot) = self.pod_cache.write().unwrap().as_mut() {
+        let mut guard = self.pod_cache.write().unwrap();
+        let previous = guard
+            .as_ref()
+            .and_then(|snap| snap.get(&ns))
+            .and_then(|pods| pods.get(&pod.metadata.name))
+            .cloned();
+        if let Some(snapshot) = guard.as_mut() {
             if deleted {
                 if let Some(pods) = snapshot.get_mut(&ns) {
                     pods.remove(&pod.metadata.name);
@@ -112,8 +274,13 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 snapshot
                     .entry(ns)
                     .or_default()
-                    .insert(pod.metadata.name.clone(), pod);
+                    .insert(pod.metadata.name.clone(), pod.clone());
             }
+        }
+        if deleted {
+            (Some(pod), None)
+        } else {
+            (previous, Some(pod))
         }
     }
 
@@ -151,6 +318,9 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             let worker_queue = queue.clone();
             let worker_self = Arc::clone(&self);
             tokio::spawn(async move {
+                // `cache.WaitForNamedCacheSyncWithContext(ctx, c.podsSynced, ...)`
+                // before any worker starts (endpointslice_controller.go:294).
+                worker_self.wait_for_pods_synced().await;
                 worker_self.worker(worker_queue).await;
             });
         }
@@ -198,14 +368,17 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             // Informer order: watches are open first, then the LIST, so no
             // pod event falls between them; buffered events replay on top of
             // the snapshot. Only then enqueue (relist -> handlers fire).
-            self.sync_pod_cache().await;
+            if !self.sync_pod_cache().await {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            }
             self.enqueue_all(&queue).await;
             self.enqueue_all_endpoints(&mirror_queue).await;
 
             let mut svc_watch = svc_watch;
             let mut pod_watch = pod_watch;
             let mut ep_watch = ep_watch;
-            let mut resync = tokio::time::interval(INFORMER_RESYNC_PERIOD);
+            let mut resync = tokio::time::interval(resync_period());
             resync.tick().await;
 
             let mut watch_broken = false;
@@ -230,8 +403,8 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     event = pod_watch.next() => {
                         match event {
                             Some(Ok(ev)) => {
-                                self.apply_pod_event(&ev);
-                                self.enqueue_services_for_pod(&queue, &ev).await;
+                                let (old, new) = self.apply_pod_event(&ev);
+                                self.enqueue_services_for_pod(&queue, old.as_ref(), new.as_ref()).await;
                             }
                             Some(Err(e)) => {
                                 tracing::warn!("Pod watch error: {}, reconnecting", e);
@@ -270,66 +443,36 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
         }
     }
 
-    /// When a pod changes, find services in the same namespace whose selector
-    /// matches the pod and enqueue them for reconciliation.
+    /// Blocks until the first pod LIST has landed: `WaitForNamedCacheSync`
+    /// (`endpointslice_controller.go:294`).
+    async fn wait_for_pods_synced(&self) {
+        let mut rx = self.pods_synced.subscribe();
+        let _ = rx.wait_for(|synced| *synced).await;
+    }
+
+    /// `onPodUpdate` + `syncPod` (`endpointslice_controller.go:532-535`,
+    /// `:491-508`): project the pod event to a [`PodProjectionKey`] and
+    /// enqueue exactly the services it affects, instead of every service in
+    /// the namespace. Upstream puts the key on `podQueue` and a worker
+    /// resolves it; here it is resolved inline (no intermediate queue).
     async fn enqueue_services_for_pod(
         &self,
         queue: &WorkQueue,
-        event: &rusternetes_storage::WatchEvent,
+        old: Option<&Pod>,
+        new: Option<&Pod>,
     ) {
-        let pod_key = extract_key(event);
-        // Parse pod key: "pods/{namespace}/{name}"
-        let parts: Vec<&str> = pod_key.splitn(3, '/').collect();
-        let ns = match parts.get(1) {
-            Some(ns) => *ns,
-            None => return,
+        let Some(key) = get_pod_update_projection_key(old, new) else {
+            return;
         };
-
-        // Get the pod to check its labels
-        let storage_key = format!("/registry/{}", pod_key);
-        let pod: Option<Pod> = self.storage.get(&storage_key).await.ok();
-
-        // List services in this namespace and find matches
         if let Ok(services) = self
             .storage
-            .list::<Service>(&build_prefix("services", Some(ns)))
+            .list::<Service>(&build_prefix("services", Some(&key.namespace)))
             .await
         {
-            match pod {
-                Some(ref pod) => {
-                    for svc in &services {
-                        if let Some(ref selector) = svc.spec.selector {
-                            if Self::labels_match(selector, &pod.metadata.labels) {
-                                queue
-                                    .add(format!("services/{}/{}", ns, svc.metadata.name))
-                                    .await;
-                            }
-                        }
-                    }
-                }
-                None => {
-                    // Pod was deleted -- enqueue all services in this namespace
-                    // since we don't know which ones matched
-                    for svc in &services {
-                        queue
-                            .add(format!("services/{}/{}", ns, svc.metadata.name))
-                            .await;
-                    }
-                }
+            for svc_key in get_services_to_update(&services, &key) {
+                queue.add(svc_key).await;
             }
         }
-    }
-
-    /// Check if all selector key-value pairs exist in the pod's labels.
-    fn labels_match(
-        selector: &std::collections::HashMap<String, String>,
-        labels: &Option<std::collections::HashMap<String, String>>,
-    ) -> bool {
-        let labels = match labels {
-            Some(l) => l,
-            None => return selector.is_empty(),
-        };
-        selector.iter().all(|(k, v)| labels.get(k) == Some(v))
     }
 
     /// Main reconciliation loop — syncs EndpointSlices for all Services
@@ -2256,5 +2399,164 @@ mod tests {
     #[test]
     fn informer_resync_period_is_not_the_old_5s_sweep() {
         assert!(INFORMER_RESYNC_PERIOD >= std::time::Duration::from_secs(12 * 3600));
+    }
+
+    /// `ResyncPeriod` (controllermanager.go:176-181): `Min * (rand + 1)`,
+    /// i.e. in [12h, 24h), and not the same every call.
+    #[test]
+    fn resync_period_is_jittered_between_1x_and_2x() {
+        let samples: Vec<_> = (0..50).map(|_| resync_period()).collect();
+        for d in &samples {
+            assert!(*d >= INFORMER_RESYNC_PERIOD && *d < INFORMER_RESYNC_PERIOD * 2);
+        }
+        assert!(samples.iter().any(|d| *d != samples[0]), "no jitter");
+    }
+
+    fn labelled(name: &str, labels: &[(&str, &str)]) -> Pod {
+        let mut pod = snapshot_pod(name, "10.0.0.1");
+        pod.metadata.labels = Some(
+            labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        pod.metadata.resource_version = Some("1".into());
+        pod
+    }
+
+    fn svc_with_selector(name: &str, sel: Option<&[(&str, &str)]>) -> Service {
+        let mut s = snapshot_service(name);
+        s.spec.selector = sel.map(|l| {
+            l.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        });
+        s
+    }
+
+    fn set(keys: &[&str]) -> std::collections::HashSet<String> {
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    /// TestDetermineNeededServiceUpdates
+    /// (staging/src/k8s.io/endpointslice/util/controller_utils_test.go:35).
+    #[test]
+    fn determine_needed_service_updates_cases() {
+        let (a, b, c) = (set(&["a", "b"]), set(&["b", "c"]), set(&[]));
+        assert_eq!(
+            determine_needed_service_updates(&a, &b, true),
+            set(&["a", "b", "c"])
+        );
+        assert_eq!(
+            determine_needed_service_updates(&a, &b, false),
+            set(&["a", "c"])
+        );
+        assert_eq!(determine_needed_service_updates(&a, &a, false), c);
+    }
+
+    /// Add / delete / resync / unrelated-update projection
+    /// (controller_utils.go:58-103).
+    #[test]
+    fn projection_key_add_delete_and_ignored_updates() {
+        let p = labelled("p", &[("app", "x")]);
+        let add = get_pod_update_projection_key(None, Some(&p)).unwrap();
+        assert_eq!(add.namespace, "ns");
+        assert_eq!(add.old_labels, None);
+        assert!(!add.pod_changed);
+        assert_eq!(get_pod_update_projection_key(Some(&p), None), Some(add));
+        assert_eq!(get_pod_update_projection_key(None, None), None);
+        // same resourceVersion == informer resync: ignored
+        assert_eq!(
+            get_pod_update_projection_key(Some(&p), Some(&p.clone())),
+            None
+        );
+        // new RV but nothing endpoint-relevant changed: ignored
+        let mut q = p.clone();
+        q.metadata.resource_version = Some("2".into());
+        assert_eq!(get_pod_update_projection_key(Some(&p), Some(&q)), None);
+    }
+
+    /// Test_podChanged (controller_utils_test.go:448): readiness / IP change
+    /// is a pod change with unchanged labels; a label change carries both
+    /// label sets.
+    #[test]
+    fn projection_key_pod_and_label_changes() {
+        let p = labelled("p", &[("app", "x")]);
+        let mut ready = p.clone();
+        ready.metadata.resource_version = Some("2".into());
+        ready.status.as_mut().unwrap().conditions = None;
+        let k = get_pod_update_projection_key(Some(&p), Some(&ready)).unwrap();
+        assert_eq!(k.old_labels, None);
+
+        let mut relabelled = p.clone();
+        relabelled.metadata.resource_version = Some("2".into());
+        relabelled.metadata.labels = Some(HashMap::from([("app".into(), "y".into())]));
+        let k = get_pod_update_projection_key(Some(&p), Some(&relabelled)).unwrap();
+        assert_eq!(k.labels["app"], "y");
+        assert_eq!(k.old_labels.as_ref().unwrap()["app"], "x");
+        assert!(!k.pod_changed);
+
+        relabelled.status.as_mut().unwrap().conditions = None;
+        let k = get_pod_update_projection_key(Some(&p), Some(&relabelled)).unwrap();
+        assert!(k.pod_changed);
+    }
+
+    /// TestGetPodServicesToUpdate (controller_utils_test.go:333): a delete
+    /// enqueues only matching services; nil selectors match nothing; a pure
+    /// relabel enqueues only the symmetric difference.
+    #[test]
+    fn services_to_update_projection() {
+        let services = vec![
+            svc_with_selector("x", Some(&[("app", "x")])),
+            svc_with_selector("y", Some(&[("app", "y")])),
+            svc_with_selector("none", None),
+        ];
+        let p = labelled("p", &[("app", "x")]);
+        let key = get_pod_update_projection_key(Some(&p), None).unwrap();
+        assert_eq!(
+            get_services_to_update(&services, &key),
+            set(&["services/ns/x"])
+        );
+
+        let mut relabelled = p.clone();
+        relabelled.metadata.resource_version = Some("2".into());
+        relabelled.metadata.labels = Some(HashMap::from([("app".into(), "y".into())]));
+        let key = get_pod_update_projection_key(Some(&p), Some(&relabelled)).unwrap();
+        assert_eq!(
+            get_services_to_update(&services, &key),
+            set(&["services/ns/x", "services/ns/y"])
+        );
+    }
+
+    /// `WaitForNamedCacheSyncWithContext(ctx, c.podsSynced, ...)`
+    /// (endpointslice_controller.go:294): blocks until the first pod LIST has
+    /// landed, then stays open (`HasSynced` never regresses).
+    #[tokio::test]
+    async fn wait_for_pods_synced_blocks_until_first_pod_list() {
+        let controller = EndpointSliceController::new(Arc::new(MemoryStorage::new()));
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            controller.wait_for_pods_synced(),
+        )
+        .await;
+        assert!(
+            pending.is_err(),
+            "wait returned before the pod cache synced"
+        );
+        assert!(controller.sync_pod_cache().await);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            controller.wait_for_pods_synced(),
+        )
+        .await
+        .expect("wait must return once synced");
+        // a later relist start clears the snapshot but not the sync gate
+        *controller.pod_cache.write().unwrap() = None;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            controller.wait_for_pods_synced(),
+        )
+        .await
+        .expect("gate must not regress");
     }
 }

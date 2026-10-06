@@ -235,7 +235,20 @@ async fn config_map_missing_optional_yields_an_empty_volume() {
     let v = volume(json!({"name": "c", "configMap": {"name": "ghost", "optional": true}}));
     let path = e.vm.create_volume(&pod(), &v).await.unwrap();
     assert!(std::path::Path::new(&path).is_dir());
-    assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
+    // Upstream runs the AtomicWriter over an empty payload, so the only
+    // entries are `..data` and the timestamped dir it points at, and that dir
+    // is empty (`configmap_test.go:506-535`).
+    let target = std::fs::read_link(std::path::Path::new(&path).join("..data")).unwrap();
+    assert_eq!(
+        std::fs::read_dir(std::path::Path::new(&path).join(target))
+            .unwrap()
+            .count(),
+        0
+    );
+    for entry in std::fs::read_dir(&path).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(name.starts_with(".."), "unexpected entry {name}");
+    }
 }
 
 // ------------------------------------------------- secret: SA token + CA cert

@@ -305,3 +305,28 @@ fn merge_filters_other_nodes() {
     let merged = merge_node_pods(vec![other], vec![], "node-1");
     assert!(merged.is_empty());
 }
+
+/// A mirror pod with a deletionTimestamp (a client deleted it) is deleted and
+/// recreated, never left Terminating forever.
+/// Upstream: pkg/kubelet/kubelet.go:3333 tryReconcileMirrorPods
+/// (`mirrorPod.DeletionTimestamp != nil || !IsMirrorPodOf` -> DeleteMirrorPod
+/// with grace 0, mirror_client.go:133-134, then CreateMirrorPod).
+#[tokio::test]
+async fn recreates_mirror_that_has_a_deletion_timestamp() {
+    let storage = MemoryStorage::new();
+    let desired = vec![static_pod("sch", ":v1")];
+    reconcile_mirror_pods(&storage, "node-1", &desired)
+        .await
+        .unwrap();
+    let key = build_key("pods", Some("kube-system"), "sch-node-1");
+    let mut mirror: rusternetes_common::resources::Pod = storage.get(&key).await.unwrap();
+    mirror.metadata.deletion_timestamp = Some(chrono::Utc::now());
+    storage.update(&key, &mirror).await.unwrap();
+
+    reconcile_mirror_pods(&storage, "node-1", &desired)
+        .await
+        .unwrap();
+    let mirror: rusternetes_common::resources::Pod = storage.get(&key).await.unwrap();
+    assert!(mirror.metadata.deletion_timestamp.is_none());
+    assert!(is_mirror_pod(&mirror));
+}

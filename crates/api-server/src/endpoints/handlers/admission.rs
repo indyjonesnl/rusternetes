@@ -154,6 +154,9 @@ impl Admission<'_> {
         if let (Operation::Update, Some(obj), Some(old)) = (op, obj, old) {
             self.validate_csr_signer(obj, old).await?;
         }
+        if let (Operation::Create, Some(obj)) = (op, obj) {
+            self.validate_csr_subject(obj)?;
+        }
         if self.is_core("pods") || self.is_pod_resize() || self.is_pod_ephemeralcontainers() {
             let obj: Option<Pod> = obj.map(recast).transpose()?;
             let old: Option<Pod> = old.map(recast).transpose()?;
@@ -206,8 +209,24 @@ impl Admission<'_> {
         }
     }
 
+    /// The `certificates/subjectrestriction` plugin, for CREATE of a
+    /// CertificateSigningRequest (subjectrestriction/admission.go:64-93).
+    fn validate_csr_subject<T: Object>(&self, obj: &T) -> Result<()> {
+        if self.resource.group != "certificates.k8s.io"
+            || self.resource.resource != "certificatesigningrequests"
+            || self.subresource.is_some()
+        {
+            return Ok(());
+        }
+        let csr: CertificateSigningRequest = recast(obj)?;
+        match crate::admission::certificates::subject_restriction_error(&csr) {
+            Some(err) => Err(self.forbidden(&csr.metadata.name, err)),
+            None => Ok(()),
+        }
+    }
+
     /// `Priority.Validate` (plugin/pkg/admission/priority/admission.go:116-133)
-    /// for PriorityClasses: `validatePriorityClass` (:156-176) lets at most
+    /// for PriorityClasses:`validatePriorityClass` (:156-176) lets at most
     /// one class be `globalDefault`.
     async fn validate_priority<T: Object>(&self, op: &Operation, obj: Option<&T>) -> Result<()> {
         let Some(obj) = obj else {
@@ -457,7 +476,7 @@ impl Admission<'_> {
                         pod,
                     ) {
                         crate::admission::PodSecurityAdmission::new()
-                            .admit(storage, namespace, pod)
+                            .admit_as(storage, namespace, pod, &self.user.username)
                             .await?;
                     }
                 }
@@ -475,7 +494,7 @@ impl Admission<'_> {
                         pod,
                     ) {
                         crate::admission::PodSecurityAdmission::new()
-                            .admit(storage, namespace, pod)
+                            .admit_as(storage, namespace, pod, &self.user.username)
                             .await?;
                     }
                     if self.subresource == Some("resize") {

@@ -1,9 +1,10 @@
+use crate::atomic_writer::FileProjection;
 use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::{ConfigMap, Pod, Secret, Volume};
+use rusternetes_common::resources::{ConfigMap, KeyToPath, Pod, Secret, Volume};
 use rusternetes_storage::{build_key, Storage, StorageBackend};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -106,395 +107,467 @@ struct ProjectedMounter {
     node_allocatable: HashMap<String, String>,
 }
 
+/// `utilerrors.NewAggregate(errlist).Error()`
+/// (`staging/src/k8s.io/apimachinery/pkg/util/errors/errors.go:70-96`): one
+/// error prints as itself; several print de-duplicated as `[a, b]`.
+fn aggregate_message(errs: &[String]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for e in errs {
+        if !seen.contains(&e.as_str()) {
+            seen.push(e);
+        }
+    }
+    if seen.len() == 1 {
+        seen[0].to_string()
+    } else {
+        format!("[{}]", seen.join(", "))
+    }
+}
+
+fn mode_of(item_mode: Option<i32>, default_mode: u32) -> u32 {
+    item_mode.map(|m| m as u32).unwrap_or(default_mode)
+}
+
+/// `configmap.MakePayload` (`pkg/volume/configmap/configmap.go:263-305`).
+fn config_map_payload(
+    items: Option<&Vec<KeyToPath>>,
+    cm: &ConfigMap,
+    default_mode: u32,
+    optional: bool,
+) -> std::result::Result<BTreeMap<String, FileProjection>, String> {
+    let mut payload = BTreeMap::new();
+    match items.filter(|i| !i.is_empty()) {
+        None => {
+            for (k, v) in cm.data.iter().flatten() {
+                payload.insert(
+                    k.clone(),
+                    FileProjection {
+                        data: v.clone().into_bytes(),
+                        mode: default_mode,
+                    },
+                );
+            }
+            for (k, v) in cm.binary_data.iter().flatten() {
+                payload.insert(
+                    k.clone(),
+                    FileProjection {
+                        data: v.clone(),
+                        mode: default_mode,
+                    },
+                );
+            }
+        }
+        Some(items) => {
+            for ktp in items {
+                let data = if let Some(v) = cm.data.as_ref().and_then(|d| d.get(&ktp.key)) {
+                    v.clone().into_bytes()
+                } else if let Some(v) = cm.binary_data.as_ref().and_then(|d| d.get(&ktp.key)) {
+                    v.clone()
+                } else if optional {
+                    continue;
+                } else {
+                    return Err(format!(
+                        "configmap references non-existent config key: {}",
+                        ktp.key
+                    ));
+                };
+                payload.insert(
+                    ktp.path.clone(),
+                    FileProjection {
+                        data,
+                        mode: mode_of(ktp.mode, default_mode),
+                    },
+                );
+            }
+        }
+    }
+    Ok(payload)
+}
+
+/// `secret.MakePayload` (`pkg/volume/secret/secret.go:259-295`).
+fn secret_payload(
+    items: Option<&Vec<KeyToPath>>,
+    secret: &Secret,
+    default_mode: u32,
+    optional: bool,
+) -> std::result::Result<BTreeMap<String, FileProjection>, String> {
+    let mut payload = BTreeMap::new();
+    match items.filter(|i| !i.is_empty()) {
+        None => {
+            for (k, v) in secret.data.iter().flatten() {
+                payload.insert(
+                    k.clone(),
+                    FileProjection {
+                        data: v.clone(),
+                        mode: default_mode,
+                    },
+                );
+            }
+        }
+        Some(items) => {
+            for ktp in items {
+                let Some(content) = secret.data.as_ref().and_then(|d| d.get(&ktp.key)) else {
+                    if optional {
+                        continue;
+                    }
+                    return Err(format!("references non-existent secret key: {}", ktp.key));
+                };
+                payload.insert(
+                    ktp.path.clone(),
+                    FileProjection {
+                        data: content.clone(),
+                        mode: mode_of(ktp.mode, default_mode),
+                    },
+                );
+            }
+        }
+    }
+    Ok(payload)
+}
+
+/// `downwardapi.CollectData` (`pkg/volume/downwardapi/downwardapi.go:238-277`):
+/// errors are accumulated, not short-circuited; an item with neither ref
+/// projects an empty file; the path is `filepath.Clean`ed.
+fn downward_api_payload(
+    items: &[rusternetes_common::resources::DownwardAPIVolumeFile],
+    pod: &Pod,
+    node_allocatable: &HashMap<String, String>,
+    default_mode: u32,
+) -> std::result::Result<BTreeMap<String, FileProjection>, String> {
+    let mut errs = Vec::new();
+    let mut data = BTreeMap::new();
+    for item in items {
+        let mut fp = FileProjection {
+            data: Vec::new(),
+            mode: mode_of(item.mode, default_mode),
+        };
+        if let Some(field_ref) = &item.field_ref {
+            match crate::downward_api::resolve_pod_field(pod, &field_ref.field_path) {
+                Ok(v) => fp.data = v.into_bytes(),
+                Err(e) => errs.push(e.to_string()),
+            }
+        } else if let Some(resource_ref) = &item.resource_field_ref {
+            match crate::downward_api::resolve_container_resource(
+                pod,
+                resource_ref,
+                Some(node_allocatable),
+            ) {
+                Ok(v) => fp.data = v.into_bytes(),
+                Err(e) => errs.push(e.to_string()),
+            }
+        }
+        data.insert(clean_path(&item.path), fp);
+    }
+    if errs.is_empty() {
+        Ok(data)
+    } else {
+        Err(aggregate_message(&errs))
+    }
+}
+
+/// Lexical `filepath.Clean` for the relative item paths validation allows.
+fn clean_path(p: &str) -> String {
+    let parts: Vec<&str> = p
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    parts.join("/")
+}
+
+impl ProjectedMounter {
+    /// `collectData` (`projected.go:226-338`): build ONE payload from every
+    /// source, accumulating errors, and fail with their aggregate.
+    async fn collect_data(&self) -> Result<BTreeMap<String, FileProjection>> {
+        let projected = self
+            .volume
+            .projected
+            .as_ref()
+            .expect("checked by can_support");
+        let default_mode = projected.default_mode.unwrap_or(0o644) as u32;
+
+        // `kubeClient == nil` (`projected.go:233-236`).
+        let Some(storage) = self.storage.as_ref() else {
+            return Err(anyhow!(
+                "cannot setup projected volume {} because kube client is not configured",
+                self.volume.name
+            ));
+        };
+
+        let mut errlist: Vec<String> = Vec::new();
+        let mut payload: BTreeMap<String, FileProjection> = BTreeMap::new();
+        for source in projected.sources.iter().flatten() {
+            if let Some(sp) = &source.secret {
+                let name = sp.name.clone().unwrap_or_default();
+                let optional = sp.optional.unwrap_or(false);
+                let key = build_key("secrets", Some(&self.namespace), &name);
+                let secret = match storage.get::<Secret>(&key).await {
+                    Ok(s) => s,
+                    // `!(errors.IsNotFound(err) && optional)` (`:243`).
+                    Err(rusternetes_common::Error::NotFound(_)) if optional => {
+                        Secret::new(&name, &self.namespace)
+                    }
+                    Err(e) => {
+                        warn!("Couldn't get secret {}/{}: {}", self.namespace, name, e);
+                        errlist.push(e.to_string());
+                        continue;
+                    }
+                };
+                match secret_payload(sp.items.as_ref(), &secret, default_mode, optional) {
+                    Ok(p) => payload.extend(p),
+                    Err(e) => errlist.push(e),
+                }
+            } else if let Some(cp) = &source.config_map {
+                let name = cp.name.clone().unwrap_or_default();
+                let optional = cp.optional.unwrap_or(false);
+                let key = build_key("configmaps", Some(&self.namespace), &name);
+                let cm = match storage.get::<ConfigMap>(&key).await {
+                    Ok(c) => c,
+                    Err(rusternetes_common::Error::NotFound(_)) if optional => {
+                        ConfigMap::new(&name, &self.namespace)
+                    }
+                    Err(e) => {
+                        warn!("Couldn't get configMap {}/{}: {}", self.namespace, name, e);
+                        errlist.push(e.to_string());
+                        continue;
+                    }
+                };
+                match config_map_payload(cp.items.as_ref(), &cm, default_mode, optional) {
+                    Ok(p) => payload.extend(p),
+                    Err(e) => errlist.push(e),
+                }
+            } else if let Some(da) = &source.downward_api {
+                let items = da.items.as_deref().unwrap_or(&[]);
+                match downward_api_payload(items, &self.pod, &self.node_allocatable, default_mode) {
+                    Ok(p) => payload.extend(p),
+                    Err(e) => errlist.push(e),
+                }
+            } else if let Some(tp) = &source.service_account_token {
+                match self.service_account_token(storage, tp).await {
+                    Ok(token) => {
+                        payload.insert(
+                            tp.path.clone(),
+                            FileProjection {
+                                data: token.into_bytes(),
+                                mode: default_mode,
+                            },
+                        );
+                    }
+                    Err(e) => errlist.push(e.to_string()),
+                }
+            }
+            // ClusterTrustBundle / PodCertificate: not yet implemented, see
+            // the follow-up issue linked from the PR.
+        }
+
+        if errlist.is_empty() {
+            Ok(payload)
+        } else {
+            Err(anyhow!("{}", aggregate_message(&errlist)))
+        }
+    }
+
+    /// The `source.ServiceAccountToken` arm of `collectData`
+    /// (`projected.go:289-318`): a token bound to this pod.
+    async fn service_account_token(
+        &self,
+        storage: &Arc<StorageBackend>,
+        sa_token: &rusternetes_common::resources::ServiceAccountTokenProjection,
+    ) -> Result<String> {
+        let storage = Some(storage);
+        let token_path = format!("{}/{}", self.path, sa_token.path);
+        // Generate a real JWT token bound to this pod
+        let sa_name = self
+            .pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.service_account_name.as_deref())
+            .unwrap_or("default");
+        let sa_uid = if let Some(storage) = storage {
+            let sa_key = build_key("serviceaccounts", Some(&self.namespace), sa_name);
+            match storage
+                .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
+                .await
+            {
+                Ok(sa) => sa.metadata.uid.clone(),
+                Err(_) => String::new(),
+            }
+        } else {
+            String::new()
+        };
+        // TokenRequest requires expirationSeconds >= 600 (10m).
+        let expiration_seconds = sa_token.expiration_seconds.unwrap_or(3600).max(600);
+        let now = chrono::Utc::now();
+        let exp = now.timestamp() + expiration_seconds;
+        // Audience to REQUEST from the api-server: exactly what the
+        // projection asked for (empty => the api-server's own
+        // default api-audience, which it will then accept — do NOT
+        // force "rusternetes", or a vanilla api-server issues a
+        // token whose audience it rejects on use).
+        let requested_audiences: Vec<String> = sa_token.audience.iter().cloned().collect();
+        // Audience baked into the self-mint FALLBACK claims (native
+        // storage-mode only): default to "rusternetes".
+        let mut audiences = vec!["rusternetes".to_string()];
+        if let Some(ref aud) = sa_token.audience {
+            audiences = vec![aud.clone()];
+        }
+        let node_name = self.pod.spec.as_ref().and_then(|s| s.node_name.clone());
+        let node_uid = if let (Some(ref nn), Some(st)) = (&node_name, storage) {
+            let node_key = build_key("nodes", None::<&str>, nn);
+            st.get::<serde_json::Value>(&node_key)
+                .await
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/metadata/uid")
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.to_string())
+                })
+        } else {
+            None
+        };
+        let claims = rusternetes_common::auth::ServiceAccountClaims {
+            sub: format!("system:serviceaccount:{}:{}", self.namespace, sa_name),
+            namespace: self.namespace.to_string(),
+            uid: sa_uid.clone(),
+            iat: now.timestamp(),
+            exp,
+            iss: "https://kubernetes.default.svc.cluster.local".to_string(),
+            aud: audiences.clone(),
+            kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
+                namespace: self.namespace.to_string(),
+                svcacct: rusternetes_common::auth::KubeRef {
+                    name: sa_name.to_string(),
+                    uid: sa_uid,
+                },
+                pod: Some(rusternetes_common::auth::KubeRef {
+                    name: self.pod_name.clone(),
+                    uid: self.pod.metadata.uid.clone(),
+                }),
+                node: node_name
+                    .as_ref()
+                    .map(|nn| rusternetes_common::auth::KubeRef {
+                        name: nn.clone(),
+                        uid: node_uid.clone().unwrap_or_default(),
+                    }),
+            }),
+            pod_name: Some(self.pod_name.clone()),
+            pod_uid: Some(self.pod.metadata.uid.clone()),
+            node_name,
+            node_uid,
+        };
+        // Reuse a still-fresh token: re-mint only when the file is
+        // missing or past ~80% of its lifetime. The per-sync volume
+        // re-creation would otherwise hit the api-server TokenRequest
+        // endpoint every few seconds per pod and churn the token file.
+        let refresh_after = (expiration_seconds * 8 / 10).max(60);
+        let token_fresh = std::fs::metadata(&token_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mt| mt.elapsed().ok())
+            .map(|age| (age.as_secs() as i64) < refresh_after)
+            .unwrap_or(false);
+        if !token_fresh {
+            // Prefer an api-server-issued bound token (TokenRequest),
+            // matching the upstream kubelet (pkg/kubelet/token) — it
+            // never self-signs. A vanilla api-server only trusts
+            // tokens IT signed, so a self-minted token is 401-rejected
+            // for in-cluster clients (kindnet et al.). Self-mint only
+            // as a fallback for the storage-direct backends
+            // (all-in-one), whose co-located api-server trusts our key.
+            let mut issued: Option<String> = None;
+            if let Some(st) = storage {
+                // Bind the token to this pod, as upstream's
+                // projected volume plugin does
+                // (pkg/volume/projected/projected.go). The
+                // api-server derives the pod/node claims from
+                // the ref, and a TokenReview on the mounted
+                // token then reports the
+                // authentication.kubernetes.io/pod-name,
+                // pod-uid and node-name extras (#1684).
+                match st
+                    .create_sa_token(
+                        &self.namespace,
+                        sa_name,
+                        &requested_audiences,
+                        expiration_seconds,
+                        Some((self.pod_name.as_str(), self.pod.metadata.uid.as_str())),
+                    )
+                    .await
+                {
+                    Ok(Some(t)) => issued = Some(t),
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        "TokenRequest for {}/{} failed: {}; self-minting",
+                        &self.namespace, sa_name, e
+                    ),
+                }
+            }
+            let token = match issued {
+                Some(t) => t,
+                None => match self.token_manager.generate_token(claims) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(
+                            "Failed to generate SA token for pod {}: {}, using placeholder",
+                            self.pod_name, e
+                        );
+                        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder".to_string()
+                    }
+                },
+            };
+            // A failed mint is an error, as upstream's
+            // `errlist = append(errlist, err)` (`projected.go:
+            // 306-309`); no placeholder token is written.
+            return Ok(token);
+        } // end if !token_fresh
+          // Still fresh: re-use the on-disk token. The upstream
+          // kubelet's token manager caches and refreshes at 80% of
+          // the lifetime (pkg/kubelet/token/token_manager.go), so a
+          // periodic re-SetUp feeds the AtomicWriter the SAME bytes
+          // and stays inert.
+        std::fs::read_to_string(&token_path)
+            .with_context(|| format!("reading cached token {token_path}"))
+    }
+}
+
 #[async_trait]
 impl Mounter for ProjectedMounter {
     fn get_path(&self) -> String {
         self.path.clone()
     }
 
+    /// `SetUpAt` (`projected.go:136-224`): collect the payload (an error here
+    /// writes nothing), then project it with the AtomicWriter
+    /// (`volumeutil.NewAtomicWriter` + `writer.Write`, `:208-221`).
+    ///
+    /// Not ported: the wrapped memory-backed emptyDir mount (`:143-157`),
+    /// `MakeNestedMountpoints` and the fsGroup ownership callback
+    /// (`:191-206`) — the kubelet host has no tmpfs wrapper or fsGroup
+    /// plumbing yet; tracked in the PR's follow-up issue.
     async fn set_up(&self) -> Result<()> {
-        // ---- moved verbatim from create_volume's projected branch
-        //      (991a503d:crates/kubelet/src/volumes.rs:1554-1933) ----
-        let projected = self
-            .volume
-            .projected
-            .as_ref()
-            .expect("checked by can_support");
         let volume_dir = &self.path;
         std::fs::create_dir_all(volume_dir)
             .context("Failed to create projected volume directory")?;
 
-        // Determine the default file mode: spec defaultMode, or 0644 (Kubernetes default)
-        let proj_default_mode = projected.default_mode.unwrap_or(0o644);
+        let payload = self.collect_data().await.inspect_err(|e| {
+            tracing::error!(
+                "Error preparing data for projected volume {} for pod {}/{}: {}",
+                self.volume.name,
+                self.namespace,
+                self.pod_name,
+                e
+            );
+        })?;
 
-        // Compute final directory permissions (will be applied after files are written)
-        #[cfg(unix)]
-        let proj_dir_mode = proj_default_mode as u32 | 0o111;
-
-        if let Some(sources) = &projected.sources {
-            let storage = self.storage.as_ref();
-
-            for source in sources {
-                // ConfigMap projection
-                if let Some(cm_proj) = &source.config_map {
-                    if let Some(cm_name) = &cm_proj.name {
-                        let key = build_key("configmaps", Some(&self.namespace), cm_name);
-                        if let Some(storage) = storage {
-                            match storage.get::<ConfigMap>(&key).await {
-                                Ok(cm) => {
-                                    // Helper to write a projected file with permissions
-                                    let write_proj_file =
-                                        |path: &str, content: &[u8], mode: i32| -> Result<()> {
-                                            if let Some(parent) =
-                                                std::path::Path::new(path).parent()
-                                            {
-                                                std::fs::create_dir_all(parent)?;
-                                            }
-                                            std::fs::write(path, content)?;
-                                            #[cfg(unix)]
-                                            {
-                                                use std::os::unix::fs::PermissionsExt;
-                                                std::fs::set_permissions(
-                                                    path,
-                                                    std::fs::Permissions::from_mode(mode as u32),
-                                                )?;
-                                            }
-                                            Ok(())
-                                        };
-
-                                    if let Some(items) = &cm_proj.items {
-                                        for item in items {
-                                            let mode = item.mode.unwrap_or(proj_default_mode);
-                                            let file_path = format!("{}/{}", volume_dir, item.path);
-                                            // Try data first, then binaryData
-                                            if let Some(value) =
-                                                cm.data.as_ref().and_then(|d| d.get(&item.key))
-                                            {
-                                                write_proj_file(
-                                                    &file_path,
-                                                    value.as_bytes(),
-                                                    mode,
-                                                )?;
-                                            } else if let Some(value) = cm
-                                                .binary_data
-                                                .as_ref()
-                                                .and_then(|d| d.get(&item.key))
-                                            {
-                                                write_proj_file(&file_path, value, mode)?;
-                                            }
-                                        }
-                                    } else {
-                                        // Mount all keys from data
-                                        if let Some(data) = &cm.data {
-                                            for (k, v) in data {
-                                                let file_path = format!("{}/{}", volume_dir, k);
-                                                write_proj_file(
-                                                    &file_path,
-                                                    v.as_bytes(),
-                                                    proj_default_mode,
-                                                )?;
-                                            }
-                                        }
-                                        // Mount all keys from binaryData
-                                        if let Some(binary_data) = &cm.binary_data {
-                                            for (k, v) in binary_data {
-                                                let file_path = format!("{}/{}", volume_dir, k);
-                                                write_proj_file(&file_path, v, proj_default_mode)?;
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(_) if cm_proj.optional.unwrap_or(false) => {
-                                    // Optional configmap not found, skip
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to get ConfigMap {} for projected volume: {}. Skipping.",
-                                        cm_name, e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Secret projection
-                if let Some(secret_proj) = &source.secret {
-                    if let Some(secret_name) = &secret_proj.name {
-                        let key = build_key("secrets", Some(&self.namespace), secret_name);
-                        if let Some(storage) = storage {
-                            match storage.get::<Secret>(&key).await {
-                                Ok(secret) => {
-                                    if let Some(data) = &secret.data {
-                                        if let Some(items) = &secret_proj.items {
-                                            for item in items {
-                                                if let Some(value) = data.get(&item.key) {
-                                                    let file_path =
-                                                        format!("{}/{}", volume_dir, item.path);
-                                                    if let Some(parent) =
-                                                        std::path::Path::new(&file_path).parent()
-                                                    {
-                                                        std::fs::create_dir_all(parent)?;
-                                                    }
-                                                    std::fs::write(&file_path, value)?;
-                                                    #[cfg(unix)]
-                                                    {
-                                                        use std::os::unix::fs::PermissionsExt;
-                                                        let mode =
-                                                            item.mode.unwrap_or(proj_default_mode)
-                                                                as u32;
-                                                        std::fs::set_permissions(
-                                                            &file_path,
-                                                            std::fs::Permissions::from_mode(mode),
-                                                        )?;
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            for (k, v) in data {
-                                                let file_path = format!("{}/{}", volume_dir, k);
-                                                std::fs::write(&file_path, v)?;
-                                                #[cfg(unix)]
-                                                {
-                                                    use std::os::unix::fs::PermissionsExt;
-                                                    std::fs::set_permissions(
-                                                        &file_path,
-                                                        std::fs::Permissions::from_mode(
-                                                            proj_default_mode as u32,
-                                                        ),
-                                                    )?;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(_) if secret_proj.optional.unwrap_or(false) => {
-                                    // Optional secret not found, skip
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to get Secret {} for projected volume: {}. Skipping.",
-                                        secret_name, e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // DownwardAPI projection
-                if let Some(downward_api) = &source.downward_api {
-                    if let Some(items) = &downward_api.items {
-                        for item in items {
-                            let file_path = format!("{}/{}", volume_dir, item.path);
-                            if let Some(parent) = std::path::Path::new(&file_path).parent() {
-                                std::fs::create_dir_all(parent)?;
-                            }
-                            let value = if let Some(ref field_ref) = item.field_ref {
-                                crate::downward_api::resolve_pod_field(
-                                    &self.pod,
-                                    &field_ref.field_path,
-                                )
-                                .map_err(|e| anyhow::anyhow!("{e}"))
-                                .unwrap_or_default()
-                            } else if let Some(ref resource_ref) = item.resource_field_ref {
-                                crate::downward_api::resolve_container_resource(
-                                    &self.pod,
-                                    resource_ref,
-                                    Some(&self.node_allocatable),
-                                )
-                                .map_err(|e| anyhow::anyhow!("{e}"))
-                                .unwrap_or_default()
-                            } else {
-                                String::new()
-                            };
-                            std::fs::write(&file_path, &value)?;
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                let mode = item.mode.unwrap_or(proj_default_mode) as u32;
-                                std::fs::set_permissions(
-                                    &file_path,
-                                    std::fs::Permissions::from_mode(mode),
-                                )?;
-                            }
-                        }
-                    }
-                }
-
-                // ServiceAccountToken projection
-                if let Some(sa_token) = &source.service_account_token {
-                    let token_path = format!("{}/{}", volume_dir, sa_token.path);
-                    if let Some(parent) = std::path::Path::new(&token_path).parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    // Generate a real JWT token bound to this pod
-                    let sa_name = self
-                        .pod
-                        .spec
-                        .as_ref()
-                        .and_then(|s| s.service_account_name.as_deref())
-                        .unwrap_or("default");
-                    let sa_uid = if let Some(storage) = storage {
-                        let sa_key = build_key("serviceaccounts", Some(&self.namespace), sa_name);
-                        match storage
-                            .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
-                            .await
-                        {
-                            Ok(sa) => sa.metadata.uid.clone(),
-                            Err(_) => String::new(),
-                        }
-                    } else {
-                        String::new()
-                    };
-                    // TokenRequest requires expirationSeconds >= 600 (10m).
-                    let expiration_seconds = sa_token.expiration_seconds.unwrap_or(3600).max(600);
-                    let now = chrono::Utc::now();
-                    let exp = now.timestamp() + expiration_seconds;
-                    // Audience to REQUEST from the api-server: exactly what the
-                    // projection asked for (empty => the api-server's own
-                    // default api-audience, which it will then accept — do NOT
-                    // force "rusternetes", or a vanilla api-server issues a
-                    // token whose audience it rejects on use).
-                    let requested_audiences: Vec<String> =
-                        sa_token.audience.iter().cloned().collect();
-                    // Audience baked into the self-mint FALLBACK claims (native
-                    // storage-mode only): default to "rusternetes".
-                    let mut audiences = vec!["rusternetes".to_string()];
-                    if let Some(ref aud) = sa_token.audience {
-                        audiences = vec![aud.clone()];
-                    }
-                    let node_name = self.pod.spec.as_ref().and_then(|s| s.node_name.clone());
-                    let node_uid = if let (Some(ref nn), Some(st)) = (&node_name, storage) {
-                        let node_key = build_key("nodes", None::<&str>, nn);
-                        st.get::<serde_json::Value>(&node_key)
-                            .await
-                            .ok()
-                            .and_then(|v| {
-                                v.pointer("/metadata/uid")
-                                    .and_then(|u| u.as_str())
-                                    .map(|s| s.to_string())
-                            })
-                    } else {
-                        None
-                    };
-                    let claims = rusternetes_common::auth::ServiceAccountClaims {
-                        sub: format!("system:serviceaccount:{}:{}", self.namespace, sa_name),
-                        namespace: self.namespace.to_string(),
-                        uid: sa_uid.clone(),
-                        iat: now.timestamp(),
-                        exp,
-                        iss: "https://kubernetes.default.svc.cluster.local".to_string(),
-                        aud: audiences.clone(),
-                        kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
-                            namespace: self.namespace.to_string(),
-                            svcacct: rusternetes_common::auth::KubeRef {
-                                name: sa_name.to_string(),
-                                uid: sa_uid,
-                            },
-                            pod: Some(rusternetes_common::auth::KubeRef {
-                                name: self.pod_name.clone(),
-                                uid: self.pod.metadata.uid.clone(),
-                            }),
-                            node: node_name
-                                .as_ref()
-                                .map(|nn| rusternetes_common::auth::KubeRef {
-                                    name: nn.clone(),
-                                    uid: node_uid.clone().unwrap_or_default(),
-                                }),
-                        }),
-                        pod_name: Some(self.pod_name.clone()),
-                        pod_uid: Some(self.pod.metadata.uid.clone()),
-                        node_name,
-                        node_uid,
-                    };
-                    // Reuse a still-fresh token: re-mint only when the file is
-                    // missing or past ~80% of its lifetime. The per-sync volume
-                    // re-creation would otherwise hit the api-server TokenRequest
-                    // endpoint every few seconds per pod and churn the token file.
-                    let refresh_after = (expiration_seconds * 8 / 10).max(60);
-                    let token_fresh = std::fs::metadata(&token_path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|mt| mt.elapsed().ok())
-                        .map(|age| (age.as_secs() as i64) < refresh_after)
-                        .unwrap_or(false);
-                    if !token_fresh {
-                        // Prefer an api-server-issued bound token (TokenRequest),
-                        // matching the upstream kubelet (pkg/kubelet/token) — it
-                        // never self-signs. A vanilla api-server only trusts
-                        // tokens IT signed, so a self-minted token is 401-rejected
-                        // for in-cluster clients (kindnet et al.). Self-mint only
-                        // as a fallback for the storage-direct backends
-                        // (all-in-one), whose co-located api-server trusts our key.
-                        let mut issued: Option<String> = None;
-                        if let Some(st) = storage {
-                            // Bind the token to this pod, as upstream's
-                            // projected volume plugin does
-                            // (pkg/volume/projected/projected.go). The
-                            // api-server derives the pod/node claims from
-                            // the ref, and a TokenReview on the mounted
-                            // token then reports the
-                            // authentication.kubernetes.io/pod-name,
-                            // pod-uid and node-name extras (#1684).
-                            match st
-                                .create_sa_token(
-                                    &self.namespace,
-                                    sa_name,
-                                    &requested_audiences,
-                                    expiration_seconds,
-                                    Some((self.pod_name.as_str(), self.pod.metadata.uid.as_str())),
-                                )
-                                .await
-                            {
-                                Ok(Some(t)) => issued = Some(t),
-                                Ok(None) => {}
-                                Err(e) => warn!(
-                                    "TokenRequest for {}/{} failed: {}; self-minting",
-                                    &self.namespace, sa_name, e
-                                ),
-                            }
-                        }
-                        let token = match issued {
-                            Some(t) => t,
-                            None => match self.token_manager.generate_token(claims) {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    warn!(
-                                    "Failed to generate SA token for pod {}: {}, using placeholder",
-                                    self.pod_name, e
-                                );
-                                    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder".to_string()
-                                }
-                            },
-                        };
-                        std::fs::write(&token_path, &token)?;
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            std::fs::set_permissions(
-                                &token_path,
-                                std::fs::Permissions::from_mode(proj_default_mode as u32),
-                            )?;
-                        }
-                    } // end if !token_fresh
-                }
-            }
-        }
-
-        // Set directory permissions after files are written so that restrictive
-        // defaultMode values don't prevent file creation.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(volume_dir, std::fs::Permissions::from_mode(proj_dir_mode))?;
-        }
+        crate::atomic_writer::write_projected_payload(std::path::Path::new(volume_dir), &payload)
+            .map_err(|e| {
+            tracing::error!("Error writing payload to dir: {}", e);
+            anyhow!(e)
+        })?;
 
         info!(
             "Created projected volume {} at {}",
             self.volume.name, volume_dir
         );
-        // ---- end moved body ----
         Ok(())
     }
 }
@@ -550,5 +623,174 @@ mod tests {
     #[test]
     fn plugin_name_is_the_upstream_name() {
         assert_eq!(plugin().name(), crate::pod_dirs::plugin::PROJECTED);
+    }
+
+    // ---- behavioural tests through the mounter (projected.go SetUpAt /
+    //      collectData) ----
+
+    use rusternetes_common::resources::ConfigMap;
+    use std::collections::HashMap;
+
+    fn pod() -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "uid": "uid-1"},
+            "spec": {"containers": [{"name": "c", "image": "i"}]}
+        }))
+        .unwrap()
+    }
+
+    fn vol(sources: serde_json::Value) -> Volume {
+        serde_json::from_value(serde_json::json!({
+            "name": "proj", "projected": {"sources": sources}
+        }))
+        .unwrap()
+    }
+
+    async fn mounter(
+        root: &std::path::Path,
+        storage: &Arc<StorageBackend>,
+        v: &Volume,
+    ) -> Box<dyn Mounter> {
+        let p = ProjectedPlugin::new(Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
+            root.to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            HashMap::new(),
+        )));
+        let spec = Spec {
+            volume: v,
+            persistent_volume: None,
+        };
+        p.new_mounter(&spec, &pod()).await.unwrap()
+    }
+
+    async fn put_cm(storage: &Arc<StorageBackend>, name: &str, k: &str, val: &str) {
+        let mut d = HashMap::new();
+        d.insert(k.to_string(), val.to_string());
+        let cm = ConfigMap::new(name, "ns").with_data(d);
+        storage
+            .create(&build_key("configmaps", Some("ns"), name), &cm)
+            .await
+            .unwrap();
+    }
+
+    /// `collectData` (`projected.go:241-246`): a non-optional source whose
+    /// object cannot be fetched appends to `errlist`, `SetUpAt` returns the
+    /// aggregate and writes nothing.
+    #[tokio::test]
+    async fn missing_required_config_map_fails_set_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(StorageBackend::new_memory());
+        let v = vol(serde_json::json!([{"configMap": {"name": "nope"}}]));
+        let m = mounter(dir.path(), &st, &v).await;
+        let err = m.set_up().await.unwrap_err().to_string();
+        assert!(err.contains("nope"), "{err}");
+        assert!(!std::path::Path::new(&m.get_path()).join("..data").exists());
+    }
+
+    /// `!(errors.IsNotFound(err) && optional)` (`projected.go:243`): an
+    /// optional, absent source is an empty payload, not an error.
+    #[tokio::test]
+    async fn missing_optional_config_map_is_empty_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(StorageBackend::new_memory());
+        let v = vol(serde_json::json!([{"configMap": {"name": "nope", "optional": true}}]));
+        let m = mounter(dir.path(), &st, &v).await;
+        m.set_up().await.unwrap();
+    }
+
+    /// `configmap.MakePayload` (`configmap.go:289-293`): a mapped key that is
+    /// absent from a non-optional configMap is an error.
+    #[tokio::test]
+    async fn missing_item_key_fails_set_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(StorageBackend::new_memory());
+        put_cm(&st, "cm", "a", "1").await;
+        let v = vol(serde_json::json!([
+            {"configMap": {"name": "cm", "items": [{"key": "zzz", "path": "z"}]}}
+        ]));
+        let m = mounter(dir.path(), &st, &v).await;
+        let err = m.set_up().await.unwrap_err().to_string();
+        assert!(
+            err.contains("configmap references non-existent config key: zzz"),
+            "{err}"
+        );
+    }
+
+    /// `volumeutil.NewAtomicWriter` + `writer.Write` (`projected.go:208-221`):
+    /// content lands behind `..data`, and a re-SetUp of an unchanged payload
+    /// leaves the on-disk layout untouched.
+    #[tokio::test]
+    async fn projects_through_atomic_writer_and_resync_is_inert() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(StorageBackend::new_memory());
+        put_cm(&st, "cm", "a", "1").await;
+        let v = vol(serde_json::json!([{"configMap": {"name": "cm"}}]));
+        let m = mounter(dir.path(), &st, &v).await;
+        m.set_up().await.unwrap();
+        let root = std::path::PathBuf::from(m.get_path());
+        assert!(root.join("..data").exists());
+        assert!(std::fs::symlink_metadata(root.join("a"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "1");
+        let before = std::fs::read_link(root.join("..data")).unwrap();
+        m.set_up().await.unwrap();
+        assert_eq!(std::fs::read_link(root.join("..data")).unwrap(), before);
+    }
+
+    /// `collectData` merges every source into ONE payload (`projected.go:
+    /// 270-272`); a later source overwrites an earlier one at the same path.
+    #[tokio::test]
+    async fn merges_sources_and_downward_api_errors_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(StorageBackend::new_memory());
+        put_cm(&st, "cm", "a", "1").await;
+        let v = vol(serde_json::json!([
+            {"configMap": {"name": "cm"}},
+            {"downwardAPI": {"items": [{"path": "n", "fieldRef": {"fieldPath": "metadata.name"}}]}}
+        ]));
+        let m = mounter(dir.path(), &st, &v).await;
+        m.set_up().await.unwrap();
+        let root = std::path::PathBuf::from(m.get_path());
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "1");
+        assert_eq!(std::fs::read_to_string(root.join("n")).unwrap(), "p");
+
+        // `downwardapi.CollectData` (`downwardapi.go:255-258`): a bad
+        // fieldPath is an error, not an empty file.
+        let dir2 = tempfile::tempdir().unwrap();
+        let v2 = vol(serde_json::json!([
+            {"downwardAPI": {"items": [{"path": "n", "fieldRef": {"fieldPath": "bogus.path"}}]}}
+        ]));
+        let m2 = mounter(dir2.path(), &st, &v2).await;
+        assert!(m2.set_up().await.is_err());
+    }
+
+    /// `secret.MakePayload` (`secret.go:280`) wording, and the optional skip.
+    #[test]
+    fn secret_payload_missing_key_error_and_optional() {
+        let s = Secret::new("s", "ns");
+        let items = vec![KeyToPath {
+            key: "k".into(),
+            path: "p".into(),
+            mode: Some(0o400),
+        }];
+        assert_eq!(
+            secret_payload(Some(&items), &s, 0o644, false).unwrap_err(),
+            "references non-existent secret key: k"
+        );
+        assert!(secret_payload(Some(&items), &s, 0o644, true)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// `aggregate.Error()` (`errors.go:70-96`).
+    #[test]
+    fn aggregate_formats_like_upstream() {
+        assert_eq!(aggregate_message(&["a".into()]), "a");
+        assert_eq!(aggregate_message(&["a".into(), "b".into()]), "[a, b]");
+        assert_eq!(aggregate_message(&["a".into(), "a".into()]), "a");
     }
 }

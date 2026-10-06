@@ -127,17 +127,17 @@
 
       <p>The script performs these steps in order:</p>
 
-      <h3>1. Generate ServiceAccount Tokens</h3>
+      <h3>1. Generate ServiceAccounts</h3>
       <p>
-        Calls <code>scripts/generate-default-serviceaccounts.sh</code> to create RS256 JWT tokens
-        for the <code>default</code> ServiceAccount in each namespace. These tokens are signed with
-        the SA private key at <code>.rusternetes/certs/sa.key</code>.
+        Calls <code>scripts/generate-default-serviceaccounts.sh</code> to write the
+        <code>default</code> ServiceAccount manifest for each namespace. No token Secret is
+        created; pods receive bound tokens through the projected volume.
       </p>
 
-      <h3>2. Apply ServiceAccounts and Secrets</h3>
+      <h3>2. Apply ServiceAccounts</h3>
       <p>
         Applies <code>.rusternetes/default-serviceaccounts.yaml</code>, which contains the
-        ServiceAccount objects and their associated token Secrets for <code>kube-system</code>
+        ServiceAccount objects for <code>kube-system</code>
         and <code>default</code> namespaces.
       </p>
 

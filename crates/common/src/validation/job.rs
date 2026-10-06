@@ -1181,6 +1181,50 @@ fn uncounted_normalized(job: &Job) -> UncountedUids<'_> {
 /// already violated a rule and the controller gets a sync to repair a status
 /// a spec edit just invalidated (strategy.go:354-367).
 pub fn get_status_validation_options(new_job: &Job, old_job: &Job) -> JobStatusValidationOptions {
+    get_status_validation_options_with_gates(new_job, old_job, JobStatusValidationGates::default())
+}
+
+/// The feature gates `getStatusValidationOptions` consults
+/// (`strategy.go:350`, `:415`). Both are GA and on by default in 1.35, and
+/// [`Default`] reflects that; the off values exist only so the gate-off
+/// branches upstream's `TestStatusStrategy_ValidateUpdate` exercises (via
+/// emulation version 1.32/1.33) are ported and testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobStatusValidationGates {
+    /// `features.JobManagedBy`
+    pub job_managed_by: bool,
+    /// `features.JobPodReplacementPolicy`
+    pub job_pod_replacement_policy: bool,
+}
+
+impl Default for JobStatusValidationGates {
+    fn default() -> Self {
+        Self {
+            job_managed_by: true,
+            job_pod_replacement_policy: true,
+        }
+    }
+}
+
+/// [`get_status_validation_options`] with explicit feature gates.
+pub fn get_status_validation_options_with_gates(
+    new_job: &Job,
+    old_job: &Job,
+    gates: JobStatusValidationGates,
+) -> JobStatusValidationOptions {
+    if !gates.job_managed_by {
+        // strategy.go:415-422
+        if gates.job_pod_replacement_policy {
+            return JobStatusValidationOptions {
+                allow_for_success_criteria_met_in_extended_scope: true,
+                ..Default::default()
+            };
+        }
+        return JobStatusValidationOptions {
+            allow_for_success_criteria_met_in_extended_scope: is_job_success_criteria_met(old_job),
+            ..Default::default()
+        };
+    }
     let new_status = new_job.status.clone().unwrap_or_default();
     let old_status = old_job.status.clone().unwrap_or_default();
     let is_indexed = new_job.spec.completion_mode.as_deref() == Some(INDEXED_COMPLETION);

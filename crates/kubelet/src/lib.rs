@@ -7,6 +7,8 @@ pub mod downward_api;
 pub mod events;
 #[allow(dead_code)]
 pub mod eviction;
+pub mod go_selinux;
+pub mod go_selinux_label;
 pub mod host_port;
 pub mod kubelet;
 pub mod labels;

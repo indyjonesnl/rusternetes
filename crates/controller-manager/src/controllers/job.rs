@@ -5128,4 +5128,237 @@ mod tests {
             Duration::from_secs(5)
         );
     }
+    /// `MemoryStorage` that can refuse Pod updates by name and records every
+    /// Job write, so a test can stage a PARTIAL `uncountedTerminatedPods` drain
+    /// (upstream's "pod patch errors with partial success" case) and inspect
+    /// the sequence of statuses that went out.
+    struct PartialDrainStorage {
+        inner: MemoryStorage,
+        fail_pod_updates: std::sync::Mutex<HashSet<String>>,
+        job_writes: std::sync::Mutex<Vec<JobStatus>>,
+    }
+
+    impl PartialDrainStorage {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStorage::new(),
+                fail_pod_updates: Default::default(),
+                job_writes: Default::default(),
+            }
+        }
+        fn record(&self, key: &str, value: &serde_json::Value) {
+            if key.starts_with("/registry/jobs/") {
+                if let Some(st) = value
+                    .get("status")
+                    .and_then(|s| serde_json::from_value::<JobStatus>(s.clone()).ok())
+                {
+                    self.job_writes.lock().unwrap().push(st);
+                }
+            }
+        }
+        fn refuse(&self, key: &str) -> bool {
+            self.fail_pod_updates
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|n| key.ends_with(&format!("/pods/default/{n}")))
+        }
+    }
+
+    type CResult<T> = std::result::Result<T, rusternetes_common::Error>;
+
+    #[async_trait::async_trait]
+    impl Storage for PartialDrainStorage {
+        async fn create<T>(&self, key: &str, value: &T) -> CResult<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.create(key, value).await
+        }
+        async fn get<T>(&self, key: &str) -> CResult<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+        async fn update<T>(&self, key: &str, value: &T) -> CResult<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            if self.refuse(key) {
+                return Err(rusternetes_common::Error::Internal(
+                    "injected pod update failure".into(),
+                ));
+            }
+            self.record(key, &serde_json::to_value(value).unwrap());
+            self.inner.update(key, value).await
+        }
+        async fn update_status<T>(&self, key: &str, value: &T) -> CResult<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.record(key, &serde_json::to_value(value).unwrap());
+            self.inner.update_status(key, value).await
+        }
+        async fn delete(&self, key: &str) -> CResult<()> {
+            self.inner.delete(key).await
+        }
+        async fn list<T>(&self, prefix: &str) -> CResult<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list(prefix).await
+        }
+        async fn watch(&self, prefix: &str) -> CResult<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> CResult<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+        async fn current_revision(&self) -> CResult<i64> {
+            self.inner.current_revision().await
+        }
+        async fn is_revision_compacted(&self, revision: i64) -> CResult<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+        async fn update_raw(&self, key: &str, value: &serde_json::Value) -> CResult<()> {
+            self.inner.update_raw(key, value).await
+        }
+    }
+
+    fn uncounted_len_of(st: &JobStatus) -> usize {
+        st.uncounted_terminated_pods.as_ref().map_or(0, |u| {
+            u.succeeded.as_ref().map_or(0, |v| v.len()) + u.failed.as_ref().map_or(0, |v| v.len())
+        })
+    }
+
+    fn has_terminal(st: &JobStatus) -> bool {
+        st.conditions.as_ref().is_some_and(|c| {
+            c.iter().any(|c| {
+                (c.condition_type == "Complete" || c.condition_type == "Failed")
+                    && c.status == "True"
+            })
+        })
+    }
+
+    /// #2378 (follow-up to #2377): only part of `uncountedTerminatedPods`
+    /// drains in one sync (one pod's finalizer removal fails). Upstream's
+    /// `enactJobFinished` (`job_controller.go:1509-1519`) returns false while
+    /// any UID remains, and the next sync re-derives `finishedCondition` from
+    /// scratch and finishes the Job. So: no write may carry a terminal
+    /// condition while UIDs remain, and the terminal condition lands once.
+    #[tokio::test]
+    async fn partial_uncounted_drain_defers_terminal_condition_to_next_sync() {
+        let storage = Arc::new(PartialDrainStorage::new());
+        let job = make_job("part", "default", 2, 2);
+        let job_key = build_key("jobs", Some("default"), "part");
+        storage.create(&job_key, &job).await.unwrap();
+        for name in ["part-1", "part-2"] {
+            let pod = make_pod(name, "default", Phase::Succeeded, "part", "job-uid-1");
+            storage
+                .create(&build_key("pods", Some("default"), name), &pod)
+                .await
+                .unwrap();
+        }
+        storage
+            .fail_pod_updates
+            .lock()
+            .unwrap()
+            .insert("part-2".into());
+
+        let controller = JobController::new(storage.clone());
+        controller.reconcile_all().await.unwrap();
+
+        let after_first: Job = storage.get(&job_key).await.unwrap();
+        let st = after_first.status.clone().unwrap();
+        assert_eq!(
+            uncounted_len_of(&st),
+            1,
+            "the pod whose finalizer could not be removed stays uncounted: {st:?}"
+        );
+        assert!(
+            !has_terminal(&st),
+            "no Complete/Failed while UIDs remain uncounted: {st:?}"
+        );
+        assert!(
+            st.conditions.as_ref().is_some_and(|c| c
+                .iter()
+                .any(|c| c.condition_type == "SuccessCriteriaMet" && c.status == "True")),
+            "the interim SuccessCriteriaMet condition is written: {st:?}"
+        );
+
+        storage.fail_pod_updates.lock().unwrap().clear();
+        controller.reconcile_all().await.unwrap();
+
+        let done: Job = storage.get(&job_key).await.unwrap();
+        let st = done.status.unwrap();
+        assert_eq!(uncounted_len_of(&st), 0, "second sync drains the rest");
+        assert_eq!(st.succeeded, Some(2));
+        assert!(has_terminal(&st), "second sync re-derives Complete: {st:?}");
+        assert!(st.completion_time.is_some());
+
+        let writes = storage.job_writes.lock().unwrap().clone();
+        for w in &writes {
+            assert!(
+                !(has_terminal(w) && uncounted_len_of(w) > 0),
+                "a write marked the Job finished while UIDs remained: {w:?}"
+            );
+        }
+        let first_terminal = writes.iter().position(has_terminal);
+        let terminal_idx: Vec<usize> = writes
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| has_terminal(w))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(first_terminal.is_some());
+        // Once terminal, every later write stays terminal (written once, never
+        // flapped off and on).
+        assert_eq!(
+            terminal_idx,
+            (first_terminal.unwrap()..writes.len()).collect::<Vec<_>>(),
+            "terminal condition must not flap: {writes:?}"
+        );
+    }
+
+    /// Same, for the failing path (`FailureTarget` interim, `Failed` final).
+    #[tokio::test]
+    async fn partial_uncounted_drain_defers_failed_condition_to_next_sync() {
+        let storage = Arc::new(PartialDrainStorage::new());
+        let mut job = make_job("pfail", "default", 2, 2);
+        job.spec.backoff_limit = Some(0);
+        let job_key = build_key("jobs", Some("default"), "pfail");
+        storage.create(&job_key, &job).await.unwrap();
+        for name in ["pfail-1", "pfail-2"] {
+            let pod = make_pod(name, "default", Phase::Failed, "pfail", "job-uid-1");
+            storage
+                .create(&build_key("pods", Some("default"), name), &pod)
+                .await
+                .unwrap();
+        }
+        storage
+            .fail_pod_updates
+            .lock()
+            .unwrap()
+            .insert("pfail-2".into());
+
+        let controller = JobController::new(storage.clone());
+        controller.reconcile_all().await.unwrap();
+        let st = storage.get::<Job>(&job_key).await.unwrap().status.unwrap();
+        assert_eq!(uncounted_len_of(&st), 1, "{st:?}");
+        assert!(!has_terminal(&st), "{st:?}");
+
+        storage.fail_pod_updates.lock().unwrap().clear();
+        controller.reconcile_all().await.unwrap();
+        let st = storage.get::<Job>(&job_key).await.unwrap().status.unwrap();
+        assert_eq!(uncounted_len_of(&st), 0, "{st:?}");
+        assert!(has_terminal(&st), "{st:?}");
+        for w in storage.job_writes.lock().unwrap().iter() {
+            assert!(!(has_terminal(w) && uncounted_len_of(w) > 0), "{w:?}");
+        }
+    }
 }

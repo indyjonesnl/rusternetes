@@ -4137,6 +4137,7 @@ dependencies = [
  "ipnet",
  "mimalloc",
  "openapiv3",
+ "pem",
  "prometheus-http-query",
  "prost",
  "prost-build",
@@ -4176,6 +4177,7 @@ dependencies = [
  "url",
  "uuid",
  "warp",
+ "x509-parser",
 ]
 
 [[package]]

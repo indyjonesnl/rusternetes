@@ -135,21 +135,13 @@ pub trait VolumePlugin: Send + Sync {
         false
     }
 
-    /// `NodeExpandableVolumePlugin.RequiresFSResize` (`plugins.go:258-263`),
-    /// gated on the plugin being node-expandable at all.
-    ///
-    /// **Deliberate collapse**, the same one as [`VolumePlugin::can_attach`]:
-    /// upstream's `FindNodeExpandablePluginBySpec` (`plugins.go:926-935`)
-    /// type-asserts the plugin to `NodeExpandableVolumePlugin` and the caller
-    /// then calls `RequiresFSResize()` on it, so a plugin that is not
-    /// node-expandable and one that is but does not need an FS resize reach
-    /// the same branch in `volumeNeedsExpansion`
-    /// (`actual_state_of_world.go:981-992`). We have no
-    /// `NodeExpandableVolumePlugin` sub-interface, so the two collapse into
-    /// one predicate. Every plugin this crate registers answers `false`,
-    /// which is the answer upstream gives for all seven of them.
-    fn requires_fs_resize(&self, _spec: &Spec<'_>) -> bool {
-        false
+    /// Rust spelling of the type assertion
+    /// `volumePlugin.(volume.NodeExpandableVolumePlugin)`
+    /// (`plugins.go:931`, `:944`), which `FindNodeExpandablePlugin{BySpec,
+    /// ByName}` perform. `None` is a failed assertion — every plugin
+    /// registered today, as upstream's seven.
+    fn as_node_expandable_plugin(&self) -> Option<&dyn NodeExpandableVolumePlugin> {
+        None
     }
 
     /// Rust spelling of the type assertion
@@ -301,6 +293,41 @@ pub struct Metrics {
     pub inodes_free: Option<Quantity>,
     /// Non-empty when the stats could not be collected.
     pub error: String,
+}
+
+/// Port of `volume.NodeResizeOptions` (`pkg/volume/plugins.go:99-116`).
+pub struct NodeResizeOptions<'a> {
+    pub volume_spec: &'a Spec<'a>,
+    /// Location of the actual device on the node. For CSI this may just be
+    /// the volume ID.
+    pub device_path: String,
+    /// Where the device is mounted on the node: the global mount path if the
+    /// volume type is attachable, otherwise where it was mounted for the pod.
+    pub device_mount_path: String,
+    /// Where the volume is staged (`DeviceStagePath`).
+    pub device_stage_path: String,
+    pub new_size: Quantity,
+    pub old_size: Quantity,
+}
+
+/// Port of `volume.NodeExpandableVolumePlugin` (`pkg/volume/plugins.go:256-263`),
+/// the extension of [`VolumePlugin`] for volumes that require expansion on
+/// the node via a `NodeExpand` call. A plugin opts in by returning itself
+/// from [`VolumePlugin::as_node_expandable_plugin`].
+///
+/// Replaces the `requires_fs_resize` predicate that previously sat on
+/// [`VolumePlugin`] and collapsed this sub-interface (#2328). Upstream's
+/// `RequiresFSResize()` takes no spec, and neither does this.
+#[async_trait]
+pub trait NodeExpandableVolumePlugin: VolumePlugin {
+    /// `RequiresFSResize` (`plugins.go:260`).
+    fn requires_fs_resize(&self) -> bool;
+
+    /// `NodeExpand` (`plugins.go:262`): expand the volume on
+    /// `device_mount_path` and report whether the resize happened. Async
+    /// where upstream is synchronous because the CSI implementation awaits
+    /// a gRPC `NodeExpandVolume`; an idiom difference, not a mechanism one.
+    async fn node_expand(&self, resize_options: NodeResizeOptions<'_>) -> Result<bool>;
 }
 
 /// Port of `volume.BlockVolumePlugin` (`pkg/volume/plugins.go:265-283`), the

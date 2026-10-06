@@ -531,7 +531,7 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
                             key
                         ))
                     })?;
-                    let merged_array = strategic_merge_arrays(orig_arr, patch_arr)?;
+                    let merged_array = strategic_merge_arrays_for_field(key, orig_arr, patch_arr)?;
                     result_obj.insert(key.clone(), Value::Array(merged_array));
                 } else if patch_value.is_object()
                     && result_obj.get(key).is_some_and(|v| v.is_object())
@@ -843,6 +843,11 @@ enum MergeKeyStrategy {
     /// directive object leaks into the stored list, breaking OwnerReference
     /// decode ("missing field `apiVersion`") and blocking orphan deletion.
     Uid,
+    /// `type` field — upstream `patchMergeKey:"type"` on every `conditions`
+    /// list (`PodStatus.conditions`, `NodeStatus.conditions`, ...). A sparse
+    /// status patch that names one condition (the readiness-gate pattern,
+    /// test/e2e/common/node/pods.go:779) must add to the list, not replace it.
+    Type,
 }
 
 /// Pick the merge-key strategy for an array based on the patch items.
@@ -899,6 +904,10 @@ fn merge_key_with(item: &Value, strategy: MergeKeyStrategy) -> Option<String> {
             .get("uid")
             .and_then(|v| v.as_str())
             .map(|s| format!("uid:{s}")),
+        MergeKeyStrategy::Type => obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("type:{s}")),
     }
 }
 
@@ -921,7 +930,37 @@ fn is_delete_directive(item: &Value) -> bool {
 /// resulting array, matching upstream
 /// `apimachinery/pkg/util/strategicpatch/patch.go::mergePatchIntoOriginal`.
 fn strategic_merge_arrays(original: &[Value], patch: &[Value]) -> Result<Vec<Value>, PatchError> {
-    let strategy = match detect_merge_key_strategy(patch) {
+    strategic_merge_arrays_with(original, patch, detect_merge_key_strategy(patch))
+}
+
+/// [`strategic_merge_arrays`] for the list under object key `field`: the
+/// `conditions` lists are keyed by `type` (upstream struct tag
+/// `patchStrategy:"merge" patchMergeKey:"type"`), which the field-agnostic
+/// detection cannot see.
+fn strategic_merge_arrays_for_field(
+    field: &str,
+    original: &[Value],
+    patch: &[Value],
+) -> Result<Vec<Value>, PatchError> {
+    let strategy = if field == "conditions"
+        && !patch.is_empty()
+        && patch
+            .iter()
+            .all(|v| v.as_object().is_some_and(|o| o.contains_key("type")))
+    {
+        Some(MergeKeyStrategy::Type)
+    } else {
+        detect_merge_key_strategy(patch)
+    };
+    strategic_merge_arrays_with(original, patch, strategy)
+}
+
+fn strategic_merge_arrays_with(
+    original: &[Value],
+    patch: &[Value],
+    strategy: Option<MergeKeyStrategy>,
+) -> Result<Vec<Value>, PatchError> {
+    let strategy = match strategy {
         Some(s) => s,
         None => {
             // Primitive list or un-keyed objects — replace the array.

@@ -443,6 +443,11 @@ pub struct Kubelet {
     metrics_port: u16,
     /// Static pod manifest dir (upstream staticPodPath). None = disabled.
     pod_manifest_path: Option<PathBuf>,
+    /// `KubeletConfiguration.nodeStatusUpdateFrequency`: how often the
+    /// heartbeat loop computes and posts NodeStatus. Upstream
+    /// `Kubelet.nodeStatusUpdateFrequency` (pkg/kubelet/kubelet.go:624),
+    /// consumed by `wait.JitterUntil(kl.syncNodeStatus, ...)` (:1852).
+    node_status_update_frequency: Duration,
     /// Current file-sourced static pods, keyed by (suffixed) pod name.
     /// Workers consult this before storage so static pods survive
     /// mirror-pod deletion.
@@ -696,6 +701,7 @@ impl Kubelet {
             last_sync: AtomicU64::new(0),
             metrics_port,
             pod_manifest_path: None,
+            node_status_update_frequency: Duration::from_secs(10),
             static_pods: Arc::new(Mutex::new(HashMap::new())),
             sysctl_allowlist: crate::sysctl::Allowlist::new(&allowed_unsafe_sysctls),
         })
@@ -705,6 +711,20 @@ impl Kubelet {
     pub fn with_pod_manifest_path(mut self, path: Option<PathBuf>) -> Self {
         self.pod_manifest_path = path;
         self
+    }
+
+    /// Apply `KubeletConfiguration.nodeStatusUpdateFrequency` (with the
+    /// upstream default of 10s when unset/zero, `defaults.go`).
+    pub fn with_node_status_update_frequency(mut self, d: Option<Duration>) -> Self {
+        self.node_status_update_frequency = d
+            .filter(|d| !d.is_zero())
+            .unwrap_or(Duration::from_secs(10));
+        self
+    }
+
+    /// Interval of the dedicated NodeStatus heartbeat in `run`.
+    pub(crate) fn node_status_heartbeat_interval(&self) -> Duration {
+        self.node_status_update_frequency
     }
 
     /// Liveness probe — true iff `sync_loop` completed inside the
@@ -1112,8 +1132,9 @@ impl Kubelet {
                         error!("Error updating node status: {}", e);
                     }
                 }
-                // Dedicated heartbeat — runs every 10s independently of sync
-                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                // Dedicated heartbeat — runs every nodeStatusUpdateFrequency
+                // (default 10s) independently of sync
+                _ = tokio::time::sleep(self.node_status_heartbeat_interval()) => {
                     if let Err(e) = self.update_node_status().await {
                         error!("Error updating node status: {}", e);
                     }
@@ -5990,6 +6011,47 @@ mod taint_eviction_tests {
 #[cfg(test)]
 mod tests {
     use super::Kubelet;
+
+    /// `nodeStatusUpdateFrequency` drives the heartbeat interval; default 10s
+    /// when unset/zero (upstream `defaults.go`; consumer
+    /// pkg/kubelet/kubelet.go:1852 `wait.JitterUntil(kl.syncNodeStatus,
+    /// kl.nodeStatusUpdateFrequency, ...)`).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heartbeat_interval_follows_node_status_update_frequency() {
+        use rusternetes_storage::StorageBackend;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let mk = || async {
+            Kubelet::new(
+                "node-hb".into(),
+                std::sync::Arc::new(StorageBackend::new_memory()),
+                10,
+                dir.path().join("vols").display().to_string(),
+                "10.96.0.10".into(),
+                "cluster.local".into(),
+                "bridge".into(),
+                String::new(),
+            )
+            .await
+            .unwrap()
+        };
+        let d = mk().await;
+        assert_eq!(d.node_status_heartbeat_interval(), Duration::from_secs(10));
+        let c = mk()
+            .await
+            .with_node_status_update_frequency(Some(Duration::from_secs(25)));
+        assert_eq!(c.node_status_heartbeat_interval(), Duration::from_secs(25));
+        let z = mk()
+            .await
+            .with_node_status_update_frequency(Some(Duration::ZERO));
+        assert_eq!(z.node_status_heartbeat_interval(), Duration::from_secs(10));
+    }
 
     /// #1929: a kubelet whose CRI endpoint is an absent socket must report
     /// `Ready=False`/`KubeletNotReady`, both at registration and on every
