@@ -355,6 +355,13 @@ pub struct DeviceRequestAllocationResult {
     /// `Required` when absent, then a DNS-1123 label (`:514`).
     #[serde(default)]
     pub device: String,
+
+    /// AdminAccess indicates that this device was allocated for administrative
+    /// access (`pkg/apis/resource/types.go` `DeviceRequestAllocationResult.AdminAccess`,
+    /// gated by `DRAAdminAccess`, default on in 1.35). Checked against the
+    /// namespace label by `AuthorizedForAdminStatus`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_access: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

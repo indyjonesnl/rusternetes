@@ -3,10 +3,11 @@
 //! `resource.kubernetes.io/admin-access: "true"` label on the containing
 //! namespace.
 //!
-//! Upstream runs these inside the strategy's `Validate`, which can read the
-//! namespace through a client. Our strategies are synchronous, so the checks
-//! run from the Store's `BeginCreate` / `BeginUpdate` hooks instead; the only
-//! difference is that a failure is reported before the other validation
+//! Upstream runs these inside the strategy's `Validate` / `ValidateUpdate`
+//! (resourceclaim/strategy.go:190-198 for the status strategy), which can read
+//! the namespace through a client. Our strategies are synchronous, so the
+//! checks run from the Store's `BeginCreate` / `BeginUpdate` hooks instead; the
+//! only difference is that a failure is reported before the other validation
 //! errors rather than together with them.
 
 use rusternetes_common::resources::dra::{DeviceRequest, DeviceRequestAllocationResult};
@@ -74,15 +75,35 @@ pub async fn authorized_for_admin(
     Ok(())
 }
 
-/// `AuthorizedForAdminStatus` (utils.go:66-101). Our allocation results have
-/// no `adminAccess` field (the gated status fields are not modelled), so there
-/// is never anything to check.
-#[allow(dead_code)]
+/// `adminRequested` (utils.go:93-101): the first result with `adminAccess`
+/// set, and its path.
+fn admin_requested(results: &[DeviceRequestAllocationResult]) -> Option<Path> {
+    results
+        .iter()
+        .position(|r| r.admin_access == Some(true))
+        .map(|i| {
+            Path::new("status")
+                .child("allocation")
+                .child("devices")
+                .child("results")
+                .index(i)
+                .child("adminAccess")
+        })
+}
+
+/// `AuthorizedForAdminStatus` (utils.go:66-91). Skipped when the old status
+/// already had admin access granted, since `status.allocation` is immutable.
 pub async fn authorized_for_admin_status(
-    _storage: &StorageBackend,
-    _new: &[DeviceRequestAllocationResult],
-    _old: &[DeviceRequestAllocationResult],
-    _namespace: &str,
+    storage: &StorageBackend,
+    new: &[DeviceRequestAllocationResult],
+    old: &[DeviceRequestAllocationResult],
+    namespace: &str,
 ) -> rusternetes_common::Result<()> {
-    Ok(())
+    if admin_requested(old).is_some() {
+        return Ok(());
+    }
+    match admin_requested(new) {
+        Some(path) => check_namespace(storage, namespace, &path).await,
+        None => Ok(()),
+    }
 }

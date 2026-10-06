@@ -21,9 +21,11 @@ use rusternetes_common::validation::resourceclaim::{
 use rusternetes_common::Result;
 use rusternetes_storage::StorageBackend;
 
-use super::admin::authorized_for_admin;
+use super::admin::{authorized_for_admin, authorized_for_admin_status};
 use super::spec::drop_disabled_fields as drop_disabled_spec_fields;
-use crate::registry::generic::store::{BeginCreate, CreateOptions, Finish};
+use crate::registry::generic::store::{
+    BeginCreate, BeginUpdate, CreateOptions, Finish, UpdateOptions,
+};
 use crate::registry::generic::Store;
 use crate::registry::rest::{
     reset_object_meta_for_status, GroupResource, NamespaceScopedStrategy, RequestContext,
@@ -90,6 +92,38 @@ impl BeginCreate<ResourceClaim> for AdminCheck {
             .or_else(|| obj.metadata.namespace.clone())
             .unwrap_or_default();
         authorized_for_admin(&self.storage, &obj.spec.devices.requests, &ns).await?;
+        Ok(Box::new(Noop))
+    }
+}
+
+/// Hook running `AuthorizedForAdminStatus` before the status update strategy
+/// (strategy.go:190-196).
+struct AdminStatusCheck {
+    storage: Arc<StorageBackend>,
+}
+
+#[async_trait]
+impl BeginUpdate<ResourceClaim> for AdminStatusCheck {
+    async fn begin_update(
+        &self,
+        ctx: &RequestContext,
+        obj: &mut ResourceClaim,
+        old: &mut ResourceClaim,
+        _options: &UpdateOptions,
+    ) -> Result<Box<dyn Finish>> {
+        let results = |c: &ResourceClaim| {
+            c.status
+                .as_ref()
+                .and_then(|s| s.allocation.as_ref())
+                .map(|a| a.devices.results.clone())
+                .unwrap_or_default()
+        };
+        let ns = ctx
+            .namespace
+            .clone()
+            .or_else(|| obj.metadata.namespace.clone())
+            .unwrap_or_default();
+        authorized_for_admin_status(&self.storage, &results(obj), &results(old), &ns).await?;
         Ok(Box::new(Noop))
     }
 }
@@ -178,8 +212,8 @@ impl RestUpdateStrategy<ResourceClaim> for StatusStrategy {
         false
     }
 
-    /// Only status may change. The status-only gated fields are not modelled
-    /// (see [`super::spec`]), so `dropDisabledStatusFields` has nothing to do.
+    /// Only status may change. `DRAAdminAccess` is on in 1.35, so
+    /// `dropDisabledStatusFields` has nothing to do for `adminAccess`.
     fn prepare_for_update(
         &self,
         _ctx: &RequestContext,
@@ -229,8 +263,11 @@ pub fn new_stores(
         Arc::new(Strategy),
     );
     store.return_deleted_object = true;
-    store.begin_create = Some(Arc::new(AdminCheck { storage }));
-    let status = store.with_update_strategy(Arc::new(StatusStrategy));
+    store.begin_create = Some(Arc::new(AdminCheck {
+        storage: storage.clone(),
+    }));
+    let mut status = store.with_update_strategy(Arc::new(StatusStrategy));
+    status.begin_update = Some(Arc::new(AdminStatusCheck { storage }));
     (store, status)
 }
 

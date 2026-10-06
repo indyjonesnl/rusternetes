@@ -223,6 +223,7 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
                         driver: device.driver,
                         pool: device.pool,
                         device: device.device_name,
+                        admin_access: None,
                     });
                 }
             }
