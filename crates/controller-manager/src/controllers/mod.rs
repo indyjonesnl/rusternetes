@@ -49,6 +49,9 @@ pub mod volume_attachment;
 pub mod volume_expansion;
 pub mod volume_snapshot;
 pub mod vpa;
+pub mod worker_pool;
+#[cfg(test)]
+mod worker_pool_tests;
 
 /// Propagate the pod's ServiceAccount `imagePullSecrets` onto a
 /// controller-created pod spec (#1084). Controllers write pods straight to

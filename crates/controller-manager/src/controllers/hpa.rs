@@ -1,3 +1,4 @@
+use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use chrono::Utc;
 use rusternetes_common::resources::autoscaling::ResourceMetricStatus;
@@ -14,6 +15,10 @@ use crate::controllers::hpa_metrics_client::{
     FakeMetricsClient, HttpMetricsClient, HttpMetricsConfig, MetricsClient, PodMetricsInfo,
 };
 use crate::controllers::hpa_replica_calculator as calc;
+
+/// Workers draining this controller's queue: upstream `ConcurrentHorizontalPodAutoscalerSyncs` default,
+/// pkg/controller/podautoscaler/config/v1alpha1/defaults.go:37-38, launched at cmd/kube-controller-manager/app/autoscaling.go:103.
+const CONCURRENT_HPA_SYNCS: usize = 5;
 
 pub struct HorizontalPodAutoscalerController<S: Storage> {
     storage: Arc<S>,
@@ -68,10 +73,14 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // Upstream launches `ConcurrentHorizontalPodAutoscalerSyncs` workers over one shared queue
+        // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);
+        // a key in flight is never handed to a second worker.
+        spawn_workers(CONCURRENT_HPA_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {

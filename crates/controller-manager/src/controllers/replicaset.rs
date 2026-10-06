@@ -1,4 +1,5 @@
 use super::expectations::ControllerExpectations;
+use crate::controllers::worker_pool::spawn_workers;
 use futures::StreamExt;
 use rusternetes_common::{
     resources::{Pod, PodStatus, ReplicaSet, ReplicaSetStatus},
@@ -7,6 +8,10 @@ use rusternetes_common::{
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WatchEvent, WorkQueue};
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
+
+/// Workers draining this controller's queue: upstream `ConcurrentRSSyncs` default,
+/// pkg/controller/replicaset/config/v1alpha1/defaults.go:33-34, launched at cmd/kube-controller-manager/app/apps.go:116.
+const CONCURRENT_RS_SYNCS: usize = 5;
 
 /// ReplicaSetController reconciles ReplicaSet resources
 /// A ReplicaSet ensures that a specified number of pod replicas are running at any given time
@@ -81,10 +86,14 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // Upstream launches `ConcurrentRSSyncs` workers over one shared queue
+        // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);
+        // a key in flight is never handed to a second worker.
+        spawn_workers(CONCURRENT_RS_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {

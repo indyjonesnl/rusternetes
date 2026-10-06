@@ -5,6 +5,7 @@
 // - Automatic deletion of finished Jobs after specified time
 // - Cleanup of associated Pods
 
+use crate::controllers::worker_pool::spawn_workers;
 use chrono::{DateTime, Duration, Utc};
 use futures::StreamExt;
 use rusternetes_common::resources::workloads::Job;
@@ -12,6 +13,10 @@ use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQue
 use std::sync::Arc;
 use tokio::time::{sleep, Duration as TokioDuration};
 use tracing::{debug, error, info, warn};
+
+/// Workers draining this controller's queue: upstream `ConcurrentTTLSyncs (ttl-after-finished)` default,
+/// pkg/controller/ttlafterfinished/config/v1alpha1/defaults.go:33-34, launched at cmd/kube-controller-manager/app/core.go:927.
+const CONCURRENT_TTL_SYNCS: usize = 5;
 
 /// TTL Controller for automatic cleanup of finished Jobs
 #[allow(dead_code)]
@@ -36,10 +41,14 @@ impl<S: Storage + 'static> TTLController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // Upstream launches `ConcurrentTTLSyncs (ttl-after-finished)` workers over one shared queue
+        // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);
+        // a key in flight is never handed to a second worker.
+        spawn_workers(CONCURRENT_TTL_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {
