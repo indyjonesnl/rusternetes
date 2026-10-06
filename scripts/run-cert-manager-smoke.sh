@@ -110,8 +110,21 @@ cleanup() {
         >"${RESULTS_DIR}/cert-manager-validatingwebhook.yaml" 2>&1 || true
     ${KUBECTL} get mutatingwebhookconfiguration cert-manager-webhook -o yaml \
         >"${RESULTS_DIR}/cert-manager-mutatingwebhook.yaml" 2>&1 || true
-    ${KUBECTL} -n cert-manager get lease -o wide \
+    # Leader-election leases live in kube-system (the old `-n cert-manager`
+    # listing was always empty).
+    ${KUBECTL} -n kube-system get lease -o yaml \
         >"${RESULTS_DIR}/cert-manager-leases.txt" 2>&1 || true
+    # How the api-server reaches the webhook: admission resolves the Service to
+    # a ready EndpointSlice address and only falls back to the ClusterIP (which
+    # the api-server netns cannot route) when none is found — run 37300860462
+    # failed on exactly that fallback.
+    ${KUBECTL} -n cert-manager get svc,endpointslice,endpoints -o yaml \
+        >"${RESULTS_DIR}/cert-manager-svc-endpoints.yaml" 2>&1 || true
+    for c in api-server controller-manager; do
+        # shellcheck disable=SC2086
+        ${COMPOSE} logs --no-color --tail=400 "${c}" \
+            >"${RESULTS_DIR}/compose-${c}.log" 2>&1 || true
+    done
     # shellcheck disable=SC2086
     ${COMPOSE} down -v --remove-orphans >/dev/null 2>&1 || true
 }
@@ -199,16 +212,32 @@ CABUNDLE_JSONPATH='{.webhooks[0].clientConfig.caBundle}'
 echo "[6b] Waiting for cainjector to inject the webhook caBundle..."
 bounced=0
 injected=0
-for i in $(seq 1 60); do
+for i in $(seq 1 90); do
     ca="$(${KUBECTL} get ${WEBHOOK_CFG} -o jsonpath="${CABUNDLE_JSONPATH}" 2>/dev/null || true)"
     if [ -n "${ca}" ]; then
         echo "caBundle injected after $((i * 2))s"
         injected=1
         break
     fi
-    # Halfway through the ~120s budget, force a fresh cainjector list-watch.
+    # After 60s of a ~180s budget, force a fresh cainjector list-watch.
     if [ "${i}" -eq 30 ] && [ "${bounced}" -eq 0 ]; then
         echo "caBundle still empty after 60s — restarting cainjector to force a re-list"
+        # Evidence first (#1628): the pod we are about to replace is the one
+        # that missed the Secret event, and its log is gone after the restart.
+        ${KUBECTL} -n cert-manager logs deploy/cert-manager-cainjector --tail=300 \
+            >"${RESULTS_DIR}/cert-manager-cainjector-before-bounce.log" 2>&1 || true
+        ${KUBECTL} -n kube-system get lease cert-manager-cainjector-leader-election -o yaml \
+            >"${RESULTS_DIR}/cainjector-lease-before-bounce.yaml" 2>&1 || true
+        ${KUBECTL} -n cert-manager get secret -l app.kubernetes.io/managed-by=cert-manager \
+            >"${RESULTS_DIR}/labeled-secrets-before-bounce.txt" 2>&1 || true
+        # The replacement pod can only inject once it leads. cainjector's
+        # leader lease is 60s and the killed pod does not always release it
+        # (runs 37195152003 / 36994513755: the new pod sat on "attempting to
+        # acquire leader lease" until the 65s wait ended). A clean deploy
+        # restart by an operator waits the lease out; the smoke does not need
+        # to, so drop the lease and let the new pod create it at once.
+        ${KUBECTL} -n kube-system delete lease cert-manager-cainjector-leader-election \
+            --ignore-not-found || true
         ${KUBECTL} -n cert-manager rollout restart deploy/cert-manager-cainjector || true
         ${KUBECTL} -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=120s || true
         bounced=1
