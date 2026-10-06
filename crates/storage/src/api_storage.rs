@@ -60,9 +60,9 @@ const SHARED_WATCH_BUFFER: usize = 256;
 /// Registry of live shared upstream watches, keyed by resolved collection path.
 type SharedWatches = Arc<Mutex<HashMap<String, broadcast::Sender<Arc<WatchEvent>>>>>;
 
-/// Discovery-resolved `plural -> (api_root, namespaced)` cache, shared between
-/// the per-controller clones of one [`ApiStorage`].
-type DynamicResources = Arc<RwLock<Option<HashMap<String, (String, bool)>>>>;
+/// Discovery cache: `plural -> (api_root, namespaced)`, shared between
+/// per-controller views (see [`ApiStorage::with_client`]).
+type DynamicTypes = Arc<RwLock<Option<HashMap<String, (String, bool)>>>>;
 
 /// A [`Storage`] implementation that proxies to the api-server over REST.
 pub struct ApiStorage {
@@ -71,7 +71,7 @@ pub struct ApiStorage {
     /// the built-in [`static_resource_info`] table (CRDs, aggregated APIs, and
     /// the arbitrary types the garbage collector traverses). `None` until the
     /// first miss triggers a one-shot discovery load; `Some` thereafter.
-    dynamic: DynamicResources,
+    dynamic: DynamicTypes,
     /// One shared upstream `?watch=true` stream per resolved collection path,
     /// fanned out to every controller watching that type via a broadcast — so
     /// the ~50 controller watch() calls collapse to ~one HTTP connection per
