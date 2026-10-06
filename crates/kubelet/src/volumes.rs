@@ -1102,10 +1102,13 @@ impl VolumeManager {
                 }
 
                 // Now use the PVC like a regular PersistentVolumeClaim
-                let pvc: PersistentVolumeClaim = storage
-                    .get(&pvc_key)
-                    .await
-                    .with_context(|| format!("Ephemeral PVC {} not found", pvc_name))?;
+                let pvc: PersistentVolumeClaim =
+                    storage.get(&pvc_key).await.with_context(|| {
+                        format!(
+                            "PersistentVolumeClaim {} not found in namespace {}",
+                            pvc_name, namespace
+                        )
+                    })?;
 
                 if let Some(pv_name) = &pvc.spec.volume_name {
                     let pv_key = build_key("persistentvolumes", None, pv_name);
@@ -1126,8 +1129,12 @@ impl VolumeManager {
                     );
                     return Ok(Some(pv));
                 } else {
+                    // Same wording as the PersistentVolumeClaim branch so
+                    // `is_volume_wait_error` treats it as a retriable wait
+                    // (upstream: an ephemeral volume is handled "the same way
+                    // as a PVC reference", `desired_state_of_world_populator.go:432-441`).
                     return Err(anyhow::anyhow!(
-                        "Ephemeral PVC {} is not bound yet",
+                        "PersistentVolumeClaim {} is not bound to a volume",
                         pvc_name
                     ));
                 }
@@ -2449,6 +2456,37 @@ mod pvc_resolution_tests {
             err.to_string(),
             "PersistentVolumeClaim is not bound to a volume"
         );
+    }
+
+    /// #1981: upstream handles a generic ephemeral volume "the same way as a
+    /// PVC reference" (`desired_state_of_world_populator.go:432-441`), so an
+    /// unbound ephemeral claim must be a retriable volume wait exactly like an
+    /// unbound PVC — not a start failure.
+    #[tokio::test]
+    async fn an_unbound_ephemeral_pvc_is_a_volume_wait_error() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "scratch",
+            "ephemeral": {"volumeClaimTemplate": {"spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": {"requests": {"storage": "1Gi"}}}}}
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "ns"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+
+        let err = vm(Some(storage))
+            .resolve_persistent_volume(&pod, &volume)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "PersistentVolumeClaim p-scratch is not bound to a volume"
+        );
+        assert!(crate::lifecycle::is_volume_wait_error(&err.to_string()));
     }
 
     /// Ruling 3: `ephemeral` set but `volumeClaimTemplate` absent falls
