@@ -10,7 +10,10 @@ use rusternetes_common::validation::metav1::{validate_create_options, CreateOpti
 use rusternetes_common::{Error, Result};
 
 use super::admission::{Admission, CreateValidation};
-use super::rest::{authorize, decode, dry_run_param, is_dry_run, respond, RequestScope};
+use super::rest::{
+    authorize, decode, dedup_owner_references_and_add_warning, dry_run_param, is_dry_run, respond,
+    RequestScope,
+};
 use crate::registry::generic;
 use crate::registry::rest::{
     ensure_object_namespace_matches_request_namespace, expected_namespace_for_scope,
@@ -76,7 +79,11 @@ pub async fn create_resource<T: Object>(
 
     // Mutating admission, then the Store's create with validating admission
     // as its callback (create.go:183-209).
+    // create.go:192-193: dedup owner references before mutating admission,
+    // and again after it (:207-208).
+    dedup_owner_references_and_add_warning(&mut obj, &ctx, false);
     let mut obj = admission.admit(Operation::Create, obj, None).await?;
+    dedup_owner_references_and_add_warning(&mut obj, &ctx, true);
     // The dispatcher decodes a webhook's patched object like a request body.
     scope.convert(&mut obj);
     let validation = CreateValidation {

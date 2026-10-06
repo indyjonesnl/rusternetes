@@ -662,7 +662,7 @@ pub struct MutatingAdmission<'a, T: Object> {
 
 #[async_trait]
 impl<T: Object> TransformFunc<T> for MutatingAdmission<'_, T> {
-    async fn transform(&self, _ctx: &RequestContext, new: Option<T>, old: Option<&T>) -> Result<T> {
+    async fn transform(&self, ctx: &RequestContext, new: Option<T>, old: Option<&T>) -> Result<T> {
         let new = new.ok_or_else(|| {
             Error::Internal("mutating admission ran before an object was built".to_string())
         })?;
@@ -675,6 +675,9 @@ impl<T: Object> TransformFunc<T> for MutatingAdmission<'_, T> {
             }
         };
         self.scope.convert(&mut obj);
+        // Dedup owner references again after mutating admission:
+        // update.go:185-189 and patch.go:691-697 (`patch` only dedups here).
+        super::rest::dedup_owner_references_and_add_warning(&mut obj, ctx, true);
         Ok(obj)
     }
 }

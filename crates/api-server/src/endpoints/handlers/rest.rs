@@ -1,7 +1,7 @@
 //! Port of `endpoints/handlers/rest.go`: the per-resource `RequestScope` and
 //! the helpers every verb handler shares.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -10,6 +10,7 @@ use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Decision, RequestAttributes};
 use rusternetes_common::dump::decode_request_body;
+use rusternetes_common::types::OwnerReference;
 use rusternetes_common::{Error, Result};
 use serde::Serialize;
 
@@ -207,6 +208,56 @@ pub(super) fn decode<T: Object>(
     let warnings = crate::handlers::validation::validate_strict_fields(params, body, &obj)?;
     scope.convert(&mut obj);
     Ok((obj, warnings))
+}
+
+/// `DuplicateOwnerReferencesWarningFormat` (rest.go:55-57).
+const DUPLICATE_OWNER_REFERENCES_WARNING: &str = ".metadata.ownerReferences contains duplicate entries; API server dedups owner references in 1.20+, and may reject such requests as early as 1.24; please fix your requests; duplicate UID(s) observed: ";
+/// `DuplicateOwnerReferencesAfterMutatingAdmissionWarningFormat`
+/// (rest.go:58-62).
+const DUPLICATE_OWNER_REFERENCES_AFTER_ADMISSION_WARNING: &str = ".metadata.ownerReferences contains duplicate entries after mutating admission happens; API server dedups owner references in 1.20+, and may reject such requests as early as 1.24; please fix your requests; duplicate UID(s) observed: ";
+
+/// `dedupOwnerReferences` (rest.go:293-313): drops an entry only when it is
+/// wholly equal to one already kept (the UID set is a short-circuit, as
+/// upstream), and reports the UID of each dropped entry.
+pub(super) fn dedup_owner_references(
+    refs: &[OwnerReference],
+) -> (Vec<OwnerReference>, Vec<String>) {
+    let mut result: Vec<OwnerReference> = Vec::new();
+    let mut duplicates = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for r in refs {
+        // `hasOwnerReference` (rest.go:323-330) compares whole entries.
+        if !seen.contains(r.uid.as_str()) || !result.contains(r) {
+            seen.insert(r.uid.as_str());
+            result.push(r.clone());
+        } else {
+            duplicates.push(r.uid.clone());
+        }
+    }
+    (result, duplicates)
+}
+
+/// `dedupOwnerReferencesAndAddWarning` (rest.go:334-353). Called before and
+/// after mutating admission on create and update, and only after it on patch.
+pub(super) fn dedup_owner_references_and_add_warning<T: Object>(
+    obj: &mut T,
+    ctx: &RequestContext,
+    after_mutating_admission: bool,
+) {
+    let Some(refs) = obj.metadata().owner_references.as_deref() else {
+        return;
+    };
+    let (deduped, duplicates) = dedup_owner_references(refs);
+    if duplicates.is_empty() {
+        return;
+    }
+    let prefix = if after_mutating_admission {
+        DUPLICATE_OWNER_REFERENCES_AFTER_ADMISSION_WARNING
+    } else {
+        DUPLICATE_OWNER_REFERENCES_WARNING
+    };
+    ctx.add_warning(format!("{prefix}{}", duplicates.join(", ")));
+    obj.metadata_mut().owner_references = Some(deduped);
 }
 
 /// `checkName` (rest.go:272-290).
