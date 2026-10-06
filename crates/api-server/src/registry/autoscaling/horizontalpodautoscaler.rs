@@ -94,6 +94,10 @@ fn copy_scaling_rules(from: Option<&HPAScalingRules>, mut to: HPAScalingRules) -
 /// through: `SetDefaults_HorizontalPodAutoscaler`
 /// (pkg/apis/autoscaling/v2/defaults.go:64-100). Runs on create and update.
 pub fn convert_to_internal(hpa: &mut HorizontalPodAutoscaler) {
+    // The stored version, whichever one the request was written in
+    // (`autoscaling/v1` bodies are converted onto it, #2100).
+    hpa.type_meta.api_version = "autoscaling/v2".to_string();
+    hpa.type_meta.kind = "HorizontalPodAutoscaler".to_string();
     let spec = &mut hpa.spec;
     spec.min_replicas.get_or_insert(1);
 

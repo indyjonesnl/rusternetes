@@ -3,6 +3,7 @@ pub mod apiregistration;
 pub mod authentication;
 pub mod authorization;
 pub mod autoscaling;
+pub mod autoscaling_v1;
 pub mod binding;
 pub mod certificates;
 pub mod componentstatus;
