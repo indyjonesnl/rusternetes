@@ -96,10 +96,9 @@ fn selector_parses_and_matches_template(
     invalid_detail: &str,
 ) -> ErrorList {
     if crate::types::label_selector_as_selector(Some(selector)).is_err() {
-        let value = serde_json::to_value(selector).unwrap_or(serde_json::Value::Null);
         return vec![Error::invalid(
             &fld_path.child("selector"),
-            BadValue::Json(value),
+            BadValue::marshal(selector),
             invalid_detail,
         )];
     }
@@ -1891,8 +1890,21 @@ mod workload_parity_tests {
 
     fn expected_selector_invalid(detail: &str) -> Vec<(String, BadValue)> {
         let selector: LabelSelector = serde_json::from_value(unknown_operator_selector()).unwrap();
-        let value = serde_json::to_value(selector).unwrap();
-        vec![(detail.to_string(), BadValue::Json(value))]
+        vec![(detail.to_string(), BadValue::marshal(&selector))]
+    }
+
+    /// #2190: the selector renders matchLabels before matchExpressions
+    /// (Go declaration order), not alphabetically.
+    #[test]
+    fn invalid_selector_renders_in_declaration_order() {
+        let mut s = base_statefulset(template(Some("Always"), None));
+        s["spec"]["selector"] = unknown_operator_selector();
+        let errs = validate_statefulset(&statefulset(s));
+        let e = errs.iter().find(|e| e.field == "spec.selector").unwrap();
+        assert_eq!(
+            e.error_body(),
+            r#"Invalid value: {"matchLabels":{"app":"x"},"matchExpressions":[{"key":"app","operator":"Bogus","values":["x"]}]}"#
+        );
     }
 
     #[test]

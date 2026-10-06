@@ -58,7 +58,7 @@ pub fn validate_subject_access_review_spec(
     if spec.resource_attributes.is_some() && spec.non_resource_attributes.is_some() {
         errs.push(Error::invalid(
             &path.child("nonResourceAttributes"),
-            BadValue::Json(serde_json::to_value(&spec.non_resource_attributes).unwrap_or_default()),
+            BadValue::marshal(&spec.non_resource_attributes),
             "cannot be specified in combination with resourceAttributes",
         ));
     }
@@ -99,7 +99,7 @@ pub fn validate_self_subject_access_review_spec(
     if spec.resource_attributes.is_some() && spec.non_resource_attributes.is_some() {
         errs.push(Error::invalid(
             &path.child("nonResourceAttributes"),
-            BadValue::Json(serde_json::to_value(&spec.non_resource_attributes).unwrap_or_default()),
+            BadValue::marshal(&spec.non_resource_attributes),
             "cannot be specified in combination with resourceAttributes",
         ));
     }
@@ -169,7 +169,7 @@ pub fn validate_local_subject_access_review(
     if spec.non_resource_attributes.is_some() {
         errs.push(Error::invalid(
             &Path::new("spec.nonResourceAttributes"),
-            BadValue::Json(serde_json::to_value(&spec.non_resource_attributes).unwrap_or_default()),
+            BadValue::marshal(&spec.non_resource_attributes),
             "disallowed on this kind of request",
         ));
     }
@@ -203,7 +203,7 @@ fn metadata_must_be_empty(
     }
     Some(Error::invalid(
         &Path::new("metadata"),
-        BadValue::Json(serde_json::to_value(reported).unwrap_or_default()),
+        BadValue::marshal(reported),
         detail,
     ))
 }
@@ -365,5 +365,36 @@ fn to_metav1_requirement(req: &LabelSelectorRequirement) -> crate::types::LabelS
         key: req.key.clone(),
         operator: req.operator.clone(),
         values: req.values.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #2190: `metadata` renders in Go struct-field order
+    /// (`ObjectMeta`: name, resourceVersion, generation, ..., labels), with
+    /// map keys sorted, not as an alphabetically sorted object. Upstream:
+    /// `field/errors.go:92-97` marshals the value with `json.Marshal`.
+    #[test]
+    fn metadata_must_be_empty_renders_in_declaration_order() {
+        let meta = ObjectMeta {
+            name: "n".into(),
+            resource_version: Some("7".into()),
+            generation: Some(2),
+            labels: Some(
+                [
+                    ("b".to_string(), "1".to_string()),
+                    ("a".to_string(), "2".to_string()),
+                ]
+                .into(),
+            ),
+            ..Default::default()
+        };
+        let e = metadata_must_be_empty(&meta, &meta, "must be empty").unwrap();
+        assert_eq!(
+            e.error_body(),
+            r#"Invalid value: {"name":"n","resourceVersion":"7","generation":2,"labels":{"a":"2","b":"1"}}: must be empty"#
+        );
     }
 }
