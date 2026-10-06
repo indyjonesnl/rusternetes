@@ -3,12 +3,37 @@ use async_trait::async_trait;
 use rusternetes_common::{Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// In-memory storage implementation for testing
+/// Default number of events retained for `watch_from_revision` replay.
+///
+/// Stands in for the watch cache's bounded ring
+/// (`cacher/watch_cache.go`: `capacity`, `cache []*watchCacheEvent`).
+pub const DEFAULT_HISTORY_CAPACITY: usize = 1000;
+
+/// Bounded event history, ordered by write. Mirrors the watch cache's ring
+/// (`cacher/watch_cache.go` `processEvent` + `updateCache`): the oldest event
+/// is dropped once `capacity` is reached.
+struct History {
+    events: VecDeque<(i64, WatchEvent)>,
+    capacity: usize,
+    /// Highest revision evicted from `events`; events at or below it can no
+    /// longer be replayed. Plays the role of upstream's `oldest` bound
+    /// (`getAllEventsSinceLocked`, `watch_cache.go:885-896`).
+    evicted_floor: i64,
+}
+
 #[derive(Clone)]
 pub struct MemoryStorage {
+    /// Replay buffer for `watch_from_revision`. Guarded by a mutex that is
+    /// also held across `bus.publish` and across subscribe+snapshot, so a
+    /// watcher sees every event exactly once: either in the snapshot or live.
+    /// (Upstream does the same under the watchCache lock: `watch_cache.go:339`
+    /// `processEvent` and `cacher.go` `Watch` both take `w.Lock()`.)
+    history: Arc<Mutex<History>>,
     data: Arc<RwLock<HashMap<String, String>>>,
     // In-process event bus for watch fan-out.
     bus: crate::EventBus,
@@ -34,7 +59,17 @@ pub struct MemoryStorage {
 
 impl MemoryStorage {
     pub fn new() -> Self {
+        Self::with_history_capacity(DEFAULT_HISTORY_CAPACITY)
+    }
+
+    /// Like [`MemoryStorage::new`] with an explicit replay-buffer size.
+    pub fn with_history_capacity(capacity: usize) -> Self {
         Self {
+            history: Arc::new(Mutex::new(History {
+                events: VecDeque::new(),
+                capacity: capacity.max(1),
+                evicted_floor: 0,
+            })),
             data: Arc::new(RwLock::new(HashMap::new())),
             bus: crate::EventBus::new(crate::event_bus::DEFAULT_CAPACITY),
             conflict_update_count: Arc::new(AtomicUsize::new(0)),
@@ -54,6 +89,19 @@ impl MemoryStorage {
     /// all carry it -- and additionally overwrites a resourceVersion a caller
     /// put in a create body, which this backend used to persist verbatim so
     /// that a client could forge one.
+    /// Record `event` (committed at `revision`) in the replay buffer and fan it
+    /// out to live watchers, atomically with respect to `watch_from_revision`.
+    fn emit(&self, revision: i64, event: WatchEvent) {
+        let mut h = self.history.lock().unwrap();
+        if h.events.len() >= h.capacity {
+            if let Some((rev, _)) = h.events.pop_front() {
+                h.evicted_floor = h.evicted_floor.max(rev);
+            }
+        }
+        h.events.push_back((revision, event.clone()));
+        self.bus.publish(event);
+    }
+
     fn stamp_revision(&self, value: &mut serde_json::Value) -> Result<String> {
         let rv = self
             .revision
@@ -155,7 +203,7 @@ impl Storage for MemoryStorage {
             }
         }
 
-        self.stamp_revision(&mut value_json)?;
+        let rev = self.stamp_revision(&mut value_json)?;
         let serialized = serde_json::to_string(&value_json)?;
 
         let mut data = self.data.write().unwrap();
@@ -167,8 +215,10 @@ impl Storage for MemoryStorage {
         drop(data); // Release lock before sending event
 
         // Emit watch event
-        self.bus
-            .publish(WatchEvent::Added(key.to_string(), serialized.clone()));
+        self.emit(
+            rev.parse().unwrap_or_default(),
+            WatchEvent::Added(key.to_string(), serialized.clone()),
+        );
 
         Ok(serde_json::from_str(&serialized)?)
     }
@@ -254,14 +304,16 @@ impl Storage for MemoryStorage {
             }
         }
 
-        self.stamp_revision(&mut value_json)?;
+        let rev = self.stamp_revision(&mut value_json)?;
         let serialized = serde_json::to_string(&value_json)?;
         data.insert(key.to_string(), serialized.clone());
         drop(data); // Release lock before sending event
 
         // Emit watch event
-        self.bus
-            .publish(WatchEvent::Modified(key.to_string(), serialized.clone()));
+        self.emit(
+            rev.parse().unwrap_or_default(),
+            WatchEvent::Modified(key.to_string(), serialized.clone()),
+        );
 
         Ok(serde_json::from_str(&serialized)?)
     }
@@ -275,7 +327,7 @@ impl Storage for MemoryStorage {
         }
 
         let mut value = value.clone();
-        self.stamp_revision(&mut value)?;
+        let rev = self.stamp_revision(&mut value)?;
         let serialized = serde_json::to_string(&value)?;
 
         let mut data = self.data.write().unwrap();
@@ -287,8 +339,10 @@ impl Storage for MemoryStorage {
         drop(data); // Release lock before sending event
 
         // Emit watch event
-        self.bus
-            .publish(WatchEvent::Modified(key.to_string(), serialized));
+        self.emit(
+            rev.parse().unwrap_or_default(),
+            WatchEvent::Modified(key.to_string(), serialized),
+        );
 
         Ok(())
     }
@@ -300,13 +354,14 @@ impl Storage for MemoryStorage {
             .ok_or_else(|| Error::NotFound(key.to_string()))?;
         // A delete advances the cluster revision in etcd; a watcher replaying
         // from the revision the delete produced must not see it again.
-        self.revision
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let rev = self
+            .revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         drop(data); // Release lock before sending event
 
         // Emit watch event with previous value
-        self.bus
-            .publish(WatchEvent::Deleted(key.to_string(), previous_value));
+        self.emit(rev, WatchEvent::Deleted(key.to_string(), previous_value));
 
         Ok(())
     }
@@ -336,9 +391,52 @@ impl Storage for MemoryStorage {
         Ok(results)
     }
 
-    async fn watch_from_revision(&self, prefix: &str, _revision: i64) -> Result<WatchStream> {
-        // Memory storage doesn't support revisions, just delegate to watch
-        self.watch(prefix).await
+    /// Replay every retained event with revision `>= revision` under `prefix`,
+    /// then continue live -- etcd's `WithRev(start)` semantics
+    /// (`etcd3/watcher.go:380`; callers pass `rv + 1`).
+    ///
+    /// A start revision the buffer no longer covers is `Gone`, upstream's
+    /// `NewResourceExpired("too old resource version: ...")`
+    /// (`cacher/watch_cache.go:915-916`), so the client relists rather than
+    /// silently missing events. `revision <= 0` means "from now", as in etcd.
+    async fn watch_from_revision(&self, prefix: &str, revision: i64) -> Result<WatchStream> {
+        if revision <= 0 {
+            return self.watch(prefix).await;
+        }
+        let compacted = self
+            .compacted_revision
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (replay, live) = {
+            let h = self.history.lock().unwrap();
+            if revision <= h.evicted_floor || (compacted > 0 && revision <= compacted) {
+                return Err(Error::Gone(format!(
+                    "too old resource version: {} ({})",
+                    revision,
+                    h.evicted_floor.max(compacted) + 1
+                )));
+            }
+            // Subscribe and snapshot under the lock `emit` holds across
+            // push+publish: no gap, no duplicate at the seam.
+            let live = self.bus.subscribe(prefix);
+            let replay: Vec<Result<WatchEvent>> = h
+                .events
+                .iter()
+                .filter(|(rev, ev)| {
+                    let key = match ev {
+                        WatchEvent::Added(k, _)
+                        | WatchEvent::Modified(k, _)
+                        | WatchEvent::Deleted(k, _) => k,
+                    };
+                    *rev >= revision && key.starts_with(prefix)
+                })
+                .map(|(_, ev)| Ok(ev.clone()))
+                .collect();
+            (replay, live)
+        };
+        Ok(Box::pin(futures::StreamExt::chain(
+            futures::stream::iter(replay),
+            live,
+        )))
     }
 
     async fn watch(&self, prefix: &str) -> Result<WatchStream> {
@@ -440,6 +538,73 @@ mod tests {
     struct TestResource {
         name: String,
         value: i32,
+    }
+
+    fn rv_of(v: &serde_json::Value) -> i64 {
+        v["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn cm(name: &str) -> serde_json::Value {
+        serde_json::json!({"metadata": {"name": name}})
+    }
+
+    /// Replay then live, in order, with no duplicate at the seam (#2239).
+    #[tokio::test]
+    async fn watch_from_revision_replays_then_goes_live() {
+        use futures::StreamExt;
+        let s = MemoryStorage::new();
+        let a: serde_json::Value = s.create("/r/cm/a", &cm("a")).await.unwrap();
+        let _b: serde_json::Value = s.create("/r/cm/b", &cm("b")).await.unwrap();
+        let _o: serde_json::Value = s.create("/r/other/x", &cm("x")).await.unwrap();
+        let mut w = s
+            .watch_from_revision("/r/cm/", rv_of(&a) + 1)
+            .await
+            .unwrap();
+        let _c: serde_json::Value = s.create("/r/cm/c", &cm("c")).await.unwrap();
+        s.delete("/r/cm/b").await.unwrap();
+        let mut got = vec![];
+        for _ in 0..3 {
+            got.push(w.next().await.unwrap().unwrap());
+        }
+        assert!(matches!(&got[0], WatchEvent::Added(k, _) if k == "/r/cm/b"));
+        assert!(matches!(&got[1], WatchEvent::Added(k, _) if k == "/r/cm/c"));
+        assert!(matches!(&got[2], WatchEvent::Deleted(k, _) if k == "/r/cm/b"));
+    }
+
+    /// A resume point older than the retained history is "too old resource
+    /// version" (`cacher/watch_cache.go:915-916`), surfaced as `Gone`.
+    #[tokio::test]
+    async fn watch_from_revision_too_old_is_gone() {
+        let s = MemoryStorage::with_history_capacity(2);
+        let a: serde_json::Value = s.create("/r/cm/a", &cm("a")).await.unwrap();
+        for n in ["b", "c", "d"] {
+            let _: serde_json::Value = s.create(&format!("/r/cm/{n}"), &cm(n)).await.unwrap();
+        }
+        // History holds only c and d; a resume at a+1 (== b) needs the evicted b.
+        let err = s
+            .watch_from_revision("/r/cm/", rv_of(&a) + 1)
+            .await
+            .err()
+            .expect("must be too old");
+        assert!(matches!(err, Error::Gone(m) if m.contains("too old resource version")));
+        // c's revision is still covered.
+        let c_rv = rv_of(&s.get::<serde_json::Value>("/r/cm/c").await.unwrap());
+        assert!(s.watch_from_revision("/r/cm/", c_rv).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn watch_from_compacted_revision_is_gone() {
+        let s = MemoryStorage::new();
+        let a: serde_json::Value = s.create("/r/cm/a", &cm("a")).await.unwrap();
+        s.compact_to(rv_of(&a));
+        assert!(matches!(
+            s.watch_from_revision("/r/cm/", rv_of(&a)).await.err(),
+            Some(Error::Gone(_))
+        ));
     }
 
     #[tokio::test]

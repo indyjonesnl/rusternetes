@@ -790,7 +790,7 @@ async fn watchers_should_restart_from_last_resource_version_observed() {
 
     // The resumed watch subscribes at (or after) checkpoint_rv.
     let mut stream = storage
-        .watch_from_revision("/registry/configmaps/default/", checkpoint_rv)
+        .watch_from_revision("/registry/configmaps/default/", checkpoint_rv + 1)
         .await
         .unwrap();
 
