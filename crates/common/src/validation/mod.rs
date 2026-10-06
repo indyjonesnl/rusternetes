@@ -28,6 +28,8 @@ pub mod ingress;
 pub mod ingressclass;
 pub mod ipaddress;
 pub mod job;
+#[cfg(test)]
+mod job_status_strategy_tests;
 pub mod lease;
 pub mod limitrange;
 pub mod metav1;
