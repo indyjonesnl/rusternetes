@@ -677,4 +677,15 @@ mod tests {
         assert_has_metadata::<Namespace>();
         assert_has_metadata::<CustomResource>();
     }
+
+    /// The accessors read and write the object's own metadata (the accessor
+    /// test dropped with `finalizers_test.rs`, #2156).
+    #[test]
+    fn accessors_read_and_write_the_objects_metadata() {
+        let mut pod = rusternetes_common::resources::Pod::new("a", Default::default());
+        pod.metadata.name = "a".to_string();
+        assert_eq!(HasMetadata::metadata(&pod).name, "a");
+        HasMetadata::metadata_mut(&mut pod).finalizers = Some(vec!["f".to_string()]);
+        assert_eq!(pod.metadata.finalizers, Some(vec!["f".to_string()]));
+    }
 }

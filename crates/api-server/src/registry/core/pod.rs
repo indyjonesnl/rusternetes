@@ -1041,8 +1041,8 @@ pub trait PdbClient: Send + Sync {
     ) -> rusternetes_common::Result<rusternetes_common::resources::PodDisruptionBudget>;
 }
 
-/// The PDB client over the PodDisruptionBudget store (reads) and
-/// `Storage::update_status_cas` (the status write).
+/// The PDB client over the PodDisruptionBudget store (reads) and its status
+/// store (the status write, so `pdbStatusStrategy` runs).
 pub struct StorePdbClient {
     storage: Arc<StorageBackend>,
 }
