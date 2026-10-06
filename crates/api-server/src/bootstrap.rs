@@ -691,7 +691,21 @@ pub async fn bootstrap_kubernetes_service(
 /// `wait.NonSlidingUntil(UpdateKubernetesService, EndpointInterval)`): the
 /// endpoint self-heals after a container recreate (new bridge IP), a stale
 /// write, or a clobber, without depending on the controller-manager.
+///
+/// Registered as the `bootstrap-controller` post-start hook
+/// (pkg/controlplane/instance.go:360-363: `Start` the controller, `return nil`
+/// -- never fatal).
 pub fn spawn_endpoint_reconciler(
+    storage: Arc<StorageBackend>,
+    api_server_port: u16,
+    service_ip: std::net::IpAddr,
+) -> tokio::task::JoinHandle<()> {
+    crate::post_start_hooks::spawn_starting_hook(BOOTSTRAP_CONTROLLER_HOOK, move || {
+        spawn_endpoint_reconciler_loop(storage, api_server_port, service_ip);
+    })
+}
+
+fn spawn_endpoint_reconciler_loop(
     storage: Arc<StorageBackend>,
     api_server_port: u16,
     service_ip: std::net::IpAddr,
@@ -737,9 +751,22 @@ pub fn spawn_endpoint_reconciler(
 /// aggregation client (`e2e Aggregator`, `kubectl get apiservices`) would hang
 /// waiting for one. Running it here matches upstream placement and works
 /// regardless of which controller-manager is deployed.
+///
+/// Upstream registers the local and the remote availability controllers as
+/// two post-start hooks (kube-aggregator/pkg/apiserver/apiserver.go:339-343,
+/// :361-366), each `go ...Run(...)` then `return nil`. One controller covers
+/// both here, so both `poststarthook/` checks are registered and finish
+/// together.
 pub fn spawn_apiservice_availability_controller(
     storage: Arc<StorageBackend>,
 ) -> tokio::task::JoinHandle<()> {
+    crate::post_start_hooks::spawn_starting_hook(APISERVICE_LOCAL_AVAILABLE_HOOK, || {});
+    crate::post_start_hooks::spawn_starting_hook(APISERVICE_REMOTE_AVAILABLE_HOOK, move || {
+        spawn_apiservice_availability_loop(storage);
+    })
+}
+
+fn spawn_apiservice_availability_loop(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()> {
     use rusternetes_controller_manager::controllers::apiservice::APIServiceAvailabilityController;
     tokio::spawn(async move {
         let controller = Arc::new(APIServiceAvailabilityController::new(storage));
@@ -1059,7 +1086,28 @@ impl<S: Storage + ?Sized> DefaultServiceCIDRController<S> {
 /// a background reconcile every [`DEFAULT_SERVICE_CIDR_RECONCILE_INTERVAL`].
 /// Mirrors upstream `Controller.Start` (`default_servicecidr_controller.go:101-140`),
 /// which likewise blocks on a first successful sync before returning.
+///
+/// Registered as the `start-kubernetes-service-cidr-controller` post-start hook
+/// (pkg/controlplane/instance.go:370-381): the hook returns `nil` once `Start`
+/// has made its first sync attempt, so the `poststarthook/` check only passes
+/// after the default ServiceCIDR was attempted. Deviation: upstream polls the
+/// first sync until it succeeds; here a failed first sync is logged and the
+/// background loop retries.
 pub async fn start_default_servicecidr_controller(
+    storage: Arc<StorageBackend>,
+    cidrs: Vec<String>,
+) -> tokio::task::JoinHandle<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let hook = crate::post_start_hooks::spawn_hook(SERVICE_CIDR_CONTROLLER_HOOK, async move {
+        let handle = start_default_servicecidr_controller_inner(storage, cidrs).await;
+        let _ = tx.send(handle);
+        Ok::<(), std::convert::Infallible>(())
+    });
+    let _ = hook.await;
+    rx.await.expect("service CIDR hook sends its handle")
+}
+
+async fn start_default_servicecidr_controller_inner(
     storage: Arc<StorageBackend>,
     cidrs: Vec<String>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1349,6 +1397,15 @@ pub fn spawn_cluster_authentication_trust_controller(
     storage: Arc<StorageBackend>,
     required: rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo,
 ) -> tokio::task::JoinHandle<()> {
+    crate::post_start_hooks::spawn_starting_hook(CLUSTER_AUTHENTICATION_INFO_HOOK, move || {
+        spawn_cluster_authentication_trust_loop(storage, required);
+    })
+}
+
+fn spawn_cluster_authentication_trust_loop(
+    storage: Arc<StorageBackend>,
+    required: rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo,
+) -> tokio::task::JoinHandle<()> {
     use futures::StreamExt;
     use rusternetes_common::clusterauthenticationtrust::{CONFIG_MAP_NAME, CONFIG_MAP_NAMESPACE};
     use rusternetes_storage::WatchEvent;
@@ -1515,6 +1572,21 @@ pub async fn bootstrap_system_priority_classes<S: Storage + ?Sized>(storage: &S)
     Ok(())
 }
 
+/// `instance.go:360`.
+pub const BOOTSTRAP_CONTROLLER_HOOK: &str = "bootstrap-controller";
+/// `pkg/controlplane/instance.go:370`.
+pub const SERVICE_CIDR_CONTROLLER_HOOK: &str = "start-kubernetes-service-cidr-controller";
+/// `kube-aggregator/pkg/apiserver/apiserver.go:339` and `:361`. One controller
+/// here covers both the local and the remote availability checks.
+pub const APISERVICE_LOCAL_AVAILABLE_HOOK: &str = "apiservice-status-local-available-controller";
+pub const APISERVICE_REMOTE_AVAILABLE_HOOK: &str = "apiservice-status-remote-available-controller";
+/// `pkg/controlplane/apiserver/server.go:249`.
+pub const CLUSTER_AUTHENTICATION_INFO_HOOK: &str = "start-cluster-authentication-info-controller";
+/// `pkg/registry/rbac/rest/storage_rbac.go:59` (`PostStartHookName`).
+pub const RBAC_BOOTSTRAP_ROLES_HOOK: &str = "rbac/bootstrap-roles";
+/// `apiextensions-apiserver/pkg/apiserver/apiserver.go:228`.
+pub const APIEXTENSIONS_CONTROLLERS_HOOK: &str = "start-apiextensions-controllers";
+
 /// `PostStartHookName` (storage_scheduling.go:41).
 pub const SYSTEM_PRIORITY_CLASSES_HOOK: &str = "scheduling/bootstrap-system-priority-classes";
 
@@ -1522,7 +1594,28 @@ pub const SYSTEM_PRIORITY_CLASSES_HOOK: &str = "scheduling/bootstrap-system-prio
 /// `attempt` every `interval` until it succeeds or `timeout` elapses; the last
 /// error is wrapped as upstream does (:140-143,
 /// "unable to add default system priority classes: %v").
-pub async fn poll_until<F, Fut>(timeout: Duration, interval: Duration, mut attempt: F) -> Result<()>
+pub async fn poll_until<F, Fut>(timeout: Duration, interval: Duration, attempt: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    poll_until_msg(
+        "unable to add default system priority classes",
+        timeout,
+        interval,
+        attempt,
+    )
+    .await
+}
+
+/// [`poll_until`] with the caller's upstream error prefix
+/// (`wait.Poll(1s, 30s, ...)` then `fmt.Errorf("<prefix>: %v", err)`).
+pub async fn poll_until_msg<F, Fut>(
+    prefix: &str,
+    timeout: Duration,
+    interval: Duration,
+    mut attempt: F,
+) -> Result<()>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
@@ -1532,9 +1625,7 @@ where
         match attempt().await {
             Ok(()) => return Ok(()),
             Err(e) if tokio::time::Instant::now() >= deadline => {
-                return Err(anyhow::anyhow!(
-                    "unable to add default system priority classes: {e}"
-                ))
+                return Err(anyhow::anyhow!("{prefix}: {e}"))
             }
             Err(e) => warn!("unable to create system priority classes: {e}. Retrying..."),
         }
@@ -1558,6 +1649,33 @@ pub fn spawn_system_priority_classes_hook<S: Storage + 'static>(storage: Arc<S>)
         info!("all system priority classes are created successfully or already exist.");
         Ok::<(), anyhow::Error>(())
     });
+}
+
+/// The `rbac/bootstrap-roles` PostStartHook (storage_rbac.go:131-140,
+/// `EnsureRBACPolicy` :162-179): poll 1s/30s until the bootstrap policy is
+/// reconciled, then fail with "unable to initialize roles: %v", which the
+/// shared runner makes fatal (hooks.go:204) -- "if we're never able to make it
+/// through initialization, kill the API server". Until it finishes,
+/// `poststarthook/rbac/bootstrap-roles` fails.
+///
+/// Deviation: upstream's hook runs after the server starts; callers here await
+/// the returned handle before serving so a fresh store is never reachable
+/// with an empty RBAC policy (#1659: no `system:masters` authorizer shortcut).
+pub fn spawn_rbac_bootstrap_roles_hook(
+    storage: Arc<StorageBackend>,
+) -> tokio::task::JoinHandle<()> {
+    crate::post_start_hooks::spawn_hook(RBAC_BOOTSTRAP_ROLES_HOOK, async move {
+        poll_until_msg(
+            "unable to initialize roles",
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            || {
+                let storage = storage.clone();
+                async move { bootstrap_default_rbac(storage).await }
+            },
+        )
+        .await
+    })
 }
 
 #[cfg(test)]
@@ -2343,5 +2461,84 @@ mod tests {
             "Ready=False is another component's to clear, not ours"
         );
         assert_eq!(cond.reason, "Terminating");
+    }
+}
+
+#[cfg(test)]
+mod post_start_hook_registration_tests {
+    use super::*;
+    use crate::post_start_hooks::global;
+
+    async fn finished(name: &str) -> bool {
+        for _ in 0..200 {
+            if global().check(name) == Some(Ok(())) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// Each controller upstream registers as a `poststarthook/<name>` check
+    /// that passes once the hook has started it (instance.go:360,
+    /// apiserver.go:339/361, server.go:249).
+    #[tokio::test]
+    async fn controller_hooks_register_and_finish() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        spawn_endpoint_reconciler(storage.clone(), 6443, super::test_service_ip());
+        spawn_apiservice_availability_controller(storage.clone());
+        crate::registry::apiextensions::customresourcedefinition::spawn_resync(storage.clone());
+        spawn_cluster_authentication_trust_controller(
+            storage.clone(),
+            cluster_authentication_info(None),
+        );
+        start_default_servicecidr_controller(
+            storage.clone(),
+            DEFAULT_SERVICE_CIDRS
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+        )
+        .await;
+        for name in [
+            BOOTSTRAP_CONTROLLER_HOOK,
+            APISERVICE_LOCAL_AVAILABLE_HOOK,
+            APISERVICE_REMOTE_AVAILABLE_HOOK,
+            APIEXTENSIONS_CONTROLLERS_HOOK,
+            CLUSTER_AUTHENTICATION_INFO_HOOK,
+            SERVICE_CIDR_CONTROLLER_HOOK,
+        ] {
+            assert!(finished(name).await, "{name} not registered/finished");
+        }
+    }
+
+    /// storage_rbac.go:162-179: poll 1s/30s, then fail with
+    /// "unable to initialize roles: %v" -- which the runner makes fatal.
+    #[tokio::test(start_paused = true)]
+    async fn rbac_hook_poll_fails_with_upstream_message() {
+        let r = poll_until_msg(
+            "unable to initialize roles",
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            || async { Err::<(), _>(anyhow::anyhow!("etcd down")) },
+        )
+        .await;
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "unable to initialize roles: etcd down"
+        );
+    }
+
+    #[tokio::test]
+    async fn rbac_hook_seeds_policy_and_finishes() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        spawn_rbac_bootstrap_roles_hook(storage.clone())
+            .await
+            .unwrap();
+        assert_eq!(global().check(RBAC_BOOTSTRAP_ROLES_HOOK), Some(Ok(())));
+        let _: serde_json::Value = storage
+            .get("/registry/clusterroles/cluster-admin")
+            .await
+            .unwrap();
     }
 }

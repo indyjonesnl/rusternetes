@@ -1033,7 +1033,19 @@ impl ControllerRateLimiter {
 /// Deviation: upstream's controllers also react to each watch event; here the
 /// write path runs them inline (see [`super::controllers`]), so only the
 /// resync-driven half is a task.
+///
+/// Registered as the `start-apiextensions-controllers` post-start hook
+/// (apiserver.go:228-261: `go <controller>.Run(...)` for each, `return nil`).
 pub fn spawn_resync(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()> {
+    crate::post_start_hooks::spawn_starting_hook(
+        crate::bootstrap::APIEXTENSIONS_CONTROLLERS_HOOK,
+        move || {
+            spawn_resync_loop(storage);
+        },
+    )
+}
+
+fn spawn_resync_loop(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let rest = new_rest(storage);
         // Each controller's `workqueue.DefaultTypedControllerRateLimiter`

@@ -106,6 +106,36 @@ where
     })
 }
 
+/// A hook that only starts background work and returns nil -- the shape of
+/// `bootstrap-controller` (instance.go:360-363), `apiservice-status-*`
+/// (apiserver.go:339-343, :361-366), `start-apiextensions-controllers`
+/// (apiserver.go:228-261) and `start-cluster-authentication-info-controller`
+/// (server.go:249-271). `start` runs, then the hook is marked done; it can
+/// never be fatal (it returns `nil`).
+pub fn spawn_starting_hook_with(
+    registry: &PostStartHooks,
+    name: &str,
+    start: impl FnOnce() + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    spawn_hook_with(
+        registry,
+        name,
+        async move {
+            start();
+            Ok::<(), std::convert::Infallible>(())
+        },
+        |_, e| match *e {},
+    )
+}
+
+/// [`spawn_starting_hook_with`] on the global registry.
+pub fn spawn_starting_hook(
+    name: &str,
+    start: impl FnOnce() + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    spawn_starting_hook_with(global(), name, start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
