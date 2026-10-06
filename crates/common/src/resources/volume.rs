@@ -5,6 +5,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// `volumeutil.PVProtectionFinalizer` (pkg/volume/util/util.go).
+pub const PV_PROTECTION_FINALIZER: &str = "kubernetes.io/pv-protection";
+/// `volumeutil.PVCProtectionFinalizer` (pkg/volume/util/util.go).
+pub const PVC_PROTECTION_FINALIZER: &str = "kubernetes.io/pvc-protection";
+
 /// PersistentVolume represents a storage resource in the cluster
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

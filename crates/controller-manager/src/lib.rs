@@ -25,6 +25,8 @@ use controllers::{
     pod_disruption_budget::{PodDisruptionBudgetController, StalePodDisruptionController},
     priorityclass::PriorityClassController,
     pv_binder::PVBinderController,
+    pv_protection::PvProtectionController,
+    pvc_protection::PvcProtectionController,
     replicaset::ReplicaSetController,
     replicationcontroller::ReplicationControllerController,
     resource_quota::ResourceQuotaController,
@@ -247,6 +249,22 @@ async fn run_controllers<S: Storage + Send + Sync + 'static>(
         let c = Arc::new(PVBinderController::new(s));
         if let Err(e) = c.run().await {
             error!("PV/PVC Binder controller error: {}", e);
+        }
+    });
+
+    let s = storage.clone();
+    tokio::spawn(async move {
+        let c = Arc::new(PvcProtectionController::new(s));
+        if let Err(e) = c.run().await {
+            error!("PVC protection controller error: {}", e);
+        }
+    });
+
+    let s = storage.clone();
+    tokio::spawn(async move {
+        let c = Arc::new(PvProtectionController::new(s));
+        if let Err(e) = c.run().await {
+            error!("PV protection controller error: {}", e);
         }
     });
 

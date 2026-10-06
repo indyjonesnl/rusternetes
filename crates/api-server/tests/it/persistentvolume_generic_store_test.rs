@@ -207,3 +207,26 @@ async fn delete_returns_the_object() {
     assert_eq!(out["kind"], "PersistentVolume", "{out}");
     assert_eq!(out["metadata"]["name"], "pv-del", "{out}");
 }
+
+/// `StorageObjectInUseProtection` (storageobjectinuseprotection/admission.go
+/// `admitPV`): a created volume carries `kubernetes.io/pv-protection`, once.
+#[tokio::test]
+async fn create_adds_the_pv_protection_finalizer() {
+    let api = TestApiServer::new();
+    let out = create(&api, "pv-protected").await;
+    assert_eq!(
+        out["metadata"]["finalizers"],
+        json!(["kubernetes.io/pv-protection"]),
+        "{out}"
+    );
+
+    let mut body = pv("pv-prefinalized");
+    body["metadata"]["finalizers"] = json!(["kubernetes.io/pv-protection", "example.com/x"]);
+    let (status, out) = api.post(PVS, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+    assert_eq!(
+        out["metadata"]["finalizers"],
+        json!(["kubernetes.io/pv-protection", "example.com/x"]),
+        "{out}"
+    );
+}

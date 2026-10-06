@@ -34,7 +34,7 @@ use rusternetes_common::{Error, Result};
 use rusternetes_storage::Storage;
 
 use super::rest::{authorize, RequestScope};
-use crate::admission::resourcequota;
+use crate::admission::{resourcequota, storage_object_in_use_protection};
 use crate::registry::rest::{
     GroupResource, Object, RequestContext, TransformFunc, ValidateObject, ValidateObjectUpdate,
 };
@@ -130,14 +130,31 @@ impl Admission<'_> {
             let pod: Pod = recast(&obj)?;
             return recast(&self.admit_pod(op, pod).await?);
         }
-        if *op != Operation::Create || !self.is_core("persistentvolumeclaims") {
+        if *op != Operation::Create {
             return Ok(obj);
         }
-        let mut pvc: PersistentVolumeClaim = recast(&obj)?;
-        crate::admission::set_default_storage_class(&self.state.storage, &mut pvc)
-            .await
-            .map_err(|e| self.forbidden(&pvc.metadata.name, e))?;
-        recast(&pvc)
+        let mut obj = obj;
+        if self.is_core("persistentvolumeclaims") {
+            let mut pvc: PersistentVolumeClaim = recast(&obj)?;
+            crate::admission::set_default_storage_class(&self.state.storage, &mut pvc)
+                .await
+                .map_err(|e| self.forbidden(&pvc.metadata.name, e))?;
+            obj = recast(&pvc)?;
+        }
+        // `StorageObjectInUseProtection` follows `DefaultStorageClass` in
+        // `AllOrderedPlugins` (plugins.go:69-100); it acts on the resource
+        // itself, never a subresource (admission.go `admitPV`/`admitPVC`).
+        if self.subresource.is_none() && self.resource.group.is_empty() {
+            if let Some(finalizer) =
+                storage_object_in_use_protection::finalizer_for(&self.resource.resource)
+            {
+                storage_object_in_use_protection::add_protection_finalizer(
+                    obj.metadata_mut(),
+                    finalizer,
+                );
+            }
+        }
+        Ok(obj)
     }
 
     /// The in-tree validating plugins. `LimitRanger.Validate`
