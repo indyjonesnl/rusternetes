@@ -1,0 +1,159 @@
+name: Release binaries
+
+# Publish statically-linked (musl) per-component binaries as GitHub release
+# assets (#1930). Consumed by the vmcompose `rusternetes-lab`.
+#
+# Contract (from #1930) — exactly four assets at the release root:
+#   rusternetes-rhino-x86_64-unknown-linux-musl
+#   rusternetes-api-server-x86_64-unknown-linux-musl
+#   rusternetes-kubelet-x86_64-unknown-linux-musl
+#   SHA256SUMS            (one file, `sha256sum` format, never per-file .sha256)
+#
+# Triggers:
+#   * push of a `v*` tag — cutting the tag is a maintainer decision (this
+#     workflow never creates tags; the first one, v0.1.0, is open on #1930).
+#   * workflow_dispatch — `tag` is the release to (re)build. With publish=false
+#     it is a DRY RUN: it builds, asserts, and uploads the four files as a
+#     workflow artifact only; no release is created or touched.
+#
+# The build is release-binaries.Dockerfile (the all-in-one-musl.Dockerfile
+# Alpine-builder approach: static, mimalloc, shipped `release` profile).
+# x86_64 only: the contract names no arm64 asset.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0). Must exist as a git tag when publish=true."
+        required: true
+        type: string
+      publish:
+        description: "Upload to the GitHub release. false = dry run (workflow artifact only)."
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-binaries-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  release:
+    name: build + publish x86_64-unknown-linux-musl
+    # Docker is required (Alpine builder); only the dind tier has it.
+    runs-on: arc-runner-set-dind
+    permissions:
+      contents: write
+    # Full `release` profile (codegen-units=1) of api-server + kubelet + rhino;
+    # a timeout reports as `cancelled`, so leave real headroom.
+    timeout-minutes: 240
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      PUBLISH: ${{ github.event_name == 'push' || github.event.inputs.publish == 'true' }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Tool prereqs (fail fast — no apt-get install)
+        run: |
+          set -euo pipefail
+          for t in docker git gh sha256sum grep ldd; do
+            command -v "$t" >/dev/null 2>&1 || { echo "missing required tool: $t"; exit 1; }
+          done
+          docker buildx version >/dev/null 2>&1 || { echo "missing required tool: docker buildx"; exit 1; }
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # On a dispatch, build the tag being released, not the dispatch ref.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          # rhino is the in-tree submodule: path-dep of crates/storage AND the
+          # source of rhino-server.
+          submodules: recursive
+
+      - name: Build static binaries (release profile)
+        run: |
+          set -euo pipefail
+          rm -rf out
+          docker buildx build \
+            -f release-binaries.Dockerfile \
+            --target artifacts \
+            --build-arg "RUSTERNETES_GIT_SHA=$(git rev-parse HEAD)" \
+            --output type=local,dest=out \
+            .
+          ls -l out
+
+      - name: Stage assets under the contract names
+        run: |
+          set -euo pipefail
+          rm -rf dist && mkdir dist
+          cp out/rhino-server "dist/rusternetes-rhino-${TARGET}"
+          cp out/api-server   "dist/rusternetes-api-server-${TARGET}"
+          cp out/kubelet      "dist/rusternetes-kubelet-${TARGET}"
+          chmod 0755 dist/rusternetes-*
+          ls -l dist
+
+      # Assert the linkage we advertise: an asset that silently turns dynamic
+      # fails three minutes into a guest boot, the worst place to find out.
+      - name: Assert statically linked
+        run: |
+          set -euo pipefail
+          for f in dist/rusternetes-*; do
+            # glibc ldd prints "not a dynamic executable" (exit 1) for a static
+            # ELF; capture instead of failing on the exit status.
+            out=$(ldd "$f" 2>&1 || true)
+            echo "$f: $out"
+            if ! printf '%s' "$out" | grep -qiE 'not a dynamic executable|statically linked'; then
+              echo "FAIL: $f is not statically linked" >&2
+              exit 1
+            fi
+          done
+
+      # One SHA256SUMS in `sha256sum` format. The two-step check below mirrors
+      # the consumer's and is deliberately NOT collapsed: `sha256sum
+      # --ignore-missing -c` exits 0 having verified NOTHING when none of the
+      # names appear in the file, so a renamed/missing asset would pass
+      # silently. Every component's own line is grepped for FIRST, and a line
+      # may never be dropped from SHA256SUMS.
+      - name: Generate + verify SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum rusternetes-* > SHA256SUMS
+          cat SHA256SUMS
+          for c in rhino api-server kubelet; do
+            name="rusternetes-${c}-${TARGET}"
+            test -f "$name" || { echo "FAIL: asset $name missing" >&2; exit 1; }
+            grep -E "^[0-9a-f]{64}  ${name}\$" SHA256SUMS \
+              || { echo "FAIL: SHA256SUMS has no line for $name" >&2; exit 1; }
+          done
+          sha256sum -c SHA256SUMS
+          # Exactly four files at the release root.
+          count="$(find . -maxdepth 1 -type f | wc -l)"
+          test "$count" -eq 4 || { echo "FAIL: expected exactly 4 assets, got $count" >&2; find . -maxdepth 1 -type f >&2; exit 1; }
+
+      - name: Upload workflow artifact (dry-run inspection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries-${{ env.TARGET }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish release assets
+        if: env.PUBLISH == 'true'
+        run: |
+          set -euo pipefail
+          # Only a tag that already exists may be released; never create one here.
+          git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null \
+            || { echo "FAIL: tag ${TAG} does not exist" >&2; exit 1; }
+          notes="Statically linked (musl, mimalloc) x86_64 binaries built from ${TAG} with the release profile: rusternetes-api-server, rusternetes-kubelet, rusternetes-rhino (the rhino-server binary). Verify with: grep each component line in SHA256SUMS, then sha256sum -c SHA256SUMS."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes "$notes"
+          fi
