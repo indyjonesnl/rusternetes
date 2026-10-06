@@ -201,7 +201,8 @@ fn validate_resource_slice_spec(spec: &ResourceSliceSpec, fld_path: &Path) -> Er
 /// (`pkg/apis/resource/validation/validation.go:801-870`), covering the parts
 /// that need no CEL environment: the name, the taints and the counter
 /// consumptions. The attribute/capacity maps and the per-device node-selection
-/// coupling stay in #1442.
+/// coupling stay in #1442. The binding conditions are validated too
+/// (`validation.go:867`).
 fn validate_device(device: &Device, fld_path: &Path) -> ErrorList {
     let mut errs = validate_device_name(&device.name, &fld_path.child("name"));
 
@@ -233,6 +234,78 @@ fn validate_device(device: &Device, fld_path: &Path) -> ErrorList {
         errs.extend(validate_device_counter_consumption(consumption, &cp));
     }
 
+    errs.extend(validate_device_binding_parameters(
+        &device.binding_conditions,
+        &device.binding_failure_conditions,
+        fld_path,
+    ));
+
+    errs
+}
+
+/// Upstream `BindingConditionsMaxSize` / `BindingFailureConditionsMaxSize`
+/// (`pkg/apis/resource/types.go:254-255`).
+const BINDING_CONDITIONS_MAX_SIZE: usize = 4;
+
+/// Port of upstream `validateDeviceBindingParameters`
+/// (`pkg/apis/resource/validation/validation.go:1450-1485`), shared with
+/// `AllocationResult` validation upstream. `validateSlice` short-circuits on
+/// the size cap (`:1176-1187`), so an oversized list reports only `TooMany`.
+pub(crate) fn validate_device_binding_parameters(
+    binding_conditions: &[String],
+    binding_failure_conditions: &[String],
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs = ErrorList::new();
+    let bc_path = fld_path.child("bindingConditions");
+    let bfc_path = fld_path.child("bindingFailureConditions");
+    for (list, path) in [
+        (binding_conditions, &bc_path),
+        (binding_failure_conditions, &bfc_path),
+    ] {
+        if list.len() > BINDING_CONDITIONS_MAX_SIZE {
+            errs.push(Error::too_many(path, BINDING_CONDITIONS_MAX_SIZE));
+        } else {
+            for (i, c) in list.iter().enumerate() {
+                errs.extend(validate_label_name(c, &path.index(i)));
+            }
+        }
+    }
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (i, c) in binding_conditions.iter().enumerate() {
+        if !seen.insert(c.as_str()) {
+            errs.push(Error::duplicate(&bc_path.index(i), c.clone()));
+        }
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (i, c) in binding_failure_conditions.iter().enumerate() {
+        if !seen.insert(c.as_str()) {
+            errs.push(Error::duplicate(&bfc_path.index(i), c.clone()));
+        }
+        if binding_conditions.contains(c) {
+            errs.push(Error::invalid(
+                &bfc_path.index(i),
+                c.clone(),
+                "bindingFailureConditions must not overlap with bindingConditions",
+            ));
+        }
+    }
+
+    if binding_conditions.is_empty() && !binding_failure_conditions.is_empty() {
+        errs.push(Error::invalid(
+            &bc_path,
+            binding_conditions.to_vec(),
+            "bindingConditions are required to use bindingFailureConditions",
+        ));
+    }
+    if binding_failure_conditions.is_empty() && !binding_conditions.is_empty() {
+        errs.push(Error::invalid(
+            &bfc_path,
+            binding_failure_conditions.to_vec(),
+            "bindingFailureConditions are required to use bindingConditions",
+        ));
+    }
     errs
 }
 
@@ -535,6 +608,123 @@ mod tests {
                 .iter()
                 .any(|e| e.field.ends_with("pool.name") && e.detail == "field is immutable"),
             "{errs2:?}"
+        );
+    }
+
+    // Port of the binding-conditions cases in upstream
+    // `pkg/apis/resource/validation/validation_resourceslice_test.go:958-995`.
+    fn binding_errs(bc: serde_json::Value, bfc: serde_json::Value) -> Vec<String> {
+        let mut dev = serde_json::json!({"name": "gpu-0"});
+        if !bc.is_null() {
+            dev["bindingConditions"] = bc;
+        }
+        if !bfc.is_null() {
+            dev["bindingFailureConditions"] = bfc;
+        }
+        errs(serde_json::json!({
+            "driver": "d.example.com", "pool": {"name": "p", "generation": 0, "resourceSliceCount": 1},
+            "allNodes": true, "devices": [dev]
+        }))
+    }
+
+    #[test]
+    fn binding_conditions_valid() {
+        let e = binding_errs(
+            serde_json::json!(["example.com/condition1", "condition2"]),
+            serde_json::json!(["example.com/condition3", "condition4"]),
+        );
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn binding_conditions_too_many() {
+        let e = binding_errs(
+            serde_json::json!(["c1", "c2", "c3", "c4", "c5"]),
+            serde_json::json!(["c6", "c7"]),
+        );
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("spec.devices[0].bindingConditions"), "{e:?}");
+        let e = binding_errs(
+            serde_json::json!(["c1", "c2"]),
+            serde_json::json!(["c3", "c4", "c5", "c6", "c7"]),
+        );
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].contains("spec.devices[0].bindingFailureConditions"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn binding_conditions_invalid_names() {
+        let e = binding_errs(
+            serde_json::json!(["condition1", "condition2!"]),
+            serde_json::json!(["condition3", "condition4"]),
+        );
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].contains("spec.devices[0].bindingConditions[1]") && e[0].contains("condition2!"),
+            "{e:?}"
+        );
+        let e = binding_errs(
+            serde_json::json!(["condition1", "condition2"]),
+            serde_json::json!(["condition3!", "condition4"]),
+        );
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].contains("spec.devices[0].bindingFailureConditions[0]"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn binding_conditions_pairing_required() {
+        let e = binding_errs(serde_json::Value::Null, serde_json::json!(["c1", "c2"]));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].contains("spec.devices[0].bindingConditions")
+                && e[0].contains("bindingConditions are required to use bindingFailureConditions"),
+            "{e:?}"
+        );
+        let e = binding_errs(serde_json::json!(["c1", "c2"]), serde_json::Value::Null);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].contains("spec.devices[0].bindingFailureConditions")
+                && e[0].contains("bindingFailureConditions are required to use bindingConditions"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn binding_conditions_duplicates_and_overlap() {
+        let e = binding_errs(
+            serde_json::json!(["condition1", "condition1"]),
+            serde_json::json!(["condition2", "condition3"]),
+        );
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].contains("spec.devices[0].bindingConditions[1]") && e[0].contains("Duplicate"),
+            "{e:?}"
+        );
+        let e = binding_errs(
+            serde_json::json!(["condition1", "condition2"]),
+            serde_json::json!(["condition3", "condition3"]),
+        );
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].contains("spec.devices[0].bindingFailureConditions[1]")
+                && e[0].contains("Duplicate"),
+            "{e:?}"
+        );
+        let e = binding_errs(
+            serde_json::json!(["condition1", "condition2"]),
+            serde_json::json!(["condition1", "condition3"]),
+        );
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].contains("spec.devices[0].bindingFailureConditions[0]")
+                && e[0].contains("must not overlap with bindingConditions"),
+            "{e:?}"
         );
     }
 }
