@@ -1137,8 +1137,13 @@ impl RestStorage<Scale> for CustomResourceScaleRest {
     }
 
     /// `ScaleREST.Get` (etcd.go:157-177).
-    async fn get(&self, ctx: &RequestContext, name: &str) -> Result<Scale> {
-        let cr = self.rest.get(ctx, name).await?;
+    async fn get(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        options: &crate::registry::generic::GetOptions,
+    ) -> Result<Scale> {
+        let cr = self.rest.get(ctx, name, options).await?;
         let (scale, found) = self.scale_from(&cr)?;
         if !found {
             return Err(Error::Internal(format!(

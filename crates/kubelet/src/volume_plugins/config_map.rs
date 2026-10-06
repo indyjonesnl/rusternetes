@@ -87,6 +87,14 @@ impl VolumePlugin for ConfigMapPlugin {
     }
 }
 
+/// `if !(errors.IsNotFound(err) && optional)` (`configmap.go:168`): the error
+/// is tolerated (empty volume) only when the ConfigMap is optional AND the
+/// failure is NotFound. Any other error (storage down, decode failure) fails
+/// the mount rather than silently projecting nothing.
+fn tolerate_get_error(err: &rusternetes_common::Error, optional: bool) -> bool {
+    optional && matches!(err, rusternetes_common::Error::NotFound(_))
+}
+
 struct ConfigMapMounter {
     path: String,
     volume_name: String,
@@ -144,7 +152,7 @@ impl Mounter for ConfigMapMounter {
                     configmap_name,
                     is_optional,
                     cm_default_mode as u32,
-                );
+                )?;
                 crate::atomic_writer::write_projected_payload(
                     std::path::Path::new(volume_dir),
                     &payload,
@@ -152,7 +160,7 @@ impl Mounter for ConfigMapMounter {
                 .with_context(|| format!("failed to project ConfigMap {configmap_name}"))?;
             }
             Err(e) => {
-                if is_optional {
+                if tolerate_get_error(&e, is_optional) {
                     info!(
                         "Optional ConfigMap {} not found in namespace {}, creating empty volume",
                         configmap_name, &self.namespace
@@ -227,5 +235,53 @@ mod tests {
     #[test]
     fn plugin_name_is_the_upstream_name() {
         assert_eq!(plugin().name(), crate::pod_dirs::plugin::CONFIG_MAP);
+    }
+
+    fn cm(pairs: &[(&str, &str)]) -> ConfigMap {
+        serde_json::from_value(json!({
+            "metadata": {"name": "cm"},
+            "data": pairs.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<_, _>>()
+        }))
+        .unwrap()
+    }
+
+    fn ktp(key: &str, path: &str) -> rusternetes_common::resources::KeyToPath {
+        serde_json::from_value(json!({"key": key, "path": path})).unwrap()
+    }
+
+    /// `MakePayload` (`configmap.go:222-229`): a mapped key that is absent
+    /// from `data` and `binaryData` is an error unless the source is optional.
+    /// `TestMakePayload` "no sources"/"missing key" cases pin this.
+    #[test]
+    fn missing_mapped_key_is_an_error_unless_optional() {
+        let c = cm(&[("a", "1")]);
+        let items = vec![ktp("nope", "p")];
+        let err = build_configmap_payload(&c, Some(&items), "cm", false, 0o644).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "configmap references non-existent config key: nope"
+        );
+        let ok = build_configmap_payload(&c, Some(&items), "cm", true, 0o644).unwrap();
+        assert!(ok.is_empty());
+    }
+
+    /// `if len(mappings) == 0` (`configmap.go:207`): an EMPTY items list means
+    /// "project every key", exactly like an absent one.
+    #[test]
+    fn empty_items_list_projects_every_key() {
+        let c = cm(&[("a", "1"), ("b", "2")]);
+        let items: Vec<rusternetes_common::resources::KeyToPath> = vec![];
+        let payload = build_configmap_payload(&c, Some(&items), "cm", false, 0o644).unwrap();
+        assert_eq!(payload.len(), 2);
+    }
+
+    /// `if !(errors.IsNotFound(err) && optional)` (`configmap.go:168`): only a
+    /// NotFound is tolerated for an optional ConfigMap; any other error fails.
+    #[test]
+    fn only_not_found_is_tolerated_when_optional() {
+        use rusternetes_common::Error;
+        assert!(tolerate_get_error(&Error::NotFound("x".into()), true));
+        assert!(!tolerate_get_error(&Error::NotFound("x".into()), false));
+        assert!(!tolerate_get_error(&Error::Storage("boom".into()), true));
     }
 }
