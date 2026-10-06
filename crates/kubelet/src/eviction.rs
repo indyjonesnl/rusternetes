@@ -27,6 +27,32 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// `scheduling.SystemCriticalPriority` = 2 * HighestUserDefinablePriority.
+/// Ported from `pkg/apis/scheduling/types.go:32`.
+pub const SYSTEM_CRITICAL_PRIORITY: i32 = 2_000_000_000;
+
+/// Mirrors `kubelettypes.IsCriticalPod`
+/// (`pkg/kubelet/types/pod_update.go:160-173`): a static pod (config source
+/// annotation present and != "api", `IsStaticPod` :144), a mirror pod
+/// (`IsMirrorPod` :136) or a pod with priority >= SystemCriticalPriority
+/// (`IsCriticalPodBasedOnPriority` :188) is critical.
+pub fn is_critical_pod(pod: &Pod) -> bool {
+    let ann = pod.metadata.annotations.as_ref();
+    if ann
+        .and_then(|a| a.get("kubernetes.io/config.source"))
+        .is_some_and(|src| src != "api")
+    {
+        return true;
+    }
+    if ann.is_some_and(|a| a.contains_key("kubernetes.io/config.mirror")) {
+        return true;
+    }
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.priority)
+        .is_some_and(|p| p >= SYSTEM_CRITICAL_PRIORITY)
+}
+
 /// Eviction signals that can trigger pod eviction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EvictionSignal {
@@ -465,6 +491,21 @@ impl EvictionManager {
                     pod.metadata.name
                 );
                 pod_stats.get(&key).map(|stats| (pod, stats))
+            })
+            // Upstream `evictPod` (eviction_manager.go:614-618) refuses with
+            // "cannot evict a critical pod" and the caller moves on to the next
+            // ranked pod; filtering up front is equivalent.
+            .filter(|(pod, _)| {
+                if is_critical_pod(pod) {
+                    debug!(
+                        "Eviction manager: cannot evict a critical pod {}/{}",
+                        pod.metadata.namespace.as_deref().unwrap_or("default"),
+                        pod.metadata.name
+                    );
+                    false
+                } else {
+                    true
+                }
             })
             .collect();
 
@@ -1493,5 +1534,79 @@ mod tests {
         let signals =
             manager.check_eviction_needed_at(&low_disk_stats, t0 + Duration::from_secs(11));
         assert!(signals.contains(&EvictionSignal::NodeFsAvailable));
+    }
+
+    // Ports pkg/kubelet/eviction/eviction_manager_test.go
+    // TestStaticCriticalPodsAreNotEvicted / TestCriticalPodsAreNotEvicted:
+    // static, mirror and system-critical-priority pods are never evicted.
+    fn candidate(
+        name: &str,
+        annotations: &[(&str, &str)],
+        priority: Option<i32>,
+    ) -> (Pod, PodStats) {
+        let mut pod = Pod::new(
+            name,
+            rusternetes_common::resources::PodSpec {
+                priority,
+                ..Default::default()
+            },
+        );
+        pod.metadata.namespace = Some("kube-system".to_string());
+        if !annotations.is_empty() {
+            pod.metadata.annotations = Some(
+                annotations
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            );
+        }
+        let stats = PodStats {
+            name: name.to_string(),
+            namespace: "kube-system".to_string(),
+            memory_usage_bytes: 1 << 30,
+            disk_usage_bytes: 1 << 30,
+            qos_class: QoSClass::BestEffort,
+        };
+        (pod, stats)
+    }
+
+    #[test]
+    fn eviction_skips_static_mirror_and_critical_pods() {
+        let cases = [
+            (
+                "static",
+                vec![("kubernetes.io/config.source", "file")],
+                None,
+            ),
+            ("mirror", vec![("kubernetes.io/config.mirror", "abc")], None),
+            ("critical", vec![], Some(SYSTEM_CRITICAL_PRIORITY)),
+        ];
+        let (normal, normal_stats) =
+            candidate("normal", &[("kubernetes.io/config.source", "api")], Some(0));
+        for (name, ann, prio) in cases {
+            let (pod, stats) = candidate(name, &ann, prio);
+            let mut stats_map = HashMap::new();
+            stats_map.insert(format!("kube-system/{}", name), stats);
+            stats_map.insert("kube-system/normal".to_string(), normal_stats.clone());
+            let m = EvictionManager::new();
+            let picked = m.select_pods_for_eviction(
+                &[pod, normal.clone()],
+                &stats_map,
+                &EvictionSignal::NodeFsAvailable,
+            );
+            assert_eq!(picked, vec!["kube-system/normal".to_string()], "{name}");
+        }
+    }
+
+    #[test]
+    fn is_critical_pod_matches_upstream() {
+        let (p, _) = candidate(
+            "a",
+            &[("kubernetes.io/config.source", "api")],
+            Some(SYSTEM_CRITICAL_PRIORITY - 1),
+        );
+        assert!(!is_critical_pod(&p));
+        let (p, _) = candidate("b", &[], None);
+        assert!(!is_critical_pod(&p));
     }
 }
