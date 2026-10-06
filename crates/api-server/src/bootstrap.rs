@@ -19,9 +19,10 @@ const CLUSTER_ADMIN_BINDING_KEY: &str = "/registry/clusterrolebindings/cluster-a
 /// `controller_policy.go` / `namespace_policy.go`, so every role carries the
 /// `kubernetes.io/bootstrapping=rbac-defaults` label and the
 /// `rbac.authorization.kubernetes.io/autoupdate=true` annotation exactly as
-/// `addClusterRoleLabel` (policy.go:48-60) stamps them. (The
-/// `cluster-roles-featuregates.yaml` variant is not vendored: it only adds
-/// alpha-gated roles.)
+/// `addClusterRoleLabel` (policy.go:48-60) stamps them. These are the output
+/// with every feature gate at its v1.35 default; what the non-default gates add
+/// is applied by [`apply_feature_gated_policy`] (the
+/// `cluster-roles-featuregates.yaml` variant is vendored for the test only).
 const BOOTSTRAP_POLICY: &[&str] = &[
     include_str!("bootstrap_policy/cluster-roles.yaml"),
     include_str!("bootstrap_policy/controller-roles.yaml"),
@@ -70,6 +71,155 @@ fn policy_key(item: &serde_json::Value) -> Option<(String, String)> {
     ))
 }
 
+/// `NewRule(...).RuleOrDie()` sorts the verbs, which is why the testdata reads
+/// `create, get, list, watch` for `podcertificaterequests`.
+fn rule(api_groups: &[&str], resources: &[&str], verbs: &[&str]) -> serde_json::Value {
+    serde_json::json!({"apiGroups": api_groups, "resources": resources, "verbs": verbs})
+}
+
+fn url_rule(url: &str) -> serde_json::Value {
+    serde_json::json!({"nonResourceURLs": [url], "verbs": ["get"]})
+}
+
+fn push_rules(items: &mut [serde_json::Value], role: &str, rules: Vec<serde_json::Value>) {
+    let target = items
+        .iter_mut()
+        .find(|i| i["kind"] == "ClusterRole" && i["metadata"]["name"] == role)
+        .unwrap_or_else(|| panic!("vendored policy has no ClusterRole {role}"));
+    let list = target["rules"].as_array_mut().expect("rules is an array");
+    list.extend(rules);
+}
+
+/// Insert `rules` just before the rule that grants `get` on core
+/// `serviceaccounts`, where `NodeRules` places the `ClusterTrustBundle` rule
+/// (`policy.go:270-278`: it precedes the credential-provider
+/// ServiceAccount rule, which is on by default and so already vendored).
+fn insert_before_node_serviceaccounts_rule(
+    items: &mut [serde_json::Value],
+    rules: Vec<serde_json::Value>,
+) {
+    let target = items
+        .iter_mut()
+        .find(|i| i["kind"] == "ClusterRole" && i["metadata"]["name"] == "system:node")
+        .expect("vendored policy has system:node");
+    let list = target["rules"].as_array_mut().expect("rules is an array");
+    let at = list
+        .iter()
+        .position(|r| r["resources"] == serde_json::json!(["serviceaccounts"]))
+        .unwrap_or(list.len());
+    list.splice(at..at, rules);
+}
+
+/// The feature-gated part of the ClusterRoles / ClusterRoleBindings. The
+/// vendored YAML is `ClusterRoles()` with every gate at its default; this adds
+/// what the branches `if utilfeature.DefaultFeatureGate.Enabled(...)` append
+/// when a gate is switched on, in upstream's order:
+/// * `system:monitoring`: `ComponentFlagz` `/flagz`, `ComponentStatusz`
+///   `/statusz` (`policy.go:301-307`)
+/// * `system:node` (`NodeRules`): `ClusterTrustBundle`, `PodCertificateRequest`
+///   (`policy.go:271-283`; `KubeletServiceAccountTokenForCredentialProviders`
+///   is on by default so it is in the vendored YAML)
+/// * `system:kube-scheduler`: `DRAExtendedResource`, `DRADeviceTaintRules`
+///   (under `DynamicResourceAllocation`, GA and on in v1.35) then
+///   `GenericWorkload` (`policy.go:644-655`)
+/// * `ClusterTrustBundle`: the `system:cluster-trust-bundle-discovery`
+///   ClusterRole (`policy.go:663-672`) and its binding to
+///   `system:serviceaccounts` (`policy.go:713-715`)
+///
+/// Gates the vendored default output already covers (`DynamicResourceAllocation`,
+/// `MultiCIDRServiceAllocator`, `KubeletFineGrainedAuthz`) are GA/on in v1.35
+/// and so need no branch here. Controller-role gates (`controller_policy.go`)
+/// are not applied; see the tracking issue.
+fn apply_feature_gated_policy(items: &mut Vec<serde_json::Value>) {
+    use rusternetes_common::feature_gates::{enabled, Feature};
+    const READ: [&str; 3] = ["get", "list", "watch"];
+    const CERTS: [&str; 1] = ["certificates.k8s.io"];
+
+    if enabled(Feature::ComponentFlagz) {
+        push_rules(items, "system:monitoring", vec![url_rule("/flagz")]);
+    }
+    if enabled(Feature::ComponentStatusz) {
+        push_rules(items, "system:monitoring", vec![url_rule("/statusz")]);
+    }
+
+    if enabled(Feature::ClusterTrustBundle) {
+        insert_before_node_serviceaccounts_rule(
+            items,
+            vec![rule(&CERTS, &["clustertrustbundles"], &READ)],
+        );
+    }
+    if enabled(Feature::PodCertificateRequest) {
+        push_rules(
+            items,
+            "system:node",
+            vec![rule(
+                &CERTS,
+                &["podcertificaterequests"],
+                &["create", "get", "list", "watch"],
+            )],
+        );
+    }
+
+    let mut scheduler = Vec::new();
+    if enabled(Feature::DRAExtendedResource) {
+        scheduler.push(rule(
+            &["resource.k8s.io"],
+            &["resourceclaims"],
+            &["create", "delete"],
+        ));
+    }
+    if enabled(Feature::DRADeviceTaintRules) {
+        scheduler.push(rule(&["resource.k8s.io"], &["devicetaintrules"], &READ));
+    }
+    if enabled(Feature::GenericWorkload) {
+        scheduler.push(rule(&["scheduling.k8s.io"], &["workloads"], &READ));
+    }
+    push_rules(items, "system:kube-scheduler", scheduler);
+
+    if enabled(Feature::ClusterTrustBundle) {
+        let meta = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "labels": {"kubernetes.io/bootstrapping": "rbac-defaults"},
+                "annotations": {"rbac.authorization.kubernetes.io/autoupdate": "true"},
+            })
+        };
+        let mut role = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "rules": [rule(&CERTS, &["clustertrustbundles"], &READ)],
+        });
+        role["metadata"] = meta("system:cluster-trust-bundle-discovery");
+        let mut binding = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "system:cluster-trust-bundle-discovery",
+            },
+            "subjects": [{
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Group",
+                "name": "system:serviceaccounts",
+            }],
+        });
+        binding["metadata"] = meta("system:cluster-trust-bundle-discovery");
+        items.push(role);
+        items.push(binding);
+    }
+}
+
+/// Every bootstrap policy object with the feature gates applied.
+fn bootstrap_policy_items() -> Result<Vec<serde_json::Value>> {
+    let mut items = Vec::new();
+    for yaml in BOOTSTRAP_POLICY {
+        items.extend(load_policy_items(yaml)?);
+    }
+    apply_feature_gated_policy(&mut items);
+    Ok(items)
+}
+
 /// Seed the full upstream RBAC bootstrap policy (#1659, #1753), mirroring
 /// `EnsureRBACPolicy` (`pkg/registry/rbac/rest/storage_rbac.go:269-331`, run
 /// from the `rbac/bootstrap-roles` post-start hook): every bootstrap
@@ -95,8 +245,8 @@ fn policy_key(item: &serde_json::Value) -> Option<(String, String)> {
 pub async fn bootstrap_default_rbac(storage: Arc<StorageBackend>) -> Result<()> {
     let mut namespaces = std::collections::BTreeSet::new();
 
-    for yaml in BOOTSTRAP_POLICY {
-        for mut item in load_policy_items(yaml)? {
+    {
+        for mut item in bootstrap_policy_items()? {
             let Some((key, kind)) = policy_key(&item) else {
                 continue;
             };
@@ -1608,6 +1758,84 @@ mod tests {
         bootstrap_default_rbac(storage.clone()).await.unwrap();
         let after: serde_json::Value = storage.get(key).await.unwrap();
         assert_eq!(after["roleRef"]["name"], "view");
+    }
+
+    /// `ClusterRoles()` only: not the `system:controller:*` roles (`ControllerRoles()`).
+    fn is_cluster_roles_item(i: &serde_json::Value) -> bool {
+        i["kind"] == "ClusterRole"
+            && !i["metadata"]["name"]
+                .as_str()
+                .unwrap()
+                .starts_with("system:controller:")
+    }
+
+    /// Upstream `TestBootstrapClusterRolesWithFeatureGatesEnabled`
+    /// (`bootstrappolicy/policy_test.go:180-200`): with the gates on, the
+    /// ClusterRoles equal `testdata/cluster-roles-featuregates.yaml`. Upstream
+    /// flips `AllAlpha`/`AllBeta`; we flip each gate that changes a ClusterRole.
+    #[test]
+    #[serial_test::serial]
+    fn cluster_roles_with_feature_gates_enabled_match_upstream_testdata() {
+        use rusternetes_common::feature_gates::{with_feature, Feature};
+        let _g: Vec<_> = [
+            Feature::ClusterTrustBundle,
+            Feature::PodCertificateRequest,
+            Feature::DRAExtendedResource,
+            Feature::DRADeviceTaintRules,
+            Feature::GenericWorkload,
+            Feature::ComponentFlagz,
+            Feature::ComponentStatusz,
+        ]
+        .into_iter()
+        .map(|f| with_feature(f, true))
+        .collect();
+        let mut got: Vec<_> = bootstrap_policy_items()
+            .unwrap()
+            .into_iter()
+            .filter(is_cluster_roles_item)
+            .collect();
+        got.sort_by_key(|i| i["metadata"]["name"].as_str().unwrap().to_string());
+        let want = load_policy_items(include_str!(
+            "bootstrap_policy/cluster-roles-featuregates.yaml"
+        ))
+        .unwrap();
+        assert_eq!(got.len(), want.len(), "role set differs");
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(g, w, "ClusterRole {} differs", w["metadata"]["name"]);
+        }
+    }
+
+    /// With the gates at their v1.35 defaults the policy is exactly the
+    /// vendored `cluster-roles.yaml` (`TestBootstrapClusterRoles`).
+    #[test]
+    #[serial_test::serial]
+    fn cluster_roles_with_default_gates_match_upstream_testdata() {
+        rusternetes_common::feature_gates::reset_to_defaults();
+        let mut got: Vec<_> = bootstrap_policy_items()
+            .unwrap()
+            .into_iter()
+            .filter(is_cluster_roles_item)
+            .collect();
+        got.sort_by_key(|i| i["metadata"]["name"].as_str().unwrap().to_string());
+        let want = load_policy_items(include_str!("bootstrap_policy/cluster-roles.yaml")).unwrap();
+        assert_eq!(got, want);
+    }
+
+    /// `policy.go:713-715`: the trust-bundle discovery binding exists only
+    /// with `ClusterTrustBundle` on.
+    #[test]
+    #[serial_test::serial]
+    fn cluster_trust_bundle_discovery_binding_follows_the_gate() {
+        use rusternetes_common::feature_gates::{with_feature, Feature};
+        let has = || {
+            bootstrap_policy_items().unwrap().iter().any(|i| {
+                i["kind"] == "ClusterRoleBinding"
+                    && i["metadata"]["name"] == "system:cluster-trust-bundle-discovery"
+            })
+        };
+        assert!(!has());
+        let _g = with_feature(Feature::ClusterTrustBundle, true);
+        assert!(has());
     }
 
     /// #1753: the whole upstream bootstrap policy is seeded, not only
