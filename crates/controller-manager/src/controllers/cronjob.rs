@@ -1,7 +1,7 @@
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::service_account::ObjectReference;
-use rusternetes_common::resources::workloads::{CronJob, CronJobStatus, Job};
+use rusternetes_common::resources::workloads::{CronJob, Job};
 use rusternetes_common::resources::{EventSource, EventType};
 use rusternetes_common::types::OwnerReference;
 use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
@@ -31,6 +31,23 @@ impl<S: Storage + 'static> CronJobController<S> {
     /// `jm.recorder.Eventf(cronJob, corev1.EventTypeWarning, ...)`. A failure to
     /// record is logged and dropped: it must not mask the sync outcome.
     async fn record_warning(&self, cronjob: &CronJob, reason: &str, message: &str) {
+        self.record_event(cronjob, EventType::Warning, reason, message)
+            .await;
+    }
+
+    /// `jm.recorder.Eventf(cronJob, corev1.EventTypeNormal, ...)`.
+    async fn record_normal(&self, cronjob: &CronJob, reason: &str, message: &str) {
+        self.record_event(cronjob, EventType::Normal, reason, message)
+            .await;
+    }
+
+    async fn record_event(
+        &self,
+        cronjob: &CronJob,
+        event_type: EventType,
+        reason: &str,
+        message: &str,
+    ) {
         let involved = ObjectReference {
             kind: Some("CronJob".to_string()),
             namespace: cronjob.metadata.namespace.clone(),
@@ -45,7 +62,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         };
         if let Err(e) = self
             .recorder
-            .event(&involved, &source, EventType::Warning, reason, message)
+            .event(&involved, &source, event_type, reason, message)
             .await
         {
             warn!("failed to record {reason} event: {e}");
@@ -192,210 +209,276 @@ impl<S: Storage + 'static> CronJobController<S> {
         Ok(())
     }
 
+    /// `sync` (cronjob_controllerv2.go:188-238): list the Jobs this CronJob
+    /// controls, run `cleanupFinishedJobs` and `syncCronJob` against ONE copy
+    /// of the CronJob, and write the status once if either asked for it.
     async fn reconcile(&self, cronjob: &mut CronJob) -> Result<()> {
-        let name = &cronjob.metadata.name;
-        let namespace = cronjob.metadata.namespace.as_ref().unwrap();
+        let namespace = cronjob.metadata.namespace.clone().unwrap_or_default();
+        debug!(
+            "Reconciling CronJob {}/{}",
+            namespace, cronjob.metadata.name
+        );
 
-        // Skip reconciliation for CronJobs being deleted — GC handles Job cleanup
-        if cronjob.metadata.is_being_deleted() {
-            return Ok(());
+        let jobs = self.jobs_to_be_reconciled(cronjob, &namespace).await?;
+        let update_after_cleanup = self.cleanup_finished_jobs(cronjob, &jobs).await;
+        let mut update_after_sync = false;
+        let sync_result = self
+            .sync_cronjob(cronjob, &jobs, &namespace, &mut update_after_sync)
+            .await;
+        if let Err(e) = &sync_result {
+            debug!(
+                "Error reconciling cronjob {}/{}: {e}",
+                namespace, cronjob.metadata.name
+            );
         }
 
-        debug!("Reconciling CronJob {}/{}", namespace, name);
+        if update_after_cleanup || update_after_sync {
+            let key = format!("/registry/cronjobs/{}/{}", namespace, cronjob.metadata.name);
+            // Conditional status write (#2153): a Conflict is returned and the
+            // work item requeued (`UpdateStatus`, :222-228).
+            self.storage.update_status_cas(&key, cronjob).await?;
+        }
+        sync_result
+    }
 
-        // Check if CronJob is suspended
+    /// `getJobsToBeReconciled` (cronjob_controllerv2.go:258-277): every Job in
+    /// the namespace whose controllerRef names this CronJob. Labels play no part.
+    async fn jobs_to_be_reconciled(&self, cronjob: &CronJob, namespace: &str) -> Result<Vec<Job>> {
+        let all: Vec<Job> = self
+            .storage
+            .list(&format!("/registry/jobs/{}/", namespace))
+            .await?;
+        Ok(all
+            .into_iter()
+            .filter(|job| {
+                job.metadata
+                    .owner_references
+                    .iter()
+                    .flatten()
+                    .find(|r| r.controller == Some(true))
+                    .is_some_and(|r| r.name == cronjob.metadata.name)
+            })
+            .collect())
+    }
+
+    /// `syncCronJob` (cronjob_controllerv2.go:426-673). `update_status` is the
+    /// returned `updateStatus` flag, set even when the sync later errors.
+    async fn sync_cronjob(
+        &self,
+        cronjob: &mut CronJob,
+        jobs: &[Job],
+        namespace: &str,
+        update_status: &mut bool,
+    ) -> Result<()> {
+        let name = cronjob.metadata.name.clone();
+        let now = chrono::Utc::now();
+
+        let mut children: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for j in jobs {
+            children.insert(j.metadata.uid.clone());
+            let found = in_active_list(cronjob, &j.metadata.uid);
+            let finished = job_finished_condition(j);
+            if !found && finished.is_none() {
+                // :439-449: re-read the CronJob; if the fresh copy has it,
+                // adopt that copy, else warn. The Job is NOT added to active.
+                let key = format!("/registry/cronjobs/{}/{}", namespace, name);
+                let fresh: CronJob = self.storage.get(&key).await?;
+                if in_active_list(&fresh, &j.metadata.uid) {
+                    *cronjob = fresh;
+                    continue;
+                }
+                self.record_warning(
+                    cronjob,
+                    "UnexpectedJob",
+                    &format!(
+                        "Saw a job that the controller did not create or forgot: {}",
+                        j.metadata.name
+                    ),
+                )
+                .await;
+            } else if let Some(condition) = finished {
+                if found {
+                    delete_from_active_list(cronjob, &j.metadata.uid);
+                    self.record_normal(
+                        cronjob,
+                        "SawCompletedJob",
+                        &format!(
+                            "Saw completed job: {}, condition: {}",
+                            j.metadata.name, condition
+                        ),
+                    )
+                    .await;
+                    *update_status = true;
+                }
+                if condition == "Complete" {
+                    // A Job need not be in the active list for its success
+                    // time to count (:462-471).
+                    let completion = j.status.as_ref().and_then(|s| s.completion_time);
+                    let status = cronjob.status.get_or_insert_with(Default::default);
+                    if status.last_successful_time.is_none() {
+                        status.last_successful_time = completion;
+                        *update_status = true;
+                    }
+                    if let (Some(done), Some(last)) = (completion, status.last_successful_time) {
+                        if done > last {
+                            status.last_successful_time = Some(done);
+                            *update_status = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // :477-496: drop active entries whose Job is gone. The Job is fetched
+        // directly so a lagging list cannot cause an unwanted miss.
+        let active: Vec<ObjectReference> = cronjob
+            .status
+            .as_ref()
+            .map(|s| s.active.clone())
+            .unwrap_or_default();
+        for r in &active {
+            let uid = r.uid.clone().unwrap_or_default();
+            if children.contains(&uid) {
+                continue;
+            }
+            let key = format!(
+                "/registry/jobs/{}/{}",
+                r.namespace.as_deref().unwrap_or(namespace),
+                r.name.as_deref().unwrap_or_default()
+            );
+            match self.storage.get::<Job>(&key).await {
+                Err(rusternetes_common::Error::NotFound(_)) => {
+                    self.record_normal(
+                        cronjob,
+                        "MissingJob",
+                        &format!(
+                            "Active job went missing: {}",
+                            r.name.as_deref().unwrap_or("")
+                        ),
+                    )
+                    .await;
+                    delete_from_active_list(cronjob, &uid);
+                    *update_status = true;
+                }
+                Err(e) => return Err(e.into()),
+                Ok(_) => {}
+            }
+        }
+
+        if cronjob.metadata.is_being_deleted() {
+            // Don't do anything other than updating status (:498-502).
+            return Ok(());
+        }
         if cronjob.spec.suspend.unwrap_or(false) {
             debug!("CronJob {}/{} is suspended", namespace, name);
             return Ok(());
         }
 
-        // Parse cron schedule
-        let schedule = &cronjob.spec.schedule;
-        let now = chrono::Utc::now();
-
-        // Simple cron parsing - in production, use a proper cron parser library
-        let Some(scheduled_time) = self.scheduled_run_time(schedule, now, cronjob).await? else {
+        let schedule = cronjob.spec.schedule.clone();
+        let Some(scheduled_time) = self.scheduled_run_time(&schedule, now, cronjob).await? else {
             return Ok(());
         };
-        // getJobName (cronjob_controllerv2.go:676): the Job is named from the
-        // SCHEDULED time, so a retry after a lost status write is idempotent.
-        let scheduled_job_name = job_name_for(&cronjob.metadata.name, scheduled_time);
-
+        // getJobName (:676): the Job is named from the SCHEDULED time.
+        let scheduled_job_name = job_name_for(&name, scheduled_time);
         info!("CronJob {}/{} triggered at {}", namespace, name, now);
 
-        // Check concurrency policy
-        let job_prefix = format!("/registry/jobs/{}/", namespace);
-        let all_jobs: Vec<Job> = self.storage.list(&job_prefix).await?;
-
-        let active_jobs: Vec<Job> = all_jobs
-            .into_iter()
-            .filter(|job| {
-                // A Job already created for THIS scheduled time by an earlier
-                // attempt whose status write lost the race is not "another
-                // active run": the retry must reach create_job and get
-                // AlreadyExists (cronjob_controllerv2.go:615-632).
-                job.metadata.name != scheduled_job_name
-                    && job
-                        .metadata
-                        .labels
-                        .as_ref()
-                        .and_then(|labels| labels.get("cronjob-name"))
-                        .map(|cj| cj == name)
-                        .unwrap_or(false)
-                    && job
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.conditions.as_ref())
-                        .map(|conds| {
-                            !conds
-                                .iter()
-                                .any(|c| c.condition_type == "Complete" && c.status == "True")
-                        })
-                        .unwrap_or(true) // Job not completed
-            })
-            .collect();
-
-        let concurrency_policy = cronjob
-            .spec
-            .concurrency_policy
-            .as_deref()
-            .unwrap_or("Allow");
-
-        match concurrency_policy {
-            "Forbid" if !active_jobs.is_empty() => {
-                info!(
-                    "CronJob {}/{} skipped due to Forbid policy (active jobs: {})",
-                    namespace,
-                    name,
-                    active_jobs.len()
-                );
-                // Still update status with active jobs list.
-                // Sort by name + omit resource_version so the active list is
-                // stable across reconciles (otherwise comparisons in the
-                // skip-write guard below would flicker on every Job update).
-                let mut sorted_active: Vec<&Job> = active_jobs.iter().collect();
-                sorted_active.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-                let active_refs: Vec<
-                    rusternetes_common::resources::service_account::ObjectReference,
-                > = sorted_active
-                    .iter()
-                    .map(
-                        |job| rusternetes_common::resources::service_account::ObjectReference {
-                            kind: Some("Job".to_string()),
-                            namespace: Some(namespace.to_string()),
-                            name: Some(job.metadata.name.clone()),
-                            uid: Some(job.metadata.uid.clone()),
-                            api_version: Some("batch/v1".to_string()),
-                            // Omitted: resource_version flickers on every Job
-                            // update and is not part of CronJob.status.active
-                            // identity in upstream K8s.
-                            resource_version: None,
-                            field_path: None,
-                        },
-                    )
-                    .collect();
-                let new_status = Some(CronJobStatus {
-                    active: active_refs,
-                    last_schedule_time: cronjob.status.as_ref().and_then(|s| s.last_schedule_time),
-                    last_successful_time: cronjob
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.last_successful_time),
-                });
-                // Only write status if it actually changed
-                if cronjob.status != new_status {
-                    cronjob.status = new_status;
-                    let key = format!("/registry/cronjobs/{}/{}", namespace, name);
-                    // Conditional status write: a Conflict requeues
-                    // (Store.Update's resourceVersion precondition, #2153).
-                    self.storage.update_status_cas(&key, cronjob).await?;
-                }
-                return Ok(());
-            }
-            "Replace" if !active_jobs.is_empty() => {
-                // Delete active jobs
-                for job in active_jobs.iter() {
-                    let job_name = &job.metadata.name;
-                    let job_key = format!("/registry/jobs/{}/{}", namespace, job_name);
-                    self.storage.delete(&job_key).await?;
-                    info!("Deleted active Job {} for replacement", job_name);
-                }
-            }
-            _ => {
-                // Allow - just create a new job
-            }
-        }
-
-        // Create new Job
-        if !self.create_job(cronjob, namespace, scheduled_time).await? {
+        // :564-573
+        if in_active_list_by_name(cronjob, namespace, &scheduled_job_name)
+            || cronjob
+                .status
+                .as_ref()
+                .and_then(|s| s.last_schedule_time)
+                .is_some_and(|t| t == scheduled_time)
+        {
+            debug!("Not starting job because the scheduled time is already processed");
             return Ok(());
         }
 
-        // Build active job references from all active jobs for this cronjob.
-        // Sort by name so the active list is deterministic across reconciles
-        // (MemoryStorage list iterates a HashMap in non-deterministic order).
-        let active_refs: Vec<rusternetes_common::resources::service_account::ObjectReference> = {
-            let job_prefix = format!("/registry/jobs/{}/", namespace);
-            let mut current_jobs: Vec<Job> =
-                self.storage.list(&job_prefix).await.unwrap_or_default();
-            current_jobs.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-            current_jobs
-                .iter()
-                .filter(|job| {
-                    job.metadata
-                        .labels
-                        .as_ref()
-                        .and_then(|l| l.get("cronjob-name"))
-                        .map(|cj| cj == name)
-                        .unwrap_or(false)
-                        && !job
-                            .status
-                            .as_ref()
-                            .and_then(|s| s.conditions.as_ref())
-                            .map(|conds| {
-                                conds
-                                    .iter()
-                                    .any(|c| c.condition_type == "Complete" && c.status == "True")
-                            })
-                            .unwrap_or(false)
-                })
-                .map(
-                    |job| rusternetes_common::resources::service_account::ObjectReference {
-                        kind: Some("Job".to_string()),
-                        namespace: Some(namespace.to_string()),
-                        name: Some(job.metadata.name.clone()),
-                        uid: Some(job.metadata.uid.clone()),
-                        api_version: Some("batch/v1".to_string()),
-                        resource_version: None,
-                        field_path: None,
-                    },
-                )
-                .collect()
-        };
-
-        // Update status with active refs and last schedule time
-        let new_status = Some(CronJobStatus {
-            active: active_refs,
-            // syncCronJob sets LastScheduleTime = the scheduled time
-            // (cronjob_controllerv2.go, `cronJob.Status.LastScheduleTime`).
-            last_schedule_time: Some(scheduled_time),
-            last_successful_time: cronjob.status.as_ref().and_then(|s| s.last_successful_time),
-        });
-
-        // Only write status if it actually changed to avoid unnecessary storage writes
-        // that trigger watch events and cause feedback loops
-        if cronjob.status != new_status {
-            cronjob.status = new_status;
-            let key = format!("/registry/cronjobs/{}/{}", namespace, name);
-            // Conditional status write (#2153): a Conflict is returned and the
-            // work item requeued; the retry's create_job gets AlreadyExists.
-            self.storage.update_status_cas(&key, cronjob).await?;
+        let policy = cronjob
+            .spec
+            .concurrency_policy
+            .clone()
+            .unwrap_or_else(|| "Allow".to_string());
+        let has_active = cronjob
+            .status
+            .as_ref()
+            .is_some_and(|s| !s.active.is_empty());
+        if policy == "Forbid" && has_active {
+            self.record_normal(
+                cronjob,
+                "JobAlreadyActive",
+                "Not starting job because prior execution is running and concurrency policy is Forbid",
+            )
+            .await;
+            return Ok(());
+        }
+        if policy == "Replace" {
+            for r in &active_refs(cronjob) {
+                let job_name = r.name.clone().unwrap_or_default();
+                let key = format!(
+                    "/registry/jobs/{}/{}",
+                    r.namespace.as_deref().unwrap_or(namespace),
+                    job_name
+                );
+                match self.storage.get::<Job>(&key).await {
+                    Ok(job) => {
+                        if !self.delete_job(cronjob, &job).await {
+                            return Err(anyhow::anyhow!(
+                                "could not replace job {}/{}",
+                                namespace,
+                                job_name
+                            ));
+                        }
+                        *update_status = true;
+                    }
+                    Err(e) => {
+                        self.record_warning(cronjob, "FailedGet", &format!("Get job: {e}"))
+                            .await;
+                        return Err(e.into());
+                    }
+                }
+            }
         }
 
-        // Clean up old jobs based on history limits
-        self.cleanup_old_jobs(cronjob, namespace).await?;
+        let Some(job) = self.create_job(cronjob, namespace, scheduled_time).await? else {
+            return Ok(());
+        };
 
+        // :655-671: add the just-started Job to the status list.
+        let status = cronjob.status.get_or_insert_with(Default::default);
+        status.active.push(ObjectReference {
+            kind: Some("Job".to_string()),
+            namespace: Some(namespace.to_string()),
+            name: Some(job.metadata.name.clone()),
+            uid: Some(job.metadata.uid.clone()),
+            api_version: Some("batch/v1".to_string()),
+            resource_version: job.metadata.resource_version.clone(),
+            field_path: None,
+        });
+        status.last_schedule_time = Some(scheduled_time);
+        *update_status = true;
         Ok(())
+    }
+
+    /// `deleteJob` (cronjob_controllerv2.go:748-760): delete the Job and its
+    /// reference in the active list; false when the delete fails.
+    async fn delete_job(&self, cronjob: &mut CronJob, job: &Job) -> bool {
+        let namespace = job.metadata.namespace.as_deref().unwrap_or("default");
+        let key = format!("/registry/jobs/{}/{}", namespace, job.metadata.name);
+        if let Err(e) = self.storage.delete(&key).await {
+            self.record_warning(cronjob, "FailedDelete", &format!("Deleted job: {e}"))
+                .await;
+            error!("Error deleting job {} from cronjob: {e}", job.metadata.name);
+            return false;
+        }
+        delete_from_active_list(cronjob, &job.metadata.uid);
+        self.record_normal(
+            cronjob,
+            "SuccessfulDelete",
+            &format!("Deleted job {}", job.metadata.name),
+        )
+        .await;
+        true
     }
 
     #[cfg(test)]
@@ -574,7 +657,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         cronjob: &CronJob,
         namespace: &str,
         scheduled_time: chrono::DateTime<chrono::Utc>,
-    ) -> Result<bool> {
+    ) -> Result<Option<Job>> {
         let cronjob_name = &cronjob.metadata.name;
         let job_name = job_name_for(cronjob_name, scheduled_time);
 
@@ -642,125 +725,149 @@ impl<S: Storage + 'static> CronJobController<S> {
         };
 
         let key = format!("/registry/jobs/{}/{}", namespace, job_name);
-        match self.storage.create(&key, &job).await {
-            Ok(_) => {}
+        let created = match self.storage.create(&key, &job).await {
+            Ok(created) => created,
             Err(rusternetes_common::Error::AlreadyExists(_)) => {
-                // cronjob_controllerv2.go:615-632: AlreadyExists means a prior
-                // attempt created this Job but lost the status write. Success,
-                // unless another actor owns it (then it updates the status).
+                // cronjob_controllerv2.go:615-632. A Job we created before
+                // losing the status write is re-added to the active list; one
+                // controlled by someone else is theirs to account for; one
+                // already in the active list needs no second write.
                 let existing: Job = self.storage.get(&key).await?;
-                let ours = existing
+                let controlled = existing
                     .metadata
                     .owner_references
-                    .as_ref()
-                    .is_some_and(|o| o.iter().any(|r| r.uid == cronjob.metadata.uid));
-                debug!(
-                    "Job {} already exists for CronJob {} (controlled by it: {})",
-                    job_name, cronjob_name, ours
+                    .iter()
+                    .flatten()
+                    .find(|r| r.controller == Some(true))
+                    .is_some_and(|r| r.uid == cronjob.metadata.uid);
+                if !controlled || in_active_list(cronjob, &existing.metadata.uid) {
+                    return Ok(None);
+                }
+                info!(
+                    "Job {} already exists for CronJob {}",
+                    job_name, cronjob_name
                 );
-                // `if !metav1.IsControlledBy(job, cronJob) { return nil,
-                // updateStatus, nil }` (cronjob_controllerv2.go:628-631).
-                return Ok(ours);
+                return Ok(Some(existing));
             }
-            Err(e) => return Err(e.into()),
-        }
+            Err(e) => {
+                self.record_warning(cronjob, "FailedCreate", &format!("Error creating job: {e}"))
+                    .await;
+                return Err(e.into());
+            }
+        };
 
         info!("Created Job {} from CronJob {}", job_name, cronjob_name);
+        self.record_normal(
+            cronjob,
+            "SuccessfulCreate",
+            &format!("Created job {}", job_name),
+        )
+        .await;
 
-        Ok(true)
+        Ok(Some(created))
     }
 
-    async fn cleanup_old_jobs(&self, cronjob: &CronJob, namespace: &str) -> Result<()> {
-        let cronjob_name = &cronjob.metadata.name;
-        // Clamp negative user-supplied values to 0 so the cast to usize does not
-        // wrap to a huge number, which would prevent any history cleanup.
-        let success_limit: usize =
-            usize::try_from(cronjob.spec.successful_jobs_history_limit.unwrap_or(3)).unwrap_or(0);
-        let failed_limit: usize =
-            usize::try_from(cronjob.spec.failed_jobs_history_limit.unwrap_or(1)).unwrap_or(0);
+    /// `cleanupFinishedJobs` (cronjob_controllerv2.go:682-716). Returns whether
+    /// the status needs writing. The history limits default to 3 / 1 here, as
+    /// the API defaulting would (SetDefaults_CronJob); upstream's early return
+    /// when both are nil is that defaulting not having run.
+    async fn cleanup_finished_jobs(&self, cronjob: &mut CronJob, jobs: &[Job]) -> bool {
+        let success_limit = cronjob.spec.successful_jobs_history_limit.unwrap_or(3);
+        let failed_limit = cronjob.spec.failed_jobs_history_limit.unwrap_or(1);
 
-        let job_prefix = format!("/registry/jobs/{}/", namespace);
-        let mut all_jobs: Vec<Job> = self.storage.list(&job_prefix).await?;
-
-        // Filter jobs from this CronJob
-        all_jobs.retain(|job| {
-            job.metadata
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get("cronjob-name"))
-                .map(|cj| cj == cronjob_name)
-                .unwrap_or(false)
-        });
-
-        // Separate successful and failed jobs
-        let mut successful_jobs: Vec<Job> = all_jobs
-            .iter()
-            .filter(|job| {
-                job.status
-                    .as_ref()
-                    .and_then(|s| s.conditions.as_ref())
-                    .map(|conds| {
-                        conds
-                            .iter()
-                            .any(|c| c.condition_type == "Complete" && c.status == "True")
-                    })
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-
-        let mut failed_jobs: Vec<Job> = all_jobs
-            .iter()
-            .filter(|job| {
-                job.status
-                    .as_ref()
-                    .and_then(|s| s.conditions.as_ref())
-                    .map(|conds| {
-                        conds
-                            .iter()
-                            .any(|c| c.condition_type == "Failed" && c.status == "True")
-                    })
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-
-        // Sort by creation timestamp (oldest first)
-        successful_jobs.sort_by(|a, b| {
-            a.metadata
-                .creation_timestamp
-                .cmp(&b.metadata.creation_timestamp)
-        });
-        failed_jobs.sort_by(|a, b| {
-            a.metadata
-                .creation_timestamp
-                .cmp(&b.metadata.creation_timestamp)
-        });
-
-        // Delete old successful jobs
-        if successful_jobs.len() > success_limit {
-            let to_delete = successful_jobs.len() - success_limit;
-            for job in successful_jobs.iter().take(to_delete) {
-                let job_name = &job.metadata.name;
-                let job_key = format!("/registry/jobs/{}/{}", namespace, job_name);
-                self.storage.delete(&job_key).await?;
-                info!("Deleted old successful Job {}", job_name);
+        let mut successful: Vec<Job> = Vec::new();
+        let mut failed: Vec<Job> = Vec::new();
+        for job in jobs {
+            match job_finished_condition(job) {
+                Some("Complete") => successful.push(job.clone()),
+                Some("Failed") => failed.push(job.clone()),
+                _ => {}
             }
         }
 
-        // Delete old failed jobs
-        if failed_jobs.len() > failed_limit {
-            let to_delete = failed_jobs.len() - failed_limit;
-            for job in failed_jobs.iter().take(to_delete) {
-                let job_name = &job.metadata.name;
-                let job_key = format!("/registry/jobs/{}/{}", namespace, job_name);
-                self.storage.delete(&job_key).await?;
-                info!("Deleted old failed Job {}", job_name);
+        let mut update = false;
+        update |= self
+            .remove_oldest_jobs(cronjob, &mut successful, success_limit)
+            .await;
+        update |= self
+            .remove_oldest_jobs(cronjob, &mut failed, failed_limit)
+            .await;
+        update
+    }
+
+    /// `removeOldestJobs` (cronjob_controllerv2.go:728-746), ordered by
+    /// `byJobStartTime` (utils.go:274-295): started Jobs first, oldest first,
+    /// name as tie-break.
+    async fn remove_oldest_jobs(
+        &self,
+        cronjob: &mut CronJob,
+        jobs: &mut [Job],
+        max_jobs: i32,
+    ) -> bool {
+        let num_to_delete = jobs.len() as i64 - max_jobs.max(0) as i64;
+        if num_to_delete <= 0 {
+            return false;
+        }
+        jobs.sort_by(|a, b| {
+            let (sa, sb) = (
+                a.status.as_ref().and_then(|s| s.start_time),
+                b.status.as_ref().and_then(|s| s.start_time),
+            );
+            (sa.is_none(), sa, &a.metadata.name).cmp(&(sb.is_none(), sb, &b.metadata.name))
+        });
+        let mut update = false;
+        for job in jobs.iter().take(num_to_delete as usize) {
+            if self.delete_job(cronjob, job).await {
+                update = true;
             }
         }
-
-        Ok(())
+        update
     }
+}
+
+/// `inActiveList` (utils.go:58-66).
+fn in_active_list(cj: &CronJob, uid: &str) -> bool {
+    cj.status
+        .as_ref()
+        .is_some_and(|s| s.active.iter().any(|r| r.uid.as_deref() == Some(uid)))
+}
+
+/// `inActiveListByName` (utils.go:68-77).
+fn in_active_list_by_name(cj: &CronJob, namespace: &str, name: &str) -> bool {
+    cj.status.as_ref().is_some_and(|s| {
+        s.active
+            .iter()
+            .any(|r| r.name.as_deref() == Some(name) && r.namespace.as_deref() == Some(namespace))
+    })
+}
+
+/// `deleteFromActiveList` (utils.go:79-93).
+fn delete_from_active_list(cj: &mut CronJob, uid: &str) {
+    if let Some(s) = cj.status.as_mut() {
+        s.active.retain(|r| r.uid.as_deref() != Some(uid));
+    }
+}
+
+fn active_refs(cj: &CronJob) -> Vec<ObjectReference> {
+    cj.status
+        .as_ref()
+        .map(|s| s.active.clone())
+        .unwrap_or_default()
+}
+
+/// `getFinishedStatus` (cronjob_controllerv2.go:718-726): the first Complete
+/// or Failed condition whose status is True.
+fn job_finished_condition(job: &Job) -> Option<&'static str> {
+    job.status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .find_map(|c| match (c.condition_type.as_str(), c.status.as_str()) {
+            ("Complete", "True") => Some("Complete"),
+            ("Failed", "True") => Some("Failed"),
+            _ => None,
+        })
 }
 
 #[cfg(test)]
@@ -985,6 +1092,54 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    // ---- status.active sync (#2366) -------------------------------------
+    // Ported from syncCronJob (cronjob_controllerv2.go:426-496) and
+    // inActiveList / inActiveListByName (utils.go:58-77).
+
+    type Mem = rusternetes_storage::memory::MemoryStorage;
+
+    fn cj_json(
+        schedule: &str,
+        policy: &str,
+        status: serde_json::Value,
+    ) -> rusternetes_common::resources::CronJob {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "batch/v1", "kind": "CronJob",
+            "metadata": {"name": "cj", "namespace": "default", "uid": "cj-uid",
+                "creationTimestamp": (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339()},
+            "spec": {"schedule": schedule, "concurrencyPolicy": policy,
+                "jobTemplate": {"spec": {"template": {"spec": {
+                    "containers": [{"name": "c", "image": "busybox"}]}}}}},
+            "status": status,
+        }))
+        .unwrap()
+    }
+
+    fn job_json(
+        name: &str,
+        uid: &str,
+        owned: bool,
+        finished: Option<&str>,
+    ) -> rusternetes_common::resources::Job {
+        let mut v = serde_json::json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": name, "namespace": "default", "uid": uid,
+                "labels": {"cronjob-name": "cj"}},
+            "spec": {"template": {"spec": {"containers": [{"name": "c", "image": "busybox"}]}}},
+        });
+        if owned {
+            v["metadata"]["ownerReferences"] = serde_json::json!([{
+                "apiVersion": "batch/v1", "kind": "CronJob", "name": "cj",
+                "uid": "cj-uid", "controller": true}]);
+        }
+        if let Some(t) = finished {
+            v["status"] = serde_json::json!({
+                "conditions": [{"type": "Complete", "status": "True"}],
+                "completionTime": t});
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
     /// utils.go:101 `earliestTime := cj.ObjectMeta.CreationTimestamp.Time`:
     /// with no lastScheduleTime the walk starts at creationTimestamp, not a
     /// "within the past minute" window. Created 05:50, now 06:02: the 06:00
@@ -1035,7 +1190,7 @@ mod tests {
         const ANN: &str = "batch.kubernetes.io/cronjob-scheduled-timestamp";
 
         let cj = cj_fixture(serde_json::json!({}));
-        assert!(ctrl.create_job(&cj, "default", t).await.unwrap());
+        assert!(ctrl.create_job(&cj, "default", t).await.unwrap().is_some());
         let job: Job = storage.get(&key("cj")).await.unwrap();
         assert_eq!(
             job.metadata.annotations.unwrap().get(ANN).unwrap(),
@@ -1081,14 +1236,144 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !ctrl.create_job(&cj, "default", t).await.unwrap(),
+            ctrl.create_job(&cj, "default", t).await.unwrap().is_none(),
             "uncontrolled existing Job: no status update"
         );
 
         // Our own Job (controlled by uid u1) -> status update proceeds.
         let mut cj2 = cj_fixture(serde_json::json!({}));
         cj2.metadata.name = "mine".into();
-        assert!(ctrl.create_job(&cj2, "default", t).await.unwrap());
-        assert!(ctrl.create_job(&cj2, "default", t).await.unwrap());
+        assert!(ctrl.create_job(&cj2, "default", t).await.unwrap().is_some());
+        assert!(ctrl.create_job(&cj2, "default", t).await.unwrap().is_some());
+    }
+
+    fn job_ref(name: &str, uid: &str) -> serde_json::Value {
+        serde_json::json!({"kind": "Job", "namespace": "default", "name": name,
+            "uid": uid, "apiVersion": "batch/v1"})
+    }
+
+    async fn seed(
+        storage: &std::sync::Arc<Mem>,
+        cj: &rusternetes_common::resources::CronJob,
+        jobs: &[rusternetes_common::resources::Job],
+    ) -> rusternetes_common::resources::CronJob {
+        use rusternetes_storage::Storage;
+        storage
+            .create("/registry/cronjobs/default/cj", cj)
+            .await
+            .unwrap();
+        for j in jobs {
+            storage
+                .create(&format!("/registry/jobs/default/{}", j.metadata.name), j)
+                .await
+                .unwrap();
+        }
+        storage.get("/registry/cronjobs/default/cj").await.unwrap()
+    }
+
+    async fn reasons(storage: &std::sync::Arc<Mem>) -> Vec<String> {
+        use rusternetes_common::resources::Event;
+        use rusternetes_storage::Storage;
+        let mut r: Vec<String> = storage
+            .list::<Event>("/registry/events/default/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.reason)
+            .collect();
+        r.sort();
+        r
+    }
+
+    /// Finished Job still in status.active: removed, SawCompletedJob recorded,
+    /// lastSuccessfulTime taken from its completionTime (:450-471). The run is
+    /// not due (yearly schedule), so nothing else touches status.
+    #[tokio::test]
+    async fn finished_job_leaves_active_and_sets_last_successful_time() {
+        use rusternetes_storage::Storage;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let cj = cj_json(
+            "0 0 1 1 *",
+            "Allow",
+            serde_json::json!({"active": [job_ref("done", "ju1")]}),
+        );
+        let mut cj = seed(
+            &storage,
+            &cj,
+            &[job_json("done", "ju1", true, Some("2025-01-15T06:00:30Z"))],
+        )
+        .await;
+        ctrl.reconcile(&mut cj).await.unwrap();
+        let got: rusternetes_common::resources::CronJob =
+            storage.get("/registry/cronjobs/default/cj").await.unwrap();
+        let st = got.status.unwrap();
+        assert!(st.active.is_empty(), "{:?}", st.active);
+        assert_eq!(
+            st.last_successful_time.unwrap().to_rfc3339(),
+            "2025-01-15T06:00:30+00:00"
+        );
+        assert_eq!(reasons(&storage).await, vec!["SawCompletedJob"]);
+    }
+
+    /// status.active entry whose Job no longer exists: MissingJob, removed
+    /// (:477-496), even when no run is due.
+    #[tokio::test]
+    async fn missing_job_is_removed_from_active() {
+        use rusternetes_storage::Storage;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let cj = cj_json(
+            "0 0 1 1 *",
+            "Allow",
+            serde_json::json!({"active": [job_ref("gone", "ju9")]}),
+        );
+        let mut cj = seed(&storage, &cj, &[]).await;
+        ctrl.reconcile(&mut cj).await.unwrap();
+        let got: rusternetes_common::resources::CronJob =
+            storage.get("/registry/cronjobs/default/cj").await.unwrap();
+        assert!(got.status.unwrap().active.is_empty());
+        assert_eq!(reasons(&storage).await, vec!["MissingJob"]);
+    }
+
+    /// Forbid consults status.active, not a label scan: a label-only Job with
+    /// no controllerRef is not ours (getJobsToBeReconciled :258-277) and does
+    /// not block the run (:565-578 uses len(Status.Active)).
+    #[tokio::test]
+    async fn forbid_uses_status_active_not_label_scan() {
+        use rusternetes_common::resources::Job;
+        use rusternetes_storage::Storage;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let cj = cj_json("* * * * *", "Forbid", serde_json::json!({}));
+        let mut cj = seed(&storage, &cj, &[job_json("stranger", "ju2", false, None)]).await;
+        ctrl.reconcile(&mut cj).await.unwrap();
+        let jobs: Vec<Job> = storage.list("/registry/jobs/default/").await.unwrap();
+        assert_eq!(jobs.len(), 2, "run must not be blocked by a foreign Job");
+        let got: rusternetes_common::resources::CronJob =
+            storage.get("/registry/cronjobs/default/cj").await.unwrap();
+        let active = got.status.unwrap().active;
+        assert_eq!(active.len(), 1, "only the Job we created is active");
+        assert_ne!(active[0].name.as_deref(), Some("stranger"));
+    }
+
+    /// An unfinished controlled Job missing from status.active is NOT adopted
+    /// into it; UnexpectedJob warning only (:437-449).
+    #[tokio::test]
+    async fn unexpected_job_is_warned_not_adopted() {
+        use rusternetes_storage::Storage;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let cj = cj_json("0 0 1 1 *", "Allow", serde_json::json!({}));
+        let mut cj = seed(&storage, &cj, &[job_json("orphan", "ju3", true, None)]).await;
+        ctrl.reconcile(&mut cj).await.unwrap();
+        let got: rusternetes_common::resources::CronJob =
+            storage.get("/registry/cronjobs/default/cj").await.unwrap();
+        assert!(got.status.map(|s| s.active.is_empty()).unwrap_or(true));
+        assert_eq!(reasons(&storage).await, vec!["UnexpectedJob"]);
     }
 }
