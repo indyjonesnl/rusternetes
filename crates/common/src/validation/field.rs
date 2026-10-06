@@ -167,8 +167,26 @@ pub enum BadValue {
     /// the real fallback is unreachable and an unused variant with that name
     /// only invites the mistake again (#1907).
     Json(serde_json::Value),
+    /// A bad value already marshalled to JSON text, in the order the value
+    /// was serialized. `serde_json::Value` is a sorted map (the workspace does
+    /// not enable `preserve_order`), while Go's `json.Marshal` keeps **struct
+    /// field order** and sorts only map keys
+    /// (`staging/src/k8s.io/apimachinery/pkg/util/validation/field/errors.go:92-97`
+    /// marshals the value; `encoding/json` walks struct fields in declaration
+    /// order). Serializing a `#[derive(Serialize)]` struct straight to a
+    /// string keeps that order; build one with [`BadValue::marshal`] (#2086).
+    Marshaled(String),
     /// Sentinel for "omit the value entirely". Mirrors upstream `omitValue`.
     Omit,
+}
+
+impl BadValue {
+    /// Marshal `value` the way `json.Marshal` would: struct fields in
+    /// declaration order. Falls back to `null` if serialization fails
+    /// (upstream falls back to `fmt.Stringer`, unreachable for our types).
+    pub fn marshal<T: serde::Serialize>(value: &T) -> Self {
+        BadValue::Marshaled(serde_json::to_string(value).unwrap_or_else(|_| "null".into()))
+    }
 }
 
 impl From<&str> for BadValue {
@@ -351,6 +369,7 @@ impl Error {
                 BadValue::String(v) => format!("{}: {:?}", self.error_type.as_str(), v),
                 BadValue::I64(v) => format!("{}: {}", self.error_type.as_str(), v),
                 BadValue::Bool(v) => format!("{}: {}", self.error_type.as_str(), v),
+                BadValue::Marshaled(v) => format!("{}: {}", self.error_type.as_str(), v),
                 BadValue::Json(v) => {
                     let rendered = serde_json::to_string(v).unwrap_or_else(|_| format!("{v:?}"));
                     format!("{}: {}", self.error_type.as_str(), rendered)
@@ -381,6 +400,34 @@ pub type ErrorList = Vec<Error>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2086: a struct-valued bad value renders in field order, not sorted.
+    /// Go: `json.Marshal` keeps struct field order (errors.go:92-97).
+    #[test]
+    fn marshaled_bad_value_keeps_struct_field_order() {
+        #[derive(serde::Serialize)]
+        struct S {
+            #[serde(rename = "MinAvailable")]
+            min: &'static str,
+            #[serde(rename = "Selector")]
+            sel: Option<u8>,
+            #[serde(rename = "MaxUnavailable")]
+            max: u8,
+        }
+        let e = Error::invalid(
+            &Path::new("foo"),
+            BadValue::marshal(&S {
+                min: "10%",
+                sel: None,
+                max: 1,
+            }),
+            "d",
+        );
+        assert_eq!(
+            e.error_body(),
+            r#"Invalid value: {"MinAvailable":"10%","Selector":null,"MaxUnavailable":1}: d"#
+        );
+    }
 
     #[test]
     fn path_render_matches_upstream() {

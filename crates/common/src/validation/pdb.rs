@@ -28,16 +28,26 @@ pub struct PodDisruptionBudgetValidationOptions {
 /// pointer as `null`; the selector is a `metav1.LabelSelector`, which does
 /// carry tags.
 fn spec_bad_value(spec: &PodDisruptionBudgetSpec) -> BadValue {
-    let int_or_string = |v: &Option<IntOrString>| match v {
-        Some(v) => v.to_json(),
-        None => serde_json::Value::Null,
-    };
-    BadValue::Json(serde_json::json!({
-        "MinAvailable": int_or_string(&spec.min_available),
-        "Selector": spec.selector,
-        "MaxUnavailable": int_or_string(&spec.max_unavailable),
-        "UnhealthyPodEvictionPolicy": spec.unhealthy_pod_eviction_policy,
-    }))
+    // Serialized from a struct, not a `json!` map: `serde_json::Value` sorts
+    // keys, Go's `json.Marshal` keeps struct field order (#2086).
+    #[derive(serde::Serialize)]
+    struct InternalSpec<'a> {
+        #[serde(rename = "MinAvailable")]
+        min_available: Option<serde_json::Value>,
+        #[serde(rename = "Selector")]
+        selector: &'a Option<crate::types::LabelSelector>,
+        #[serde(rename = "MaxUnavailable")]
+        max_unavailable: Option<serde_json::Value>,
+        #[serde(rename = "UnhealthyPodEvictionPolicy")]
+        unhealthy_pod_eviction_policy: &'a Option<String>,
+    }
+    let int_or_string = |v: &Option<IntOrString>| v.as_ref().map(IntOrString::to_json);
+    BadValue::marshal(&InternalSpec {
+        min_available: int_or_string(&spec.min_available),
+        selector: &spec.selector,
+        max_unavailable: int_or_string(&spec.max_unavailable),
+        unhealthy_pod_eviction_policy: &spec.unhealthy_pod_eviction_policy,
+    })
 }
 
 /// `ValidatePodDisruptionBudgetSpec`
