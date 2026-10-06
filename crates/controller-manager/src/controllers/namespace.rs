@@ -75,6 +75,60 @@ struct GvrDeletionMetadata {
     num_remaining: usize,
     /// finalizer-token -> # of resources of this type stuck on it.
     finalizers_to_num_remaining: BTreeMap<String, usize>,
+    /// Seconds to wait before looking again; 0 means no estimate. Upstream's
+    /// `gvrDeletionMetadata.finalizerEstimateSeconds`.
+    finalizer_estimate_seconds: i64,
+}
+
+/// Wait applied when items remain only because of finalizers, "to allow for GC
+/// to complete". Upstream `finalizerEstimateSeconds = int64(15)`
+/// (`pkg/controller/namespace/deletion/namespaced_resources_deleter.go:212`).
+const FINALIZER_ESTIMATE_SECONDS: i64 = 15;
+
+/// Port of `estimateGracefulTerminationForPods`
+/// (`namespaced_resources_deleter.go:630-657`): the largest
+/// `terminationGracePeriodSeconds` among the namespace's non-terminal pods.
+fn estimate_graceful_termination_for_pods(pods: &[serde_json::Value]) -> i64 {
+    let mut estimate = 0i64;
+    for pod in pods {
+        // filter out terminal pods
+        let phase = pod.pointer("/status/phase").and_then(|p| p.as_str());
+        if matches!(phase, Some("Succeeded") | Some("Failed")) {
+            continue;
+        }
+        if let Some(grace) = pod
+            .pointer("/spec/terminationGracePeriodSeconds")
+            .and_then(|g| g.as_i64())
+        {
+            if grace > estimate {
+                estimate = grace;
+            }
+        }
+    }
+    estimate
+}
+
+/// Tail of `estimateGracefulTermination` (`:621-627`): "determine if the
+/// estimate is greater than the deletion timestamp" - once the namespace has
+/// been deleting for at least the estimate, the estimate is spent.
+fn clamp_estimate_to_namespace_age(
+    estimate: i64,
+    namespace_deleted_at: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> i64 {
+    let elapsed = now.signed_duration_since(namespace_deleted_at);
+    if elapsed >= chrono::Duration::seconds(estimate) {
+        0
+    } else {
+        estimate
+    }
+}
+
+/// Requeue delay for a namespace that reported `estimate` seconds remaining:
+/// `t := estimate.Estimate/2 + 1` (`pkg/controller/namespace/
+/// namespace_controller.go:158`), then `queue.AddAfter(key, t seconds)`.
+fn requeue_delay_for_estimate(estimate: i64) -> Duration {
+    Duration::from_secs((estimate / 2 + 1) as u64)
 }
 
 /// Namespaces reconciled at once.
@@ -238,8 +292,14 @@ impl<S: Storage + 'static> NamespaceController<S> {
 
             match self.storage.get::<Namespace>(&storage_key).await {
                 Ok(ns) => match self.reconcile_namespace(&ns).await {
-                    Ok(()) => {
+                    Ok(estimate) => {
                         queue.forget(&key).await;
+                        if estimate > 0 {
+                            // namespace_controller.go:157-160
+                            queue
+                                .add_after(key.clone(), requeue_delay_for_estimate(estimate))
+                                .await;
+                        }
                     }
                     Err(e) => {
                         error!("Failed to reconcile namespace {}: {}", name, e);
@@ -298,7 +358,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
     }
 
     /// Reconcile a single namespace
-    async fn reconcile_namespace(&self, namespace: &Namespace) -> Result<()> {
+    async fn reconcile_namespace(&self, namespace: &Namespace) -> Result<i64> {
         let name = &namespace.metadata.name;
 
         // Check if namespace is being deleted
@@ -356,7 +416,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
         }
 
         debug!("Namespace {} is active", name);
-        Ok(())
+        Ok(0)
     }
 
     /// Build the standard set of namespace deletion conditions.
@@ -531,7 +591,9 @@ impl<S: Storage + 'static> NamespaceController<S> {
     }
 
     /// Finalize a namespace by deleting all resources within it
-    async fn finalize_namespace(&self, namespace: &Namespace) -> Result<()> {
+    /// Returns the seconds to wait before the next pass (upstream's
+    /// `ResourcesRemainingError.Estimate`, `Delete` `:140-142`); 0 = none.
+    async fn finalize_namespace(&self, namespace: &Namespace) -> Result<i64> {
         let name = &namespace.metadata.name;
 
         info!("Finalizing namespace {}", name);
@@ -620,8 +682,17 @@ impl<S: Storage + 'static> NamespaceController<S> {
         // gate on exactly this (`gvrToNumRemaining[podsGVR] > 0`), not on
         // whether the pod had a finalizer or on any prior bookkeeping.
         let mut pods_remaining = 0usize;
-        match self.delete_all_resources_with_metadata(name, "pods").await {
+        let deleted_at = namespace
+            .metadata
+            .deletion_timestamp
+            .unwrap_or_else(Utc::now);
+        let mut estimate = 0i64;
+        match self
+            .delete_all_resources_with_metadata(name, "pods", deleted_at)
+            .await
+        {
             Ok(meta) => {
+                estimate = estimate.max(meta.finalizer_estimate_seconds);
                 pods_remaining = meta.num_remaining;
                 if meta.num_remaining > 0 {
                     gvr_to_num_remaining
@@ -679,7 +750,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
                     name, pods_remaining
                 );
             }
-            return Ok(());
+            return Ok(estimate);
         }
 
         // Phase 2: Delete every other resource type. For each, accumulate
@@ -690,10 +761,11 @@ impl<S: Storage + 'static> NamespaceController<S> {
                 continue; // Already processed
             }
             match self
-                .delete_all_resources_with_metadata(name, resource_type)
+                .delete_all_resources_with_metadata(name, resource_type, deleted_at)
                 .await
             {
                 Ok(meta) => {
+                    estimate = estimate.max(meta.finalizer_estimate_seconds);
                     if meta.num_remaining > 0 {
                         gvr_to_num_remaining.insert(
                             resource_type_to_gvr_label(resource_type),
@@ -795,7 +867,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
                 "Namespace {} still has {} resources, will retry",
                 name, remaining_count
             );
-            return Ok(()); // Will be retried in next reconciliation
+            return Ok(estimate); // Retried after the estimate, else on resync
         }
 
         // Check if conditions were ALREADY set when we entered this function.
@@ -816,7 +888,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
                 "Namespace {} resources cleared, conditions set (will finalize next cycle)",
                 name
             );
-            return Ok(());
+            return Ok(0);
         }
 
         // Re-fetch the live namespace, then retire ONLY the built-in
@@ -868,7 +940,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
         }
 
         info!("Namespace {} finalization complete", name);
-        Ok(())
+        Ok(0)
     }
 
     /// Clean up cluster-scoped webhook configurations that reference a deleted namespace.
@@ -941,8 +1013,20 @@ impl<S: Storage + 'static> NamespaceController<S> {
         &self,
         namespace: &str,
         resource_type: &str,
+        namespace_deleted_at: chrono::DateTime<Utc>,
     ) -> Result<GvrDeletionMetadata> {
         let prefix = build_prefix(resource_type, Some(namespace));
+
+        // `estimateGracefulTermination` (`:421`) runs BEFORE the delete.
+        let mut estimate = 0i64;
+        if resource_type == "pods" {
+            let pods: Vec<serde_json::Value> = self.storage.list(&prefix).await?;
+            estimate = clamp_estimate_to_namespace_age(
+                estimate_graceful_termination_for_pods(&pods),
+                namespace_deleted_at,
+                Utc::now(),
+            );
+        }
 
         // First try to delete the entire collection with one call
         // (`deleteAllContentForGroupVersionResource`, upstream
@@ -967,7 +1051,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
         let resources: Vec<serde_json::Value> =
             self.storage.list(&prefix).await.unwrap_or_default();
         if resources.is_empty() {
-            return Ok(GvrDeletionMetadata::default());
+            return Ok(GvrDeletionMetadata::default()); // `:454-457`
         }
 
         let mut finalizers_to_num_remaining: BTreeMap<String, usize> = BTreeMap::new();
@@ -1040,9 +1124,15 @@ impl<S: Storage + 'static> NamespaceController<S> {
             }
         }
 
+        // `:467-484`: an estimate wins; otherwise finalizer-held items get the
+        // default so GC can finish.
+        if estimate == 0 && !finalizers_to_num_remaining.is_empty() {
+            estimate = FINALIZER_ESTIMATE_SECONDS;
+        }
         Ok(GvrDeletionMetadata {
             num_remaining,
             finalizers_to_num_remaining,
+            finalizer_estimate_seconds: estimate,
         })
     }
 
@@ -1127,6 +1217,69 @@ mod tests {
             .spec
             .get_or_insert_with(Default::default)
             .finalizers = Some(finalizers);
+    }
+
+    // Ports of upstream's estimate semantics
+    // (`namespaced_resources_deleter.go:608-657`, `namespace_controller.go:157-160`).
+    #[test]
+    fn pod_estimate_is_max_grace_of_non_terminal_pods() {
+        let pods = vec![
+            serde_json::json!({"spec":{"terminationGracePeriodSeconds":30},"status":{"phase":"Running"}}),
+            serde_json::json!({"spec":{"terminationGracePeriodSeconds":300},"status":{"phase":"Failed"}}),
+            serde_json::json!({"spec":{"terminationGracePeriodSeconds":10},"status":{"phase":"Succeeded"}}),
+            serde_json::json!({"spec":{"terminationGracePeriodSeconds":45}}),
+            serde_json::json!({"spec":{}}),
+        ];
+        assert_eq!(estimate_graceful_termination_for_pods(&pods), 45);
+        assert_eq!(estimate_graceful_termination_for_pods(&[]), 0);
+    }
+
+    #[test]
+    fn estimate_is_spent_once_namespace_has_been_deleting_that_long() {
+        let now = Utc::now();
+        let fresh = now - chrono::Duration::seconds(5);
+        assert_eq!(clamp_estimate_to_namespace_age(30, fresh, now), 30);
+        let old = now - chrono::Duration::seconds(30);
+        assert_eq!(clamp_estimate_to_namespace_age(30, old, now), 0);
+        assert_eq!(clamp_estimate_to_namespace_age(0, now, now), 0);
+    }
+
+    #[test]
+    fn requeue_delay_is_half_the_estimate_plus_one() {
+        assert_eq!(requeue_delay_for_estimate(30), Duration::from_secs(16));
+        assert_eq!(requeue_delay_for_estimate(15), Duration::from_secs(8));
+    }
+
+    #[tokio::test]
+    async fn finalize_reports_grace_estimate_then_finalizer_default() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = NamespaceController::new(storage.clone());
+        let mut ns = Namespace::new("est-ns");
+        ns.metadata.deletion_timestamp = Some(Utc::now());
+        set_namespace_finalizers(&mut ns, vec!["kubernetes".to_string()]);
+        storage
+            .create(&build_key("namespaces", None, "est-ns"), &ns)
+            .await
+            .unwrap();
+        // A running pod held by a finalizer, grace 60s -> estimate 60.
+        let pod = serde_json::json!({
+            "apiVersion":"v1","kind":"Pod",
+            "metadata":{"name":"p","namespace":"est-ns","finalizers":["x/y"]},
+            "spec":{"containers":[{"name":"c","image":"i"}],"terminationGracePeriodSeconds":60},
+            "status":{"phase":"Running"}
+        });
+        let pod_key = build_key("pods", Some("est-ns"), "p");
+        storage.create(&pod_key, &pod).await.unwrap();
+        assert_eq!(controller.finalize_namespace(&ns).await.unwrap(), 60);
+
+        // Terminal pod: no grace estimate, finalizer default applies.
+        let mut term = pod.clone();
+        term["status"]["phase"] = serde_json::json!("Failed");
+        storage.update(&pod_key, &term).await.unwrap();
+        assert_eq!(
+            controller.finalize_namespace(&ns).await.unwrap(),
+            FINALIZER_ESTIMATE_SECONDS
+        );
     }
 
     #[test]
