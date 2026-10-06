@@ -1,8 +1,10 @@
 use anyhow::Result;
 use futures::StreamExt;
+use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::workloads::{CronJob, CronJobStatus, Job};
+use rusternetes_common::resources::{EventSource, EventType};
 use rusternetes_common::types::OwnerReference;
-use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -16,11 +18,48 @@ fn job_name_for(cronjob_name: &str, scheduled_time: chrono::DateTime<chrono::Utc
 
 pub struct CronJobController<S: Storage> {
     storage: Arc<S>,
+    /// `jm.recorder` (cronjob_controllerv2.go).
+    recorder: EventRecorder<S>,
 }
 
 impl<S: Storage + 'static> CronJobController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        let recorder = EventRecorder::new(Arc::clone(&storage));
+        Self { storage, recorder }
+    }
+
+    /// `jm.recorder.Eventf(cronJob, corev1.EventTypeWarning, ...)`. A failure to
+    /// record is logged and dropped: it must not mask the sync outcome.
+    async fn record_warning(&self, cronjob: &CronJob, reason: &str, message: &str) {
+        let involved = ObjectReference {
+            kind: Some("CronJob".to_string()),
+            namespace: cronjob.metadata.namespace.clone(),
+            name: Some(cronjob.metadata.name.clone()),
+            uid: Some(cronjob.metadata.uid.clone()),
+            api_version: Some("batch/v1".to_string()),
+            ..Default::default()
+        };
+        let source = EventSource {
+            component: "cronjob-controller".to_string(),
+            host: None,
+        };
+        if let Err(e) = self
+            .recorder
+            .event(&involved, &source, EventType::Warning, reason, message)
+            .await
+        {
+            warn!("failed to record {reason} event: {e}");
+        }
+    }
+
+    /// `UnparseableSchedule` (cronjob_controllerv2.go:519-526).
+    async fn record_unparseable(&self, cronjob: &CronJob, schedule: &str, err: &str) {
+        self.record_warning(
+            cronjob,
+            "UnparseableSchedule",
+            &format!("unparseable schedule: {schedule:?} : {err}"),
+        )
+        .await;
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -175,7 +214,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         let now = chrono::Utc::now();
 
         // Simple cron parsing - in production, use a proper cron parser library
-        let Some(scheduled_time) = self.scheduled_run_time(schedule, now, cronjob)? else {
+        let Some(scheduled_time) = self.scheduled_run_time(schedule, now, cronjob).await? else {
             return Ok(());
         };
         // getJobName (cronjob_controllerv2.go:676): the Job is named from the
@@ -358,18 +397,21 @@ impl<S: Storage + 'static> CronJobController<S> {
     }
 
     #[cfg(test)]
-    fn should_run_now(
+    async fn should_run_now(
         &self,
         schedule: &str,
         now: chrono::DateTime<chrono::Utc>,
         cronjob: &CronJob,
     ) -> Result<bool> {
-        Ok(self.scheduled_run_time(schedule, now, cronjob)?.is_some())
+        Ok(self
+            .scheduled_run_time(schedule, now, cronjob)
+            .await?
+            .is_some())
     }
 
     /// The most recent scheduled time in `(last, now]`, or None when nothing is
     /// due (mostRecentScheduleTime, pkg/controller/cronjob/utils.go).
-    fn scheduled_run_time(
+    async fn scheduled_run_time(
         &self,
         schedule: &str,
         now: chrono::DateTime<chrono::Utc>,
@@ -377,6 +419,35 @@ impl<S: Storage + 'static> CronJobController<S> {
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
         // Get last schedule time
         let last_schedule = cronjob.status.as_ref().and_then(|s| s.last_schedule_time);
+
+        // syncCronJob checks spec.timeZone before anything else and records an
+        // UnknownTimeZone event (cronjob_controllerv2.go:507-513).
+        if let Some(name) = cronjob.spec.time_zone.as_deref() {
+            if !name.is_empty() && name.parse::<chrono_tz::Tz>().is_err() {
+                warn!(
+                    "CronJob {}: invalid timeZone {:?}; not scheduling",
+                    cronjob.metadata.name, name
+                );
+                self.record_warning(
+                    cronjob,
+                    "UnknownTimeZone",
+                    &format!("invalid timeZone: {name:?}: unknown time zone {name}"),
+                )
+                .await;
+                return Ok(None);
+            }
+        }
+
+        // formatSchedule (cronjob_controllerv2.go:766-773) records
+        // UnsupportedSchedule for any schedule containing "TZ".
+        if schedule.contains("TZ") {
+            self.record_warning(
+                cronjob,
+                "UnsupportedSchedule",
+                &format!("CRON_TZ or TZ used in schedule {schedule:?} is not officially supported, see https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/ for more details"),
+            )
+            .await;
+        }
 
         // Inline `TZ=`/`CRON_TZ=` prefix: robfig/cron/v3 `Parser.Parse`
         // (vendor/github.com/robfig/cron/v3/parser.go:95-103) strips it and
@@ -392,6 +463,8 @@ impl<S: Storage + 'static> CronJobController<S> {
                         "Unparseable schedule '{}': no space after TZ prefix",
                         schedule
                     );
+                    self.record_unparseable(cronjob, schedule, "no space after TZ prefix")
+                        .await;
                     return Ok(None);
                 };
                 let eq = schedule.find('=').unwrap_or(0);
@@ -400,6 +473,13 @@ impl<S: Storage + 'static> CronJobController<S> {
                     Ok(t) => (schedule[i..].trim(), Some(t)),
                     Err(_) => {
                         warn!("Unparseable schedule '{}': bad location {}", schedule, name);
+                        // robfig/cron parser.go:100.
+                        self.record_unparseable(
+                            cronjob,
+                            schedule,
+                            &format!("provided bad location {name}: unknown time zone {name}"),
+                        )
+                        .await;
                         return Ok(None);
                     }
                 }
@@ -438,6 +518,8 @@ impl<S: Storage + 'static> CronJobController<S> {
             Ok(s) => s,
             Err(e) => {
                 warn!("Failed to parse cron schedule '{}': {}", cron_schedule, e);
+                self.record_unparseable(cronjob, schedule, &e.to_string())
+                    .await;
                 return Ok(None);
             }
         };
@@ -715,19 +797,22 @@ mod tests {
 
         let ny = mk(serde_json::json!("America/New_York"));
         assert!(
-            ctrl.should_run_now("0 0 * * *", now, &ny).unwrap(),
+            ctrl.should_run_now("0 0 * * *", now, &ny).await.unwrap(),
             "New York local midnight has passed → must fire"
         );
 
         let utc = mk(serde_json::Value::Null);
         assert!(
-            !ctrl.should_run_now("0 0 * * *", now, &utc).unwrap(),
+            !ctrl.should_run_now("0 0 * * *", now, &utc).await.unwrap(),
             "UTC next midnight is tomorrow → must NOT fire"
         );
 
         let invalid = mk(serde_json::json!("Mars/Phobos"));
         assert!(
-            !ctrl.should_run_now("0 0 * * *", now, &invalid).unwrap(),
+            !ctrl
+                .should_run_now("0 0 * * *", now, &invalid)
+                .await
+                .unwrap(),
             "invalid timeZone → must not schedule"
         );
     }
@@ -759,16 +844,107 @@ mod tests {
             .unwrap();
         assert!(ctrl
             .should_run_now("CRON_TZ=America/New_York 0 0 * * *", now, &cj)
+            .await
             .unwrap());
         assert!(ctrl
             .should_run_now("TZ=America/New_York @daily", now, &cj)
+            .await
             .unwrap());
         assert!(!ctrl
             .should_run_now("CRON_TZ=UTC 0 0 * * *", now, &cj)
+            .await
             .unwrap());
         assert!(!ctrl
             .should_run_now("CRON_TZ=Mars/Phobos 0 0 * * *", now, &cj)
+            .await
             .unwrap());
-        assert!(!ctrl.should_run_now("TZ=UTC", now, &cj).unwrap());
+        assert!(!ctrl.should_run_now("TZ=UTC", now, &cj).await.unwrap());
+    }
+
+    /// syncCronJob / formatSchedule record Warning events for a bad schedule
+    /// or zone (cronjob_controllerv2.go:507-526, :766-773). Reasons and
+    /// message text are upstream's.
+    #[tokio::test]
+    async fn schedule_problems_record_upstream_events() {
+        use rusternetes_common::resources::Event;
+        use std::sync::Arc;
+        type Mem = rusternetes_storage::memory::MemoryStorage;
+        let now = chrono::DateTime::parse_from_rfc3339("2025-01-15T06:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mk =
+            |schedule: &str, tz: serde_json::Value| -> rusternetes_common::resources::CronJob {
+                serde_json::from_value(serde_json::json!({
+                    "apiVersion": "batch/v1", "kind": "CronJob",
+                    "metadata": {"name": "cj", "namespace": "default", "uid": "u1"},
+                    "spec": {
+                        "schedule": schedule,
+                        "timeZone": tz,
+                        "jobTemplate": {"spec": {"template": {"spec": {
+                            "containers": [{"name": "c", "image": "busybox"}]
+                        }}}},
+                    },
+                }))
+                .unwrap()
+            };
+        async fn events(storage: &Arc<Mem>) -> Vec<Event> {
+            use rusternetes_storage::Storage;
+            storage
+                .list::<Event>("/registry/events/default/")
+                .await
+                .unwrap()
+        }
+
+        // Unparseable schedule -> UnparseableSchedule, `unparseable schedule: %q : %s`.
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let cj = mk("not a cron", serde_json::Value::Null);
+        assert!(!ctrl.should_run_now("not a cron", now, &cj).await.unwrap());
+        let evs = events(&storage).await;
+        assert_eq!(evs.len(), 1, "{evs:?}");
+        assert_eq!(evs[0].reason, "UnparseableSchedule");
+        assert!(
+            evs[0]
+                .message
+                .starts_with("unparseable schedule: \"not a cron\" : "),
+            "{}",
+            evs[0].message
+        );
+        assert_eq!(evs[0].involved_object.kind.as_deref(), Some("CronJob"));
+        assert_eq!(evs[0].involved_object.name.as_deref(), Some("cj"));
+
+        // TZ in schedule -> UnsupportedSchedule (and it still schedules).
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let s = "CRON_TZ=UTC 0 0 * * *";
+        let cj = mk(s, serde_json::Value::Null);
+        ctrl.should_run_now(s, now, &cj).await.unwrap();
+        let evs = events(&storage).await;
+        assert_eq!(evs.len(), 1, "{evs:?}");
+        assert_eq!(evs[0].reason, "UnsupportedSchedule");
+        assert_eq!(
+            evs[0].message,
+            "CRON_TZ or TZ used in schedule \"CRON_TZ=UTC 0 0 * * *\" is not officially supported, see https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/ for more details"
+        );
+
+        // Invalid spec.timeZone -> UnknownTimeZone, `invalid timeZone: %q: %s`.
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let cj = mk("0 0 * * *", serde_json::json!("Mars/Phobos"));
+        assert!(!ctrl.should_run_now("0 0 * * *", now, &cj).await.unwrap());
+        let evs = events(&storage).await;
+        assert_eq!(evs.len(), 1, "{evs:?}");
+        assert_eq!(evs[0].reason, "UnknownTimeZone");
+        assert_eq!(
+            evs[0].message,
+            "invalid timeZone: \"Mars/Phobos\": unknown time zone Mars/Phobos"
+        );
+
+        // A valid schedule records nothing.
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let cj = mk("0 0 * * *", serde_json::Value::Null);
+        ctrl.should_run_now("0 0 * * *", now, &cj).await.unwrap();
+        assert!(events(&storage).await.is_empty());
     }
 }
