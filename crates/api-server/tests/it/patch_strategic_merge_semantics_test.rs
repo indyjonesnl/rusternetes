@@ -1114,7 +1114,7 @@ async fn smp_delete_from_primitive_list_finalizers() {
 
     let patch = json!({
         "metadata": {
-            "finalizers": [{"$deleteFromPrimitiveList": ["example.com/drop"]}]
+            "$deleteFromPrimitiveList/finalizers": ["example.com/drop"]
         }
     });
     let (status, body) = apply_patch(router, "smp-6d", &patch).await;
