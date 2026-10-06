@@ -157,6 +157,45 @@ fn failed_status() -> PodStatus {
     }
 }
 
+/// A Failed status whose container finished `secs_ago` seconds ago. Upstream
+/// delays counting/releasing the last failed pod of an index until its
+/// per-index backoff has elapsed and a replacement exists
+/// (indexed_job_utils.go getPodsWithDelayedDeletionPerIndex, backoff_utils.go
+/// getFinishedTime), so a test asserting on `status.failed` needs a failure old
+/// enough to be past the 10s base backoff.
+fn failed_status_finished_ago(secs_ago: i64) -> PodStatus {
+    let finished = chrono::Utc::now() - chrono::Duration::seconds(secs_ago);
+    PodStatus {
+        phase: Some(Phase::Failed),
+        container_statuses: Some(vec![ContainerStatus {
+            name: "task".to_string(),
+            ready: false,
+            restart_count: 0,
+            state: Some(ContainerState::Terminated {
+                exit_code: 1,
+                signal: None,
+                reason: Some("Error".to_string()),
+                message: None,
+                started_at: None,
+                finished_at: Some(finished.to_rfc3339()),
+                container_id: None,
+            }),
+            last_state: None,
+            image: Some("busybox".to_string()),
+            image_id: None,
+            container_id: None,
+            started: None,
+            allocated_resources: None,
+            resources: None,
+            volume_mounts: None,
+            user: None,
+            allocated_resources_status: None,
+            stop_signal: None,
+        }]),
+        ..Default::default()
+    }
+}
+
 async fn set_pod_status(
     storage: &Arc<MemoryStorage>,
     namespace: &str,
@@ -426,13 +465,14 @@ async fn test_indexed_job_backoff_limit_per_index_failed_count_excludes_resolved
         .expect("pod for index 0");
     set_pod_status(&storage, "default", &pod0, succeeded_status()).await;
 
-    // Index 1: fail once.
+    // Index 1: fail once, long enough ago that its per-index backoff has
+    // elapsed and the replacement pod exists (see failed_status_finished_ago).
     let pod1 = pods
         .iter()
         .find(|p| pod_index(p) == Some(1))
         .cloned()
         .expect("pod for index 1");
-    set_pod_status(&storage, "default", &pod1, failed_status()).await;
+    set_pod_status(&storage, "default", &pod1, failed_status_finished_ago(3600)).await;
 
     controller.reconcile_all().await.unwrap();
 
