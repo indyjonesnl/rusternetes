@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use rusternetes_common::equality::semantic_equal;
 use rusternetes_common::feature_gates::{self, Feature};
+use rusternetes_common::pod_warnings::get_warnings_for_pod_template;
 use rusternetes_common::resources::{
     Scale, ScaleSpec, ScaleStatus, StatefulSet, StatefulSetStatus,
 };
@@ -13,9 +14,10 @@ use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_common::validation::apps::{
     validate_statefulset, validate_statefulset_status_update, validate_statefulset_update,
 };
-use rusternetes_common::validation::field::ErrorList;
+use rusternetes_common::validation::field::{ErrorList, Path};
 use rusternetes_storage::StorageBackend;
 
+use crate::registry::core::persistentvolumeclaim::get_warnings_for_persistent_volume_claim_spec;
 use crate::registry::generic::Store;
 use crate::registry::rest::{
     GarbageCollectionPolicy, GroupResource, NamespaceScopedStrategy, RequestContext,
@@ -54,10 +56,8 @@ fn drop_disabled_fields(new: &mut StatefulSet, old: Option<&StatefulSet>) {
     }
 }
 
-/// The `revisionHistoryLimit` warning of `WarningsOnCreate` /
-/// `WarningsOnUpdate` (strategy.go:136-147, 168-183). `GetWarningsForPodTemplate` and the
-/// per-template `GetWarningsForPersistentVolumeClaimSpec` are not ported
-/// (#1996, #2000).
+/// The `revisionHistoryLimit` warning shared by `WarningsOnCreate` /
+/// `WarningsOnUpdate` (strategy.go:143-145, 178-180).
 fn revision_history_limit_warning(ss: &StatefulSet) -> Vec<String> {
     match ss.spec.revision_history_limit {
         Some(limit) if limit < 0 => vec![
@@ -65,6 +65,27 @@ fn revision_history_limit_warning(ss: &StatefulSet) -> Vec<String> {
         ],
         _ => Vec::new(),
     }
+}
+
+/// `pvcutil.GetWarningsForPersistentVolumeClaimSpec` over every
+/// `volumeClaimTemplates[i]` (strategy.go:139-141, 175-177). `child` is the
+/// path segment appended after the index: upstream's create path uses none, its
+/// update path uses the (miscapitalised) `Spec`, ported as written.
+fn volume_claim_template_warnings(ss: &StatefulSet, child: Option<&str>) -> Vec<String> {
+    let base = Path::new("spec").child("volumeClaimTemplates");
+    ss.spec
+        .volume_claim_templates
+        .iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(i, pvc)| {
+            let at = match child {
+                Some(c) => base.index(i).child(c),
+                None => base.index(i),
+            };
+            get_warnings_for_persistent_volume_claim_spec(&at, &pvc.spec)
+        })
+        .collect()
 }
 
 /// `statefulSetStrategy` (strategy.go:38-44).
@@ -90,7 +111,14 @@ impl RestCreateStrategy<StatefulSet> for Strategy {
     }
 
     fn warnings_on_create(&self, _ctx: &RequestContext, obj: &StatefulSet) -> Vec<String> {
-        revision_history_limit_warning(obj)
+        let mut warnings = get_warnings_for_pod_template(
+            &Path::new("spec").child("template"),
+            &obj.spec.template,
+            None,
+        );
+        warnings.extend(volume_claim_template_warnings(obj, None));
+        warnings.extend(revision_history_limit_warning(obj));
+        warnings
     }
 }
 
@@ -122,9 +150,21 @@ impl RestUpdateStrategy<StatefulSet> for Strategy {
         &self,
         _ctx: &RequestContext,
         obj: &StatefulSet,
-        _old: &StatefulSet,
+        old: &StatefulSet,
     ) -> Vec<String> {
-        revision_history_limit_warning(obj)
+        // strategy.go:172-174: only a generation change re-evaluates the template.
+        let mut warnings = if obj.metadata.generation != old.metadata.generation {
+            get_warnings_for_pod_template(
+                &Path::new("spec").child("template"),
+                &obj.spec.template,
+                Some(&old.spec.template),
+            )
+        } else {
+            Vec::new()
+        };
+        warnings.extend(volume_claim_template_warnings(obj, Some("Spec")));
+        warnings.extend(revision_history_limit_warning(obj));
+        warnings
     }
 
     fn allow_unconditional_update(&self) -> bool {
@@ -378,6 +418,48 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].starts_with("spec.revisionHistoryLimit:"));
         assert_eq!(Strategy.warnings_on_update(&ctx(), &ss, &ss).len(), 1);
+    }
+
+    /// `SetDefaults_StatefulSet` (pkg/apis/apps/v1/defaults.go:127-135): an absent
+    /// retention policy and its empty fields default to Retain, so validation
+    /// never sees an unset whenDeleted/whenScaled (#2210 item 3).
+    #[test]
+    fn absent_retention_policy_defaults_to_retain() {
+        let ss = stateful_set();
+        let p = ss.spec.persistent_volume_claim_retention_policy.unwrap();
+        assert_eq!(p.when_deleted.as_deref(), Some("Retain"));
+        assert_eq!(p.when_scaled.as_deref(), Some("Retain"));
+    }
+
+    #[test]
+    fn volume_claim_templates_and_the_template_warn() {
+        let mut ss = stateful_set();
+        ss.spec.template.metadata.as_mut().unwrap().annotations = Some(HashMap::from([(
+            "container.apparmor.security.beta.kubernetes.io/c".into(),
+            "runtime/default".into(),
+        )]));
+        ss.spec.volume_claim_templates = Some(vec![serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "data"},
+            "spec": {"resources": {"requests": {"storage": "1500m"}}}
+        }))
+        .unwrap()]);
+        let create = Strategy.warnings_on_create(&ctx(), &ss);
+        assert!(
+            create.iter().any(|w| w.starts_with(
+                "spec.volumeClaimTemplates[0].resources.requests[storage]: fractional byte value"
+            )),
+            "{create:?}"
+        );
+        // Update: unchanged generation skips the template, keeps the PVC
+        // warning under the miscapitalised `Spec` segment (strategy.go:176).
+        let update = Strategy.warnings_on_update(&ctx(), &ss, &ss);
+        assert_eq!(update.len(), 1, "{update:?}");
+        assert!(
+            update[0].starts_with("spec.volumeClaimTemplates[0].Spec.resources.requests[storage]:")
+        );
+        let mut newer = ss.clone();
+        newer.metadata.generation = Some(5);
+        assert!(Strategy.warnings_on_update(&ctx(), &newer, &ss).len() > 1);
     }
 
     #[test]

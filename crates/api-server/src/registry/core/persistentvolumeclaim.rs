@@ -10,7 +10,7 @@ use rusternetes_common::resources::volume::{
     PersistentVolumeClaimSpec, TypedLocalObjectReference, TypedObjectReference,
 };
 use rusternetes_common::resources::{PersistentVolumeClaim, PersistentVolumeClaimStatus};
-use rusternetes_common::validation::field::ErrorList;
+use rusternetes_common::validation::field::{ErrorList, Path};
 use rusternetes_common::validation::pvc::{
     validate_persistent_volume_claim, validate_persistent_volume_claim_status_update,
     validate_persistent_volume_claim_update,
@@ -122,7 +122,22 @@ fn warnings_for_persistent_volume_claim(pvc: &PersistentVolumeClaim) -> Vec<Stri
             r#"metadata.annotations[{BETA_STORAGE_CLASS_ANNOTATION}]: deprecated since v1.8; use "storageClassName" attribute instead"#
         ));
     }
-    let resources = &pvc.spec.resources;
+    warnings.extend(get_warnings_for_persistent_volume_claim_spec(
+        &Path::new("spec"),
+        &pvc.spec,
+    ));
+    warnings
+}
+
+/// `GetWarningsForPersistentVolumeClaimSpec(fieldPath, pvSpec)`
+/// (util.go:213-236), shared with the StatefulSet strategy's
+/// per-`volumeClaimTemplates` warnings.
+pub(crate) fn get_warnings_for_persistent_volume_claim_spec(
+    field_path: &Path,
+    spec: &PersistentVolumeClaimSpec,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let resources = &spec.resources;
     for (list, map) in [
         ("requests", &resources.requests),
         ("limits", &resources.limits),
@@ -136,7 +151,8 @@ fn warnings_for_persistent_volume_claim(pvc: &PersistentVolumeClaim) -> Vec<Stri
         };
         if q.milli_value() % 1000 != 0 {
             warnings.push(format!(
-                "spec.resources.{list}[storage]: fractional byte value \"{q}\" is invalid, must be an integer"
+                "{}: fractional byte value \"{q}\" is invalid, must be an integer",
+                field_path.child("resources").child(list).key("storage")
             ));
         }
     }
