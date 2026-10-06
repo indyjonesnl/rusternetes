@@ -139,6 +139,23 @@ impl ApiStorage {
         expiration_seconds: i64,
         bound_pod: Option<(&str, &str)>,
     ) -> Result<String> {
+        self.create_sa_token_status(namespace, name, audiences, expiration_seconds, bound_pod)
+            .await
+            .map(|(token, _)| token)
+    }
+
+    /// Same POST as [`Self::create_sa_token`], but returns the whole
+    /// `TokenRequestStatus` as `(token, expirationTimestamp)`. The CSI mounter
+    /// needs the expiry as well (`podServiceAccountTokenAttrs`,
+    /// `pkg/volume/csi/csi_mounter.go:358-416` serialises the status).
+    pub async fn create_sa_token_status(
+        &self,
+        namespace: &str,
+        name: &str,
+        audiences: &[String],
+        expiration_seconds: i64,
+        bound_pod: Option<(&str, &str)>,
+    ) -> Result<(String, String)> {
         let path = format!("/api/v1/namespaces/{namespace}/serviceaccounts/{name}/token");
         let mut spec = serde_json::json!({
             "audiences": audiences,
@@ -165,9 +182,14 @@ impl ApiStorage {
             .post(&path, &body)
             .await
             .map_err(map_write_err)?;
+        let expiration = resp
+            .pointer("/status/expirationTimestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string();
         resp.pointer("/status/token")
             .and_then(|t| t.as_str())
-            .map(|s| s.to_string())
+            .map(|s| (s.to_string(), expiration))
             .ok_or_else(|| {
                 Error::Internal(format!(
                     "TokenRequest for {namespace}/{name} returned no status.token"
@@ -1255,6 +1277,21 @@ mod tests {
             req.contains("\"expirationSeconds\":3600"),
             "request body must carry expirationSeconds, got: {req}"
         );
+    }
+
+    // `create_sa_token_status` also returns `status.expirationTimestamp`, which
+    // the CSI mounter serialises into `csi.storage.k8s.io/serviceAccount.tokens`.
+    #[tokio::test]
+    async fn create_sa_token_status_returns_the_expiration_timestamp() {
+        let (base, _captured) = spawn_tokenrequest_server("ISSUED").await;
+        let client = Arc::new(ApiClient::new(&base, true, None).unwrap());
+        let storage = ApiStorage::new(client);
+        let (tok, exp) = storage
+            .create_sa_token_status("ns", "sa", &[], 3600, None)
+            .await
+            .expect("token issued");
+        assert_eq!(tok, "ISSUED");
+        assert_eq!(exp, "2026-01-01T00:00:00Z");
     }
 
     // Regression for #1684: a projected SA token must be bound to the pod that
