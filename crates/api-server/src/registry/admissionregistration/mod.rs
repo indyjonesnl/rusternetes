@@ -3,11 +3,6 @@
 //!
 //! Not modelled, each tracked on the issue named:
 //!
-//! - The `paramKind` / `paramRef` read-access check of
-//!   `validatingadmissionpolicy/authz.go` and
-//!   `validatingadmissionpolicybinding/authz.go`, which `Validate` runs once
-//!   the object is well-formed. A strategy's `validate` is synchronous here
-//!   and the authorizer is async (#2109).
 //! - CEL compilation of a policy's `validations`, `variables`,
 //!   `auditAnnotations` and `messageExpression`, and the type-checking
 //!   controller that fills `status.typeChecking` (#1442). The
@@ -17,6 +12,7 @@
 //!   implement.
 //! - `GetResetFields` (managed-fields reset sets) and declarative validation.
 
+pub mod authz;
 pub mod validatingadmissionpolicy;
 pub mod validatingadmissionpolicybinding;
 pub mod webhookconfiguration;
