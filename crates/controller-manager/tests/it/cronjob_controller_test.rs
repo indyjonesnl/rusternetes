@@ -54,6 +54,7 @@ async fn rewind_and_step(storage: &Arc<MemoryStorage>, namespace: &str, name: &s
     };
     let current = chrono::Utc::now().timestamp() / 60;
     let mut earliest = mine.iter().map(minute).min().unwrap_or(current);
+    let mut renamed: Vec<(String, String)> = Vec::new();
     for mut j in mine.into_iter().filter(|j| minute(j) >= current) {
         storage
             .delete(&format!("{}{}", prefix, j.metadata.name))
@@ -62,11 +63,23 @@ async fn rewind_and_step(storage: &Arc<MemoryStorage>, namespace: &str, name: &s
         earliest -= 1;
         j.metadata.name = format!("{}-{}", name, earliest);
         j.metadata.resource_version = None;
+        renamed.push((j.metadata.uid.clone(), j.metadata.name.clone()));
         storage
             .create(&format!("{}{}", prefix, j.metadata.name), &j)
             .await
             .unwrap();
     }
+    // status.active names the Job (inActiveListByName, utils.go:68), so the
+    // re-dated Job's reference must follow it.
+    let mut cj: CronJob = storage.get(&key).await.unwrap();
+    if let Some(ref mut st) = cj.status {
+        for r in st.active.iter_mut() {
+            if let Some((_, n)) = renamed.iter().find(|(u, _)| r.uid.as_deref() == Some(u)) {
+                r.name = Some(n.clone());
+            }
+        }
+    }
+    storage.update(&key, &cj).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 }
 
