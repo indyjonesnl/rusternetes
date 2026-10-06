@@ -2611,24 +2611,6 @@ pub async fn watch_storageclasses(
     .await
 }
 
-/// Watch horizontalpodautoscalers in a namespace
-pub async fn watch_horizontalpodautoscalers(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    Path(namespace): Path<String>,
-    Query(params): Query<WatchParams>,
-) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::HorizontalPodAutoscaler>(
-        state,
-        auth_ctx,
-        namespace,
-        "horizontalpodautoscalers",
-        "autoscaling",
-        params,
-    )
-    .await
-}
-
 /// Watch clusterroles (cluster-scoped)
 pub async fn watch_clusterroles(
     State(state): State<Arc<ApiServerState>>,
