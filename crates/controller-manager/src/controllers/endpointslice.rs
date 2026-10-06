@@ -10,6 +10,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
+/// How often the watch loop re-enqueues every Service/Endpoints as a safety
+/// net. Upstream has no such controller-level sweep: it is purely event
+/// driven, and only its informers resync, every `MinResyncPeriod`
+/// (`staging/src/k8s.io/controller-manager/config/v1alpha1/defaults.go:31-33`,
+/// 12h; `ResyncPeriod` in `cmd/kube-controller-manager/app/controllermanager.go:176-181`
+/// multiplies it by a random 1-2 factor, which we do not replicate). Each
+/// resync re-fires the service handler, `onServiceUpdate`
+/// (`endpointslice_controller.go:122-126`). This replaces a 5s sweep (#2208).
+const INFORMER_RESYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
+
+/// Pods by namespace then name: the stand-in for upstream's shared pod
+/// informer cache (`c.podLister`, `endpointslice_controller.go:137,208-210`).
+type PodSnapshot = HashMap<String, HashMap<String, Pod>>;
+
 /// EndpointSliceController builds EndpointSlices directly from Services and Pods,
 /// following the same approach as the K8s endpointslice controller.
 ///
@@ -36,11 +50,84 @@ const CONCURRENT_SERVICE_ENDPOINT_SYNCS: usize = 5;
 
 pub struct EndpointSliceController<S: Storage> {
     storage: Arc<S>,
+    /// Snapshot of every pod, shared by all service workers and kept current
+    /// from the pod watch, as upstream's `podLister` is by the pod informer
+    /// (`endpointslice_controller.go:137,410`). `None` until the initial LIST
+    /// of a (re)connect has landed; `reconcile_service` then falls back to its
+    /// own LIST (direct callers such as tests, and the window before sync --
+    /// upstream instead blocks workers on `WaitForNamedCacheSync`, :294).
+    pod_cache: Arc<std::sync::RwLock<Option<PodSnapshot>>>,
 }
 
 impl<S: Storage + 'static> EndpointSliceController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            pod_cache: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Initial/relist half of the pod informer: replace the snapshot with one
+    /// LIST of every pod.
+    async fn sync_pod_cache(&self) {
+        match self.storage.list::<Pod>(&build_prefix("pods", None)).await {
+            Ok(pods) => {
+                let mut snapshot = PodSnapshot::new();
+                for pod in pods {
+                    let ns = pod.metadata.namespace.clone().unwrap_or_default();
+                    snapshot
+                        .entry(ns)
+                        .or_default()
+                        .insert(pod.metadata.name.clone(), pod);
+                }
+                *self.pod_cache.write().unwrap() = Some(snapshot);
+            }
+            Err(e) => {
+                tracing::error!("Failed to list pods for the pod snapshot: {}", e);
+                *self.pod_cache.write().unwrap() = None;
+            }
+        }
+    }
+
+    /// Watch half of the pod informer: fold one event into the snapshot.
+    /// Must run before the event is turned into service enqueues, so a worker
+    /// woken by it sees the new pod (the informer indexer is updated before
+    /// handlers fire).
+    fn apply_pod_event(&self, event: &rusternetes_storage::WatchEvent) {
+        use rusternetes_storage::WatchEvent;
+        let (value, deleted) = match event {
+            WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) => (v, false),
+            WatchEvent::Deleted(_, v) => (v, true),
+        };
+        let Ok(pod) = serde_json::from_str::<Pod>(value) else {
+            return;
+        };
+        let ns = pod.metadata.namespace.clone().unwrap_or_default();
+        if let Some(snapshot) = self.pod_cache.write().unwrap().as_mut() {
+            if deleted {
+                if let Some(pods) = snapshot.get_mut(&ns) {
+                    pods.remove(&pod.metadata.name);
+                }
+            } else {
+                snapshot
+                    .entry(ns)
+                    .or_default()
+                    .insert(pod.metadata.name.clone(), pod);
+            }
+        }
+    }
+
+    /// `c.podLister.Pods(ns).List(labels.Everything())` against the snapshot;
+    /// `None` when the snapshot is not synced.
+    fn cached_pods(&self, namespace: &str) -> Option<Vec<Pod>> {
+        let guard = self.pod_cache.read().unwrap();
+        let snapshot = guard.as_ref()?;
+        Some(
+            snapshot
+                .get(namespace)
+                .map(|pods| pods.values().cloned().collect())
+                .unwrap_or_default(),
+        )
     }
 
     /// Watch-based run loop. Watches services, pods, AND endpoints as primary resources.
@@ -75,8 +162,9 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
         });
 
         loop {
-            self.enqueue_all(&queue).await;
-            self.enqueue_all_endpoints(&mirror_queue).await;
+            // Unsynced until this connect's LIST lands; workers fall back to
+            // their own LIST meanwhile.
+            *self.pod_cache.write().unwrap() = None;
 
             let svc_prefix = build_prefix("services", None);
             let pod_prefix = build_prefix("pods", None);
@@ -107,10 +195,17 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 }
             };
 
+            // Informer order: watches are open first, then the LIST, so no
+            // pod event falls between them; buffered events replay on top of
+            // the snapshot. Only then enqueue (relist -> handlers fire).
+            self.sync_pod_cache().await;
+            self.enqueue_all(&queue).await;
+            self.enqueue_all_endpoints(&mirror_queue).await;
+
             let mut svc_watch = svc_watch;
             let mut pod_watch = pod_watch;
             let mut ep_watch = ep_watch;
-            let mut resync = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut resync = tokio::time::interval(INFORMER_RESYNC_PERIOD);
             resync.tick().await;
 
             let mut watch_broken = false;
@@ -135,6 +230,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     event = pod_watch.next() => {
                         match event {
                             Some(Ok(ev)) => {
+                                self.apply_pod_event(&ev);
                                 self.enqueue_services_for_pod(&queue, &ev).await;
                             }
                             Some(Err(e)) => {
@@ -674,17 +770,21 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
     /// Reconcile EndpointSlices for a single Service
     /// Reconcile one service, fetching the namespace's pods itself.
     ///
-    /// Used by the watch-driven path, which reconciles one service in
-    /// response to an event and so legitimately needs its own read. The sweep
+    /// Used by the watch-driven path. It reads pods from the shared snapshot
+    /// (`podLister`, endpointslice_controller.go:410) and only LISTs when the
+    /// snapshot is not synced (direct callers). The sweep
     /// uses [`Self::reconcile_service_with_pods`] instead, so a namespace full
     /// of services costs one pod LIST rather than one per service.
     async fn reconcile_service(&self, service: &Service) -> Result<()> {
         let namespace = service.metadata.namespace.as_deref().unwrap_or("default");
-        let all_pods: Vec<Pod> = self
-            .storage
-            .list(&build_prefix("pods", Some(namespace)))
-            .await
-            .unwrap_or_default();
+        let all_pods: Vec<Pod> = match self.cached_pods(namespace) {
+            Some(pods) => pods,
+            None => self
+                .storage
+                .list(&build_prefix("pods", Some(namespace)))
+                .await
+                .unwrap_or_default(),
+        };
         self.reconcile_service_with_pods(service, &all_pods).await
     }
 
@@ -1858,7 +1958,7 @@ mod tests {
             where
                 T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
             {
-                if prefix.starts_with("/registry/pods/") {
+                if prefix.starts_with("/registry/endpointslices/") {
                     let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     self.max_in_flight.fetch_max(now, Ordering::SeqCst);
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1938,5 +2038,223 @@ mod tests {
             "only {max} service sync(s) ever ran at once; the service queue must be drained \
              by a pool of CONCURRENT_SERVICE_ENDPOINT_SYNCS workers"
         );
+    }
+
+    /// Storage that counts pod LISTs, for the shared pod snapshot tests.
+    struct PodListCounter {
+        inner: Arc<MemoryStorage>,
+        pod_lists: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for PodListCounter {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.create(key, value).await
+        }
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update(key, value).await
+        }
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.inner.update_raw(key, value).await
+        }
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            if prefix.starts_with("/registry/pods/") {
+                self.pod_lists
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.list(prefix).await
+        }
+        async fn watch(
+            &self,
+            prefix: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    fn snapshot_service(name: &str) -> Service {
+        Service {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Service".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new(name).with_namespace("ns"),
+            spec: ServiceSpec {
+                selector: Some(HashMap::from([("app".to_string(), "snap".to_string())])),
+                ports: vec![ServicePort {
+                    name: None,
+                    port: 80,
+                    target_port: None,
+                    protocol: "TCP".to_string(),
+                    node_port: None,
+                    app_protocol: None,
+                }],
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    fn snapshot_pod(name: &str, ip: &str) -> Pod {
+        Pod {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new(name)
+                .with_namespace("ns")
+                .with_labels(HashMap::from([("app".to_string(), "snap".to_string())])),
+            spec: Some(rusternetes_common::resources::PodSpec {
+                containers: vec![rusternetes_common::resources::Container {
+                    name: "c".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: Some(rusternetes_common::resources::PodStatus {
+                phase: Some(rusternetes_common::types::Phase::Running),
+                pod_ip: Some(ip.to_string()),
+                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                    condition_type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: None,
+                    message: None,
+                    last_probe_time: None,
+                    last_transition_time: None,
+                    observed_generation: None,
+                }]),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// The live path must read pods from a snapshot shared by every worker,
+    /// not LIST per service sync. Upstream's `syncService` reads
+    /// `c.podLister.Pods(ns).List(selector)` from the shared pod informer's
+    /// cache (endpointslice_controller.go:410); the informer LISTs once.
+    /// Stand-in for informer cache (#2208).
+    #[tokio::test]
+    async fn run_shares_one_pod_snapshot_across_service_syncs() {
+        use std::sync::atomic::Ordering;
+        let inner = Arc::new(MemoryStorage::new());
+        let storage = Arc::new(PodListCounter {
+            inner: Arc::clone(&inner),
+            pod_lists: std::sync::atomic::AtomicUsize::new(0),
+        });
+        for i in 0..20 {
+            let name = format!("svc-{i}");
+            storage
+                .create(
+                    &build_key("services", Some("ns"), &name),
+                    &snapshot_service(&name),
+                )
+                .await
+                .unwrap();
+        }
+        let controller = Arc::new(EndpointSliceController::new(Arc::clone(&storage)));
+        let handle = tokio::spawn(async move { controller.run().await });
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        handle.abort();
+
+        let lists = storage.pod_lists.load(Ordering::SeqCst);
+        assert!(
+            lists <= 1,
+            "{lists} pod LISTs for 20 services; workers must share one pod snapshot \
+             (upstream podLister reads the informer cache)"
+        );
+    }
+
+    /// The snapshot is kept current from the pod watch, so a pod created
+    /// after the initial sync reaches the slice without any 5s full resync
+    /// and without a fresh LIST (informer event handler -> podQueue ->
+    /// service enqueue, endpointslice_controller.go:132-135, 532).
+    #[tokio::test]
+    async fn pod_snapshot_follows_pod_watch_events() {
+        use std::sync::atomic::Ordering;
+        let inner = Arc::new(MemoryStorage::new());
+        let storage = Arc::new(PodListCounter {
+            inner: Arc::clone(&inner),
+            pod_lists: std::sync::atomic::AtomicUsize::new(0),
+        });
+        storage
+            .create(
+                &build_key("services", Some("ns"), "svc"),
+                &snapshot_service("svc"),
+            )
+            .await
+            .unwrap();
+        let controller = Arc::new(EndpointSliceController::new(Arc::clone(&storage)));
+        let handle = tokio::spawn(async move { controller.run().await });
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let before = storage.pod_lists.load(Ordering::SeqCst);
+
+        storage
+            .create(
+                &build_key("pods", Some("ns"), "p1"),
+                &snapshot_pod("p1", "10.0.0.7"),
+            )
+            .await
+            .unwrap();
+        let es_key = build_key("endpointslices", Some("ns"), "svc");
+        let mut seen = false;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Ok(es) = storage.get::<EndpointSlice>(&es_key).await {
+                if es.endpoints.iter().any(|e| e.addresses == vec!["10.0.0.7"]) {
+                    seen = true;
+                    break;
+                }
+            }
+        }
+        handle.abort();
+        assert!(seen, "pod created after sync never reached the slice");
+        assert_eq!(
+            storage.pod_lists.load(Ordering::SeqCst),
+            before,
+            "a pod event must update the snapshot, not trigger a pod LIST"
+        );
+    }
+
+    /// Upstream has no periodic full resync of its own: only the informers
+    /// resync, every MinResyncPeriod (12h default,
+    /// staging/src/k8s.io/controller-manager/config/v1alpha1/defaults.go:32).
+    #[test]
+    fn informer_resync_period_is_not_the_old_5s_sweep() {
+        assert!(INFORMER_RESYNC_PERIOD >= std::time::Duration::from_secs(12 * 3600));
     }
 }
