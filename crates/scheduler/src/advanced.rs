@@ -279,23 +279,9 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
     };
 
     // Get pod resource requests
-    let mut cpu_request = 0i64;
-    let mut memory_request = 0i64;
-
-    if let Some(spec) = &pod.spec {
-        for container in &spec.containers {
-            if let Some(ref resources) = container.resources {
-                if let Some(ref requests) = resources.requests {
-                    if let Some(cpu) = requests.get("cpu") {
-                        cpu_request += parse_resource_quantity(cpu, "cpu");
-                    }
-                    if let Some(memory) = requests.get("memory") {
-                        memory_request += parse_resource_quantity(memory, "memory");
-                    }
-                }
-            }
-        }
-    }
+    let pod_amounts = pod_request_amounts(pod);
+    let cpu_request = pod_amounts.get("cpu").copied().unwrap_or(0);
+    let memory_request = pod_amounts.get("memory").copied().unwrap_or(0);
 
     // Calculate total allocatable
     let total_cpu = allocatable
@@ -367,60 +353,37 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
         if existing_pod.metadata.deletion_timestamp.is_some() {
             continue;
         }
-        if let Some(spec) = &existing_pod.spec {
-            for container in &spec.containers {
-                if let Some(ref resources) = container.resources {
-                    if let Some(ref requests) = resources.requests {
-                        if let Some(cpu) = requests.get("cpu") {
-                            used_cpu += parse_resource_quantity(cpu, "cpu");
-                        }
-                        if let Some(memory) = requests.get("memory") {
-                            used_memory += parse_resource_quantity(memory, "memory");
-                        }
-                        // Track extended resource usage. Quantities use the
-                        // full k8s format (e.g. "1k" == 1000), so parse with
-                        // parse_resource_quantity, not a raw i64 parse — a
-                        // canonicalized value like "1k" would otherwise parse
-                        // to 0 and silently under-count usage.
-                        for (key, val) in requests {
-                            if key != "cpu" && key != "memory" && key != "ephemeral-storage" {
-                                *used_extended.entry(key.clone()).or_insert(0) +=
-                                    parse_resource_quantity(val, key);
-                            }
-                        }
-                    }
-                }
+        // Track extended resource usage. Quantities use the full k8s format
+        // (e.g. "1k" == 1000), so they are parsed as Quantities, not raw i64
+        // — a canonicalized value like "1k" would otherwise parse to 0 and
+        // silently under-count usage.
+        for (key, amount) in pod_request_amounts(existing_pod) {
+            match key.as_str() {
+                "cpu" => used_cpu += amount,
+                "memory" => used_memory += amount,
+                "ephemeral-storage" => {}
+                _ => *used_extended.entry(key).or_insert(0) += amount,
             }
         }
     }
 
     // Check extended resources requested by the pod against node allocatable.
     // If ANY extended resource is insufficient, return 0 (can't schedule).
-    if let Some(spec) = &pod.spec {
-        for container in &spec.containers {
-            if let Some(ref resources) = container.resources {
-                if let Some(ref requests) = resources.requests {
-                    for (key, val) in requests {
-                        if key != "cpu" && key != "memory" && key != "ephemeral-storage" {
-                            // Both the request and the node's advertised capacity
-                            // use the full k8s quantity format. The conformance
-                            // `AddExtendedResource` helper writes `resource.MustParse`d
-                            // values, which serialize canonically (e.g. 1000 -> "1k"),
-                            // so a raw i64 parse of the node capacity yields 0 and
-                            // wrongly rejects the pod. Parse both with
-                            // parse_resource_quantity. (#542)
-                            let requested = parse_resource_quantity(val, key);
-                            let node_capacity = allocatable
-                                .get(key)
-                                .map(|s| parse_resource_quantity(s, key))
-                                .unwrap_or(0);
-                            let used = used_extended.get(key).copied().unwrap_or(0);
-                            if used + requested > node_capacity {
-                                return 0; // Extended resource insufficient
-                            }
-                        }
-                    }
-                }
+    for (key, requested) in &pod_amounts {
+        if key != "cpu" && key != "memory" && key != "ephemeral-storage" {
+            // Both the request and the node's advertised capacity use the
+            // full k8s quantity format. The conformance `AddExtendedResource`
+            // helper writes `resource.MustParse`d values, which serialize
+            // canonically (e.g. 1000 -> "1k"), so a raw i64 parse of the node
+            // capacity yields 0 and wrongly rejects the pod. Parse both as
+            // Quantities. (#542)
+            let node_capacity = allocatable
+                .get(key)
+                .map(|s| parse_resource_quantity(s, key))
+                .unwrap_or(0);
+            let used = used_extended.get(key).copied().unwrap_or(0);
+            if used + requested > node_capacity {
+                return 0; // Extended resource insufficient
             }
         }
     }
@@ -435,64 +398,48 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
 
     // Check extended resources (non-cpu/memory/pods/ephemeral-storage)
     // K8s scheduler checks all requested resources against node allocatable.
-    if let Some(spec) = &pod.spec {
-        for container in &spec.containers {
-            if let Some(ref resources) = container.resources {
-                if let Some(ref requests) = resources.requests {
-                    for (res_name, req_qty) in requests {
-                        if res_name == "cpu"
-                            || res_name == "memory"
-                            || res_name == "pods"
-                            || res_name == "ephemeral-storage"
-                        {
-                            continue; // Already handled above or not tracked
-                        }
-                        // Extended resource — check node allocatable
-                        let total = allocatable
-                            .get(res_name)
-                            .map(|s| parse_resource_quantity(s, res_name))
-                            .unwrap_or(0);
-                        if total == 0 {
-                            return 0; // Node doesn't have this resource
-                        }
-                        let requested = parse_resource_quantity(req_qty, res_name);
-                        // Count used by other pods
-                        let mut used = 0i64;
-                        for existing_pod in all_pods {
-                            let on_node = existing_pod
-                                .spec
-                                .as_ref()
-                                .and_then(|s| s.node_name.as_ref())
-                                .map(|n| n == node_name)
-                                .unwrap_or(false);
-                            if !on_node {
-                                continue;
-                            }
-                            let phase = existing_pod.status.as_ref().and_then(|s| s.phase.as_ref());
-                            if !matches!(phase, Some(rusternetes_common::types::Phase::Running)) {
-                                continue;
-                            }
-                            if existing_pod.metadata.deletion_timestamp.is_some() {
-                                continue;
-                            }
-                            if let Some(spec) = &existing_pod.spec {
-                                for c in &spec.containers {
-                                    if let Some(ref r) = c.resources {
-                                        if let Some(ref reqs) = r.requests {
-                                            if let Some(q) = reqs.get(res_name) {
-                                                used += parse_resource_quantity(q, res_name);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if requested > total - used {
-                            return 0; // Not enough extended resource
-                        }
-                    }
-                }
+    for (res_name, &requested) in &pod_amounts {
+        if res_name == "cpu"
+            || res_name == "memory"
+            || res_name == "pods"
+            || res_name == "ephemeral-storage"
+        {
+            continue; // Already handled above or not tracked
+        }
+        // Extended resource — check node allocatable
+        let total = allocatable
+            .get(res_name)
+            .map(|s| parse_resource_quantity(s, res_name))
+            .unwrap_or(0);
+        if total == 0 {
+            return 0; // Node doesn't have this resource
+        }
+        // Count used by other pods
+        let mut used = 0i64;
+        for existing_pod in all_pods {
+            let on_node = existing_pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.node_name.as_ref())
+                .map(|n| n == node_name)
+                .unwrap_or(false);
+            if !on_node {
+                continue;
             }
+            let phase = existing_pod.status.as_ref().and_then(|s| s.phase.as_ref());
+            if !matches!(phase, Some(rusternetes_common::types::Phase::Running)) {
+                continue;
+            }
+            if existing_pod.metadata.deletion_timestamp.is_some() {
+                continue;
+            }
+            used += pod_request_amounts(existing_pod)
+                .get(res_name)
+                .copied()
+                .unwrap_or(0);
+        }
+        if requested > total - used {
+            return 0; // Not enough extended resource
         }
     }
 
@@ -536,6 +483,31 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
 /// beyond `i64` saturate, matching upstream `ScaledValue`.
 pub(crate) fn parse_resource_quantity(quantity: &str, resource_type: &str) -> i64 {
     parse_resource_value(quantity, resource_type).unwrap_or(0)
+}
+
+/// A pod's total resource requests as the scheduler accounts for them, keyed by
+/// resource name, in each resource's base unit (milli-units for `cpu`, units
+/// for everything else — upstream `Resource.Add`, `types.go:917-918`).
+///
+/// Delegates to [`rusternetes_common::quota::pod_requests`], the port of
+/// upstream `PodRequests` (`component-helpers/resource/helpers.go:149-185`):
+/// containers summed, init containers folded in as a max (restartable ones
+/// added), pod-level `spec.resources.requests` overriding per name (only when
+/// `PodLevelResources` is enabled — `SkipPodLevelResources:
+/// !EnablePodLevelResources`, `noderesources/fit.go:296-297`,
+/// `framework/types.go:722-731`), and `spec.overhead` added.
+pub(crate) fn pod_request_amounts(pod: &Pod) -> HashMap<String, i64> {
+    rusternetes_common::quota::pod_requests(pod)
+        .into_iter()
+        .map(|(name, q)| {
+            let v = if name == "cpu" {
+                q.milli_value()
+            } else {
+                q.value()
+            };
+            (name, v.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+        })
+        .collect()
 }
 
 /// System-critical priority threshold. Pods at or above this priority
@@ -899,17 +871,8 @@ pub fn check_preemption_with_pdbs(
     // See: pkg/scheduler/framework/preemption/preemption.go
     let mut resources_needed: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
-    if let Some(spec) = &pod.spec {
-        for container in &spec.containers {
-            if let Some(ref resources) = container.resources {
-                if let Some(ref requests) = resources.requests {
-                    for (key, val) in requests {
-                        let amount = parse_resource_quantity(val, key);
-                        *resources_needed.entry(key.clone()).or_insert(0) += amount;
-                    }
-                }
-            }
-        }
+    for (key, amount) in pod_request_amounts(pod) {
+        *resources_needed.entry(key).or_insert(0) += amount;
     }
 
     // Get node's total allocatable resources (all types)
@@ -935,17 +898,8 @@ pub fn check_preemption_with_pdbs(
     // Calculate resources used by ALL pods on this node (including non-candidates)
     let mut total_used: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for p in &node_pods {
-        if let Some(spec) = &p.spec {
-            for container in &spec.containers {
-                if let Some(ref resources) = container.resources {
-                    if let Some(ref requests) = resources.requests {
-                        for (key, val) in requests {
-                            *total_used.entry(key.clone()).or_insert(0) +=
-                                parse_resource_quantity(val, key);
-                        }
-                    }
-                }
-            }
+        for (key, amount) in pod_request_amounts(p) {
+            *total_used.entry(key).or_insert(0) += amount;
         }
     }
 
@@ -975,17 +929,8 @@ pub fn check_preemption_with_pdbs(
     // Calculate total freed resources if ALL candidates are evicted
     let mut total_freed: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for (candidate_pod, _) in &candidates {
-        if let Some(spec) = &candidate_pod.spec {
-            for container in &spec.containers {
-                if let Some(ref resources) = container.resources {
-                    if let Some(ref requests) = resources.requests {
-                        for (key, val) in requests {
-                            *total_freed.entry(key.clone()).or_insert(0) +=
-                                parse_resource_quantity(val, key);
-                        }
-                    }
-                }
-            }
+        for (key, amount) in pod_request_amounts(candidate_pod) {
+            *total_freed.entry(key).or_insert(0) += amount;
         }
     }
 
@@ -1019,17 +964,8 @@ pub fn check_preemption_with_pdbs(
             if reprieved.contains(&other_pod.metadata.name) {
                 continue; // Skip already-reprieved pods
             }
-            if let Some(spec) = &other_pod.spec {
-                for container in &spec.containers {
-                    if let Some(ref resources) = container.resources {
-                        if let Some(ref requests) = resources.requests {
-                            for (key, val) in requests {
-                                *freed_without_this.entry(key.clone()).or_insert(0) +=
-                                    parse_resource_quantity(val, key);
-                            }
-                        }
-                    }
-                }
+            for (key, amount) in pod_request_amounts(other_pod) {
+                *freed_without_this.entry(key).or_insert(0) += amount;
             }
         }
 
@@ -1082,17 +1018,8 @@ pub fn check_preemption_with_pdbs(
                 if reprieved_pdb.contains(&other_pod.metadata.name) {
                     continue;
                 }
-                if let Some(spec) = &other_pod.spec {
-                    for container in &spec.containers {
-                        if let Some(ref resources) = container.resources {
-                            if let Some(ref requests) = resources.requests {
-                                for (key, val) in requests {
-                                    *freed_without_this.entry(key.clone()).or_insert(0) +=
-                                        parse_resource_quantity(val, key);
-                                }
-                            }
-                        }
-                    }
+                for (key, amount) in pod_request_amounts(other_pod) {
+                    *freed_without_this.entry(key).or_insert(0) += amount;
                 }
             }
 
@@ -2541,6 +2468,153 @@ mod tests {
             pick_one_node_for_preemption(&candidates, &pods).as_deref(),
             Some("node-2"),
             "a PDB violation must outrank a lower victim priority"
+        );
+    }
+
+    // ---- #2268: resource fit must use upstream PodRequests ----------------
+    //
+    // Upstream: component-helpers/resource/helpers.go PodRequests (:149-185),
+    // fed to the fit plugin by noderesources/fit.go computePodResourceRequest
+    // (:293-302) and to node accounting by framework/types.go CalculateResource
+    // (:722-731). Upstream cases mirrored: TestPodRequests-style init-container
+    // max / sidecar sum / overhead / pod-level override in
+    // component-helpers/resource/helpers_test.go.
+
+    fn reqs(pairs: &[(&str, &str)]) -> rusternetes_common::types::ResourceRequirements {
+        rusternetes_common::types::ResourceRequirements {
+            requests: Some(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            limits: None,
+            claims: None,
+        }
+    }
+
+    /// A pod whose single container asks `cpu`, with optional extras.
+    fn pod_with(cpu: &str) -> Pod {
+        let mut c = make_container(cpu, "1Mi");
+        c.resources = Some(reqs(&[("cpu", cpu)]));
+        Pod::new(
+            "p",
+            rusternetes_common::resources::PodSpec {
+                containers: vec![c],
+                ..Default::default()
+            },
+        )
+    }
+
+    fn init_container(
+        name: &str,
+        cpu: &str,
+        restartable: bool,
+    ) -> rusternetes_common::resources::Container {
+        let mut c = make_container(cpu, "1Mi");
+        c.name = name.to_string();
+        c.resources = Some(reqs(&[("cpu", cpu)]));
+        if restartable {
+            c.restart_policy = Some("Always".to_string());
+        }
+        c
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn init_container_raises_the_pod_request_to_its_max() {
+        // Upstream AggregateContainerRequests: init containers define the
+        // minimum of any resource (helpers.go max(reqs, initContainerReqs)).
+        let mut pod = pod_with("1");
+        pod.spec.as_mut().unwrap().init_containers = Some(vec![init_container("i", "3", false)]);
+        assert_eq!(pod_request_amounts(&pod)["cpu"], 3000);
+        // Node with 2 CPU cannot fit it, node with 4 can.
+        assert_eq!(
+            calculate_resource_score(&make_node("small", "2", "1Gi"), &pod),
+            0
+        );
+        assert!(calculate_resource_score(&make_node("big", "4", "1Gi"), &pod) > 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn restartable_init_container_is_added_to_the_pod_request() {
+        let mut pod = pod_with("1");
+        pod.spec.as_mut().unwrap().init_containers = Some(vec![init_container("side", "1", true)]);
+        assert_eq!(pod_request_amounts(&pod)["cpu"], 2000);
+        assert_eq!(
+            calculate_resource_score(&make_node("n", "1500m", "1Gi"), &pod),
+            0
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn overhead_is_added_to_the_pod_request() {
+        let mut pod = pod_with("1");
+        pod.spec.as_mut().unwrap().overhead =
+            Some([("cpu".to_string(), "1500m".to_string())].into());
+        assert_eq!(pod_request_amounts(&pod)["cpu"], 2500);
+        assert_eq!(
+            calculate_resource_score(&make_node("n", "2", "1Gi"), &pod),
+            0
+        );
+        assert!(calculate_resource_score(&make_node("n", "3", "1Gi"), &pod) > 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pod_level_resources_override_the_container_sum_when_gate_on() {
+        let _g = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::PodLevelResources,
+            true,
+        );
+        let mut pod = pod_with("1");
+        pod.spec.as_mut().unwrap().resources = Some(reqs(&[("cpu", "3")]));
+        assert_eq!(pod_request_amounts(&pod)["cpu"], 3000);
+        assert_eq!(
+            calculate_resource_score(&make_node("n", "2", "1Gi"), &pod),
+            0
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pod_level_resources_ignored_when_gate_off() {
+        // SkipPodLevelResources: !EnablePodLevelResources (fit.go:296-297).
+        let _g = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::PodLevelResources,
+            false,
+        );
+        let mut pod = pod_with("1");
+        pod.spec.as_mut().unwrap().resources = Some(reqs(&[("cpu", "3")]));
+        assert_eq!(pod_request_amounts(&pod)["cpu"], 1000);
+        assert!(calculate_resource_score(&make_node("n", "2", "1Gi"), &pod) > 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn node_usage_counts_existing_pods_init_and_overhead() {
+        // Node accounting uses the same PodRequests (types.go:722-731), so an
+        // existing pod's init container + overhead consume node capacity.
+        let mut existing = make_scheduled_pod("old", 0, "100m", "1Mi", "n");
+        {
+            let spec = existing.spec.as_mut().unwrap();
+            spec.init_containers = Some(vec![init_container("i", "1", false)]);
+            spec.overhead = Some([("cpu".to_string(), "500m".to_string())].into());
+        }
+        // existing requests max(100m, 1) + 500m = 1500m; 1 CPU more won't fit in 2.
+        let pod = pod_with("1");
+        assert_eq!(
+            calculate_resource_score_with_pods(
+                &make_node("n", "2", "1Gi"),
+                &pod,
+                &[existing.clone()]
+            ),
+            0
+        );
+        assert!(
+            calculate_resource_score_with_pods(&make_node("n", "3", "1Gi"), &pod, &[existing]) > 0
         );
     }
 }
