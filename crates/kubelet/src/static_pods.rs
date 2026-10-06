@@ -196,8 +196,12 @@ pub async fn reconcile_mirror_pods<S: Storage>(
                     .and_then(|a| a.get(CONFIG_MIRROR_ANNOTATION))
                     .cloned()
                     .unwrap_or_default();
-                if have != want_hash {
-                    // manifest changed: recreate the mirror (upstream behavior)
+                // Upstream tryReconcileMirrorPods (pkg/kubelet/kubelet.go:3333):
+                // `mirrorPod.DeletionTimestamp != nil || !IsMirrorPodOf(..)` ->
+                // delete the mirror (grace 0, mirror_client.go:133-134), then
+                // recreate it. A client-deleted mirror must not stay Terminating.
+                if have != want_hash || existing.metadata.deletion_timestamp.is_some() {
+                    // manifest changed or mirror deleted: recreate it
                     let _ = storage.delete(&key).await;
                     storage.create(&key, &make_mirror_pod(pod)).await?;
                 }
