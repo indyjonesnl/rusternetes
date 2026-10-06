@@ -27,7 +27,9 @@ use rusternetes_common::admission::{
     self, AdmissionResponse, GroupVersionKind, GroupVersionResource, Operation,
 };
 use rusternetes_common::auth::UserInfo;
-use rusternetes_common::resources::{PersistentVolumeClaim, Pod, PriorityClass};
+use rusternetes_common::resources::{
+    CertificateSigningRequest, PersistentVolumeClaim, Pod, PriorityClass,
+};
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::Storage;
 
@@ -140,6 +142,9 @@ impl Admission<'_> {
         obj: Option<&T>,
         old: Option<&T>,
     ) -> Result<()> {
+        if let (Operation::Update, Some(obj), Some(old)) = (op, obj, old) {
+            self.validate_csr_signer(obj, old).await?;
+        }
         if self.is_core("pods") || self.is_pod_resize() {
             let obj: Option<Pod> = obj.map(recast).transpose()?;
             let old: Option<Pod> = old.map(recast).transpose()?;
@@ -164,6 +169,31 @@ impl Admission<'_> {
             Ok(None) => Ok(()),
             Ok(Some(err)) => Err(self.forbidden(&pvc.metadata.name, err)),
             Err(e) => Err(self.forbidden(&pvc.metadata.name, e)),
+        }
+    }
+
+    /// The `certificates/approval` and `certificates/signing` plugins, for an
+    /// UPDATE of a CertificateSigningRequest's `approval` or `status`
+    /// ([`crate::admission::certificates`]).
+    async fn validate_csr_signer<T: Object>(&self, obj: &T, old: &T) -> Result<()> {
+        if self.resource.group != "certificates.k8s.io"
+            || self.resource.resource != "certificatesigningrequests"
+        {
+            return Ok(());
+        }
+        let new: CertificateSigningRequest = recast(obj)?;
+        let old: CertificateSigningRequest = recast(old)?;
+        match crate::admission::certificates::validate_update(
+            self.state,
+            self.user,
+            self.subresource,
+            &new,
+            &old,
+        )
+        .await
+        {
+            Some(err) => Err(self.forbidden(&old.metadata.name, err)),
+            None => Ok(()),
         }
     }
 
