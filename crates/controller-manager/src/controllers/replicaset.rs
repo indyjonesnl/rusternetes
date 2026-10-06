@@ -345,7 +345,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         // Count ready and available pods
         let ready_count = replicaset_pods
             .iter()
-            .filter(|p| self.is_pod_ready(p))
+            .filter(|p| rusternetes_common::podutil::is_pod_ready(p))
             .count() as i32;
 
         let available_count = replicaset_pods
@@ -434,7 +434,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
 
         let final_ready_count = replicaset_pods_after
             .iter()
-            .filter(|p| self.is_pod_ready(p))
+            .filter(|p| rusternetes_common::podutil::is_pod_ready(p))
             .count() as i32;
 
         let final_available_count = replicaset_pods_after
@@ -652,21 +652,10 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         self.labels_match_selector(pod, replicaset)
     }
 
-    /// Check if a pod is ready by examining its conditions
-    fn is_pod_ready(&self, pod: &Pod) -> bool {
-        if let Some(conditions) = pod.status.as_ref().and_then(|s| s.conditions.as_ref()) {
-            conditions
-                .iter()
-                .any(|c| c.condition_type == "Ready" && c.status == "True")
-        } else {
-            false
-        }
-    }
-
     fn is_pod_available(&self, pod: &Pod, replicaset: &ReplicaSet) -> bool {
         // K8s IsPodAvailable: Ready condition True + minReadySeconds + not terminating
         // Does NOT require phase == Running (a pod can be Ready before/during phase transitions)
-        if !self.is_pod_ready(pod) {
+        if !rusternetes_common::podutil::is_pod_ready(pod) {
             return false;
         }
 

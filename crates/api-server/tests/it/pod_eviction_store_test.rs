@@ -1498,3 +1498,41 @@ async fn a_uid_precondition_that_does_not_match_is_a_409() {
 fn the_router_serves_the_store_backed_rest(storage: Arc<StorageBackend>) -> StoreEvictionRest {
     new_eviction_rest(storage)
 }
+
+/// `checkAndDecrement` writes the budget through `UpdateStatus`
+/// (eviction.go:432), the PDB status store, so `podDisruptionBudgetStatusStrategy`
+/// (strategy.go:156-174) runs: validation refuses a negative count, and
+/// `PrepareForUpdate` keeps the stored spec (#2087, #2156).
+#[tokio::test]
+async fn the_pdb_status_write_runs_the_status_strategy() {
+    use rusternetes_api_server::registry::core::pod::StorePdbClient;
+    use rusternetes_common::resources::IntOrString;
+    let api = TestApiServer::new();
+    seed_pdb(
+        &api,
+        "b",
+        json!({"minAvailable": 1, "selector": {"matchLabels": {"app": "web"}}}),
+        json!({"currentHealthy": 2, "desiredHealthy": 1, "disruptionsAllowed": 1, "expectedPods": 2}),
+    )
+    .await;
+    let client = StorePdbClient::new(Arc::new(StorageBackend::Memory(api.storage.clone())));
+
+    // Validation: a negative disruptionsAllowed is Invalid.
+    let mut bad = client.get("default", "b").await.unwrap();
+    bad.status.as_mut().unwrap().disruptions_allowed = -1;
+    let err = client.update_status("default", &bad).await.unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)), "{err:?}");
+
+    // PrepareForUpdate: a spec change rides along but is dropped.
+    let mut changed = client.get("default", "b").await.unwrap();
+    changed.spec.min_available = Some(IntOrString::Int(2));
+    changed.status.as_mut().unwrap().disruptions_allowed = 0;
+    client.update_status("default", &changed).await.unwrap();
+    let stored = stored_pdb(&api, "b").await;
+    assert_eq!(stored.status.unwrap().disruptions_allowed, 0);
+    assert_eq!(stored.spec.min_available, Some(IntOrString::Int(1)));
+
+    // Conflict: the first read's resourceVersion is stale now.
+    let err = client.update_status("default", &changed).await.unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+}
