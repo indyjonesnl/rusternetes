@@ -319,6 +319,18 @@ pub fn validate_node(node: &Node) -> ErrorList {
             families.push(fam);
         }
         if cidrs.len() > 1 {
+            // validation.go:7205-7208: a ParseCIDRs failure (netutils.ParseCIDRs,
+            // k8s.io/utils/net/net.go:30-40, first bad index) is an InternalError
+            // on top of the Invalid below (dualStack is false then).
+            if let Some(i) = families.iter().position(Option::is_none) {
+                errs.push(Error::internal(
+                    &cidrs_path,
+                    format!(
+                        "invalid PodCIDRs. failed to check with dual stack with error:invalid CIDR[{i}]: <nil> (invalid CIDR address: {})",
+                        cidrs[i]
+                    ),
+                ));
+            }
             let dual_stack = cidrs.len() == 2
                 && matches!((families[0], families[1]), (Some(a), Some(b)) if a != b);
             if !dual_stack {
@@ -759,6 +771,7 @@ mod avoid_pods_tests {
 #[cfg(test)]
 mod pod_cidr_tests {
     use super::*;
+    use crate::validation::field::ErrorType;
 
     fn node_with_cidrs(cidrs: &[&str]) -> Node {
         serde_json::from_value(serde_json::json!({
@@ -787,5 +800,34 @@ mod pod_cidr_tests {
         let errs = validate_node(&node_with_cidrs(&["10.9.8.0/33"]));
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert_eq!(errs[0].field, "spec.podCIDRs[0]");
+    }
+
+    // validation.go:7205-7208: when ParseCIDRs fails on a multi-CIDR list,
+    // upstream emits field.InternalError(podCIDRsField, ...) and then, since
+    // dualStack is false, the Invalid "no more than one CIDR" error too.
+    #[test]
+    fn unparseable_multi_cidr_list_emits_internal_error() {
+        let errs = validate_node(&node_with_cidrs(&["10.9.8.0/24", "bogus"]));
+        let internal: Vec<_> = errs
+            .iter()
+            .filter(|e| e.error_type == ErrorType::Internal)
+            .collect();
+        assert_eq!(internal.len(), 1, "{errs:?}");
+        assert_eq!(internal[0].field, "spec.podCIDRs");
+        assert_eq!(
+            internal[0].detail,
+            "invalid PodCIDRs. failed to check with dual stack with error:invalid CIDR[1]: <nil> (invalid CIDR address: bogus)"
+        );
+        // per-element Invalid + the dual-stack Invalid remain.
+        assert!(errs.iter().any(|e| e.field == "spec.podCIDRs[1]"));
+        assert!(errs.iter().any(|e| e.field == "spec.podCIDRs"
+            && e.error_type == ErrorType::Invalid
+            && e.detail == "may specify no more than one CIDR for each IP family"));
+    }
+
+    #[test]
+    fn single_bad_cidr_has_no_internal_error() {
+        let errs = validate_node(&node_with_cidrs(&["bogus"]));
+        assert!(errs.iter().all(|e| e.error_type != ErrorType::Internal));
     }
 }

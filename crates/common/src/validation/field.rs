@@ -258,6 +258,18 @@ impl Error {
         }
     }
 
+    /// `field.InternalError` (apimachinery field/errors.go:308): the bad value
+    /// is omitted and the detail is the underlying error's text.
+    pub fn internal(path: &Path, detail: impl Into<String>) -> Self {
+        Self {
+            error_type: ErrorType::Internal,
+            field: path.to_string(),
+            bad_value: BadValue::Omit,
+            detail: detail.into(),
+            origin: String::new(),
+        }
+    }
+
     /// `field.Required` — the bad value is omitted.
     pub fn required(path: &Path, detail: impl Into<String>) -> Self {
         Self {
