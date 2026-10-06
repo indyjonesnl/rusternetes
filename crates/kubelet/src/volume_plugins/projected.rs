@@ -458,7 +458,7 @@ impl ProjectedMounter {
         // missing or past ~80% of its lifetime. The per-sync volume
         // re-creation would otherwise hit the api-server TokenRequest
         // endpoint every few seconds per pod and churn the token file.
-        let refresh_after = (expiration_seconds * 8 / 10).max(60);
+        let refresh_after = token_refresh_after_secs(expiration_seconds, token_jitter_secs());
         let token_fresh = std::fs::metadata(&token_path)
             .and_then(|m| m.modified())
             .ok()
@@ -572,9 +572,39 @@ impl Mounter for ProjectedMounter {
     }
 }
 
+/// Seconds after minting at which a projected token is refreshed. Ports
+/// `requiresRefresh` (pkg/kubelet/token/token_manager.go:174-195): refresh at
+/// 80% of the lifetime (`exp - ExpirationSeconds*20/100 - jitter`) AND never
+/// later than `maxTTL (24h) - jitter` (`:40`, `:187`). `maxJitter = 10s` (`:42`).
+fn token_refresh_after_secs(expiration_seconds: i64, jitter_secs: i64) -> i64 {
+    const MAX_TTL_SECS: i64 = 24 * 3600;
+    let pct = expiration_seconds - (expiration_seconds * 20) / 100 - jitter_secs;
+    pct.min(MAX_TTL_SECS - jitter_secs).max(60)
+}
+
+/// Jitter in [0, 10) seconds (upstream `rand.Float64()*maxJitter`, :186).
+fn token_jitter_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() % 10) as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Upstream pkg/kubelet/token/token_manager.go:40 `maxTTL = 24 * time.Hour`,
+    // :187 `now.After(iat.Add(maxTTL - jitter))` => refresh by 24h-jitter.
+    #[test]
+    fn refresh_after_is_capped_at_24h_minus_jitter_2358() {
+        // 48h token: 80% (38.4h) exceeds the 24h cap.
+        assert_eq!(token_refresh_after_secs(48 * 3600, 4), 24 * 3600 - 4);
+        // 1h token: 80% rule wins.
+        assert_eq!(token_refresh_after_secs(3600, 0), 2880);
+        // Floor kept (pre-existing 60s minimum).
+        assert_eq!(token_refresh_after_secs(10, 0), 60);
+    }
     use rusternetes_common::resources::Volume;
 
     fn plugin() -> ProjectedPlugin {
