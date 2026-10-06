@@ -25,6 +25,20 @@ pub struct JobController<S: Storage> {
     /// (`pkg/controller/job/tracking_utils.go:48`) — the brake that stops a
     /// stale pod list from claiming the same termination twice.
     finalizer_expectations: FinalizerExpectations,
+    /// Delayed re-syncs requested by `reconcile`, keyed `namespace/name`.
+    /// Stands in for upstream's `jm.queue.AddAfter` call inside `manageJob`
+    /// (`enqueueSyncJobWithDelay`, `job_controller.go:620`); the worker drains
+    /// it after each sync and calls `WorkQueue::add_after`.
+    requeue_delays: std::sync::Mutex<HashMap<String, Duration>>,
+}
+
+/// `SyncJobBatchPeriod` (`job_controller.go:64`).
+const SYNC_JOB_BATCH_PERIOD: Duration = Duration::from_secs(1);
+
+/// `enqueueSyncJobWithDelay` (`job_controller.go:620`): "custom delay, but not
+/// smaller than the batching delay".
+fn requeue_delay_for(delay: Duration) -> Duration {
+    delay.max(SYNC_JOB_BATCH_PERIOD)
 }
 
 /// Cap on how many UIDs one pass may park in `.status.uncountedTerminatedPods`.
@@ -215,7 +229,26 @@ impl<S: Storage + 'static> JobController<S> {
         Self {
             storage,
             finalizer_expectations: FinalizerExpectations::new(),
+            requeue_delays: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record a delayed re-sync for a Job, keeping the earliest request.
+    fn request_requeue(&self, namespace: &str, name: &str, delay: Duration) {
+        let mut map = self.requeue_delays.lock().unwrap();
+        map.entry(format!("{namespace}/{name}"))
+            .and_modify(|d| *d = (*d).min(delay))
+            .or_insert(delay);
+    }
+
+    /// Take the delayed re-sync requested by the last `reconcile` of a Job,
+    /// already clamped to `SyncJobBatchPeriod`.
+    fn take_requeue_delay(&self, namespace: &str, name: &str) -> Option<Duration> {
+        self.requeue_delays
+            .lock()
+            .unwrap()
+            .remove(&format!("{namespace}/{name}"))
+            .map(requeue_delay_for)
     }
 
     /// Phase 1 of the exactly-once protocol: claim every terminal pod that is
@@ -659,7 +692,12 @@ impl<S: Storage + 'static> JobController<S> {
                 Ok(resource) => {
                     let mut resource = resource;
                     match self.reconcile(&mut resource).await {
-                        Ok(()) => queue.forget(&key).await,
+                        Ok(()) => {
+                            queue.forget(&key).await;
+                            if let Some(delay) = self.take_requeue_delay(ns, name) {
+                                queue.add_after(key.clone(), delay).await;
+                            }
+                        }
                         Err(e) => {
                             error!("Failed to reconcile {}: {}", key, e);
                             queue.requeue_rate_limited(key.clone()).await;
@@ -1858,30 +1896,44 @@ impl<S: Storage + 'static> JobController<S> {
                             per_index_limit,
                         ));
                     }
-                    // `getPodCreationInfoForIndependentIndexes`
-                    // (`job_controller.go:1850`): an index is only retried once
-                    // its own failure backoff has elapsed.
-                    let now = chrono::Utc::now();
-                    (0..completions)
+                    // `firstPendingIndexes` (`job_controller.go:1743`): the
+                    // first `diff` indexes that are neither active, succeeded
+                    // nor failed.
+                    let pending: Vec<i32> = (0..completions)
                         .filter(|i| {
-                            // Skip indexes that already have active or succeeded pods
-                            if active_or_succeeded_indexes.contains(i) {
-                                return false;
-                            }
-                            // Skip indexes that are permanently failed (backoffLimitPerIndex or FailIndex)
-                            if exhausted_indexes.contains(i) {
-                                return false;
-                            }
-                            // Per-index failure backoff.
-                            if remaining_time_per_index(now, delayed_deletion.get(i))
-                                > Duration::ZERO
-                            {
-                                return false;
-                            }
-                            true
+                            !active_or_succeeded_indexes.contains(i)
+                                && !exhausted_indexes.contains(i)
                         })
                         .take(pods_needed as usize)
-                        .collect()
+                        .collect();
+                    if backoff_limit_per_index.is_some() {
+                        // `getPodCreationInfoForIndependentIndexes`
+                        // (`job_controller.go:1850`): an index is only retried
+                        // once its own failure backoff has elapsed; when none
+                        // is ready, `enqueueSyncJobWithDelay` re-runs the sync
+                        // after the smallest remaining time
+                        // (`job_controller.go:1746-1749`).
+                        let now = chrono::Utc::now();
+                        let mut now_ready: Vec<i32> = Vec::new();
+                        let mut min_remaining: Option<Duration> = None;
+                        for idx in pending {
+                            let remaining =
+                                remaining_time_per_index(now, delayed_deletion.get(&idx));
+                            if remaining.is_zero() {
+                                now_ready.push(idx);
+                            } else if min_remaining.is_none_or(|m| remaining < m) {
+                                min_remaining = Some(remaining);
+                            }
+                        }
+                        if now_ready.is_empty() {
+                            if let Some(m) = min_remaining {
+                                self.request_requeue(namespace, name, m);
+                            }
+                        }
+                        now_ready
+                    } else {
+                        pending
+                    }
                 } else {
                     (0..pods_needed).collect()
                 };
@@ -2299,44 +2351,89 @@ fn parse_count_annotation(pod: &Pod, key: &str) -> i32 {
 }
 
 /// `getFinishedTime` (`backoff_utils.go:174`): latest container finish time,
-/// else the Ready=False transition, else the deletion timestamp, else the
-/// creation timestamp.
+/// else the Ready=False transition, else `deletionTimestamp - gracePeriod`,
+/// else the creation timestamp.
 fn pod_finished_time(pod: &Pod) -> chrono::DateTime<chrono::Utc> {
+    pod_finish_time_from_containers(pod)
+        .or_else(|| pod_finish_time_from_ready_false(pod))
+        .or_else(|| {
+            // `getFinishTimeFromDeletionTimestamp` (`backoff_utils.go:231`).
+            pod.metadata.deletion_timestamp.map(|t| {
+                t - chrono::Duration::seconds(
+                    pod.metadata.deletion_grace_period_seconds.unwrap_or(0),
+                )
+            })
+        })
+        .or(pod.metadata.creation_timestamp)
+        .unwrap_or_else(chrono::Utc::now)
+}
+
+/// `latestFinishTime` (`backoff_utils.go:207`): the latest `finishedAt` over
+/// the statuses passing `check`. Any status that is not terminated, or has no
+/// finish time, makes the whole lookup yield `None`.
+fn latest_finish_time(
+    prev: Option<chrono::DateTime<chrono::Utc>>,
+    statuses: &[rusternetes_common::resources::pod::ContainerStatus],
+    check: impl Fn(&rusternetes_common::resources::pod::ContainerStatus) -> bool,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     use rusternetes_common::resources::pod::ContainerState;
-    let from_containers = pod
-        .status
+    let mut finish = prev;
+    for cs in statuses.iter().filter(|c| check(c)) {
+        let Some(ContainerState::Terminated {
+            finished_at: Some(t),
+            ..
+        }) = &cs.state
+        else {
+            return None;
+        };
+        let t = chrono::DateTime::parse_from_rfc3339(t)
+            .ok()?
+            .with_timezone(&chrono::Utc);
+        if t.timestamp() == 0 {
+            // `FinishedAt.Time.IsZero()`.
+            return None;
+        }
+        if finish.is_none_or(|f| f < t) {
+            finish = Some(t);
+        }
+    }
+    finish
+}
+
+/// `getFinishTimeFromContainers` (`backoff_utils.go:188`), with the
+/// `SidecarContainers` gate (GA in 1.35): restartable init containers always
+/// finish after regular ones, so their statuses are folded in too.
+fn pod_finish_time_from_containers(pod: &Pod) -> Option<chrono::DateTime<chrono::Utc>> {
+    let status = pod.status.as_ref();
+    let regular = status
+        .and_then(|s| s.container_statuses.as_deref())
+        .unwrap_or(&[]);
+    let finish = latest_finish_time(None, regular, |_| true);
+    let sidecars: HashSet<&str> = pod
+        .spec
         .as_ref()
-        .and_then(|s| s.container_statuses.as_ref())
+        .and_then(|s| s.init_containers.as_ref())
         .into_iter()
         .flatten()
-        .filter_map(|c| match &c.state {
-            Some(ContainerState::Terminated {
-                finished_at: Some(t),
-                ..
-            }) => chrono::DateTime::parse_from_rfc3339(t)
-                .ok()
-                .map(|t| t.with_timezone(&chrono::Utc)),
-            _ => None,
-        })
-        .max();
-    if let Some(t) = from_containers {
-        return t;
-    }
-    let ready_false = pod
-        .status
+        .filter(|c| c.restart_policy.as_deref() == Some("Always"))
+        .map(|c| c.name.as_str())
+        .collect();
+    let init = status
+        .and_then(|s| s.init_container_statuses.as_deref())
+        .unwrap_or(&[]);
+    latest_finish_time(finish, init, |c| sidecars.contains(c.name.as_str()))
+}
+
+/// `getFinishTimeFromPodReadyFalseCondition` (`backoff_utils.go:224`).
+fn pod_finish_time_from_ready_false(pod: &Pod) -> Option<chrono::DateTime<chrono::Utc>> {
+    pod.status
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
         .into_iter()
         .flatten()
-        .find(|c| c.condition_type == "Ready" && c.status == "False")
-        .and_then(|c| c.last_transition_time);
-    if let Some(t) = ready_false {
-        return t;
-    }
-    pod.metadata
-        .deletion_timestamp
-        .or(pod.metadata.creation_timestamp)
-        .unwrap_or_else(chrono::Utc::now)
+        .find(|c| c.condition_type == "Ready")
+        .filter(|c| c.status == "False")
+        .and_then(|c| c.last_transition_time)
 }
 
 /// `getRemainingTimePerIndex` (`backoff_utils.go:248`) with
@@ -4811,5 +4908,158 @@ mod tests {
             "{r:?}"
         );
         assert_eq!(remaining_time_per_index(now, None), Duration::ZERO);
+    }
+
+    fn terminated_status(
+        name: &str,
+        finished: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> ContainerStatus {
+        let mut cs = failed_pod_with_count("tmp", 0, 0, 0)
+            .status
+            .unwrap()
+            .container_statuses
+            .unwrap()
+            .remove(0);
+        cs.name = name.to_string();
+        cs.state = Some(ContainerState::Terminated {
+            exit_code: 0,
+            signal: None,
+            reason: None,
+            message: None,
+            started_at: None,
+            finished_at: finished.map(|t| t.to_rfc3339()),
+            container_id: None,
+        });
+        cs
+    }
+
+    /// `getFinishTimeFromContainers` (`backoff_utils.go:188`): a restartable
+    /// init container (sidecar) finishes after the regular containers, so its
+    /// finish time wins.
+    #[test]
+    fn test_pod_finished_time_includes_sidecar_init_containers() {
+        let now = chrono::Utc::now();
+        let main_done = now - chrono::Duration::seconds(100);
+        let sidecar_done = now - chrono::Duration::seconds(30);
+        let mut pod = failed_pod_with_count("p", 0, 0, 0);
+        pod.spec.as_mut().unwrap().init_containers = Some(vec![
+            Container {
+                name: "sidecar".to_string(),
+                restart_policy: Some("Always".to_string()),
+                ..Default::default()
+            },
+            Container {
+                name: "plain-init".to_string(),
+                ..Default::default()
+            },
+        ]);
+        let status = pod.status.as_mut().unwrap();
+        status.container_statuses = Some(vec![terminated_status("test", Some(main_done))]);
+        // The plain init container finished latest of all but is not a sidecar.
+        status.init_container_statuses = Some(vec![
+            terminated_status("sidecar", Some(sidecar_done)),
+            terminated_status("plain-init", Some(now)),
+        ]);
+        let got = pod_finished_time(&pod);
+        assert_eq!(got.timestamp(), sidecar_done.timestamp());
+    }
+
+    /// `latestFinishTime` (`backoff_utils.go:213`): one sidecar that has not
+    /// terminated (or has a zero finish time) makes the container lookup yield
+    /// nothing, so the Ready=False transition is used instead.
+    #[test]
+    fn test_pod_finished_time_unfinished_sidecar_falls_back_to_ready_false() {
+        let now = chrono::Utc::now();
+        let ready_false = now - chrono::Duration::seconds(7);
+        let mut pod = failed_pod_with_count("p", 0, 0, 50);
+        pod.spec.as_mut().unwrap().init_containers = Some(vec![Container {
+            name: "sidecar".to_string(),
+            restart_policy: Some("Always".to_string()),
+            ..Default::default()
+        }]);
+        let status = pod.status.as_mut().unwrap();
+        let mut running = terminated_status("sidecar", None);
+        running.state = Some(ContainerState::Running { started_at: None });
+        status.init_container_statuses = Some(vec![running]);
+        status.conditions = Some(vec![PodCondition {
+            condition_type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: None,
+            message: None,
+            last_probe_time: None,
+            last_transition_time: Some(ready_false),
+            observed_generation: None,
+        }]);
+        assert_eq!(pod_finished_time(&pod).timestamp(), ready_false.timestamp());
+    }
+
+    /// `getFinishTimeFromDeletionTimestamp` (`backoff_utils.go:231`):
+    /// deletionTimestamp minus the grace period.
+    #[test]
+    fn test_pod_finished_time_deletion_timestamp_minus_grace() {
+        let now = chrono::Utc::now();
+        let mut pod = failed_pod_with_count("p", 0, 0, 0);
+        pod.status.as_mut().unwrap().container_statuses = None;
+        pod.metadata.deletion_timestamp = Some(now);
+        pod.metadata.deletion_grace_period_seconds = Some(30);
+        let got = pod_finished_time(&pod);
+        assert_eq!(
+            got.timestamp(),
+            (now - chrono::Duration::seconds(30)).timestamp()
+        );
+    }
+
+    /// `getPodCreationInfoForIndependentIndexes` + `enqueueSyncJobWithDelay`
+    /// (`job_controller.go:1746-1749`): when every pending index is inside its
+    /// backoff window the sync asks to be re-run after the remaining time
+    /// instead of waiting for the resync.
+    #[tokio::test]
+    async fn test_per_index_backoff_requests_requeue_after_remaining_time() {
+        let storage = Arc::new(MemoryStorage::new());
+        let job = per_index_job(&storage, 5).await;
+        let failed = failed_pod_with_count("idx-0-failed", 0, 0, 0);
+        storage
+            .create("/registry/pods/default/idx-0-failed", &failed)
+            .await
+            .unwrap();
+        let running = make_indexed_pod(
+            "idx-1-run",
+            "default",
+            Phase::Running,
+            "idx-job",
+            "job-uid-1",
+            1,
+        );
+        storage
+            .create("/registry/pods/default/idx-1-run", &running)
+            .await
+            .unwrap();
+        let controller = JobController::new(storage.clone());
+        let mut job = job;
+        controller.reconcile(&mut job).await.unwrap();
+        let d = controller
+            .take_requeue_delay("default", "idx-job")
+            .expect("a pending per-index backoff must request a delayed requeue");
+        assert!(
+            d > Duration::from_secs(8) && d <= Duration::from_secs(10),
+            "{d:?}"
+        );
+        assert!(controller
+            .take_requeue_delay("default", "idx-job")
+            .is_none());
+    }
+
+    /// `enqueueSyncJobWithDelay` never delays less than `SyncJobBatchPeriod`
+    /// (`job_controller.go:620`).
+    #[test]
+    fn test_requeue_delay_floor_is_sync_job_batch_period() {
+        assert_eq!(
+            requeue_delay_for(Duration::from_millis(10)),
+            SYNC_JOB_BATCH_PERIOD
+        );
+        assert_eq!(
+            requeue_delay_for(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
     }
 }
