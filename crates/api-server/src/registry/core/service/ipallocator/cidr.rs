@@ -17,7 +17,10 @@ use rusternetes_common::resources::{Service, ServiceCIDR};
 use rusternetes_storage::Storage;
 use tokio::sync::Mutex;
 
-use super::{family_of, list_managed, prefix_contains_ip, Allocator, IpError, IpResult};
+use super::{
+    family_of, list_managed, prefix_contains_ip, Allocator, IpAddressClient, IpError, IpResult,
+    LoopbackSlot,
+};
 
 /// `item` (cidrallocator.go:80-83).
 struct Item<S: Storage> {
@@ -33,6 +36,7 @@ pub struct MetaAllocator<S: Storage> {
     storage: Arc<S>,
     allocators: Mutex<HashMap<String, Item<S>>>,
     ip_family: &'static str,
+    loopback: LoopbackSlot,
 }
 
 /// `isReady` (cidrallocator.go:520-533): the Ready condition, true when
@@ -53,7 +57,13 @@ impl<S: Storage> MetaAllocator<S> {
             storage,
             allocators: Mutex::new(HashMap::new()),
             ip_family: if is_ipv6 { "IPv6" } else { "IPv4" },
+            loopback: LoopbackSlot::default(),
         }
+    }
+
+    /// Install the client the allocators write IPAddresses through.
+    pub fn set_loopback(&self, client: Arc<dyn IpAddressClient>) {
+        let _ = self.loopback.set(client);
     }
 
     /// `syncAllocators` (cidrallocator.go:240-297) plus the removal half of
@@ -91,7 +101,7 @@ impl<S: Storage> MetaAllocator<S> {
                 }
 
                 let allocator = match Allocator::new(prefix, self.storage.clone()) {
-                    Ok(a) => a,
+                    Ok(a) => a.with_loopback(self.loopback.clone()),
                     Err(e) => {
                         tracing::info!(
                             "error creating new IPAllocator for Service CIDR {cidr}: {e}"

@@ -1,7 +1,8 @@
 //! Generic Store endpoints for IPAddress; list/watch retain their existing implementation.
 //! Port of pkg/registry/networking/ipaddress/storage/storage.go and apiserver endpoints/handlers.
 //! The service IP allocator (`registry::core::service::ipallocator`) writes
-//! IPAddress objects straight to storage, as upstream's does.
+//! IPAddress objects through `registry::networking::ipaddress::Loopback`,
+//! the Store plus admission, as upstream's loopback client does.
 use crate::endpoints::handlers::{self as endpoints, RequestScope};
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{

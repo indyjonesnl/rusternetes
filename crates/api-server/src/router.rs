@@ -838,6 +838,9 @@ async fn custom_resource_fallback(
 }
 
 pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> Router {
+    // Every Service write allocates through the router's own handlers, so
+    // the allocators' loopback is installed where the finished state lands.
+    state.install_ip_address_loopback();
     let skip_auth = state.skip_auth;
 
     // Routes that don't require authentication

@@ -4,9 +4,12 @@
 //! named after it; the create's uniqueness is the allocation lock.
 //!
 //! Upstream reads IPAddresses through an informer's lister and writes them
-//! through a loopback client. Rusternetes runs in-process, so both go to
-//! storage directly — the same objects under the same keys, with the
-//! lister's view replaced by a fresh read.
+//! through a loopback client (ipallocator.go:155, :382). Reads here go to
+//! storage directly, the lister's view replaced by a fresh read. Writes go
+//! through an [`IpAddressClient`] once the api-server has installed its
+//! loopback (`registry::networking::ipaddress::Loopback`), so strategy,
+//! validation and admission run as for any request; before that (unit tests
+//! of the allocator alone) they go straight to storage.
 
 pub mod cidr;
 pub mod repair;
@@ -15,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ipnet::IpNet;
 use rand::Rng;
@@ -60,6 +63,18 @@ impl fmt::Display for IpError {
         }
     }
 }
+
+/// The slice of `networkingv1client.IPAddressInterface` the allocator uses
+/// (`Create`, `Delete`; ipallocator.go:155, :382).
+#[async_trait::async_trait]
+pub trait IpAddressClient: Send + Sync {
+    async fn create(&self, ip: IPAddress) -> rusternetes_common::Result<()>;
+    async fn delete(&self, name: &str) -> rusternetes_common::Result<()>;
+}
+
+/// Where the api-server installs its loopback client after construction
+/// (the state holds the allocators, the client holds the state).
+pub type LoopbackSlot = Arc<OnceLock<Arc<dyn IpAddressClient>>>;
 
 pub type IpResult<T> = std::result::Result<T, IpError>;
 
@@ -219,6 +234,7 @@ pub struct Allocator<S: Storage> {
     family: &'static str,
     range_offset: u64,
     size: u64,
+    loopback: LoopbackSlot,
     /// Whether this allocator may hand out new addresses; it depends on
     /// its ServiceCIDR being ready.
     pub(crate) ready: AtomicBool,
@@ -255,8 +271,15 @@ impl<S: Storage> Allocator<S> {
             family,
             range_offset,
             size,
+            loopback: LoopbackSlot::default(),
             ready: AtomicBool::new(true),
         })
+    }
+
+    /// Write through `slot`'s client once one is installed.
+    pub(crate) fn with_loopback(mut self, slot: LoopbackSlot) -> Self {
+        self.loopback = slot;
+        self
     }
 
     pub fn ip_family(&self) -> &'static str {
@@ -270,8 +293,16 @@ impl<S: Storage> Allocator<S> {
     /// `createIPAddress` (ipallocator.go:147-176).
     async fn create_ip_address(&self, name: &str, svc: Option<&Service>) -> IpResult<()> {
         let ip = new_ip_address(name, svc);
-        match self.storage.create(&ip_address_key(name), &ip).await {
-            Ok(_) => Ok(()),
+        let created = match self.loopback.get() {
+            Some(client) => client.create(ip).await,
+            None => self
+                .storage
+                .create(&ip_address_key(name), &ip)
+                .await
+                .map(|_| ()),
+        };
+        match created {
+            Ok(()) => Ok(()),
             Err(Error::AlreadyExists(_)) => Err(IpError::Allocated),
             Err(e) => Err(IpError::Other(e)),
         }
@@ -376,7 +407,11 @@ impl<S: Storage> Allocator<S> {
             return Ok(());
         }
         let name = ip.to_string();
-        if let Err(e) = self.storage.delete(&ip_address_key(&name)).await {
+        let deleted = match self.loopback.get() {
+            Some(client) => client.delete(&name).await,
+            None => self.storage.delete(&ip_address_key(&name)).await,
+        };
+        if let Err(e) = deleted {
             tracing::info!("error releasing ip {name} : {e}");
         }
         Ok(())

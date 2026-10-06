@@ -631,6 +631,14 @@ impl<S: Storage> ClusterIpAllocators<S> {
         self.by_family[0].0.clone()
     }
 
+    /// Install the loopback client every family's allocators write
+    /// IPAddresses through.
+    pub fn set_loopback(&self, client: Arc<dyn super::ipallocator::IpAddressClient>) {
+        for (_, a) in &self.by_family {
+            a.set_loopback(client.clone());
+        }
+    }
+
     /// The configured families, primary first.
     pub fn families(&self) -> Vec<IPFamily> {
         self.by_family.iter().map(|(f, _)| f.clone()).collect()

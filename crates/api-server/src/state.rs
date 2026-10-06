@@ -139,6 +139,15 @@ impl ApiServerState {
         self
     }
 
+    /// Give the ClusterIP allocators their loopback IPAddress client
+    /// (storage_core.go:358, :430). Needs the finished `Arc` because the
+    /// client reads the state back; it holds only a `Weak`.
+    pub fn install_ip_address_loopback(self: &Arc<Self>) {
+        self.cluster_ip_allocators.set_loopback(Arc::new(
+            crate::registry::networking::ipaddress::Loopback::new(self),
+        ));
+    }
+
     /// Set the CA certificate PEM for distribution to service accounts
     pub fn with_ca_cert(mut self, ca_cert_pem: Option<String>) -> Self {
         self.ca_cert_pem = ca_cert_pem;
