@@ -6,8 +6,10 @@
 //! (`Validate`, :69-100), both built on `IsAuthorizedForSignerName`
 //! (`pkg/certauthorization/certauthorization.go:31-90`).
 //!
-//! Not ported: `certificates/ctbattest` (no ClusterTrustBundle resource here)
-//! and `certificates/subjectrestriction` (needs the parsed PKCS#10 subject).
+//! `certificates/subjectrestriction` (`Validate`, :64-93) is
+//! [`subject_restriction_error`].
+//!
+//! Not ported: `certificates/ctbattest` (no ClusterTrustBundle resource here).
 
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Decision, RequestAttributes};
@@ -100,4 +102,130 @@ pub async fn validate_update(
         _ => {}
     }
     None
+}
+
+/// `certificatesv1beta1.KubeAPIServerClientSignerName`
+/// (staging/src/k8s.io/api/certificates/v1beta1/types.go:150).
+const KUBE_APISERVER_CLIENT_SIGNER_NAME: &str = "kubernetes.io/kube-apiserver-client";
+
+/// `certificatesapi.ParseCSR` (pkg/apis/certificates/helpers.go:31-41) over
+/// `spec.request`, whose JSON form is the base64 of the PEM. Returns the
+/// organizations of the subject, or the error text.
+fn parse_csr_organizations(request: &str) -> Result<Vec<String>, String> {
+    use base64::Engine;
+    use x509_parser::prelude::FromDer;
+    const NOT_CSR: &str = "PEM block type must be CERTIFICATE REQUEST";
+    let pem_bytes = base64::engine::general_purpose::STANDARD
+        .decode(request)
+        .map_err(|_| NOT_CSR.to_string())?;
+    let block = pem::parse(&pem_bytes).map_err(|_| NOT_CSR.to_string())?;
+    if block.tag() != "CERTIFICATE REQUEST" {
+        return Err(NOT_CSR.to_string());
+    }
+    let (_, csr) =
+        x509_parser::certification_request::X509CertificationRequest::from_der(block.contents())
+            .map_err(|e| e.to_string())?;
+    Ok(csr
+        .certification_request_info
+        .subject
+        .iter_organization()
+        .filter_map(|o| o.as_str().ok().map(str::to_string))
+        .collect())
+}
+
+/// `subjectrestriction.Plugin.Validate` (subjectrestriction/admission.go:64-93).
+/// Registered for CREATE only (:55, `admission.NewHandler(admission.Create)`);
+/// the caller has already matched `certificatesigningrequests` with no
+/// subresource (:65-67). A CSR for the `kube-apiserver-client` signer may not
+/// request the `system:masters` organization.
+///
+/// Returns the error text to wrap in `admission.NewForbidden`.
+pub fn subject_restriction_error(csr: &CertificateSigningRequest) -> Option<String> {
+    if csr.spec.signer_name != KUBE_APISERVER_CLIENT_SIGNER_NAME {
+        return None;
+    }
+    let organizations = match parse_csr_organizations(&csr.spec.request) {
+        Ok(o) => o,
+        Err(e) => return Some(format!("failed to parse CSR: {e}")),
+    };
+    if organizations.iter().any(|g| g == "system:masters") {
+        return Some(format!(
+            "use of {KUBE_APISERVER_CLIENT_SIGNER_NAME} signer with system:masters group is not allowed"
+        ));
+    }
+    None
+}
+
+#[cfg(test)]
+mod subject_restriction_tests {
+    //! Cases of subjectrestriction/admission_test.go `TestPlugin_Validate`
+    //! (:34-110). "ignored resource", "ignored subresource" and "wrong type"
+    //! are the caller's resource match and Rust's typing.
+    use super::*;
+    use base64::Engine;
+
+    /// `pemWithGroup` (admission_test.go:166-191), base64'd as `spec.request`.
+    fn request_with_group(group: &str) -> String {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, group);
+        let pem = params.serialize_request(&key).unwrap().pem().unwrap();
+        base64::engine::general_purpose::STANDARD.encode(pem)
+    }
+
+    fn csr(request: String, signer: &str) -> CertificateSigningRequest {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": "x"},
+            "spec": {"request": request, "signerName": signer, "usages": []}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn some_other_signer() {
+        let c = csr(
+            request_with_group("system:masters"),
+            "kubernetes.io/kube-apiserver-client-kubelet",
+        );
+        assert_eq!(subject_restriction_error(&c), None);
+    }
+
+    #[test]
+    fn invalid_request() {
+        let c = csr(
+            base64::engine::general_purpose::STANDARD.encode("this is not a CSR"),
+            KUBE_APISERVER_CLIENT_SIGNER_NAME,
+        );
+        assert_eq!(
+            subject_restriction_error(&c).as_deref(),
+            Some("failed to parse CSR: PEM block type must be CERTIFICATE REQUEST")
+        );
+    }
+
+    #[test]
+    fn some_other_group() {
+        let c = csr(
+            request_with_group("system:admin"),
+            KUBE_APISERVER_CLIENT_SIGNER_NAME,
+        );
+        assert_eq!(subject_restriction_error(&c), None);
+    }
+
+    #[test]
+    fn request_for_system_masters() {
+        let c = csr(
+            request_with_group("system:masters"),
+            KUBE_APISERVER_CLIENT_SIGNER_NAME,
+        );
+        assert_eq!(
+            subject_restriction_error(&c).as_deref(),
+            Some(
+                "use of kubernetes.io/kube-apiserver-client signer with system:masters group is not allowed"
+            )
+        );
+    }
 }
