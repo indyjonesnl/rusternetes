@@ -202,6 +202,10 @@ COPY crates/api-server/proto    crates/api-server/proto
 # time, so the proto must be present from Pass-1.
 COPY crates/cri/build.rs        crates/cri/build.rs
 COPY crates/cri/proto           crates/cri/proto
+# kubelet/build.rs runs tonic-build over the CSI v1 proto (#2313); without both
+# in Pass-1 the generated `proto` module is empty and kubelet fails to compile.
+COPY crates/kubelet/build.rs     crates/kubelet/build.rs
+COPY crates/kubelet/proto        crates/kubelet/proto
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate. Lib vs
 # bin choice MUST match each Cargo.toml's [lib] + [[bin]] entries.
