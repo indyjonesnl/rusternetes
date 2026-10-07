@@ -3724,11 +3724,11 @@ pub fn validate_active_deadline_seconds_update(
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if let Some(new_deadline) = new {
-        if !(1..=i32::MAX as i64).contains(&new_deadline) {
+        if !(0..=i32::MAX as i64).contains(&new_deadline) {
             errs.push(Error::invalid(
                 path,
                 new_deadline,
-                "must be in the range [1, 2147483647]",
+                "must be between 0 and 2147483647, inclusive",
             ));
             return errs;
         }
@@ -3918,6 +3918,82 @@ pub fn validate_node_affinity_mutation(
     errs
 }
 
+/// `updatablePodSpecFields` (validation.go:5683-5689, release-1.35).
+const UPDATABLE_POD_SPEC_FIELDS: [&str; 5] = [
+    "`spec.containers[*].image`",
+    "`spec.initContainers[*].image`",
+    "`spec.activeDeadlineSeconds`",
+    "`spec.tolerations` (only additions to existing tolerations)",
+    "`spec.terminationGracePeriodSeconds` (allow it to be set to 1 if it was previously negative)",
+];
+
+/// `ValidateContainerUpdates` (validation.go:5579-5598). Returns the errors
+/// and whether validation must stop.
+pub fn validate_container_updates(
+    new: &[Container],
+    old: &[Container],
+    path: &Path,
+) -> (ErrorList, bool) {
+    let mut errs: ErrorList = Vec::new();
+    if new.len() != old.len() {
+        errs.push(Error::forbidden(
+            path,
+            "pod updates may not add or remove containers",
+        ));
+        return (errs, true);
+    }
+    for (i, c) in new.iter().enumerate() {
+        if c.image.is_empty() {
+            errs.push(Error::required(&path.index(i).child("image"), ""));
+        }
+        if c.image.trim().len() != c.image.len() {
+            errs.push(Error::invalid(
+                &path.index(i).child("image"),
+                c.image.clone(),
+                "must not have leading or trailing whitespace",
+            ));
+        }
+    }
+    (errs, false)
+}
+
+/// Stand-in for upstream's `diff.Diff(old, munged)` (a `cmp.Diff` rendering
+/// that Rust cannot reproduce byte for byte): one `path: -old +new` line per
+/// differing leaf.
+fn json_spec_diff(old: &serde_json::Value, new: &serde_json::Value) -> String {
+    fn walk(path: &str, a: &serde_json::Value, b: &serde_json::Value, out: &mut Vec<String>) {
+        use serde_json::Value;
+        match (a, b) {
+            (Value::Object(x), Value::Object(y)) => {
+                let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
+                keys.sort();
+                keys.dedup();
+                for k in keys {
+                    let p = format!("{path}.{k}");
+                    match (x.get(k), y.get(k)) {
+                        (Some(l), Some(r)) => walk(&p, l, r, out),
+                        (l, r) => out.push(format!(
+                            "{p}: -{} +{}",
+                            l.map_or("<absent>".to_string(), |v| v.to_string()),
+                            r.map_or("<absent>".to_string(), |v| v.to_string())
+                        )),
+                    }
+                }
+            }
+            (Value::Array(x), Value::Array(y)) if x.len() == y.len() => {
+                for (i, (l, r)) in x.iter().zip(y).enumerate() {
+                    walk(&format!("{path}[{i}]"), l, r, out);
+                }
+            }
+            _ if a != b => out.push(format!("{path}: -{a} +{b}")),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk("spec", old, new, &mut out);
+    out.join("\n")
+}
+
 /// Top-level immutability fence. Composes the four pre-checks above plus a
 /// munge+DeepEqual fence that catches any other forbidden field changes.
 /// Mirrors `ValidatePodUpdate` (validation.go:5695-5838).
@@ -3935,12 +4011,22 @@ pub fn validate_pod_spec_update(
     let spec = Path::new("spec");
     let mut all_errs: ErrorList = Vec::new();
 
-    // 1. Container count immutability.
-    if old.containers.len() != new.containers.len() {
-        return vec![Error::forbidden(
-            &spec.child("containers"),
-            "pod updates may not add or remove containers",
-        )];
+    // 1. ValidateContainerUpdates for containers then initContainers
+    //    (validation.go:5707-5716); a count change stops validation.
+    let (errs, stop) =
+        validate_container_updates(&new.containers, &old.containers, &spec.child("containers"));
+    all_errs.extend(errs);
+    if stop {
+        return all_errs;
+    }
+    let (errs, stop) = validate_container_updates(
+        new.init_containers.as_deref().unwrap_or(&[]),
+        old.init_containers.as_deref().unwrap_or(&[]),
+        &spec.child("initContainers"),
+    );
+    all_errs.extend(errs);
+    if stop {
+        return all_errs;
     }
 
     // 2. Tolerations: additions only.
@@ -3971,21 +4057,22 @@ pub fn validate_pod_spec_update(
     );
     all_errs.extend(errs);
 
-    // 4. activeDeadlineSeconds: nil->positive or decrease-only.
+    // 4. activeDeadlineSeconds: nil->positive or decrease-only. Upstream
+    //    returns immediately on the range / increase errors
+    //    (validation.go:5718-5738); only positive->nil falls through.
     let errs = validate_active_deadline_seconds_update(
         old.active_deadline_seconds,
         new.active_deadline_seconds,
         &spec.child("activeDeadlineSeconds"),
     );
+    let returns_early = new.active_deadline_seconds.is_some() && !errs.is_empty();
     all_errs.extend(errs);
+    if returns_early {
+        return all_errs;
+    }
 
-    // 5. TerminationGracePeriodSeconds: immutable except negative→1.
-    let errs = validate_termination_grace_period_immutable(
-        old.termination_grace_period_seconds,
-        new.termination_grace_period_seconds,
-        &spec.child("terminationGracePeriodSeconds"),
-    );
-    all_errs.extend(errs);
+    // 5. terminationGracePeriodSeconds has no dedicated error upstream: it is
+    //    folded into the munge below (validation.go:5774-5778).
 
     // 6. Munge + DeepEqual fence. Reset every field K8s allows to mutate to
     //    the OLD value, then compare. Any remaining diff = forbidden change.
@@ -4001,7 +4088,13 @@ pub fn validate_pod_spec_update(
         }
     }
     munged.active_deadline_seconds = old.active_deadline_seconds;
-    munged.termination_grace_period_seconds = old.termination_grace_period_seconds;
+    // Relax the immutable field to allow 1 when it was previously negative
+    // (validation.go:5774-5778); any other change trips the fence below.
+    if old.termination_grace_period_seconds.is_some_and(|v| v < 0)
+        && munged.termination_grace_period_seconds == Some(1)
+    {
+        munged.termination_grace_period_seconds = old.termination_grace_period_seconds;
+    }
     munged.tolerations = old.tolerations.clone();
     munged.scheduling_gates = old.scheduling_gates.clone();
     if is_ephemeral_subresource {
@@ -4088,12 +4181,14 @@ pub fn validate_pod_spec_update(
     strip_empty_objects(&mut munged_json);
     strip_empty_objects(&mut old_json);
     if munged_json != old_json {
+        // validation.go:5830-5834: the message carries a diff of old vs munged.
         all_errs.push(Error::forbidden(
             &spec,
-            "pod updates may not change fields other than \
-             `spec.containers[*].image`, `spec.initContainers[*].image`, \
-             `spec.activeDeadlineSeconds`, `spec.terminationGracePeriodSeconds`, \
-             `spec.tolerations` (additions only), `spec.schedulingGates` (deletions only)",
+            format!(
+                "pod updates may not change fields other than {}\n{}",
+                UPDATABLE_POD_SPEC_FIELDS.join(","),
+                json_spec_diff(&old_json, &munged_json),
+            ),
         ));
     }
 
@@ -4471,17 +4566,15 @@ mod tests {
             .to_string()
             .contains("must not update from a positive integer to nil value"));
 
-        let zero_errs = validate_active_deadline_seconds_update(None, Some(0), &path);
-        assert_eq!(zero_errs.len(), 1);
-        assert!(zero_errs[0]
-            .to_string()
-            .contains("must be in the range [1, 2147483647]"));
+        // validation.go:5721: the update range is [0, MaxInt32]; a zero is
+        // refused by the create-time rule in validatePodMetadataAndSpec.
+        assert!(validate_active_deadline_seconds_update(None, Some(0), &path).is_empty());
 
         let negative_errs = validate_active_deadline_seconds_update(None, Some(-1), &path);
         assert_eq!(negative_errs.len(), 1);
         assert!(negative_errs[0]
             .to_string()
-            .contains("must be in the range [1, 2147483647]"));
+            .contains("must be between 0 and 2147483647, inclusive"));
     }
 
     fn dns_cfg(searches: &[&str]) -> PodDNSConfig {
