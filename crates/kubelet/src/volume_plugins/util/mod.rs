@@ -4,8 +4,10 @@
 //! Only the helpers with a consumer in the volume-manager caches are ported;
 //! `pkg/volume/util/util.go` is ~900 lines of which this is a small slice.
 
+pub mod node_expander;
 pub mod operation_executor;
 pub mod operation_generator;
+pub mod resize_util;
 pub mod selinux;
 pub mod types;
 pub mod volumepathhandler;
