@@ -171,6 +171,11 @@ pub struct DeviceSubRequest {
 pub enum DeviceAllocationMode {
     ExactCount,
     All,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2497).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -229,6 +234,11 @@ pub struct DeviceToleration {
 pub enum TolerationOperator {
     Equal,
     Exists,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2497).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// `CapacityRequirements` (`staging/src/k8s.io/api/resource/v1/types.go:1110`):
@@ -437,6 +447,11 @@ pub enum AllocationConfigSource {
     FromClass,
     /// FromClaim indicates configuration comes from ResourceClaim
     FromClaim,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2497).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -867,6 +882,11 @@ pub enum DeviceTaintEffect {
     None,
     NoSchedule,
     NoExecute,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2497).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
