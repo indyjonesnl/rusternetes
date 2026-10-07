@@ -25,6 +25,7 @@ service Node {
   rpc NodeUnpublishVolume (NodeUnpublishVolumeRequest) returns (NodeUnpublishVolumeResponse) {}
   rpc NodeGetCapabilities (NodeGetCapabilitiesRequest) returns (NodeGetCapabilitiesResponse) {}
   rpc NodeExpandVolume (NodeExpandVolumeRequest) returns (NodeExpandVolumeResponse) {}
+  rpc NodeGetInfo (NodeGetInfoRequest) returns (NodeGetInfoResponse) {}
 }
 
 message VolumeCapability {
@@ -103,6 +104,18 @@ message NodeUnpublishVolumeRequest {
 }
 
 message NodeUnpublishVolumeResponse {}
+
+message NodeGetInfoRequest {}
+
+message NodeGetInfoResponse {
+  string node_id = 1;
+  int64 max_volumes_per_node = 2;
+  Topology accessible_topology = 3;
+}
+
+message Topology {
+  map<string, string> segments = 1;
+}
 
 message NodeGetCapabilitiesRequest {}
 
