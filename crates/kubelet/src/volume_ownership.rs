@@ -35,6 +35,24 @@ pub fn set_volume_ownership(dir: &Path, fs_group: Option<i64>, read_only: bool) 
     })
 }
 
+/// The `setPerms` closure the configMap, secret, downwardAPI and projected
+/// plugins each build around `writer.Write(payload, setPerms)`
+/// (`configmap.go:246-252`, `secret.go:242-248`, `downwardapi.go:217-223`,
+/// `projected.go:200-214`): "change the permissions on the whole volume and not
+/// only in the timestamp directory", then write through the AtomicWriter.
+/// All four volumes report `ReadOnly: true` (`GetAttributes`), so `read_only`
+/// is `true` for each caller.
+pub fn write_payload_with_ownership(
+    dir: &Path,
+    payload: &std::collections::BTreeMap<String, crate::atomic_writer::FileProjection>,
+    fs_group: Option<i64>,
+    read_only: bool,
+) -> io::Result<()> {
+    let set_perms =
+        move |dir: &Path| -> io::Result<()> { set_volume_ownership(dir, fs_group, read_only) };
+    crate::atomic_writer::write_projected_payload_with(dir, payload, Some(&set_perms))
+}
+
 /// `changeFilePermission` (`volume_linux.go:147-181`): `Lchown(-1, fsGroup)`,
 /// skip `chmod` for a symlink, else `chmod(mode | mask)` where the mask is
 /// `roMask` for a read-only volume else `rwMask`, plus `setgid|execMask` on a

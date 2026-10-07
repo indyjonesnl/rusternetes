@@ -793,13 +793,13 @@ async fn orphaned_pod_csi_volume_is_unpublished() {
 
     // Live pod: untouched.
     let live: std::collections::HashSet<String> = ["uid-1".to_string()].into();
-    vm.unmount_csi_volumes(&live, &std::collections::HashSet::new())
+    vm.unmount_orphaned_volumes(&live, &std::collections::HashSet::new())
         .await;
     assert!(f.fake.calls.lock().unwrap().unpublish.is_empty());
     assert!(mount.is_dir());
 
     // Orphaned pod: NodeUnpublishVolume with the saved handle + mount path.
-    vm.unmount_csi_volumes(
+    vm.unmount_orphaned_volumes(
         &std::collections::HashSet::new(),
         &std::collections::HashSet::new(),
     )
@@ -840,7 +840,10 @@ async fn construct_volume_spec_rebuilds_a_persistent_spec() {
         .unwrap()
         .to_path_buf();
 
-    let rec = f.plugin.construct_volume_spec(&volume_dir).unwrap();
+    let rec = f
+        .plugin
+        .construct_volume_spec("pv1", volume_dir.to_str().unwrap())
+        .unwrap();
     let rebuilt = rec.persistent_volume.expect("a PV spec");
     let csi = rebuilt.spec.csi.as_ref().expect("a CSI source");
     assert_eq!(csi.driver, f.driver);
@@ -863,7 +866,10 @@ async fn construct_volume_spec_rebuilds_an_inline_spec() {
         ("volumeLifecycleMode".to_string(), "Ephemeral".to_string()),
     ]);
     save_volume_data(&dir, &data).unwrap();
-    let rec = f.plugin.construct_volume_spec(&dir).unwrap();
+    let rec = f
+        .plugin
+        .construct_volume_spec("vol", dir.to_str().unwrap())
+        .unwrap();
     assert!(rec.persistent_volume.is_none());
     assert_eq!(rec.volume.name, "inl");
     assert_eq!(rec.volume.csi.as_ref().unwrap().driver, f.driver);
@@ -872,10 +878,7 @@ async fn construct_volume_spec_rebuilds_an_inline_spec() {
 #[tokio::test]
 async fn construct_volume_spec_fails_without_a_data_file() {
     let f = fx("construct-none", &[], None).await;
-    assert!(f
-        .plugin
-        .construct_volume_spec(std::path::Path::new(&f.root))
-        .is_err());
+    assert!(f.plugin.construct_volume_spec("x", &f.root).is_err());
 }
 
 /// Lay out a staged device (`<g>/globalmount` + `<g>/vol_data.json`) by hand.
@@ -998,7 +1001,7 @@ async fn staged_device_is_unstaged_only_after_the_last_pod_unpublishes() {
     // Pod 2 is live, pod 1 gone: unpublish pod 1 only; the device stays staged.
     let none = std::collections::HashSet::new();
     let live2: std::collections::HashSet<String> = ["uid-2".to_string()].into();
-    vm.unmount_csi_volumes(&live2, &none).await;
+    vm.unmount_orphaned_volumes(&live2, &none).await;
     vm.unmount_unused_csi_devices(&[]).await;
     assert_eq!(f.fake.calls.lock().unwrap().unpublish.len(), 1);
     assert!(
@@ -1007,7 +1010,7 @@ async fn staged_device_is_unstaged_only_after_the_last_pod_unpublishes() {
     );
 
     // Both gone: unpublish pod 2, then unstage exactly once.
-    vm.unmount_csi_volumes(&none, &none).await;
+    vm.unmount_orphaned_volumes(&none, &none).await;
     vm.unmount_unused_csi_devices(&[]).await;
     let calls = f.fake.calls.lock().unwrap();
     assert_eq!(calls.unpublish.len(), 2);
@@ -1062,9 +1065,9 @@ async fn terminated_live_pod_csi_volume_is_unpublished() {
     m.set_up().await.unwrap();
     let vm = volume_manager(&f.root);
     let live: std::collections::HashSet<String> = ["uid-1".to_string()].into();
-    vm.unmount_csi_volumes(&live, &std::collections::HashSet::new())
+    vm.unmount_orphaned_volumes(&live, &std::collections::HashSet::new())
         .await;
     assert!(f.fake.calls.lock().unwrap().unpublish.is_empty());
-    vm.unmount_csi_volumes(&live, &live).await;
+    vm.unmount_orphaned_volumes(&live, &live).await;
     assert_eq!(f.fake.calls.lock().unwrap().unpublish.len(), 1);
 }
