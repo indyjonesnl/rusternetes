@@ -390,6 +390,8 @@ fn static_resource_info(rt: &str) -> Option<(&'static str, bool)> {
         "clusterroles" | "clusterrolebindings" => ("/apis/rbac.authorization.k8s.io/v1", false),
         // certificates.k8s.io/v1 — cluster-scoped
         "certificatesigningrequests" => ("/apis/certificates.k8s.io/v1", false),
+        // certificates.k8s.io/v1beta1 — cluster-scoped
+        "clustertrustbundles" => ("/apis/certificates.k8s.io/v1beta1", false),
         // apiextensions.k8s.io/v1 — cluster-scoped
         "customresourcedefinitions" => ("/apis/apiextensions.k8s.io/v1", false),
         // apiregistration.k8s.io/v1 — cluster-scoped
