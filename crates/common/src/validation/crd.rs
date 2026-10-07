@@ -1206,7 +1206,11 @@ mod whole_object_tests {
             .iter()
             .find(|e| e.field == "spec.scope")
             .unwrap_or_else(|| panic!("{errs:?}"));
-        assert_eq!(e.error_type, crate::validation::field::ErrorType::NotSupported, "{errs:?}");
+        assert_eq!(
+            e.error_type,
+            crate::validation::field::ErrorType::NotSupported,
+            "{errs:?}"
+        );
         assert!(
             e.to_string()
                 .contains("supported values: \"Cluster\", \"Namespaced\""),
@@ -1229,9 +1233,14 @@ mod whole_object_tests {
             .iter()
             .find(|e| e.field == "spec.conversion.strategy")
             .unwrap_or_else(|| panic!("{errs:?}"));
-        assert_eq!(e.error_type, crate::validation::field::ErrorType::NotSupported, "{errs:?}");
+        assert_eq!(
+            e.error_type,
+            crate::validation::field::ErrorType::NotSupported,
+            "{errs:?}"
+        );
         assert!(
-            e.to_string().contains("supported values: \"None\", \"Webhook\""),
+            e.to_string()
+                .contains("supported values: \"None\", \"Webhook\""),
             "{e}"
         );
     }

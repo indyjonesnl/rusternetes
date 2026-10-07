@@ -698,6 +698,11 @@ pub enum DeletionPolicy {
     Unspecified,
     Delete,
     Retain,
+    /// A value outside the CRD's `enum: [Delete, Retain]`. The apiserver
+    /// answers an enum violation `Unsupported value` (422) via
+    /// `kubeOpenAPIResultToFieldErrors`, not a 400 decode failure (#2498).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// VolumeSnapshotContent represents the actual snapshot data

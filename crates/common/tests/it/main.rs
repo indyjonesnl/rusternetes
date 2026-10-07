@@ -84,6 +84,7 @@ mod validation_storageclass_update;
 mod validation_vac_update;
 mod validation_volumeattachment;
 mod validation_volumeattributesclass;
+mod validation_volumesnapshot_deletion_policy;
 mod validation_webhookconfiguration;
 mod wire_field_shape_guard;
 
