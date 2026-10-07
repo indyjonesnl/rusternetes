@@ -126,10 +126,12 @@ fn insert_before_node_serviceaccounts_rule(
 ///   ClusterRole (`policy.go:663-672`) and its binding to
 ///   `system:serviceaccounts` (`policy.go:713-715`)
 ///
+/// * `ControllerRoles()` (`controller_policy.go`), see
+///   [`apply_feature_gated_controller_roles`]
+///
 /// Gates the vendored default output already covers (`DynamicResourceAllocation`,
 /// `MultiCIDRServiceAllocator`, `KubeletFineGrainedAuthz`) are GA/on in v1.35
-/// and so need no branch here. Controller-role gates (`controller_policy.go`)
-/// are not applied; see the tracking issue.
+/// and so need no branch here.
 fn apply_feature_gated_policy(items: &mut Vec<serde_json::Value>) {
     use rusternetes_common::feature_gates::{enabled, Feature};
     const READ: [&str; 3] = ["get", "list", "watch"];
@@ -208,6 +210,180 @@ fn apply_feature_gated_policy(items: &mut Vec<serde_json::Value>) {
         items.push(role);
         items.push(binding);
     }
+
+    apply_feature_gated_controller_roles(items);
+}
+
+/// `eventsRule()` (`controller_policy.go:55-57`).
+fn events_rule() -> serde_json::Value {
+    rule(
+        &["", "events.k8s.io"],
+        &["events"],
+        &["create", "patch", "update"],
+    )
+}
+
+/// `addControllerRole` (`controller_policy.go:36-52`): the
+/// `system:controller:<name>` ClusterRole plus its ClusterRoleBinding to the
+/// `kube-system/<name>` ServiceAccount, both with the bootstrapping label and
+/// autoupdate annotation (`addClusterRoleLabel` / `addClusterRoleBindingLabel`).
+fn add_controller_role(
+    items: &mut Vec<serde_json::Value>,
+    short: &str,
+    rules: Vec<serde_json::Value>,
+) {
+    let name = format!("system:controller:{short}");
+    // upstream `klog.Fatalf("role %q was already registered")`
+    assert!(
+        !items
+            .iter()
+            .any(|i| i["kind"] == "ClusterRole" && i["metadata"]["name"] == name.as_str()),
+        "role {name:?} was already registered"
+    );
+    let meta = serde_json::json!({
+        "name": name,
+        "labels": {"kubernetes.io/bootstrapping": "rbac-defaults"},
+        "annotations": {"rbac.authorization.kubernetes.io/autoupdate": "true"},
+    });
+    items.push(serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": meta,
+        "rules": rules,
+    }));
+    items.push(serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": meta,
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": name,
+        },
+        "subjects": [{"kind": "ServiceAccount", "name": short, "namespace": "kube-system"}],
+    }));
+}
+
+/// The `if utilfeature.DefaultFeatureGate.Enabled(...)` branches of
+/// `buildControllerRoles` (`controller_policy.go`) whose gate is off in v1.35,
+/// so the vendored `controller-roles.yaml` (default gates) lacks them:
+/// `DRADeviceTaints` (+ `DRADeviceTaintRules`) under `DynamicResourceAllocation`
+/// (`:206-231`), `PodCertificateRequest` (`:440-446`), `ClusterTrustBundle`
+/// (`:490-498`), `StorageVersionAPI` && `APIServerIdentity` (`:512-523`),
+/// `StorageVersionMigrator` (`:534-546`). The on-by-default branches
+/// (`DynamicResourceAllocation`, `MultiCIDRServiceAllocator`,
+/// `VolumeAttributesClass`, `SELinuxChangePolicy`) are in the YAML already.
+fn apply_feature_gated_controller_roles(items: &mut Vec<serde_json::Value>) {
+    use rusternetes_common::feature_gates::{enabled, Feature};
+    const READ: [&str; 3] = ["get", "list", "watch"];
+    const CERTS: [&str; 1] = ["certificates.k8s.io"];
+    const DRA: [&str; 1] = ["resource.k8s.io"];
+
+    // DynamicResourceAllocation is GA and on in v1.35 (the YAML carries
+    // resource-claim-controller), so only the nested gates need a branch.
+    if enabled(Feature::DRADeviceTaints) {
+        let mut rules = vec![
+            // Deletes pods to evict them.
+            rule(&[""], &["pods"], &["get", "list", "watch", "delete"]),
+            // Sets pod conditions.
+            rule(&[""], &["pods/status"], &["update", "patch"]),
+            // The rest is read-only.
+            rule(&DRA, &["resourceclaims"], &READ),
+            rule(&DRA, &["resourceslices"], &READ),
+            rule(&DRA, &["deviceclasses"], &READ),
+            events_rule(),
+        ];
+        if enabled(Feature::DRADeviceTaintRules) {
+            // Sets DeviceTaintRule conditions.
+            rules.push(rule(
+                &DRA,
+                &["devicetaintrules/status"],
+                &["update", "patch"],
+            ));
+            // Read-only for spec.
+            rules.push(rule(&DRA, &["devicetaintrules"], &READ));
+        }
+        add_controller_role(
+            items,
+            "device-taint-eviction-controller",
+            sorted_verbs(rules),
+        );
+    }
+    if enabled(Feature::PodCertificateRequest) {
+        add_controller_role(
+            items,
+            "podcertificaterequestcleaner",
+            vec![rule(
+                &CERTS,
+                &["podcertificaterequests"],
+                &["delete", "get", "list", "watch"],
+            )],
+        );
+    }
+    if enabled(Feature::ClusterTrustBundle) {
+        let mut attest = rule(&CERTS, &["signers"], &["attest"]);
+        attest["resourceNames"] = serde_json::json!(["kubernetes.io/kube-apiserver-serving"]);
+        add_controller_role(
+            items,
+            "kube-apiserver-serving-clustertrustbundle-publisher",
+            vec![
+                attest,
+                rule(
+                    &CERTS,
+                    &["clustertrustbundles"],
+                    &["create", "delete", "list", "update", "watch"],
+                ),
+                events_rule(),
+            ],
+        );
+    }
+    if enabled(Feature::StorageVersionAPI) && enabled(Feature::APIServerIdentity) {
+        add_controller_role(
+            items,
+            "storage-version-garbage-collector",
+            vec![
+                rule(&["coordination.k8s.io"], &["leases"], &READ),
+                rule(
+                    &["internal.apiserver.k8s.io"],
+                    &["storageversions"],
+                    &["delete", "get", "list", "patch", "update", "watch"],
+                ),
+                rule(
+                    &["internal.apiserver.k8s.io"],
+                    &["storageversions/status"],
+                    &["get", "patch", "update"],
+                ),
+            ],
+        );
+    }
+    if enabled(Feature::StorageVersionMigrator) {
+        add_controller_role(
+            items,
+            "storage-version-migrator-controller",
+            vec![
+                // need list to get current RV for any resource
+                // need patch for SSA of any resource
+                // need create because SSA of a deleted resource will be
+                // interpreted as a create request (always a conflict: UID set)
+                rule(&["*"], &["*"], &["create", "list", "patch"]),
+                rule(
+                    &["storagemigration.k8s.io"],
+                    &["storageversionmigrations/status"],
+                    &["update"],
+                ),
+            ],
+        );
+    }
+}
+
+/// `NewRule(...).RuleOrDie()` sorts each rule's verbs.
+fn sorted_verbs(mut rules: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    for r in &mut rules {
+        if let Some(v) = r["verbs"].as_array_mut() {
+            v.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        }
+    }
+    rules
 }
 
 /// Every bootstrap policy object with the feature gates applied.
@@ -2048,6 +2224,198 @@ mod tests {
         assert!(!has());
         let _g = with_feature(Feature::ClusterTrustBundle, true);
         assert!(has());
+    }
+
+    fn find_item(kind: &str, name: &str) -> Option<serde_json::Value> {
+        bootstrap_policy_items()
+            .unwrap()
+            .into_iter()
+            .find(|i| i["kind"] == kind && i["metadata"]["name"] == name)
+    }
+
+    fn events() -> serde_json::Value {
+        // `eventsRule()` (controller_policy.go:55-57)
+        serde_json::json!({"apiGroups": ["", "events.k8s.io"], "resources": ["events"],
+            "verbs": ["create", "patch", "update"]})
+    }
+
+    /// Asserts the role exists with exactly `rules` and that its
+    /// `addControllerRole` binding (`controller_policy.go:36-52`) exists too.
+    fn assert_controller_role(short: &str, rules: Vec<serde_json::Value>) {
+        let name = format!("system:controller:{short}");
+        let role =
+            find_item("ClusterRole", &name).unwrap_or_else(|| panic!("no ClusterRole {name}"));
+        assert_eq!(role["rules"], serde_json::Value::Array(rules), "{name}");
+        assert_eq!(
+            role["metadata"]["labels"]["kubernetes.io/bootstrapping"],
+            "rbac-defaults"
+        );
+        let b = find_item("ClusterRoleBinding", &name)
+            .unwrap_or_else(|| panic!("no ClusterRoleBinding {name}"));
+        assert_eq!(b["roleRef"]["name"], name.as_str());
+        assert_eq!(b["subjects"][0]["kind"], "ServiceAccount");
+        assert_eq!(b["subjects"][0]["name"], short);
+        assert_eq!(b["subjects"][0]["namespace"], "kube-system");
+    }
+
+    fn assert_no_controller_role(short: &str) {
+        let name = format!("system:controller:{short}");
+        assert!(find_item("ClusterRole", &name).is_none(), "{name} role");
+        assert!(
+            find_item("ClusterRoleBinding", &name).is_none(),
+            "{name} binding"
+        );
+    }
+
+    /// `buildControllerRoles` (`controller_policy.go:206-231`): the DRA
+    /// device-taint-eviction role needs `DRADeviceTaints`; `DRADeviceTaintRules`
+    /// appends the DeviceTaintRule rules.
+    #[test]
+    #[serial_test::serial]
+    fn device_taint_eviction_controller_role_follows_dra_gates() {
+        use rusternetes_common::feature_gates::{with_feature, Feature};
+        const R: &str = "device-taint-eviction-controller";
+        rusternetes_common::feature_gates::reset_to_defaults();
+        assert_no_controller_role(R);
+        let _a = with_feature(Feature::DRADeviceTaints, true);
+        let mut rules = vec![
+            serde_json::json!({"apiGroups": [""], "resources": ["pods"], "verbs": ["delete", "get", "list", "watch"]}),
+            serde_json::json!({"apiGroups": [""], "resources": ["pods/status"], "verbs": ["patch", "update"]}),
+            serde_json::json!({"apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims"], "verbs": ["get", "list", "watch"]}),
+            serde_json::json!({"apiGroups": ["resource.k8s.io"], "resources": ["resourceslices"], "verbs": ["get", "list", "watch"]}),
+            serde_json::json!({"apiGroups": ["resource.k8s.io"], "resources": ["deviceclasses"], "verbs": ["get", "list", "watch"]}),
+            events(),
+        ];
+        assert_controller_role(R, rules.clone());
+        let _b = with_feature(Feature::DRADeviceTaintRules, true);
+        rules.push(serde_json::json!({"apiGroups": ["resource.k8s.io"], "resources": ["devicetaintrules/status"], "verbs": ["patch", "update"]}));
+        rules.push(serde_json::json!({"apiGroups": ["resource.k8s.io"], "resources": ["devicetaintrules"], "verbs": ["get", "list", "watch"]}));
+        assert_controller_role(R, rules);
+    }
+
+    /// `controller_policy.go:440-446` (`PodCertificateRequest`) and `:490-498`
+    /// (`ClusterTrustBundle`).
+    #[test]
+    #[serial_test::serial]
+    fn certificate_controller_roles_follow_their_gates() {
+        use rusternetes_common::feature_gates::{with_feature, Feature};
+        rusternetes_common::feature_gates::reset_to_defaults();
+        assert_no_controller_role("podcertificaterequestcleaner");
+        assert_no_controller_role("kube-apiserver-serving-clustertrustbundle-publisher");
+        let _a = with_feature(Feature::PodCertificateRequest, true);
+        assert_controller_role(
+            "podcertificaterequestcleaner",
+            vec![
+                serde_json::json!({"apiGroups": ["certificates.k8s.io"], "resources": ["podcertificaterequests"], "verbs": ["delete", "get", "list", "watch"]}),
+            ],
+        );
+        assert_no_controller_role("kube-apiserver-serving-clustertrustbundle-publisher");
+        let _b = with_feature(Feature::ClusterTrustBundle, true);
+        assert_controller_role(
+            "kube-apiserver-serving-clustertrustbundle-publisher",
+            vec![
+                serde_json::json!({"apiGroups": ["certificates.k8s.io"], "resourceNames": ["kubernetes.io/kube-apiserver-serving"], "resources": ["signers"], "verbs": ["attest"]}),
+                serde_json::json!({"apiGroups": ["certificates.k8s.io"], "resources": ["clustertrustbundles"], "verbs": ["create", "delete", "list", "update", "watch"]}),
+                events(),
+            ],
+        );
+    }
+
+    /// `controller_policy.go:512-523`: needs `StorageVersionAPI` AND
+    /// `APIServerIdentity` (on by default).
+    #[test]
+    #[serial_test::serial]
+    fn storage_version_gc_role_needs_both_gates() {
+        use rusternetes_common::feature_gates::{with_feature, Feature};
+        const R: &str = "storage-version-garbage-collector";
+        rusternetes_common::feature_gates::reset_to_defaults();
+        assert_no_controller_role(R);
+        {
+            let _a = with_feature(Feature::StorageVersionAPI, true);
+            let _b = with_feature(Feature::APIServerIdentity, false);
+            assert_no_controller_role(R);
+        }
+        let _a = with_feature(Feature::StorageVersionAPI, true);
+        assert_controller_role(
+            R,
+            vec![
+                serde_json::json!({"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get", "list", "watch"]}),
+                serde_json::json!({"apiGroups": ["internal.apiserver.k8s.io"], "resources": ["storageversions"], "verbs": ["delete", "get", "list", "patch", "update", "watch"]}),
+                serde_json::json!({"apiGroups": ["internal.apiserver.k8s.io"], "resources": ["storageversions/status"], "verbs": ["get", "patch", "update"]}),
+            ],
+        );
+    }
+
+    /// `controller_policy.go:534-546`.
+    #[test]
+    #[serial_test::serial]
+    fn storage_version_migrator_role_follows_the_gate() {
+        use rusternetes_common::feature_gates::{with_feature, Feature};
+        const R: &str = "storage-version-migrator-controller";
+        rusternetes_common::feature_gates::reset_to_defaults();
+        assert_no_controller_role(R);
+        let _a = with_feature(Feature::StorageVersionMigrator, true);
+        assert_controller_role(
+            R,
+            vec![
+                serde_json::json!({"apiGroups": ["*"], "resources": ["*"], "verbs": ["create", "list", "patch"]}),
+                serde_json::json!({"apiGroups": ["storagemigration.k8s.io"], "resources": ["storageversionmigrations/status"], "verbs": ["update"]}),
+            ],
+        );
+    }
+
+    /// Gates that are on in v1.35 (`DynamicResourceAllocation`,
+    /// `MultiCIDRServiceAllocator`, `VolumeAttributesClass`, `SELinuxChangePolicy`)
+    /// are already in the vendored `controller-roles.yaml`; switching one off
+    /// removes its role (`controller_policy.go:206,386,463,549`).
+    #[test]
+    #[serial_test::serial]
+    fn default_on_controller_roles_are_present() {
+        rusternetes_common::feature_gates::reset_to_defaults();
+        for r in [
+            "resource-claim-controller",
+            "service-cidrs-controller",
+            "volumeattributesclass-protection-controller",
+            "selinux-warning-controller",
+        ] {
+            assert!(
+                find_item("ClusterRole", &format!("system:controller:{r}")).is_some(),
+                "{r}"
+            );
+        }
+    }
+
+    /// Default-gate output equals the vendored `controller-roles.yaml` /
+    /// `controller-role-bindings.yaml` (`TestBootstrapControllerRoles`,
+    /// `policy_test.go:212-248`).
+    #[test]
+    #[serial_test::serial]
+    fn controller_roles_with_default_gates_match_upstream_testdata() {
+        rusternetes_common::feature_gates::reset_to_defaults();
+        for (kind, yaml) in [
+            (
+                "ClusterRole",
+                include_str!("bootstrap_policy/controller-roles.yaml"),
+            ),
+            (
+                "ClusterRoleBinding",
+                include_str!("bootstrap_policy/controller-role-bindings.yaml"),
+            ),
+        ] {
+            let mut got: Vec<_> = bootstrap_policy_items()
+                .unwrap()
+                .into_iter()
+                .filter(|i| {
+                    i["kind"] == kind
+                        && i["metadata"]["name"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("system:controller:")
+                })
+                .collect();
+            got.sort_by_key(|i| i["metadata"]["name"].as_str().unwrap().to_string());
+            assert_eq!(got, load_policy_items(yaml).unwrap(), "{kind}");
+        }
     }
 
     /// #1753: the whole upstream bootstrap policy is seeded, not only
