@@ -177,6 +177,26 @@ impl Admission<'_> {
         if let (Operation::Create | Operation::Update, Some(obj)) = (op, obj) {
             self.validate_ctb_attest(obj, old).await?;
         }
+        // PodSecurity `ValidateNamespace` (pod-security-admission/admission/
+        // admission.go:229-327): label validation, and the existing pods
+        // checked against a tightened enforce level.
+        if let (Operation::Create | Operation::Update, Some(obj), true) =
+            (op, obj, self.is_core("namespaces"))
+        {
+            let ns: rusternetes_common::resources::Namespace = recast(obj)?;
+            let old_ns: Option<rusternetes_common::resources::Namespace> =
+                if *op == Operation::Update {
+                    old.map(recast).transpose()?
+                } else {
+                    None
+                };
+            for w in crate::admission::PodSecurityAdmission::new()
+                .validate_namespace(&self.state.storage, &ns, old_ns.as_ref())
+                .await?
+            {
+                ctx.add_warning(w);
+            }
+        }
         if self.is_core("pods") || self.is_pod_resize() || self.is_pod_ephemeralcontainers() {
             let obj: Option<Pod> = obj.map(recast).transpose()?;
             let old: Option<Pod> = old.map(recast).transpose()?;
