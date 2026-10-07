@@ -800,179 +800,34 @@ impl VolumeManager {
                 }
             }
         }
-        // Resync projected volumes (may contain configmap/secret projections)
+        // Resync projected volumes: re-run the projected plugin's SetUp
+        // (`projected.go:136-224` `SetUpAt`: `collectData` then
+        // `AtomicWriter.Write`), never an in-place rewrite through the
+        // `..data` symlinks (#1656, #2390). An unchanged payload is a no-op, a
+        // changed one swaps `..data`, and a removed key is pruned by the
+        // writer. A source that cannot be collected leaves the volume
+        // untouched, as upstream's failed `SetUpAt` writes nothing.
         if let Some(projected) = &volume.projected {
-            if let Some(sources) = &projected.sources {
-                let volume_dir = self.pod_volume_dir(pod, volume);
-                // Track expected files so we can delete stale ones
-                let mut expected_files: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-
-                // Per-file permissions must survive a resync rewrite, matching
-                // the initial-mount path and upstream's atomic writer (which
-                // re-applies each file's mode on every update). A plain
-                // `fs::write` of a *new* key (added after pod start) would
-                // otherwise leave it at the umask default instead of the
-                // item's `mode` / the projection `defaultMode` (#1050).
-                let proj_default_mode = projected.default_mode.unwrap_or(0o644);
-                let apply_mode = |path: &str, mode: i32| {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            path,
-                            std::fs::Permissions::from_mode(mode as u32),
-                        );
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = (path, mode);
-                    }
-                };
-
-                for source in sources {
-                    if let Some(cm_proj) = &source.config_map {
-                        if let Some(cm_name) = &cm_proj.name {
-                            if let Some(cm) = fetched.config_map(cm_name) {
-                                if let Some(items) = &cm_proj.items {
-                                    // Selective projection — only mount specified keys
-                                    for item in items {
-                                        let file_path = format!("{}/{}", volume_dir, item.path);
-                                        expected_files.insert(file_path.clone());
-                                        if let Some(value) =
-                                            cm.data.as_ref().and_then(|d| d.get(&item.key))
-                                        {
-                                            if let Ok(existing) =
-                                                std::fs::read_to_string(&file_path)
-                                            {
-                                                if existing == *value {
-                                                    continue;
-                                                }
-                                            }
-                                            if let Some(parent) =
-                                                std::path::Path::new(&file_path).parent()
-                                            {
-                                                let _ = std::fs::create_dir_all(parent);
-                                            }
-                                            if std::fs::write(&file_path, value).is_ok() {
-                                                apply_mode(
-                                                    &file_path,
-                                                    item.mode.unwrap_or(proj_default_mode),
-                                                );
-                                            }
-                                        }
-                                    }
-                                } else if let Some(data) = &cm.data {
-                                    // Mount all keys
-                                    for (k, v) in data {
-                                        let file_path = format!("{}/{}", volume_dir, k);
-                                        expected_files.insert(file_path.clone());
-                                        if let Ok(existing) = std::fs::read_to_string(&file_path) {
-                                            if existing == *v {
-                                                continue;
-                                            }
-                                        }
-                                        if std::fs::write(&file_path, v).is_ok() {
-                                            apply_mode(&file_path, proj_default_mode);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(sec_proj) = &source.secret {
-                        if let Some(sec_name) = &sec_proj.name {
-                            if let Some(secret) = fetched.secret(sec_name) {
-                                if let Some(data) = &secret.data {
-                                    if let Some(items) = &sec_proj.items {
-                                        for item in items {
-                                            let file_path = format!("{}/{}", volume_dir, item.path);
-                                            expected_files.insert(file_path.clone());
-                                            if let Some(v) = data.get(&item.key) {
-                                                if let Ok(existing) = std::fs::read(&file_path) {
-                                                    if existing == *v {
-                                                        apply_mode(
-                                                            &file_path,
-                                                            item.mode.unwrap_or(proj_default_mode),
-                                                        );
-                                                        continue;
-                                                    }
-                                                }
-                                                if let Some(parent) =
-                                                    std::path::Path::new(&file_path).parent()
-                                                {
-                                                    let _ = std::fs::create_dir_all(parent);
-                                                }
-                                                if std::fs::write(&file_path, v).is_ok() {
-                                                    apply_mode(
-                                                        &file_path,
-                                                        item.mode.unwrap_or(proj_default_mode),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        for (k, v) in data {
-                                            let file_path = format!("{}/{}", volume_dir, k);
-                                            expected_files.insert(file_path.clone());
-                                            if let Ok(existing) = std::fs::read(&file_path) {
-                                                if existing == *v {
-                                                    apply_mode(&file_path, proj_default_mode);
-                                                    continue;
-                                                }
-                                            }
-                                            if std::fs::write(&file_path, v).is_ok() {
-                                                apply_mode(&file_path, proj_default_mode);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // ServiceAccountToken projection resync — preserve the token file
-                    if let Some(sa_token) = &source.service_account_token {
-                        let file_path = format!("{}/{}", volume_dir, sa_token.path);
-                        expected_files.insert(file_path);
-                    }
-                    // DownwardAPI projection resync
-                    if let Some(downward_api) = &source.downward_api {
-                        if let Some(items) = &downward_api.items {
-                            for item in items {
-                                let file_path = format!("{}/{}", volume_dir, item.path);
-                                expected_files.insert(file_path.clone());
-                                let value = if let Some(ref field_ref) = item.field_ref {
-                                    self.get_pod_field_value(pod, &field_ref.field_path)
-                                        .unwrap_or_default()
-                                } else if let Some(ref resource_ref) = item.resource_field_ref {
-                                    self.get_container_resource_value(pod, resource_ref)
-                                        .unwrap_or_default()
-                                } else {
-                                    String::new()
-                                };
-                                if let Ok(existing) = std::fs::read_to_string(&file_path) {
-                                    if existing == value {
-                                        continue;
-                                    }
-                                }
-                                let _ = std::fs::write(&file_path, &value);
-                            }
-                        }
+            let volume_dir = self.pod_volume_dir(pod, volume);
+            let dir = std::path::Path::new(&volume_dir);
+            match crate::volume_plugins::projected::resync_payload(
+                projected,
+                pod,
+                &self.node_allocatable,
+                dir,
+                |n| fetched.secret(n),
+                |n| fetched.config_map(n),
+            ) {
+                Ok(payload) => {
+                    if let Err(e) = crate::volume_plugins::projected::write_payload(
+                        dir,
+                        &payload,
+                        crate::volume_plugins::util::fs_group_from(pod),
+                    ) {
+                        warn!("projected volume {} resync: {}", volume.name, e);
                     }
                 }
-
-                // Delete stale files that are no longer in any projection source
-                if let Ok(entries) = std::fs::read_dir(&volume_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file() {
-                            let path_str = path.to_string_lossy().to_string();
-                            if !expected_files.contains(&path_str) {
-                                let _ = std::fs::remove_file(&path);
-                            }
-                        }
-                    }
-                }
+                Err(e) => warn!("projected volume {} resync: {}", volume.name, e),
             }
         }
         // Resync standalone downwardAPI volumes: re-project through the
@@ -1902,6 +1757,129 @@ mod projected_mode_tests {
             "hunter2",
         )
         .await;
+    }
+
+    /// #2390: the projected branch of `resync_volumes` must re-project through
+    /// the AtomicWriter like the initial mount (`projected.go:208-221`) --
+    /// never write through the `..data` symlinks. Unchanged => zero fs changes
+    /// (ctime of every real file and the `..data` target untouched, bound SA
+    /// token kept); a changed source swaps `..data`; a removed key is pruned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reproject_unchanged_projected_is_a_noop() {
+        use std::os::unix::fs::MetadataExt;
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-proj"},
+            "spec": {"containers": [], "volumes": [{
+                "name": "proj",
+                "projected": {"defaultMode": 420, "sources": [
+                    {"configMap": {"name": "cfg"}},
+                    {"secret": {"name": "sec", "items": [{"key": "password", "path": "pw", "mode": 256}]}},
+                    {"downwardAPI": {"items": [{"path": "podname", "fieldRef": {"fieldPath": "metadata.name"}}]}},
+                    {"serviceAccountToken": {"path": "token", "expirationSeconds": 3600}}
+                ]}
+            }]}
+        }))
+        .unwrap();
+        let tmp = std::env::temp_dir().join(format!("rn-proj-noop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let storage = Arc::new(StorageBackend::new_memory());
+        let cm = ConfigMap::new("cfg", "default").with_data(HashMap::from([
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("configmaps", Some("default"), "cfg"),
+            &cm,
+        )
+        .await
+        .unwrap();
+        let secret = Secret::new("sec", "default").with_data(HashMap::from([(
+            "password".to_string(),
+            b"hunter2".to_vec(),
+        )]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("secrets", Some("default"), "sec"),
+            &secret,
+        )
+        .await
+        .unwrap();
+        let vm = VolumeManager::new(
+            tmp.to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        vm.create_pod_volumes(&pod).await.unwrap();
+        let dir = crate::pod_dirs::get_pod_volume_dir(
+            &tmp.to_string_lossy(),
+            "uid-proj",
+            crate::pod_dirs::plugin::PROJECTED,
+            "proj",
+        );
+        let files = ["a", "b", "pw", "podname", "token"];
+        let snapshot = |dir: &std::path::Path| -> Vec<(i64, i64, u32)> {
+            files
+                .iter()
+                .map(|f| {
+                    let real = std::fs::canonicalize(dir.join(f)).unwrap();
+                    let m = std::fs::metadata(&real).unwrap();
+                    (m.ctime(), m.ctime_nsec(), m.permissions().mode() & 0o777)
+                })
+                .collect()
+        };
+        for f in files {
+            assert!(
+                std::fs::symlink_metadata(dir.join(f))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{f} must be an AtomicWriter symlink after the initial mount"
+            );
+        }
+        let before = snapshot(&dir);
+        let link_before = std::fs::read_link(dir.join("..data")).unwrap();
+        let token_before = std::fs::read(dir.join("token")).unwrap();
+        for _ in 0..3 {
+            vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        }
+        assert_eq!(
+            before,
+            snapshot(&dir),
+            "unchanged resync must not touch any file"
+        );
+        assert_eq!(link_before, std::fs::read_link(dir.join("..data")).unwrap());
+        assert_eq!(std::fs::read(dir.join("token")).unwrap(), token_before);
+        assert_eq!(
+            std::fs::metadata(dir.join("pw"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400,
+            "items[].mode is kept"
+        );
+
+        // A changed ConfigMap key swaps `..data`; the removed key `b` is
+        // pruned; the bound token and the other sources survive.
+        let cm2 = ConfigMap::new("cfg", "default")
+            .with_data(HashMap::from([("a".to_string(), "changed".to_string())]));
+        Storage::update(
+            storage.as_ref(),
+            &build_key("configmaps", Some("default"), "cfg"),
+            &cm2,
+        )
+        .await
+        .unwrap();
+        vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        assert_ne!(link_before, std::fs::read_link(dir.join("..data")).unwrap());
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "changed");
+        assert!(std::fs::symlink_metadata(dir.join("b")).is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("pw")).unwrap(), "hunter2");
+        assert_eq!(std::fs::read_to_string(dir.join("podname")).unwrap(), "p");
+        assert_eq!(std::fs::read(dir.join("token")).unwrap(), token_before);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// #1656: a service-account-token Secret volume must not have its bound

@@ -288,23 +288,27 @@ fn clean_path(p: &str) -> String {
     parts.join("/")
 }
 
+/// The mode of a token / bundle / key file (`projected.go:276-282`):
+///
+/// ```go
+/// // When FsGroup is set, we depend on SetVolumeOwnership to
+/// // change from 0600 to 0640.
+/// mode := *s.source.DefaultMode
+/// if mounterArgs.FsUser != nil || mounterArgs.FsGroup != nil {
+///     mode = 0600
+/// }
+/// ```
+fn secret_file_mode(fs_user: Option<i64>, fs_group: Option<i64>, default_mode: u32) -> u32 {
+    if fs_user.is_some() || fs_group.is_some() {
+        0o600
+    } else {
+        default_mode
+    }
+}
+
 impl ProjectedMounter {
-    /// The mode of a token / bundle / key file (`projected.go:276-282`):
-    ///
-    /// ```go
-    /// // When FsGroup is set, we depend on SetVolumeOwnership to
-    /// // change from 0600 to 0640.
-    /// mode := *s.source.DefaultMode
-    /// if mounterArgs.FsUser != nil || mounterArgs.FsGroup != nil {
-    ///     mode = 0600
-    /// }
-    /// ```
     fn secret_file_mode(&self, default_mode: u32) -> u32 {
-        if self.fs_user.is_some() || self.fs_group.is_some() {
-            0o600
-        } else {
-            default_mode
-        }
+        secret_file_mode(self.fs_user, self.fs_group, default_mode)
     }
 
     /// `collectData` (`projected.go:226-338`): build ONE payload from every
@@ -596,20 +600,7 @@ impl Mounter for ProjectedMounter {
             );
         })?;
 
-        // `setPerms` (`projected.go:200-206`): "This may be the first time
-        // writing and new files get created outside the timestamp
-        // subdirectory: change the permissions on the whole volume and not
-        // only in the timestamp directory."
-        let fs_group = self.fs_group;
-        let set_perms = move |dir: &std::path::Path| -> std::io::Result<()> {
-            crate::volume_ownership::set_volume_ownership(dir, fs_group, true)
-        };
-        crate::atomic_writer::write_projected_payload_with(
-            std::path::Path::new(volume_dir),
-            &payload,
-            Some(&set_perms),
-        )
-        .map_err(|e| {
+        write_payload(std::path::Path::new(volume_dir), &payload, self.fs_group).map_err(|e| {
             tracing::error!("Error writing payload to dir: {}", e);
             anyhow!(e)
         })?;
@@ -619,6 +610,120 @@ impl Mounter for ProjectedMounter {
             self.volume.name, volume_dir
         );
         Ok(())
+    }
+}
+
+/// `volumeutil.NewAtomicWriter(..).Write(data, setPerms)` (`projected.go:
+/// 200-221`). `setPerms` (`:200-206`): "This may be the first time writing and
+/// new files get created outside the timestamp subdirectory: change the
+/// permissions on the whole volume and not only in the timestamp directory."
+/// The volume is read-only (`GetAttributes().ReadOnly`, `:175-181`).
+pub(crate) fn write_payload(
+    dir: &std::path::Path,
+    payload: &BTreeMap<String, FileProjection>,
+    fs_group: Option<i64>,
+) -> std::io::Result<()> {
+    let set_perms = move |dir: &std::path::Path| -> std::io::Result<()> {
+        crate::volume_ownership::set_volume_ownership(dir, fs_group, true)
+    };
+    crate::atomic_writer::write_projected_payload_with(dir, payload, Some(&set_perms))
+}
+
+/// The payload a periodic re-SetUp of a projected volume projects
+/// (`collectData`, `projected.go:226-338`), built from objects the caller has
+/// already fetched, so it can run on the blocking pool (#2390).
+///
+/// Same per-source rules as [`ProjectedMounter::collect_data`]: errors are
+/// accumulated and returned as their aggregate (the volume is then left
+/// untouched, as upstream's failed `SetUpAt` writes nothing); an optional,
+/// absent source is an empty payload.
+///
+/// The service-account-token source keeps the bytes already on disk: minting
+/// is the mounter's job (an async `TokenRequest`, refreshed at 80% of its
+/// lifetime, `token_manager.go:174-195`), and re-projecting the SAME bytes is
+/// what keeps the AtomicWriter inert.
+pub(crate) fn resync_payload<'a>(
+    projected: &rusternetes_common::resources::ProjectedVolumeSource,
+    pod: &Pod,
+    node_allocatable: &HashMap<String, String>,
+    volume_dir: &std::path::Path,
+    secret: impl Fn(&str) -> Option<&'a Secret>,
+    config_map: impl Fn(&str) -> Option<&'a ConfigMap>,
+) -> std::result::Result<BTreeMap<String, FileProjection>, String> {
+    let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+    let default_mode = projected.default_mode.unwrap_or(0o644) as u32;
+    let fs_user = crate::volume_plugins::util::fs_user_from(pod);
+    let fs_group = crate::volume_plugins::util::fs_group_from(pod);
+    let mut errlist: Vec<String> = Vec::new();
+    let mut payload: BTreeMap<String, FileProjection> = BTreeMap::new();
+    for source in projected.sources.iter().flatten() {
+        if let Some(sp) = &source.secret {
+            let name = sp.name.clone().unwrap_or_default();
+            let optional = sp.optional.unwrap_or(false);
+            let empty;
+            let secret = match secret(&name) {
+                Some(s) => s,
+                None if optional => {
+                    empty = Secret::new(&name, namespace);
+                    &empty
+                }
+                None => {
+                    errlist.push(format!("secret \"{name}\" not found"));
+                    continue;
+                }
+            };
+            match secret_payload(sp.items.as_ref(), secret, default_mode, optional) {
+                Ok(p) => payload.extend(p),
+                Err(e) => errlist.push(e),
+            }
+        } else if let Some(cp) = &source.config_map {
+            let name = cp.name.clone().unwrap_or_default();
+            let optional = cp.optional.unwrap_or(false);
+            let empty;
+            let cm = match config_map(&name) {
+                Some(c) => c,
+                None if optional => {
+                    empty = ConfigMap::new(&name, namespace);
+                    &empty
+                }
+                None => {
+                    errlist.push(format!("configmap \"{name}\" not found"));
+                    continue;
+                }
+            };
+            match config_map_payload(cp.items.as_ref(), cm, default_mode, optional) {
+                Ok(p) => payload.extend(p),
+                Err(e) => errlist.push(e),
+            }
+        } else if let Some(da) = &source.downward_api {
+            let items = da.items.as_deref().unwrap_or(&[]);
+            match downward_api_payload(items, pod, node_allocatable, default_mode) {
+                Ok(p) => payload.extend(p),
+                Err(e) => errlist.push(e),
+            }
+        } else if let Some(tp) = &source.service_account_token {
+            match std::fs::read(volume_dir.join(&tp.path)) {
+                Ok(token) => {
+                    payload.insert(
+                        tp.path.clone(),
+                        FileProjection {
+                            fs_user,
+                            data: token,
+                            mode: secret_file_mode(fs_user, fs_group, default_mode),
+                        },
+                    );
+                }
+                Err(e) => errlist.push(format!(
+                    "service account token {} is not projected yet: {e}",
+                    tp.path
+                )),
+            }
+        }
+    }
+    if errlist.is_empty() {
+        Ok(payload)
+    } else {
+        Err(aggregate_message(&errlist))
     }
 }
 
