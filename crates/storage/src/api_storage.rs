@@ -671,6 +671,24 @@ impl Storage for ApiStorage {
         serde_json::from_value(patched).map_err(Error::Serialization)
     }
 
+    async fn patch_status_strategic_merge<T>(
+        &self,
+        key: &str,
+        patch: &Value,
+        _full: &T,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        let path = format!("{}/status", self.object_path(key).await?);
+        let patched: Value = self
+            .client
+            .patch(&path, patch, "application/strategic-merge-patch+json")
+            .await
+            .map_err(map_write_err)?;
+        serde_json::from_value(patched).map_err(Error::Serialization)
+    }
+
     async fn update_raw(&self, key: &str, value: &Value) -> Result<()> {
         let path = self.object_path(key).await?;
         let _: Value = self.client.put(&path, value).await.map_err(map_write_err)?;
@@ -1495,5 +1513,65 @@ mod tests {
             "{req}"
         );
         assert!(req.contains(r#""podCIDRs":["10.0.0.0/24"]"#), "{req}");
+    }
+
+    /// `patch_status_strategic_merge` PATCHes `/status` with the
+    /// strategic-merge content type (nodeutil.PatchNodeStatus,
+    /// component-helpers/node/util/status.go:38).
+    #[tokio::test]
+    async fn patch_status_strategic_merge_patches_the_status_subresource() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(h) = text.find("\r\n\r\n") {
+                    let len = text[..h]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= h + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"apiVersion":"v1","kind":"Node","metadata":{"name":"n1"}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&buf).to_string()
+        });
+        let client = Arc::new(ApiClient::new(&format!("http://{addr}"), false, None).unwrap());
+        let storage = ApiStorage::new(client);
+        let patch = serde_json::json!({"status": {"phase": "x"}});
+        let full = serde_json::json!({});
+        let _: Value = storage
+            .patch_status_strategic_merge("/registry/nodes/n1", &patch, &full)
+            .await
+            .unwrap();
+        let req = server.await.unwrap();
+        assert_eq!(
+            req.lines().next().unwrap(),
+            "PATCH /api/v1/nodes/n1/status HTTP/1.1",
+            "{req}"
+        );
+        assert!(
+            req.to_ascii_lowercase()
+                .contains("content-type: application/strategic-merge-patch+json"),
+            "{req}"
+        );
     }
 }
