@@ -92,6 +92,11 @@ impl RhinoStorage<RedisBackend> {
     }
 }
 
+/// A TTL in seconds as kine's `lease` column; `0` is no lease.
+fn lease_seconds(ttl: u64) -> Result<i64> {
+    i64::try_from(ttl).map_err(|_| Error::Storage(format!("TTL {ttl}s overflows a kine lease")))
+}
+
 impl<B: Backend> RhinoStorage<B> {
     /// Serialize a value to JSON.
     fn serialize<T: Serialize>(value: &T) -> Result<String> {
@@ -170,6 +175,16 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
+        self.create_with_ttl(key, value, 0).await
+    }
+
+    /// kine takes a TTL as the key's `lease` column, in seconds, and its TTL
+    /// loop deletes the key when that many seconds have passed.
+    async fn create_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        let lease = lease_seconds(ttl)?;
         // Stamp system-managed creation metadata (uid, creationTimestamp,
         // generation) centrally, mirroring k8s registry.Store.Create.
         let json = {
@@ -182,7 +197,7 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
         };
 
         let mod_revision = retry_busy(RetryPolicy::default(), || {
-            self.backend.create(key, json.as_bytes(), 0)
+            self.backend.create(key, json.as_bytes(), lease)
         })
         .await
         .map_err(|e| match e {
@@ -222,6 +237,14 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
+        self.update_with_ttl(key, value, 0).await
+    }
+
+    async fn update_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        let lease = lease_seconds(ttl)?;
         let json = Self::serialize(value)?;
 
         // Extract resourceVersion from the incoming resource for optimistic concurrency
@@ -238,7 +261,7 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
 
             let (rev, prev_kv, succeeded) = retry_busy(RetryPolicy::default(), || {
                 self.backend
-                    .update(key, json.as_bytes(), expected_mod_revision, 0)
+                    .update(key, json.as_bytes(), expected_mod_revision, lease)
             })
             .await
             .map_err(|e| map_backend_error(key, "update", "update resource", &e))?;
@@ -276,7 +299,7 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
 
             let (new_rev, _prev_kv, succeeded) = retry_busy(RetryPolicy::default(), || {
                 self.backend
-                    .update(key, json.as_bytes(), existing_kv.mod_revision, 0)
+                    .update(key, json.as_bytes(), existing_kv.mod_revision, lease)
             })
             .await
             .map_err(|e| map_backend_error(key, "update", "update resource", &e))?;
@@ -293,7 +316,7 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
 
                 let (new_rev, _prev_kv, succeeded) = retry_busy(RetryPolicy::default(), || {
                     self.backend
-                        .update(key, json.as_bytes(), latest_kv.mod_revision, 0)
+                        .update(key, json.as_bytes(), latest_kv.mod_revision, lease)
                 })
                 .await
                 .map_err(|e| map_backend_error(key, "update", "update resource", &e))?;
