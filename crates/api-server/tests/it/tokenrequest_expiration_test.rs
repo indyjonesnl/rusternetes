@@ -60,3 +60,33 @@ async fn token_expiration_valid_accepted() {
         "token must be issued: {body}"
     );
 }
+
+/// `errors.NewInvalid(gvk.GroupKind(), "", errs)`
+/// (`pkg/registry/core/serviceaccount/storage/token.go:143`): the message is
+/// `TokenRequest.authentication.k8s.io "" is invalid: ...` (#2392).
+#[tokio::test]
+async fn token_expiration_invalid_is_new_invalid_shaped() {
+    let state = TestApiServer::new();
+    make_sa(&state, "sa-c").await;
+    let (_, body) = state.post(&token_uri("sa-c"), &token_req(60)).await;
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.starts_with("TokenRequest.authentication.k8s.io \"\" is invalid: "),
+        "{body}"
+    );
+    assert_eq!(body["details"]["kind"], json!("TokenRequest"), "{body}");
+    assert_eq!(
+        body["details"]["group"],
+        json!("authentication.k8s.io"),
+        "{body}"
+    );
+    let c = &body["details"]["causes"][0];
+    assert_eq!(c["field"], json!("spec.expirationSeconds"), "{body}");
+    assert!(
+        !c["message"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("spec.expirationSeconds: "),
+        "{body}"
+    );
+}
