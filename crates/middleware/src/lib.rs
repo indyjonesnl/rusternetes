@@ -3441,7 +3441,10 @@ mod tests {
             Some("ns-1")
         );
         assert_eq!(updated_namespace("/api/v1/namespaces/ns-1/pods"), None);
-        assert_eq!(updated_namespace("/api/v1/namespaces/ns-1/pods/p/status"), None);
+        assert_eq!(
+            updated_namespace("/api/v1/namespaces/ns-1/pods/p/status"),
+            None
+        );
         assert_eq!(updated_namespace("/api/v1/namespaces/ns-1"), None);
         assert_eq!(updated_namespace("/api/v1/nodes/n1"), None);
         // admission_test.go:186 — immortal set is default/kube-system/kube-public.

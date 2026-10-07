@@ -62,12 +62,14 @@ impl TestApiServer {
     /// NamespaceLifecycle admission answers NotFound for a create into a
     /// namespace that does not exist (upstream `lifecycle/admission.go`), so a
     /// fixture that POSTs namespaced content must have created the namespace.
-    /// This does that for every namespaced collection POST, once, in one place;
+    /// This does that for every namespaced create/update, once, in one place;
     /// it never touches a namespace that already exists. Tests that assert the
     /// missing-namespace behaviour opt out with
     /// [`TestApiServerBuilder::strict_namespaces`].
     fn seed_namespace_for(&self, method: &str, uri: &str) {
-        if !self.seed_namespaces || !method.eq_ignore_ascii_case("POST") {
+        let post = method.eq_ignore_ascii_case("POST");
+        let update = method.eq_ignore_ascii_case("PUT") || method.eq_ignore_ascii_case("PATCH");
+        if !self.seed_namespaces || !(post || update) {
             return;
         }
         let path = uri.split('?').next().unwrap_or(uri);
@@ -75,9 +77,12 @@ impl TestApiServer {
         let Some(i) = segs.iter().position(|s| *s == "namespaces") else {
             return;
         };
-        // `.../namespaces/{ns}/{collection}` only: not the namespace
-        // collection itself, not a named object's subresource.
-        if segs.len() != i + 3 || !matches!(segs[0], "api" | "apis") {
+        // `.../namespaces/{ns}/{collection}` (POST) or
+        // `.../namespaces/{ns}/{collection}/{name}` (PUT/PATCH) only: not the
+        // namespace itself, not a subresource. Upstream runs the existence
+        // check for updates too (`admission.go:129-166`).
+        let want = if post { i + 3 } else { i + 4 };
+        if segs.len() != want || !matches!(segs[0], "api" | "apis") {
             return;
         }
         let name = segs[i + 1];
@@ -294,7 +299,7 @@ impl Default for TestApiServerBuilder {
 }
 
 impl TestApiServerBuilder {
-    /// Do not auto-create the namespace of namespaced POSTs, so
+    /// Do not auto-create the namespace of namespaced creates and updates, so
     /// NamespaceLifecycle's NotFound for a missing namespace is observable.
     pub fn strict_namespaces(mut self) -> Self {
         self.strict_namespaces = true;

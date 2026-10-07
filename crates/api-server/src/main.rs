@@ -262,6 +262,14 @@ async fn main() -> Result<()> {
             e
         );
     }
+    // systemnamespaces controller (upstream pkg/controlplane/controller/
+    // systemnamespaces): NamespaceLifecycle needs these to exist (#2533).
+    if let Err(e) = bootstrap::bootstrap_system_namespaces(storage.as_ref()).await {
+        warn!(
+            "Failed to bootstrap system namespaces: {}. Continuing anyway.",
+            e
+        );
+    }
     // Seed the cluster-admin ClusterRole + binding to system:masters so the
     // cluster admin is authorized on a freshly-bootstrapped (empty) store
     // (upstream bootstrap policy; #1659). Idempotent.
