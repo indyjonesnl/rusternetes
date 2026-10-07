@@ -72,6 +72,25 @@ fn baseline_pod() -> Pod {
 }
 
 async fn seed(state: &TestApiServer, pod: &Pod) {
+    // The harness only auto-seeds a namespace for a non-subresource request,
+    // and PodSecurity answers InternalError for a namespace it cannot fetch
+    // (admission.go:344-350), so the `/ephemeralcontainers` PUTs below need
+    // the namespace to exist.
+    if let Some(ns) = pod.metadata.namespace.as_deref() {
+        let nskey = build_key("namespaces", None, ns);
+        let _ = state
+            .storage
+            .create(
+                &nskey,
+                &serde_json::json!({
+                    "apiVersion": "v1", "kind": "Namespace",
+                    "metadata": {"name": ns},
+                    "spec": {"finalizers": ["kubernetes"]},
+                    "status": {"phase": "Active"},
+                }),
+            )
+            .await;
+    }
     let key = build_key(
         "pods",
         pod.metadata.namespace.as_deref(),

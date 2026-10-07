@@ -1082,7 +1082,7 @@ async fn job_with_success_policy_succeeded_count_should_complete_on_threshold() 
     // Only two of the four pods succeed (indexes 0 and 2).
     mark_indexed_pods_succeeded(&storage, namespace, "success-count", &[0, 2]).await;
 
-    controller.reconcile_all().await.unwrap();
+    crate::kubelet_double::job_reconcile_all_settled(&controller, &storage).await;
 
     let updated_job: Job = storage.get(&job_key).await.unwrap();
     let status = updated_job

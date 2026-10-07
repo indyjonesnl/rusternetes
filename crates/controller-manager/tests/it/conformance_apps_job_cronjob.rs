@@ -486,7 +486,7 @@ async fn job_should_fail_when_exceeds_active_deadline() {
     }
     storage.update(&key, &fresh).await.unwrap();
 
-    controller.reconcile_all().await.unwrap();
+    crate::kubelet_double::job_reconcile_all_settled(&controller, &storage).await;
     let done: Job = storage.get(&key).await.unwrap();
     let status = done.status.expect("status set");
     let failed_cond = status
@@ -605,7 +605,7 @@ async fn job_should_delete_pods_when_suspended() {
     let mut fresh: Job = storage.get(&key).await.unwrap();
     fresh.spec.suspend = Some(true);
     storage.update(&key, &fresh).await.unwrap();
-    controller.reconcile_all().await.unwrap();
+    crate::kubelet_double::job_reconcile_all_settled(&controller, &storage).await;
 
     let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
     assert!(

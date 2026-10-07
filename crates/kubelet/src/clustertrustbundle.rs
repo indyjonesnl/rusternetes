@@ -15,13 +15,16 @@
 //!   restarts" per its comment — but the cache is what keeps that stable
 //!   within a run. With no cache, the order is instead a fixed pseudo-random
 //!   permutation seeded once per process, which is what the comment describes.
-//! * ClusterTrustBundles are read as untyped JSON: `rusternetes-common` has no
-//!   ClusterTrustBundle type yet (see the follow-up issue).
+//! * ClusterTrustBundles are read as the typed
+//!   `rusternetes_common::resources::ClusterTrustBundle` (certificates.k8s.io
+//!   v1beta1). `m.ctbHandlers.GetSignerName(ctb)` (`:260`) is its
+//!   `spec.signerName`, `GetTrustBundle` its `spec.trustBundle`.
 
 use anyhow::{anyhow, Result};
+use rusternetes_common::resources::ClusterTrustBundle;
 use rusternetes_common::types::{label_selector_as_selector, LabelSelector};
 use rusternetes_storage::{build_key, build_prefix, Storage};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::hash::BuildHasher;
 use std::sync::OnceLock;
 
@@ -37,13 +40,13 @@ pub async fn get_trust_anchors_by_name<S: Storage + ?Sized>(
     name: &str,
     allow_missing: bool,
 ) -> Result<Vec<u8>> {
-    let ctb: serde_json::Value = match storage.get(&build_key(RESOURCE, None, name)).await {
+    let ctb: ClusterTrustBundle = match storage.get(&build_key(RESOURCE, None, name)).await {
         Ok(v) => v,
         // `k8serrors.IsNotFound(err) && allowMissing` (`:208-211`).
         Err(rusternetes_common::Error::NotFound(_)) if allow_missing => return Ok(Vec::new()),
         Err(e) => return Err(anyhow!("while getting ClusterTrustBundle: {e}")),
     };
-    Ok(normalize_trust_anchors(&[trust_bundle_of(&ctb)]))
+    Ok(normalize_trust_anchors(&[ctb.spec.trust_bundle]))
 }
 
 /// `GetTrustAnchorsBySigner` (`clustertrustbundle_manager.go:229-283`): the
@@ -69,7 +72,7 @@ pub async fn get_trust_anchors_by_signer<S: Storage + ?Sized>(
         ));
     }
 
-    let all: Vec<serde_json::Value> =
+    let all: Vec<ClusterTrustBundle> =
         storage
             .list(&build_prefix(RESOURCE, None))
             .await
@@ -80,17 +83,13 @@ pub async fn get_trust_anchors_by_signer<S: Storage + ?Sized>(
             })?;
 
     let bundles: Vec<String> = all
-        .iter()
+        .into_iter()
         .filter(|ctb| {
-            let labels: HashMap<String, String> = ctb
-                .pointer("/metadata/labels")
-                .and_then(|l| serde_json::from_value(l.clone()).ok())
-                .unwrap_or_default();
-            selector.matches(Some(&labels))
+            selector.matches(Some(&ctb.metadata.labels.clone().unwrap_or_default()))
                 // `m.ctbHandlers.GetSignerName(ctb) == signerName` (`:260`).
-                && ctb.pointer("/spec/signerName").and_then(|s| s.as_str()) == Some(signer_name)
+                && ctb.spec.signer_name == signer_name
         })
-        .map(trust_bundle_of)
+        .map(|ctb| ctb.spec.trust_bundle)
         .collect();
 
     if bundles.is_empty() {
@@ -102,13 +101,6 @@ pub async fn get_trust_anchors_by_signer<S: Storage + ?Sized>(
         ));
     }
     Ok(normalize_trust_anchors(&bundles))
-}
-
-fn trust_bundle_of(ctb: &serde_json::Value) -> String {
-    ctb.pointer("/spec/trustBundle")
-        .and_then(|t| t.as_str())
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// `normalizeTrustAnchors` (`clustertrustbundle_manager.go:285-312`): decode
@@ -146,6 +138,7 @@ fn normalize_trust_anchors(bundles: &[String]) -> Vec<u8> {
 mod tests {
     use super::*;
     use rusternetes_storage::StorageBackend;
+    use std::collections::HashMap;
 
     /// A syntactically valid PEM `CERTIFICATE` block. `diffBundles`-style
     /// comparison (decode, sort) is used below, as upstream's test does
@@ -179,16 +172,8 @@ mod tests {
         labels: serde_json::Value,
         bundle: &str,
     ) {
-        let mut spec = serde_json::json!({"trustBundle": bundle});
-        if !signer.is_empty() {
-            spec["signerName"] = signer.into();
-        }
-        let ctb = serde_json::json!({
-            "apiVersion": "certificates.k8s.io/v1beta1",
-            "kind": "ClusterTrustBundle",
-            "metadata": {"name": name, "labels": labels},
-            "spec": spec
-        });
+        let mut ctb = ClusterTrustBundle::new(name, signer, bundle);
+        ctb.metadata.labels = serde_json::from_value(labels).unwrap();
         st.create(&build_key(RESOURCE, None, name), &ctb)
             .await
             .unwrap();
@@ -317,6 +302,27 @@ mod tests {
             err,
             "combination of signerName and labelSelector matched zero ClusterTrustBundles"
         );
+    }
+
+    /// `GetSignerName(ctb) == signerName` (`:260`) compares the typed
+    /// `spec.signerName`, so a name-only bundle (signerName "") matches "".
+    #[tokio::test]
+    async fn by_signer_empty_signer_name_matches_unsigned_bundles() {
+        let st = StorageBackend::new_memory();
+        put(&st, "plain", "", serde_json::json!({}), &root("p")).await;
+        put(
+            &st,
+            "signed",
+            "foo.bar/a",
+            serde_json::json!({}),
+            &root("s"),
+        )
+        .await;
+        let empty = ls(serde_json::json!({}));
+        let got = get_trust_anchors_by_signer(&st, "", Some(&empty), false)
+            .await
+            .unwrap();
+        assert!(same_bundle(&got, &root("p")));
     }
 
     /// "big labelselector should cause error" (`...manager_test.go:277-291`).

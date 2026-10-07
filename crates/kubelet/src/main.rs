@@ -6,7 +6,6 @@
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[allow(dead_code, unused_imports)]
-mod cni;
 mod config;
 #[allow(dead_code, unused_imports)]
 mod cri_runtime;
@@ -329,6 +328,11 @@ async fn main() -> Result<()> {
     // runtimeRequestTimeout from the config file (None => upstream default 2m).
     let runtime_request_timeout = config_file.as_ref().and_then(|c| c.runtime_request_timeout);
 
+    // crashLoopBackOff.maxContainerRestartPeriod (None => 300s default).
+    let crash_loop_backoff_max = config_file
+        .as_ref()
+        .map(|c| c.effective_max_container_restart_period());
+
     // Parse etcd endpoints
     let etcd_endpoints: Vec<String> = args
         .etcd_servers
@@ -519,7 +523,8 @@ async fn main() -> Result<()> {
         .with_pod_manifest_path(args.pod_manifest_path.clone())
         .with_node_status_update_frequency(node_status_update_frequency)
         .with_file_check_frequency(file_check_frequency)
-        .with_runtime_request_timeout(runtime_request_timeout),
+        .with_runtime_request_timeout(runtime_request_timeout)
+        .with_crash_loop_backoff_max(crash_loop_backoff_max),
     );
 
     // Plugin manager (`pkg/kubelet/pluginmanager`): watch
@@ -532,24 +537,27 @@ async fn main() -> Result<()> {
     // CSINode (`nodeinfomanager.InstallCSIDriver`). Upstream sets `nim.nodeID`
     // (the Node's UID) in `csiPlugin.Init` -> `initializeCSINode`, before any
     // plugin can register, and keeps the kubelet NotReady until it succeeds
-    // (`csi_plugin.go:281-355`); here the plugin manager is started once the
-    // Node exists and the CSINode is initialized (retried every second, like
-    // `waitForAPIServerForever`'s poll). The NotReady gate is not ported.
+    // (`csi_plugin.go:374-415`, `SetKubeletError`); the same gate is applied
+    // here and the plugin manager starts once it clears. As upstream
+    // (`klog.Fatalf`, csi_plugin.go:413), exhausting the retries exits.
     {
         let registry_dir = pluginmanager::plugins_registry_dir(&runtime_config.root_dir);
         let nim = Arc::new(volume_plugins::nodeinfomanager::NodeInfoManager::new(
             runtime_config.node_name.clone(),
             storage.clone(),
         ));
+        let klet = kubelet.clone();
+        // Set before the task spawns (csi_plugin.go:374) so the first Ready
+        // post cannot race ahead of the gate.
+        klet.set_kubelet_error(Some("CSINode is not yet initialized".into()));
         tokio::spawn(async move {
-            loop {
-                match nim.initialize_csi_node().await {
-                    Ok(()) => break,
-                    Err(e) => {
-                        info!("Waiting to initialize the CSINode: {e}");
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                }
+            let k = klet.clone();
+            if let Err(e) = nim
+                .initialize_csi_node_gating_ready(move |err| k.set_kubelet_error(err))
+                .await
+            {
+                tracing::error!("{e}");
+                std::process::exit(1);
             }
             let plugin_manager = pluginmanager::PluginManager::new(registry_dir);
             plugin_manager.register_metrics(&plugin_metrics.registry);
