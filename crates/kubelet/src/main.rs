@@ -320,6 +320,9 @@ async fn main() -> Result<()> {
         .as_ref()
         .and_then(|c| c.node_status_update_frequency);
 
+    // runtimeRequestTimeout from the config file (None => upstream default 2m).
+    let runtime_request_timeout = config_file.as_ref().and_then(|c| c.runtime_request_timeout);
+
     // Parse etcd endpoints
     let etcd_endpoints: Vec<String> = args
         .etcd_servers
@@ -507,7 +510,8 @@ async fn main() -> Result<()> {
         )
         .await?
         .with_pod_manifest_path(args.pod_manifest_path.clone())
-        .with_node_status_update_frequency(node_status_update_frequency),
+        .with_node_status_update_frequency(node_status_update_frequency)
+        .with_runtime_request_timeout(runtime_request_timeout),
     );
 
     // Plugin manager (`pkg/kubelet/pluginmanager`): watch
