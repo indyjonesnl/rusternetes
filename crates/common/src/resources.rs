@@ -76,8 +76,7 @@ pub use autoscaling::{
 };
 pub use binding::Binding;
 pub use certificates::{
-    CertificateSigningRequest, CertificateSigningRequestCondition,
-    CertificateSigningRequestConditionType, CertificateSigningRequestSpec,
+    CertificateSigningRequest, CertificateSigningRequestCondition, CertificateSigningRequestSpec,
     CertificateSigningRequestStatus, KeyUsage,
 };
 pub use clustertrustbundle::{ClusterTrustBundle, ClusterTrustBundleSpec};
