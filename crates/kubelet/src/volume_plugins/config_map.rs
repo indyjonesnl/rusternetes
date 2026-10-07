@@ -85,6 +85,36 @@ impl VolumePlugin for ConfigMapPlugin {
             storage: self.host.get_kube_client().cloned(),
         }))
     }
+
+    /// `NewUnmounter` (`configmap.go:108-130`): the wrapper plugins share one unmounter that
+    /// delegates `TearDownAt` to emptyDir (`volumeutil.UnmountViaEmptyDir`).
+    fn new_unmounter(
+        &self,
+        vol_name: &str,
+        pod_uid: &str,
+    ) -> Result<Box<dyn crate::volume_plugins::Unmounter>> {
+        Ok(Box::new(
+            crate::volume_plugins::util::WrappedEmptyDirUnmounter {
+                host: self.host.clone(),
+                plugin_name: self.name(),
+                vol_name: vol_name.to_string(),
+                pod_uid: pod_uid.to_string(),
+            },
+        ))
+    }
+
+    /// `ConstructVolumeSpec` (`configmap.go:108-130`): a bare `ConfigMapVolumeSource{}`
+    /// named after the volume.
+    fn construct_volume_spec(
+        &self,
+        vol_name: &str,
+        _mount_path: &str,
+    ) -> Result<crate::volume_plugins::ReconstructedVolume> {
+        crate::volume_plugins::util::reconstructed_volume(
+            vol_name,
+            serde_json::json!({"configMap": {"name": ""}}),
+        )
+    }
 }
 
 /// `if !(errors.IsNotFound(err) && optional)` (`configmap.go:168`): the error

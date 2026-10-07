@@ -82,6 +82,29 @@ pub(crate) fn mount_tmpfs_for_emptydir(dir: &str, size_bytes: Option<u64>) -> an
     Ok(())
 }
 
+/// Unmount `target`: `mount.Interface.Unmount`
+/// (`staging/src/k8s.io/mount-utils/mount_linux.go:401`), which runs
+/// `umount <target>` and reports its output on failure.
+///
+/// The counterpart of [`mount_tmpfs_for_emptydir`], which nothing used to
+/// undo: a `medium: Memory` emptyDir's tmpfs outlived its pod and blocked the
+/// removal of the pod directory (#2537).
+pub(crate) fn unmount_path(target: &str) -> anyhow::Result<()> {
+    let out = std::process::Command::new("umount")
+        .arg(target)
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not exec umount for {target}: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "unmount failed: exit status {}\nUnmounting arguments: {target}\nOutput: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    info!("Unmounted {}", target);
+    Ok(())
+}
+
 /// Parse a Kubernetes `resource.Quantity` (e.g. `1Gi`, `512Mi`, `0.5Gi`) into a
 /// byte count. Returns `None` on input that upstream `ParseQuantity` rejects,
 /// and on a negative quantity — a `sizeLimit` below zero is not a size, and

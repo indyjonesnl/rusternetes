@@ -79,10 +79,12 @@ impl OwnedSpec {
 
 /// Port of `volume.VolumePlugin` (`pkg/volume/plugins.go:128`).
 ///
-/// Only the methods with a consumer are ported. `ConstructVolumeSpec` and
-/// `NewUnmounter` arrive with the sub-project that calls them (#1970);
-/// `GetVolumeName`, `RequiresRemount` and `SupportsSELinuxContextMount`
-/// arrived here with `DesiredStateOfWorld`, which calls all three.
+/// Only the methods with a consumer are ported. `NewUnmounter` and
+/// `ConstructVolumeSpec` arrived with the orphaned-volume teardown
+/// ([`crate::volumes::VolumeManager::unmount_orphaned_volumes`]) and the CSI
+/// held-device scan; `GetVolumeName`, `RequiresRemount` and
+/// `SupportsSELinuxContextMount` arrived with `DesiredStateOfWorld`, which
+/// calls all three.
 #[async_trait]
 pub trait VolumePlugin: Send + Sync {
     /// `GetPluginName` (`plugins.go:138`). Namespaced, exactly one `/`.
@@ -154,6 +156,61 @@ pub trait VolumePlugin: Send + Sync {
 
     /// `NewMounter` (`plugins.go:162`).
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>>;
+
+    /// `NewUnmounter` (`plugins.go:167`): create a [`Unmounter`] from
+    /// recoverable state — the volume's name as per the `v1.Volume` spec and
+    /// the UID of the pod it belonged to, which is all that survives on disk
+    /// (`<pod>/volumes/<plugin>/<volName>`). Not async: the CSI plugin reads
+    /// its volume info file here, everything else just builds a path.
+    fn new_unmounter(&self, vol_name: &str, pod_uid: &str) -> Result<Box<dyn Unmounter>>;
+
+    /// `ConstructVolumeSpec` (`plugins.go:173`): rebuild a spec from the
+    /// volume name and the volume's path on disk, for a volume the kubelet
+    /// found there rather than in the API. The spec may be incomplete.
+    fn construct_volume_spec(
+        &self,
+        vol_name: &str,
+        mount_path: &str,
+    ) -> Result<ReconstructedVolume>;
+}
+
+/// `volume.ReconstructedVolume` (`pkg/volume/plugins.go`): what
+/// `ConstructVolumeSpec` rebuilds from a mounted volume's on-disk state.
+///
+/// **Deviation:** upstream returns a `*volume.Spec` whose `Volume` is nil for a
+/// PV-backed spec. Our [`Spec`] borrows a mandatory `Volume`, so the owned parts
+/// are returned and the caller builds the `Spec`; for the PV arm `volume` is a
+/// placeholder named after the PV (see `Spec::name`'s inherited deviation).
+pub struct ReconstructedVolume {
+    pub volume: Volume,
+    pub persistent_volume: Option<PersistentVolume>,
+}
+
+/// Port of `volume.Unmounter` (`pkg/volume/volume.go:189-198`).
+///
+/// `async` where upstream is synchronous: the CSI implementation awaits a gRPC
+/// `NodeUnpublishVolume`. An idiom difference, not a mechanism change.
+/// `Send + Sync` for the reason given on [`Mounter`].
+///
+/// Upstream's `Unmounter` embeds `Volume`, i.e. `GetPath` plus a
+/// `MetricsProvider`; only `GetPath` is ported, as the metrics half has no
+/// consumer on the teardown path.
+#[async_trait]
+pub trait Unmounter: Send + Sync {
+    /// `Volume::GetPath` (`volume.go:36`).
+    fn get_path(&self) -> String;
+
+    /// `TearDown` (`volume.go:194`): unmount the volume from a
+    /// self-determined directory and remove traces of the SetUp procedure.
+    /// Every upstream implementation is `return x.TearDownAt(x.GetPath())`,
+    /// so that is the default.
+    async fn tear_down(&self) -> Result<()> {
+        self.tear_down_at(&self.get_path()).await
+    }
+
+    /// `TearDownAt` (`volume.go:197`): unmount the volume from the specified
+    /// directory and remove traces of the SetUp procedure.
+    async fn tear_down_at(&self, dir: &str) -> Result<()>;
 }
 
 /// Port of `volume.Mounter` (`pkg/volume/volume.go:162`).

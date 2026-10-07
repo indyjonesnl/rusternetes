@@ -72,6 +72,36 @@ impl VolumePlugin for DownwardApiPlugin {
             node_allocatable: self.host.get_node_allocatable().clone(),
         }))
     }
+
+    /// `NewUnmounter` (`downwardapi.go:110-131`): the wrapper plugins share one unmounter that
+    /// delegates `TearDownAt` to emptyDir (`volumeutil.UnmountViaEmptyDir`).
+    fn new_unmounter(
+        &self,
+        vol_name: &str,
+        pod_uid: &str,
+    ) -> Result<Box<dyn crate::volume_plugins::Unmounter>> {
+        Ok(Box::new(
+            crate::volume_plugins::util::WrappedEmptyDirUnmounter {
+                host: self.host.clone(),
+                plugin_name: self.name(),
+                vol_name: vol_name.to_string(),
+                pod_uid: pod_uid.to_string(),
+            },
+        ))
+    }
+
+    /// `ConstructVolumeSpec` (`downwardapi.go:110-131`): a bare `DownwardAPIVolumeSource{}`
+    /// named after the volume.
+    fn construct_volume_spec(
+        &self,
+        vol_name: &str,
+        _mount_path: &str,
+    ) -> Result<crate::volume_plugins::ReconstructedVolume> {
+        crate::volume_plugins::util::reconstructed_volume(
+            vol_name,
+            serde_json::json!({"downwardAPI": {}}),
+        )
+    }
 }
 
 struct DownwardApiMounter {

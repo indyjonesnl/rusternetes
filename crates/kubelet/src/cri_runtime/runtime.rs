@@ -2539,16 +2539,16 @@ impl CriContainerRuntime {
         }
     }
 
-    /// NodeUnpublish the CSI volumes of pods that are gone. No-op when no
+    /// Tear down the volumes of pods that are gone. No-op when no
     /// VolumeManager is attached.
-    pub async fn unmount_csi_volumes(
+    pub async fn unmount_orphaned_volumes(
         &self,
         live_pod_uids: &std::collections::HashSet<String>,
         terminated_pod_uids: &std::collections::HashSet<String>,
     ) {
         if let Some(volumes) = self.volumes.as_ref() {
             volumes
-                .unmount_csi_volumes(live_pod_uids, terminated_pod_uids)
+                .unmount_orphaned_volumes(live_pod_uids, terminated_pod_uids)
                 .await;
         }
     }

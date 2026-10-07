@@ -1997,7 +1997,7 @@ impl Kubelet {
             .map(|p| p.metadata.uid.clone())
             .filter(|uid| !uid.is_empty())
             .collect();
-        // Unpublish CSI volumes first: upstream's reconciler unmounts before
+        // Unmount volumes first: upstream's reconciler unmounts before
         // cleanupOrphanedPodDirs, which refuses to remove a mounted volume.
         // Pods that are deleted (not in the live set) and pods that are
         // terminated but still in the API both no longer want their volumes.
@@ -2009,7 +2009,7 @@ impl Kubelet {
             .filter(|uid| !uid.is_empty())
             .collect();
         self.runtime
-            .unmount_csi_volumes(&live_pod_uids, &terminated_pod_uids)
+            .unmount_orphaned_volumes(&live_pod_uids, &terminated_pod_uids)
             .await;
         // ...then release the staged devices nothing holds or wants any more
         // (reconciler unmountDetachDevices, reconciler_common.go:273): after
