@@ -331,4 +331,66 @@ mod tests {
             errs[0]
         );
     }
+
+    /// validation.go:505-516 `validateFSGroupPolicy`: only a nil pointer is
+    /// skipped; a non-nil empty string is not in `supportedFSGroupPolicy`, so
+    /// `fsGroupPolicy: ""` is NotSupported (#2505), while an absent field is fine.
+    #[test]
+    fn empty_string_fs_group_policy_is_not_supported_but_absent_is_fine() {
+        let bad: CSIDriverSpec = serde_json::from_value(serde_json::json!({
+            "attachRequired": false, "podInfoOnMount": false,
+            "storageCapacity": true, "seLinuxMount": false,
+            "fsGroupPolicy": ""
+        }))
+        .expect("an empty fsGroupPolicy must decode");
+        assert_eq!(
+            bad.fs_group_policy,
+            Some(FSGroupPolicy::Unknown(String::new()))
+        );
+        let errs = validate_csi_driver(&driver(bad));
+        assert!(
+            has(&errs, "spec.fsGroupPolicy", ErrorType::NotSupported),
+            "{errs:?}"
+        );
+
+        let ok: CSIDriverSpec = serde_json::from_value(serde_json::json!({
+            "attachRequired": false, "podInfoOnMount": false,
+            "storageCapacity": true, "seLinuxMount": false
+        }))
+        .unwrap();
+        assert!(ok.fs_group_policy.is_none());
+        assert!(!has(
+            &validate_csi_driver(&driver(ok)),
+            "spec.fsGroupPolicy",
+            ErrorType::NotSupported
+        ));
+    }
+
+    /// validation_test.go:2031-2035 "FSGroupPolicy invalidated" (update case):
+    /// changing a valid policy to "invalid" is rejected; changing to "File"
+    /// ("change FSGroupPolicy", :1934-1937) is allowed.
+    #[test]
+    fn update_to_invalid_fs_group_policy_rejected() {
+        let mk = |v: &str| {
+            let spec: CSIDriverSpec = serde_json::from_value(serde_json::json!({
+                "attachRequired": false, "podInfoOnMount": false,
+                "storageCapacity": true, "seLinuxMount": false,
+                "fsGroupPolicy": v
+            }))
+            .unwrap();
+            driver(spec)
+        };
+        let old = mk("None");
+        let errs = validate_csi_driver_update(&mk("invalid"), &old);
+        assert!(
+            has(&errs, "spec.fsGroupPolicy", ErrorType::NotSupported),
+            "{errs:?}"
+        );
+        let errs = validate_csi_driver_update(&mk(""), &old);
+        assert!(
+            has(&errs, "spec.fsGroupPolicy", ErrorType::NotSupported),
+            "{errs:?}"
+        );
+        assert!(validate_csi_driver_update(&mk("File"), &old).is_empty());
+    }
 }
