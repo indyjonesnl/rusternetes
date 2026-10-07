@@ -339,3 +339,40 @@ async fn create_requires_the_name_to_be_plural_dot_group() {
         "{out}"
     );
 }
+
+/// The apiapproval controller (apiapproval/apiapproval_controller.go:85-128):
+/// a protected group's CRD carries a `KubernetesAPIApprovalPolicyConformant`
+/// condition reflecting its annotation, and any other group's carries none.
+#[tokio::test]
+async fn a_protected_group_gets_the_api_approval_condition() {
+    let api = TestApiServer::new();
+    let mut approved = crd("widgets", "Widget", "example.k8s.io");
+    approved["metadata"]["annotations"] =
+        json!({"api-approved.kubernetes.io": "https://github.com/kubernetes/kubernetes/pull/1"});
+    let out = create(&api, &approved).await;
+    let cond = condition(&out, "KubernetesAPIApprovalPolicyConformant").expect("condition");
+    assert_eq!(cond["status"], "True", "{out}");
+    assert_eq!(cond["reason"], "ApprovedAnnotation", "{out}");
+    assert_eq!(
+        cond["message"], "approved in https://github.com/kubernetes/kubernetes/pull/1",
+        "{out}"
+    );
+
+    let mut bypassed = crd("gadgets", "Gadget", "example.k8s.io");
+    bypassed["metadata"]["annotations"] =
+        json!({"api-approved.kubernetes.io": "unapproved, experimental"});
+    let out = create(&api, &bypassed).await;
+    let cond = condition(&out, "KubernetesAPIApprovalPolicyConformant").expect("condition");
+    assert_eq!(cond["status"], "False", "{out}");
+    assert_eq!(cond["reason"], "UnapprovedAnnotation", "{out}");
+
+    let other = create(&api, &crd("things", "Thing", "example.com")).await;
+    assert!(
+        condition(&other, "KubernetesAPIApprovalPolicyConformant").is_none(),
+        "{other}"
+    );
+    assert!(
+        condition(&other, "NonStructuralSchema").is_none(),
+        "{other}"
+    );
+}
