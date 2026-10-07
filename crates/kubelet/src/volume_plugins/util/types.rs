@@ -69,3 +69,45 @@ pub enum VolumeOperationError {
     #[error("{0}")]
     TransientOperationFailure(String),
 }
+
+/// `NodeExpansionNotRequired` (`pkg/volume/util/types/types.go:29`): PVC
+/// annotation recording that the driver needs no node expansion.
+pub const NODE_EXPANSION_NOT_REQUIRED: &str = "volume.kubernetes.io/node-expansion-not-required";
+
+/// Port of `IsOperationFinishedError` (`types.go:171-181`): true unless the
+/// error is an uncertain-progress or transient one.
+///
+/// `UncertainProgressError` has no variant here: the CSI expander flattens an
+/// uncertain-progress gRPC error to a plain message (see `csi/expander.rs`),
+/// so it reads as finished. That is a pre-existing gap in the expander, not
+/// something this predicate can recover.
+pub fn is_operation_finished_error(err: &anyhow::Error) -> bool {
+    !matches!(
+        err.downcast_ref::<VolumeOperationError>(),
+        Some(VolumeOperationError::TransientOperationFailure(_))
+    )
+}
+
+/// Port of `IsInfeasibleError` (`types.go:125-128`).
+pub fn is_infeasible_error(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<VolumeOperationError>(),
+        Some(VolumeOperationError::Infeasible(_))
+    )
+}
+
+/// Port of `IsFailedPreconditionError` (`types.go:104-107`).
+pub fn is_failed_precondition_error(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<VolumeOperationError>(),
+        Some(VolumeOperationError::FailedPrecondition(_))
+    )
+}
+
+/// Port of `IsOperationNotSupportedError` (`types.go:142-145`).
+pub fn is_operation_not_supported_error(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<VolumeOperationError>(),
+        Some(VolumeOperationError::OperationNotSupported(_))
+    )
+}

@@ -296,6 +296,10 @@ pub struct Metrics {
 }
 
 /// Port of `volume.NodeResizeOptions` (`pkg/volume/plugins.go:99-116`).
+///
+/// `Clone` because upstream passes it by value and `nodeExpander` reuses one
+/// copy for the pre-check and the plugin call.
+#[derive(Clone)]
 pub struct NodeResizeOptions<'a> {
     pub volume_spec: &'a Spec<'a>,
     /// Location of the actual device on the node. For CSI this may just be
