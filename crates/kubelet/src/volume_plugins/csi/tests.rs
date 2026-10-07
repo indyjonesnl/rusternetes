@@ -767,3 +767,42 @@ fn new_unmounter_without_a_data_file_fails() {
         "{err:#}"
     );
 }
+
+/// An orphaned pod's published CSI volume is NodeUnpublished by the kubelet's
+/// cleanup: upstream's reconciler `unmountVolumes` -> `UnmountVolume` ->
+/// `NewUnmounter` -> `TearDownAt` (`reconciler.go`, `operation_generator.go`
+/// `GenerateUnmountVolumeFunc`, `csi_plugin.go:540-567`, `csi_mounter.go:432-466`).
+/// A live pod's volume must be left alone.
+#[tokio::test]
+async fn orphaned_pod_csi_volume_is_unpublished() {
+    let f = fx("orphan", &[], Some(json!({"attachRequired": false}))).await;
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+    m.set_up().await.unwrap();
+    let mount = std::path::PathBuf::from(m.get_path());
+    let vm = crate::volumes::VolumeManager::new(
+        f.root.clone(),
+        None,
+        rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+    );
+
+    // Live pod: untouched.
+    let live: std::collections::HashSet<String> = ["uid-1".to_string()].into();
+    vm.unmount_orphaned_csi_volumes(&live).await;
+    assert!(f.fake.calls.lock().unwrap().unpublish.is_empty());
+    assert!(mount.is_dir());
+
+    // Orphaned pod: NodeUnpublishVolume with the saved handle + mount path.
+    vm.unmount_orphaned_csi_volumes(&std::collections::HashSet::new())
+        .await;
+    let calls = f.fake.calls.lock().unwrap();
+    assert_eq!(calls.unpublish.len(), 1);
+    assert_eq!(calls.unpublish[0].volume_id, "vol-1");
+    assert_eq!(calls.unpublish[0].target_path, m.get_path());
+    assert!(!mount.exists());
+}

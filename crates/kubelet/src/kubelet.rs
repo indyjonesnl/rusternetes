@@ -1905,6 +1905,11 @@ impl Kubelet {
             .map(|p| p.metadata.uid.clone())
             .filter(|uid| !uid.is_empty())
             .collect();
+        // Unpublish CSI volumes first: upstream's reconciler unmounts before
+        // cleanupOrphanedPodDirs, which refuses to remove a mounted volume.
+        self.runtime
+            .unmount_orphaned_csi_volumes(&live_pod_uids)
+            .await;
         self.runtime.cleanup_orphaned_pod_dirs(&live_pod_uids);
 
         // Garbage-collect terminal pods (Succeeded/Failed) from storage.
