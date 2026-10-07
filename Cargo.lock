@@ -4446,6 +4446,7 @@ dependencies = [
  "inotify",
  "mimalloc",
  "pem",
+ "prometheus",
  "prost",
  "rcgen",
  "reqwest",

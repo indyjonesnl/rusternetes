@@ -466,6 +466,7 @@ async fn main() -> Result<()> {
     // Initialize metrics
     let metrics = Arc::new(MetricsRegistry::new().with_kubelet_metrics()?);
     let metrics_clone = metrics.clone();
+    let plugin_metrics = metrics.clone();
 
     // Convert RuntimeConfig to KubeletConfiguration for /configz endpoint
     let kubelet_config = KubeletConfiguration {
@@ -551,6 +552,7 @@ async fn main() -> Result<()> {
                 }
             }
             let plugin_manager = pluginmanager::PluginManager::new(registry_dir);
+            plugin_manager.register_metrics(&plugin_metrics.registry);
             plugin_manager.add_handler(
                 pluginmanager::csi_handler::CSI_PLUGIN,
                 Arc::new(pluginmanager::csi_handler::RegistrationHandler::new(nim)),
