@@ -556,6 +556,28 @@ pub struct StorageClass {
     pub mount_options: Option<Vec<String>>,
 }
 
+/// `GetDefaultClass` (`pkg/volume/util/storageclass.go:40-71`): of the classes
+/// annotated default (`IsDefaultAnnotation`, :76-85), the newest, then the
+/// first by name.
+pub fn get_default_class(classes: Vec<StorageClass>) -> Option<StorageClass> {
+    let is_default = |sc: &StorageClass| {
+        sc.metadata.annotations.as_ref().is_some_and(|a| {
+            a.get("storageclass.kubernetes.io/is-default-class")
+                .is_some_and(|v| v == "true")
+                || a.get("storageclass.beta.kubernetes.io/is-default-class")
+                    .is_some_and(|v| v == "true")
+        })
+    };
+    let mut defaults: Vec<_> = classes.into_iter().filter(is_default).collect();
+    defaults.sort_by(|a, b| {
+        b.metadata
+            .creation_timestamp
+            .cmp(&a.metadata.creation_timestamp)
+            .then_with(|| a.metadata.name.cmp(&b.metadata.name))
+    });
+    defaults.into_iter().next()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum VolumeBindingMode {
     Immediate,
