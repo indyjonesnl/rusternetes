@@ -37,6 +37,10 @@ pub struct StaleListStorage {
     /// Strip `metadata.deletionTimestamp` from every listed object: a delete
     /// issued this cycle is not yet visible to the next reconcile's list.
     hide_deletion_timestamps: bool,
+    /// Refuse a plain `update` that ADDS a `deletionTimestamp` the stored
+    /// object lacks: the generic Store's `BeforeUpdate` keeps the old value and
+    /// validation rejects a change, so only a DELETE can stamp it.
+    reject_deletion_timestamp_stamps: bool,
     /// Object names omitted from the *next* `list` call only, then revealed —
     /// an informer that has not yet observed an object the store already has.
     hide_next_list: Mutex<HashSet<String>>,
@@ -47,6 +51,7 @@ impl StaleListStorage {
         Self {
             inner: MemoryStorage::new(),
             hide_deletion_timestamps: false,
+            reject_deletion_timestamp_stamps: false,
             hide_next_list: Mutex::new(HashSet::new()),
         }
     }
@@ -54,6 +59,12 @@ impl StaleListStorage {
     /// Model a list that has not yet caught up with in-flight deletions.
     pub fn hiding_deletion_timestamps(mut self) -> Self {
         self.hide_deletion_timestamps = true;
+        self
+    }
+
+    /// Model a Store-backed api-server: a PUT cannot stamp `deletionTimestamp`.
+    pub fn rejecting_deletion_timestamp_stamps(mut self) -> Self {
+        self.reject_deletion_timestamp_stamps = true;
         self
     }
 
@@ -127,6 +138,18 @@ impl Storage for StaleListStorage {
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
+        if self.reject_deletion_timestamp_stamps {
+            let new =
+                serde_json::to_value(value).map_err(rusternetes_common::Error::Serialization)?;
+            let stored: serde_json::Value = self.inner.get(key).await?;
+            if new.pointer("/metadata/deletionTimestamp").is_some()
+                && stored.pointer("/metadata/deletionTimestamp").is_none()
+            {
+                return Err(rusternetes_common::Error::InvalidResource(
+                    "metadata.deletionTimestamp: field is immutable".to_string(),
+                ));
+            }
+        }
         self.inner.update(key, value).await
     }
 

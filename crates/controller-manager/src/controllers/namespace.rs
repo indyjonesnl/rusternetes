@@ -1090,26 +1090,27 @@ impl<S: Storage + 'static> NamespaceController<S> {
                 .unwrap_or_default();
 
             if !finalizers.is_empty() {
-                // Stays in storage; stamp deletionTimestamp if not already set.
                 num_remaining += 1;
                 for f in &finalizers {
                     *finalizers_to_num_remaining.entry(f.clone()).or_insert(0) += 1;
                 }
+                // Stays in storage until its finalizers drain. Mark it for
+                // deletion with a DELETE and let the registry stamp
+                // `deletionTimestamp` (upstream `deleteEachItem`,
+                // namespaced_resources_deleter.go:393-415, only ever calls
+                // Delete). A PUT cannot: the generic Store keeps the stored
+                // `deletionTimestamp` on update (#2723).
                 let already_terminating = metadata
                     .get("deletionTimestamp")
                     .and_then(|d| d.as_str())
                     .is_some();
                 if !already_terminating {
-                    let mut updated = resource.clone();
-                    if let Some(meta) = updated.get_mut("metadata") {
-                        if let Some(m) = meta.as_object_mut() {
-                            m.insert(
-                                "deletionTimestamp".to_string(),
-                                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
-                            );
-                        }
+                    if let Err(e) = self.storage.delete_gracefully(&key).await {
+                        warn!(
+                            "Failed to mark {}/{}/{} for deletion: {}",
+                            resource_type, namespace, name, e
+                        );
                     }
-                    let _ = self.storage.update(&key, &updated).await;
                 }
             } else {
                 // No finalizers — hard delete from storage.
