@@ -93,7 +93,8 @@ impl AdmissionWebhookClient {
                         // Allow the request despite the error
                         Ok(AdmissionReviewResponse::allow(request.uid.clone()))
                     }
-                    FailurePolicy::Fail => {
+                    // Upstream treats anything but `Ignore` as Fail (mutating/dispatcher.go:167).
+                    FailurePolicy::Fail | FailurePolicy::Unknown(_) => {
                         error!(
                             "Webhook {} failed with FailurePolicy Fail: {}",
                             webhook.name, e
@@ -136,7 +137,8 @@ impl AdmissionWebhookClient {
                         // Allow the request despite the error
                         Ok(AdmissionReviewResponse::allow(request.uid.clone()))
                     }
-                    FailurePolicy::Fail => {
+                    // Upstream treats anything but `Ignore` as Fail (mutating/dispatcher.go:167).
+                    FailurePolicy::Fail | FailurePolicy::Unknown(_) => {
                         error!(
                             "Webhook {} failed with FailurePolicy Fail: {}",
                             webhook.name, e
