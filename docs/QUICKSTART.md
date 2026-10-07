@@ -105,7 +105,7 @@ Standard `kubectl` works because rusternetes implements the same REST API as ups
 | API Server | Port 6443, HTTPS, REST API + Watch + RBAC + Webhooks + **Web Console** |
 | Scheduler | Affinity, taints/tolerations, priority, preemption |
 | Controller Manager | 31 controllers (Deployment, StatefulSet, Job, DaemonSet, HPA, etc.) |
-| Kubelet (node-1, node-2) | Container runtime via CRI (containerd + Youki), probes, volumes |
+| Kubelet (node-1, node-2) | Container runtime via CRI (containerd + crun), probes, volumes |
 | Kube-Proxy | iptables ClusterIP/NodePort/LoadBalancer routing |
 | CoreDNS | Kubernetes service discovery |
 | Storage | etcd (default), SQLite, or Redis via [Rhino](https://github.com/calfonso/rhino) |
@@ -229,7 +229,7 @@ Rusternetes is a ground-up reimplementation — not a fork. Every component is w
 
 - 216,000+ lines of Rust across 10 crates
 - 90% conformance pass rate (398/441 tests) across 149 rounds of testing
-- Uses CRI (CRI v1 gRPC → containerd → Youki) as the container runtime
+- Uses CRI (CRI v1 gRPC → containerd → crun) as the container runtime
 - Standard `kubectl` works against it (same REST API)
 - Built-in web console with topology visualization, live metrics, and pod log streaming
 - Supports CNI plugins (Calico, Cilium, Flannel) on Linux

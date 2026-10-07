@@ -661,7 +661,7 @@ impl Kubelet {
         metrics_port: u16,
         allowed_unsafe_sysctls: Vec<String>,
     ) -> Result<Self> {
-        // CRI runtime backend (containerd + Youki). The endpoint and runtime
+        // CRI runtime backend (containerd + crun). The endpoint and runtime
         // handler come from the standard kubelet env vars; pod networking is
         // owned entirely by containerd's CNI plugin (CNI is the only
         // pod-networking path). `allowed_unsafe_sysctls` IS wired: it builds
