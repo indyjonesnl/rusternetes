@@ -332,19 +332,48 @@ fn side(resources: Option<&ResourceRequirements>, requests: bool) -> ResourceLis
 /// actuated figures out of `status.containerStatuses` to price an in-place
 /// resize in flight, and quota here is computed from `spec`.
 pub fn aggregate_container_resources(pod: &Pod, requests: bool) -> ResourceList {
+    aggregate_container_resources_non_missing(pod, requests, None)
+}
+
+/// Port of upstream `applyNonMissing` (`component-helpers/resource/helpers.go:322-336`):
+/// every resource named in `non_missing` that the container does not set at
+/// all (an explicit zero counts as set) is added to the container's list.
+fn apply_non_missing(own: ResourceList, non_missing: Option<&ResourceList>) -> ResourceList {
+    let Some(non_missing) = non_missing.filter(|n| !n.is_empty()) else {
+        return own;
+    };
+    let mut cp = own.clone();
+    for (name, value) in non_missing {
+        if !own.contains_key(name) {
+            cp.insert(name.clone(), *value);
+        }
+    }
+    cp
+}
+
+/// [`aggregate_container_resources`] with upstream's
+/// `PodResourcesOptions.NonMissingContainerRequests`
+/// (`helpers.go:218-220`, `:253-255`): applied to each app container and each
+/// init container before it is folded into the pod total.
+pub fn aggregate_container_resources_non_missing(
+    pod: &Pod,
+    requests: bool,
+    non_missing: Option<&ResourceList>,
+) -> ResourceList {
     let Some(spec) = &pod.spec else {
         return ResourceList::new();
     };
 
     let mut total = ResourceList::new();
     for container in &spec.containers {
-        total = add(&total, &side(container.resources.as_ref(), requests));
+        let own = apply_non_missing(side(container.resources.as_ref(), requests), non_missing);
+        total = add(&total, &own);
     }
 
     let mut restartable = ResourceList::new();
     let mut init_max = ResourceList::new();
     for container in spec.init_containers.iter().flatten() {
-        let own = side(container.resources.as_ref(), requests);
+        let own = apply_non_missing(side(container.resources.as_ref(), requests), non_missing);
         let effective = if is_restartable_init(container.restart_policy.as_ref()) {
             total = add(&total, &own);
             restartable = add(&restartable, &own);
@@ -367,7 +396,14 @@ pub fn aggregate_container_resources(pod: &Pod, requests: bool) -> ResourceList 
 /// (`SkipPodLevelResources: !Enabled(PodLevelResources)`,
 /// `pkg/quota/v1/evaluator/core/pods.go:403-404`; `helpers.go:155`).
 pub fn pod_requests(pod: &Pod) -> ResourceList {
-    let mut reqs = aggregate_container_resources(pod, true);
+    pod_requests_non_missing(pod, None)
+}
+
+/// [`pod_requests`] with upstream's `NonMissingContainerRequests` option
+/// (`helpers.go:56`), used by the scheduler for `Non0CPU`/`Non0Mem`
+/// (`pkg/scheduler/framework/types.go:722-745`).
+pub fn pod_requests_non_missing(pod: &Pod, non_missing: Option<&ResourceList>) -> ResourceList {
+    let mut reqs = aggregate_container_resources_non_missing(pod, true, non_missing);
     let Some(spec) = &pod.spec else {
         return reqs;
     };

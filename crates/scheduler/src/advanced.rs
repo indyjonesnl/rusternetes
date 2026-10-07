@@ -297,6 +297,10 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
     // K8s checks ALL resources (cpu, memory, AND extended resources like fakecpu).
     let mut used_cpu = 0i64;
     let mut used_memory = 0i64;
+    // Non-zero usage for the score only (upstream scores on
+    // `GetNonZeroRequested`, `noderesources/resource_allocation.go:188`).
+    let mut used_cpu_non0 = 0i64;
+    let mut used_memory_non0 = 0i64;
     let mut used_extended: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
     let node_name = &node.metadata.name;
@@ -357,6 +361,9 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
         // (e.g. "1k" == 1000), so they are parsed as Quantities, not raw i64
         // — a canonicalized value like "1k" would otherwise parse to 0 and
         // silently under-count usage.
+        let (non0_cpu, non0_mem) = non_zero_request_amounts(existing_pod);
+        used_cpu_non0 += non0_cpu;
+        used_memory_non0 += non0_mem;
         for (key, amount) in pod_request_amounts(existing_pod) {
             match key.as_str() {
                 "cpu" => used_cpu += amount,
@@ -443,16 +450,20 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
         }
     }
 
-    // Calculate score based on remaining capacity (0-100)
-    // Higher remaining capacity = higher score (balanced scheduling)
-    let cpu_score = if available_cpu > 0 {
-        ((available_cpu - cpu_request) * 100 / available_cpu) as i32
+    // Calculate score based on remaining capacity (0-100), over the non-zero
+    // requests (`Non0CPU`/`Non0Mem`, `framework/types.go:722-751`) so
+    // best-effort pods still weigh on the node. Fit above used raw requests.
+    let (cpu_request_non0, memory_request_non0) = non_zero_request_amounts(pod);
+    let score_cpu = total_cpu - used_cpu_non0;
+    let score_memory = total_memory - used_memory_non0;
+    let cpu_score = if score_cpu > 0 {
+        ((score_cpu - cpu_request_non0).max(0) * 100 / score_cpu) as i32
     } else {
         0
     };
 
-    let memory_score = if available_memory > 0 {
-        ((available_memory - memory_request) * 100 / available_memory) as i32
+    let memory_score = if score_memory > 0 {
+        ((score_memory - memory_request_non0).max(0) * 100 / score_memory) as i32
     } else {
         0
     };
@@ -508,6 +519,60 @@ pub(crate) fn pod_request_amounts(pod: &Pod) -> HashMap<String, i64> {
             (name, v.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
         })
         .collect()
+}
+
+/// `DefaultMilliCPURequest` — `pkg/scheduler/util/pod_resources.go:29`
+/// (`100 // 0.1 core`).
+pub(crate) const DEFAULT_MILLI_CPU_REQUEST: i64 = 100;
+/// `DefaultMemoryRequest` — `pkg/scheduler/util/pod_resources.go:31`
+/// (`200 * 1024 * 1024 // 200 MB`).
+pub(crate) const DEFAULT_MEMORY_REQUEST: i64 = 200 * 1024 * 1024;
+
+/// A pod's non-zero CPU (milli) and memory requests: the `Non0CPU`/`Non0Mem`
+/// that upstream `PodInfo.CalculateResource` computes for scoring
+/// (`pkg/scheduler/framework/types.go:722-751`, via
+/// `getNonMissingContainerRequests` `:1025-1053`).
+///
+/// A container (or init container) that does not set cpu/memory is charged
+/// `DEFAULT_MILLI_CPU_REQUEST`/`DEFAULT_MEMORY_REQUEST` so best-effort pods
+/// still weigh on a node's score. Filtering keeps using the raw
+/// [`pod_request_amounts`].
+pub(crate) fn non_zero_request_amounts(pod: &Pod) -> (i64, i64) {
+    use rusternetes_common::quantity::{Format, Quantity};
+    use rusternetes_common::quota::{pod_requests, pod_requests_non_missing, ResourceList};
+
+    let requests = pod_requests(pod);
+    let pod_level_set = rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::PodLevelResources,
+    ) && pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.resources.as_ref())
+        .and_then(|r| r.requests.as_ref())
+        .is_some_and(|r| {
+            r.keys()
+                .any(|k| rusternetes_common::quota::is_supported_pod_level_resource(k))
+        });
+    let cpu = Quantity::from_milli_value(DEFAULT_MILLI_CPU_REQUEST, Format::DecimalSI);
+    let mem = Quantity::from_value(DEFAULT_MEMORY_REQUEST, Format::DecimalSI);
+    let mut non_missing = ResourceList::new();
+    if !pod_level_set || !requests.contains_key("cpu") {
+        non_missing.insert("cpu".to_string(), cpu);
+    }
+    if !pod_level_set || !requests.contains_key("memory") {
+        non_missing.insert("memory".to_string(), mem);
+    }
+    // Upstream types.go:731-745 only recomputes when non-missing is non-empty.
+    let non0 = if non_missing.is_empty() {
+        requests
+    } else {
+        pod_requests_non_missing(pod, Some(&non_missing))
+    };
+    let clamp = |v: i128| v.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    (
+        non0.get("cpu").map(|q| clamp(q.milli_value())).unwrap_or(0),
+        non0.get("memory").map(|q| clamp(q.value())).unwrap_or(0),
+    )
 }
 
 /// System-critical priority threshold. Pods at or above this priority
@@ -2616,5 +2681,154 @@ mod tests {
         assert!(
             calculate_resource_score_with_pods(&make_node("n", "3", "1Gi"), &pod, &[existing]) > 0
         );
+    }
+
+    // ---- Non0CPU / Non0Mem (#2401) ---------------------------------------
+    // Ported from TestPodInfoCalculateResources,
+    // ../kubernetes/pkg/scheduler/framework/types_test.go:1441-1700.
+
+    fn bare_container(name: &str) -> rusternetes_common::resources::Container {
+        let mut c = make_container("1", "1Mi");
+        c.name = name.to_string();
+        c.resources = None;
+        c
+    }
+
+    fn pod_of(
+        containers: Vec<rusternetes_common::resources::Container>,
+        init: Vec<rusternetes_common::resources::Container>,
+        pod_level: Option<&[(&str, &str)]>,
+    ) -> Pod {
+        Pod::new(
+            "p",
+            rusternetes_common::resources::PodSpec {
+                containers,
+                init_containers: if init.is_empty() { None } else { Some(init) },
+                resources: pod_level.map(reqs),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn requested(cpu: &str, mem: &str) -> rusternetes_common::resources::Container {
+        let mut c = make_container(cpu, mem);
+        c.resources = Some(reqs(&[("cpu", cpu), ("memory", mem)]));
+        c
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn non_zero_requestless_container_gets_defaults() {
+        // types_test.go:1457 "requestless container"
+        let pod = pod_of(vec![bare_container("a")], vec![], None);
+        assert_eq!(
+            non_zero_request_amounts(&pod),
+            (DEFAULT_MILLI_CPU_REQUEST, DEFAULT_MEMORY_REQUEST)
+        );
+        assert_eq!(DEFAULT_MEMORY_REQUEST, 209715200);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn non_zero_equals_requests_when_set() {
+        // types_test.go:1470 "1X container with requests"
+        let pod = pod_of(vec![requested("500m", "500Mi")], vec![], None);
+        assert_eq!(non_zero_request_amounts(&pod), (500, 500 * 1024 * 1024));
+        // :1491 "2X container with requests"
+        let pod = pod_of(
+            vec![requested("500m", "500Mi"), requested("700m", "800Mi")],
+            vec![],
+            None,
+        );
+        assert_eq!(non_zero_request_amounts(&pod), (1200, 1300 * 1024 * 1024));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn non_zero_defaults_only_the_containers_missing_a_request() {
+        let pod = pod_of(
+            vec![requested("500m", "500Mi"), bare_container("b")],
+            vec![],
+            None,
+        );
+        assert_eq!(
+            non_zero_request_amounts(&pod),
+            (500 + 100, 500 * 1024 * 1024 + DEFAULT_MEMORY_REQUEST)
+        );
+        // raw requests (used for fit) are untouched
+        assert_eq!(pod_request_amounts(&pod)["cpu"], 500);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn non_zero_pod_level_memory_only() {
+        // types_test.go:1584 "1X container with pod-level memory requests"
+        let _g = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::PodLevelResources,
+            true,
+        );
+        let pod = pod_of(
+            vec![bare_container("a")],
+            vec![bare_container("i")],
+            Some(&[("memory", "1200Mi")]),
+        );
+        assert_eq!(
+            non_zero_request_amounts(&pod),
+            (DEFAULT_MILLI_CPU_REQUEST, 1200 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn non_zero_pod_level_cpu_only() {
+        // types_test.go:1613 "1X container with pod-level cpu requests"
+        let _g = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::PodLevelResources,
+            true,
+        );
+        let pod = pod_of(
+            vec![bare_container("a")],
+            vec![bare_container("i")],
+            Some(&[("cpu", "500m")]),
+        );
+        assert_eq!(
+            non_zero_request_amounts(&pod),
+            (500, DEFAULT_MEMORY_REQUEST)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn non_zero_pod_level_overrides_containers() {
+        // types_test.go:1532 "1X container and 1X sidecar with pod-level requests"
+        let _g = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::PodLevelResources,
+            true,
+        );
+        let mut side = requested("500m", "500Mi");
+        side.restart_policy = Some("Always".to_string());
+        let pod = pod_of(
+            vec![requested("500m", "500Mi")],
+            vec![side],
+            Some(&[("cpu", "1200m"), ("memory", "1200Mi")]),
+        );
+        assert_eq!(non_zero_request_amounts(&pod), (1200, 1200 * 1024 * 1024));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn score_counts_best_effort_pods_on_the_node() {
+        // NodeInfo.GetNonZeroRequested drives resource_allocation.go:188, so
+        // a best-effort pod must weigh on its node's score. Node n1 holds a
+        // best-effort pod, n2 is empty: n2 must score strictly higher.
+        let mut running = make_scheduled_pod("be", 0, "1", "1Mi", "n1");
+        running.spec.as_mut().unwrap().containers[0].resources = None;
+        let incoming = pod_of(vec![requested("100m", "100Mi")], vec![], None);
+        let n1 = make_node("n1", "1", "1Gi");
+        let n2 = make_node("n2", "1", "1Gi");
+        let all = [running];
+        let s1 = calculate_resource_score_with_pods(&n1, &incoming, &all);
+        let s2 = calculate_resource_score_with_pods(&n2, &incoming, &all);
+        assert!(s2 > s1, "empty node {s2} must outscore loaded node {s1}");
     }
 }
