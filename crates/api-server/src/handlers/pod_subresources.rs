@@ -845,8 +845,8 @@ pub fn build_kubelet_portforward_url(
 ///
 /// Proxies port-forward to the pod's kubelet with an upgrade-aware reverse proxy.
 /// Mirrors `PortForwardREST.Connect` (`pkg/registry/core/pod/rest/subresources.go:256-279`)
-/// + `PortForwardLocation`; the kubelet resolves the sandbox and calls CRI
-/// `PortForward`, and the SPDY/WebSocket bytes pass through untouched.
+/// and `PortForwardLocation`. The kubelet resolves the sandbox and calls CRI
+/// `PortForward`; the SPDY/WebSocket bytes pass through untouched.
 pub async fn portforward(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
