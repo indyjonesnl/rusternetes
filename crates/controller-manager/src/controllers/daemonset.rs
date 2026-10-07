@@ -752,6 +752,25 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     .any(|p| format!("{}/{}", namespace, p.metadata.name) == pending)
                 {
                     self.observe_creation(&exp_key, &pending);
+                } else {
+                    // Rusternetes deviation: upstream settles a creation from
+                    // the pod informer's add event (`addPod` ->
+                    // `CreationObserved`, daemon_controller.go:~360), which
+                    // fires even if the pod is deleted right after (a Failed
+                    // daemon pod being replaced, e2e daemon_set.go "should
+                    // retry creating failed daemon pods"). Without a watch,
+                    // a pod missing from the listing is either not yet
+                    // visible (stale list: keep waiting) or created and
+                    // already gone. A direct read tells them apart: NotFound
+                    // after a successful create means it was observable.
+                    let name = pending.rsplit('/').next().unwrap_or(&pending);
+                    let pod_key = build_key("pods", Some(namespace), name);
+                    if matches!(
+                        self.storage.get::<Pod>(&pod_key).await,
+                        Err(rusternetes_common::Error::NotFound(_))
+                    ) {
+                        self.observe_creation(&exp_key, &pending);
+                    }
                 }
             }
             for pending in self.expectations.pending_deletions(&exp_key) {
