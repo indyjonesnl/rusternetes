@@ -1,4 +1,5 @@
 use super::expectations::ControllerExpectations;
+use super::replicationcontroller::slow_start_batches_capped;
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use futures::StreamExt;
@@ -94,42 +95,123 @@ pub struct DaemonSetController<S: Storage> {
     /// Per-DaemonSet ("ns/name") expectations of in-flight pod deletions.
     /// Upstream `dsc.expectations` (`daemon_controller.go`), a
     /// `UIDTrackingControllerExpectations`; shared implementation in
-    /// [`super::expectations`]. Only the deletion half is wired; creation
-    /// expectations are a tracked follow-up.
+    /// [`super::expectations`]. Both halves are wired (creations and
+    /// deletions, set together by `sync_nodes`).
     expectations: Arc<ControllerExpectations>,
+    /// Rusternetes-only: per-DaemonSet keys ("ns/pod") of pods this
+    /// controller created whose creation is still unobserved. Lets `Added`
+    /// events and a fresh listing each observe a creation exactly once
+    /// (upstream `addPod` observes unconditionally, :551).
+    created_pods:
+        std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
 }
+
+/// `BurstReplicas` (pkg/controller/daemon/daemon_controller.go:61): caps the
+/// creates and the deletes one `syncNodes` call issues.
+const BURST_REPLICAS: usize = 250;
+/// `controller.SlowStartInitialBatchSize`
+/// (pkg/controller/controller_utils.go:87).
+const SLOW_START_INITIAL_BATCH_SIZE: usize = 1;
 
 impl<S: Storage + 'static> DaemonSetController<S> {
     pub fn new(storage: Arc<S>) -> Self {
         Self {
             storage,
             expectations: Arc::new(ControllerExpectations::new()),
+            created_pods: Default::default(),
         }
     }
 
-    /// Port of `RealPodControl.DeletePod` as driven by `syncNodes`
-    /// (`daemon_controller.go:1060-1073`; `controller_utils.go:618`):
-    /// record the expected deletions BEFORE issuing them
-    /// (`SetExpectations`, :1000), delete each pod GRACEFULLY, and on any
-    /// error lower the expectation for that pod (`DeletionObserved`, :1068)
-    /// because the informer will never see the delete. NotFound is benign
-    /// (`!apierrors.IsNotFound(err)`, :1069); other errors are returned.
-    async fn delete_pods(
+    /// Port of `syncNodes` (`pkg/controller/daemon/daemon_controller.go:984-1073`).
+    ///
+    /// Expectations are recorded BEFORE anything is issued
+    /// (`SetExpectations(dsKey, createDiff, deleteDiff)`, :1000), both counts
+    /// capped at `burstReplicas` (:987-992). Pods are created in slow-start
+    /// batches (:1019-1057): a failed create lowers its own expectation
+    /// (`CreationObserved`, :1043) and a failing batch abandons the rest,
+    /// lowering by the skipped count (`LowerExpectations`, :1055). Deletes are
+    /// graceful (`RealPodControl.DeletePod`, controller_utils.go:618); a
+    /// failed one lowers its expectation (`DeletionObserved`, :1068) because
+    /// the informer will never see it, NotFound being benign (:1069).
+    /// Errors are aggregated; the first is returned.
+    async fn sync_nodes(
         &self,
+        daemonset: &DaemonSet,
         exp_key: &str,
         namespace: &str,
-        pod_names: &[String],
+        pods_to_delete: &[String],
+        nodes_needing_pods: &[String],
     ) -> Result<()> {
-        if pod_names.is_empty() {
+        if pods_to_delete.is_empty() && nodes_needing_pods.is_empty() {
             return Ok(());
         }
+        let create_diff = nodes_needing_pods.len().min(BURST_REPLICAS);
+        let delete_diff = pods_to_delete.len().min(BURST_REPLICAS);
+        let pod_names = &pods_to_delete[..delete_diff];
+        let nodes_needing_pods = &nodes_needing_pods[..create_diff];
         let observed_keys: Vec<String> = pod_names
             .iter()
             .map(|n| format!("{}/{}", namespace, n))
             .collect();
+        // Track which pods the deletions wait on, then record both halves in
+        // one `SetExpectations`.
         self.expectations
             .expect_deletions_of(exp_key, &observed_keys);
-        let mut first_err: Option<rusternetes_common::Error> = None;
+        self.expectations
+            .set_expectations(exp_key, create_diff as i64, delete_diff as i64);
+        self.created_pods.lock().unwrap().remove(exp_key);
+
+        let mut first_err: Option<anyhow::Error> = None;
+        let mut attempted = 0usize;
+        for batch in
+            slow_start_batches_capped(create_diff, SLOW_START_INITIAL_BATCH_SIZE, usize::MAX)
+        {
+            let nodes = &nodes_needing_pods[attempted..attempted + batch];
+            attempted += batch;
+            let results = futures::future::join_all(
+                nodes
+                    .iter()
+                    .map(|node| self.create_pod(daemonset, node, namespace)),
+            )
+            .await;
+            let mut batch_failed = false;
+            for result in results {
+                match result {
+                    Ok(pod_name) => {
+                        self.created_pods
+                            .lock()
+                            .unwrap()
+                            .entry(exp_key.to_string())
+                            .or_default()
+                            .insert(format!("{}/{}", namespace, pod_name));
+                    }
+                    Err(e) => {
+                        // Rusternetes deviation: upstream returns without
+                        // lowering for a NamespaceTerminating cause
+                        // (:1034-1038); we lower for every failure so the
+                        // record never waits out its TTL. AlreadyExists is
+                        // benign (race / re-reconcile), as before.
+                        self.expectations.creation_observed(exp_key);
+                        let text = e.to_string();
+                        if text.contains("already exists") || text.contains("AlreadyExists") {
+                            debug!("DaemonSet pod already exists, skipping: {}", text);
+                            continue;
+                        }
+                        warn!("Failed to create DaemonSet pod in {}: {}", namespace, e);
+                        batch_failed = true;
+                        first_err.get_or_insert(e);
+                    }
+                }
+            }
+            // Pods we never attempted shouldn't be expected (:1051-1058).
+            let skipped = create_diff - attempted;
+            if batch_failed && skipped > 0 {
+                self.expectations
+                    .lower_expectations(exp_key, skipped as i64, 0);
+                break;
+            }
+        }
+
         for (name, observed) in pod_names.iter().zip(&observed_keys) {
             let pod_key = build_key("pods", Some(namespace), name);
             if let Err(e) = self.storage.delete_gracefully(&pod_key).await {
@@ -139,12 +221,12 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                         "Failed to delete DaemonSet pod {}/{}: {}",
                         namespace, name, e
                     );
-                    first_err.get_or_insert(e);
+                    first_err.get_or_insert(e.into());
                 }
             }
         }
         match first_err {
-            Some(e) => Err(e.into()),
+            Some(e) => Err(e),
             None => Ok(()),
         }
     }
@@ -279,6 +361,21 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         }
     }
 
+    /// Lower the creation expectation for `pod_key`, only if this controller
+    /// is still waiting to see that pod (so an event and a listing never
+    /// both count it).
+    fn observe_creation(&self, exp_key: &str, pod_key: &str) {
+        let hit = self
+            .created_pods
+            .lock()
+            .unwrap()
+            .get_mut(exp_key)
+            .is_some_and(|set| set.remove(pod_key));
+        if hit {
+            self.expectations.creation_observed(exp_key);
+        }
+    }
+
     /// When a pod changes, find its owning DaemonSet and enqueue it for reconciliation.
     async fn enqueue_ds_for_pod_event(
         &self,
@@ -303,6 +400,15 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 for owner in owner_refs {
                     if owner.kind == "DaemonSet" {
                         let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+                        if matches!(event, rusternetes_storage::WatchEvent::Added(..)) && !deleting
+                        {
+                            // `addPod` -> `expectations.CreationObserved`
+                            // (daemon_controller.go:551), once per created pod.
+                            self.observe_creation(
+                                &format!("{}/{}", ns, owner.name),
+                                &format!("{}/{}", ns, pod.metadata.name),
+                            );
+                        }
                         if deleting {
                             self.expectations.deletion_observed_of(
                                 &format!("{}/{}", ns, owner.name),
@@ -363,6 +469,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     // upstream TestExpectationsOnRecreate).
                     self.expectations
                         .delete_expectations(&format!("{}/{}", ns, name));
+                    self.created_pods
+                        .lock()
+                        .unwrap()
+                        .remove(&format!("{}/{}", ns, name));
                     queue.forget(&key).await;
                 }
             }
@@ -627,6 +737,23 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         // expectation now rather than blocking on a watch event that may
         // never reach a controller driven by direct `reconcile` calls.
         if !exp_satisfied {
+            // Same for creations: a pod this DaemonSet created that the
+            // listing already shows has been observed.
+            let pending_creates: Vec<String> = self
+                .created_pods
+                .lock()
+                .unwrap()
+                .get(&exp_key)
+                .map(|set| set.iter().cloned().collect())
+                .unwrap_or_default();
+            for pending in pending_creates {
+                if all_pods
+                    .iter()
+                    .any(|p| format!("{}/{}", namespace, p.metadata.name) == pending)
+                {
+                    self.observe_creation(&exp_key, &pending);
+                }
+            }
             for pending in self.expectations.pending_deletions(&exp_key) {
                 let still_live = all_pods.iter().any(|p| {
                     p.metadata.deletion_timestamp.is_none()
@@ -728,39 +855,29 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         }
 
         // `syncDaemonSet` (daemon_controller.go:1263-1266): while earlier
-        // deletions are unobserved, do nothing but update status.
+        // creations/deletions are unobserved, do nothing but update status.
         if exp_satisfied {
-            // `syncNodes` (daemon_controller.go:984-1073): graceful delete of
-            // everything collected above, expectations set first.
-            if let Err(e) = self.delete_pods(&exp_key, namespace, &pods_to_delete).await {
+            // Manage phase: one pod per eligible node (only nodes with NO
+            // pod) plus everything collected above to delete, in ONE
+            // `syncNodes` call (daemon_controller.go:984-1073) so both
+            // expectation halves are set together. Runs BEFORE the rolling
+            // update phase, matching K8s: manage() then rollingUpdate().
+            let nodes_needing_pods: Vec<String> = eligible_nodes
+                .iter()
+                .map(|n| n.metadata.name.clone())
+                .filter(|n| !pods_by_node.contains_key(n))
+                .collect();
+            if let Err(e) = self
+                .sync_nodes(
+                    daemonset,
+                    &exp_key,
+                    namespace,
+                    &pods_to_delete,
+                    &nodes_needing_pods,
+                )
+                .await
+            {
                 deferred_err = Some(e);
-            }
-        }
-
-        // --- Manage phase: ensure one pod per eligible node (only for nodes with NO pod) ---
-        // This runs BEFORE the rolling update phase, matching K8s behavior:
-        // manage() creates pods on empty nodes, then rollingUpdate() replaces old pods.
-        for node in eligible_nodes.iter().filter(|_| exp_satisfied) {
-            let node_name = &node.metadata.name;
-
-            if !pods_by_node.contains_key(node_name) {
-                // Create pod for this node, ignore AlreadyExists (race / re-reconcile)
-                match self.create_pod(daemonset, node_name, namespace).await {
-                    Ok(_) => {
-                        info!("Created DaemonSet pod on node {}", node_name);
-                    }
-                    Err(e) => {
-                        let err_str = format!("{}", e);
-                        if err_str.contains("already exists") || err_str.contains("AlreadyExists") {
-                            debug!(
-                                "DaemonSet pod on node {} already exists, skipping",
-                                node_name
-                            );
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                }
             }
         }
 
@@ -914,7 +1031,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 })
                 .collect();
             if let Err(e) = self
-                .delete_pods(&exp_key, namespace, &rolling_deletes)
+                .sync_nodes(daemonset, &exp_key, namespace, &rolling_deletes, &[])
                 .await
             {
                 deferred_err.get_or_insert(e);
@@ -1197,7 +1314,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         daemonset: &DaemonSet,
         node_name: &str,
         namespace: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let daemonset_name = &daemonset.metadata.name;
         // Pod naming depends on the update strategy.
         //
@@ -1374,7 +1491,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         let key = format!("/registry/pods/{}/{}", namespace, pod_name);
         self.storage.create(&key, &pod).await?;
 
-        Ok(())
+        Ok(pod_name)
     }
 
     /// Inject the projected `kube-api-access` volume, as upstream's ServiceAccount
@@ -2716,6 +2833,129 @@ mod tests {
             after.metadata.deletion_timestamp,
             Some(ts),
             "deletionTimestamp untouched"
+        );
+    }
+
+    /// `syncNodes` (daemon_controller.go:1000) sets creation expectations
+    /// together with deletion ones; `addPod` (:551) observes each created pod
+    /// once. While unmet the next sync only updates status.
+    #[tokio::test]
+    async fn test_creation_expectations_set_observed_once_and_gate_sync() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DaemonSetController::new(storage.clone());
+        for n in ["n1", "n2"] {
+            storage
+                .create(&format!("/registry/nodes/{n}"), &make_test_node(n))
+                .await
+                .unwrap();
+        }
+        let mut ds = make_test_daemonset("cx", "default");
+        storage
+            .create("/registry/daemonsets/default/cx", &ds)
+            .await
+            .unwrap();
+        controller.reconcile(&mut ds).await.unwrap();
+        assert_eq!(
+            controller.expectations.get_expectations("default/cx"),
+            Some((2, 0))
+        );
+        assert!(!controller.expectations.satisfied("default/cx"));
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        let queue = WorkQueue::new();
+        for pod in &pods {
+            let key = format!("/registry/pods/default/{}", pod.metadata.name);
+            let json = serde_json::to_string(pod).unwrap();
+            let ev = rusternetes_storage::WatchEvent::Added(key, json);
+            controller.enqueue_ds_for_pod_event(&ev, &queue).await;
+            // a replayed event must not count twice
+            controller.enqueue_ds_for_pod_event(&ev, &queue).await;
+        }
+        assert_eq!(
+            controller.expectations.get_expectations("default/cx"),
+            Some((0, 0))
+        );
+    }
+
+    /// Rusternetes settle step: a created pod the fresh listing shows counts
+    /// as observed, so direct `reconcile` calls do not wedge on a missing
+    /// event.
+    #[tokio::test]
+    async fn test_listing_settles_creation_expectation() {
+        let (controller, _storage, mut ds, _pod) = one_pod_fixture("cs").await;
+        assert_eq!(
+            controller.expectations.get_expectations("default/cs"),
+            Some((1, 0))
+        );
+        controller.reconcile(&mut ds).await.unwrap();
+        assert!(controller.expectations.satisfied("default/cs"));
+    }
+
+    /// `syncNodes` caps one call at `burstReplicas` (:987-989) and sets the
+    /// capped count as the expectation.
+    #[tokio::test]
+    async fn test_burst_replicas_caps_creates() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DaemonSetController::new(storage.clone());
+        for i in 0..(BURST_REPLICAS + 10) {
+            let n = format!("n{i}");
+            storage
+                .create(&format!("/registry/nodes/{n}"), &make_test_node(&n))
+                .await
+                .unwrap();
+        }
+        let mut ds = make_test_daemonset("bc", "default");
+        storage
+            .create("/registry/daemonsets/default/bc", &ds)
+            .await
+            .unwrap();
+        controller.reconcile(&mut ds).await.unwrap();
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(ds_pods(&pods, "bc").len(), BURST_REPLICAS);
+        assert_eq!(
+            controller.expectations.get_expectations("default/bc"),
+            Some((BURST_REPLICAS as i64, 0))
+        );
+    }
+
+    /// A failed create lowers its own expectation (`CreationObserved`,
+    /// :1043): no pod will ever arrive for it. Forced with an OnDelete
+    /// DaemonSet whose deterministic pod name is already taken.
+    #[tokio::test]
+    async fn test_failed_create_lowers_expectation() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DaemonSetController::new(storage.clone());
+        storage
+            .create("/registry/nodes/n1", &make_test_node("n1"))
+            .await
+            .unwrap();
+        let mut ds = make_test_daemonset("fc", "default");
+        ds.spec.update_strategy = Some(
+            rusternetes_common::resources::workloads::DaemonSetUpdateStrategy {
+                strategy_type: Some("OnDelete".to_string()),
+                rolling_update: None,
+            },
+        );
+        storage
+            .create("/registry/daemonsets/default/fc", &ds)
+            .await
+            .unwrap();
+        // An unowned pod already holds the name `fc-n1`.
+        let mut squatter = DaemonSetController::<MemoryStorage>::candidate_pod_from_template(&ds);
+        squatter.metadata.name = "fc-n1".to_string();
+        squatter.metadata.namespace = Some("default".to_string());
+        squatter.metadata.owner_references = None;
+        squatter.metadata.labels = None;
+        squatter.spec.as_mut().unwrap().node_name = None;
+        storage
+            .create("/registry/pods/default/fc-n1", &squatter)
+            .await
+            .unwrap();
+        controller.reconcile(&mut ds).await.unwrap();
+        assert_eq!(
+            controller.expectations.get_expectations("default/fc"),
+            Some((0, 0)),
+            "the failed create must not be waited on"
         );
     }
 }
