@@ -692,6 +692,8 @@ async fn daemonset_should_remove_pod_when_node_leaves() {
 
     // Reconcile should remove pod from departed node
     controller.reconcile_all().await.unwrap();
+    // The controller deletes gracefully (#2465); the kubelet reaps the pod.
+    simulate_kubelet_cleanup(&storage, "default").await;
 
     let final_pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
     assert_eq!(

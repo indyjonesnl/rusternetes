@@ -6422,6 +6422,80 @@ mod tests {
         assert_eq!(ready(&node).status, "False");
     }
 
+    /// #2591: the CSI plugin's `SetKubeletError` must surface in the node's
+    /// Ready condition at the kubelet level, ordered runtime, network, storage
+    /// (`errs := []error{runtimeErrorsFunc(), networkErrorsFunc(),
+    /// storageErrorsFunc(), ...}`, pkg/kubelet/nodestatus/setters.go:491) and
+    /// joined by `utilerrors.NewAggregate` (setters.go:505-513). The CRI
+    /// socket is absent so the runtime error is the first aggregate member;
+    /// the CSINode error must follow it and vanish once cleared.
+    /// Regression guard: the behaviour already exists (#2590).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn csinode_storage_error_gates_ready_condition() {
+        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = Kubelet::new(
+            "node-csi".into(),
+            storage.clone(),
+            10,
+            dir.path().join("vols").display().to_string(),
+            "10.96.0.10".into(),
+            "cluster.local".into(),
+            "bridge".into(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+        k.update_runtime_up().await;
+        k.set_kubelet_error(Some("CSINode is not yet initialized".into()));
+        let errs = k.ready_errors();
+        assert_eq!(
+            errs.last().map(String::as_str),
+            Some("CSINode is not yet initialized"),
+            "storage error is last: {errs:?}"
+        );
+        assert!(errs.len() >= 2, "runtime error precedes storage: {errs:?}");
+
+        k.register_node().await.unwrap();
+        let key = build_key("nodes", None, "node-csi");
+        let ready = |n: &rusternetes_common::resources::Node| {
+            n.status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|c| c.condition_type == "Ready")
+                .cloned()
+                .unwrap()
+        };
+        let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        let c = ready(&node);
+        assert_eq!(c.status, "False");
+        assert_eq!(c.reason.as_deref(), Some("KubeletNotReady"));
+        let msg = c.message.unwrap();
+        assert!(msg.contains("CSINode is not yet initialized"), "{msg}");
+        assert!(
+            msg.find("container runtime").unwrap() < msg.find("CSINode").unwrap(),
+            "runtime before storage: {msg}"
+        );
+
+        // Cleared (CSINode initialised): the heartbeat drops the message.
+        k.set_kubelet_error(None);
+        k.update_node_status().await.unwrap();
+        let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        let c = ready(&node);
+        assert!(!c.message.unwrap().contains("CSINode"));
+    }
+
     fn resources(pairs: &[(&str, &str)]) -> Option<std::collections::HashMap<String, String>> {
         Some(
             pairs

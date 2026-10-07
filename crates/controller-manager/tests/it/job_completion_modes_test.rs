@@ -378,7 +378,7 @@ async fn test_indexed_job_success_policy_caps_status_succeeded_at_policy_match()
     set_pod_status(&storage, "default", &pod0, succeeded_status()).await;
 
     // First reconcile: policy fires on index 0. Other pod gets terminated.
-    controller.reconcile_all().await.unwrap();
+    crate::kubelet_double::job_reconcile_all_settled(&controller, &storage).await;
 
     let after_policy: Job = storage.get(&key).await.unwrap();
     let st1 = after_policy.status.clone().expect("status after policy");
