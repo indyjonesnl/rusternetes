@@ -751,51 +751,40 @@ impl<S: Storage + 'static> JobController<S> {
         Ok(())
     }
 
-    /// Persist `job.status`, retrying a CAS conflict, and skipping the write
-    /// entirely when nothing changed (a redundant write wakes every watcher).
+    /// Persist `job.status` conditionally on the resourceVersion of the Job
+    /// this sync read, skipping the write when nothing changed (a redundant
+    /// write wakes every watcher).
+    ///
+    /// Upstream's `updateStatusHandler` is `Jobs(ns).UpdateStatus(ctx, job)`
+    /// on the object the sync was handed (`pkg/controller/job/
+    /// job_controller.go:1891-1893`); the registry enforces the
+    /// resourceVersion, a lost race is a Conflict, `syncJob` returns it and the
+    /// workqueue retries with a fresh read. So: no in-place retry and no write
+    /// built from a re-read; a status computed from a stale read must never
+    /// overwrite a newer one (#2160). The worker already requeues on Err.
     async fn write_status(&self, key: &str, job: &mut Job) -> Result<()> {
-        let status_to_save = job.status.clone();
-        for attempt in 0..3 {
-            match self.storage.get::<Job>(key).await {
-                Ok(mut fresh_job) => {
-                    // Counters must not go backwards against what is already
-                    // persisted, or the api-server refuses this and every later
-                    // write (#1955).
-                    let mut next_status = status_to_save.clone();
-                    if let Some(next) = next_status.as_mut() {
-                        clamp_counters_monotonic(next, fresh_job.status.as_ref());
-                    }
-                    if fresh_job.status == next_status {
-                        job.status = next_status;
-                        return Ok(());
-                    }
-                    fresh_job.status = next_status.clone();
-                    // Status subresource write (#1723).
-                    match self.storage.update_status(key, &fresh_job).await {
-                        Ok(_) => {
-                            job.status = next_status;
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Job status update CAS conflict on {} (attempt {}): {}",
-                                key,
-                                attempt + 1,
-                                e
-                            );
-                            if attempt == 2 {
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    // The Job was deleted between the list and this write.
-                    debug!("Job {} no longer exists: {}", key, e);
-                    return Ok(());
-                }
+        let persisted = match self.storage.get::<Job>(key).await {
+            Ok(j) => j,
+            Err(e) => {
+                // The Job was deleted between the list and this write.
+                debug!("Job {} no longer exists: {}", key, e);
+                return Ok(());
             }
+        };
+        // Counters must not go backwards against what is already persisted, or
+        // the api-server refuses this and every later write (#1955).
+        if let Some(next) = job.status.as_mut() {
+            clamp_counters_monotonic(next, persisted.status.as_ref());
         }
+        let stale = job.metadata.resource_version.is_some()
+            && persisted.metadata.resource_version != job.metadata.resource_version;
+        if !stale && persisted.status == job.status {
+            return Ok(());
+        }
+        // update_status_cas refuses (Conflict) when `job` is older than the
+        // stored object; the error goes to the worker for requeue.
+        let written = self.storage.update_status_cas(key, &*job).await?;
+        job.metadata.resource_version = written.metadata.resource_version;
         Ok(())
     }
 
@@ -1265,8 +1254,9 @@ impl<S: Storage + 'static> JobController<S> {
                                 if let Some(ref mut s) = fresh_job.status {
                                     s.terminating = Some(terminating);
                                 }
-                                // Status subresource write (#1723).
-                                let _ = self.storage.update_status(&key, &fresh_job).await;
+                                // Status subresource write (#1723), conditional
+                                // on the fresh read's resourceVersion (#2160).
+                                let _ = self.storage.update_status_cas(&key, &fresh_job).await;
                             }
                         }
                     }
