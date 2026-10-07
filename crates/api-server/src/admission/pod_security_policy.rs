@@ -1617,6 +1617,10 @@ fn windows_host_process_1_0(_: &ObjectMeta, spec: &PodSpec) -> CheckResult {
 }
 
 #[cfg(test)]
+#[path = "pod_security_policy_cases.rs"]
+mod cases;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rusternetes_common::resources::pod::Pod;
