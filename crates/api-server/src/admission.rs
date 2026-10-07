@@ -967,22 +967,8 @@ pub async fn set_default_storage_class<S: Storage>(
 fn get_default_class(
     classes: Vec<rusternetes_common::resources::StorageClass>,
 ) -> Option<rusternetes_common::resources::StorageClass> {
-    let is_default = |sc: &rusternetes_common::resources::StorageClass| {
-        sc.metadata.annotations.as_ref().is_some_and(|a| {
-            a.get("storageclass.kubernetes.io/is-default-class")
-                .is_some_and(|v| v == "true")
-                || a.get("storageclass.beta.kubernetes.io/is-default-class")
-                    .is_some_and(|v| v == "true")
-        })
-    };
-    let mut defaults: Vec<_> = classes.into_iter().filter(is_default).collect();
-    defaults.sort_by(|a, b| {
-        b.metadata
-            .creation_timestamp
-            .cmp(&a.metadata.creation_timestamp)
-            .then_with(|| a.metadata.name.cmp(&b.metadata.name))
-    });
-    defaults.into_iter().next()
+    // Shared with the PV controller.
+    rusternetes_common::resources::volume::get_default_class(classes)
 }
 
 /// ServiceAccount admission controller - injects service account token volumes into pods
