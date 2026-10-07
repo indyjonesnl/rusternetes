@@ -7,8 +7,8 @@
 //!
 //! and `pkg/quota/v1/evaluator/core/persistent_volume_claims.go`
 //! (`pvcEvaluator`; its `Usage` is `rusternetes_common::quota::pvc_usage`,
-//! shared with the quota controller's `UsageStats`). Not ported yet: the
-//! VolumeAttributesClass scope, and `Handles` for the `status` subresource
+//! shared with the quota controller's `UsageStats`), including the
+//! VolumeAttributesClass scope and `Handles` for the `status` subresource
 //! (`RequiresQuotaReplenish`).
 //!
 //! The pod evaluator (`pods.go`) is not ported here: pods are admitted by
@@ -18,38 +18,90 @@
 use rusternetes_common::admission::Operation;
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::quota::ResourceList;
-use rusternetes_common::quota::{pvc_matches_resource_name, pvc_usage};
-use rusternetes_common::resources::{PersistentVolumeClaim, ResourceQuota, Service, ServiceType};
+use rusternetes_common::quota::{
+    pvc_matches_resource_name, pvc_matches_scope, pvc_matching_scopes,
+    pvc_requires_quota_replenish, pvc_usage, scope_selectors_from_quota,
+};
+use rusternetes_common::resources::{
+    PersistentVolumeClaim, ResourceQuota, ScopedResourceSelectorRequirement, Service, ServiceType,
+};
 use serde_json::Value;
 
+use super::Attributes;
 use crate::registry::rest::GroupResource;
 
 /// `quota.Evaluator` (apiserver/pkg/quota/v1/interfaces.go), reduced to what
-/// admission calls. Scope matching is always `MatchesNoScopeFunc` for the
-/// evaluators ported here, so `MatchingScopes` / `UncoveredQuotaScopes`
-/// return nothing and are left out.
+/// admission calls. The evaluators without a scope function of their own use
+/// `generic.MatchesNoScopeFunc`, which matches no scope, so their
+/// `MatchingScopes` / `UncoveredQuotaScopes` return nothing.
 pub trait Evaluator: Send + Sync {
-    /// `Handles`: whether the operation can change quota usage.
-    fn handles(&self, operation: &Operation, subresource: Option<&str>) -> bool;
+    /// `Handles`: whether the request can change quota usage. It receives the
+    /// whole request because the `status` subresource decides on the objects
+    /// (persistent_volume_claims.go:96-111).
+    fn handles(&self, a: &Attributes<'_>) -> bool;
     /// `MatchingResources`: the subset of `input` this evaluator tracks.
     fn matching_resources(&self, input: &[String]) -> Vec<String>;
     /// `Usage`: what `obj` consumes.
     fn usage(&self, obj: &Value) -> Result<ResourceList, String>;
+    /// `Constraints`: verify the required resources are present on `item`.
+    /// A no-op for every evaluator ported here.
+    fn constraints(&self, _required: &[String], _item: &Value) -> Result<(), String> {
+        Ok(())
+    }
 
-    /// `Matches` via `generic.Matches` (evaluator.go:190-209) with
-    /// `MatchesNoScopeFunc`: the quota tracks one of our resources, and has
-    /// no scope (no scope matches an object this evaluator measures).
-    fn matches(&self, quota: &ResourceQuota) -> bool {
+    /// `MatchesScopeFunc` (generic/evaluator.go:63): whether `item` matches
+    /// one scope selector. Default is `MatchesNoScopeFunc`
+    /// (evaluator.go:50-52): never.
+    fn matches_scope(
+        &self,
+        _selector: &ScopedResourceSelectorRequirement,
+        _item: &Value,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// `Matches` via `generic.Matches` (evaluator.go:150-169): the quota
+    /// tracks one of our resources, and `item` matches every scope the quota
+    /// carries (`spec.scopes` and `spec.scopeSelector`).
+    fn matches(&self, quota: &ResourceQuota, item: &Value) -> Result<bool, String> {
         let match_resource = !self
             .matching_resources(&status_hard_names(quota))
             .is_empty();
-        let has_scope = quota.spec.scopes.as_ref().is_some_and(|s| !s.is_empty())
-            || quota
-                .spec
-                .scope_selector
-                .as_ref()
-                .is_some_and(|s| !s.match_expressions.is_empty());
-        match_resource && !has_scope
+        let mut match_scope = true;
+        for selector in scope_selectors_from_quota(&quota.spec) {
+            let inner = self.matches_scope(&selector, item)?;
+            match_scope = match_scope && inner;
+        }
+        Ok(match_resource && match_scope)
+    }
+
+    /// `MatchingScopes`: the selectors `item` matches.
+    fn matching_scopes(
+        &self,
+        item: &Value,
+        selectors: &[ScopedResourceSelectorRequirement],
+    ) -> Result<Vec<ScopedResourceSelectorRequirement>, String> {
+        let mut matched = Vec::new();
+        for selector in selectors {
+            let m = self
+                .matches_scope(selector, item)
+                .map_err(|e| format!("error on matching scope {selector:?}: {e}"))?;
+            if m {
+                matched.push(selector.clone());
+            }
+        }
+        Ok(matched)
+    }
+
+    /// `UncoveredQuotaScopes`: the limited scopes with no matched quota scope
+    /// of the same name. Evaluators with no scope function return none
+    /// (`generic.UncoveredQuotaScopes`'s no-scope behaviour).
+    fn uncovered_quota_scopes(
+        &self,
+        _limited: &[ScopedResourceSelectorRequirement],
+        _matched: &[ScopedResourceSelectorRequirement],
+    ) -> Result<Vec<ScopedResourceSelectorRequirement>, String> {
+        Ok(Vec::new())
     }
 }
 
@@ -110,8 +162,8 @@ impl ObjectCountEvaluator {
 impl Evaluator for ObjectCountEvaluator {
     /// evaluator.go:275-282: count objects on create, never on a
     /// subresource.
-    fn handles(&self, operation: &Operation, subresource: Option<&str>) -> bool {
-        subresource.is_none() && *operation == Operation::Create
+    fn handles(&self, a: &Attributes<'_>) -> bool {
+        a.subresource.is_none() && a.operation == Operation::Create
     }
 
     fn matching_resources(&self, input: &[String]) -> Vec<String> {
@@ -139,8 +191,8 @@ pub struct ServiceEvaluator;
 impl Evaluator for ServiceEvaluator {
     /// services.go:67-75: create and update, since a type change moves
     /// usage between node ports and load balancers.
-    fn handles(&self, operation: &Operation, subresource: Option<&str>) -> bool {
-        subresource.is_none() && matches!(operation, Operation::Create | Operation::Update)
+    fn handles(&self, a: &Attributes<'_>) -> bool {
+        a.subresource.is_none() && matches!(a.operation, Operation::Create | Operation::Update)
     }
 
     /// `serviceResources` (services.go:37-42).
@@ -194,10 +246,53 @@ impl Evaluator for ServiceEvaluator {
 pub struct PersistentVolumeClaimEvaluator;
 
 impl Evaluator for PersistentVolumeClaimEvaluator {
-    /// persistent_volume_claims.go:93-96: create and update of the claim
-    /// itself.
-    fn handles(&self, operation: &Operation, subresource: Option<&str>) -> bool {
-        subresource.is_none() && matches!(operation, Operation::Create | Operation::Update)
+    /// persistent_volume_claims.go:96-111: create and update of the claim
+    /// itself; on `status`, only an update that `RequiresQuotaReplenish`
+    /// (an object that does not decode is not handled).
+    fn handles(&self, a: &Attributes<'_>) -> bool {
+        match a.subresource {
+            None => matches!(a.operation, Operation::Create | Operation::Update),
+            Some("status") => {
+                let pvc = decode_pvc(a.object);
+                let old = a.old_object.map(decode_pvc);
+                match (pvc, old) {
+                    (Ok(pvc), Some(Ok(old))) => pvc_requires_quota_replenish(&pvc, &old),
+                    _ => false,
+                }
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// `pvcMatchesScopeFunc` (persistent_volume_claims.go:293-309).
+    fn matches_scope(
+        &self,
+        selector: &ScopedResourceSelectorRequirement,
+        item: &Value,
+    ) -> Result<bool, String> {
+        pvc_matches_scope(selector, &decode_pvc(item)?)
+    }
+
+    /// `pvcEvaluator.MatchingScopes` (:122-139).
+    fn matching_scopes(
+        &self,
+        item: &Value,
+        selectors: &[ScopedResourceSelectorRequirement],
+    ) -> Result<Vec<ScopedResourceSelectorRequirement>, String> {
+        pvc_matching_scopes(&decode_pvc(item)?, selectors)
+    }
+
+    /// `pvcEvaluator.UncoveredQuotaScopes` (:141-161).
+    fn uncovered_quota_scopes(
+        &self,
+        limited: &[ScopedResourceSelectorRequirement],
+        matched: &[ScopedResourceSelectorRequirement],
+    ) -> Result<Vec<ScopedResourceSelectorRequirement>, String> {
+        Ok(limited
+            .iter()
+            .filter(|l| !matched.iter().any(|m| m.scope_name == l.scope_name))
+            .cloned()
+            .collect())
     }
 
     fn matching_resources(&self, input: &[String]) -> Vec<String> {
@@ -212,11 +307,16 @@ impl Evaluator for PersistentVolumeClaimEvaluator {
     }
 
     fn usage(&self, obj: &Value) -> Result<ResourceList, String> {
-        let pvc: PersistentVolumeClaim = serde_json::from_value(obj.clone()).map_err(|e| {
-            format!("expect *api.PersistentVolumeClaim or *v1.PersistentVolumeClaim, got {e}")
-        })?;
-        Ok(pvc_usage(&pvc))
+        Ok(pvc_usage(&decode_pvc(obj)?))
     }
+}
+
+/// `toExternalPersistentVolumeClaimOrError` (persistent_volume_claims.go:
+/// 260-274).
+fn decode_pvc(obj: &Value) -> Result<PersistentVolumeClaim, String> {
+    serde_json::from_value(obj.clone()).map_err(|e| {
+        format!("expect *api.PersistentVolumeClaim or *v1.PersistentVolumeClaim, got {e}")
+    })
 }
 
 /// `legacyObjectCountAliases` (registry.go:33-38).

@@ -16,6 +16,7 @@ mod cri_runtime;
 // into the bin (shared modules) but read as dead here; the lib is their real
 // consumer.
 mod atomic_writer;
+mod clustertrustbundle;
 // The single home for downward-API `fieldRef`/`resourceFieldRef` resolution.
 // `volumes` and `cri_runtime::translate` both delegate here; until now this
 // module was declared only in `lib.rs`, so the *binary* compiled two divergent
@@ -59,6 +60,8 @@ mod sysctl;
 // with the desired-state-of-world populator (#1970).
 #[allow(dead_code, unused_imports)]
 mod volume_manager;
+#[allow(dead_code)]
+mod volume_ownership;
 #[allow(dead_code, unused_imports)]
 mod volume_plugins;
 #[allow(dead_code)]
@@ -523,25 +526,46 @@ async fn main() -> Result<()> {
     // the registration handshake, which fills the CSI driver store. Upstream
     // wires it in `kubelet.go` (`pluginManager.AddHandler(pluginwatcherapi.CSIPlugin,
     // plugincache.PluginHandler(csi.PluginHandler))`).
+    //
+    // `RegisterPlugin` records each driver's `NodeGetInfo` on the Node and
+    // CSINode (`nodeinfomanager.InstallCSIDriver`). Upstream sets `nim.nodeID`
+    // (the Node's UID) in `csiPlugin.Init` -> `initializeCSINode`, before any
+    // plugin can register, and keeps the kubelet NotReady until it succeeds
+    // (`csi_plugin.go:281-355`); here the plugin manager is started once the
+    // Node exists and the CSINode is initialized (retried every second, like
+    // `waitForAPIServerForever`'s poll). The NotReady gate is not ported.
     {
         let registry_dir = pluginmanager::plugins_registry_dir(&runtime_config.root_dir);
-        let plugin_manager = pluginmanager::PluginManager::new(registry_dir);
-        plugin_manager.add_handler(
-            pluginmanager::csi_handler::CSI_PLUGIN,
-            Arc::new(pluginmanager::csi_handler::RegistrationHandler::new()),
-        );
-        // The kubelet runs for the life of the process, so the stop channel's
-        // sender is parked in a task that never finishes.
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        match plugin_manager.run(stop_rx) {
-            Ok(()) => {
-                tokio::spawn(async move {
+        let nim = Arc::new(volume_plugins::nodeinfomanager::NodeInfoManager::new(
+            runtime_config.node_name.clone(),
+            storage.clone(),
+        ));
+        tokio::spawn(async move {
+            loop {
+                match nim.initialize_csi_node().await {
+                    Ok(()) => break,
+                    Err(e) => {
+                        info!("Waiting to initialize the CSINode: {e}");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+            let plugin_manager = pluginmanager::PluginManager::new(registry_dir);
+            plugin_manager.add_handler(
+                pluginmanager::csi_handler::CSI_PLUGIN,
+                Arc::new(pluginmanager::csi_handler::RegistrationHandler::new(nim)),
+            );
+            // The kubelet runs for the life of the process, so the stop
+            // channel's sender is parked here and never dropped.
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            match plugin_manager.run(stop_rx) {
+                Ok(()) => {
                     let _keep = (plugin_manager, stop_tx);
                     std::future::pending::<()>().await;
-                });
+                }
+                Err(e) => warn!("Failed to start the kubelet plugin manager: {e}"),
             }
-            Err(e) => warn!("Failed to start the kubelet plugin manager: {e}"),
-        }
+        });
     }
 
     let server_state = server::ServerState {

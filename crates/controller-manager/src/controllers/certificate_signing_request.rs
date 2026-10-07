@@ -541,6 +541,7 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
             | KeyUsage::OCSPSigning
             | KeyUsage::MicrosoftSGC
             | KeyUsage::NetscapeSGC => Ok(()),
+            KeyUsage::Unknown(u) => Err(anyhow::anyhow!("unsupported CSR usage {u:?}")),
         }
     }
 }
