@@ -36,6 +36,7 @@ mod kubelet;
 mod labels;
 #[allow(dead_code)]
 mod lifecycle;
+mod node_status;
 // Wired in main below; the full surface is only reachable from lib users/tests.
 #[allow(dead_code)]
 mod pluginmanager;
@@ -51,6 +52,7 @@ mod serving_tls;
 mod runtime;
 mod runtime_state;
 mod server;
+mod static_pod_watch;
 mod static_pods;
 mod streaming_server;
 mod sync_locks;
@@ -324,6 +326,11 @@ async fn main() -> Result<()> {
 
     // fileCheckFrequency from the config file (None => upstream default 20s).
     let file_check_frequency = config_file.as_ref().and_then(|c| c.file_check_frequency);
+    // nodeStatusReportFrequency (5m default, or nodeStatusUpdateFrequency when
+    // only that was set explicitly; defaults.go).
+    let node_status_report_frequency = config_file
+        .as_ref()
+        .map(|c| c.effective_node_status_report_frequency());
 
     // runtimeRequestTimeout from the config file (None => upstream default 2m).
     let runtime_request_timeout = config_file.as_ref().and_then(|c| c.runtime_request_timeout);
@@ -522,6 +529,7 @@ async fn main() -> Result<()> {
         .with_pod_manifest_path(args.pod_manifest_path.clone())
         .with_node_status_update_frequency(node_status_update_frequency)
         .with_file_check_frequency(file_check_frequency)
+        .with_node_status_report_frequency(node_status_report_frequency)
         .with_runtime_request_timeout(runtime_request_timeout)
         .with_crash_loop_backoff_max(crash_loop_backoff_max),
     );

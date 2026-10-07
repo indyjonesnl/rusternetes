@@ -68,23 +68,38 @@ pub enum VolumeOperationError {
     /// `TransientOperationFailure` (`types.go:149`): may fix itself on retry.
     #[error("{0}")]
     TransientOperationFailure(String),
+    /// `UncertainProgressError` (`types.go:164`): a non-final error; the
+    /// operation may still be in progress in the background.
+    #[error("{0}")]
+    UncertainProgress(String),
 }
 
 /// `NodeExpansionNotRequired` (`pkg/volume/util/types/types.go:29`): PVC
 /// annotation recording that the driver needs no node expansion.
 pub const NODE_EXPANSION_NOT_REQUIRED: &str = "volume.kubernetes.io/node-expansion-not-required";
 
-/// Port of `IsOperationFinishedError` (`types.go:171-181`): true unless the
+/// Port of `IsOperationFinishedError` (`types.go:177-187`): true unless the
 /// error is an uncertain-progress or transient one.
 ///
-/// `UncertainProgressError` has no variant here: the CSI expander flattens an
-/// uncertain-progress gRPC error to a plain message (see `csi/expander.rs`),
-/// so it reads as finished. That is a pre-existing gap in the expander, not
-/// something this predicate can recover.
+/// Like upstream's `err.(*UncertainProgressError)` type assertion this does
+/// not unwrap: the CSI expander wraps the client's uncertain-progress error
+/// with `fmt.Errorf("...: %w", err)` (`expander.go:127`), so upstream reads
+/// that one as finished too, and `csi/expander.rs` flattens it likewise.
 pub fn is_operation_finished_error(err: &anyhow::Error) -> bool {
     !matches!(
         err.downcast_ref::<VolumeOperationError>(),
-        Some(VolumeOperationError::TransientOperationFailure(_))
+        Some(
+            VolumeOperationError::UncertainProgress(_)
+                | VolumeOperationError::TransientOperationFailure(_)
+        )
+    )
+}
+
+/// Port of `IsUncertainProgressError` (`types.go:198-203`).
+pub fn is_uncertain_progress_error(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<VolumeOperationError>(),
+        Some(VolumeOperationError::UncertainProgress(_))
     )
 }
 
@@ -110,4 +125,26 @@ pub fn is_operation_not_supported_error(err: &anyhow::Error) -> bool {
         err.downcast_ref::<VolumeOperationError>(),
         Some(VolumeOperationError::OperationNotSupported(_))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `types.go:179-187`: uncertain progress and transient failures are not
+    /// finished; everything else, including a plain error, is.
+    #[test]
+    fn operation_finished_error_classification() {
+        let uncertain: anyhow::Error = VolumeOperationError::UncertainProgress("u".into()).into();
+        let transient: anyhow::Error =
+            VolumeOperationError::TransientOperationFailure("t".into()).into();
+        let infeasible: anyhow::Error = VolumeOperationError::Infeasible("i".into()).into();
+        assert!(!is_operation_finished_error(&uncertain));
+        assert!(!is_operation_finished_error(&transient));
+        assert!(is_operation_finished_error(&infeasible));
+        assert!(is_operation_finished_error(&anyhow::anyhow!("plain")));
+        assert!(is_uncertain_progress_error(&uncertain));
+        assert!(!is_uncertain_progress_error(&transient));
+        assert_eq!(uncertain.to_string(), "u");
+    }
 }

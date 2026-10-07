@@ -131,6 +131,29 @@ impl Admission<'_> {
             let pod: Pod = recast(&obj)?;
             return recast(&self.admit_pod(op, pod).await?);
         }
+        // NodeRestriction.Admit (admission.go:228-229): a node's request on
+        // any operation or subresource of a PodCertificateRequest.
+        if self.resource.group == "certificates.k8s.io"
+            && self.resource.resource == "podcertificaterequests"
+        {
+            let pcr: rusternetes_common::resources::podcertificaterequest::PodCertificateRequest =
+                recast(&obj)?;
+            crate::handlers::node_restriction::admit_pod_certificate_request(
+                &*self.state.storage,
+                &rusternetes_middleware::AuthContext {
+                    user: self.user.clone(),
+                },
+                *op == Operation::Create,
+                self.subresource,
+                self.namespace.unwrap_or(""),
+                &pcr,
+            )
+            .await
+            .map_err(|e| match e {
+                Error::Forbidden(m) => self.forbidden(&pcr.metadata.name, m),
+                other => other,
+            })?;
+        }
         if *op != Operation::Create {
             return Ok(obj);
         }
@@ -197,6 +220,35 @@ impl Admission<'_> {
                 .await?
             {
                 ctx.add_warning(w);
+            }
+        }
+        // PodSecurity `ValidatePodController` (admission.go:393-453): the
+        // warn/audit evaluation of a controller's pod template. The plugin
+        // runs it for resources with `HasPodSpec` (podsecurity/admission.go:195).
+        if let (Operation::Create | Operation::Update, Some(obj), Some(namespace)) =
+            (op, obj, self.namespace)
+        {
+            let r = &self.resource;
+            if !(r.group.is_empty() && r.resource == "pods")
+                && crate::admission::pod_security_controller::has_pod_spec(&r.group, &r.resource)
+            {
+                let value = serde_json::to_value(obj)
+                    .map_err(|e| Error::Internal(format!("failed to encode object: {e}")))?;
+                for w in crate::admission::PodSecurityAdmission::new()
+                    .validate_pod_controller(
+                        &self.state.storage,
+                        namespace,
+                        self.subresource,
+                        &r.group,
+                        &r.resource,
+                        &value,
+                        &self.user.username,
+                    )
+                    .await
+                    .warnings
+                {
+                    ctx.add_warning(w);
+                }
             }
         }
         if self.is_core("pods") || self.is_pod_resize() || self.is_pod_ephemeralcontainers() {
