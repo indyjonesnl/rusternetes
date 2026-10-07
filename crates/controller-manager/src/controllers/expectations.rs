@@ -197,6 +197,21 @@ impl ControllerExpectations {
         }
     }
 
+    /// Controllee keys still expected to be seen deleted for `key`.
+    ///
+    /// Rusternetes-only (no upstream equivalent): lets a controller that can
+    /// list its controllees fresh from storage settle an expectation from
+    /// that listing when a pod is already gone or terminating, instead of
+    /// waiting for the watch event (see the DaemonSet controller).
+    pub fn pending_deletions(&self, key: &str) -> Vec<String> {
+        self.uids
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// The outstanding `(add, del)` counts, or `None` if nothing is recorded.
     /// Upstream `GetExpectations` (`controller_utils.go:172-179`), which is part
     /// of its public interface; here only the tests inspect the counts, so it

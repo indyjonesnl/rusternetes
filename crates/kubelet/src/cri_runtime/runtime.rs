@@ -332,11 +332,11 @@ pub fn sandbox_filter_by_namespaced_name(
     }
 }
 
-/// Drives a CRI v1 runtime (containerd → Youki) for the kubelet.
+/// Drives a CRI v1 runtime (containerd → crun) for the kubelet.
 #[derive(Clone)]
 pub struct CriContainerRuntime {
     cri: CriClient,
-    /// Runtime class passed to `RunPodSandbox` (e.g. `youki`); empty = default.
+    /// Runtime class passed to `RunPodSandbox` (e.g. `crun`); empty = default.
     runtime_handler: String,
     /// Root under which per-pod log directories are created.
     log_root: String,
@@ -2539,16 +2539,16 @@ impl CriContainerRuntime {
         }
     }
 
-    /// NodeUnpublish the CSI volumes of pods that are gone. No-op when no
+    /// Tear down the volumes of pods that are gone. No-op when no
     /// VolumeManager is attached.
-    pub async fn unmount_csi_volumes(
+    pub async fn unmount_orphaned_volumes(
         &self,
         live_pod_uids: &std::collections::HashSet<String>,
         terminated_pod_uids: &std::collections::HashSet<String>,
     ) {
         if let Some(volumes) = self.volumes.as_ref() {
             volumes
-                .unmount_csi_volumes(live_pod_uids, terminated_pod_uids)
+                .unmount_orphaned_volumes(live_pod_uids, terminated_pod_uids)
                 .await;
         }
     }

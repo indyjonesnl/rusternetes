@@ -494,6 +494,16 @@ async fn daemonset_rolling_update_replaces_pods_on_template_change() {
     // kubelet cleanup replay is needed between reconciles.
     for _ in 0..5 {
         ctrl.reconcile_all().await.unwrap();
+        // The controller deletes gracefully (#2465); the kubelet reaps the pod.
+        let pods: Vec<Pod> = storage.list(&build_prefix("pods", Some(ns))).await.unwrap();
+        for pod in pods
+            .iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_some())
+        {
+            let _ = storage
+                .delete(&build_key("pods", Some(ns), &pod.metadata.name))
+                .await;
+        }
         mark_all_pods_ready(&storage, ns).await;
     }
 

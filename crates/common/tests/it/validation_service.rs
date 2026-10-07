@@ -11,8 +11,8 @@
 //! are not, the "without feature gate" traffic-distribution cases (which
 //! emulate 1.34) are not, and the update cases that only fail under strict IP
 //! validation (the runner sets it, :20468) are not. Cases whose invalid value
-//! the Rust types cannot hold (an unknown enum value, a port above 65535) are
-//! left out too.
+//! the Rust types cannot hold (a port above 65535) are left out too; the
+//! unknown-enum cases are in `unknown_enum_values_report_unsupported_value`.
 
 use rusternetes_common::resources::service::Service;
 use rusternetes_common::validation::field::Path;
@@ -1573,4 +1573,65 @@ fn plain_string_enums_still_decode_empty_as_unset() {
     let svc = decode(v);
     assert!(svc.spec.service_type.is_none());
     assert!(svc.spec.external_traffic_policy.is_none());
+}
+
+/// Unknown values of the string-typed enum fields decode and validation
+/// reports `Unsupported value` (422), as upstream's plain `string` types do
+/// (#2469). Upstream cases: validation_test.go:17185 ("invalid internalTraffic
+/// field"), :17254/:17261 ("invalid ipFamilies"); NotSupported checks at
+/// validation.go:6672 (type), :6838 (externalTrafficPolicy), :6888
+/// (internalTrafficPolicy), :9000 (ipFamilies), :9014 (ipFamilyPolicy).
+#[test]
+fn unknown_enum_values_report_unsupported_value() {
+    type Tweak = fn(&mut Value);
+    let cases: Vec<(&str, Tweak, &str)> = vec![
+        (
+            "spec.type",
+            |s| s["spec"]["type"] = json!("garbage"),
+            "spec.type: Unsupported value: \"garbage\": supported values: \"ClusterIP\", \"ExternalName\", \"LoadBalancer\", \"NodePort\"",
+        ),
+        (
+            "spec.ipFamilyPolicy",
+            |s| s["spec"]["ipFamilyPolicy"] = json!("garbage"),
+            "spec.ipFamilyPolicy: Unsupported value: \"garbage\": supported values: \"SingleStack\", \"PreferDualStack\", \"RequireDualStack\"",
+        ),
+        (
+            "spec.ipFamilies[0]",
+            |s| s["spec"]["ipFamilies"] = json!(["garbage"]),
+            "spec.ipFamilies[0]: Unsupported value: \"garbage\": supported values: \"IPv4\", \"IPv6\"",
+        ),
+        (
+            "spec.internalTrafficPolicy",
+            |s| s["spec"]["internalTrafficPolicy"] = json!("garbage"),
+            "spec.internalTrafficPolicy: Unsupported value: \"garbage\": supported values: \"Cluster\", \"Local\"",
+        ),
+        (
+            "spec.externalTrafficPolicy",
+            |s| {
+                node_port_type(s);
+                s["spec"]["externalTrafficPolicy"] = json!("garbage");
+            },
+            "spec.externalTrafficPolicy: Unsupported value: \"garbage\": supported values: \"Cluster\", \"Local\"",
+        ),
+    ];
+    for (name, tweak, want) in cases {
+        let mut v = make_valid_service();
+        tweak(&mut v);
+        let svc: Service = serde_json::from_value(v)
+            .unwrap_or_else(|e| panic!("{name}: unknown value must decode: {e}"));
+        let errs: Vec<String> = validate_service_create(&svc)
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(
+            errs.iter().any(|e| e == want),
+            "{name}: want {want:?} in {errs:?}"
+        );
+        // and the value round-trips unchanged
+        let back = serde_json::to_value(&svc).unwrap();
+        assert!(
+            back.to_string().contains("\"garbage\""),
+            "{name}: unknown value must round-trip: {back}"
+        );
+    }
 }

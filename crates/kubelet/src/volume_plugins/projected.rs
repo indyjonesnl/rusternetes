@@ -66,6 +66,36 @@ impl VolumePlugin for ProjectedPlugin {
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
         Ok(Box::new(self.build_mounter(spec, pod)))
     }
+
+    /// `NewUnmounter` (`projected.go:126-148`): the wrapper plugins share one unmounter that
+    /// delegates `TearDownAt` to emptyDir (`volumeutil.UnmountViaEmptyDir`).
+    fn new_unmounter(
+        &self,
+        vol_name: &str,
+        pod_uid: &str,
+    ) -> Result<Box<dyn crate::volume_plugins::Unmounter>> {
+        Ok(Box::new(
+            crate::volume_plugins::util::WrappedEmptyDirUnmounter {
+                host: self.host.clone(),
+                plugin_name: self.name(),
+                vol_name: vol_name.to_string(),
+                pod_uid: pod_uid.to_string(),
+            },
+        ))
+    }
+
+    /// `ConstructVolumeSpec` (`projected.go:126-148`): a bare `ProjectedVolumeSource{}`
+    /// named after the volume.
+    fn construct_volume_spec(
+        &self,
+        vol_name: &str,
+        _mount_path: &str,
+    ) -> Result<crate::volume_plugins::ReconstructedVolume> {
+        crate::volume_plugins::util::reconstructed_volume(
+            vol_name,
+            serde_json::json!({"projected": {"sources": []}}),
+        )
+    }
 }
 
 impl ProjectedPlugin {
@@ -671,10 +701,7 @@ pub(crate) fn write_payload(
     payload: &BTreeMap<String, FileProjection>,
     fs_group: Option<i64>,
 ) -> std::io::Result<()> {
-    let set_perms = move |dir: &std::path::Path| -> std::io::Result<()> {
-        crate::volume_ownership::set_volume_ownership(dir, fs_group, true)
-    };
-    crate::atomic_writer::write_projected_payload_with(dir, payload, Some(&set_perms))
+    crate::volume_ownership::write_payload_with_ownership(dir, payload, fs_group, true)
 }
 
 /// The payload a periodic re-SetUp of a projected volume projects

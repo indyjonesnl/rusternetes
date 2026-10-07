@@ -29,6 +29,7 @@ pub mod namespace;
 pub mod networking;
 pub mod node;
 pub mod pod;
+pub mod podcertificaterequest;
 pub mod policy;
 pub mod rangeallocation;
 pub mod rbac;

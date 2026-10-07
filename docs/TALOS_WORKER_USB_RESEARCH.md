@@ -102,7 +102,7 @@ and rebooting rebuilds the node; wiping `STATE` de-identifies it.
 A Rusternetes worker node is far smaller than the control plane. It needs only:
 
 - **`rusternetes-kubelet`** and **`rusternetes-kube-proxy`** (existing crates);
-- a **CRI runtime** — the project's target stack is **containerd + youki**
+- a **CRI runtime** — the project's target stack is **containerd + crun**
   (see `CLAUDE.md` / the CRI migration), talked to over the CRI gRPC socket;
 - **CNI plugins** + a CNI network config (per the non-negotiable CNI contract);
 - a **join/identity mechanism** (api-server endpoint + cluster CA + a
@@ -134,7 +134,7 @@ Adopt Talos's read-only-squashfs-into-RAM + overlay design:
 
 - Read-only **squashfs** rootfs built from an existing Rusternetes container
   image (we already build `rusternetes-kubelet` / `-kube-proxy` / containerd
-  images — §3.5), plus busybox/Alpine userland, containerd, youki, CNI plugins,
+  images — §3.5), plus busybox/Alpine userland, containerd, crun, CNI plugins,
   and iptables.
 - `tmpfs` for `/run`, `/tmp`; **overlayfs on `EPHEMERAL` (`/var`)** for
   persistence (containerd state, kubelet state).
@@ -164,7 +164,7 @@ the image dramatically simpler to produce (see #1041 / #1042 synergy below).
 We already build worker images with hand-listed crate Dockerfiles. Rather than
 a bespoke installer, build an **imager-style OCI job**:
 
-1. Assemble a rootfs dir: minimal userland + `containerd` + `youki` + CNI
+1. Assemble a rootfs dir: minimal userland + `containerd` + `crun` + CNI
    plugins + `iptables` + the static `rusternetes-kubelet` / `-kube-proxy`
    binaries + a first-boot supervisor unit.
 2. `mksquashfs` → read-only rootfs image.
@@ -208,7 +208,7 @@ Join sequence:
 - **No SSH, no login shell** by default; node identity is an mTLS client cert.
 - Read-only rootfs; only `STATE` (identity) and `EPHEMERAL` (bulk) are
   writable, and both are re-creatable.
-- Minimal package set — kernel, containerd, youki, CNI, iptables, the two
+- Minimal package set — kernel, containerd, crun, CNI, iptables, the two
   Rusternetes binaries, a supervisor. Nothing else.
 
 ## 4. Phased roadmap
@@ -217,7 +217,7 @@ Join sequence:
    `rusternetes-kubelet` + `-kube-proxy` (**#1041**). Hard prerequisite for a
    self-contained squashfs.
 2. **P1 — bootable rootfs.** Imager-style OCI job → squashfs → ISO + raw image
-   that boots to a shell-less node with containerd + youki + CNI up. No join
+   that boots to a shell-less node with containerd + crun + CNI up. No join
    yet.
 3. **P2 — config + join.** NoCloud config partition → kubelet TLS bootstrap →
    node registers against an existing Rusternetes control plane and runs a pod.

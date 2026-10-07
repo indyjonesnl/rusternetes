@@ -1819,6 +1819,8 @@ pub const CLUSTER_AUTHENTICATION_INFO_HOOK: &str = "start-cluster-authentication
 pub const RBAC_BOOTSTRAP_ROLES_HOOK: &str = "rbac/bootstrap-roles";
 /// `apiextensions-apiserver/pkg/apiserver/apiserver.go:228`.
 pub const APIEXTENSIONS_CONTROLLERS_HOOK: &str = "start-apiextensions-controllers";
+/// `apiextensions-apiserver/pkg/apiserver/apiserver.go:263`.
+pub const CRD_INFORMER_SYNCED_HOOK: &str = "crd-informer-synced";
 
 /// `PostStartHookName` (storage_scheduling.go:41).
 pub const SYSTEM_PRIORITY_CLASSES_HOOK: &str = "scheduling/bootstrap-system-priority-classes";
@@ -2927,6 +2929,9 @@ mod post_start_hook_registration_tests {
         spawn_endpoint_reconciler(storage.clone(), 6443, super::test_service_ip());
         spawn_apiservice_availability_controller(storage.clone());
         crate::registry::apiextensions::customresourcedefinition::spawn_resync(storage.clone());
+        crate::registry::apiextensions::customresourcedefinition::spawn_crd_informer_synced_hook(
+            storage.clone(),
+        );
         spawn_cluster_authentication_trust_controller(
             storage.clone(),
             cluster_authentication_info(None),
@@ -2944,6 +2949,7 @@ mod post_start_hook_registration_tests {
             APISERVICE_LOCAL_AVAILABLE_HOOK,
             APISERVICE_REMOTE_AVAILABLE_HOOK,
             APIEXTENSIONS_CONTROLLERS_HOOK,
+            CRD_INFORMER_SYNCED_HOOK,
             CLUSTER_AUTHENTICATION_INFO_HOOK,
             SERVICE_CIDR_CONTROLLER_HOOK,
         ] {

@@ -338,10 +338,12 @@ pub async fn settle<T>(mut op: PortAllocationOperation, result: &Result<T>) {
 // IP families
 // ---------------------------------------------------------------------------
 
+/// `otherFamily` (pkg/registry/core/service/storage/storage.go:144-149):
+/// IPv4 flips to IPv6, anything else to IPv4.
 fn other_family(fam: &IPFamily) -> IPFamily {
     match fam {
         IPFamily::IPv4 => IPFamily::IPv6,
-        IPFamily::IPv6 => IPFamily::IPv4,
+        _ => IPFamily::IPv4,
     }
 }
 
@@ -532,7 +534,7 @@ pub fn init_ip_family_fields(
                     let name = match fam {
                         Some(IPFamily::IPv4) => "IPv4",
                         Some(IPFamily::IPv6) => "IPv6",
-                        None => "unknown",
+                        Some(IPFamily::Unknown(_)) | None => "unknown",
                     };
                     el.push(field::Error::invalid(
                         &field::Path::new("spec").child("clusterIPs").index(i),

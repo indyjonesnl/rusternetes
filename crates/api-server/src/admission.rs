@@ -1,5 +1,6 @@
 pub mod certificates;
 pub mod pod_security_api;
+pub mod pod_security_namespace;
 pub mod pod_security_policy;
 pub mod resourcequota;
 pub mod storage_object_in_use_protection;
@@ -1288,21 +1289,16 @@ impl PodSecurityAdmission {
             return Ok(exempt("user"));
         }
         let ns_key = rusternetes_storage::build_key("namespaces", None, namespace);
-        // admission.go:344-350: a namespace that cannot be fetched answers
-        // `NewInternalError("failed to lookup namespace %q")`, not an allow.
-        //
-        // Deliberate deviation for NotFound: upstream never sees it here
-        // because the NamespaceLifecycle plugin runs first and answers
-        // NotFound for a pod in a namespace that does not exist. This server
-        // has no such plugin for pod creates yet, so a missing namespace is
-        // still treated as unlabelled (privileged) rather than turning every
-        // pod create into a 500.
+        // admission.go:344-350: any namespace lookup failure, NotFound
+        // included, answers `NewInternalError("failed to lookup namespace
+        // %q")`, not an allow. Upstream never sees NotFound here because
+        // NamespaceLifecycle answers it first; that plugin exists here too
+        // (#2543), so there is no NotFound arm.
         let labels = match storage
             .get::<rusternetes_common::resources::Namespace>(&ns_key)
             .await
         {
             Ok(ns) => ns.metadata.labels,
-            Err(rusternetes_common::Error::NotFound(_)) => None,
             Err(e) => {
                 warn!("PodSecurity: failed to fetch pod namespace {namespace:?}: {e}");
                 return Err(rusternetes_common::Error::Internal(format!(
@@ -2594,15 +2590,20 @@ plugins:
         );
     }
 
-    /// A namespace that does not exist is unlabelled: NamespaceLifecycle
-    /// (upstream) answers NotFound before PodSecurity runs, and this server
-    /// has no such plugin for pod creates.
+    /// admission.go:344-350: a missing namespace is an InternalError too.
+    /// Upstream never reaches it because NamespaceLifecycle answers NotFound
+    /// first; here that plugin exists, so no NotFound arm remains.
     #[tokio::test]
-    async fn psa_missing_namespace_is_unlabelled() {
+    async fn psa_missing_namespace_is_internal_error() {
         let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
-        PodSecurityAdmission::new()
+        let err = PodSecurityAdmission::new()
             .admit_outcome(&storage, "missing", &privileged_pod(None), "alice")
             .await
-            .expect("a missing namespace carries no labels");
+            .expect_err("a missing namespace must not fail open");
+        assert!(
+            matches!(&err, rusternetes_common::Error::Internal(m)
+                if m.contains(r#"failed to lookup namespace "missing""#)),
+            "{err:?}"
+        );
     }
 }
