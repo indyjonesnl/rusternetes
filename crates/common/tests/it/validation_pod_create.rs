@@ -960,6 +960,7 @@ fn test_validate_pod_spec_volumes_success_unique_names() {
         containers: vec![minimal_container("c", "nginx")],
         volumes: Some(vec![
             Volume {
+                legacy_sources: Default::default(),
                 name: "vol-a".to_string(),
                 empty_dir: Some(EmptyDirVolumeSource {
                     medium: None,
@@ -978,6 +979,7 @@ fn test_validate_pod_spec_volumes_success_unique_names() {
                 image: None,
             },
             Volume {
+                legacy_sources: Default::default(),
                 name: "vol-b".to_string(),
                 empty_dir: Some(EmptyDirVolumeSource {
                     medium: None,
@@ -1008,6 +1010,7 @@ fn test_validate_pod_spec_volumes_error_duplicate_names() {
         containers: vec![minimal_container("c", "nginx")],
         volumes: Some(vec![
             Volume {
+                legacy_sources: Default::default(),
                 name: "vol-a".to_string(),
                 empty_dir: Some(EmptyDirVolumeSource {
                     medium: None,
@@ -1026,6 +1029,7 @@ fn test_validate_pod_spec_volumes_error_duplicate_names() {
                 image: None,
             },
             Volume {
+                legacy_sources: Default::default(),
                 name: "vol-a".to_string(),
                 empty_dir: Some(EmptyDirVolumeSource {
                     medium: None,

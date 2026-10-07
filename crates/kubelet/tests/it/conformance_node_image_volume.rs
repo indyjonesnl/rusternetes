@@ -19,6 +19,7 @@ use serde_json::json;
 
 fn image_volume(name: &str, reference: Option<&str>, policy: Option<&str>) -> Volume {
     Volume {
+        legacy_sources: Default::default(),
         name: name.to_string(),
         image: Some(ImageVolumeSource {
             reference: reference.map(str::to_string),
