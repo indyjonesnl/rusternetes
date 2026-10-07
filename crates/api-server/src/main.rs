@@ -7,6 +7,7 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admission;
 pub use rusternetes_admission_webhook as admission_webhook;
+mod apiserver_identity;
 mod bootstrap;
 mod legacy_token_tracking;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
@@ -308,6 +309,8 @@ async fn main() -> Result<()> {
     // start-legacy-token-tracking-controller (server.go:319-322): keeps
     // kube-system/kube-apiserver-legacy-service-account-token-tracking.
     legacy_token_tracking::spawn_legacy_token_tracking_controller(storage.clone());
+    // start-kube-apiserver-identity-lease-{controller,garbage-collector} (server.go:295,:304).
+    apiserver_identity::spawn_identity_hooks(storage.clone());
 
     // The `kubernetes` ServiceCIDR, owned by the apiserver-side
     // default-ServiceCIDR controller (upstream
