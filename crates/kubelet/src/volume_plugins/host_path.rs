@@ -125,6 +125,28 @@ impl VolumePlugin for HostPathPlugin {
             volume_name: spec.volume.name.clone(),
         }))
     }
+
+    /// `NewUnmounter` (`host_path.go:147-151`): `&hostPathUnmounter{&hostPath{path: ""}}`.
+    fn new_unmounter(
+        &self,
+        _vol_name: &str,
+        _pod_uid: &str,
+    ) -> Result<Box<dyn crate::volume_plugins::Unmounter>> {
+        Ok(Box::new(HostPathUnmounter))
+    }
+
+    /// `ConstructVolumeSpec` (`host_path.go:184-196`): a hostPath volume named
+    /// after, and pointing at, `volumeName`.
+    fn construct_volume_spec(
+        &self,
+        vol_name: &str,
+        _mount_path: &str,
+    ) -> Result<crate::volume_plugins::ReconstructedVolume> {
+        crate::volume_plugins::util::reconstructed_volume(
+            vol_name,
+            serde_json::json!({"hostPath": {"path": vol_name}}),
+        )
+    }
 }
 
 /// Port of `ValidatePathNoBacksteps`
@@ -169,6 +191,29 @@ impl Mounter for HostPathMounter {
         info!("Using hostPath volume {} at {}", self.volume_name, path);
         // ---- end moved body ----
         Ok(())
+    }
+}
+
+/// `hostPathUnmounter` (`host_path.go:266-280`). A hostPath volume is the host's
+/// own directory: there is nothing under the pod directory to unmount.
+struct HostPathUnmounter;
+
+#[async_trait]
+impl crate::volume_plugins::Unmounter for HostPathUnmounter {
+    /// `hostPath.path` is `""` for an unmounter (`host_path.go:149`).
+    fn get_path(&self) -> String {
+        String::new()
+    }
+
+    /// `TearDown` (`host_path.go:272-274`): "TearDown does nothing."
+    async fn tear_down(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// `TearDownAt` (`host_path.go:277-280`): "does not make sense for host
+    /// paths - probably programmer error."
+    async fn tear_down_at(&self, _dir: &str) -> Result<()> {
+        Err(anyhow!("TearDownAt() does not make sense for host paths"))
     }
 }
 

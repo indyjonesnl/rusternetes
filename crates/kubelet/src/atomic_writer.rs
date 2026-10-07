@@ -56,6 +56,7 @@ pub type SetPerms<'a> = &'a dyn Fn(&Path) -> io::Result<()>;
 /// No-op (no writes, no chmod, no symlink swap) when the on-disk `..data`
 /// payload already equals `payload` — the property that keeps kube-proxy and
 /// other config-file watchers stable across the kubelet's periodic re-SetUp.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn write_projected_payload(
     target_dir: &Path,
     payload: &BTreeMap<String, FileProjection>,

@@ -279,6 +279,9 @@ impl<S: Storage + 'static> ServiceController<S> {
                     let ip = match family {
                         IPFamily::IPv4 => self.allocate_cluster_ip().await?,
                         IPFamily::IPv6 => self.allocate_cluster_ip_v6().await?,
+                        // The API server rejects an unsupported family at
+                        // validation (#2469); never allocate for one.
+                        IPFamily::Unknown(_) => continue,
                     };
                     info!(
                         "Allocated ClusterIP {} ({:?}) for service {}/{}",

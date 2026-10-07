@@ -1961,7 +1961,7 @@ mod tests {
     /// sysctls with slashes as separator".
     ///
     /// Kubernetes accepts `/` as an alternate separator for `.` in sysctl names.
-    /// runc/youki use dot form internally; passing a slash-form name to the CRI
+    /// runc/crun use dot form internally; passing a slash-form name to the CRI
     /// sandbox would cause RunPodSandbox to fail with "sysctl is not in a
     /// separate kernel namespace". The kubelet normalizes before the CRI call.
     ///
@@ -2006,7 +2006,7 @@ mod tests {
             .unwrap()
             .sysctls;
         // Slash form must be normalized to dot form before the CRI call.
-        // runc/youki identify sysctls by dot-form name; passing "kernel/shm_rmid_forced"
+        // runc/crun identify sysctls by dot-form name; passing "kernel/shm_rmid_forced"
         // causes RunPodSandbox to reject the sandbox with "sysctl not in a separate
         // kernel namespace" (kuberuntime_manager.go:1529-1537 comment).
         assert_eq!(

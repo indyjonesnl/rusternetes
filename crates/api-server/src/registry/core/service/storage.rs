@@ -146,10 +146,12 @@ pub fn patch_allocated_values(new: &mut Service, old: &Service) {
     }
 }
 
+/// `otherFamily` (pkg/registry/core/service/storage/storage.go:144-149):
+/// IPv4 flips to IPv6, anything else to IPv4.
 fn other_family(fam: &IPFamily) -> IPFamily {
     match fam {
         IPFamily::IPv4 => IPFamily::IPv6,
-        IPFamily::IPv6 => IPFamily::IPv4,
+        _ => IPFamily::IPv4,
     }
 }
 
