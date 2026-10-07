@@ -332,11 +332,11 @@ pub fn sandbox_filter_by_namespaced_name(
     }
 }
 
-/// Drives a CRI v1 runtime (containerd → Youki) for the kubelet.
+/// Drives a CRI v1 runtime (containerd → crun) for the kubelet.
 #[derive(Clone)]
 pub struct CriContainerRuntime {
     cri: CriClient,
-    /// Runtime class passed to `RunPodSandbox` (e.g. `youki`); empty = default.
+    /// Runtime class passed to `RunPodSandbox` (e.g. `crun`); empty = default.
     runtime_handler: String,
     /// Root under which per-pod log directories are created.
     log_root: String,

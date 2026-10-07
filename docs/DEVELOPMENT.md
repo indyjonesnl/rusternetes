@@ -26,7 +26,7 @@ Rusternetes is a Cargo workspace with 10 crates (216,000+ lines of Rust, 3,100+ 
 | `crates/api-server` | Axum-based REST API with 75+ handler files and router.rs |
 | `crates/storage` | Pluggable storage: etcd, SQLite/Redis (rhino), and in-memory backends |
 | `crates/controller-manager` | 31 reconciliation controllers |
-| `crates/kubelet` | Node agent, CRI container runtime (containerd + Youki) |
+| `crates/kubelet` | Node agent, CRI container runtime (containerd + crun) |
 | `crates/kube-proxy` | iptables-based service routing (host network mode) |
 | `crates/scheduler` | Pod scheduling with affinity, taints, priority/preemption plugins |
 | `crates/kubectl` | CLI tool |

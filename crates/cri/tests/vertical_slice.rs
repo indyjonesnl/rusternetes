@@ -6,7 +6,7 @@
 //! unless `RUSTERNETES_CRI_SOCKET` points at a real CRI runtime (e.g.
 //! `/run/containerd/containerd.sock`), so `cargo test` stays green on machines
 //! without one. Optionally set `RUSTERNETES_CRI_RUNTIME_HANDLER` to select a
-//! runtime class (e.g. the Youki handler); it defaults to the runtime default.
+//! runtime class (e.g. the crun handler); it defaults to the runtime default.
 //!
 //! Run it against a live runtime with:
 //!

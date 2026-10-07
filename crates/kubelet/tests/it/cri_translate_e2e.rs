@@ -4,11 +4,11 @@
 //!
 //! Socket-gated like the crates/cri slice — does nothing unless
 //! `RUSTERNETES_CRI_SOCKET` is set. Optionally set `RUSTERNETES_CRI_RUNTIME_HANDLER`
-//! (e.g. `youki`).
+//! (e.g. `crun`).
 //!
 //! ```bash
 //! RUSTERNETES_CRI_SOCKET=/tmp/cri-verify/containerd.sock \
-//! RUSTERNETES_CRI_RUNTIME_HANDLER=youki \
+//! RUSTERNETES_CRI_RUNTIME_HANDLER=crun \
 //!   cargo test -p rusternetes-kubelet --test cri_translate_e2e -- --nocapture
 //! ```
 
