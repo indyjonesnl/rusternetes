@@ -99,6 +99,7 @@ fn is_dual_stack(cidrs: &[IpNet]) -> bool {
 
 impl NodeIpamConfig {
     /// Single-stack convenience: `--cluster-cidr` plus `--node-cidr-mask-size`.
+    #[cfg(test)]
     pub fn new(cluster_cidr: &str, node_mask: u8) -> Result<Self, String> {
         Self::from_flags(
             cluster_cidr,
@@ -239,6 +240,7 @@ impl NodeIpamConfig {
 
     /// Keep `service_cidr` out of the allocatable range
     /// (upstream `rangeAllocator.filterOutServiceRange`).
+    #[cfg(test)]
     #[must_use]
     pub fn with_service_cidr(mut self, service_cidr: IpNet) -> Self {
         self.service_cidrs.push(service_cidr.trunc());
@@ -1635,7 +1637,8 @@ mod tests {
     #[test]
     fn occupy_pre_existing_cidr_rows() {
         // (description, existing podCIDRs, cluster cidrs, masks, ctrlCreateFail)
-        let rows: &[(&str, &[&str], &[&str], &[u8], bool)] = &[
+        type Row<'a> = (&'a str, &'a [&'a str], &'a [&'a str], &'a [u8], bool);
+        let rows: &[Row<'_>] = &[
             (
                 "single stack no node allocation",
                 &[],
