@@ -221,9 +221,9 @@ async fn main() -> Result<()> {
             Arc::new(rusternetes_common::authz::NodeAuthorizer);
         let rbac: Arc<dyn rusternetes_common::authz::Authorizer> =
             Arc::new(RBACAuthorizer::new(storage.clone()));
-        Arc::new(rusternetes_common::authz::UnionAuthorizer::new(vec![
-            node, rbac,
-        ]))
+        // `system:masters` superuser first, as `newForConfig`
+        // (`pkg/kubeapiserver/authorizer/reload.go:97-99`) does (#1576).
+        Arc::new(rusternetes_common::authz::superuser_then(vec![node, rbac]))
     };
 
     // Initialize Metrics Registry

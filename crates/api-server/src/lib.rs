@@ -229,7 +229,11 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer)
     } else {
         info!("Initializing RBAC Authorizer");
-        Arc::new(RBACAuthorizer::new(storage.clone()))
+        // `system:masters` superuser first, as `newForConfig`
+        // (`pkg/kubeapiserver/authorizer/reload.go:97-99`) does (#1576).
+        let rbac: Arc<dyn rusternetes_common::authz::Authorizer> =
+            Arc::new(RBACAuthorizer::new(storage.clone()));
+        Arc::new(rusternetes_common::authz::superuser_then(vec![rbac]))
     };
 
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);
