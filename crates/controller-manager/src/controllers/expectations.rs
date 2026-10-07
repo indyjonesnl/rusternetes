@@ -19,7 +19,7 @@
 //! takes the timeout so the expiry rule can be tested in milliseconds rather
 //! than by waiting five minutes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -63,6 +63,10 @@ impl ControlleeExpectations {
 #[derive(Debug)]
 pub struct ControllerExpectations {
     entries: Mutex<HashMap<String, ControlleeExpectations>>,
+    /// Pod keys a controller is waiting to see deleted — upstream's
+    /// `UIDTrackingControllerExpectations.uidStore`
+    /// (`controller_utils.go:343-409`).
+    uids: Mutex<HashMap<String, HashSet<String>>>,
     timeout: Duration,
 }
 
@@ -82,6 +86,7 @@ impl ControllerExpectations {
     pub fn with_timeout(timeout: Duration) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            uids: Mutex::new(HashMap::new()),
             timeout,
         }
     }
@@ -164,6 +169,32 @@ impl ControllerExpectations {
     /// the case upstream's `TestExpectationsOnRecreate` covers.
     pub fn delete_expectations(&self, key: &str) {
         self.entries.lock().unwrap().remove(key);
+        self.uids.lock().unwrap().remove(key);
+    }
+
+    /// Upstream `UIDTrackingControllerExpectations.ExpectDeletions`
+    /// (`controller_utils.go:361-377`): expect exactly these controllee keys
+    /// to be seen deleted, so each is counted once whether it is observed as a
+    /// deletionTimestamp update or as the final delete.
+    pub fn expect_deletions_of(&self, key: &str, deleted_keys: &[String]) {
+        let set: HashSet<String> = deleted_keys.iter().cloned().collect();
+        let n = set.len() as i64;
+        self.uids.lock().unwrap().insert(key.to_string(), set);
+        self.expect_deletions(key, n);
+    }
+
+    /// Upstream `UIDTrackingControllerExpectations.DeletionObserved`
+    /// (`controller_utils.go:380-390`): lowers the count only if `deleted_key`
+    /// is still expected, so the MODIFIED (deletionTimestamp) and DELETED
+    /// events of one pod are not double counted.
+    pub fn deletion_observed_of(&self, key: &str, deleted_key: &str) {
+        let hit = {
+            let mut uids = self.uids.lock().unwrap();
+            uids.get_mut(key).is_some_and(|set| set.remove(deleted_key))
+        };
+        if hit {
+            self.deletion_observed(key);
+        }
     }
 
     /// The outstanding `(add, del)` counts, or `None` if nothing is recorded.
@@ -307,6 +338,25 @@ mod tests {
         exp.deletion_observed(KEY);
 
         assert_eq!(exp.get_expectations(KEY), None);
+        assert!(exp.satisfied(KEY));
+    }
+
+    /// Upstream `UIDTrackingControllerExpectations` (`controller_utils.go:343`):
+    /// a pod seen with a deletionTimestamp and then deleted counts once, and
+    /// an unexpected pod's deletion does not lower the count.
+    #[test]
+    fn keyed_deletions_are_counted_once_per_pod() {
+        let exp = ControllerExpectations::new();
+        exp.expect_deletions_of(KEY, &["ns/a".to_string(), "ns/b".to_string()]);
+        assert_eq!(exp.get_expectations(KEY), Some((0, 2)));
+
+        exp.deletion_observed_of(KEY, "ns/a");
+        exp.deletion_observed_of(KEY, "ns/a"); // the later DELETED event
+        exp.deletion_observed_of(KEY, "ns/other");
+        assert_eq!(exp.get_expectations(KEY), Some((0, 1)));
+        assert!(!exp.satisfied(KEY));
+
+        exp.deletion_observed_of(KEY, "ns/b");
         assert!(exp.satisfied(KEY));
     }
 

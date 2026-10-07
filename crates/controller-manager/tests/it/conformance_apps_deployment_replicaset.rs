@@ -1002,7 +1002,13 @@ async fn replicaset_scale_subresource_resizes_pod_population() {
     ctrl.reconcile_all().await.unwrap();
 
     let pods: Vec<Pod> = storage.list(&build_prefix("pods", Some(ns))).await.unwrap();
-    assert_eq!(pods.len(), 1, "scale to 1 must reduce pods to 1");
+    // Excess pods are deleted gracefully (controller_utils.go:618), so they
+    // linger with a deletionTimestamp; count the active ones.
+    let active = pods
+        .iter()
+        .filter(|p| p.metadata.deletion_timestamp.is_none())
+        .count();
+    assert_eq!(active, 1, "scale to 1 must reduce pods to 1");
 }
 
 /// [sig-apps] ReplicaSet Replace and Patch tests [Conformance]
