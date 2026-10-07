@@ -106,6 +106,12 @@ struct Args {
     #[arg(long, default_value = "15")]
     leader_election_lease_duration: u64,
 
+    /// Port serving Prometheus `/metrics` (plain HTTP). 0 disables it.
+    /// Default is upstream kube-controller-manager's secure port
+    /// (`ports.KubeControllerManagerPort`, `pkg/cluster/ports/ports.go`).
+    #[arg(long, default_value_t = 10257)]
+    metrics_port: u16,
+
     /// API server base URL for the HPA metrics client
     #[arg(long, default_value = "https://api-server:6443")]
     api_server_url: String,
@@ -191,9 +197,41 @@ fn node_ipam_params(args: &Args) -> Result<Option<(String, u8, Option<String>)>>
 /// Resolves the api-server CA from `--kubeconfig` and the URL from
 /// `--api-server-url`, builds an [`ApiClient`], and delegates to the library's
 /// `run_with_api`, which drives every controller through `ApiStorage`.
+/// Serve `gather()` on `GET /metrics` (upstream serves the `legacyregistry` on
+/// the same path of the controller-manager's secure port). A bind failure is
+/// logged, not fatal: metrics must not take the controllers down.
+fn spawn_metrics_server(port: u16, gather: fn() -> String) {
+    if port == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let app = axum::Router::new().route(
+            "/metrics",
+            axum::routing::get(move || async move { gather() }),
+        );
+        let addr = format!("0.0.0.0:{port}");
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                info!("Serving /metrics on {addr}");
+                if let Err(e) = axum::serve(listener, app).await {
+                    error!("metrics server error: {e}");
+                }
+            }
+            Err(e) => warn!("metrics server: cannot bind {addr}: {e}"),
+        }
+    });
+}
+
 async fn run_api_mode(args: Args) -> Result<()> {
     use rusternetes_client::http::ApiClient;
     use rusternetes_client::kubeconfig::KubeConfig;
+
+    // API mode runs the lib's controllers, so serve the lib's registry (the
+    // bin compiles its own copy of `controllers`, with a separate registry).
+    spawn_metrics_server(
+        args.metrics_port,
+        rusternetes_controller_manager::controllers::cidrset_metrics::gather,
+    );
 
     let (ca_pem, kube_insecure, token, client_cert, client_key) =
         if let Some(path) = args.kubeconfig.as_deref() {
@@ -292,6 +330,8 @@ async fn main() -> Result<()> {
         );
         return run_api_mode(args).await;
     }
+
+    spawn_metrics_server(args.metrics_port, controllers::cidrset_metrics::gather);
 
     info!(
         "Starting Rusternetes Controller Manager {}",
