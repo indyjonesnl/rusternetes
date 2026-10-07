@@ -258,13 +258,39 @@ impl<T: Object> Patcher<'_, T> {
 
     /// `applyPatcher.applyPatchToCurrentObject` / `createNewObject`
     /// (patch.go:500-543): `current` is `None` when the object does not exist.
-    fn apply(&self, apply: ApplyFn<T>, options: &ApplyOptions, current: Option<&T>) -> Result<T> {
+    fn apply(
+        &self,
+        ctx: &RequestContext,
+        apply: ApplyFn<T>,
+        options: &ApplyOptions,
+        current: Option<&T>,
+    ) -> Result<T> {
         let desired = decode_apply_body(self.content_type, self.body)
             .map_err(|e| Error::BadRequest(format!("error decoding YAML: {e}")))?;
         match apply(current, &desired, options)
             .map_err(|e| Error::InvalidResource(e.to_string()))?
         {
-            ApplyOutcome::Applied { object, .. } => Ok(*object),
+            ApplyOutcome::Applied { object, .. } => {
+                // Strict-decode the body once the apply has succeeded, as
+                // upstream does (patch.go:517-527); Warn turns each
+                // `line N: ...` of the error into a warning
+                // (rest.go:439-446 addStrictDecodingWarnings /
+                // parseYAMLWarnings).
+                let directive = self.params.get("fieldValidation").map(String::as_str);
+                if matches!(directive, Some("Strict") | Some("Warn")) {
+                    if let Err(msg) = crate::ssa::strict_decode_apply_body(self.body) {
+                        if directive == Some("Strict") {
+                            return Err(Error::BadRequest(format!(
+                                "error strict decoding YAML: {msg}"
+                            )));
+                        }
+                        for line in msg.lines().skip(1) {
+                            ctx.add_warning(line.trim().to_string());
+                        }
+                    }
+                }
+                Ok(*object)
+            }
             ApplyOutcome::Conflicts(conflicts) => {
                 let detail = conflicts
                     .iter()
@@ -294,7 +320,7 @@ impl<T: Object> TransformFunc<T> for Patcher<'_, T> {
         let current = old.filter(|o| !o.metadata().uid.is_empty());
         let mut obj = match (&self.mechanism, current) {
             (Mechanism::Apply { apply, options }, current) => {
-                self.apply(*apply, options, current)?
+                self.apply(ctx, *apply, options, current)?
             }
             // jsonPatcher / smpPatcher.createNewObject: nothing to patch.
             (Mechanism::Json(_), None) => {
