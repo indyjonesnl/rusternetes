@@ -409,13 +409,11 @@ pub fn request_info(method: &Method, path: &str, query: Option<&str>) -> Attribu
         }
         .to_string();
     }
-    if parts[0] == "namespaces" {
-        if parts.len() > 1 {
-            a.namespace = parts[1].to_string();
-            // namespaceSubresources = {"status", "finalize"}
-            if parts.len() > 2 && parts[2] != "status" && parts[2] != "finalize" {
-                parts = &parts[2..];
-            }
+    if parts[0] == "namespaces" && parts.len() > 1 {
+        a.namespace = parts[1].to_string();
+        // namespaceSubresources = {"status", "finalize"}
+        if parts.len() > 2 && parts[2] != "status" && parts[2] != "finalize" {
+            parts = &parts[2..];
         }
     }
     if parts.len() >= 3 && !no_subresources {
@@ -546,6 +544,7 @@ pub fn add_audit_annotations(kvs: &[(String, String)]) {
 }
 
 /// `audit.AddAuditAnnotation(ctx, key, value)` (context.go:297).
+#[allow(dead_code)]
 pub fn add_audit_annotation(key: &str, value: &str) {
     add_audit_annotations(&[(key.to_string(), value.to_string())]);
 }
@@ -974,7 +973,7 @@ rules:
 
     fn test_ac() -> Arc<AuditContext> {
         let cap = Arc::new(Capture(Default::default()));
-        let ac = Arc::new(AuditContext {
+        Arc::new(AuditContext {
             inner: Mutex::new(AuditInner {
                 event: AuditEvent {
                     api_version: "audit.k8s.io/v1".into(),
@@ -1005,8 +1004,7 @@ rules:
                 },
             }),
             sink: cap,
-        });
-        ac
+        })
     }
 
     #[tokio::test]
