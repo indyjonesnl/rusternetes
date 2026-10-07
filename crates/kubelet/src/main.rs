@@ -6,7 +6,6 @@
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[allow(dead_code, unused_imports)]
-mod cni;
 mod config;
 #[allow(dead_code, unused_imports)]
 mod cri_runtime;
