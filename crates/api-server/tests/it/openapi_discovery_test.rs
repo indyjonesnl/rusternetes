@@ -128,6 +128,20 @@ async fn test_openapi_v3_shape() {
 }
 
 #[tokio::test]
+async fn test_openapi_v3_lists_certificates_v1beta1() {
+    // ClusterTrustBundle is served at certificates.k8s.io/v1beta1
+    // (storage_certificates.go:95-100), so that group/version must be listed.
+    let router = spawn_router();
+    let (status, body) = get_json(&router, "/openapi/v3").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.pointer("/paths/apis~1certificates.k8s.io~1v1beta1")
+            .is_some(),
+        "apis/certificates.k8s.io/v1beta1 must be listed in /openapi/v3 root"
+    );
+}
+
+#[tokio::test]
 async fn test_openapi_v3_subdocument_shape() {
     // First fetch the v3 root, then follow one of the listed sub-document
     // URLs and assert the body shape (`openapi: 3.0.x`, `paths`,
