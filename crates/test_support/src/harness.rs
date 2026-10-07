@@ -31,6 +31,9 @@ use tower::ServiceExt;
 pub struct TestApiServer {
     pub storage: Arc<MemoryStorage>,
     pub router: axum::Router,
+    /// Auto-create the namespace of a namespaced POST (see
+    /// [`TestApiServerBuilder::strict_namespaces`]).
+    pub seed_namespaces: bool,
 }
 
 impl TestApiServer {
@@ -47,12 +50,51 @@ impl TestApiServer {
         TestApiServerBuilder::default()
     }
 
-    fn from_parts(mem: Arc<MemoryStorage>, state: ApiServerState) -> Self {
+    fn from_parts(mem: Arc<MemoryStorage>, state: ApiServerState, seed_namespaces: bool) -> Self {
         let router = build_router(Arc::new(state), None);
         Self {
             storage: mem,
             router,
+            seed_namespaces,
         }
+    }
+
+    /// NamespaceLifecycle admission answers NotFound for a create into a
+    /// namespace that does not exist (upstream `lifecycle/admission.go`), so a
+    /// fixture that POSTs namespaced content must have created the namespace.
+    /// This does that for every namespaced collection POST, once, in one place;
+    /// it never touches a namespace that already exists. Tests that assert the
+    /// missing-namespace behaviour opt out with
+    /// [`TestApiServerBuilder::strict_namespaces`].
+    fn seed_namespace_for(&self, method: &str, uri: &str) {
+        if !self.seed_namespaces || !method.eq_ignore_ascii_case("POST") {
+            return;
+        }
+        let path = uri.split('?').next().unwrap_or(uri);
+        let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let Some(i) = segs.iter().position(|s| *s == "namespaces") else {
+            return;
+        };
+        // `.../namespaces/{ns}/{collection}` only: not the namespace
+        // collection itself, not a named object's subresource.
+        if segs.len() != i + 3 || !matches!(segs[0], "api" | "apis") {
+            return;
+        }
+        let name = segs[i + 1];
+        let key = rusternetes_storage::build_key("namespaces", None, name);
+        let ns = serde_json::json!({
+            "apiVersion": "v1", "kind": "Namespace",
+            "metadata": {"name": name},
+            "spec": {"finalizers": ["kubernetes"]},
+            "status": {"phase": "Active"},
+        });
+        let storage = self.storage.clone();
+        futures::FutureExt::now_or_never(async move {
+            use rusternetes_storage::Storage;
+            if storage.get::<Value>(&key).await.is_err() {
+                let _ = storage.create(&key, &ns).await;
+            }
+        });
     }
 
     /// Low-level request primitive — returns status, raw body bytes, and the
@@ -120,6 +162,7 @@ impl TestApiServer {
         content_type: Option<&str>,
         body: Option<Vec<u8>>,
     ) -> axum::response::Response {
+        self.seed_namespace_for(method, uri);
         let mut builder = Request::builder().method(method).uri(uri);
         if let Some(ct) = content_type {
             builder = builder.header("content-type", ct);
@@ -146,6 +189,7 @@ impl TestApiServer {
         headers: &[(&str, &str)],
         body: Option<Vec<u8>>,
     ) -> (StatusCode, HeaderMap, Vec<u8>, Value) {
+        self.seed_namespace_for(method, uri);
         let mut builder = Request::builder().method(method).uri(uri);
         for (k, v) in headers {
             builder = builder.header(*k, *v);
@@ -233,6 +277,7 @@ pub struct TestApiServerBuilder {
     secret: Vec<u8>,
     ca_cert_pem: Option<String>,
     service_cluster_ip_range: String,
+    strict_namespaces: bool,
 }
 
 impl Default for TestApiServerBuilder {
@@ -243,11 +288,19 @@ impl Default for TestApiServerBuilder {
             secret: b"test-secret".to_vec(),
             ca_cert_pem: None,
             service_cluster_ip_range: String::new(),
+            strict_namespaces: false,
         }
     }
 }
 
 impl TestApiServerBuilder {
+    /// Do not auto-create the namespace of namespaced POSTs, so
+    /// NamespaceLifecycle's NotFound for a missing namespace is observable.
+    pub fn strict_namespaces(mut self) -> Self {
+        self.strict_namespaces = true;
+        self
+    }
+
     /// Toggle the auth middleware. `false` exercises the real bearer-token /
     /// authorizer pipeline instead of the skip-auth shortcut.
     pub fn skip_auth(mut self, skip_auth: bool) -> Self {
@@ -321,7 +374,7 @@ impl TestApiServerBuilder {
         )
         .expect("the initial NodePort repair on MemoryStorage completes without waiting")
         .expect("the initial NodePort repair succeeds");
-        TestApiServer::from_parts(mem, state)
+        TestApiServer::from_parts(mem, state, !self.strict_namespaces)
     }
 }
 
