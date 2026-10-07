@@ -280,6 +280,10 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
             e
         );
     }
+    // `rbac/bootstrap-roles` PostStartHook (upstream pkg/registry/rbac/rest/
+    // storage_rbac.go:131-179), same as main.rs: the SAME hook, awaited so a
+    // fresh store is never served with an empty RBAC policy (#2490).
+    let _ = bootstrap::spawn_rbac_bootstrap_roles_hook(storage.clone()).await;
     // scheduling/bootstrap-system-priority-classes PostStartHook (upstream
     // pkg/registry/scheduling/rest/storage_scheduling.go), same as main.rs.
     bootstrap::spawn_system_priority_classes_hook(storage.clone());
