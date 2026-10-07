@@ -23,6 +23,7 @@ mod peer_cert_acceptor;
 mod post_start_hooks;
 mod prometheus_client;
 mod registry;
+mod storage_readiness_hook;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]
 mod response;
@@ -283,6 +284,9 @@ async fn main() -> Result<()> {
     // pkg/controlplane/apiserver/server.go:145): keeps kube-system,
     // kube-public, default, kube-node-lease existing.
     bootstrap::spawn_system_namespaces_controller(storage.clone());
+    // storage-readiness PostStartHook (server.go:315-317), behind
+    // WatchCacheInitializationPostStartHook (off by default).
+    storage_readiness_hook::spawn_for_backend(storage.clone());
     // Keep the kubernetes endpoint tracking the live api-server IP across
     // container recreates / IP changes (upstream EndpointReconciler, #1188).
     bootstrap::spawn_endpoint_reconciler(

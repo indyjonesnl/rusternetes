@@ -168,6 +168,9 @@ pub enum Feature {
 
     /// Upstream gate `StorageVersionMigrator` (1.35 Beta, still off; `pkg/features/kube_features.go:1829-1832`).
     StorageVersionMigrator,
+
+    /// Upstream gate `WatchCacheInitializationPostStartHook` (1.31 Beta, still off; `staging/src/k8s.io/apiserver/pkg/features/kube_features.go:494-496`).
+    WatchCacheInitializationPostStartHook,
 }
 
 impl Feature {
@@ -206,6 +209,7 @@ impl Feature {
             Feature::StorageVersionAPI => 29,
             Feature::APIServerIdentity => 30,
             Feature::StorageVersionMigrator => 31,
+            Feature::WatchCacheInitializationPostStartHook => 32,
         }
     }
 
@@ -276,6 +280,8 @@ impl Feature {
             Feature::APIServerIdentity => true,
             // 1.35 Beta, still off (pkg/features/kube_features.go:1829-1832)
             Feature::StorageVersionMigrator => false,
+            // 1.31 Beta, no `Default: true` (apiserver kube_features.go:494-496)
+            Feature::WatchCacheInitializationPostStartHook => false,
         }
     }
 }
@@ -324,6 +330,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::StorageVersionAPI,
     Feature::APIServerIdentity,
     Feature::StorageVersionMigrator,
+    Feature::WatchCacheInitializationPostStartHook,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -370,6 +377,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::StorageVersionAPI.default_enabled()),
     AtomicBool::new(Feature::APIServerIdentity.default_enabled()),
     AtomicBool::new(Feature::StorageVersionMigrator.default_enabled()),
+    AtomicBool::new(Feature::WatchCacheInitializationPostStartHook.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.

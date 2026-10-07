@@ -17,6 +17,7 @@ pub mod peer_cert_acceptor;
 pub mod post_start_hooks;
 pub mod prometheus_client;
 pub mod registry;
+pub mod storage_readiness_hook;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]
 pub mod response;
@@ -284,6 +285,9 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     bootstrap::spawn_system_priority_classes_hook(storage.clone());
     // start-system-namespaces-controller (server.go:145).
     bootstrap::spawn_system_namespaces_controller(storage.clone());
+    // storage-readiness PostStartHook (server.go:315-317), behind
+    // WatchCacheInitializationPostStartHook (off by default).
+    storage_readiness_hook::spawn_for_backend(storage.clone());
     // Keep the kubernetes endpoint tracking the live api-server IP across
     // container recreates / IP changes (upstream EndpointReconciler, #1188).
     bootstrap::spawn_endpoint_reconciler(
