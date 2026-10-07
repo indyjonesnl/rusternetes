@@ -142,6 +142,7 @@ fn config_map_payload(
                 payload.insert(
                     k.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: v.clone().into_bytes(),
                         mode: default_mode,
                     },
@@ -151,6 +152,7 @@ fn config_map_payload(
                 payload.insert(
                     k.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: v.clone(),
                         mode: default_mode,
                     },
@@ -174,6 +176,7 @@ fn config_map_payload(
                 payload.insert(
                     ktp.path.clone(),
                     FileProjection {
+                        fs_user: None,
                         data,
                         mode: mode_of(ktp.mode, default_mode),
                     },
@@ -198,6 +201,7 @@ fn secret_payload(
                 payload.insert(
                     k.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: v.clone(),
                         mode: default_mode,
                     },
@@ -215,6 +219,7 @@ fn secret_payload(
                 payload.insert(
                     ktp.path.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: content.clone(),
                         mode: mode_of(ktp.mode, default_mode),
                     },
@@ -238,6 +243,7 @@ fn downward_api_payload(
     let mut data = BTreeMap::new();
     for item in items {
         let mut fp = FileProjection {
+            fs_user: None,
             data: Vec::new(),
             mode: mode_of(item.mode, default_mode),
         };
@@ -347,6 +353,7 @@ impl ProjectedMounter {
                         payload.insert(
                             tp.path.clone(),
                             FileProjection {
+                                fs_user: None,
                                 data: token.into_bytes(),
                                 mode: default_mode,
                             },

@@ -49,6 +49,7 @@ pub(crate) fn build_configmap_payload(
                 payload.insert(
                     item.path.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: v.clone().into_bytes(),
                         mode,
                     },
@@ -61,6 +62,7 @@ pub(crate) fn build_configmap_payload(
                 payload.insert(
                     item.path.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: v.clone(),
                         mode,
                     },
@@ -77,6 +79,7 @@ pub(crate) fn build_configmap_payload(
                 payload.insert(
                     k.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: v.clone().into_bytes(),
                         mode: default_mode,
                     },
@@ -88,6 +91,7 @@ pub(crate) fn build_configmap_payload(
                 payload.insert(
                     k.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: v.clone(),
                         mode: default_mode,
                     },
@@ -1053,6 +1057,7 @@ impl VolumeManager {
                     payload.insert(
                         "ca.crt".to_string(),
                         FileProjection {
+                            fs_user: None,
                             data: existing,
                             mode,
                         },
