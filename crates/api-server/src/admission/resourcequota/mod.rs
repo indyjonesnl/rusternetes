@@ -105,7 +105,18 @@ pub fn check_request(
 
     // The quotas pertinent to this request (controller.go:505-536).
     let mut interesting: Vec<usize> = Vec::new();
+    let mut restricted_scopes = Vec::new();
     for (i, q) in quotas.iter().enumerate() {
+        let selectors = quota::scope_selectors_from_quota(&q.spec);
+        let local = evaluator
+            .matching_scopes(a.object, &selectors)
+            .map_err(|e| {
+                QuotaError::Other(format!(
+                    "error matching scopes of quota {}, err: {e}",
+                    q.metadata.name
+                ))
+            })?;
+        restricted_scopes.extend(local);
         if !evaluator.matches(q, a.object).map_err(QuotaError::Other)? {
             continue;
         }
@@ -187,6 +198,18 @@ pub fn check_request(
         }
     } else if quota::remove_zeros(&delta_when_no_interesting).is_empty() {
         return Ok(quotas.to_vec());
+    }
+
+    // Every limited scope needs a covering quota scope (controller.go:
+    // 617-625). `LimitedResources` is empty, so no scope is limited.
+    let limited_scopes = Vec::new();
+    let uncovered = evaluator
+        .uncovered_quota_scopes(&limited_scopes, &restricted_scopes)
+        .map_err(QuotaError::Other)?;
+    if !uncovered.is_empty() {
+        return Err(QuotaError::Other(format!(
+            "insufficient quota to match these scopes: {uncovered:?}"
+        )));
     }
 
     if interesting.is_empty() {
