@@ -70,7 +70,7 @@ fn scope(state: &ApiServerState, uri: &Uri) -> (Served, RequestScope<Event>) {
             resource: "events".to_string(),
         },
         subresource: None,
-        store: Box::new(event::new_store(state.storage.clone())),
+        store: Box::new(event::new_store(state.storage.clone(), state.event_ttl)),
         apply: Some(match served {
             Served::Core => crate::ssa::apply_legacy::<Event>,
             Served::EventsV1 => event::apply_events_v1,

@@ -164,6 +164,15 @@ struct Args {
     /// Client CA certificate file for mTLS client certificate authentication
     #[arg(long)]
     client_ca_file: Option<String>,
+
+    /// Amount of time to retain events, as a Go duration (`--event-ttl`). `0`
+    /// keeps them forever.
+    #[arg(
+        long,
+        default_value = "1h",
+        value_parser = rusternetes_api_server::registry::core::event::parse_event_ttl
+    )]
+    event_ttl: u64,
 }
 
 fn main() -> Result<()> {
@@ -262,6 +271,7 @@ async fn async_main() -> Result<()> {
         console_dir: args.console_dir.map(std::path::PathBuf::from),
         client_ca_file: args.client_ca_file.clone(),
         service_cluster_ip_range: args.service_cluster_ip_range.clone(),
+        event_ttl: args.event_ttl,
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;

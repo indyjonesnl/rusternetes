@@ -179,6 +179,9 @@ pub struct ApiServerConfig {
     /// `--service-cluster-ip-range`: one CIDR, or two of different IP
     /// families, comma-separated.
     pub service_cluster_ip_range: String,
+    /// `--event-ttl` in seconds: how long an Event lives after its last write
+    /// (`0` keeps events forever).
+    pub event_ttl: u64,
 }
 
 impl Default for ApiServerConfig {
@@ -200,6 +203,7 @@ impl Default for ApiServerConfig {
                 registry::core::service::portallocator::DEFAULT_SERVICE_NODE_PORT_RANGE,
             service_cluster_ip_range:
                 registry::core::service::ipranges::DEFAULT_SERVICE_CLUSTER_IP_RANGE.to_string(),
+            event_ttl: registry::core::event::DEFAULT_EVENT_TTL_SECONDS,
         }
     }
 }
@@ -360,6 +364,7 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         .with_service_cluster_ip_ranges(&service_ranges)
         .with_ca_cert(ca_cert_pem)
         .with_service_node_port_range(config.service_node_port_range)
+        .with_event_ttl(config.event_ttl)
         .with_prometheus_client(prom_client),
     );
 

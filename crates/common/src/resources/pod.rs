@@ -1586,8 +1586,19 @@ pub struct ResourceHealth {
     pub health: Option<String>,
 }
 
+/// Go's `ContainerState` (core/v1/types.go) is a struct of three optional
+/// pointers; nothing requires exactly one (`ValidateContainerStateTransition`,
+/// pkg/apis/core/validation/validation.go:5841, only constrains Terminated
+/// transitions), so a strategic-merge status patch without `waiting: null`
+/// stores `running` and `waiting` together (#2453). This enum holds one, so the
+/// hand-written `Deserialize` below accepts several keys and keeps the most
+/// final one (Terminated, then Running, then Waiting); `null` keys are absent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    remote = "Self",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ContainerState {
     Waiting {
         reason: Option<String>,
@@ -1623,6 +1634,34 @@ pub enum ContainerState {
         finished_at: Option<String>,
         container_id: Option<String>,
     },
+}
+
+impl Serialize for ContainerState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ContainerState::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContainerState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let value = match value {
+            serde_json::Value::Object(mut map) if map.len() > 1 => {
+                map.retain(|_, v| !v.is_null());
+                if map.len() > 1 {
+                    let keep = ["terminated", "running", "waiting"]
+                        .into_iter()
+                        .find(|k| map.contains_key(*k));
+                    if let Some(k) = keep {
+                        map.retain(|key, _| key == k);
+                    }
+                }
+                serde_json::Value::Object(map)
+            }
+            v => v,
+        };
+        ContainerState::deserialize(value).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Affinity is a group of affinity scheduling rules
@@ -2001,6 +2040,28 @@ pub struct PodResourceClaimStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2453: Go's struct tolerates several states set at once.
+    #[test]
+    fn container_state_with_several_keys_keeps_the_most_final() {
+        let s: ContainerState = serde_json::from_value(serde_json::json!({
+            "running": {"startedAt": "2026-10-07T00:00:00Z"},
+            "waiting": {"reason": "ContainerCreating"}
+        }))
+        .unwrap();
+        assert!(matches!(s, ContainerState::Running { .. }));
+        let s: ContainerState = serde_json::from_value(serde_json::json!({
+            "running": {}, "waiting": null
+        }))
+        .unwrap();
+        assert!(matches!(s, ContainerState::Running { .. }));
+        let s: ContainerState = serde_json::from_value(serde_json::json!({
+            "waiting": {"reason": "x"},
+            "terminated": {"exitCode": 1}
+        }))
+        .unwrap();
+        assert!(matches!(s, ContainerState::Terminated { exit_code: 1, .. }));
+    }
 
     /// Pod condition timestamps MUST serialize at whole-second precision, like
     /// upstream `metav1.Time.MarshalJSON`. Sub-second precision diverges from
