@@ -1045,6 +1045,39 @@ pub fn spawn_resync(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()>
     )
 }
 
+/// `PollUntilContextCancel(ctx, 100*time.Millisecond, true, ..)` over the
+/// informer's `HasSynced` (apiserver.go:263-271): `synced` is tried at once,
+/// then every 100ms, until it reports true. Upstream returns only on context
+/// cancel (shutdown), which here is the task being dropped.
+pub async fn wait_for_crd_informer_synced<F, Fut>(mut synced: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    while !synced().await {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// The `crd-informer-synced` post-start hook (apiserver.go:259-271):
+/// "we don't want to report healthy until we can handle all CRDs that have
+/// already been registered". Here the CRDs are read straight from storage
+/// (there is no informer cache), so the informer's initial list completing
+/// maps to a list of CRDs succeeding. The hook's `poststarthook` check is the
+/// piece readyz/healthz expose.
+///
+/// Not ported: the `CRDInformerHasNotSynced` mux-and-discovery signal
+/// (apiserver.go:133-139, closed at :266) which makes requests for custom
+/// resource paths 503 rather than 404 until sync; custom resource routes here
+/// are resolved per request from storage, with no install phase to guard.
+pub fn spawn_crd_informer_synced_hook(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()> {
+    crate::post_start_hooks::spawn_hook(crate::bootstrap::CRD_INFORMER_SYNCED_HOOK, async move {
+        let rest = new_rest(storage);
+        wait_for_crd_informer_synced(|| async { rest.all_names().await.is_ok() }).await;
+        Ok::<(), std::convert::Infallible>(())
+    })
+}
+
 fn spawn_resync_loop(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let rest = new_rest(storage);
@@ -1108,6 +1141,17 @@ pub fn new_rest(storage: Arc<StorageBackend>) -> CrdRest {
 
 #[cfg(test)]
 mod tests {
+    /// The hook polls until the informer reports synced (apiserver.go:263-271).
+    #[tokio::test(start_paused = true)]
+    async fn crd_informer_synced_polls_until_synced() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        super::wait_for_crd_informer_synced(|| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { n >= 3 }
+        })
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
     use super::*;
 
     fn crd(extra: serde_json::Value) -> CustomResourceDefinition {

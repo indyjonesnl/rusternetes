@@ -17,6 +17,19 @@ use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Replay kubelet: physically delete pods the controller gracefully deleted
+/// (stamped `deletionTimestamp`), as the kubelet does after the grace period.
+async fn simulate_kubelet_cleanup(storage: &Arc<MemoryStorage>, namespace: &str) {
+    let prefix = format!("/registry/pods/{}/", namespace);
+    let pods: Vec<Pod> = storage.list(&prefix).await.unwrap_or_default();
+    for pod in pods {
+        if pod.metadata.deletion_timestamp.is_some() {
+            let key = format!("/registry/pods/{}/{}", namespace, pod.metadata.name);
+            let _ = storage.delete(&key).await;
+        }
+    }
+}
+
 async fn setup() -> Arc<MemoryStorage> {
     let storage = Arc::new(MemoryStorage::new());
     storage.clear();
@@ -407,6 +420,8 @@ async fn test_failed_pod_is_deleted_and_replacement_has_different_name() {
         .await
         .unwrap();
     controller.reconcile_all().await.unwrap();
+    // The controller deletes gracefully (#2465); the kubelet reaps the pod.
+    simulate_kubelet_cleanup(&storage, "default").await;
 
     // The original failed pod should be GONE from storage
     let result: Result<Pod, _> = storage.get(&pod_key).await;
@@ -498,6 +513,8 @@ async fn test_succeeded_pod_is_deleted() {
         .await
         .unwrap();
     controller.reconcile_all().await.unwrap();
+    // The controller deletes gracefully (#2465); the kubelet reaps the pod.
+    simulate_kubelet_cleanup(&storage, "default").await;
 
     // Original should be gone
     let result: Result<Pod, _> = storage.get(&pod_key).await;
