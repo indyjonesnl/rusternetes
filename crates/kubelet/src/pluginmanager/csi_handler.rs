@@ -3,19 +3,23 @@
 //! version/version.go:93-130`): the plugin-manager handler for `CSIPlugin`
 //! registrations, which populates [`DriversStore`].
 //!
-//! NOT PORTED YET (tracked in the follow-up issue): upstream's
-//! `RegisterPlugin` goes on to call the driver's `NodeGetInfo` and
+//! `RegisterPlugin` also runs the driver's `NodeGetInfo` and hands the result to
 //! `nodeinfomanager.InstallCSIDriver` (the `CSINode` object and the
 //! `csi.volume.kubernetes.io/nodeid` node annotation), unregistering the driver
-//! again if either fails (`csi_plugin.go:134-175`), and `DeRegisterPlugin`
-//! calls `UninstallCSIDriver`. Here registration ends once the driver is in
-//! the store, which is what the CSI volume plugin reads
-//! (`newCsiDriverClient`).
+//! again if either fails (`csi_plugin.go:134-175`); `DeRegisterPlugin` calls
+//! `UninstallCSIDriver` (`unregisterDriver`, `csi_plugin.go:962-970`).
+//!
+//! NOT PORTED (tracked in follow-up issues): `csiNodeUpdaterVar.syncDriverUpdater`
+//! (the periodic `NodeGetInfo` refresh driven by
+//! `CSIDriver.NodeAllocatableUpdatePeriodSeconds`).
 
 use super::cache::PluginHandler;
+use crate::volume_plugins::csi_client::{CsiDriverClient, CSI_TIMEOUT};
 use crate::volume_plugins::csi_drivers_store::{csi_drivers, Driver, DriversStore};
+use crate::volume_plugins::nodeinfomanager::NodeInfoInstaller;
 use async_trait::async_trait;
 use std::cmp::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// `registerapi.CSIPlugin` (`pluginregistration/v1/constants.go:21`): the
@@ -147,26 +151,44 @@ pub fn highest_supported_version(versions: &[String]) -> Result<Version, String>
 /// `RegistrationHandler` (`csi_plugin.go:93`).
 pub struct RegistrationHandler {
     drivers: &'static DriversStore,
-}
-
-impl Default for RegistrationHandler {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Upstream's package-level `nim` (`csi_plugin.go:73`).
+    nim: Arc<dyn NodeInfoInstaller>,
 }
 
 impl RegistrationHandler {
     /// Backed by the process-wide `csiDrivers` store, as upstream's
     /// `PluginHandler` is.
-    pub fn new() -> Self {
+    pub fn new(nim: Arc<dyn NodeInfoInstaller>) -> Self {
         Self {
             drivers: csi_drivers(),
+            nim,
         }
     }
 
     /// Back the handler with another store (tests).
-    pub fn with_store(drivers: &'static DriversStore) -> Self {
-        Self { drivers }
+    pub fn with_store(drivers: &'static DriversStore, nim: Arc<dyn NodeInfoInstaller>) -> Self {
+        Self { drivers, nim }
+    }
+
+    /// `unregisterDriver` (`csi_plugin.go:962-970`): delete from the store
+    /// first, then uninstall the node info.
+    async fn unregister_driver(&self, driver_name: &str) -> Result<(), String> {
+        self.drivers.delete(driver_name);
+        self.nim
+            .uninstall_csi_driver(driver_name)
+            .await
+            .map_err(|e| format!("kubernetes.io/csi: Error uninstalling CSI driver: {e}"))
+    }
+
+    /// The shared failure arm of `RegisterPlugin` (`csi_plugin.go:150-164`):
+    /// unregister the driver, log a failure to do so, return the original error.
+    async fn fail_registration(&self, plugin_name: &str, err: String) -> Result<(), String> {
+        if let Err(unreg) = self.unregister_driver(plugin_name).await {
+            tracing::error!(
+                "kubernetes.io/csi: registrationHandler.RegisterPlugin failed to unregister plugin due to previous error: {unreg}"
+            );
+        }
+        Err(err)
     }
 
     /// `validateVersions` (`csi_plugin.go:262-297`).
@@ -220,14 +242,13 @@ impl PluginHandler for RegistrationHandler {
             })
     }
 
-    /// `RegisterPlugin` (`csi_plugin.go:114-177`), up to and including
-    /// `csiDrivers.Set`; see the module doc for what is not ported.
+    /// `RegisterPlugin` (`csi_plugin.go:114-177`).
     async fn register_plugin(
         &self,
         plugin_name: &str,
         endpoint: &str,
         versions: &[String],
-        _plugin_client_timeout: Option<Duration>,
+        plugin_client_timeout: Option<Duration>,
     ) -> Result<(), String> {
         tracing::info!(
             "kubernetes.io/csi: Register new plugin with name: {plugin_name} at endpoint: {endpoint}"
@@ -241,22 +262,61 @@ impl PluginHandler for RegistrationHandler {
                 highest_supported_version: highest.to_string(),
             },
         );
+
+        // Get node info from the driver (`newCsiDriverClient` resolves the
+        // endpoint from the store just written).
+        let driver = self.drivers.get(plugin_name).ok_or_else(|| {
+            format!("driver name {plugin_name} not found in the list of registered CSI drivers")
+        })?;
+        let csi = CsiDriverClient::with_endpoint(plugin_name, driver.endpoint);
+        let timeout = plugin_client_timeout.unwrap_or(CSI_TIMEOUT);
+        let info = match tokio::time::timeout(timeout, csi.node_get_info()).await {
+            Ok(Ok(info)) => info,
+            Ok(Err(e)) => return self.fail_registration(plugin_name, e.to_string()).await,
+            Err(_) => {
+                return self
+                    .fail_registration(plugin_name, "context deadline exceeded".to_string())
+                    .await
+            }
+        };
+
+        if let Err(e) = self
+            .nim
+            .install_csi_driver(
+                plugin_name,
+                &info.node_id,
+                info.max_volumes_per_node,
+                &info.accessible_topology,
+            )
+            .await
+        {
+            return self.fail_registration(plugin_name, e).await;
+        }
         Ok(())
     }
 
-    /// `DeRegisterPlugin` (`csi_plugin.go:242-252`): `unregisterDriver` ->
-    /// `csiDrivers.Delete`.
-    fn deregister_plugin(&self, plugin_name: &str, endpoint: &str) {
+    /// `DeRegisterPlugin` (`csi_plugin.go:270-279`): `unregisterDriver`; its
+    /// error is logged, not returned.
+    async fn deregister_plugin(&self, plugin_name: &str, endpoint: &str) {
         tracing::info!(
             "kubernetes.io/csi: registrationHandler.DeRegisterPlugin request for plugin {plugin_name}, endpoint {endpoint}"
         );
-        self.drivers.delete(plugin_name);
+        if let Err(e) = self.unregister_driver(plugin_name).await {
+            tracing::error!("kubernetes.io/csi: registrationHandler.DeRegisterPlugin failed: {e}");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::volume_plugins::csi_client::fake as csi_fake;
+    use crate::volume_plugins::csi_client::proto::{NodeGetInfoResponse, Topology};
+    use csi_fake::FakeDriver;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    type Install = (String, String, i64, HashMap<String, String>);
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
@@ -264,6 +324,65 @@ mod tests {
 
     fn store() -> &'static DriversStore {
         Box::leak(Box::new(DriversStore::new()))
+    }
+
+    /// Records what the handler asks the NodeInfoManager to do.
+    #[derive(Default)]
+    struct RecordingNim {
+        installs: Mutex<Vec<Install>>,
+        uninstalls: Mutex<Vec<String>>,
+        fail_install: bool,
+        fail_uninstall: bool,
+    }
+
+    #[async_trait]
+    impl NodeInfoInstaller for RecordingNim {
+        async fn install_csi_driver(
+            &self,
+            driver_name: &str,
+            driver_node_id: &str,
+            max_attach_limit: i64,
+            topology: &HashMap<String, String>,
+        ) -> Result<(), String> {
+            self.installs.lock().unwrap().push((
+                driver_name.into(),
+                driver_node_id.into(),
+                max_attach_limit,
+                topology.clone(),
+            ));
+            if self.fail_install {
+                return Err("install failed".into());
+            }
+            Ok(())
+        }
+        async fn uninstall_csi_driver(&self, driver_name: &str) -> Result<(), String> {
+            self.uninstalls.lock().unwrap().push(driver_name.into());
+            if self.fail_uninstall {
+                return Err("uninstall failed".into());
+            }
+            Ok(())
+        }
+    }
+
+    /// A fake CSI driver answering `NodeGetInfo` on a unix socket; returns the
+    /// socket path (the temp dir is leaked for the test's lifetime).
+    fn driver_socket(info: Option<Result<NodeGetInfoResponse, tonic::Code>>) -> String {
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let sock = dir.path().join("csi.sock");
+        let d = FakeDriver::default();
+        *d.node_info.lock().unwrap() = info;
+        std::mem::forget(csi_fake::serve(d, &sock));
+        sock.to_string_lossy().into_owned()
+    }
+
+    fn node_info(id: &str) -> NodeGetInfoResponse {
+        NodeGetInfoResponse {
+            node_id: id.into(),
+            max_volumes_per_node: 7,
+            accessible_topology: Some(Topology {
+                segments: HashMap::from([("topology.example.com/zone".into(), "z1".into())]),
+            }),
+        }
     }
 
     /// `TestHighestSupportedVersion` (`version_test.go:350-440`), every row.
@@ -300,7 +419,7 @@ mod tests {
     /// handler (fresh store, so no existing driver).
     #[test]
     fn validate_plugin_table() {
-        let h = RegistrationHandler::with_store(store());
+        let h = RegistrationHandler::with_store(store(), Arc::new(RecordingNim::default()));
         let ok = |v: &[&str]| h.validate_plugin("test.plugin", "/csi.sock", &s(v)).is_ok();
         assert!(ok(&["v1.0.0"]));
         assert!(!ok(&["0.3.0"]));
@@ -326,7 +445,7 @@ mod tests {
                         .to_string(),
                 },
             );
-            RegistrationHandler::with_store(st)
+            RegistrationHandler::with_store(st, Arc::new(RecordingNim::default()))
         };
         // Different name: fine.
         let h = seed("test.plugin", &["v1.0.0"]);
@@ -345,19 +464,97 @@ mod tests {
             .is_ok());
     }
 
-    /// Register puts the driver in the store the CSI volume plugin reads;
-    /// DeRegister removes it.
+    /// `RegisterPlugin` (`csi_plugin.go:134-177`): after `csiDrivers.Set` it
+    /// calls `NodeGetInfo` and hands the node id, max volumes and topology
+    /// segments to `InstallCSIDriver`; DeRegister clears the store and calls
+    /// `UninstallCSIDriver` (`unregisterDriver`, `csi_plugin.go:962-970`).
     #[tokio::test]
-    async fn register_populates_store_and_deregister_clears() {
+    async fn register_installs_node_info_and_deregister_uninstalls() {
         let st = store();
-        let h = RegistrationHandler::with_store(st);
-        h.register_plugin("csi.example.com", "/p/csi.sock", &s(&["v1.2.3"]), None)
+        let nim = Arc::new(RecordingNim::default());
+        let h = RegistrationHandler::with_store(st, nim.clone());
+        let ep = driver_socket(Some(Ok(node_info("csi-node-1"))));
+        h.register_plugin("csi.example.com", &ep, &s(&["v1.2.3"]), None)
             .await
             .unwrap();
         let d = st.get("csi.example.com").expect("driver registered");
-        assert_eq!(d.endpoint, "/p/csi.sock");
+        assert_eq!(d.endpoint, ep);
         assert_eq!(d.highest_supported_version, "1.2.3");
-        h.deregister_plugin("csi.example.com", "/p/csi.sock");
+        {
+            let installs = nim.installs.lock().unwrap();
+            assert_eq!(installs.len(), 1);
+            assert_eq!(installs[0].0, "csi.example.com");
+            assert_eq!(installs[0].1, "csi-node-1");
+            assert_eq!(installs[0].2, 7);
+            assert_eq!(installs[0].3["topology.example.com/zone"], "z1");
+        }
+
+        h.deregister_plugin("csi.example.com", &ep).await;
+        assert!(st.get("csi.example.com").is_none());
+        assert_eq!(*nim.uninstalls.lock().unwrap(), vec!["csi.example.com"]);
+    }
+
+    /// `NodeGetInfo` failing unregisters the driver again and surfaces the
+    /// error (`csi_plugin.go:150-156`); nothing is installed.
+    #[tokio::test]
+    async fn node_get_info_failure_unregisters_the_driver() {
+        let st = store();
+        let nim = Arc::new(RecordingNim::default());
+        let h = RegistrationHandler::with_store(st, nim.clone());
+        let ep = driver_socket(Some(Err(tonic::Code::Unavailable)));
+        let err = h
+            .register_plugin(
+                "csi.example.com",
+                &ep,
+                &s(&["v1.0.0"]),
+                Some(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap_err();
+        assert!(!err.is_empty());
+        assert!(
+            st.get("csi.example.com").is_none(),
+            "driver must be unregistered"
+        );
+        assert!(nim.installs.lock().unwrap().is_empty());
+        // unregisterDriver also uninstalls.
+        assert_eq!(*nim.uninstalls.lock().unwrap(), vec!["csi.example.com"]);
+    }
+
+    /// `InstallCSIDriver` failing unregisters the driver again
+    /// (`csi_plugin.go:158-164`).
+    #[tokio::test]
+    async fn install_failure_unregisters_the_driver() {
+        let st = store();
+        let nim = Arc::new(RecordingNim {
+            fail_install: true,
+            ..Default::default()
+        });
+        let h = RegistrationHandler::with_store(st, nim.clone());
+        let ep = driver_socket(Some(Ok(node_info("csi-node-1"))));
+        let err = h
+            .register_plugin("csi.example.com", &ep, &s(&["v1.0.0"]), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("install failed"), "{err}");
+        assert!(st.get("csi.example.com").is_none());
+    }
+
+    /// `unregisterDriver` deletes from the store BEFORE uninstalling, so a
+    /// failing uninstall still leaves the store clean (`csi_plugin.go:963-967`).
+    #[tokio::test]
+    async fn deregister_clears_the_store_even_if_uninstall_fails() {
+        let st = store();
+        let nim = Arc::new(RecordingNim {
+            fail_uninstall: true,
+            ..Default::default()
+        });
+        let h = RegistrationHandler::with_store(st, nim);
+        let ep = driver_socket(Some(Ok(node_info("n"))));
+        h.register_plugin("csi.example.com", &ep, &s(&["v1.0.0"]), None)
+            .await
+            .unwrap();
+        h.deregister_plugin("csi.example.com", &ep).await;
         assert!(st.get("csi.example.com").is_none());
     }
 }

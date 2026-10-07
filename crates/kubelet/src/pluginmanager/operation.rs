@@ -179,12 +179,12 @@ impl OperationExecutor {
     ) -> Result<(), RunError> {
         let key = info.socket_path.clone();
         self.pending_operations
-            .run(&key, async move { unregister_plugin(info, asw) })
+            .run(&key, unregister_plugin(info, asw))
     }
 }
 
 /// `GenerateUnregisterPluginFunc` (`operation_generator.go:136-155`).
-fn unregister_plugin(info: PluginInfo, asw: Arc<ActualStateOfWorld>) -> Result<(), String> {
+async fn unregister_plugin(info: PluginInfo, asw: Arc<ActualStateOfWorld>) -> Result<(), String> {
     let Some(handler) = info.handler.clone() else {
         return Err(format!(
             "UnregisterPlugin error -- failed to get plugin handler for {}",
@@ -195,7 +195,7 @@ fn unregister_plugin(info: PluginInfo, asw: Arc<ActualStateOfWorld>) -> Result<(
     // that a register event arriving meanwhile is processed as a Register call
     // (`operation_generator.go:146-147`).
     asw.remove_plugin(&info.socket_path);
-    handler.deregister_plugin(&info.name, &info.endpoint);
+    handler.deregister_plugin(&info.name, &info.endpoint).await;
     tracing::debug!(plugin = %info.name, "DeRegisterPlugin called");
     Ok(())
 }
