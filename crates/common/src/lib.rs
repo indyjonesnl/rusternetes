@@ -21,6 +21,7 @@ pub mod label_selector;
 pub mod leader_election;
 pub mod observability;
 pub mod pagination;
+pub mod patch;
 pub mod pdbhelper;
 pub mod pod_drop_disabled;
 pub mod pod_warnings;
