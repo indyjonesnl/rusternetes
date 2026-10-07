@@ -10510,6 +10510,12 @@ impl ProtoRegistry {
         schemas.insert("CronJobList".into(), list_schema("CronJob"));
         schemas.insert("JobList".into(), list_schema("Job"));
 
+        // certificates/v1beta1
+        schemas.insert(
+            "ClusterTrustBundleList".into(),
+            list_schema("ClusterTrustBundle"),
+        );
+
         // networking/v1
         schemas.insert("IPAddressList".into(), list_schema("IPAddress"));
         schemas.insert("IngressClassList".into(), list_schema("IngressClass"));
@@ -13041,6 +13047,35 @@ impl ProtoRegistry {
     /// (map<string, ExtraValue=repeated string>) has no matching FieldType and
     /// is omitted — the decoder skips field 6.
     fn register_certificates_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        // certificates.k8s.io/v1beta1 ClusterTrustBundle
+        // (staging/src/k8s.io/api/certificates/v1beta1/generated.proto:214-257).
+        schemas.insert(
+            "ClusterTrustBundle".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("ClusterTrustBundleSpec".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ClusterTrustBundleSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("signerName".into(), FieldType::String)),
+                    (2, ("trustBundle".into(), FieldType::String)),
+                ]),
+            },
+        );
         schemas.insert(
             "CertificateSigningRequest".into(),
             MessageSchema {
@@ -14867,6 +14902,7 @@ mod tests {
         "ClusterRole",
         "ClusterRoleBinding",
         "ComponentStatus",
+        "ClusterTrustBundle",
         "ConfigMap",
         "ControllerRevision",
         "CronJob",
@@ -14978,6 +15014,27 @@ mod tests {
             missing.len(),
             missing.join("\n")
         );
+    }
+
+    #[test]
+    fn test_cluster_trust_bundle_protobuf_roundtrip() {
+        // certificates/v1beta1 generated.proto: ClusterTrustBundle{metadata=1,spec=2},
+        // Spec{signerName=1,trustBundle=2}, List{metadata=1,items=2}.
+        let reg = ProtoRegistry::new();
+        let ctb = json!({
+            "metadata": {"name": "example.com:foo:abc"},
+            "spec": {"signerName": "example.com/foo", "trustBundle": "PEM"}
+        });
+        let bytes = reg.encode_message("ClusterTrustBundle", &ctb).unwrap();
+        let back = reg.decode_message("ClusterTrustBundle", &bytes).unwrap();
+        assert_eq!(back["spec"]["signerName"], "example.com/foo");
+        assert_eq!(back["spec"]["trustBundle"], "PEM");
+        let list = json!({"metadata": {}, "items": [ctb]});
+        let bytes = reg.encode_message("ClusterTrustBundleList", &list).unwrap();
+        let back = reg
+            .decode_message("ClusterTrustBundleList", &bytes)
+            .unwrap();
+        assert_eq!(back["items"][0]["spec"]["trustBundle"], "PEM");
     }
 
     #[test]

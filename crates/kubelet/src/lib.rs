@@ -13,6 +13,7 @@ pub mod host_port;
 pub mod kubelet;
 pub mod labels;
 pub mod lifecycle;
+pub mod node_status;
 pub mod pluginmanager;
 pub mod pod_dirs;
 mod poll;

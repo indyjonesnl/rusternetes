@@ -381,3 +381,28 @@ async fn node_runs_a_worker_pool() {
     .await;
     assert!(peak > 1, "node run() peaked at {peak}");
 }
+
+/// Upstream runs `podUpdateWorkerSize = 4` pod workers (`Run`, :493-497)
+/// beside the node pool. Red before the split: the fused controller had no
+/// pod pool, so no pod `get` ever overlapped.
+#[tokio::test]
+async fn node_lifecycle_runs_a_pod_update_pool() {
+    let peak = peak_concurrency(
+        "pods",
+        12,
+        |i| {
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": meta(i),
+                "spec": {"nodeName": "n1", "containers": [{"name": "c", "image": "i"}]}
+            })
+        },
+        |s| async move {
+            let _ = Arc::new(crate::controllers::node::NodeController::new(s))
+                .run()
+                .await;
+        },
+    )
+    .await;
+    assert!(peak > 1, "node-lifecycle pod pool peaked at {peak}");
+}

@@ -22,10 +22,55 @@ fn job_name_for(cronjob_name: &str, scheduled_time: chrono::DateTime<chrono::Utc
 /// requeue to absorb NTP skew.
 const NEXT_SCHEDULE_DELTA: chrono::Duration = chrono::Duration::milliseconds(100);
 
+/// robfig/cron's `Schedule`: either a parsed crontab spec or the
+/// `ConstantDelaySchedule` of an `@every` descriptor
+/// (vendor/github.com/robfig/cron/v3/constantdelay.go:3-26).
+#[derive(Debug, Clone)]
+enum Schedule {
+    Cron(Box<cron::Schedule>),
+    /// Whole seconds, at least 1 (`Every`, constantdelay.go:13-21).
+    Every(chrono::Duration),
+}
+
+impl Schedule {
+    /// `Every(duration)`: delays under a second round up to one second and
+    /// sub-second parts are truncated (constantdelay.go:13-21).
+    fn every(nanos: i64) -> Self {
+        let nanos = nanos.max(1_000_000_000);
+        Schedule::Every(chrono::Duration::seconds(nanos / 1_000_000_000))
+    }
+
+    /// `Next(t)`: the first slot strictly after `t`, in `tz`. For `@every` it
+    /// is `t + delay - t.Nanosecond()` (constantdelay.go:24-26).
+    fn next(
+        &self,
+        tz: chrono_tz::Tz,
+        t: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Schedule::Cron(s) => s
+                .after(&t.with_timezone(&tz))
+                .next()
+                .map(|n| n.with_timezone(&chrono::Utc)),
+            Schedule::Every(delay) => {
+                use chrono::Timelike;
+                Some(t + *delay - chrono::Duration::nanoseconds(t.nanosecond() as i64))
+            }
+        }
+    }
+}
+
 /// Parse a Kubernetes schedule (5 fields or an `@descriptor`) into the `cron`
 /// crate's 7-field form. The error is the parser's message, which
 /// `UnparseableSchedule` / `InvalidSchedule` events carry.
-fn parse_standard_schedule(schedule: &str) -> Result<cron::Schedule, String> {
+fn parse_standard_schedule(schedule: &str) -> Result<Schedule, String> {
+    // `@every <duration>` (robfig/cron v3 parser.go:424-431): a
+    // ConstantDelaySchedule, which the 7-field `cron` crate cannot express.
+    if let Some(d) = schedule.strip_prefix("@every ") {
+        let nanos = rusternetes_common::go_duration::parse_go_duration(d)
+            .map_err(|e| format!("failed to parse duration {schedule}: {e}"))?;
+        return Ok(Schedule::every(nanos));
+    }
     // Handle special schedules (Kubernetes 5-field format)
     let cron_schedule = match schedule {
         "@yearly" | "@annually" => "0 0 1 1 *",
@@ -52,7 +97,9 @@ fn parse_standard_schedule(schedule: &str) -> Result<cron::Schedule, String> {
     } else {
         cron_schedule.to_string()
     };
-    cron::Schedule::try_from(cron_schedule.as_str()).map_err(|e| e.to_string())
+    cron::Schedule::try_from(cron_schedule.as_str())
+        .map(|s| Schedule::Cron(Box::new(s)))
+        .map_err(|e| e.to_string())
 }
 
 /// robfig/cron numbers the day of week 0-6 from Sunday, and 7 is NOT accepted:
@@ -151,14 +198,11 @@ type MostRecent = (
 /// `schedule.Next(t)` of robfig/cron: the first slot strictly after `t`, in
 /// `tz`; `None` is Go's zero time (a schedule that never fires).
 fn schedule_next(
-    schedule: &cron::Schedule,
+    schedule: &Schedule,
     tz: chrono_tz::Tz,
     t: chrono::DateTime<chrono::Utc>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    schedule
-        .after(&t.with_timezone(&tz))
-        .next()
-        .map(|n| n.with_timezone(&chrono::Utc))
+    schedule.next(tz, t)
 }
 
 /// `mostRecentScheduleTime` (pkg/controller/cronjob/utils.go:100-176): returns
@@ -169,7 +213,7 @@ fn schedule_next(
 fn most_recent_schedule_time(
     cj: &CronJob,
     now: chrono::DateTime<chrono::Utc>,
-    schedule: &cron::Schedule,
+    schedule: &Schedule,
     tz: chrono_tz::Tz,
     include_sds: bool,
 ) -> Result<MostRecent, String> {
@@ -293,7 +337,7 @@ enum CronJobEnqueue {
 /// `nextScheduleTimeDuration` (pkg/controller/cronjob/utils.go:188-205): the
 /// delay until the next schedule slot, plus `NEXT_SCHEDULE_DELTA`.
 fn next_schedule_duration(
-    schedule: &cron::Schedule,
+    schedule: &Schedule,
     tz: chrono_tz::Tz,
     cj: &CronJob,
     now: chrono::DateTime<chrono::Utc>,
@@ -316,7 +360,7 @@ fn next_schedule_duration(
 fn next_schedule_time(
     cj: &CronJob,
     now: chrono::DateTime<chrono::Utc>,
-    schedule: &cron::Schedule,
+    schedule: &Schedule,
     tz: chrono_tz::Tz,
 ) -> Result<(Option<chrono::DateTime<chrono::Utc>>, MissedSchedules), String> {
     let (_, most_recent, missed) = most_recent_schedule_time(cj, now, schedule, tz, true)?;
@@ -1085,7 +1129,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         &self,
         schedule: &str,
         cronjob: &CronJob,
-    ) -> Result<Option<(cron::Schedule, chrono_tz::Tz)>> {
+    ) -> Result<Option<(Schedule, chrono_tz::Tz)>> {
         // syncCronJob checks spec.timeZone before anything else and records an
         // UnknownTimeZone event (cronjob_controllerv2.go:507-513).
         if let Some(name) = cronjob.spec.time_zone.as_deref() {
@@ -2226,7 +2270,7 @@ mod tests {
     // Ported from TestNextScheduleTimeDuration
     // (pkg/controller/cronjob/utils_test.go:614-702).
 
-    fn std_schedule(s: &str) -> cron::Schedule {
+    fn std_schedule(s: &str) -> super::Schedule {
         super::parse_standard_schedule(s).unwrap()
     }
 
@@ -2336,8 +2380,7 @@ mod tests {
 
     // ---- startingDeadlineSeconds / missed schedules (#2557) -------------
     // Ported from TestMostRecentScheduleTime (utils_test.go:348-612) and
-    // TestNextScheduleTime (utils_test.go:150-283). The `@every 1h` case is
-    // not ported: the `cron` crate has no `@every` descriptor.
+    // TestNextScheduleTime (utils_test.go:150-283).
 
     fn cj_sds(
         schedule: &str,
@@ -2522,6 +2565,20 @@ mod tests {
                 None,
                 NoneMissed,
             ),
+            // utils_test.go:478-495 "@every schedule"; creation -59m is
+            // overridden by lastScheduleTime (+1m).
+            (
+                "@every schedule",
+                "@every 1h",
+                m(-59),
+                Some(m(1)),
+                Some(10),
+                false,
+                D::days(7),
+                m(1),
+                Some(D::days(6) + h(23) + m(1)),
+                Many,
+            ),
         ];
         for (name, sched, created, last, sds, include, now, earliest, recent, missed) in cases {
             let cj = cj_sds(sched, created, last, sds);
@@ -2681,6 +2738,36 @@ mod tests {
             ev.message,
             "invalid schedule: 59 23 31 2 * : time difference between two schedules is less than 1 second"
         );
+    }
+
+    /// `@every` is robfig's ConstantDelaySchedule (parser.go:424-431,
+    /// constantdelay.go:13-26): sub-second delays round up to 1s, `Next`
+    /// drops the nanoseconds of its input, bad durations are parse errors.
+    #[test]
+    fn every_descriptor_matches_robfig() {
+        use chrono::{Duration as D, TimeZone};
+        let next = |s: &str, t: chrono::DateTime<chrono::Utc>| {
+            std_schedule(s).next(chrono_tz::UTC, t).unwrap()
+        };
+        let t = chrono::Utc.timestamp_opt(1_000, 500_000_000).unwrap();
+        assert_eq!(
+            next("@every 1h30m", t),
+            chrono::Utc.timestamp_opt(1_000, 0).unwrap() + D::minutes(90)
+        );
+        assert_eq!(
+            next("@every 100ms", t),
+            chrono::Utc.timestamp_opt(1_001, 0).unwrap()
+        );
+        assert_eq!(
+            next("@every 1500ms", t),
+            chrono::Utc.timestamp_opt(1_001, 0).unwrap()
+        );
+        let e = super::parse_standard_schedule("@every nope").unwrap_err();
+        assert_eq!(
+            e,
+            "failed to parse duration @every nope: time: invalid duration \"nope\""
+        );
+        assert!(super::parse_standard_schedule("@every").is_err());
     }
 
     /// robfig/cron v3 dow bounds are {0, 6} (vendor/github.com/robfig/cron/v3/
