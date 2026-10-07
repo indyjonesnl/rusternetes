@@ -14,6 +14,31 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
+/// Port of `getCredentialsFromSecret` (`csi_util.go:45-57`), shared by the
+/// mounter and the expander; `storage` is the kube client (`None` when the
+/// host has none).
+pub(super) async fn get_credentials_from_secret(
+    storage: Option<&Arc<StorageBackend>>,
+    namespace: &str,
+    name: &str,
+) -> Result<HashMap<String, String>> {
+    let storage = storage.context("failed to get a kubernetes client")?;
+    let secret: Secret = storage
+        .get(&build_key("secrets", Some(namespace), name))
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "kubernetes.io/csi: failed to find the secret {name} in the namespace {namespace} with error: {e}"
+            )
+        })?;
+    Ok(secret
+        .data
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| (k, String::from_utf8_lossy(&v).to_string()))
+        .collect())
+}
+
 /// Port of `volDataFileName` (`pkg/volume/csi/csi_plugin.go:58`): the per-volume
 /// info file the mounter persists so teardown can find the driver and handle.
 const VOL_DATA_FILE_NAME: &str = "vol_data.json";
@@ -516,24 +541,7 @@ impl CsiMounter {
         namespace: &str,
         name: &str,
     ) -> Result<HashMap<String, String>> {
-        let storage = self
-            .storage
-            .as_ref()
-            .context("failed to get a kubernetes client")?;
-        let secret: Secret = storage
-            .get(&build_key("secrets", Some(namespace), name))
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "kubernetes.io/csi: failed to find the secret {name} in the namespace {namespace} with error: {e}"
-                )
-            })?;
-        Ok(secret
-            .data
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| (k, String::from_utf8_lossy(&v).to_string()))
-            .collect())
+        get_credentials_from_secret(self.storage.as_ref(), namespace, name).await
     }
 
     /// Port of `getPublishContext` + `skipAttach` (`csi_plugin.go:858-928`).
