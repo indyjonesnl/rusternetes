@@ -12,7 +12,7 @@
 //! The `BeginCreate`, `BeginUpdate`, `AfterDelete` and `Decorator` hooks are
 //! ported; `AfterCreate` and `AfterUpdate` are not, as no in-tree registry
 //! sets them. Not yet ported, and added with the first resource that needs
-//! them: TTLs, `ResetFieldsStrategy`, managed-fields timestamp handling, and
+//! them: `ResetFieldsStrategy`, managed-fields timestamp handling, and
 //! the `RetryGenerateName` retry loop.
 
 use std::sync::Arc;
@@ -175,6 +175,13 @@ pub trait AfterDelete<T>: Send + Sync {
 /// Store returns, for values that are not stored.
 pub type DecoratorFn<T> = Arc<dyn Fn(&mut T) + Send + Sync>;
 
+/// `Store.TTLFunc` (store.go:138-144): the TTL, in seconds, objects are
+/// persisted with. `existing` is the current TTL or the default for this
+/// operation, and `update` says whether the operation is against an existing
+/// object. Objects persisted with a TTL are evicted once it expires; `0` is
+/// no TTL, not "expire immediately".
+pub type TtlFn<T> = Arc<dyn Fn(&T, u64, bool) -> Result<u64> + Send + Sync>;
+
 /// `genericregistry.Store`, reduced to the fields a resource sets today.
 pub struct Store<T: Object, S: Storage> {
     pub storage: Arc<S>,
@@ -204,6 +211,8 @@ pub struct Store<T: Object, S: Storage> {
     pub decode_defaulter: Option<DecodeDefaulterFn<T>>,
     /// `Decorator`.
     pub decorator: Option<DecoratorFn<T>>,
+    /// `TTLFunc`.
+    pub ttl_func: Option<TtlFn<T>>,
     /// `BeginCreate`.
     pub begin_create: Option<Arc<dyn BeginCreate<T>>>,
     /// `BeginUpdate`.
@@ -256,6 +265,7 @@ impl<T: Object, S: Storage> Clone for Store<T, S> {
             should_delete_during_update: self.should_delete_during_update,
             decode_defaulter: self.decode_defaulter,
             decorator: self.decorator.clone(),
+            ttl_func: self.ttl_func.clone(),
             begin_create: self.begin_create.clone(),
             begin_update: self.begin_update.clone(),
             after_delete: self.after_delete.clone(),
@@ -321,6 +331,7 @@ impl<T: Object, S: Storage> Store<T, S> {
             should_delete_during_update: None,
             decode_defaulter: None,
             decorator: None,
+            ttl_func: None,
             begin_create: None,
             begin_update: None,
             after_delete: None,
@@ -333,6 +344,27 @@ impl<T: Object, S: Storage> Store<T, S> {
     pub fn with_decode_defaulter(mut self, defaulter: DecodeDefaulterFn<T>) -> Self {
         self.decode_defaulter = Some(defaulter);
         self
+    }
+
+    /// This store with a `TTLFunc` (see [`TtlFn`]).
+    pub fn with_ttl_func(mut self, ttl_func: TtlFn<T>) -> Self {
+        self.ttl_func = Some(ttl_func);
+        self
+    }
+
+    /// `calculateTTL` (store.go:1469-1486): the TTL to persist `obj` with.
+    ///
+    /// `default_ttl` is the object's current TTL. Upstream reads it back from
+    /// the etcd lease (`res.TTL`) on an update; the [`Storage`] trait cannot
+    /// report a key's TTL, so an update passes 0. A `TTLFunc` that decides from
+    /// `existing` therefore sees no TTL on update -- the Event one, the only
+    /// in-tree one, ignores it (pkg/registry/core/event/storage/storage.go:
+    /// 42-44).
+    fn calculate_ttl(&self, obj: &T, default_ttl: u64, update: bool) -> Result<u64> {
+        match &self.ttl_func {
+            Some(ttl_func) => ttl_func(obj, default_ttl, update),
+            None => Ok(default_ttl),
+        }
     }
 
     /// An object as the Store returns it: run through the `Decorator`.
@@ -570,7 +602,8 @@ impl<T: Object, S: Storage> Store<T, S> {
             }
 
             let Some(current) = current else {
-                match self.storage.create(key, &updated).await {
+                let ttl = self.calculate_ttl(&updated, 0, false)?;
+                match self.storage.create_with_ttl(key, &updated, ttl).await {
                     Ok(stored) => return Ok(self.decoded(stored)),
                     // Someone created it between the read and the write.
                     Err(Error::AlreadyExists(_)) => continue,
@@ -583,7 +616,8 @@ impl<T: Object, S: Storage> Store<T, S> {
             if is_same_object(&updated, &current) {
                 return Ok(current);
             }
-            match self.storage.update(key, &updated).await {
+            let ttl = self.calculate_ttl(&updated, 0, true)?;
+            match self.storage.update_with_ttl(key, &updated, ttl).await {
                 Ok(stored) => return Ok(self.decoded(stored)),
                 Err(Error::Conflict(msg)) => {
                     debug!("{key}: write lost a race ({msg}); retrying on the current object");
@@ -798,6 +832,7 @@ impl<T: Object, S: Storage> Store<T, S> {
 
         let name = obj.metadata().name.clone();
         let key = self.key_func(ctx, &name)?;
+        let ttl = self.calculate_ttl(&obj, 0, false)?;
 
         let result = if options.dry_run {
             // `DryRunnableStorage.Create` (dryrun.go:39-47).
@@ -808,7 +843,7 @@ impl<T: Object, S: Storage> Store<T, S> {
             }
         } else {
             self.storage
-                .create(&key, &obj)
+                .create_with_ttl(&key, &obj, ttl)
                 .await
                 .map(|out| self.decoded(out))
         };

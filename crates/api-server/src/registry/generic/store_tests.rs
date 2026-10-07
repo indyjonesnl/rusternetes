@@ -1343,3 +1343,109 @@ async fn get_with_a_resource_version_of_a_missing_object_is_not_found() {
         .unwrap_err();
     assert!(matches!(err, Error::NotFound(_)), "{err:?}");
 }
+
+// -- TTL ---------------------------------------------------------------------
+
+/// The `(existing, update)` pairs a `TTLFunc` was called with.
+type TtlCalls = Arc<std::sync::Mutex<Vec<(u64, bool)>>>;
+
+/// A store whose `TTLFunc` records `(existing, update)` and answers with
+/// `create_ttl` for a create and `update_ttl` for an update.
+fn ttl_store(create_ttl: u64, update_ttl: u64) -> (Store<ConfigMap, MemoryStorage>, TtlCalls) {
+    let calls = TtlCalls::default();
+    let seen = calls.clone();
+    let registry =
+        store(TestStrategy::default()).with_ttl_func(Arc::new(move |_, existing, update| {
+            seen.lock().unwrap().push((existing, update));
+            Ok(if update { update_ttl } else { create_ttl })
+        }));
+    (registry, calls)
+}
+
+async fn after(seconds: u64) {
+    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+    tokio::task::yield_now().await;
+}
+
+/// `calculateTTL` -> `Storage.Create(..., ttl, ...)` (store.go:521-526): an
+/// object is evicted once the TTL the `TTLFunc` chose for it expires.
+#[tokio::test(start_paused = true)]
+async fn a_ttl_func_expires_the_objects_it_creates() {
+    let (registry, calls) = ttl_store(60, 0);
+    create(&registry, cm("foo")).await;
+    assert_eq!(*calls.lock().unwrap(), [(0, false)]);
+
+    after(30).await;
+    registry
+        .get(&ctx(), "foo", &GetOptions::default())
+        .await
+        .expect("still alive");
+    after(31).await;
+    assert!(matches!(
+        registry.get(&ctx(), "foo", &GetOptions::default()).await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+/// Without a `TTLFunc` nothing expires, and `ttl == 0` is "no TTL", not
+/// "expire immediately" (`calculateTTL`, store.go:1469-1486).
+#[tokio::test(start_paused = true)]
+async fn without_a_ttl_func_nothing_expires() {
+    let registry = store(TestStrategy::default());
+    create(&registry, cm("foo")).await;
+    let (zero, _) = ttl_store(0, 0);
+    create(&zero, cm("bar")).await;
+    after(100_000).await;
+    registry
+        .get(&ctx(), "foo", &GetOptions::default())
+        .await
+        .unwrap();
+    zero.get(&ctx(), "bar", &GetOptions::default())
+        .await
+        .unwrap();
+}
+
+/// An update asks the `TTLFunc` again with `update = true`, and the TTL it
+/// answers replaces the object's (store.go:778-791): 0 makes the object
+/// permanent, a TTL on a permanent object makes it expire.
+#[tokio::test(start_paused = true)]
+async fn an_update_replaces_the_ttl() {
+    let (registry, calls) = ttl_store(60, 0);
+    create(&registry, cm("foo")).await;
+    update(&registry, with_node(cm("foo"), "other"))
+        .await
+        .unwrap();
+    assert_eq!(*calls.lock().unwrap(), [(0, false), (0, true)]);
+    after(120).await;
+    registry
+        .get(&ctx(), "foo", &GetOptions::default())
+        .await
+        .expect("the update detached the TTL");
+
+    let (registry, _) = ttl_store(0, 60);
+    create(&registry, cm("bar")).await;
+    update(&registry, with_node(cm("bar"), "other"))
+        .await
+        .unwrap();
+    after(61).await;
+    assert!(matches!(
+        registry.get(&ctx(), "bar", &GetOptions::default()).await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+/// A `TTLFunc` error fails the write and stores nothing.
+#[tokio::test]
+async fn a_ttl_func_error_fails_the_create() {
+    let registry = store(TestStrategy::default()).with_ttl_func(Arc::new(|_, _, _| {
+        Err(Error::Internal("no ttl for you".to_string()))
+    }));
+    registry
+        .create(&ctx(), cm("foo"), None, &CreateOptions::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        registry.get(&ctx(), "foo", &GetOptions::default()).await,
+        Err(Error::NotFound(_))
+    ));
+}

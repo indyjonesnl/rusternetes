@@ -34,6 +34,9 @@ pub struct ApiServerState {
     pub watch_cache: Arc<WatchCache>,
     pub ca_cert_pem: Option<String>,
     pub prometheus_client: Option<Arc<PrometheusClient>>,
+    /// `--event-ttl` in seconds: how long an Event lives after its last write
+    /// (`ControlPlane.EventTTL`, pkg/controlplane/apiserver/config.go:75).
+    pub event_ttl: u64,
 }
 
 /// `newServiceIPAllocators`' NodePort half (storage_core.go:484-495): one
@@ -100,6 +103,7 @@ impl ApiServerState {
             watch_cache,
             ca_cert_pem: None,
             prometheus_client: None,
+            event_ttl: crate::registry::core::event::DEFAULT_EVENT_TTL_SECONDS,
         }
     }
 
@@ -126,6 +130,12 @@ impl ApiServerState {
             self.storage.clone(),
             &ranges.families(),
         ));
+        self
+    }
+
+    /// Set `--event-ttl`, in seconds; `0` keeps events forever.
+    pub fn with_event_ttl(mut self, seconds: u64) -> Self {
+        self.event_ttl = seconds;
         self
     }
 
