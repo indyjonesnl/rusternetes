@@ -1328,6 +1328,52 @@ async fn create_namespace_if_needed(storage: &StorageBackend, ns: &str) -> Resul
     }
 }
 
+/// `ServerRunOptions.SystemNamespaces`: `{kube-system, kube-public, default}`
+/// (pkg/controlplane/apiserver/options/options.go:131) plus `kube-node-lease`
+/// appended by cmd/kube-apiserver/app/options/options.go:94.
+pub const SYSTEM_NAMESPACES: [&str; 4] =
+    ["kube-system", "kube-public", "default", "kube-node-lease"];
+
+/// Post-start hook name (pkg/controlplane/apiserver/server.go:146).
+pub const SYSTEM_NAMESPACES_HOOK: &str = "start-system-namespaces-controller";
+
+/// The controller's resync period (`interval := 1 * time.Minute`,
+/// system_namespaces_controller.go NewController).
+const SYSTEM_NAMESPACES_INTERVAL: Duration = Duration::from_secs(60);
+
+/// `Controller.sync` (system_namespaces_controller.go): create each system
+/// namespace that does not exist (`createNamespaceIfNeeded`: existing ->
+/// no-op, AlreadyExists -> ok). Per-namespace failures are logged (upstream
+/// `utilruntime.HandleError`) and returned, and do not stop the loop.
+pub async fn sync_system_namespaces(storage: &StorageBackend, namespaces: &[&str]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for ns in namespaces {
+        if let Err(e) = create_namespace_if_needed(storage, ns).await {
+            let msg = format!("unable to create required kubernetes system Namespace {ns}: {e}");
+            warn!("{msg}");
+            errors.push(msg);
+        }
+    }
+    errors
+}
+
+/// `start-system-namespaces-controller` (server.go:145-150): the hook spawns
+/// `Run` and returns nil at once, so it is never fatal. `Run` is
+/// `wait.Until(c.sync, 1m, stopCh)`: sync now, then every interval. (No
+/// informer-sync wait: there is no informer cache here -- `sync` reads
+/// storage directly.)
+pub fn spawn_system_namespaces_controller(storage: Arc<StorageBackend>) {
+    crate::post_start_hooks::spawn_hook(SYSTEM_NAMESPACES_HOOK, async move {
+        tokio::spawn(async move {
+            loop {
+                sync_system_namespaces(&storage, &SYSTEM_NAMESPACES).await;
+                tokio::time::sleep(SYSTEM_NAMESPACES_INTERVAL).await;
+            }
+        });
+        Ok::<(), anyhow::Error>(())
+    });
+}
+
 /// `syncConfigMap` (cluster_authentication_trust_controller.go:140-179) with
 /// `writeConfigMap` (:199-220): update, or create when absent.
 pub async fn sync_cluster_authentication_trust(
@@ -2540,5 +2586,70 @@ mod post_start_hook_registration_tests {
             .get("/registry/clusterroles/cluster-admin")
             .await
             .unwrap();
+    }
+}
+
+/// Ported from `pkg/controlplane/controller/systemnamespaces/
+/// system_namespaces_controller_test.go` `Test_Controller`: `sync` creates
+/// exactly the missing system namespaces and leaves existing ones alone.
+#[cfg(test)]
+mod system_namespaces_tests {
+    use super::*;
+    use rusternetes_common::resources::Namespace;
+
+    async fn seed(storage: &StorageBackend, ns: &str) -> String {
+        create_namespace_if_needed(storage, ns).await.unwrap();
+        let key = rusternetes_storage::build_key("namespaces", None, ns);
+        storage
+            .get::<Namespace>(&key)
+            .await
+            .unwrap()
+            .metadata
+            .uid
+            .clone()
+    }
+
+    /// options.go:131 `{kube-system, kube-public, default}` plus
+    /// cmd/kube-apiserver/app/options/options.go:94 `kube-node-lease`.
+    #[test]
+    fn the_four_system_namespaces() {
+        assert_eq!(
+            SYSTEM_NAMESPACES,
+            ["kube-system", "kube-public", "default", "kube-node-lease"]
+        );
+        assert_eq!(SYSTEM_NAMESPACES_HOOK, "start-system-namespaces-controller");
+    }
+
+    #[tokio::test]
+    async fn creates_every_missing_system_namespace() {
+        for pre in [
+            &["foo", "bar"][..],
+            &["kube-system"],
+            &["kube-system", "kube-public"],
+        ] {
+            let storage = StorageBackend::new_memory();
+            for ns in pre {
+                seed(&storage, ns).await;
+            }
+            let errs = sync_system_namespaces(&storage, &SYSTEM_NAMESPACES).await;
+            assert!(errs.is_empty(), "{errs:?}");
+            for ns in SYSTEM_NAMESPACES {
+                let key = rusternetes_storage::build_key("namespaces", None, ns);
+                let got: Namespace = storage.get(&key).await.unwrap();
+                assert_eq!(got.metadata.name, ns);
+            }
+        }
+    }
+
+    /// "the four namespaces" case: no create at all, so uids are unchanged.
+    #[tokio::test]
+    async fn existing_namespaces_are_not_recreated() {
+        let storage = StorageBackend::new_memory();
+        let before = seed(&storage, "kube-system").await;
+        sync_system_namespaces(&storage, &SYSTEM_NAMESPACES).await;
+        sync_system_namespaces(&storage, &SYSTEM_NAMESPACES).await;
+        let key = rusternetes_storage::build_key("namespaces", None, "kube-system");
+        let got: Namespace = storage.get(&key).await.unwrap();
+        assert_eq!(got.metadata.uid, before);
     }
 }

@@ -271,6 +271,10 @@ async fn main() -> Result<()> {
     // pkg/registry/scheduling/rest/storage_scheduling.go): seeds
     // system-node-critical and system-cluster-critical.
     bootstrap::spawn_system_priority_classes_hook(storage.clone());
+    // start-system-namespaces-controller PostStartHook (upstream
+    // pkg/controlplane/apiserver/server.go:145): keeps kube-system,
+    // kube-public, default, kube-node-lease existing.
+    bootstrap::spawn_system_namespaces_controller(storage.clone());
     // Keep the kubernetes endpoint tracking the live api-server IP across
     // container recreates / IP changes (upstream EndpointReconciler, #1188).
     bootstrap::spawn_endpoint_reconciler(
