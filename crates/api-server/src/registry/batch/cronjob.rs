@@ -249,6 +249,25 @@ mod tests {
         assert!(warnings[0].starts_with("cannot use TZ or CRON_TZ in spec.spec.schedule"));
     }
 
+    /// SetDefaults_CronJob (pkg/apis/batch/v1/defaults.go:83-88) defaults the
+    /// history limits to 3 / 1 so the controller can treat nil as "unset"
+    /// (cronjob_controllerv2.go:684-686); explicit values are kept.
+    #[test]
+    fn history_limits_are_defaulted_at_the_api() {
+        let mut cj = cron_job();
+        cj.spec.successful_jobs_history_limit = None;
+        cj.spec.failed_jobs_history_limit = None;
+        convert_to_internal(&mut cj);
+        assert_eq!(cj.spec.successful_jobs_history_limit, Some(3));
+        assert_eq!(cj.spec.failed_jobs_history_limit, Some(1));
+
+        cj.spec.successful_jobs_history_limit = Some(0);
+        cj.spec.failed_jobs_history_limit = Some(7);
+        convert_to_internal(&mut cj);
+        assert_eq!(cj.spec.successful_jobs_history_limit, Some(0));
+        assert_eq!(cj.spec.failed_jobs_history_limit, Some(7));
+    }
+
     #[test]
     fn status_prepare_for_update_keeps_spec() {
         let old = cron_job();
