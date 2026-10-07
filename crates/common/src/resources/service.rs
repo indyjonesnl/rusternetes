@@ -161,6 +161,12 @@ pub enum ServiceType {
     NodePort,
     LoadBalancer,
     ExternalName,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string` (staging/src/k8s.io/api/core/v1/types.go), so any string
+    /// decodes and validation answers `Unsupported value` (422), not a 400
+    /// decode failure (#2469).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// ServiceStatus represents the current status of a service
@@ -231,6 +237,12 @@ pub struct ClientIPConfig {
 pub enum IPFamily {
     IPv4,
     IPv6,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string` (staging/src/k8s.io/api/core/v1/types.go), so any string
+    /// decodes and validation answers `Unsupported value` (422), not a 400
+    /// decode failure (#2469).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// IPFamilyPolicy represents the dual-stack-ness requested or required by a Service
@@ -280,6 +292,12 @@ pub enum ServiceExternalTrafficPolicy {
     Cluster,
     /// Local routes traffic only to node-local endpoints, preserving client source IP and avoiding second hop
     Local,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string` (staging/src/k8s.io/api/core/v1/types.go), so any string
+    /// decodes and validation answers `Unsupported value` (422), not a 400
+    /// decode failure (#2469).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[cfg(test)]

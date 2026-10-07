@@ -12,9 +12,9 @@
 //! (names are DNS-1035 labels), `StrictIPCIDRValidation` off (IPs and CIDRs
 //! parse "sloppily"), `PreferSameTrafficDistribution` GA.
 //!
-//! `type`, `ipFamilies`, `ipFamilyPolicy` and the traffic policies are closed
-//! enums in [`ServiceSpec`], so a value outside the supported set fails to
-//! decode rather than reaching the `NotSupported` checks upstream has for them.
+//! `type`, `ipFamilies`, `ipFamilyPolicy` and the traffic policies are plain
+//! strings upstream; here they are enums with an `Unknown(String)` variant so
+//! any string decodes and the `NotSupported` checks below report it (#2469).
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
@@ -269,10 +269,11 @@ fn policy_str(p: &IPFamilyPolicy) -> &str {
     }
 }
 
-fn family_str(f: &IPFamily) -> &'static str {
+fn family_str(f: &IPFamily) -> &str {
     match f {
         IPFamily::IPv4 => "IPv4",
         IPFamily::IPv6 => "IPv6",
+        IPFamily::Unknown(v) => v,
     }
 }
 
@@ -426,6 +427,7 @@ fn validate_service_external_traffic_policy(svc: &Service) -> ErrorList {
     let etp = svc.spec.external_traffic_policy.as_ref().map(|p| match p {
         ServiceExternalTrafficPolicy::Cluster => "Cluster",
         ServiceExternalTrafficPolicy::Local => "Local",
+        ServiceExternalTrafficPolicy::Unknown(v) => v.as_str(),
     });
     if !externally_accessible(svc) {
         if let Some(etp) = etp {
@@ -437,6 +439,14 @@ fn validate_service_external_traffic_policy(svc: &Service) -> ErrorList {
         }
     } else if etp.is_none() {
         errs.push(Error::required(&fld.child("externalTrafficPolicy"), ""));
+    } else if let Some(ServiceExternalTrafficPolicy::Unknown(v)) = &svc.spec.external_traffic_policy
+    {
+        // validation.go:6838-6839 (`validExternalTrafficPolicies`).
+        errs.push(Error::not_supported(
+            &fld.child("externalTrafficPolicy"),
+            v.as_str(),
+            &["Cluster", "Local"],
+        ));
     }
 
     let hcnp = health_check_node_port(svc);
@@ -471,7 +481,6 @@ fn validate_service_external_traffic_fields_update(before: &Service, after: &Ser
 }
 
 /// `validateServiceInternalTrafficFieldsValue` (validation.go:6875-6892).
-/// The enum admits only the supported values.
 fn validate_service_internal_traffic_fields_value(svc: &Service) -> ErrorList {
     let itp: Option<&ServiceInternalTrafficPolicy> = svc.spec.internal_traffic_policy.as_ref();
     let mut errs = Vec::new();
@@ -672,8 +681,15 @@ fn validate_service(svc: &Service, old: Option<&Service>) -> ErrorList {
         }
     }
 
-    if svc.spec.service_type.is_none() {
-        errs.push(Error::required(&spec_path.child("type"), ""));
+    // validation.go:6669-6673 (`supportedServiceType`, sorted by `sets.List`).
+    match &svc.spec.service_type {
+        None => errs.push(Error::required(&spec_path.child("type"), "")),
+        Some(ServiceType::Unknown(v)) => errs.push(Error::not_supported(
+            &spec_path.child("type"),
+            v.as_str(),
+            &["ClusterIP", "ExternalName", "LoadBalancer", "NodePort"],
+        )),
+        Some(_) => {}
     }
 
     if is_type(svc, ServiceType::ClusterIP) {
@@ -830,9 +846,17 @@ pub fn validate_service_cluster_ips_related_fields(
         ));
     }
 
-    // Families are a closed enum; only duplicates remain to check.
+    // validation.go:8996-9007: each family must be supported, and no family
+    // may repeat.
     let mut seen = HashSet::new();
     for (i, family) in ip_families(svc).iter().enumerate() {
+        if let IPFamily::Unknown(v) = family {
+            errs.push(Error::not_supported(
+                &ip_families_field.index(i),
+                v.as_str(),
+                &["IPv4", "IPv6"],
+            ));
+        }
         if !seen.insert(family_str(family)) {
             errs.push(Error::duplicate(
                 &ip_families_field.index(i),
