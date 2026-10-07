@@ -649,13 +649,14 @@ pub async fn get_api_groups(
         APIGroup {
             name: "autoscaling".to_string(),
             versions: vec![
-                GroupVersionForDiscovery {
-                    group_version: "autoscaling/v1".to_string(),
-                    version: "v1".to_string(),
-                },
+                // Priority order, pkg/apis/autoscaling/install/install.go:43.
                 GroupVersionForDiscovery {
                     group_version: "autoscaling/v2".to_string(),
                     version: "v2".to_string(),
+                },
+                GroupVersionForDiscovery {
+                    group_version: "autoscaling/v1".to_string(),
+                    version: "v1".to_string(),
                 },
             ],
             preferred_version: GroupVersionForDiscovery {
@@ -4351,6 +4352,87 @@ mod tests {
             .iter()
             .find(|s| s.get("subresource").and_then(|v| v.as_str()) == Some("finalize"))
             .expect("namespaces should have finalize subresource");
+    }
+
+    /// Upstream's default-enabled served versions per built-in group, in
+    /// discovery order. pkg/controlplane/instance.go:447-468
+    /// (`stableAPIGroupVersionsEnabledByDefault`; beta/alpha are disabled
+    /// by default, :471-497) with order from each group's
+    /// `SetVersionPriority` (autoscaling: pkg/apis/autoscaling/install/
+    /// install.go:43 `v2, v1, ...`; the served ones are v2 then v1).
+    const UPSTREAM_SERVED: &[(&str, &[&str])] = &[
+        ("admissionregistration.k8s.io", &["v1"]),
+        ("apps", &["v1"]),
+        ("authentication.k8s.io", &["v1"]),
+        ("authorization.k8s.io", &["v1"]),
+        ("autoscaling", &["v2", "v1"]),
+        ("batch", &["v1"]),
+        ("certificates.k8s.io", &["v1"]),
+        ("coordination.k8s.io", &["v1"]),
+        ("discovery.k8s.io", &["v1"]),
+        ("events.k8s.io", &["v1"]),
+        ("networking.k8s.io", &["v1"]),
+        ("node.k8s.io", &["v1"]),
+        ("policy", &["v1"]),
+        ("rbac.authorization.k8s.io", &["v1"]),
+        ("resource.k8s.io", &["v1"]),
+        ("storage.k8s.io", &["v1"]),
+        ("scheduling.k8s.io", &["v1"]),
+        ("flowcontrol.apiserver.k8s.io", &["v1"]),
+        // Served by the apiextensions / kube-aggregator servers.
+        ("apiextensions.k8s.io", &["v1"]),
+        ("apiregistration.k8s.io", &["v1"]),
+    ];
+
+    #[tokio::test]
+    async fn test_apis_builtin_group_versions_match_upstream_default_set() {
+        let response = get_api_groups(None, HeaderMap::new()).await;
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let groups = v["groups"].as_array().unwrap();
+        for (name, want) in UPSTREAM_SERVED {
+            let g = groups
+                .iter()
+                .find(|g| g["name"] == *name)
+                .unwrap_or_else(|| panic!("/apis is missing built-in group {name}"));
+            let got: Vec<&str> = g["versions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x["version"].as_str().unwrap())
+                .collect();
+            assert_eq!(&got, want, "/apis versions for {name}");
+            assert_eq!(
+                g["preferredVersion"]["version"], want[0],
+                "{name} preferred"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apis_group_names_table_matches_upstream_default_set() {
+        for (name, want) in UPSTREAM_SERVED {
+            let (_, preferred) = get_api_group_names()
+                .into_iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("get_api_group_names() is missing {name}"));
+            assert_eq!(preferred, want[0], "table preferred version for {name}");
+
+            let response = get_api_group(None, axum::extract::Path(name.to_string())).await;
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let got: Vec<&str> = v["versions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x["version"].as_str().unwrap())
+                .collect();
+            assert_eq!(&got, want, "/apis/{name} versions");
+        }
     }
 
     #[test]
