@@ -18,10 +18,10 @@
 //! CRD is established before the creating request returns. That is the one
 //! deliberate deviation of the mechanism; the logic is upstream's.
 //!
-//! Not modelled: the `nonstructuralschema` controller (the
-//! `NonStructuralSchema` condition) and the `apiapproval` controller (the
-//! `KubernetesAPIApprovalPolicyConformant` condition), neither of which
-//! gates serving; the `InvalidCABundle` check of the establishing
+//! The `nonstructuralschema` and `apiapproval` controllers live in
+//! `condition_controllers.rs`.
+//!
+//! Not modelled: the `InvalidCABundle` check of the establishing
 //! controller; the finalizer's `OverlappingBuiltInResources` skip. The
 //! finalizer's wait for the instances to be gone is ported, but instances are
 //! removed from storage directly (finalizers and all), so it sees them go at
@@ -194,7 +194,7 @@ fn equal_to_accepted_or_fresh(
 
 /// `utilerrors.NewAggregate(errs).Error()`: the message itself for one
 /// error, the bracketed list for several (duplicates dropped).
-fn aggregate(errs: &[String]) -> String {
+pub(super) fn aggregate(errs: &[String]) -> String {
     let mut seen = HashSet::new();
     let unique: Vec<&String> = errs.iter().filter(|e| seen.insert(*e)).collect();
     match unique.as_slice() {

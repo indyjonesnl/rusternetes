@@ -85,6 +85,7 @@ impl VolumePlugin for SecretPlugin {
             volumes_base_path: self.host.get_volumes_base_path().to_string(),
             token_manager: self.host.get_service_account_token_func().clone(),
             fs_group: crate::volume_plugins::util::fs_group_from(pod),
+            pod: pod.clone(),
         }))
     }
 
@@ -185,6 +186,9 @@ struct SecretMounter {
     token_manager: rusternetes_common::auth::TokenManager,
     /// `mounterArgs.FsGroup` (`volume.go:132`).
     fs_group: Option<i64>,
+    /// `secretVolumeMounter.pod` (`secret.go:155`), read by
+    /// `MakeNestedMountpoints`.
+    pod: Pod,
 }
 
 #[async_trait]
@@ -267,6 +271,7 @@ impl Mounter for SecretMounter {
                             name: nn.clone(),
                             uid: node_uid.clone().unwrap_or_default(),
                         }),
+                    secret: None,
                 }),
                 pod_name: Some(self.pod_name.to_string()),
                 pod_uid: Some(self.pod_uid.clone()),
@@ -397,6 +402,13 @@ impl Mounter for SecretMounter {
         // ownership runs in the AtomicWriter's `setPerms` (:242-247) below.
         crate::volume_plugins::empty_dir::setup_dir(volume_dir)
             .context("Failed to create Secret volume directory")?;
+        // `volumeutil.MakeNestedMountpoints(b.volName, dir, b.pod)`
+        // (secret.go:181-183), before the failure-teardown `defer` is armed.
+        crate::volume_plugins::util::nested_volumes::make_nested_mountpoints(
+            &self.volume_name,
+            std::path::Path::new(volume_dir),
+            &self.pod,
+        )?;
 
         // `writer.Write(payload, setPerms)` (secret.go:196-204) via the
         // upstream AtomicWriter port: unchanged content is a no-op. The
@@ -706,6 +718,36 @@ mod tests {
         let dir = std::path::PathBuf::from(m.get_path());
         std::fs::create_dir_all(&dir).unwrap();
         m.set_up().await.unwrap();
+        assert_eq!(std::fs::read(dir.join("a")).unwrap(), b"1");
+    }
+
+    /// `MakeNestedMountpoints` (secret.go:181): a volume mounted beneath the
+    /// secret volume gets its mountpoint directory created inside it.
+    #[tokio::test]
+    async fn nested_mountpoints_are_created_inside_the_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = plugin_with_secret(
+            tmp.path().to_str().unwrap(),
+            Some(opaque("s", &[("a", b"1")])),
+        )
+        .await;
+        let v = volume_with_items(json!([]), false);
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+        };
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {"containers": [{"name": "c", "image": "i", "volumeMounts": [
+                {"name": "sec", "mountPath": "/etc/sec"},
+                {"name": "other", "mountPath": "/etc/sec/sub/dir"}
+            ]}]}
+        }))
+        .unwrap();
+        let m = p.new_mounter(&spec, &pod).await.unwrap();
+        m.set_up().await.unwrap();
+        let dir = std::path::PathBuf::from(m.get_path());
+        assert!(dir.join("sub/dir").is_dir());
         assert_eq!(std::fs::read(dir.join("a")).unwrap(), b"1");
     }
 }

@@ -168,6 +168,12 @@ pub enum Feature {
 
     /// Upstream gate `StorageVersionMigrator` (1.35 Beta, still off; `pkg/features/kube_features.go:1829-1832`).
     StorageVersionMigrator,
+
+    /// Upstream gate `KubeletCrashLoopBackOffMax` (1.32 Alpha off, 1.35 Beta on; `pkg/features/kube_features.go:1429-1432`).
+    KubeletCrashLoopBackOffMax,
+
+    /// Upstream gate `ReduceDefaultCrashLoopBackOffDecay` (1.33 Alpha, off; `pkg/features/kube_features.go:1692-1694`).
+    ReduceDefaultCrashLoopBackOffDecay,
 }
 
 impl Feature {
@@ -206,6 +212,8 @@ impl Feature {
             Feature::StorageVersionAPI => 29,
             Feature::APIServerIdentity => 30,
             Feature::StorageVersionMigrator => 31,
+            Feature::KubeletCrashLoopBackOffMax => 32,
+            Feature::ReduceDefaultCrashLoopBackOffDecay => 33,
         }
     }
 
@@ -276,6 +284,8 @@ impl Feature {
             Feature::APIServerIdentity => true,
             // 1.35 Beta, still off (pkg/features/kube_features.go:1829-1832)
             Feature::StorageVersionMigrator => false,
+            Feature::KubeletCrashLoopBackOffMax => true,
+            Feature::ReduceDefaultCrashLoopBackOffDecay => false,
         }
     }
 }
@@ -324,6 +334,8 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::StorageVersionAPI,
     Feature::APIServerIdentity,
     Feature::StorageVersionMigrator,
+    Feature::KubeletCrashLoopBackOffMax,
+    Feature::ReduceDefaultCrashLoopBackOffDecay,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -370,6 +382,8 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::StorageVersionAPI.default_enabled()),
     AtomicBool::new(Feature::APIServerIdentity.default_enabled()),
     AtomicBool::new(Feature::StorageVersionMigrator.default_enabled()),
+    AtomicBool::new(Feature::KubeletCrashLoopBackOffMax.default_enabled()),
+    AtomicBool::new(Feature::ReduceDefaultCrashLoopBackOffDecay.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.

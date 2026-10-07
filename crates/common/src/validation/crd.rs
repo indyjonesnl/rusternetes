@@ -903,7 +903,7 @@ pub fn is_protected_community_group(group: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApiApprovalState {
+pub enum ApiApprovalState {
     Invalid,
     Approved,
     Bypassed,
@@ -911,7 +911,7 @@ enum ApiApprovalState {
 }
 
 /// `GetAPIApprovalState` (`apihelpers/helpers.go:55-70`).
-fn api_approval_state(
+pub fn api_approval_state(
     annotations: Option<&std::collections::HashMap<String, String>>,
 ) -> (ApiApprovalState, String) {
     let annotation = annotations

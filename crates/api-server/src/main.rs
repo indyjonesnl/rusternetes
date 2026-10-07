@@ -6,8 +6,11 @@
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admission;
+mod audit;
 pub use rusternetes_admission_webhook as admission_webhook;
+#[allow(dead_code)]
 mod bootstrap;
+#[allow(dead_code)]
 mod legacy_token_tracking;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
 mod conversion;
@@ -21,8 +24,10 @@ use rusternetes_middleware as middleware;
 mod openapi;
 mod patch;
 mod peer_cert_acceptor;
+#[allow(dead_code)]
 mod post_start_hooks;
 mod prometheus_client;
+#[allow(dead_code)]
 mod registry;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]
@@ -35,7 +40,6 @@ mod spdy;
 #[allow(dead_code)]
 mod spdy3;
 #[allow(dead_code)]
-mod spdy_handlers;
 mod ssa;
 mod state;
 #[allow(dead_code)]
@@ -49,7 +53,7 @@ use prometheus_client::PrometheusClient;
 use rusternetes_common::auth::TokenManager;
 use rusternetes_common::authz::RBACAuthorizer;
 use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{Storage, StorageBackend, StorageConfig};
+use rusternetes_storage::{StorageBackend, StorageConfig};
 use state::ApiServerState;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -81,6 +85,38 @@ struct Args {
     /// JWT secret for service account tokens
     #[arg(long, default_value = "rusternetes-secret-change-in-production")]
     jwt_secret: String,
+
+    /// File containing PEM-encoded x509 RSA or ECDSA private or public keys,
+    /// used to verify ServiceAccount tokens. The specified file can contain
+    /// multiple keys, and the flag can be specified multiple times with
+    /// different files. Must be specified when
+    /// --service-account-signing-key-file is provided
+    /// (pkg/kubeapiserver/options/authentication.go:432-437).
+    #[arg(long = "service-account-key-file")]
+    service_account_key_file: Vec<String>,
+
+    /// Path to the file that contains the current private key of the service
+    /// account token issuer. The issuer will sign issued ID tokens with this
+    /// private key (pkg/controlplane/apiserver/options/options.go:207).
+    #[arg(long = "service-account-signing-key-file")]
+    service_account_signing_key_file: Option<String>,
+
+    /// Identifier of the service account token issuer. The issuer will assert
+    /// this identifier in "iss" claim of issued tokens. When this flag is
+    /// specified multiple times, the first is used to generate tokens and all
+    /// are used to determine which issuers are accepted
+    /// (pkg/kubeapiserver/options/authentication.go:442-452).
+    #[arg(long = "service-account-issuer")]
+    service_account_issuer: Vec<String>,
+
+    /// Identifiers of the API. The service account token authenticator will
+    /// validate that tokens used against the API are bound to at least one of
+    /// these audiences. If the --service-account-issuer flag is configured and
+    /// this flag is not, this field defaults to a single element list
+    /// containing the issuer URL
+    /// (pkg/kubeapiserver/options/authentication.go:352).
+    #[arg(long = "api-audiences", value_delimiter = ',')]
+    api_audiences: Vec<String>,
 
     /// Enable TLS/HTTPS
     #[arg(long)]
@@ -146,6 +182,55 @@ struct Args {
         value_parser = registry::core::event::parse_event_ttl
     )]
     event_ttl: u64,
+
+    /// Path to the file that defines the audit policy configuration
+    /// (`--audit-policy-file`, pkg/server/options/audit.go:258).
+    #[arg(long)]
+    audit_policy_file: Option<String>,
+
+    /// Path of the file audit events are written to; `-` is stdout
+    /// (`--audit-log-path`, options/audit.go:436).
+    #[arg(long)]
+    audit_log_path: Option<String>,
+
+    /// Format of saved audits (`--audit-log-format`, options/audit.go:444);
+    /// only `json` is supported.
+    #[arg(long, default_value = "json")]
+    audit_log_format: String,
+}
+
+/// `--audit-policy-file` + `--audit-log-path` build the audit pipeline.
+/// Like `WithAudit` (filters/audit.go:42), a missing policy or sink leaves
+/// auditing off.
+async fn install_audit_from_flags(args: &Args) -> Result<()> {
+    if args.audit_log_format != "json" {
+        anyhow::bail!(
+            "invalid audit log format {:?}: only \"json\" is supported",
+            args.audit_log_format
+        );
+    }
+    let (Some(policy_file), Some(log_path)) = (&args.audit_policy_file, &args.audit_log_path)
+    else {
+        if args.audit_policy_file.is_some() || args.audit_log_path.is_some() {
+            warn!("auditing needs both --audit-policy-file and --audit-log-path; it is off");
+        }
+        return Ok(());
+    };
+    let yaml = std::fs::read_to_string(policy_file)
+        .with_context(|| format!("reading --audit-policy-file {policy_file}"))?;
+    let policy = audit::Policy::from_yaml(&yaml)
+        .map_err(|e| anyhow::anyhow!("{e}: from file {policy_file}"))?;
+    let sink: std::sync::Arc<dyn rusternetes_common::audit::AuditBackend> = if log_path == "-" {
+        std::sync::Arc::new(audit::StdoutAuditBackend)
+    } else {
+        std::sync::Arc::new(
+            rusternetes_common::audit::FileAuditBackend::new(log_path.clone())
+                .await
+                .with_context(|| format!("opening --audit-log-path {log_path}"))?,
+        )
+    };
+    audit::install_audit(audit::AuditConfig { policy, sink });
+    Ok(())
 }
 
 #[tokio::main]
@@ -166,6 +251,8 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
         admission::install_pod_security_exemptions(exemptions);
     }
+
+    install_audit_from_flags(&args).await?;
 
     info!(
         "Starting Rusternetes API Server {}",
@@ -198,7 +285,16 @@ async fn main() -> Result<()> {
     // Initialize TokenManager — prefer RSA keys for RS256 (K8s OIDC compatible),
     // fall back to HMAC HS256 if no RSA keys found.
     info!("Initializing TokenManager");
-    let token_manager = Arc::new(TokenManager::new_auto(args.jwt_secret.as_bytes()));
+    let service_account = rusternetes_common::auth::ServiceAccountOptions {
+        key_files: args.service_account_key_file.clone(),
+        signing_key_file: args.service_account_signing_key_file.clone(),
+        issuers: args.service_account_issuer.clone(),
+        api_audiences: args.api_audiences.clone(),
+    };
+    let token_manager = Arc::new(
+        TokenManager::new_auto(args.jwt_secret.as_bytes())
+            .with_service_account_options(&service_account)?,
+    );
 
     // Initialize Authorizer (RBAC or AlwaysAllow based on skip_auth)
     let authorizer: Arc<dyn rusternetes_common::authz::Authorizer> = if args.skip_auth {
@@ -217,9 +313,9 @@ async fn main() -> Result<()> {
             Arc::new(rusternetes_common::authz::NodeAuthorizer);
         let rbac: Arc<dyn rusternetes_common::authz::Authorizer> =
             Arc::new(RBACAuthorizer::new(storage.clone()));
-        Arc::new(rusternetes_common::authz::UnionAuthorizer::new(vec![
-            node, rbac,
-        ]))
+        // `system:masters` superuser first, as `newForConfig`
+        // (`pkg/kubeapiserver/authorizer/reload.go:97-99`) does (#1576).
+        Arc::new(rusternetes_common::authz::superuser_then(vec![node, rbac]))
     };
 
     // Initialize Metrics Registry
@@ -236,6 +332,7 @@ async fn main() -> Result<()> {
         skip_auth: args.skip_auth,
         client_ca_file: args.client_ca_file.clone(),
         service_node_port_range: args.service_node_port_range,
+        service_account,
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;
@@ -251,112 +348,14 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
 
-    if let Err(e) = bootstrap::bootstrap_kubernetes_service(
+    rusternetes_api_server::startup::register_post_start_hooks(
         storage.clone(),
         api_port,
         service_ranges.api_server_service_ip(),
+        service_ranges.cidrs(),
+        ca_cert_pem.as_deref(),
     )
-    .await
-    {
-        warn!(
-            "Failed to bootstrap kubernetes Service Endpoints: {}. Continuing anyway.",
-            e
-        );
-    }
-    // systemnamespaces controller (upstream pkg/controlplane/controller/
-    // systemnamespaces): NamespaceLifecycle needs these to exist (#2533).
-    if let Err(e) = bootstrap::bootstrap_system_namespaces(storage.as_ref()).await {
-        warn!(
-            "Failed to bootstrap system namespaces: {}. Continuing anyway.",
-            e
-        );
-    }
-    // Seed the cluster-admin ClusterRole + binding to system:masters so the
-    // cluster admin is authorized on a freshly-bootstrapped (empty) store
-    // (upstream bootstrap policy; #1659). Idempotent. The `rbac/bootstrap-roles`
-    // PostStartHook (upstream storage_rbac.go:131-179): failing for 30s is fatal.
-    let _ = bootstrap::spawn_rbac_bootstrap_roles_hook(storage.clone()).await;
-    // scheduling/bootstrap-system-priority-classes PostStartHook (upstream
-    // pkg/registry/scheduling/rest/storage_scheduling.go): seeds
-    // system-node-critical and system-cluster-critical.
-    bootstrap::spawn_system_priority_classes_hook(storage.clone());
-    // start-system-namespaces-controller PostStartHook (upstream
-    // pkg/controlplane/apiserver/server.go:145): keeps kube-system,
-    // kube-public, default, kube-node-lease existing.
-    bootstrap::spawn_system_namespaces_controller(storage.clone());
-    // Keep the kubernetes endpoint tracking the live api-server IP across
-    // container recreates / IP changes (upstream EndpointReconciler, #1188).
-    bootstrap::spawn_endpoint_reconciler(
-        storage.clone(),
-        api_port,
-        service_ranges.api_server_service_ip(),
-    );
-
-    // Aggregation layer: probe aggregated APIService backends and set their
-    // Available condition (upstream kube-aggregator availability controller,
-    // which lives in the apiserver — not KCM).
-    bootstrap::spawn_apiservice_availability_controller(storage.clone());
-
-    // CRD controllers' resync (upstream post-start hook, apiextensions-apiserver
-    // pkg/apiserver/apiserver.go:244-252): retries a CRD left Terminating.
-    registry::apiextensions::customresourcedefinition::spawn_resync(storage.clone());
-    // crd-informer-synced (apiserver.go:263): not ready until the CRDs are readable.
-    registry::apiextensions::customresourcedefinition::spawn_crd_informer_synced_hook(
-        storage.clone(),
-    );
-
-    // start-legacy-token-tracking-controller (server.go:319-322): keeps
-    // kube-system/kube-apiserver-legacy-service-account-token-tracking.
-    legacy_token_tracking::spawn_legacy_token_tracking_controller(storage.clone());
-
-    // The `kubernetes` ServiceCIDR, owned by the apiserver-side
-    // default-ServiceCIDR controller (upstream
-    // `pkg/controlplane/controller/defaultservicecidr`). Reconciles rather than
-    // create-once: dual-stack upgrade, flag-mismatch warning, and `Ready=True`
-    // only when the persisted CIDRs match this api-server's configuration.
-    bootstrap::start_default_servicecidr_controller(storage.clone(), service_ranges.cidrs()).await;
-
-    // kube-system/extension-apiserver-authentication, kept by the
-    // apiserver-side ClusterAuthenticationTrust controller (upstream
-    // `pkg/controlplane/controller/clusterauthenticationtrust`).
-    if let Err(e) =
-        bootstrap::bootstrap_extension_apiserver_authentication_rbac(storage.clone()).await
-    {
-        warn!(
-            "Failed to bootstrap extension-apiserver-authentication RBAC: {e}. Continuing anyway."
-        );
-    }
-    bootstrap::spawn_cluster_authentication_trust_controller(
-        storage.clone(),
-        bootstrap::cluster_authentication_info(ca_cert_pem.as_deref()),
-    );
-
-    // Create default StorageClass (like k3s/kind ship with a default)
-    {
-        let sc_key = rusternetes_storage::build_key("storageclasses", None, "standard");
-        if storage.get::<serde_json::Value>(&sc_key).await.is_err() {
-            let storage_class = serde_json::json!({
-                "apiVersion": "storage.k8s.io/v1",
-                "kind": "StorageClass",
-                "metadata": {
-                    "name": "standard",
-                    "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    "annotations": {
-                        "storageclass.kubernetes.io/is-default-class": "true"
-                    }
-                },
-                "provisioner": "rusternetes.io/hostpath",
-                "reclaimPolicy": "Delete",
-                "volumeBindingMode": "WaitForFirstConsumer"
-            });
-            if let Err(e) = storage.create(&sc_key, &storage_class).await {
-                warn!("Failed to create default StorageClass: {}", e);
-            } else {
-                info!("Created default StorageClass 'standard' with rusternetes.io/hostpath provisioner");
-            }
-        }
-    }
+    .await;
 
     // Initialize Prometheus client for custom metrics (if URL provided)
     let prometheus_client = if let Some(url) = args.prometheus_url {

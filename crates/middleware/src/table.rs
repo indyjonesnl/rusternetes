@@ -332,6 +332,14 @@ const OBJECT_META_NAME_DOC: &str = "Name must be unique within a namespace. Is r
 /// `ObjectMeta` swagger doc for `creationTimestamp`.
 const OBJECT_META_CREATION_TIMESTAMP_DOC: &str = "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata";
 
+/// `PodCertificateRequestSpec` swagger doc for `signerName`
+/// (certificates/v1beta1 types_swagger_doc_generated.go:131).
+const PCR_SIGNER_NAME_DOC: &str = "signerName indicates the requested signer.\n\nAll signer names beginning with `kubernetes.io` are reserved for use by the Kubernetes project.  There is currently one well-known signer documented by the Kubernetes project, `kubernetes.io/kube-apiserver-client-pod`, which will issue client certificates understood by kube-apiserver.  It is currently unimplemented.";
+
+/// `PodCertificateRequestSpec` swagger doc for `unverifiedUserAnnotations`
+/// (certificates/v1beta1 types_swagger_doc_generated.go:141).
+const PCR_ANNOTATIONS_DOC: &str = "unverifiedUserAnnotations allow pod authors to pass additional information to the signer implementation.  Kubernetes does not restrict or validate this metadata in any way.\n\nEntries are subject to the same validation as object metadata annotations, with the addition that all keys must be domain-prefixed. No restrictions are placed on values, except an overall size limitation on the entire field.\n\nSigners should document the keys and values they support.  Signers should deny requests that contain keys they do not recognize.";
+
 fn col(
     name: &str,
     column_type: &str,
@@ -485,6 +493,49 @@ pub fn printer_columns(kind: &str) -> Option<Vec<ColumnDefinition>> {
                 0,
             ),
             col("Age", "string", "", OBJECT_META_CREATION_TIMESTAMP_DOC, 0),
+        ],
+        // pkg/printers/internalversion/printers.go:426-436
+        // (`podCertificateRequestColumnDefinitions`); descriptions are the
+        // certificates/v1beta1 `PodCertificateRequestSpec` swagger docs
+        // (types_swagger_doc_generated.go:131-141).
+        "PodCertificateRequest" => vec![
+            col("Name", "string", "name", OBJECT_META_NAME_DOC, 0),
+            col(
+                "PodName",
+                "string",
+                "",
+                "podName is the name of the pod into which the certificate will be mounted.",
+                0,
+            ),
+            col(
+                "ServiceAccountName",
+                "string",
+                "",
+                "serviceAccountName is the name of the service account the pod is running as.",
+                0,
+            ),
+            col(
+                "NodeName",
+                "string",
+                "",
+                "nodeName is the name of the node the pod is assigned to.",
+                0,
+            ),
+            col("SignerName", "string", "", PCR_SIGNER_NAME_DOC, 0),
+            col(
+                "State",
+                "string",
+                "",
+                "Is the request Pending, Issued, Denied, or Failed?",
+                0,
+            ),
+            col(
+                "UnverifiedUserAnnotations",
+                "string",
+                "",
+                PCR_ANNOTATIONS_DOC,
+                0,
+            ),
         ],
         _ => return None,
     };
@@ -690,6 +741,46 @@ pub fn printer_row_cells(kind: &str, obj: &serde_json::Value) -> Option<Vec<serd
                 Value::String(service),
                 Value::String(status),
                 Value::String(age),
+            ]
+        }
+        // printers.go:2356-2381 (`printPodCertificateRequest`): "Issued",
+        // "Denied" and "Failed" are mutually exclusive; the last matching
+        // condition wins, as in upstream's loop. The server renders the Wide
+        // cell (labels.FormatLabels) always.
+        "PodCertificateRequest" => {
+            let mut state = "Pending";
+            if let Some(conds) = obj.pointer("/status/conditions").and_then(|c| c.as_array()) {
+                for c in conds {
+                    match c.get("type").and_then(|v| v.as_str()) {
+                        Some("Issued") => state = "Issued",
+                        Some("Denied") => state = "Denied",
+                        Some("Failed") => state = "Failed",
+                        _ => {}
+                    }
+                }
+            }
+            let annotations = match obj
+                .pointer("/spec/unverifiedUserAnnotations")
+                .and_then(|a| a.as_object())
+            {
+                Some(m) if !m.is_empty() => {
+                    let mut kv: Vec<String> = m
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v.as_str().unwrap_or("")))
+                        .collect();
+                    kv.sort();
+                    kv.join(",")
+                }
+                _ => "<none>".to_string(),
+            };
+            vec![
+                Value::String(name),
+                Value::String(str_at(obj, &["spec", "podName"]).unwrap_or_default()),
+                Value::String(str_at(obj, &["spec", "serviceAccountName"]).unwrap_or_default()),
+                Value::String(str_at(obj, &["spec", "nodeName"]).unwrap_or_default()),
+                Value::String(str_at(obj, &["spec", "signerName"]).unwrap_or_default()),
+                Value::String(state.to_string()),
+                Value::String(annotations),
             ]
         }
         _ => return None,
@@ -1004,6 +1095,58 @@ mod tests {
         // etcd.go:109-110: no reason is the bare status.
         assert_eq!(with("False", None), json!("False"));
         assert_eq!(with("False", Some("")), json!("False"));
+    }
+
+    // printers.go:426-436 + 2356-2381.
+    #[test]
+    fn pod_certificate_request_columns_and_cells_match_upstream() {
+        let cols = printer_columns("PodCertificateRequestList").expect("has a printer");
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Name",
+                "PodName",
+                "ServiceAccountName",
+                "NodeName",
+                "SignerName",
+                "State",
+                "UnverifiedUserAnnotations"
+            ]
+        );
+        assert_eq!(cols[0].format, "name");
+        assert_eq!(
+            cols[5].description,
+            "Is the request Pending, Issued, Denied, or Failed?"
+        );
+        let cells =
+            |obj: serde_json::Value| printer_row_cells("PodCertificateRequest", &obj).unwrap();
+        let pending = cells(json!({
+            "metadata": {"name": "r"},
+            "spec": {"podName": "p", "serviceAccountName": "sa", "nodeName": "n", "signerName": "x.io/s"}
+        }));
+        assert_eq!(
+            pending,
+            vec![
+                json!("r"),
+                json!("p"),
+                json!("sa"),
+                json!("n"),
+                json!("x.io/s"),
+                json!("Pending"),
+                json!("<none>")
+            ]
+        );
+        assert_eq!(pending.len(), cols.len());
+        for t in ["Issued", "Denied", "Failed"] {
+            let c = cells(json!({
+                "metadata": {"name": "r"},
+                "spec": {"unverifiedUserAnnotations": {"b.io/k": "2", "a.io/k": "1"}},
+                "status": {"conditions": [{"type": t, "status": "True"}]}
+            }));
+            assert_eq!(c[5], json!(t));
+            assert_eq!(c[6], json!("a.io/k=1,b.io/k=2"));
+        }
     }
 
     // duration_test.go TestHumanDuration + TestHumanDurationBoundaries.

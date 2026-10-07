@@ -358,6 +358,59 @@ async fn stale_pod_disruption_cleanup_conflicts_on_stale_read() {
     assert_eq!(cond_status(&stored).as_deref(), Some("False"));
 }
 
+/// `syncRolloutStatus` (pkg/controller/deployment/progress.go:113-116) does
+/// `UpdateStatus` on the object the sync read; a Deployment changed since is a
+/// Conflict that the workqueue retries, never overwritten with a status
+/// computed from the stale read (#2160).
+#[tokio::test]
+async fn deployment_status_write_conflicts_on_stale_read() {
+    use rusternetes_controller_manager::controllers::deployment::DeploymentController;
+    let storage = RacingStatusStorage::new();
+    let key = "/registry/deployments/default/dep";
+    seed(
+        &storage,
+        key,
+        json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": "dep", "namespace": "default", "uid": "u-dep"},
+            "spec": {"replicas": 0, "selector": {"matchLabels": {"app": "dep"}}, "template": template("dep")}
+        }),
+    )
+    .await;
+    let c = DeploymentController::new(storage.clone(), 10);
+    c.reconcile_all().await.unwrap();
+    assert_lost_race_is_refused(&storage, key, status_is_set).await;
+    c.reconcile_all().await.unwrap();
+    assert_converges(&storage, key, status_is_set).await;
+}
+
+/// `updateStatusHandler` (pkg/controller/job/job_controller.go:1891-1893) is
+/// `UpdateStatus` on the Job the sync was handed; a lost race is a Conflict
+/// requeued by the workqueue, not retried from a re-read (#2160).
+#[tokio::test]
+async fn job_status_write_conflicts_on_stale_read() {
+    use rusternetes_controller_manager::controllers::job::JobController;
+    let storage = RacingStatusStorage::new();
+    let key = "/registry/jobs/default/job";
+    seed(
+        &storage,
+        key,
+        json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "job", "namespace": "default", "uid": "u-job"},
+            "spec": {"completions": 1, "parallelism": 1, "template": {
+                "metadata": {"labels": {"app": "job"}},
+                "spec": {"restartPolicy": "Never", "containers": [{"name": "c", "image": "busybox"}]}}}
+        }),
+    )
+    .await;
+    let c = JobController::new(storage.clone());
+    c.reconcile_all().await.unwrap();
+    assert_lost_race_is_refused(&storage, key, status_is_set).await;
+    c.reconcile_all().await.unwrap();
+    assert_converges(&storage, key, status_is_set).await;
+}
+
 /// `syncCronJob` (pkg/controller/cronjob/cronjob_controllerv2.go:603-642):
 /// the Job is created BEFORE `UpdateStatus`, under the deterministic name
 /// `getJobName` (`{cronjob}-{scheduledTime/60}`, utils.go / v2.go:676), so a

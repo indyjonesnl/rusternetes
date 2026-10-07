@@ -12,8 +12,11 @@
 
 use crate::events::{FILE_SYSTEM_RESIZE_FAILED, FILE_SYSTEM_RESIZE_SUCCESS};
 use crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld;
-use crate::volume_plugins::plugin::{NodeExpandableVolumePlugin, NodeResizeOptions, Spec};
+use crate::volume_plugins::plugin::{
+    DeviceMounterArgs, NodeExpandableVolumePlugin, NodeResizeOptions, Spec,
+};
 use crate::volume_plugins::registry::VolumePluginMgr;
+use crate::volume_plugins::util::fs_group_from;
 use crate::volume_plugins::util::node_expander::{
     pvc_object_reference, record_event, NodeExpander, NodeResizeOperationOpts,
 };
@@ -26,6 +29,7 @@ use anyhow::{anyhow, Error};
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::volume::{PersistentVolume, PersistentVolumeClaim};
 use rusternetes_common::resources::EventType;
+use rusternetes_common::resources::Pod;
 use rusternetes_storage::{build_key, EventRecorder, Storage};
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
@@ -432,6 +436,58 @@ impl<'a, S: Storage + ?Sized> OperationGenerator<'a, S> {
         }
         (true, None)
     }
+}
+
+/// Port of the mount half of `operationGenerator.GenerateMountVolumeFunc`
+/// (`operation_generator.go:431-640`): find the plugin, `NewMounter`, and for a
+/// device-mountable plugin `NewDeviceMounter` -> `GetDeviceMountPath` ->
+/// `MountDevice` (`NodeStageVolume` for CSI) strictly BEFORE `SetUp`
+/// (`NodePublishVolume`), as the CSI spec orders them. Returns the mounter's
+/// path.
+///
+/// Not ported (each waits on the reconciler/`ActualStateOfWorld` wiring,
+/// tracked under #1970): skipping `MountDevice` when
+/// `GetDeviceMountState == DeviceGloballyMounted` (`:530`),
+/// `MarkDeviceAsMounted` / `markDeviceErrorState` (`:545-566`), `WaitForAttach`
+/// (`:505-518`), the ReadWriteOncePod-elsewhere check (`:480-489`), the
+/// post-`SetUp` expansion and `MarkVolumeAsMounted` (`:600-640`).
+/// `MountDevice` is idempotent per the CSI spec, so repeating it is safe.
+pub async fn mount_volume(
+    mgr: &VolumePluginMgr,
+    spec: &Spec<'_>,
+    pod: &Pod,
+    device_path: &str,
+) -> anyhow::Result<String> {
+    let plugin = mgr.find_plugin_by_spec(spec)?;
+    let mounter = plugin.new_mounter(spec, pod).await?;
+
+    // get deviceMounter, if possible (`:495-500`)
+    let device_mounter = mgr
+        .find_device_mountable_plugin_by_spec(spec)
+        .and_then(|p| p.as_device_mountable_plugin())
+        .and_then(|dm| dm.new_device_mounter().ok());
+
+    if let Some(device_mounter) = device_mounter {
+        let device_mount_path = device_mounter.get_device_mount_path(spec)?;
+        let args = DeviceMounterArgs {
+            fs_group: fs_group_from(pod),
+            node_name: pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.node_name.clone())
+                .unwrap_or_default(),
+        };
+        device_mounter
+            .mount_device(spec, device_path, &device_mount_path, &args)
+            .await?;
+        info!(
+            "MountVolume.MountDevice succeeded for volume {} (device mount path {device_mount_path:?})",
+            spec.name()
+        );
+    }
+
+    mounter.set_up().await?;
+    Ok(mounter.get_path())
 }
 
 #[cfg(test)]

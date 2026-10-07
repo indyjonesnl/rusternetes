@@ -27,7 +27,8 @@
 //! so static-pod lifecycle was broken (#1906). This module is the missing half;
 //! the authorizer grant is restored alongside it.
 
-use rusternetes_common::resources::Pod;
+use rusternetes_common::resources::podcertificaterequest::PodCertificateRequest;
+use rusternetes_common::resources::{Node, Pod, ServiceAccount};
 use rusternetes_common::types::ObjectMeta;
 use rusternetes_common::{Error, Result};
 use rusternetes_middleware::AuthContext;
@@ -169,6 +170,168 @@ pub fn admit_pod_delete(auth: &AuthContext, existing: &Pod) -> Result<()> {
             "node {node_name:?} can only delete pods with spec.nodeName set to itself"
         )));
     }
+    Ok(())
+}
+
+/// `admitPodCertificateRequest` (`plugin/pkg/admission/noderestriction/
+/// admission.go:820-895`), dispatched from `Admit` at `admission.go:228-229`.
+///
+/// Upstream's first check, `!p.podCertificateRequestsEnabled` -> "PodCertificateRequest
+/// feature gate is disabled" (`:821-823`), has no counterpart: the resource is
+/// only served when the gate is on (`handlers/podcertificaterequest.rs`), so
+/// it is unreachable for a request that got this far.
+///
+/// Upstream's plain (non-Forbidden) errors mark failures that informer lag can
+/// cause, so that a retry may succeed (`:845-847`, `:852-853`, `:858-860`,
+/// `:865-866`, `:882-885`, `:890-891`); they map to `Error::Internal` here.
+pub async fn admit_pod_certificate_request<S>(
+    storage: &S,
+    auth: &AuthContext,
+    create: bool,
+    subresource: Option<&str>,
+    namespace: &str,
+    req: &PodCertificateRequest,
+) -> Result<()>
+where
+    S: rusternetes_storage::Storage,
+{
+    let Some(node_name) = node_identity(auth) else {
+        return Ok(());
+    };
+
+    if !create {
+        return Err(Error::Forbidden("unexpected operation".to_string()));
+    }
+    if let Some(sub) = subresource.filter(|s| !s.is_empty()) {
+        return Err(Error::Forbidden(format!("unexpected subresource {sub}")));
+    }
+
+    let spec = &req.spec;
+    let pod_ref = format!("{namespace}/{}", spec.pod_name);
+
+    // Cross check the node name and node UID with the node that made the request.
+    if spec.node_name != node_name {
+        return Err(Error::Forbidden(format!(
+            "PodCertificateRequest.Spec.NodeName={:?}, which is not the requesting node {node_name:?}",
+            spec.node_name
+        )));
+    }
+    let node: Node = match storage
+        .get(&rusternetes_storage::build_key(
+            "nodes",
+            None,
+            &spec.node_name,
+        ))
+        .await
+    {
+        Ok(n) => n,
+        Err(Error::NotFound(_)) => {
+            return Err(Error::Internal(format!(
+            "while retrieving node {:?} named in the PodCertificateRequest: node {:?} not found",
+            spec.node_name, spec.node_name
+        )))
+        }
+        Err(e) => {
+            return Err(Error::Forbidden(format!(
+                "while retrieving node {:?} named in the PodCertificateRequest: {e}",
+                spec.node_name
+            )))
+        }
+    };
+    if node.metadata.uid != spec.node_uid {
+        return Err(Error::Internal(format!(
+            "PodCertificateRequest for pod {pod_ref:?} names node UID {:?}, inconsistent with the running node ({:?})",
+            spec.node_uid, node.metadata.uid
+        )));
+    }
+
+    // Cross-check that the pod is a real pod, running on the node.
+    let pod: Pod = match storage
+        .get(&rusternetes_storage::build_key(
+            "pods",
+            Some(namespace),
+            &spec.pod_name,
+        ))
+        .await
+    {
+        Ok(p) => p,
+        Err(Error::NotFound(_)) => {
+            return Err(Error::Internal(format!(
+                "while retrieving pod {pod_ref:?} named in the PodCertificateRequest: pod {:?} not found",
+                spec.pod_name
+            )))
+        }
+        Err(e) => {
+            return Err(Error::Forbidden(format!(
+                "while retrieving pod {pod_ref:?} named in the PodCertificateRequest: {e}"
+            )))
+        }
+    };
+    if spec.pod_uid != pod.metadata.uid {
+        return Err(Error::Internal(format!(
+            "PodCertificateRequest for pod {pod_ref:?} contains pod UID ({:?}) which differs from running pod {:?}",
+            spec.pod_uid, pod.metadata.uid
+        )));
+    }
+    if spec_node_name(&pod) != spec.node_name {
+        return Err(Error::Forbidden(format!(
+            "pod {pod_ref:?} is not running on node {:?} named in the PodCertificateRequest",
+            spec.node_name
+        )));
+    }
+
+    // Mirror pods don't get pod certificates.
+    if pod
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(MIRROR_POD_ANNOTATION_KEY))
+    {
+        return Err(Error::Forbidden(format!("pod {pod_ref:?} is a mirror pod")));
+    }
+
+    let pod_sa = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.service_account_name.as_deref())
+        .unwrap_or("");
+    if spec.service_account_name != pod_sa {
+        // We can outright forbid because this cannot be caused by informer lag (the UIDs match)
+        return Err(Error::Forbidden(format!(
+            "PodCertificateRequest for pod {pod_ref:?} contains serviceAccountName ({:?}) that differs from running pod ({pod_sa:?})",
+            spec.service_account_name
+        )));
+    }
+    let sa_ref = format!("{namespace}/{}", spec.service_account_name);
+    let sa: ServiceAccount = match storage
+        .get(&rusternetes_storage::build_key(
+            "serviceaccounts",
+            Some(namespace),
+            &spec.service_account_name,
+        ))
+        .await
+    {
+        Ok(sa) => sa,
+        Err(Error::NotFound(_)) => {
+            return Err(Error::Internal(format!(
+                "while retrieving service account {sa_ref:?} named in the PodCertificateRequest: serviceaccount {:?} not found",
+                spec.service_account_name
+            )))
+        }
+        Err(e) => {
+            return Err(Error::Forbidden(format!(
+                "while retrieving service account {sa_ref:?} named in the PodCertificateRequest: {e}"
+            )))
+        }
+    };
+    let sa_uid = sa.metadata.uid.as_str();
+    if spec.service_account_uid != sa_uid {
+        return Err(Error::Internal(format!(
+            "PodCertificateRequest for pod {pod_ref:?} names service account UID {:?}, which differs from the running service account ({sa_uid:?})",
+            spec.service_account_uid
+        )));
+    }
+
     Ok(())
 }
 

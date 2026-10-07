@@ -441,6 +441,135 @@ pub async fn skip_auth_middleware(
     Ok(next.run(request).await)
 }
 
+/// Port of `validator.Validate` (pkg/serviceaccount/claims.go:144-263), the
+/// domain validation the JWT authenticator applies once signature and issuer
+/// are verified: the ServiceAccount and every object the token is bound to
+/// (Secret, Pod, Node) must still exist with the same UID and must not have
+/// been deleted before `now - jwt.DefaultLeeway`. This is how deleting a bound
+/// object invalidates its tokens.
+///
+/// The feature gates `ServiceAccountTokenPodNodeInfo` and
+/// `ServiceAccountTokenNodeBindingValidation` are GA and locked on in 1.35, so
+/// they are treated as enabled.
+pub async fn validate_service_account_claims(
+    storage: &StorageBackend,
+    claims: &rusternetes_common::auth::ServiceAccountClaims,
+) -> std::result::Result<(), String> {
+    use rusternetes_common::resources::{Node, Pod, Secret, ServiceAccount};
+
+    // consider things deleted prior to now()-leeway to be invalid
+    let invalid_if_deleted_before = chrono::Utc::now() - chrono::Duration::seconds(60);
+    let deleted = |m: &rusternetes_common::types::ObjectMeta| {
+        m.deletion_timestamp
+            .is_some_and(|t| t < invalid_if_deleted_before)
+    };
+
+    let kube = claims.kubernetes.as_ref();
+    let namespace = kube
+        .map(|k| k.namespace.clone())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| claims.namespace.clone());
+    let (sa_name, sa_uid) = match kube {
+        Some(k) if !k.svcacct.name.is_empty() => (k.svcacct.name.clone(), k.svcacct.uid.clone()),
+        _ => (
+            claims
+                .sub
+                .strip_prefix("system:serviceaccount:")
+                .and_then(|s| s.split(':').nth(1))
+                .unwrap_or("")
+                .to_string(),
+            claims.uid.clone(),
+        ),
+    };
+    if sa_name.is_empty() || namespace.is_empty() {
+        // not a service-account-shaped token; nothing to look up
+        return Ok(());
+    }
+
+    // Make sure service account still exists (name and UID)
+    let sa_key = build_key("serviceaccounts", Some(&namespace), &sa_name);
+    let sa: ServiceAccount = storage
+        .get(&sa_key)
+        .await
+        .map_err(|_| format!("serviceaccounts \"{sa_name}\" not found"))?;
+    if sa.metadata.uid != sa_uid {
+        return Err(format!(
+            "service account UID ({}) does not match claim ({})",
+            sa.metadata.uid, sa_uid
+        ));
+    }
+    if deleted(&sa.metadata) {
+        return Err(format!(
+            "service account {namespace}/{sa_name} has been deleted"
+        ));
+    }
+
+    // Bound Secret (claims.go:195-210)
+    if let Some(r) = kube.and_then(|k| k.secret.as_ref()) {
+        let secret: Secret = storage
+            .get(&build_key("secrets", Some(&namespace), &r.name))
+            .await
+            .map_err(|_| "service account token has been invalidated".to_string())?;
+        if r.uid != secret.metadata.uid {
+            return Err(format!(
+                "secret UID ({}) does not match service account secret ref claim ({})",
+                secret.metadata.uid, r.uid
+            ));
+        }
+        if deleted(&secret.metadata) {
+            return Err("service account token has been invalidated".to_string());
+        }
+    }
+
+    // Bound Pod (claims.go:212-230); older rusternetes tokens carry the pod
+    // only in the flat `pod_name` / `pod_uid` claims.
+    let pod_ref = kube
+        .and_then(|k| k.pod.as_ref())
+        .map(|p| (p.name.clone(), p.uid.clone()))
+        .or_else(|| {
+            claims
+                .pod_name
+                .as_ref()
+                .map(|n| (n.clone(), claims.pod_uid.clone().unwrap_or_default()))
+        });
+    if let Some((pod_name, pod_uid)) = &pod_ref {
+        let pod: Pod = storage
+            .get(&build_key("pods", Some(&namespace), pod_name))
+            .await
+            .map_err(|_| "service account token has been invalidated".to_string())?;
+        if *pod_uid != pod.metadata.uid {
+            return Err(format!(
+                "pod UID ({}) does not match service account pod ref claim ({})",
+                pod.metadata.uid, pod_uid
+            ));
+        }
+        if deleted(&pod.metadata) {
+            return Err("service account token has been invalidated".to_string());
+        }
+    }
+
+    // Bound Node, only when not pod-bound (claims.go:232-263): for pod-bound
+    // tokens the node claims are informational.
+    if pod_ref.is_none() {
+        if let Some(r) = kube.and_then(|k| k.node.as_ref()) {
+            let node: Node = storage
+                .get(&build_key("nodes", None::<&str>, &r.name))
+                .await
+                .map_err(|_| "service account token has been invalidated".to_string())?;
+            if r.uid != node.metadata.uid {
+                return Err(format!(
+                    "node UID ({}) does not match service account node ref claim ({})",
+                    node.metadata.uid, r.uid
+                ));
+            }
+            if deleted(&node.metadata) {
+                return Err("service account token has been invalidated".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Authentication middleware that extracts and validates JWT tokens.
 ///
 /// Mirrors upstream `pkg/serviceaccount/legacy.go` / `bound.go`: after a JWT
@@ -473,49 +602,11 @@ pub async fn auth_middleware(
         // Try to validate as a service account token first
         if let Ok(claims) = token_manager.validate_token(token) {
             // Upstream parity: a JWT that decodes is not sufficient; the
-            // ServiceAccount it references must also still exist. This is
-            // how upstream invalidates tokens after SA deletion.
-            let sa_name = claims
-                .kubernetes
-                .as_ref()
-                .map(|k| k.svcacct.name.clone())
-                .unwrap_or_else(|| {
-                    // Fallback: parse from `sub` ("system:serviceaccount:<ns>:<name>")
-                    claims
-                        .sub
-                        .strip_prefix("system:serviceaccount:")
-                        .and_then(|s| s.split(':').nth(1))
-                        .unwrap_or("")
-                        .to_string()
-                });
-            if !sa_name.is_empty() && !claims.namespace.is_empty() {
-                let sa_key = build_key("serviceaccounts", Some(&claims.namespace), &sa_name);
-                match storage
-                    .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
-                    .await
-                {
-                    Ok(sa) => {
-                        // Also verify UID matches — upstream checks this to
-                        // detect "same-name, different-instance" cases.
-                        if !claims.uid.is_empty()
-                            && !sa.metadata.uid.is_empty()
-                            && sa.metadata.uid != claims.uid
-                        {
-                            warn!(
-                                "ServiceAccount {}/{} UID mismatch: token uid={} current uid={}",
-                                claims.namespace, sa_name, claims.uid, sa.metadata.uid
-                            );
-                            return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
-                        }
-                    }
-                    Err(_) => {
-                        warn!(
-                            "ServiceAccount {}/{} no longer exists; rejecting token",
-                            claims.namespace, sa_name
-                        );
-                        return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
-                    }
-                }
+            // ServiceAccount and every bound object must still exist
+            // (`validator.Validate`, claims.go:144-263).
+            if let Err(reason) = validate_service_account_claims(&storage, &claims).await {
+                warn!("Rejecting service account token: {}", reason);
+                return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
             }
             let user_info = UserInfo::from_service_account_claims(&claims);
             debug!(

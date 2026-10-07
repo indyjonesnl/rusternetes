@@ -137,6 +137,38 @@ const CRASHLOOP_BACKOFF_INITIAL: Duration = Duration::from_secs(10);
 /// Default maximum CrashLoopBackOff delay: upstream `MaxCrashLoopBackOff` (5m),
 /// overridable by `crashLoopBackOff.maxContainerRestartPeriod`.
 const CRASHLOOP_BACKOFF_MAX: Duration = crate::config::MAX_CONTAINER_BACKOFF;
+/// `reducedMaxCrashLoopBackOff` (pkg/kubelet/kubelet.go:167): max backoff when
+/// the `ReduceDefaultCrashLoopBackOffDecay` gate is on.
+const REDUCED_CRASHLOOP_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// `reducedInitialCrashLoopBackOff` (pkg/kubelet/kubelet.go:174): initial
+/// backoff when the `ReduceDefaultCrashLoopBackOffDecay` gate is on.
+const REDUCED_CRASHLOOP_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+
+/// Port of `newCrashLoopBackOff` (pkg/kubelet/kubelet.go:345-361), returning
+/// `(boMax, boInitial)`. `configured` is
+/// `kubeCfg.CrashLoopBackOff.MaxContainerRestartPeriod` after defaulting
+/// (see `KubeletConfiguration::effective_max_container_restart_period_gated`);
+/// it is only consulted when `KubeletCrashLoopBackOffMax` is enabled, exactly
+/// as upstream.
+pub(crate) fn new_crash_loop_backoff(configured: Option<Duration>) -> (Duration, Duration) {
+    use rusternetes_common::feature_gates::{enabled, Feature};
+    let mut bo_max = CRASHLOOP_BACKOFF_MAX;
+    let mut bo_initial = CRASHLOOP_BACKOFF_INITIAL;
+    if enabled(Feature::ReduceDefaultCrashLoopBackOffDecay) {
+        bo_max = REDUCED_CRASHLOOP_BACKOFF_MAX;
+        bo_initial = REDUCED_CRASHLOOP_BACKOFF_INITIAL;
+    }
+    if enabled(Feature::KubeletCrashLoopBackOffMax) {
+        // operator-invoked configuration always has precedence if valid
+        if let Some(d) = configured {
+            bo_max = d;
+        }
+        if bo_max < bo_initial {
+            bo_initial = bo_max;
+        }
+    }
+    (bo_max, bo_initial)
+}
 
 /// Defensive backoff for a terminal pod whose `finalize_terminated_pod_storage`
 /// reported removal but left the object in storage (#1157). The per-pod worker
@@ -463,6 +495,9 @@ pub struct Kubelet {
     last_sync: AtomicU64,
     /// Effective `crashLoopBackOff.maxContainerRestartPeriod` (default 5m).
     crash_loop_backoff_max: Duration,
+    /// `boInitial` from `newCrashLoopBackOff` (10s, or 1s with
+    /// `ReduceDefaultCrashLoopBackOffDecay`, clamped to the max).
+    crash_loop_backoff_initial: Duration,
     /// Port the kubelet API server listens on (the `--metrics-port` flag).
     /// Advertised in the node's `status.daemonEndpoints.kubeletEndpoint.Port`
     /// so the api-server proxies log/exec/metrics requests to the right port.
@@ -758,7 +793,14 @@ impl Kubelet {
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
             pod_workers: Arc::new(Mutex::new(HashMap::new())),
             last_sync: AtomicU64::new(0),
-            crash_loop_backoff_max: CRASHLOOP_BACKOFF_MAX,
+            crash_loop_backoff_max: new_crash_loop_backoff(
+                crate::config::KubeletConfiguration::default_max_container_restart_period(None),
+            )
+            .0,
+            crash_loop_backoff_initial: new_crash_loop_backoff(
+                crate::config::KubeletConfiguration::default_max_container_restart_period(None),
+            )
+            .1,
             metrics_port,
             pod_manifest_path: None,
             node_status_update_frequency: Duration::from_secs(10),
@@ -824,16 +866,17 @@ impl Kubelet {
     /// [1s, 300s]; `None` keeps the 300s default). Ported from
     /// `newCrashLoopBackOff` (pkg/kubelet/kubelet.go:345-358).
     pub fn with_crash_loop_backoff_max(mut self, d: Option<Duration>) -> Self {
-        if let Some(d) = d {
-            self.crash_loop_backoff_max = d;
+        if d.is_some() {
+            let (m, i) = new_crash_loop_backoff(d);
+            self.crash_loop_backoff_max = m;
+            self.crash_loop_backoff_initial = i;
         }
         self
     }
 
-    /// Initial backoff: 10s, clamped to the max (`if boMax < boInitial { boInitial = boMax }`,
-    /// kubelet.go:356-358).
+    /// Initial backoff from `newCrashLoopBackOff` (kubelet.go:345-361).
     pub(crate) fn crash_loop_backoff_initial(&self) -> Duration {
-        CRASHLOOP_BACKOFF_INITIAL.min(self.crash_loop_backoff_max)
+        self.crash_loop_backoff_initial
     }
 
     /// Apply `KubeletConfiguration.nodeStatusReportFrequency` (5m when
@@ -1081,6 +1124,20 @@ impl Kubelet {
         // immediately to speed up startup", file.go:96), then every
         // fileCheckFrequency.
         let mut static_pod_timer = tokio::time::interval(self.static_pod_poll_interval());
+        // File source watch (`startWatch`, file.go:116): inotify events on the
+        // manifest dir trigger an immediate pass; the timer above stays as the
+        // resync / fallback.
+        let (static_pod_watch_tx, mut static_pod_watch_rx) =
+            tokio::sync::mpsc::channel(crate::static_pod_watch::EVENT_BUFFER_LEN);
+        if let Some(dir) = &self.pod_manifest_path {
+            // NewSourceFile: "requires a path without trailing /"
+            let dir = std::path::PathBuf::from(dir.to_string_lossy().trim_end_matches('/'));
+            tokio::spawn(crate::static_pod_watch::start_watch(
+                dir,
+                static_pod_watch_tx.clone(),
+            ));
+        }
+        drop(static_pod_watch_tx);
 
         // Lease-based heartbeat in a SEPARATE task.
         // K8s kubelet uses Lease objects (coordination.k8s.io/v1) for heartbeats
@@ -1287,6 +1344,16 @@ impl Kubelet {
                         if let Err(e) = self.sync_loop().await {
                             error!("Error in static pod sync: {}", e);
                         }
+                    }
+                }
+                Some(ev) = static_pod_watch_rx.recv() => {
+                    // consumeWatchEvent (file.go): coalesce a burst, then
+                    // re-list (see static_pod_watch module docs).
+                    tracing::debug!(file = %ev.file_name.display(), kind = ?ev.event_type, "static pod manifest event");
+                    while static_pod_watch_rx.try_recv().is_ok() {}
+                    self.poll_static_pods().await;
+                    if let Err(e) = self.sync_loop().await {
+                        error!("Error in static pod sync: {}", e);
                     }
                 }
                 // Periodic full sync as safety net
@@ -6388,6 +6455,27 @@ mod tests {
             .await
             .with_runtime_request_timeout(Some(Duration::ZERO));
         assert_eq!(z.runtime_request_timeout(), Duration::from_secs(120));
+    }
+
+    /// `newCrashLoopBackOff` gate matrix (pkg/kubelet/kubelet.go:345-361).
+    #[test]
+    #[serial_test::serial]
+    fn new_crash_loop_backoff_gate_matrix() {
+        use super::new_crash_loop_backoff;
+        use rusternetes_common::feature_gates::{with_feature, Feature};
+        let s = std::time::Duration::from_secs;
+        // Defaults (Max on, Reduce off): operator value wins, initial 10s clamped.
+        assert_eq!(new_crash_loop_backoff(Some(s(45))), (s(45), s(10)));
+        assert_eq!(new_crash_loop_backoff(Some(s(3))), (s(3), s(3)));
+        // Max off: operator value is ignored, 300s/10s.
+        let _m = with_feature(Feature::KubeletCrashLoopBackOffMax, false);
+        assert_eq!(new_crash_loop_backoff(Some(s(45))), (s(300), s(10)));
+        // Max off + Reduce on: 60s/1s.
+        let _r = with_feature(Feature::ReduceDefaultCrashLoopBackOffDecay, true);
+        assert_eq!(new_crash_loop_backoff(None), (s(60), s(1)));
+        // Both on: configured value overrides the reduced max; initial stays 1s.
+        let _m2 = with_feature(Feature::KubeletCrashLoopBackOffMax, true);
+        assert_eq!(new_crash_loop_backoff(Some(s(45))), (s(45), s(1)));
     }
 
     /// `crashLoopBackOff.maxContainerRestartPeriod` caps the restart backoff and

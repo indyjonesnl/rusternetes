@@ -2001,6 +2001,14 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             "/apis/certificates.k8s.io/v1beta1/watch/clustertrustbundles",
             get(handlers::watch::watch_clustertrustbundles),
         )
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/watch/podcertificaterequests",
+            get(handlers::watch::watch_all_podcertificaterequests),
+        )
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/watch/namespaces/:namespace/podcertificaterequests",
+            get(handlers::watch::watch_podcertificaterequests),
+        )
         // Discovery API - EndpointSlices (namespace-scoped)
         .route(
             "/apis/discovery.k8s.io/v1/namespaces/:namespace/endpointslices",
@@ -2632,6 +2640,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             .layer(axum_middleware::from_fn(
                 middleware::generate_name_middleware,
             ))
+            // WithAudit sits after authentication and before the handler's
+            // authorization/admission (server/config.go DefaultBuildHandlerChain).
+            .layer(axum_middleware::from_fn(crate::audit::audit_middleware))
             .layer(axum_middleware::from_fn(
                 middleware::normalize_content_type_middleware,
             ))
@@ -2664,6 +2675,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             .layer(axum_middleware::from_fn(
                 middleware::generate_name_middleware,
             ))
+            // WithAudit sits after authentication and before the handler's
+            // authorization/admission (server/config.go DefaultBuildHandlerChain).
+            .layer(axum_middleware::from_fn(crate::audit::audit_middleware))
             .layer(axum_middleware::from_fn(
                 middleware::normalize_content_type_middleware,
             ))

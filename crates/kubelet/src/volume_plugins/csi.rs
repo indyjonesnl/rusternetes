@@ -1,9 +1,13 @@
 use super::csi_client::{CsiDriverClient, CsiError};
+use crate::volume_plugins::plugin::{
+    DeviceMountableVolumePlugin, DeviceMounter, DeviceMounterArgs,
+};
 use crate::volume_plugins::{
     Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use rusternetes_common::resources::csi::FSGroupPolicy;
 use rusternetes_common::resources::{
     CSIDriver, PersistentVolume, PersistentVolumeAccessMode, Pod, Secret, VolumeAttachment,
 };
@@ -141,6 +145,21 @@ impl VolumePlugin for CsiPlugin {
         ))
     }
 
+    /// `CanDeviceMount` (`csi_plugin.go:702-715`): an ephemeral (inline) volume
+    /// is never device-mounted, a persistent one always is.
+    fn can_device_mount(&self, spec: &Spec<'_>) -> bool {
+        spec.volume.csi.is_none()
+            && spec
+                .persistent_volume
+                .is_some_and(|pv| pv.spec.csi.is_some())
+    }
+
+    /// Rust spelling of the `volume.DeviceMountableVolumePlugin` assertion
+    /// (`plugins.go:836-849`) made of `csiPlugin`.
+    fn as_device_mountable_plugin(&self) -> Option<&dyn DeviceMountableVolumePlugin> {
+        Some(self)
+    }
+
     /// Rust spelling of the `volume.NodeExpandableVolumePlugin` assertion
     /// `expander.go:32` makes of `csiPlugin`.
     fn as_node_expandable_plugin(
@@ -251,6 +270,12 @@ impl VolumePlugin for CsiPlugin {
             storage: self.host.get_kube_client().cloned(),
             plugin_dir: plugin_dir(self.host.get_volumes_base_path()),
             token_manager: self.host.get_service_account_token_func().clone(),
+            fs_group: crate::volume_plugins::util::fs_group_from(pod),
+            fs_group_change_policy: pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref())
+                .and_then(|sc| sc.fs_group_change_policy.clone()),
         }))
     }
 
@@ -467,6 +492,10 @@ struct CsiMounter {
     /// token when the backend has no api-server to ask (see
     /// [`CsiMounter::pod_service_account_token_attrs`]).
     token_manager: rusternetes_common::auth::TokenManager,
+    /// `MounterArgs.FsGroup` (`operation_generator.go:501-509`).
+    fs_group: Option<i64>,
+    /// `MounterArgs.FSGroupChangePolicy` (`operation_generator.go:502-509`).
+    fs_group_change_policy: Option<String>,
 }
 
 fn transient(msg: String) -> anyhow::Error {
@@ -474,19 +503,67 @@ fn transient(msg: String) -> anyhow::Error {
 }
 
 impl CsiMounter {
-    /// Read a CSIDriver. `Ok(None)` is upstream's `apierrors.IsNotFound` (the
-    /// CSIDriver object is optional); other errors are real.
+    /// See [`get_csi_driver`].
     async fn get_csi_driver(&self) -> Result<Option<CSIDriver>> {
-        let Some(storage) = self.storage.as_ref() else {
-            return Ok(None);
-        };
-        match storage
-            .get::<CSIDriver>(&build_key("csidrivers", None, &self.driver_name))
-            .await
+        get_csi_driver(self.storage.as_ref(), &self.driver_name).await
+    }
+
+    /// Port of `supportsFSGroup` (`csi_mounter.go:469-500`).
+    fn supports_fs_group(&self, fs_type: &str, driver_policy: &FSGroupPolicy) -> bool {
+        if self.fs_group.is_none() || matches!(driver_policy, FSGroupPolicy::None) || self.read_only
         {
-            Ok(d) => Ok(Some(d)),
-            Err(rusternetes_common::Error::NotFound(_)) => Ok(None),
-            Err(e) => Err(anyhow!("failed to get CSIDriver {}: {e}", self.driver_name)),
+            return false;
+        }
+        if matches!(driver_policy, FSGroupPolicy::File) {
+            return true;
+        }
+        if fs_type.is_empty() {
+            debug!(
+                "kubernetes.io/csi: mounter.SetupAt WARNING: skipping fsGroup, fsType not provided"
+            );
+            return false;
+        }
+        match &self.source {
+            Source::Pv(pv) => {
+                if pv.spec.access_modes.is_empty() {
+                    debug!("kubernetes.io/csi: mounter.SetupAt WARNING: skipping fsGroup, access modes not provided");
+                    return false;
+                }
+                // `hasReadWriteOnce` (`csi_util.go:132-143`): RWO or RWOP.
+                if !pv.spec.access_modes.iter().any(|m| {
+                    matches!(
+                        m,
+                        PersistentVolumeAccessMode::ReadWriteOnce
+                            | PersistentVolumeAccessMode::ReadWriteOncePod
+                    )
+                }) {
+                    debug!("kubernetes.io/csi: mounter.SetupAt WARNING: skipping fsGroup, only support ReadWriteOnce access mode");
+                    return false;
+                }
+                true
+            }
+            // Inline CSI volumes are always mounted with RWO AccessMode by SetUpAt.
+            Source::Inline(_) => true,
+        }
+    }
+
+    /// Port of `getFSGroupPolicy` (`csi_mounter.go:504-527`). No CSIDriver is
+    /// the default `ReadWriteOnceWithFSType`.
+    ///
+    /// DEVIATION: an unset `fsGroupPolicy` is read as that default instead of
+    /// an error, as `supports_volume_lifecycle_mode` does for its field —
+    /// the API server defaults it, but we read storage directly and may see it
+    /// unset. A non-nil empty string is still an error, as upstream.
+    fn get_fs_group_policy(&self, driver: Option<&CSIDriver>) -> Result<FSGroupPolicy> {
+        let Some(driver) = driver else {
+            return Ok(FSGroupPolicy::ReadWriteOnceWithFSType);
+        };
+        match &driver.spec.fs_group_policy {
+            None => Ok(FSGroupPolicy::ReadWriteOnceWithFSType),
+            Some(FSGroupPolicy::Unknown(s)) if s.is_empty() => Err(anyhow!(
+                "expected valid fsGroupPolicy, received nil value or empty string"
+            )),
+            Some(p) => Ok(p.clone()),
         }
     }
 
@@ -544,79 +621,198 @@ impl CsiMounter {
         get_credentials_from_secret(self.storage.as_ref(), namespace, name).await
     }
 
-    /// Port of `getPublishContext` + `skipAttach` (`csi_plugin.go:858-928`).
+    /// See [`get_publish_context`].
     async fn get_publish_context(
         &self,
         driver: Option<&CSIDriver>,
         handle: &str,
     ) -> Result<HashMap<String, String>> {
-        // `skipAttach`: a missing CSIDriver does NOT skip attach.
-        if driver.is_some_and(|d| d.spec.attach_required == Some(false)) {
-            return Ok(HashMap::new());
-        }
-        let storage = self
-            .storage
-            .as_ref()
-            .context("failed to get a kubernetes client")?;
-        let attach_id = get_attachment_name(handle, &self.driver_name, &self.node_name);
-        let attachment: VolumeAttachment = storage
-            .get(&build_key("volumeattachments", None, &attach_id))
-            .await
-            .map_err(|e| anyhow!("VolumeAttachment {attach_id}: {e}"))?;
-        Ok(attachment
-            .status
-            .and_then(|s| s.attachment_metadata)
-            .unwrap_or_default())
+        get_publish_context(
+            self.storage.as_ref(),
+            driver,
+            &self.driver_name,
+            &self.node_name,
+            handle,
+        )
+        .await
     }
+}
 
-    /// Port of `makeDeviceMountPath` (`csi_attacher.go:598-622`):
-    /// `<pluginDir>/<driver>/<sha256(volumeHandle)>/globalmount`.
-    fn make_device_mount_path(&self, pv_handle: &str) -> Result<PathBuf> {
-        if self.driver_name.is_empty() {
-            return Err(anyhow!(
-                "makeDeviceMountPath failed, csi source driver name is empty"
-            ));
-        }
-        if pv_handle.is_empty() {
-            return Err(anyhow!(
-                "makeDeviceMountPath failed, CSIPersistentVolumeSource volume handle is empty"
-            ));
-        }
-        Ok(self
-            .plugin_dir
-            .join(&self.driver_name)
-            .join(format!("{:x}", Sha256::digest(pv_handle.as_bytes())))
-            .join(GLOBAL_MOUNT_IN_GLOBAL_PATH))
+/// Read a CSIDriver. `Ok(None)` is upstream's `apierrors.IsNotFound` (the
+/// CSIDriver object is optional); other errors are real.
+async fn get_csi_driver(
+    storage: Option<&Arc<StorageBackend>>,
+    driver_name: &str,
+) -> Result<Option<CSIDriver>> {
+    let Some(storage) = storage else {
+        return Ok(None);
+    };
+    match storage
+        .get::<CSIDriver>(&build_key("csidrivers", None, driver_name))
+        .await
+    {
+        Ok(d) => Ok(Some(d)),
+        Err(rusternetes_common::Error::NotFound(_)) => Ok(None),
+        Err(e) => Err(anyhow!("failed to get CSIDriver {driver_name}: {e}")),
+    }
+}
+
+/// Port of `getPublishContext` + `skipAttach` (`csi_plugin.go:858-928`).
+async fn get_publish_context(
+    storage: Option<&Arc<StorageBackend>>,
+    driver: Option<&CSIDriver>,
+    driver_name: &str,
+    node_name: &str,
+    handle: &str,
+) -> Result<HashMap<String, String>> {
+    // `skipAttach`: a missing CSIDriver does NOT skip attach.
+    if driver.is_some_and(|d| d.spec.attach_required == Some(false)) {
+        return Ok(HashMap::new());
+    }
+    let storage = storage.context("failed to get a kubernetes client")?;
+    let attach_id = get_attachment_name(handle, driver_name, node_name);
+    let attachment: VolumeAttachment = storage
+        .get(&build_key("volumeattachments", None, &attach_id))
+        .await
+        .map_err(|e| anyhow!("VolumeAttachment {attach_id}: {e}"))?;
+    Ok(attachment
+        .status
+        .and_then(|s| s.attachment_metadata)
+        .unwrap_or_default())
+}
+
+/// Port of `makeDeviceMountPath` (`csi_attacher.go:598-622`):
+/// `<pluginDir>/<driver>/<sha256(volumeHandle)>/globalmount`.
+fn make_device_mount_path(
+    plugin_dir: &Path,
+    driver_name: &str,
+    pv_handle: &str,
+) -> Result<PathBuf> {
+    if driver_name.is_empty() {
+        return Err(anyhow!(
+            "makeDeviceMountPath failed, csi source driver name is empty"
+        ));
+    }
+    if pv_handle.is_empty() {
+        return Err(anyhow!(
+            "makeDeviceMountPath failed, CSIPersistentVolumeSource volume handle is empty"
+        ));
+    }
+    Ok(plugin_dir
+        .join(driver_name)
+        .join(format!("{:x}", Sha256::digest(pv_handle.as_bytes())))
+        .join(GLOBAL_MOUNT_IN_GLOBAL_PATH))
+}
+
+/// Port of `csiAttacher`'s `volume.DeviceMounter` half
+/// (`csi_attacher.go:254-411`), built by `csiPlugin.NewDeviceMounter`
+/// (`csi_plugin.go:667-669`).
+struct CsiAttacher {
+    storage: Option<Arc<StorageBackend>>,
+    plugin_dir: PathBuf,
+}
+
+impl DeviceMountableVolumePlugin for CsiPlugin {
+    /// `NewDeviceMounter` (`csi_plugin.go:667-669`).
+    fn new_device_mounter(&self) -> Result<Box<dyn DeviceMounter>> {
+        Ok(Box::new(CsiAttacher {
+            storage: self.host.get_kube_client().cloned(),
+            plugin_dir: plugin_dir(self.host.get_volumes_base_path()),
+        }))
+    }
+}
+
+/// `getPVSourceFromSpec` (`csi_util.go:165-174`).
+fn pv_source_from_spec<'a>(
+    spec: &'a Spec<'_>,
+) -> Result<&'a rusternetes_common::resources::volume::CSIVolumeSource> {
+    if spec.volume.csi.is_some() {
+        return Err(anyhow!(
+            "unexpected api.CSIVolumeSource found in volume.Spec"
+        ));
+    }
+    spec.persistent_volume
+        .and_then(|pv| pv.spec.csi.as_ref())
+        .ok_or_else(|| anyhow!("volume source not found in volume.Spec"))
+}
+
+#[async_trait]
+impl DeviceMounter for CsiAttacher {
+    /// `GetDeviceMountPath` (`csi_attacher.go:254-262`).
+    fn get_device_mount_path(&self, spec: &Spec<'_>) -> Result<String> {
+        let fail = |e: anyhow::Error| {
+            anyhow!("kubernetes.io/csi: attacher.GetDeviceMountPath failed to make device mount path: {e}")
+        };
+        let src = pv_source_from_spec(spec).map_err(fail)?;
+        let path = make_device_mount_path(
+            &self.plugin_dir,
+            &src.driver,
+            src.volume_handle.as_deref().unwrap_or_default(),
+        )
+        .map_err(fail)?;
+        Ok(path.to_string_lossy().to_string())
     }
 
     /// Port of `csiAttacher.MountDevice` (`csi_attacher.go:264-411`):
-    /// `NodeStageVolume` when the driver advertises `STAGE_UNSTAGE_VOLUME`.
+    /// `NodeStageVolume` when the driver advertises `STAGE_UNSTAGE_VOLUME`,
+    /// run by the `MountVolume` operation before `SetUp`
+    /// ([`crate::volume_plugins::util::operation_generator::mount_volume`]).
     ///
-    /// **Deviation:** upstream runs this from the volume manager's reconciler
-    /// (the `MountVolume` operation calls `MountDevice` for a device-mountable
-    /// plugin, then `SetUp`). The reconciler here does not drive device mounts
-    /// yet (`can_device_mount` is false for every plugin), so the mounter calls
-    /// it directly, immediately before `NodePublishVolume`, in the same order.
-    /// SELinux mount options and `VOLUME_MOUNT_GROUP` are not ported (no
-    /// `DeviceMounterArgs`).
+    /// Not ported: the SELinux mount option (`:331-343`,
+    /// `DeviceMounterArgs.SELinuxLabel`), see #2312.
     async fn mount_device(
         &self,
-        client: &CsiDriverClient,
-        pv: &PersistentVolume,
-        publish_context: HashMap<String, String>,
-        device_mount_path: &Path,
+        spec: &Spec<'_>,
+        _device_path: &str,
+        device_mount_path: &str,
+        args: &DeviceMounterArgs,
     ) -> Result<()> {
-        let pv_src = pv.spec.csi.as_ref().expect("checked by new_mounter");
+        if device_mount_path.is_empty() {
+            return Err(anyhow!(
+                "kubernetes.io/csi: attacher.MountDevice failed, deviceMountPath is empty"
+            ));
+        }
+        let device_mount_path = Path::new(device_mount_path);
+        let pv_src = pv_source_from_spec(spec).map_err(|e| {
+            anyhow!("kubernetes.io/csi: attacher.MountDevice failed to get CSIPersistentVolumeSource: {e}")
+        })?;
+        let pv = spec
+            .persistent_volume
+            .expect("checked by pv_source_from_spec");
+
+        // Treat the absence of the CSI driver as a transient error
+        // (https://github.com/kubernetes/kubernetes/issues/120268).
+        let client = CsiDriverClient::new(&pv_src.driver).map_err(|e| {
+            transient(format!(
+                "kubernetes.io/csi: attacher.MountDevice failed to create newCsiDriverClient: {e}"
+            ))
+        })?;
         let stage_unstage_set = client.node_supports_stage_unstage().await?;
 
+        // Get secrets and publish context required for mountDevice.
+        let handle = pv_src.volume_handle.clone().unwrap_or_default();
+        let driver = get_csi_driver(self.storage.as_ref(), &pv_src.driver)
+            .await
+            .map_err(|e| transient(e.to_string()))?;
+        let publish_context = get_publish_context(
+            self.storage.as_ref(),
+            driver.as_ref(),
+            &pv_src.driver,
+            &args.node_name,
+            &handle,
+        )
+        .await
+        .map_err(|e| transient(e.to_string()))?;
+
+        // We only require secrets if csiSource has them and the driver has the
+        // NodeStage capability.
         let mut stage_secrets = HashMap::new();
         if let (Some(r), true) = (pv_src.node_stage_secret_ref.as_ref(), stage_unstage_set) {
             let (ns, name) = (
                 r.namespace.as_deref().unwrap_or_default(),
                 r.name.as_deref().unwrap_or_default(),
             );
-            stage_secrets = self
-                .get_credentials_from_secret(ns, name)
+            stage_secrets = get_credentials_from_secret(self.storage.as_ref(), ns, name)
                 .await
                 .map_err(|e| {
                     transient(format!(
@@ -626,7 +822,7 @@ impl CsiMounter {
         }
 
         // Store volume metadata for UnmountDevice. Keep it around even if the
-        // driver does not support NodeStage.
+        // driver does not support NodeStage, UnmountDevice still needs it.
         make_dir_0750(device_mount_path).map_err(|e| {
             anyhow!(
                 "kubernetes.io/csi: attacher.MountDevice failed to create dir {:?}:  {e}",
@@ -641,11 +837,26 @@ impl CsiMounter {
             return Ok(());
         }
 
+        // TODO (vladimirvivien) implement better AccessModes mapping between
+        // k8s and CSI — upstream's own TODO; first access mode wins.
+        let access_mode = pv
+            .spec
+            .access_modes
+            .first()
+            .cloned()
+            .unwrap_or(PersistentVolumeAccessMode::ReadWriteOnce);
+
+        let driver_supports_mount_group = client
+            .node_supports_volume_mount_group()
+            .await
+            .map_err(|e| {
+                transient(format!(
+                    "kubernetes.io/csi: attacher.MountDevice failed to determine if the node service has VOLUME_MOUNT_GROUP capability: {e}"
+                ))
+            })?;
+
         let data = HashMap::from([
-            (
-                vol_data_key::VOL_HANDLE.to_string(),
-                pv_src.volume_handle.clone().unwrap_or_default(),
-            ),
+            (vol_data_key::VOL_HANDLE.to_string(), handle.clone()),
             (vol_data_key::DRIVER_NAME.to_string(), pv_src.driver.clone()),
         ]);
         if let Err(e) = save_volume_data(data_dir, &data) {
@@ -659,30 +870,32 @@ impl CsiMounter {
             return Err(e);
         }
 
-        // TODO (vladimirvivien) implement better AccessModes mapping between
-        // k8s and CSI — upstream's own TODO; first access mode wins.
-        let access_mode = pv
-            .spec
-            .access_modes
-            .first()
-            .cloned()
-            .unwrap_or(PersistentVolumeAccessMode::ReadWriteOnce);
-        let staging = device_mount_path.to_string_lossy();
+        let node_stage_fs_group = if driver_supports_mount_group {
+            debug!(
+                "Driver {} supports applying FSGroup (has VOLUME_MOUNT_GROUP node capability). Delegating FSGroup application to the driver through NodeStageVolume.",
+                pv_src.driver
+            );
+            args.fs_group
+        } else {
+            None
+        };
+
         let result = client
             .node_stage_volume(
-                pv_src.volume_handle.as_deref().unwrap_or_default(),
+                &handle,
                 publish_context,
-                &staging,
+                &device_mount_path.to_string_lossy(),
                 pv_src.fs_type.as_deref().unwrap_or_default(),
                 &access_mode,
                 stage_secrets,
                 pv_src.volume_attributes.clone().unwrap_or_default(),
                 pv.spec.mount_options.as_deref().unwrap_or_default(),
-                None,
+                node_stage_fs_group,
             )
             .await;
         if let Err(e) = result {
             if e.is_operation_finished() {
+                // clean up metadata
                 error!("kubernetes.io/csi: attacher.MountDevice failed: {e}");
                 if let Err(re) = remove_mount_dir(device_mount_path) {
                     error!(
@@ -709,10 +922,12 @@ impl Mounter for CsiMounter {
 
     /// Port of `csiMountMgr.SetUpAt` (`csi_mounter.go:102-356`).
     ///
-    /// Not ported: `FSGroup` handling (`VOLUME_MOUNT_GROUP` delegation and the
-    /// kubelet-side ownership change — `set_up` carries no `MounterArgs` yet),
-    /// SELinux mount context, and the post-publish SELinux-support probe. See
-    /// #2312.
+    /// FSGroup handling is ported (`csi_mounter.go:126-129`, `:250-260`,
+    /// `:333-352`): `VOLUME_MOUNT_GROUP` delegation to the driver, else the
+    /// kubelet-side ownership change gated by `CSIDriver.Spec.FSGroupPolicy`.
+    ///
+    /// Not ported: SELinux mount context and the post-publish SELinux-support
+    /// probe. See #2312.
     async fn set_up(&self) -> Result<()> {
         let dir = Path::new(&self.path);
 
@@ -749,6 +964,13 @@ impl Mounter for CsiMounter {
                     "kubernetes.io/csi: mounter.SetupAt failed to check volume lifecycle mode: {e}"
                 ))
             })?;
+
+        // `getFSGroupPolicy` (`csi_mounter.go:126-129`).
+        let fs_group_policy = self.get_fs_group_policy(csi_driver.as_ref()).map_err(|e| {
+            transient(format!(
+                "kubernetes.io/csi: mounter.SetupAt failed to check fsGroup policy: {e}"
+            ))
+        })?;
 
         let mut access_mode = PersistentVolumeAccessMode::ReadWriteOnce;
         let fs_type: String;
@@ -791,15 +1013,17 @@ impl Mounter for CsiMounter {
                 let stage_unstage_set = client.node_supports_stage_unstage().await.map_err(|e| {
                     anyhow!("kubernetes.io/csi: mounter.SetUpAt failed to check for STAGE_UNSTAGE_VOLUME capability: {e}")
                 })?;
-                let staging = if stage_unstage_set {
-                    let p = self.make_device_mount_path(&self.volume_id).map_err(|e| {
+                if stage_unstage_set {
+                    let p = make_device_mount_path(
+                        &self.plugin_dir,
+                        &self.driver_name,
+                        &self.volume_id,
+                    )
+                    .map_err(|e| {
                         anyhow!("kubernetes.io/csi: mounter.SetUpAt failed to make device mount path: {e}")
                     })?;
                     device_mount_path = p.to_string_lossy().to_string();
-                    Some(p)
-                } else {
-                    None
-                };
+                }
 
                 // Search for the attachment (VolumeAttachment).
                 publish_context = self
@@ -810,12 +1034,6 @@ impl Mounter for CsiMounter {
                             "kubernetes.io/csi: mounter.SetUpAt failed to fetch publishContext: {e}"
                         ))
                     })?;
-
-                // MountDevice, then SetUp, as the reconciler would sequence them.
-                if let Some(staging) = staging {
-                    self.mount_device(&client, pv, publish_context.clone(), &staging)
-                        .await?;
-                }
             }
         }
 
@@ -904,6 +1122,21 @@ impl Mounter for CsiMounter {
             return Err(e);
         }
 
+        // `NodeSupportsVolumeMountGroup` (`csi_mounter.go:250-260`): a driver
+        // with VOLUME_MOUNT_GROUP applies the fsGroup itself, through
+        // NodePublishVolume.
+        let driver_supports_volume_mount_group =
+            client.node_supports_volume_mount_group().await.map_err(|e| {
+                transient(format!(
+                    "kubernetes.io/csi: mounter.SetUpAt failed to determine if the node service has VOLUME_MOUNT_GROUP capability: {e}"
+                ))
+            })?;
+        let node_publish_fs_group = if driver_supports_volume_mount_group {
+            self.fs_group
+        } else {
+            None
+        };
+
         let result = client
             .node_publish_volume(
                 &self.volume_id,
@@ -916,7 +1149,7 @@ impl Mounter for CsiMounter {
                 node_publish_secrets,
                 &fs_type,
                 &mount_options,
-                None,
+                node_publish_fs_group,
             )
             .await;
         if let Err(e) = result {
@@ -931,6 +1164,39 @@ impl Mounter for CsiMounter {
                 }
             }
             return Err(e.into());
+        }
+
+        // `csi_mounter.go:333-352`: the driver does not apply the fsGroup, so
+        // the kubelet must. The mount succeeded, so a failure here is
+        // UncertainProgress (the volume must still be cleaned up).
+        if !driver_supports_volume_mount_group && self.supports_fs_group(&fs_type, &fs_group_policy)
+        {
+            let fs_group = self.fs_group;
+            let policy = self.fs_group_change_policy.clone();
+            let root = self.path.clone();
+            // GetAttributes().ReadOnly is `c.readOnly`, which
+            // `supportsFSGroup` already excluded.
+            tokio::task::spawn_blocking(move || {
+                crate::volume_ownership::set_volume_ownership_with_policy(
+                    Path::new(&root),
+                    fs_group,
+                    policy.as_deref(),
+                    false,
+                )
+            })
+            .await
+            .map_err(|e| anyhow!("fsGroup ownership task panicked: {e}"))?
+            .map_err(|e| {
+                CsiError::UncertainProgress(format!(
+                    "applyFSGroup failed for vol {}: {e}",
+                    self.volume_id
+                ))
+            })?;
+            debug!(
+                "kubernetes.io/csi: mounter.SetupAt fsGroup [{}] applied successfully to {}",
+                self.fs_group.unwrap_or_default(),
+                self.volume_id
+            );
         }
 
         debug!(

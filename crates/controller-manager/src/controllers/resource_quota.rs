@@ -429,126 +429,23 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
         Ok(())
     }
 
-    /// Check if a pod is BestEffort QoS class — the `BestEffort` ResourceQuota
-    /// scope.
-    ///
-    /// Port of upstream `isBestEffort`
-    /// (`pkg/quota/v1/evaluator/core/pods.go:412-414`):
-    /// `qos.GetPodQOS(pod) == corev1.PodQOSBestEffort`. The quota controller and
-    /// the api-server's quota admission
-    /// (`crates/api-server/src/admission.rs`) must agree on which pods a
-    /// `BestEffort`-scoped quota covers, or admission charges a pod the
-    /// controller then does not count.
-    fn is_pod_best_effort(pod: &Pod) -> bool {
-        rusternetes_common::qos::get_pod_qos(pod) == rusternetes_common::qos::QoSClass::BestEffort
-    }
-
-    /// Check if a pod matches the given scopes
+    /// Whether a pod matches every scope of the quota: the scope half of
+    /// `generic.CalculateUsageStats` (`staging/src/k8s.io/apiserver/pkg/quota/
+    /// v1/generic/evaluator.go`) through `podMatchesScopeFunc`
+    /// (`pkg/quota/v1/evaluator/core/pods.go:331-356`), which the api-server's
+    /// quota admission shares (`rusternetes_common::quota`), so admission and
+    /// this controller agree on which pods a scoped quota covers.
     fn pod_matches_scopes(
         pod: &Pod,
         scopes: &[String],
         scope_selector: Option<&rusternetes_common::resources::ScopeSelector>,
     ) -> bool {
-        let is_terminating = pod.metadata.deletion_timestamp.is_some()
-            || pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.active_deadline_seconds)
-                .is_some();
-        let is_best_effort = Self::is_pod_best_effort(pod);
-
-        // All scopes must match (AND logic)
-        for scope in scopes {
-            match scope.as_str() {
-                "Terminating" if !is_terminating => {
-                    return false;
-                }
-                "NotTerminating" if is_terminating => {
-                    return false;
-                }
-                "BestEffort" if !is_best_effort => {
-                    return false;
-                }
-                "NotBestEffort" if is_best_effort => {
-                    return false;
-                }
-                _ => {}
-            }
-        }
-
-        // Check scopeSelector if present (all match expressions must match, AND logic)
-        if let Some(selector) = scope_selector {
-            for req in &selector.match_expressions {
-                match req.scope_name.as_str() {
-                    "Terminating" => {
-                        let matches = match req.operator.as_str() {
-                            "Exists" => is_terminating,
-                            "DoesNotExist" => !is_terminating,
-                            _ => true,
-                        };
-                        if !matches {
-                            return false;
-                        }
-                    }
-                    "NotTerminating" => {
-                        let matches = match req.operator.as_str() {
-                            "Exists" => !is_terminating,
-                            "DoesNotExist" => is_terminating,
-                            _ => true,
-                        };
-                        if !matches {
-                            return false;
-                        }
-                    }
-                    "BestEffort" => {
-                        let matches = match req.operator.as_str() {
-                            "Exists" => is_best_effort,
-                            "DoesNotExist" => !is_best_effort,
-                            _ => true,
-                        };
-                        if !matches {
-                            return false;
-                        }
-                    }
-                    "NotBestEffort" => {
-                        let matches = match req.operator.as_str() {
-                            "Exists" => !is_best_effort,
-                            "DoesNotExist" => is_best_effort,
-                            _ => true,
-                        };
-                        if !matches {
-                            return false;
-                        }
-                    }
-                    "PriorityClass" => {
-                        let pod_priority_class = pod
-                            .spec
-                            .as_ref()
-                            .and_then(|s| s.priority_class_name.as_deref())
-                            .unwrap_or("");
-                        let matches = match req.operator.as_str() {
-                            "In" => req
-                                .values
-                                .as_ref()
-                                .is_some_and(|v| v.iter().any(|val| val == pod_priority_class)),
-                            "NotIn" => req
-                                .values
-                                .as_ref()
-                                .is_none_or(|v| !v.iter().any(|val| val == pod_priority_class)),
-                            "Exists" => !pod_priority_class.is_empty(),
-                            "DoesNotExist" => pod_priority_class.is_empty(),
-                            _ => true,
-                        };
-                        if !matches {
-                            return false;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        true
+        let spec = rusternetes_common::resources::ResourceQuotaSpec {
+            hard: None,
+            scopes: Some(scopes.to_vec()),
+            scope_selector: scope_selector.cloned(),
+        };
+        quota::pod_matches_quota_scopes(pod, &spec)
     }
 
     /// Calculate resource usage in a namespace, respecting quota scopes.
@@ -877,7 +774,7 @@ mod tests {
     fn test_is_pod_best_effort() {
         // Pod with no resources is BestEffort
         let pod = make_pod("test", "default", None);
-        assert!(ResourceQuotaController::<MemoryStorage>::is_pod_best_effort(&pod));
+        assert!(quota::is_best_effort(&pod));
 
         // Pod with empty resources is BestEffort
         let pod = make_pod(
@@ -889,7 +786,7 @@ mod tests {
                 claims: None,
             }),
         );
-        assert!(ResourceQuotaController::<MemoryStorage>::is_pod_best_effort(&pod));
+        assert!(quota::is_best_effort(&pod));
 
         // Pod with empty maps is BestEffort
         let pod = make_pod(
@@ -901,7 +798,7 @@ mod tests {
                 claims: None,
             }),
         );
-        assert!(ResourceQuotaController::<MemoryStorage>::is_pod_best_effort(&pod));
+        assert!(quota::is_best_effort(&pod));
 
         // Pod with CPU request is NOT BestEffort
         let mut reqs = HashMap::new();
@@ -915,7 +812,7 @@ mod tests {
                 claims: None,
             }),
         );
-        assert!(!ResourceQuotaController::<MemoryStorage>::is_pod_best_effort(&pod));
+        assert!(!quota::is_best_effort(&pod));
 
         // Pod with only limits is NOT BestEffort
         let mut limits = HashMap::new();
@@ -929,7 +826,7 @@ mod tests {
                 claims: None,
             }),
         );
-        assert!(!ResourceQuotaController::<MemoryStorage>::is_pod_best_effort(&pod));
+        assert!(!quota::is_best_effort(&pod));
     }
 
     #[test]
@@ -1034,6 +931,8 @@ mod tests {
             )
         );
 
+        // `podMatchesScopeFunc` ignores the operator of the pod-state scopes
+        // (pods.go:335-342); validation only admits `Exists` for them.
         let selector_not = ScopeSelector {
             match_expressions: vec![ScopedResourceSelectorRequirement {
                 scope_name: "Terminating".to_string(),
@@ -1042,7 +941,7 @@ mod tests {
             }],
         };
         assert!(
-            !ResourceQuotaController::<MemoryStorage>::pod_matches_scopes(
+            ResourceQuotaController::<MemoryStorage>::pod_matches_scopes(
                 &pod,
                 &[],
                 Some(&selector_not)

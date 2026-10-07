@@ -7,13 +7,6 @@
 //! `EvaluatePod`), `helpers.go`, `visitor.go` and every `check_*.go`. The
 //! tests port `registry_test.go`, `checks_test.go` and the `check_*_test.go`
 //! cases.
-//!
-//! One deliberate gap: the typed [`Volume`] and [`EphemeralContainer`] carry
-//! only a subset of the upstream fields, so a volume source the type does not
-//! model (`gcePersistentDisk`, ...) deserialises to a volume with no source
-//! and is reported by `restrictedVolumes` as type `unknown` (the upstream
-//! `default:` arm) rather than by its real type; and ephemeral containers
-//! have no ports, probes or lifecycle for the checks that read them.
 
 use super::pod_security_api::{Level, LevelVersion, Version};
 use rusternetes_common::resources::pod::{
@@ -420,8 +413,7 @@ fn relax_policy_for_user_namespace_pod(spec: &PodSpec) -> bool {
 }
 
 /// One container as `visitContainers` hands it to a visitor. An
-/// `EphemeralContainerCommon` carries the same fields as a `Container`; the
-/// typed [`EphemeralContainer`] models only some of them.
+/// `EphemeralContainerCommon` carries the same fields as a `Container`.
 struct ContainerView<'a> {
     name: &'a str,
     security_context: Option<&'a SecurityContext>,
@@ -448,9 +440,13 @@ fn ephemeral_view(c: &EphemeralContainer) -> ContainerView<'_> {
     ContainerView {
         name: c.name.as_str(),
         security_context: c.security_context.as_ref(),
-        ports: &[],
-        probes: [None, None, None],
-        lifecycle: None,
+        ports: c.ports.as_deref().unwrap_or(&[]),
+        probes: [
+            c.liveness_probe.as_ref(),
+            c.readiness_probe.as_ref(),
+            c.startup_probe.as_ref(),
+        ],
+        lifecycle: c.lifecycle.as_ref(),
     }
 }
 
@@ -1027,15 +1023,34 @@ fn restricted_volumes_1_0(_: &ObjectMeta, spec: &PodSpec) -> CheckResult {
             continue;
         }
         bad_volumes.push(v.name.clone());
-        let ty = if v.host_path.is_some() {
-            "hostPath"
-        } else if v.nfs.is_some() {
-            "nfs"
-        } else if v.iscsi.is_some() {
-            "iscsi"
-        } else {
-            "unknown"
-        };
+        let l = &v.legacy_sources;
+        // The switch order of check_restrictedVolumes.go:108-150.
+        let ty = [
+            (v.host_path.is_some(), "hostPath"),
+            (l.gce_persistent_disk.is_some(), "gcePersistentDisk"),
+            (l.aws_elastic_block_store.is_some(), "awsElasticBlockStore"),
+            (l.git_repo.is_some(), "gitRepo"),
+            (v.nfs.is_some(), "nfs"),
+            (v.iscsi.is_some(), "iscsi"),
+            (l.glusterfs.is_some(), "glusterfs"),
+            (l.rbd.is_some(), "rbd"),
+            (l.flex_volume.is_some(), "flexVolume"),
+            (l.cinder.is_some(), "cinder"),
+            (l.cephfs.is_some(), "cephfs"),
+            (l.flocker.is_some(), "flocker"),
+            (l.fc.is_some(), "fc"),
+            (l.azure_file.is_some(), "azureFile"),
+            (l.vsphere_volume.is_some(), "vsphereVolume"),
+            (l.quobyte.is_some(), "quobyte"),
+            (l.azure_disk.is_some(), "azureDisk"),
+            (l.photon_persistent_disk.is_some(), "photonPersistentDisk"),
+            (l.portworx_volume.is_some(), "portworxVolume"),
+            (l.scale_io.is_some(), "scaleIO"),
+            (l.storageos.is_some(), "storageos"),
+        ]
+        .into_iter()
+        .find(|(set, _)| *set)
+        .map_or("unknown", |(_, name)| name);
         bad_types.insert(ty.to_string());
     }
     if bad_volumes.is_empty() {
@@ -1617,6 +1632,10 @@ fn windows_host_process_1_0(_: &ObjectMeta, spec: &PodSpec) -> CheckResult {
 }
 
 #[cfg(test)]
+#[path = "pod_security_policy_cases.rs"]
+mod cases;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rusternetes_common::resources::pod::Pod;
@@ -2060,6 +2079,140 @@ mod tests {
         assert!(!results("v1.34").allowed);
     }
 
+    /// check_hostProbesAndhostLifecycle_test.go
+    /// `TestHostProbesAndHostLifecycleEmulation`: the host check only
+    /// exists from 1.34, and an emulation version below that removes it
+    /// even for `latest`/`1.34` evaluations.
+    #[test]
+    fn host_probes_and_lifecycle_emulation() {
+        let p = pod(serde_json::json!({"containers": [
+            {"name": "", "startupProbe": {"httpGet": {"port": 80, "host": "localhost"}}},
+        ]}));
+        // (emulate, hostCheckActive)
+        for (emulate, active) in [
+            (None, true),
+            (Some(Version::major_minor(1, 34)), true),
+            (Some(Version::major_minor(1, 33)), false),
+        ] {
+            let reg = CheckRegistry::new(default_checks(), emulate).unwrap();
+            let allowed = |v: &str| {
+                aggregate_check_results(&reg.evaluate_pod(
+                    lv(Level::Baseline, v),
+                    &p.metadata,
+                    p.spec.as_ref().unwrap(),
+                ))
+                .allowed
+            };
+            assert_eq!(allowed("latest"), !active, "latest, emulate {emulate:?}");
+            assert_eq!(allowed("v1.34"), !active, "1.34, emulate {emulate:?}");
+            assert!(allowed("v1.33"), "1.33, emulate {emulate:?}");
+        }
+    }
+
+    /// check_hostProbesAndhostLifecycle_test.go `TestHostProbesAndHostLifecycle`
+    /// table, verbatim names and details.
+    #[test]
+    fn host_probes_and_lifecycle_upstream_table() {
+        use serde_json::json;
+        let http = |h: &str| json!({"httpGet": {"port": 80, "host": h}});
+        let tcp = |h: &str| json!({"tcpSocket": {"port": 80, "host": h}});
+        let ctr = |name: &str, extra: serde_json::Value| {
+            let mut m = json!({"name": name, "image": "i"});
+            m.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            m
+        };
+        let cases: Vec<(&str, serde_json::Value, Option<&str>)> = vec![
+            (
+                "valid pod with unset hosts",
+                json!({"containers": [ctr("a", json!({
+                    "livenessProbe": {"httpGet": {"port": 80}},
+                    "readinessProbe": {"tcpSocket": {"port": 80}},
+                    "lifecycle": {"postStart": {"httpGet": {"port": 80}}},
+                }))]}),
+                None,
+            ),
+            (
+                "invalid pod with local host IP as probe host",
+                json!({"containers": [ctr("a", json!({
+                    "livenessProbe": http("127.0.0.1"),
+                    "readinessProbe": tcp("::1"),
+                    "startupProbe": http("localhost"),
+                }))]}),
+                Some(
+                    r#"container "a" uses probe or lifecycle hosts "127.0.0.1", "::1", "localhost""#,
+                ),
+            ),
+            (
+                "invalid httpget host in liveness probe",
+                json!({"containers": [ctr("a", json!({"livenessProbe": http("invalid.host")}))]}),
+                Some(r#"container "a" uses probe or lifecycle host "invalid.host""#),
+            ),
+            (
+                "invalid tcpsocket host in readiness probe",
+                json!({"containers": [ctr("b", json!({"readinessProbe": tcp("invalid.host")}))]}),
+                Some(r#"container "b" uses probe or lifecycle host "invalid.host""#),
+            ),
+            (
+                "invalid httpget host in startup probe",
+                json!({"containers": [ctr("c", json!({"startupProbe": http("invalid.host")}))]}),
+                Some(r#"container "c" uses probe or lifecycle host "invalid.host""#),
+            ),
+            (
+                "invalid poststart tcpsocket host",
+                json!({"containers": [ctr("d", json!({"lifecycle": {"postStart": tcp("invalid.host")}}))]}),
+                Some(r#"container "d" uses probe or lifecycle host "invalid.host""#),
+            ),
+            (
+                "invalid prestop httpget host",
+                json!({"containers": [ctr("e", json!({"lifecycle": {"preStop": http("another.invalid.host")}}))]}),
+                Some(r#"container "e" uses probe or lifecycle host "another.invalid.host""#),
+            ),
+            (
+                "multiple containers with multiple invalid hosts",
+                json!({"containers": [
+                    ctr("valid", json!({})),
+                    ctr("invalid1", json!({"livenessProbe": http("a.com")})),
+                    ctr("invalid2", json!({
+                        "lifecycle": {"preStop": tcp("b.com")},
+                        "startupProbe": http("a.com"),
+                    })),
+                ]}),
+                Some(
+                    r#"containers "invalid1", "invalid2" use probe or lifecycle hosts "a.com", "b.com""#,
+                ),
+            ),
+            (
+                "invalid ipv4 host in probe",
+                json!({"containers": [ctr("a", json!({"livenessProbe": http("8.8.8.8")}))]}),
+                Some(r#"container "a" uses probe or lifecycle host "8.8.8.8""#),
+            ),
+            (
+                "invalid ipv6 host in probe",
+                json!({"containers": [ctr("a", json!({"livenessProbe": tcp("2001:4860:4860::8888")}))]}),
+                Some(r#"container "a" uses probe or lifecycle host "2001:4860:4860::8888""#),
+            ),
+            (
+                "invalid host in initcontainer",
+                json!({"containers": [], "initContainers": [
+                    ctr("init", json!({"livenessProbe": http("invalid.init.host")}))]}),
+                Some(r#"container "init" uses probe or lifecycle host "invalid.init.host""#),
+            ),
+        ];
+        for (name, spec, detail) in cases {
+            let r = run(host_probes_and_host_lifecycle_1_34, &pod(spec));
+            match detail {
+                None => assert!(r.allowed, "{name}: expected allowed, got {r:?}"),
+                Some(d) => {
+                    assert!(!r.allowed, "{name}: expected forbidden");
+                    assert_eq!(r.forbidden_reason, "probe or lifecycle host", "{name}");
+                    assert_eq!(r.forbidden_detail, d, "{name}");
+                }
+            }
+        }
+    }
+
     /// check_capabilities_baseline_test.go.
     #[test]
     fn capabilities_baseline() {
@@ -2474,6 +2627,59 @@ mod tests {
             run(restricted_volumes_1_0, &p),
             "restricted volume types",
             r#"volumes "a", "c", "e" use restricted volume types "hostPath", "nfs", "unknown""#,
+        );
+    }
+
+    /// check_restrictedVolumes.go:108-153: every deprecated in-tree source is
+    /// named by its own type; only a source-less volume is "unknown".
+    #[test]
+    fn restricted_volumes_names_every_legacy_type() {
+        let cases = [
+            "gcePersistentDisk",
+            "awsElasticBlockStore",
+            "gitRepo",
+            "glusterfs",
+            "rbd",
+            "flexVolume",
+            "cinder",
+            "cephfs",
+            "flocker",
+            "fc",
+            "azureFile",
+            "vsphereVolume",
+            "quobyte",
+            "azureDisk",
+            "photonPersistentDisk",
+            "portworxVolume",
+            "scaleIO",
+            "storageos",
+        ];
+        for ty in cases {
+            let p = pod(serde_json::json!({"containers": [], "volumes": [
+                {"name": "v", ty: {}},
+            ]}));
+            let want = format!(r#"volume "v" uses restricted volume type "{ty}""#);
+            expect(
+                run(restricted_volumes_1_0, &p),
+                "restricted volume types",
+                &want,
+            );
+        }
+    }
+
+    /// visitor.go:30-40 visits ephemeral containers, so a hostPort on one is
+    /// seen by hostPorts.
+    #[test]
+    fn host_ports_sees_ephemeral_container_ports() {
+        let p = pod(
+            serde_json::json!({"containers": [], "ephemeralContainers": [
+                {"name": "dbg", "image": "x", "ports": [{"containerPort": 80, "hostPort": 80}]},
+            ]}),
+        );
+        expect(
+            run(host_ports_1_0, &p),
+            "hostPort",
+            r#"container "dbg" uses hostPort 80"#,
         );
     }
 
