@@ -218,6 +218,12 @@ pub enum PersistentVolumeReclaimPolicy {
     Retain,
     Recycle,
     Delete,
+    /// Any value this server does not recognise. Decoding leniently lets the
+    /// PV controller reach `reclaimVolume`'s default branch and fail the
+    /// volume (`pv_controller.go:1217-1222`) instead of the PV becoming
+    /// undecodable. Validation still rejects it on write.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -556,6 +562,28 @@ pub struct StorageClass {
     pub mount_options: Option<Vec<String>>,
 }
 
+/// `GetDefaultClass` (`pkg/volume/util/storageclass.go:40-71`): of the classes
+/// annotated default (`IsDefaultAnnotation`, :76-85), the newest, then the
+/// first by name.
+pub fn get_default_class(classes: Vec<StorageClass>) -> Option<StorageClass> {
+    let is_default = |sc: &StorageClass| {
+        sc.metadata.annotations.as_ref().is_some_and(|a| {
+            a.get("storageclass.kubernetes.io/is-default-class")
+                .is_some_and(|v| v == "true")
+                || a.get("storageclass.beta.kubernetes.io/is-default-class")
+                    .is_some_and(|v| v == "true")
+        })
+    };
+    let mut defaults: Vec<_> = classes.into_iter().filter(is_default).collect();
+    defaults.sort_by(|a, b| {
+        b.metadata
+            .creation_timestamp
+            .cmp(&a.metadata.creation_timestamp)
+            .then_with(|| a.metadata.name.cmp(&b.metadata.name))
+    });
+    defaults.into_iter().next()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum VolumeBindingMode {
     Immediate,
@@ -698,6 +726,11 @@ pub enum DeletionPolicy {
     Unspecified,
     Delete,
     Retain,
+    /// A value outside the CRD's `enum: [Delete, Retain]`. The apiserver
+    /// answers an enum violation `Unsupported value` (422) via
+    /// `kubeOpenAPIResultToFieldErrors`, not a 400 decode failure (#2498).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// VolumeSnapshotContent represents the actual snapshot data

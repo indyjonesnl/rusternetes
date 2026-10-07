@@ -1876,6 +1876,13 @@ pub fn extract_rv_from_json(json: &str) -> Option<String> {
 
 /// Derive the Kind and apiVersion from resource_type and api_group
 fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (String, String) {
+    // Served only as certificates.k8s.io/v1beta1 (storage_certificates.go:91-104).
+    if resource_type == "clustertrustbundles" && api_group == "certificates.k8s.io" {
+        return (
+            "ClusterTrustBundle".to_string(),
+            "certificates.k8s.io/v1beta1".to_string(),
+        );
+    }
     let kind = match resource_type {
         "pods" => "Pod",
         "services" => "Service",
@@ -2747,6 +2754,23 @@ pub async fn watch_certificatesigningrequests(
         state,
         auth_ctx,
         "certificatesigningrequests",
+        "certificates.k8s.io",
+        params,
+    )
+    .await
+}
+
+/// Watch clustertrustbundles (cluster-scoped, certificates.k8s.io/v1beta1)
+pub async fn watch_clustertrustbundles(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<WatchParams>,
+) -> Result<Response> {
+    crate::handlers::clustertrustbundle::gate()?;
+    watch_cluster_scoped::<rusternetes_common::resources::ClusterTrustBundle>(
+        state,
+        auth_ctx,
+        "clustertrustbundles",
         "certificates.k8s.io",
         params,
     )

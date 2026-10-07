@@ -159,6 +159,15 @@ pub enum Feature {
 
     /// Upstream gate `ComponentStatusz` (1.32 Alpha, off (k8s.io/component-base/zpages/features/kube_features.go:43-45)).
     ComponentStatusz,
+
+    /// Upstream gate `StorageVersionAPI` (1.20 Alpha, off; `pkg/features/kube_features.go:2084-2086`).
+    StorageVersionAPI,
+
+    /// Upstream gate `APIServerIdentity` (1.26 Beta, on; `pkg/features/kube_features.go:1957-1960`).
+    APIServerIdentity,
+
+    /// Upstream gate `StorageVersionMigrator` (1.35 Beta, still off; `pkg/features/kube_features.go:1829-1832`).
+    StorageVersionMigrator,
 }
 
 impl Feature {
@@ -194,6 +203,9 @@ impl Feature {
             Feature::DRADeviceTaintRules => 26,
             Feature::ComponentFlagz => 27,
             Feature::ComponentStatusz => 28,
+            Feature::StorageVersionAPI => 29,
+            Feature::APIServerIdentity => 30,
+            Feature::StorageVersionMigrator => 31,
         }
     }
 
@@ -258,6 +270,12 @@ impl Feature {
             Feature::ComponentFlagz => false,
             // 1.32 Alpha, off (k8s.io/component-base/zpages/features/kube_features.go:43-45)
             Feature::ComponentStatusz => false,
+            // 1.20 Alpha, off (pkg/features/kube_features.go:2084-2086)
+            Feature::StorageVersionAPI => false,
+            // 1.26 Beta, on (pkg/features/kube_features.go:1957-1960)
+            Feature::APIServerIdentity => true,
+            // 1.35 Beta, still off (pkg/features/kube_features.go:1829-1832)
+            Feature::StorageVersionMigrator => false,
         }
     }
 }
@@ -303,6 +321,9 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::DRADeviceTaintRules,
     Feature::ComponentFlagz,
     Feature::ComponentStatusz,
+    Feature::StorageVersionAPI,
+    Feature::APIServerIdentity,
+    Feature::StorageVersionMigrator,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -346,6 +367,9 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::DRADeviceTaintRules.default_enabled()),
     AtomicBool::new(Feature::ComponentFlagz.default_enabled()),
     AtomicBool::new(Feature::ComponentStatusz.default_enabled()),
+    AtomicBool::new(Feature::StorageVersionAPI.default_enabled()),
+    AtomicBool::new(Feature::APIServerIdentity.default_enabled()),
+    AtomicBool::new(Feature::StorageVersionMigrator.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.

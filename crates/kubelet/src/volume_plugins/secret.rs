@@ -109,6 +109,7 @@ pub(crate) fn make_payload(
                 payload.insert(
                     name.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: bytes.clone(),
                         mode: default_mode,
                     },
@@ -126,6 +127,7 @@ pub(crate) fn make_payload(
                 payload.insert(
                     ktp.path.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: content.clone(),
                         mode: ktp.mode.map(|m| m as u32).unwrap_or(default_mode),
                     },
@@ -246,9 +248,7 @@ impl Mounter for SecretMounter {
         let key = build_key("secrets", Some(&self.namespace), secret_name);
         let secret_result: Result<Secret, _> = storage.get(&key).await;
 
-        // Create volume directory
         let volume_dir = &self.path;
-        std::fs::create_dir_all(volume_dir).context("Failed to create Secret volume directory")?;
 
         let secret = match secret_result {
             Ok(s) => Some(s),
@@ -339,6 +339,7 @@ impl Mounter for SecretMounter {
                     payload.insert(
                         "ca.crt".to_string(),
                         FileProjection {
+                            fs_user: None,
                             data: ca_content,
                             mode: secret_default_mode as u32,
                         },
@@ -356,10 +357,30 @@ impl Mounter for SecretMounter {
             }
         }
 
+        // `wrapped.SetUpAt(dir, ...)` (secret.go:179-181) runs AFTER `getSecret`
+        // and `MakePayload` (:166-177), so a missing Secret or bad item leaves
+        // no volume behind (`TestInvalidPathSecret`, secret_test.go:365). The
+        // wrapped emptyDir's `setupDir` creates the root at 0777. Its fsGroup
+        // `setPerms` (:187-193) is not ported (#2540/#2541).
+        crate::volume_plugins::empty_dir::setup_dir(volume_dir)
+            .context("Failed to create Secret volume directory")?;
+
         // `writer.Write(payload, setPerms)` (secret.go:196-204) via the
-        // upstream AtomicWriter port: unchanged content is a no-op.
-        crate::atomic_writer::write_projected_payload(std::path::Path::new(volume_dir), &payload)
-            .with_context(|| format!("failed to project Secret {secret_name}"))?;
+        // upstream AtomicWriter port: unchanged content is a no-op. The
+        // `defer` at secret.go:183-200 runs `unmounter.TearDown()` when the
+        // write fails; emptyDir `TearDownAt` removes the volume directory
+        // (same as configMap/downwardAPI).
+        if let Err(e) = crate::atomic_writer::write_projected_payload(
+            std::path::Path::new(volume_dir),
+            &payload,
+        ) {
+            if let Err(td) = std::fs::remove_dir_all(volume_dir) {
+                tracing::error!("Error tearing down volume {}: {}", self.volume_name, td);
+            }
+            return Err(
+                anyhow::Error::new(e).context(format!("failed to project Secret {secret_name}"))
+            );
+        }
 
         info!(
             "Created Secret volume {} at {}",
@@ -555,5 +576,101 @@ mod tests {
         );
         m.set_up().await.unwrap();
         assert_eq!(std::fs::read_link(dir.join("..data")).unwrap(), first);
+    }
+
+    async fn mounter_at(
+        base: &std::path::Path,
+        items: serde_json::Value,
+        secret: Option<Secret>,
+    ) -> Box<dyn Mounter> {
+        let p = plugin_with_secret(base.to_str().unwrap(), secret).await;
+        let v = volume_with_items(items, false);
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+        };
+        p.new_mounter(&spec, &test_pod()).await.unwrap()
+    }
+
+    /// `TestInvalidPathSecret` (secret_test.go:365-417): `MakePayload` fails
+    /// BEFORE `wrapped.SetUpAt` (secret.go:177-181), so the volume path must
+    /// not exist afterwards ("Expected path %s to not exist").
+    #[tokio::test]
+    async fn invalid_path_secret_does_not_create_the_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mounter_at(
+            tmp.path(),
+            json!([{"key": "missing", "path": "missing"}]),
+            Some(opaque("s", &[("a", b"1")])),
+        )
+        .await;
+        assert!(m.set_up().await.is_err());
+        assert!(!std::path::Path::new(&m.get_path()).exists());
+    }
+
+    /// `getSecret` fails before `wrapped.SetUpAt` too (secret.go:166-176).
+    #[tokio::test]
+    async fn missing_required_secret_does_not_create_the_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mounter_at(tmp.path(), json!([]), None).await;
+        assert!(m.set_up().await.is_err());
+        assert!(!std::path::Path::new(&m.get_path()).exists());
+    }
+
+    /// The wrapped emptyDir's `setupDir` (empty_dir.go:447-486) leaves the
+    /// volume root at 0777 (same as downwardAPI).
+    #[tokio::test]
+    async fn volume_root_is_the_wrapped_empty_dir_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mounter_at(
+            tmp.path(),
+            json!([{"key": "a", "path": "a", "mode": 256}]),
+            Some(opaque("s", &[("a", b"1")])),
+        )
+        .await;
+        m.set_up().await.unwrap();
+        let mode = std::fs::metadata(m.get_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o777);
+    }
+
+    /// SetUpAt's `defer` (secret.go:183-200): a failed AtomicWriter runs
+    /// `unmounter.TearDown()`, and emptyDir `TearDownAt` removes the volume.
+    #[tokio::test]
+    async fn failed_write_tears_the_volume_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mounter_at(
+            tmp.path(),
+            json!([{"key": "a", "path": "a"}]),
+            Some(opaque("s", &[("a", b"1")])),
+        )
+        .await;
+        let dir = std::path::PathBuf::from(m.get_path());
+        std::fs::create_dir_all(dir.join("..data_tmp/x")).unwrap();
+        assert!(m.set_up().await.is_err());
+        assert!(
+            !dir.exists(),
+            "volume dir must be removed after a failed write"
+        );
+    }
+
+    /// `TestPluginReboot` (secret_test.go:419-470): the volume dir already
+    /// exists (post-reboot state); SetUp still writes the data.
+    #[tokio::test]
+    async fn plugin_reboot_sets_up_over_an_existing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mounter_at(
+            tmp.path(),
+            json!([{"key": "a", "path": "a"}]),
+            Some(opaque("s", &[("a", b"1")])),
+        )
+        .await;
+        let dir = std::path::PathBuf::from(m.get_path());
+        std::fs::create_dir_all(&dir).unwrap();
+        m.set_up().await.unwrap();
+        assert_eq!(std::fs::read(dir.join("a")).unwrap(), b"1");
     }
 }

@@ -79,6 +79,19 @@ fn validate_volume_snapshot_source(source: &VolumeSnapshotSource, fld_path: &Pat
     )
 }
 
+/// `deletionPolicy` is `required` with `enum: [Delete, Retain]` in both CRDs. An
+/// enum violation is `field.NotSupported` with the enum values in declaration
+/// order (apiextensions-apiserver/pkg/apiserver/validation/validation.go:177-190).
+fn validate_deletion_policy(policy: &DeletionPolicy, path: &Path) -> ErrorList {
+    match policy {
+        DeletionPolicy::Unspecified => vec![Error::required(path, "")],
+        DeletionPolicy::Unknown(v) => {
+            vec![Error::not_supported(path, v.clone(), &["Delete", "Retain"])]
+        }
+        DeletionPolicy::Delete | DeletionPolicy::Retain => Vec::new(),
+    }
+}
+
 /// Validate a `VolumeSnapshotClass`: the CRD
 /// (`snapshot.storage.k8s.io_volumesnapshotclasses.yaml`) declares
 /// `required: [deletionPolicy, driver]` and carries no CEL rule. An absent key
@@ -90,9 +103,10 @@ pub fn validate_volume_snapshot_class(class: &VolumeSnapshotClass) -> ErrorList 
     if class.driver.is_empty() {
         errs.push(Error::required(&Path::new("driver"), ""));
     }
-    if matches!(class.deletion_policy, DeletionPolicy::Unspecified) {
-        errs.push(Error::required(&Path::new("deletionPolicy"), ""));
-    }
+    errs.extend(validate_deletion_policy(
+        &class.deletion_policy,
+        &Path::new("deletionPolicy"),
+    ));
     errs
 }
 
@@ -155,12 +169,10 @@ fn validate_volume_snapshot_content_spec(
     if spec.driver.is_empty() {
         errs.push(Error::required(&fld_path.child("driver"), ""));
     }
-    if matches!(
-        spec.deletion_policy,
-        crate::resources::volume::DeletionPolicy::Unspecified
-    ) {
-        errs.push(Error::required(&fld_path.child("deletionPolicy"), ""));
-    }
+    errs.extend(validate_deletion_policy(
+        &spec.deletion_policy,
+        &fld_path.child("deletionPolicy"),
+    ));
 
     errs.extend(validate_volume_snapshot_content_source(
         &spec.source,

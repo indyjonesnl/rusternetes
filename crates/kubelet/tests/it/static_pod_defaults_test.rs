@@ -153,3 +153,50 @@ spec:
         "absent limits must leave requests unset"
     );
 }
+
+/// Static pods also get the PodLevelResources half of `SetDefaults_Pod`
+/// (`pkg/apis/core/v1/defaults.go:194-199`): the decode path is the same
+/// `SetObjectDefaults_Pod`. Case ported from `TestPodResourcesDefaults`
+/// ("pod requests=empty map limits=set, container requests=unset limits=set",
+/// `pkg/apis/core/v1/defaults_test.go:378`).
+#[test]
+#[serial_test::serial]
+fn pod_level_requests_default_at_decode() {
+    let _g = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::PodLevelResources,
+        true,
+    );
+    const POD_LEVEL: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: p
+  namespace: kube-system
+spec:
+  resources:
+    limits:
+      cpu: 5m
+      memory: 7Mi
+    requests: {}
+  containers:
+  - name: a
+    image: busybox
+    resources:
+      limits:
+        cpu: 2m
+        memory: 1Mi
+  - name: b
+    image: busybox
+    resources:
+      limits:
+        cpu: 1m
+        memory: 5Mi
+"#;
+    let pod = parse_manifest(POD_LEVEL.as_bytes(), "p.yaml").unwrap();
+    let res = pod.spec.as_ref().unwrap().resources.as_ref().unwrap();
+    let requests = res.requests.as_ref().unwrap();
+    assert_eq!(requests.get("cpu").map(String::as_str), Some("3m"));
+    assert_eq!(requests.get("memory").map(String::as_str), Some("6Mi"));
+    let limits = res.limits.as_ref().unwrap();
+    assert_eq!(limits.get("cpu").map(String::as_str), Some("5m"));
+}

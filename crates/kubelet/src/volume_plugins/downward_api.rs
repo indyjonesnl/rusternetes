@@ -186,7 +186,11 @@ pub(crate) fn collect_data(
         }
         data.insert(
             clean_path(&item.path),
-            crate::atomic_writer::FileProjection { data: bytes, mode },
+            crate::atomic_writer::FileProjection {
+                fs_user: None,
+                data: bytes,
+                mode,
+            },
         );
     }
     if errlist.is_empty() {

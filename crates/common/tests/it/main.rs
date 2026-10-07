@@ -42,6 +42,7 @@ mod validation_csr;
 mod validation_csr_conditions;
 mod validation_daemonset;
 mod validation_deployment;
+mod validation_dra_unknown_enums;
 mod validation_endpoints;
 mod validation_endpointslice;
 mod validation_endpointslice_update;
@@ -84,6 +85,7 @@ mod validation_storageclass_update;
 mod validation_vac_update;
 mod validation_volumeattachment;
 mod validation_volumeattributesclass;
+mod validation_volumesnapshot_deletion_policy;
 mod validation_webhookconfiguration;
 mod wire_field_shape_guard;
 
