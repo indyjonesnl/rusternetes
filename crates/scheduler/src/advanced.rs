@@ -620,8 +620,9 @@ fn pod_terminating_by_preemption(p: &Pod) -> bool {
 #[derive(Debug, Clone)]
 pub struct PreemptionCandidate {
     pub node_name: String,
-    /// Victim pod names, as returned by [`check_preemption`].
-    pub victims: Vec<String>,
+    /// Victim pod objects, as returned by [`select_preemption_victims`]
+    /// (upstream `extenderv1.Victims.Pods`).
+    pub victims: Vec<Pod>,
     /// How many of those victims violate a PodDisruptionBudget. The live
     /// scheduling path calls the PDB-unaware [`check_preemption`], so this is
     /// currently always 0 there; the field exists so the score chain is the
@@ -659,30 +660,21 @@ pub struct PreemptionCandidate {
 /// exactly what criterion 2 guarantees.
 ///
 /// Returns `None` only when `candidates` is empty.
-pub fn pick_one_node_for_preemption(
-    candidates: &[PreemptionCandidate],
-    all_pods: &[Pod],
-) -> Option<String> {
+pub fn pick_one_node_for_preemption(candidates: &[PreemptionCandidate]) -> Option<String> {
     if candidates.is_empty() {
         return None;
     }
 
-    let priority_of = |name: &str| -> i32 {
-        all_pods
-            .iter()
-            .find(|p| p.metadata.name == name)
-            .and_then(|p| p.spec.as_ref())
-            .and_then(|s| s.priority)
-            .unwrap_or(0)
-    };
+    // Upstream reads priority and start time off the victim object itself
+    // (`corev1helpers.PodPriority(pod)`), never by looking a name back up.
+    let priority_of = |p: &Pod| -> i32 { p.spec.as_ref().and_then(|s| s.priority).unwrap_or(0) };
 
     // Highest victim priority on a candidate. Upstream reads
     // `nodesToVictims[node].Pods[0]` because its victim list is sorted
     // highest-priority-first; we take the max explicitly rather than depend on
     // check_preemption's ordering.
-    let highest_victim_priority = |c: &PreemptionCandidate| -> i32 {
-        c.victims.iter().map(|v| priority_of(v)).max().unwrap_or(0)
-    };
+    let highest_victim_priority =
+        |c: &PreemptionCandidate| -> i32 { c.victims.iter().map(&priority_of).max().unwrap_or(0) };
 
     // Upstream adds MaxInt32+1 to every priority before summing, so that a node
     // with a few negative-priority pods is not preferred over a node with fewer
@@ -704,10 +696,8 @@ pub fn pick_one_node_for_preemption(
             .iter()
             .filter(|v| priority_of(v) == top)
             .map(|v| {
-                all_pods
-                    .iter()
-                    .find(|p| p.metadata.name == *v)
-                    .and_then(|p| p.status.as_ref())
+                v.status
+                    .as_ref()
                     .and_then(|st| st.start_time)
                     .map(|t| t.timestamp_nanos_opt().unwrap_or(i64::MIN))
                     .unwrap_or(i64::MIN)
@@ -780,6 +770,42 @@ pub fn check_preemption_with_pdbs(
     pdbs: &[PodDisruptionBudget],
     priority_classes: &HashMap<String, PriorityClass>,
 ) -> (bool, Vec<String>) {
+    let (ok, victims) = select_preemption_victims(node, pod, all_pods, pdbs, priority_classes);
+    (ok, victims.into_iter().map(|v| v.metadata.name).collect())
+}
+
+/// Identity of a pod for preemption bookkeeping: its UID, falling back to
+/// `namespace/name` for pods that carry none (unit-test fixtures).
+///
+/// Upstream keys everything on `types.UID` (`preempting sets.Set[types.UID]`,
+/// pkg/scheduler/framework/preemption/preemption.go:140) and removes nodeInfo
+/// pods by UID (`NodeInfo.RemovePod`, pkg/scheduler/framework/types.go). Name
+/// alone is not an identity: two namespaces can each hold a pod called `w`.
+pub fn pod_key(p: &Pod) -> String {
+    if !p.metadata.uid.is_empty() {
+        return p.metadata.uid.clone();
+    }
+    format!(
+        "{}/{}",
+        p.metadata.namespace.as_deref().unwrap_or(""),
+        p.metadata.name
+    )
+}
+
+/// Victim selection returning the victim pod *objects*, as upstream's
+/// `SelectVictimsOnNode` returns `[]*v1.Pod`
+/// (pkg/scheduler/framework/plugins/defaultpreemption/default_preemption.go:207-213).
+/// The caller deletes by `pod.Namespace`/`pod.Name` like
+/// `util.DeletePod` (pkg/scheduler/util/utils.go:137-138).
+///
+/// Returns (should_preempt, victims).
+pub fn select_preemption_victims(
+    node: &Node,
+    pod: &Pod,
+    all_pods: &[Pod],
+    pdbs: &[PodDisruptionBudget],
+    priority_classes: &HashMap<String, PriorityClass>,
+) -> (bool, Vec<Pod>) {
     // Get the priority of the incoming pod
     let incoming_priority = pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
 
@@ -958,10 +984,10 @@ pub fn check_preemption_with_pdbs(
         let mut freed_without_this: std::collections::HashMap<String, i64> =
             std::collections::HashMap::new();
         for (other_pod, _) in &candidates {
-            if other_pod.metadata.name == candidate_pod.metadata.name {
+            if pod_key(other_pod) == pod_key(candidate_pod) {
                 continue; // Skip the candidate we're trying to reprieve
             }
-            if reprieved.contains(&other_pod.metadata.name) {
+            if reprieved.contains(&pod_key(other_pod)) {
                 continue; // Skip already-reprieved pods
             }
             for (key, amount) in pod_request_amounts(other_pod) {
@@ -978,7 +1004,7 @@ pub fn check_preemption_with_pdbs(
 
         if fits_without {
             // Pod fits without evicting this candidate → reprieve it
-            reprieved.insert(candidate_pod.metadata.name.clone());
+            reprieved.insert(pod_key(candidate_pod));
         }
         // else: must evict this candidate
     }
@@ -996,14 +1022,14 @@ pub fn check_preemption_with_pdbs(
         let pdb_covered: std::collections::HashSet<String> = candidates
             .iter()
             .filter(|(p, _)| pod_violates_any_pdb(p, pdbs, all_pods))
-            .map(|(p, _)| p.metadata.name.clone())
+            .map(|(p, _)| pod_key(p))
             .collect();
 
         let mut pdb_aware_order = candidates.clone();
         // Primary key: PDB-covered first (reverse: true → 0, false → 1).
         // Secondary key: highest priority first (existing behavior).
         pdb_aware_order.sort_by_key(|(p, priority)| {
-            let covered = pdb_covered.contains(&p.metadata.name);
+            let covered = pdb_covered.contains(&pod_key(p));
             (if covered { 0 } else { 1 }, std::cmp::Reverse(*priority))
         });
 
@@ -1012,10 +1038,10 @@ pub fn check_preemption_with_pdbs(
             let mut freed_without_this: std::collections::HashMap<String, i64> =
                 std::collections::HashMap::new();
             for (other_pod, _) in &candidates {
-                if other_pod.metadata.name == candidate_pod.metadata.name {
+                if pod_key(other_pod) == pod_key(candidate_pod) {
                     continue;
                 }
-                if reprieved_pdb.contains(&other_pod.metadata.name) {
+                if reprieved_pdb.contains(&pod_key(other_pod)) {
                     continue;
                 }
                 for (key, amount) in pod_request_amounts(other_pod) {
@@ -1030,7 +1056,7 @@ pub fn check_preemption_with_pdbs(
             });
 
             if fits_without {
-                reprieved_pdb.insert(candidate_pod.metadata.name.clone());
+                reprieved_pdb.insert(pod_key(candidate_pod));
             }
         }
 
@@ -1038,10 +1064,10 @@ pub fn check_preemption_with_pdbs(
     }
 
     // Collect final victims (candidates that were NOT reprieved)
-    let pods_to_evict: Vec<String> = candidates
+    let pods_to_evict: Vec<Pod> = candidates
         .iter()
-        .filter(|(p, _)| !reprieved.contains(&p.metadata.name))
-        .map(|(p, _)| p.metadata.name.clone())
+        .filter(|(p, _)| !reprieved.contains(&pod_key(p)))
+        .map(|(p, _)| (*p).clone())
         .collect();
 
     if pods_to_evict.is_empty() {
@@ -1082,11 +1108,8 @@ pub fn check_preemption_with_pdbs(
 /// ([`pod_violates_any_pdb`]) — so the number agrees with the selection that
 /// produced it.
 ///
-/// Victim names that match no live pod are ignored rather than counted: an
-/// unknown pod cannot be shown to violate a budget, and guessing "yes" would
-/// steer node choice on no evidence.
 pub fn count_pdb_violating_victims(
-    victims: &[String],
+    victims: &[Pod],
     all_pods: &[Pod],
     pdbs: &[PodDisruptionBudget],
 ) -> i64 {
@@ -1095,7 +1118,6 @@ pub fn count_pdb_violating_victims(
     }
     victims
         .iter()
-        .filter_map(|name| all_pods.iter().find(|p| &p.metadata.name == name))
         .filter(|victim| pod_violates_any_pdb(victim, pdbs, all_pods))
         .count() as i64
 }
@@ -2198,10 +2220,24 @@ mod tests {
     // LOWEST-priority pod is the one preempted.
     // -----------------------------------------------------------------------
 
-    fn candidate(node: &str, victims: &[&str], pdb_violations: i64) -> PreemptionCandidate {
+    fn candidate(
+        node: &str,
+        victims: &[&str],
+        all_pods: &[Pod],
+        pdb_violations: i64,
+    ) -> PreemptionCandidate {
         PreemptionCandidate {
             node_name: node.to_string(),
-            victims: victims.iter().map(|v| v.to_string()).collect(),
+            victims: victims
+                .iter()
+                .map(|v| {
+                    all_pods
+                        .iter()
+                        .find(|p| p.metadata.name == *v)
+                        .unwrap_or_else(|| panic!("fixture pod {v} missing"))
+                        .clone()
+                })
+                .collect(),
             num_pdb_violations: pdb_violations,
         }
     }
@@ -2213,11 +2249,11 @@ mod tests {
             make_scheduled_pod("pod1-1-medium", 500, "100m", "64Mi", "node-2"),
         ];
         let candidates = vec![
-            candidate("node-1", &["pod0-0-low"], 0),
-            candidate("node-2", &["pod1-1-medium"], 0),
+            candidate("node-1", &["pod0-0-low"], &all_pods, 0),
+            candidate("node-2", &["pod1-1-medium"], &all_pods, 0),
         ];
         assert_eq!(
-            pick_one_node_for_preemption(&candidates, &all_pods).as_deref(),
+            pick_one_node_for_preemption(&candidates).as_deref(),
             Some("node-1"),
             "must preempt the low-priority victim, not the medium-priority one"
         );
@@ -2231,11 +2267,11 @@ mod tests {
             make_scheduled_pod("pod1-1-medium", 500, "100m", "64Mi", "node-2"),
         ];
         let reversed = vec![
-            candidate("node-2", &["pod1-1-medium"], 0),
-            candidate("node-1", &["pod0-0-low"], 0),
+            candidate("node-2", &["pod1-1-medium"], &all_pods, 0),
+            candidate("node-1", &["pod0-0-low"], &all_pods, 0),
         ];
         assert_eq!(
-            pick_one_node_for_preemption(&reversed, &all_pods).as_deref(),
+            pick_one_node_for_preemption(&reversed).as_deref(),
             Some("node-1"),
         );
     }
@@ -2249,11 +2285,11 @@ mod tests {
             make_scheduled_pod("medium-free", 500, "100m", "64Mi", "node-2"),
         ];
         let candidates = vec![
-            candidate("node-1", &["low-but-guarded"], 1),
-            candidate("node-2", &["medium-free"], 0),
+            candidate("node-1", &["low-but-guarded"], &all_pods, 1),
+            candidate("node-2", &["medium-free"], &all_pods, 0),
         ];
         assert_eq!(
-            pick_one_node_for_preemption(&candidates, &all_pods).as_deref(),
+            pick_one_node_for_preemption(&candidates).as_deref(),
             Some("node-2"),
         );
     }
@@ -2268,11 +2304,11 @@ mod tests {
             make_scheduled_pod("b-extra", 100, "100m", "64Mi", "node-2"),
         ];
         let candidates = vec![
-            candidate("node-1", &["a-top", "a-extra"], 0),
-            candidate("node-2", &["b-top", "b-extra"], 0),
+            candidate("node-1", &["a-top", "a-extra"], &all_pods, 0),
+            candidate("node-2", &["b-top", "b-extra"], &all_pods, 0),
         ];
         assert_eq!(
-            pick_one_node_for_preemption(&candidates, &all_pods).as_deref(),
+            pick_one_node_for_preemption(&candidates).as_deref(),
             Some("node-2"),
         );
     }
@@ -2286,11 +2322,11 @@ mod tests {
             make_scheduled_pod("b2", 100, "100m", "64Mi", "node-2"),
         ];
         let candidates = vec![
-            candidate("node-2", &["b1", "b2"], 0),
-            candidate("node-1", &["a1"], 0),
+            candidate("node-2", &["b1", "b2"], &all_pods, 0),
+            candidate("node-1", &["a1"], &all_pods, 0),
         ];
         assert_eq!(
-            pick_one_node_for_preemption(&candidates, &all_pods).as_deref(),
+            pick_one_node_for_preemption(&candidates).as_deref(),
             Some("node-1"),
         );
     }
@@ -2306,26 +2342,26 @@ mod tests {
         newer.status.as_mut().unwrap().start_time = Some(base);
         let all_pods = vec![older, newer];
         let candidates = vec![
-            candidate("node-1", &["older"], 0),
-            candidate("node-2", &["newer"], 0),
+            candidate("node-1", &["older"], &all_pods, 0),
+            candidate("node-2", &["newer"], &all_pods, 0),
         ];
         assert_eq!(
-            pick_one_node_for_preemption(&candidates, &all_pods).as_deref(),
+            pick_one_node_for_preemption(&candidates).as_deref(),
             Some("node-2"),
         );
     }
 
     #[test]
     fn test_pick_node_returns_none_without_candidates() {
-        assert_eq!(pick_one_node_for_preemption(&[], &[]), None);
+        assert_eq!(pick_one_node_for_preemption(&[]), None);
     }
 
     #[test]
     fn test_pick_node_single_candidate_is_chosen() {
         let all_pods = vec![make_scheduled_pod("only", 100, "100m", "64Mi", "node-1")];
-        let candidates = vec![candidate("node-1", &["only"], 7)];
+        let candidates = vec![candidate("node-1", &["only"], &all_pods, 7)];
         assert_eq!(
-            pick_one_node_for_preemption(&candidates, &all_pods).as_deref(),
+            pick_one_node_for_preemption(&candidates).as_deref(),
             Some("node-1"),
             "a lone candidate is used even when it violates a PDB — upstream has no better option either"
         );
@@ -2374,7 +2410,7 @@ mod tests {
     fn test_count_pdb_violating_victims_zero_without_budgets() {
         let pods = vec![labelled_pod("a", 100, "node-1", "web")];
         assert_eq!(
-            count_pdb_violating_victims(&["a".to_string()], &pods, &[]),
+            count_pdb_violating_victims(&pods[..1], &pods, &[]),
             0,
             "no budgets means nothing can violate one"
         );
@@ -2385,10 +2421,7 @@ mod tests {
         // One replica, minAvailable=1: evicting it breaks the budget.
         let pods = vec![labelled_pod("only-web", 100, "node-1", "web")];
         let pdbs = vec![make_pdb_min_available("web-pdb", "default", "web", 1)];
-        assert_eq!(
-            count_pdb_violating_victims(&["only-web".to_string()], &pods, &pdbs),
-            1,
-        );
+        assert_eq!(count_pdb_violating_victims(&pods[..1], &pods, &pdbs), 1,);
     }
 
     #[test]
@@ -2400,22 +2433,7 @@ mod tests {
             labelled_pod("batch-1", 100, "node-1", "batch"),
         ];
         let pdbs = vec![make_pdb_min_available("web-pdb", "default", "web", 1)];
-        assert_eq!(
-            count_pdb_violating_victims(&["batch-1".to_string()], &pods, &pdbs),
-            0,
-        );
-    }
-
-    #[test]
-    fn test_count_pdb_violating_victims_ignores_unknown_victim_name() {
-        // A name matching no live pod cannot be shown to violate anything;
-        // counting it would steer node choice on no evidence.
-        let pods = vec![labelled_pod("web-1", 100, "node-1", "web")];
-        let pdbs = vec![make_pdb_min_available("web-pdb", "default", "web", 1)];
-        assert_eq!(
-            count_pdb_violating_victims(&["ghost".to_string()], &pods, &pdbs),
-            0,
-        );
+        assert_eq!(count_pdb_violating_victims(&pods[2..], &pods, &pdbs), 0,);
     }
 
     #[test]
@@ -2428,10 +2446,7 @@ mod tests {
             make_pdb_min_available("web-pdb", "default", "web", 1),
             make_pdb_min_available("api-pdb", "default", "api", 1),
         ];
-        assert_eq!(
-            count_pdb_violating_victims(&["web-1".to_string(), "api-1".to_string()], &pods, &pdbs),
-            2,
-        );
+        assert_eq!(count_pdb_violating_victims(&pods, &pods, &pdbs), 2,);
     }
 
     #[test]
@@ -2447,25 +2462,17 @@ mod tests {
         let candidates = vec![
             PreemptionCandidate {
                 node_name: "node-1".to_string(),
-                victims: vec!["guarded-low".to_string()],
-                num_pdb_violations: count_pdb_violating_victims(
-                    &["guarded-low".to_string()],
-                    &pods,
-                    &pdbs,
-                ),
+                victims: vec![pods[0].clone()],
+                num_pdb_violations: count_pdb_violating_victims(&pods[..1], &pods, &pdbs),
             },
             PreemptionCandidate {
                 node_name: "node-2".to_string(),
-                victims: vec!["free-medium".to_string()],
-                num_pdb_violations: count_pdb_violating_victims(
-                    &["free-medium".to_string()],
-                    &pods,
-                    &pdbs,
-                ),
+                victims: vec![pods[1].clone()],
+                num_pdb_violations: count_pdb_violating_victims(&pods[1..], &pods, &pdbs),
             },
         ];
         assert_eq!(
-            pick_one_node_for_preemption(&candidates, &pods).as_deref(),
+            pick_one_node_for_preemption(&candidates).as_deref(),
             Some("node-2"),
             "a PDB violation must outrank a lower victim priority"
         );
