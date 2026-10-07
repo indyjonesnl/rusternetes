@@ -168,45 +168,34 @@ async fn custom_resource_fallback(
     // Handle /apis/{group} — return APIGroup info for the group
     if parts.len() == 1 && !parts[0].is_empty() {
         let group_name = parts[0];
-        // Look up CRDs for this group to determine the actual versions
-        let prefix = rusternetes_storage::build_prefix("customresourcedefinitions", None);
-        let crds: Vec<CustomResourceDefinition> =
-            state.storage.list(&prefix).await.unwrap_or_default();
-        let mut versions = Vec::new();
-        for crd in &crds {
-            if crd.spec.group == group_name {
-                for ver in &crd.spec.versions {
-                    if ver.served
-                        && !versions.iter().any(|v: &serde_json::Value| {
-                            v.get("version").and_then(|v| v.as_str()) == Some(&ver.name)
-                        })
-                    {
-                        versions.push(serde_json::json!({
-                            "groupVersion": format!("{}/{}", group_name, ver.name),
-                            "version": ver.name,
-                        }));
-                    }
-                }
-            }
+        // Delegate to the same handler as `/apis/{group}/` so both spellings
+        // agree: upstream serves one APIGroup per group from a single handler
+        // (staging/src/k8s.io/apiserver/pkg/endpoints/discovery/group.go:71-73
+        // `APIGroupHandler.ServeHTTP`) and an unknown group is a 404.
+        let resp = handlers::discovery::get_api_group(
+            Some(state.storage.clone()),
+            axum::extract::Path(group_name.to_string()),
+        )
+        .await;
+        if resp.status() != StatusCode::NOT_FOUND {
+            return Ok(resp);
         }
-        if versions.is_empty() {
-            versions.push(serde_json::json!({
-                "groupVersion": format!("{}/v1", group_name),
-                "version": "v1",
-            }));
+        // Not built-in or CRD: an aggregated APIService group is still served.
+        let aggregated = handlers::aggregator::list_registered_apiservice_groups(&state).await;
+        if let Some(g) = aggregated
+            .into_iter()
+            .find(|g| g.get("name").and_then(|n| n.as_str()) == Some(group_name))
+        {
+            let mut g = g;
+            g["kind"] = serde_json::json!("APIGroup");
+            g["apiVersion"] = serde_json::json!("v1");
+            return Ok(axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(g.to_string()))
+                .unwrap());
         }
-        let group_info = serde_json::json!({
-            "kind": "APIGroup",
-            "apiVersion": "v1",
-            "name": group_name,
-            "versions": versions,
-            "preferredVersion": versions[0],
-        });
-        return Ok(axum::response::Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "application/json")
-            .body(axum::body::Body::from(group_info.to_string()))
-            .unwrap());
+        return Ok(resp);
     }
 
     // Handle /apis/{group}/{version} — return APIResourceList for CRDs in this group/version
