@@ -53,6 +53,44 @@ pub trait Storage: Send + Sync {
     where
         T: Serialize + DeserializeOwned + Send + Sync;
 
+    /// [`Storage::create`] with a time to live, in seconds. `0` means no TTL
+    /// ("not expire immediately"), as upstream's `calculateTTL` documents.
+    ///
+    /// Port of the `ttl uint64` parameter of `storage.Interface.Create`
+    /// (`staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go`, `Create`
+    /// -> `ttlOpts` -> `clientv3.WithLease(lease)`): the object is evicted
+    /// once the TTL expires. etcd takes a lease, the rhino backends (SQLite,
+    /// Redis) the kine lease column their TTL loop reaps.
+    ///
+    /// The default refuses a non-zero TTL: a backend that cannot expire keys
+    /// must not silently store them forever.
+    async fn create_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        if ttl != 0 {
+            return Err(Error::Storage(
+                "this storage backend cannot expire keys (TTL unsupported)".to_string(),
+            ));
+        }
+        self.create(key, value).await
+    }
+
+    /// [`Storage::update`] with a time to live, in seconds, replacing the
+    /// key's TTL: `0` makes the object permanent, as a write without a lease
+    /// does in etcd. See [`Storage::create_with_ttl`].
+    async fn update_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        if ttl != 0 {
+            return Err(Error::Storage(
+                "this storage backend cannot expire keys (TTL unsupported)".to_string(),
+            ));
+        }
+        self.update(key, value).await
+    }
+
     /// Update a resource through a named API subresource.
     ///
     /// Direct storage backends have no HTTP subresources, so their default
@@ -609,6 +647,20 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
         (**self).update(key, value).await
     }
 
+    async fn create_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        (**self).create_with_ttl(key, value, ttl).await
+    }
+
+    async fn update_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        (**self).update_with_ttl(key, value, ttl).await
+    }
+
     async fn update_subresource<T>(&self, key: &str, subresource: &str, value: &T) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
@@ -1002,6 +1054,44 @@ impl Storage for StorageBackend {
             StorageBackend::Memory(s) => Storage::update(s.as_ref(), key, value).await,
             #[cfg(feature = "api-client")]
             StorageBackend::Api(s) => Storage::update(s, key, value).await,
+        }
+    }
+
+    async fn create_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        match self {
+            StorageBackend::Etcd(s) => Storage::create_with_ttl(s, key, value, ttl).await,
+            #[cfg(feature = "sqlite")]
+            StorageBackend::Sqlite(s) => Storage::create_with_ttl(s, key, value, ttl).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::create_with_ttl(s, key, value, ttl).await,
+            StorageBackend::Memory(s) => {
+                Storage::create_with_ttl(s.as_ref(), key, value, ttl).await
+            }
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::create_with_ttl(s, key, value, ttl).await,
+        }
+    }
+
+    /// Unlike [`Storage::update`] this has no no-op short-circuit: the write
+    /// is what replaces the key's TTL.
+    async fn update_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        match self {
+            StorageBackend::Etcd(s) => Storage::update_with_ttl(s, key, value, ttl).await,
+            #[cfg(feature = "sqlite")]
+            StorageBackend::Sqlite(s) => Storage::update_with_ttl(s, key, value, ttl).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::update_with_ttl(s, key, value, ttl).await,
+            StorageBackend::Memory(s) => {
+                Storage::update_with_ttl(s.as_ref(), key, value, ttl).await
+            }
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::update_with_ttl(s, key, value, ttl).await,
         }
     }
 
