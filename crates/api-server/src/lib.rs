@@ -274,6 +274,8 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     // scheduling/bootstrap-system-priority-classes PostStartHook (upstream
     // pkg/registry/scheduling/rest/storage_scheduling.go), same as main.rs.
     bootstrap::spawn_system_priority_classes_hook(storage.clone());
+    // start-system-namespaces-controller (server.go:145).
+    bootstrap::spawn_system_namespaces_controller(storage.clone());
     // Keep the kubernetes endpoint tracking the live api-server IP across
     // container recreates / IP changes (upstream EndpointReconciler, #1188).
     bootstrap::spawn_endpoint_reconciler(
