@@ -262,6 +262,14 @@ async fn main() -> Result<()> {
             e
         );
     }
+    // systemnamespaces controller (upstream pkg/controlplane/controller/
+    // systemnamespaces): NamespaceLifecycle needs these to exist (#2533).
+    if let Err(e) = bootstrap::bootstrap_system_namespaces(storage.as_ref()).await {
+        warn!(
+            "Failed to bootstrap system namespaces: {}. Continuing anyway.",
+            e
+        );
+    }
     // Seed the cluster-admin ClusterRole + binding to system:masters so the
     // cluster admin is authorized on a freshly-bootstrapped (empty) store
     // (upstream bootstrap policy; #1659). Idempotent. The `rbac/bootstrap-roles`
@@ -271,6 +279,10 @@ async fn main() -> Result<()> {
     // pkg/registry/scheduling/rest/storage_scheduling.go): seeds
     // system-node-critical and system-cluster-critical.
     bootstrap::spawn_system_priority_classes_hook(storage.clone());
+    // start-system-namespaces-controller PostStartHook (upstream
+    // pkg/controlplane/apiserver/server.go:145): keeps kube-system,
+    // kube-public, default, kube-node-lease existing.
+    bootstrap::spawn_system_namespaces_controller(storage.clone());
     // Keep the kubernetes endpoint tracking the live api-server IP across
     // container recreates / IP changes (upstream EndpointReconciler, #1188).
     bootstrap::spawn_endpoint_reconciler(

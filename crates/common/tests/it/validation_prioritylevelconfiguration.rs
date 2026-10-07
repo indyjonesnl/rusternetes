@@ -305,3 +305,42 @@ fn mandatory_exempt_rejects_other_spec_changes() {
         "{errs:?}"
     );
 }
+
+// #2497: unknown enum strings decode and validate to NotSupported.
+fn plc_from_json(name: &str, spec: serde_json::Value) -> PriorityLevelConfiguration {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "PriorityLevelConfiguration",
+        "metadata": {"name": name},
+        "spec": spec,
+    }))
+    .expect("an unknown enum string must decode")
+}
+
+#[test]
+fn unknown_priority_level_type_is_not_supported() {
+    // validation.go:419 `default:` arm of `switch spec.Type`.
+    let p = plc_from_json("workload", serde_json::json!({"type": "Bogus"}));
+    let errs = validate_priority_level_configuration(&p);
+    assert!(
+        errs.iter()
+            .any(|e| e.error_type == ErrorType::NotSupported && e.field == "spec.type"),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn unknown_limit_response_type_is_not_supported() {
+    // validation.go:477-479.
+    let p = plc_from_json(
+        "workload",
+        serde_json::json!({"type": "Limited", "limited": {
+            "nominalConcurrencyShares": 30, "limitResponse": {"type": "Drop"}}}),
+    );
+    let errs = validate_priority_level_configuration(&p);
+    assert!(
+        errs.iter().any(|e| e.error_type == ErrorType::NotSupported
+            && e.field == "spec.limited.limitResponse.type"),
+        "{errs:?}"
+    );
+}

@@ -2,6 +2,7 @@ pub mod apiservice;
 pub mod cascade_tests;
 pub mod cert_authority;
 pub mod certificate_signing_request;
+pub mod cidrset_metrics;
 pub mod clusterrole_aggregation;
 pub mod cronjob;
 pub mod daemonset;
@@ -45,6 +46,7 @@ pub mod statefulset;
 pub mod status_subresource_double;
 pub mod storage_class;
 pub mod taint_eviction;
+pub mod taint_eviction_timed_workers;
 pub mod ttl_controller;
 #[allow(dead_code)]
 pub mod volume_attachment;

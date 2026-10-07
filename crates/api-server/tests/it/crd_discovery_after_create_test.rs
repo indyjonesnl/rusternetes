@@ -346,3 +346,32 @@ async fn discovery_reflects_served_versions_only() {
         "not-served version must expose zero resources: {rl}"
     );
 }
+
+/// #2546: `GET /apis/{group}` (no trailing slash) must answer with the same
+/// APIGroup as `GET /apis/{group}/`. Upstream serves one APIGroup per group
+/// from a single handler (`APIGroupHandler.ServeHTTP`,
+/// staging/src/k8s.io/apiserver/pkg/endpoints/discovery/group.go:71-73), and
+/// an unknown group is a 404 (no handler registered for the path).
+#[tokio::test]
+async fn apis_group_without_trailing_slash_matches_slash_form_for_builtin_groups() {
+    let router = spawn_router();
+    for group in ["autoscaling", "certificates.k8s.io", "apps", "batch"] {
+        let (s1, slash) = send(&router, Method::GET, &format!("/apis/{group}/"), None).await;
+        let (s2, noslash) = send(&router, Method::GET, &format!("/apis/{group}"), None).await;
+        assert_eq!(s1, StatusCode::OK, "{group}/");
+        assert_eq!(s2, StatusCode::OK, "{group}");
+        assert_eq!(
+            noslash, slash,
+            "no-slash APIGroup must equal slash form for {group}"
+        );
+    }
+    let (_, ag) = send(&router, Method::GET, "/apis/autoscaling", None).await;
+    assert_eq!(ag["versions"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn apis_unknown_group_without_trailing_slash_is_404() {
+    let router = spawn_router();
+    let (status, _) = send(&router, Method::GET, "/apis/no-such.example.com", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

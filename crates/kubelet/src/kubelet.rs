@@ -292,6 +292,25 @@ fn init_container_failed_terminally(pod: &Pod, init_statuses: Option<&[Container
         .unwrap_or(false)
 }
 
+/// Whether a pod still in the API no longer wants its volumes mounted: its
+/// phase is terminal and no container is still running. Upstream's populator
+/// drops a pod's volumes from the desired state once
+/// `ShouldPodRuntimeBeRemoved` holds (`pod_workers.go:698`,
+/// `desired_state_of_world_populator.go:221-233`), i.e. the pod worker has seen
+/// every container exit.
+fn pod_volumes_released(pod: &Pod) -> bool {
+    let Some(status) = pod.status.as_ref() else {
+        return false;
+    };
+    matches!(status.phase, Some(Phase::Succeeded | Phase::Failed))
+        && !status
+            .container_statuses
+            .iter()
+            .flatten()
+            .chain(status.init_container_statuses.iter().flatten())
+            .any(|c| matches!(c.state, Some(ContainerState::Running { .. })))
+}
+
 fn deadline_exceeded_terminal(status: Option<&PodStatus>) -> bool {
     status.is_some_and(|status| {
         status.phase == Some(Phase::Failed)
@@ -448,6 +467,13 @@ pub struct Kubelet {
     /// `Kubelet.nodeStatusUpdateFrequency` (pkg/kubelet/kubelet.go:624),
     /// consumed by `wait.JitterUntil(kl.syncNodeStatus, ...)` (:1852).
     node_status_update_frequency: Duration,
+    /// `KubeletConfiguration.fileCheckFrequency`: how often the static pod
+    /// manifest dir is re-read. Upstream passes
+    /// `kubeCfg.FileCheckFrequency.Duration` as the `period` of
+    /// `config.NewSourceFile` (pkg/kubelet/kubelet.go:384), whose
+    /// `sourceFile.run` re-lists on `time.NewTicker(s.period)`
+    /// (pkg/kubelet/config/file.go:93-104).
+    file_check_frequency: Duration,
     /// Current file-sourced static pods, keyed by (suffixed) pod name.
     /// Workers consult this before storage so static pods survive
     /// mirror-pod deletion.
@@ -716,6 +742,7 @@ impl Kubelet {
             metrics_port,
             pod_manifest_path: None,
             node_status_update_frequency: Duration::from_secs(10),
+            file_check_frequency: Duration::from_secs(20),
             static_pods: Arc::new(Mutex::new(HashMap::new())),
             sysctl_allowlist: crate::sysctl::Allowlist::new(&allowed_unsafe_sysctls),
         })
@@ -734,6 +761,41 @@ impl Kubelet {
             .filter(|d| !d.is_zero())
             .unwrap_or(Duration::from_secs(10));
         self
+    }
+
+    /// Apply `KubeletConfiguration.fileCheckFrequency` (20s when unset/zero,
+    /// v1beta1/defaults.go).
+    pub fn with_file_check_frequency(mut self, d: Option<Duration>) -> Self {
+        self.file_check_frequency = d
+            .filter(|d| !d.is_zero())
+            .unwrap_or(Duration::from_secs(20));
+        self
+    }
+
+    /// Period of the static-pod file source poll in `run`.
+    pub(crate) fn static_pod_poll_interval(&self) -> Duration {
+        self.file_check_frequency
+    }
+
+    /// One pass of the file source (`sourceFile.listConfig`,
+    /// pkg/kubelet/config/file.go:121): re-read the manifest dir, project
+    /// mirror pods into storage, and publish the result to the static-pod
+    /// cache that `sync_loop` consumes.
+    pub(crate) async fn poll_static_pods(&self) {
+        let Some(dir) = &self.pod_manifest_path else {
+            return;
+        };
+        let pods = crate::static_pods::load_static_pods(dir, &self.node_name);
+        if let Err(e) =
+            crate::static_pods::reconcile_mirror_pods(self.storage.as_ref(), &self.node_name, &pods)
+                .await
+        {
+            warn!("static pods: mirror reconcile failed: {}", e);
+        }
+        *self.static_pods.lock().unwrap() = pods
+            .iter()
+            .map(|p| (p.metadata.name.clone(), p.clone()))
+            .collect();
     }
 
     /// Apply `KubeletConfiguration.runtimeRequestTimeout` (2m when unset/zero,
@@ -949,6 +1011,10 @@ impl Kubelet {
         // The watch-triggered syncs handle the fast path
         let full_sync_interval = Duration::from_secs(self.sync_interval.as_secs().max(1));
         let mut full_sync_timer = tokio::time::interval(full_sync_interval);
+        // File source poll: first tick fires immediately ("Read path
+        // immediately to speed up startup", file.go:96), then every
+        // fileCheckFrequency.
+        let mut static_pod_timer = tokio::time::interval(self.static_pod_poll_interval());
 
         // Lease-based heartbeat in a SEPARATE task.
         // K8s kubelet uses Lease objects (coordination.k8s.io/v1) for heartbeats
@@ -1146,6 +1212,15 @@ impl Kubelet {
                     // If no worker exists, start one
                     if !has_worker {
                         self.ensure_pod_worker(&pod_name).await;
+                    }
+                }
+                // Static pod file source (NewSourceFile, kubelet.go:384)
+                _ = static_pod_timer.tick() => {
+                    self.poll_static_pods().await;
+                    if self.pod_manifest_path.is_some() {
+                        if let Err(e) = self.sync_loop().await {
+                            error!("Error in static pod sync: {}", e);
+                        }
                     }
                 }
                 // Periodic full sync as safety net
@@ -1799,27 +1874,10 @@ impl Kubelet {
         let all_pods_prefix = build_prefix("pods", None);
         let all_pods: Vec<Pod> = self.storage.list(&all_pods_prefix).await?;
 
-        // Static pods: rescan the manifest dir (file source resync) and
-        // project mirrors into storage before computing the node's pod set.
-        let static_pods: Vec<Pod> = if let Some(dir) = &self.pod_manifest_path {
-            let pods = crate::static_pods::load_static_pods(dir, &self.node_name);
-            if let Err(e) = crate::static_pods::reconcile_mirror_pods(
-                self.storage.as_ref(),
-                &self.node_name,
-                &pods,
-            )
-            .await
-            {
-                warn!("static pods: mirror reconcile failed: {}", e);
-            }
-            *self.static_pods.lock().unwrap() = pods
-                .iter()
-                .map(|p| (p.metadata.name.clone(), p.clone()))
-                .collect();
-            pods
-        } else {
-            Vec::new()
-        };
+        // Static pods: the file source is polled on its own ticker
+        // (`fileCheckFrequency`, see `poll_static_pods` / `run`); the sync
+        // loop consumes the last published set.
+        let static_pods: Vec<Pod> = self.static_pods.lock().unwrap().values().cloned().collect();
 
         let node_pods: Vec<Pod> =
             crate::static_pods::merge_node_pods(all_pods.clone(), static_pods, &self.node_name);
@@ -1941,9 +1999,27 @@ impl Kubelet {
             .collect();
         // Unpublish CSI volumes first: upstream's reconciler unmounts before
         // cleanupOrphanedPodDirs, which refuses to remove a mounted volume.
+        // Pods that are deleted (not in the live set) and pods that are
+        // terminated but still in the API both no longer want their volumes.
+        let terminated_pod_uids: std::collections::HashSet<String> = all_pods
+            .iter()
+            .chain(node_pods.iter())
+            .filter(|p| pod_volumes_released(p))
+            .map(|p| p.metadata.uid.clone())
+            .filter(|uid| !uid.is_empty())
+            .collect();
         self.runtime
-            .unmount_orphaned_csi_volumes(&live_pod_uids)
+            .unmount_csi_volumes(&live_pod_uids, &terminated_pod_uids)
             .await;
+        // ...then release the staged devices nothing holds or wants any more
+        // (reconciler unmountDetachDevices, reconciler_common.go:273): after
+        // unpublish, so a shared device outlives every pod using it.
+        let desired_pods: Vec<Pod> = node_pods
+            .iter()
+            .filter(|p| !pod_volumes_released(p))
+            .cloned()
+            .collect();
+        self.runtime.unmount_unused_csi_devices(&desired_pods).await;
         self.runtime.cleanup_orphaned_pod_dirs(&live_pod_uids);
 
         // Garbage-collect terminal pods (Succeeded/Failed) from storage.
@@ -6063,6 +6139,29 @@ mod tests {
         assert!(super::terminating_grace_elapsed(None, now));
     }
 
+    /// A terminal pod with no running container no longer wants its volumes
+    /// (`ShouldPodRuntimeBeRemoved`); one still running a container, or a
+    /// running pod, does.
+    #[test]
+    fn pod_volumes_released_only_when_terminal_and_stopped() {
+        let mk = |phase: &str, state: serde_json::Value| -> rusternetes_common::resources::Pod {
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": "p", "uid": "u"},
+                "spec": {"containers": []},
+                "status": {"phase": phase, "containerStatuses": [
+                    {"name": "c", "ready": false, "restartCount": 0, "image": "i", "imageID": "", "state": state}
+                ]}
+            }))
+            .unwrap()
+        };
+        let done = serde_json::json!({"terminated": {"exitCode": 0}});
+        let running = serde_json::json!({"running": {}});
+        assert!(super::pod_volumes_released(&mk("Succeeded", done.clone())));
+        assert!(super::pod_volumes_released(&mk("Failed", done.clone())));
+        assert!(!super::pod_volumes_released(&mk("Running", done)));
+        assert!(!super::pod_volumes_released(&mk("Failed", running)));
+    }
+
     /// `nodeStatusUpdateFrequency` drives the heartbeat interval; default 10s
     /// when unset/zero (upstream `defaults.go`; consumer
     /// pkg/kubelet/kubelet.go:1852 `wait.JitterUntil(kl.syncNodeStatus,
@@ -6102,6 +6201,56 @@ mod tests {
             .await
             .with_node_status_update_frequency(Some(Duration::ZERO));
         assert_eq!(z.node_status_heartbeat_interval(), Duration::from_secs(10));
+    }
+
+    /// `fileCheckFrequency` drives the static-pod file source poll
+    /// (kubelet.go:384 -> file.go:93) and a poll publishes manifests to the
+    /// cache `sync_loop` reads.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn file_check_frequency_drives_static_pod_poll() {
+        use rusternetes_storage::StorageBackend;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).unwrap();
+        let mk = || async {
+            Kubelet::new(
+                "node-fc".into(),
+                std::sync::Arc::new(StorageBackend::new_memory()),
+                10,
+                dir.path().join("vols").display().to_string(),
+                "10.96.0.10".into(),
+                "cluster.local".into(),
+                "bridge".into(),
+                String::new(),
+            )
+            .await
+            .unwrap()
+        };
+        let d = mk().await;
+        assert_eq!(d.static_pod_poll_interval(), Duration::from_secs(20));
+        let z = mk().await.with_file_check_frequency(Some(Duration::ZERO));
+        assert_eq!(z.static_pod_poll_interval(), Duration::from_secs(20));
+        let k = mk()
+            .await
+            .with_pod_manifest_path(Some(manifests.clone()))
+            .with_file_check_frequency(Some(Duration::from_secs(5)));
+        assert_eq!(k.static_pod_poll_interval(), Duration::from_secs(5));
+
+        std::fs::write(
+            manifests.join("web.yaml"),
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\nspec:\n  containers:\n  - name: c\n    image: busybox\n",
+        )
+        .unwrap();
+        assert!(k.static_pods.lock().unwrap().is_empty(), "no poll yet");
+        k.poll_static_pods().await;
+        assert_eq!(k.static_pods.lock().unwrap().len(), 1);
     }
 
     /// `runtimeRequestTimeout` reaches the CRI client (upstream passes

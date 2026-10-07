@@ -28,7 +28,7 @@ use rusternetes_common::admission::{
 };
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::resources::{
-    CertificateSigningRequest, PersistentVolumeClaim, Pod, PriorityClass,
+    CertificateSigningRequest, ClusterTrustBundle, PersistentVolumeClaim, Pod, PriorityClass,
 };
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::Storage;
@@ -174,6 +174,9 @@ impl Admission<'_> {
         if let (Operation::Create, Some(obj)) = (op, obj) {
             self.validate_csr_subject(obj)?;
         }
+        if let (Operation::Create | Operation::Update, Some(obj)) = (op, obj) {
+            self.validate_ctb_attest(obj, old).await?;
+        }
         if self.is_core("pods") || self.is_pod_resize() || self.is_pod_ephemeralcontainers() {
             let obj: Option<Pod> = obj.map(recast).transpose()?;
             let old: Option<Pod> = old.map(recast).transpose()?;
@@ -222,6 +225,31 @@ impl Admission<'_> {
         .await
         {
             Some(err) => Err(self.forbidden(&old.metadata.name, err)),
+            None => Ok(()),
+        }
+    }
+
+    /// The `certificates/ctbattest` plugin (`ClusterTrustBundleAttest`), for
+    /// CREATE and UPDATE of a ClusterTrustBundle
+    /// ([`crate::admission::certificates::validate_cluster_trust_bundle_attest`]).
+    async fn validate_ctb_attest<T: Object>(&self, obj: &T, old: Option<&T>) -> Result<()> {
+        if self.resource.group != "certificates.k8s.io"
+            || self.resource.resource != "clustertrustbundles"
+            || self.subresource.is_some()
+        {
+            return Ok(());
+        }
+        let new: ClusterTrustBundle = recast(obj)?;
+        let old: Option<ClusterTrustBundle> = old.map(recast).transpose()?;
+        match crate::admission::certificates::validate_cluster_trust_bundle_attest(
+            self.state,
+            self.user,
+            &new,
+            old.as_ref(),
+        )
+        .await
+        {
+            Some(err) => Err(self.forbidden(&new.metadata.name, err)),
             None => Ok(()),
         }
     }

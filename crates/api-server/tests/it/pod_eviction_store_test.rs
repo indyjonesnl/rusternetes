@@ -1453,10 +1453,7 @@ async fn concurrent_evictions_each_take_one_disruption() {
     .await;
     let mut handles = Vec::new();
     for i in 0..N {
-        let api = TestApiServer {
-            storage: api.storage.clone(),
-            router: api.router.clone(),
-        };
+        let api = api.clone();
         handles.push(tokio::spawn(async move {
             evict(&api, &format!("p{i}"), "").await.0
         }));

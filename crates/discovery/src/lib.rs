@@ -250,7 +250,20 @@ pub async fn get_api_groups(
                 continue;
             }
             seen_groups.insert(name.to_string());
-            let versions = if name == "autoscaling" {
+            let versions = if name == "certificates.k8s.io" && certificates_v1beta1_served() {
+                vec![
+                    serde_json::json!({
+                        "version": version,
+                        "resources": get_aggregated_resources_for_group(name, version),
+                        "freshness": "Current"
+                    }),
+                    serde_json::json!({
+                        "version": "v1beta1",
+                        "resources": get_aggregated_resources_for_group(name, "v1beta1"),
+                        "freshness": "Current"
+                    }),
+                ]
+            } else if name == "autoscaling" {
                 vec![
                     serde_json::json!({
                         "version": "v2",
@@ -736,6 +749,16 @@ pub async fn get_api_groups(
         },
     ];
 
+    // certificates.k8s.io/v1beta1 is served under the ClusterTrustBundle gate.
+    if certificates_v1beta1_served() {
+        if let Some(group) = groups.iter_mut().find(|g| g.name == "certificates.k8s.io") {
+            group.versions.push(GroupVersionForDiscovery {
+                group_version: "certificates.k8s.io/v1beta1".to_string(),
+                version: "v1beta1".to_string(),
+            });
+        }
+    }
+
     // Dynamically add CRD groups to the non-aggregated discovery response.
     // kubectl uses this to find resources by GVK. Without CRD groups here,
     // kubectl create/explain fails with "no matches for kind".
@@ -830,6 +853,16 @@ pub async fn get_api_groups(
     };
 
     (StatusCode::OK, Json(api_group_list)).into_response()
+}
+
+/// Whether `certificates.k8s.io/v1beta1` is served: its only resource,
+/// `clustertrustbundles`, is installed only under the `ClusterTrustBundle`
+/// feature gate (pkg/registry/certificates/rest/storage_certificates.go:
+/// 91-104), and upstream drops a group version that has no storage.
+fn certificates_v1beta1_served() -> bool {
+    rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::ClusterTrustBundle,
+    )
 }
 
 /// Helper to get all API group names and their preferred versions
@@ -1363,6 +1396,15 @@ fn get_aggregated_resources_for_group_uncategorized(
             vec![sub("status", "CustomResourceDefinition", status_verbs)],
         )],
         "coordination.k8s.io" => vec![res("leases", "lease", "Lease", true, all_verbs, vec![])],
+        // v1beta1 serves only ClusterTrustBundle (storage_certificates.go:91-104).
+        "certificates.k8s.io" if version == "v1beta1" => vec![res(
+            "clustertrustbundles",
+            "clustertrustbundle",
+            "ClusterTrustBundle",
+            false,
+            all_verbs,
+            vec![],
+        )],
         "certificates.k8s.io" => vec![res_with_short(
             "certificatesigningrequests",
             "certificatesigningrequest",
@@ -1589,7 +1631,18 @@ pub async fn get_api_group(
 
     if let Some((name, version)) = found {
         // autoscaling has both v1 and v2
-        let versions = if *name == "autoscaling" {
+        let versions = if *name == "certificates.k8s.io" && certificates_v1beta1_served() {
+            vec![
+                GroupVersionForDiscovery {
+                    group_version: format!("{}/{}", name, version),
+                    version: version.to_string(),
+                },
+                GroupVersionForDiscovery {
+                    group_version: format!("{}/v1beta1", name),
+                    version: "v1beta1".to_string(),
+                },
+            ]
+        } else if *name == "autoscaling" {
             vec![
                 GroupVersionForDiscovery {
                     group_version: format!("{}/v2", name),
@@ -3280,6 +3333,56 @@ pub async fn get_certificates_v1_resources() -> (StatusCode, Json<APIResourceLis
     };
 
     (StatusCode::OK, Json(resource_list))
+}
+
+/// GET /apis/certificates.k8s.io/v1beta1
+/// Returns the resources of certificates.k8s.io/v1beta1: `clustertrustbundles`,
+/// which exists only while the `ClusterTrustBundle` gate is on (404 otherwise,
+/// as for an API version with no storage).
+pub async fn get_certificates_v1beta1_resources() -> Response {
+    if !certificates_v1beta1_served() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "message": "the server could not find the requested resource",
+                "reason": "NotFound",
+                "code": 404
+            })),
+        )
+            .into_response();
+    }
+    let resources = vec![APIResource {
+        name: "clustertrustbundles".to_string(),
+        singular_name: "clustertrustbundle".to_string(),
+        namespaced: false,
+        kind: "ClusterTrustBundle".to_string(),
+        verbs: [
+            "create",
+            "delete",
+            "deletecollection",
+            "get",
+            "list",
+            "patch",
+            "update",
+            "watch",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+        short_names: None,
+        categories: None,
+        storage_version_hash: None,
+    }];
+    let resource_list = APIResourceList {
+        kind: "APIResourceList".to_string(),
+        api_version: "v1".to_string(),
+        group_version: "certificates.k8s.io/v1beta1".to_string(),
+        resources,
+    };
+    (StatusCode::OK, Json(resource_list)).into_response()
 }
 
 /// GET /apis/snapshot.storage.k8s.io/v1

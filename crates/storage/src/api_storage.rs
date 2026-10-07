@@ -390,6 +390,8 @@ fn static_resource_info(rt: &str) -> Option<(&'static str, bool)> {
         "clusterroles" | "clusterrolebindings" => ("/apis/rbac.authorization.k8s.io/v1", false),
         // certificates.k8s.io/v1 — cluster-scoped
         "certificatesigningrequests" => ("/apis/certificates.k8s.io/v1", false),
+        // certificates.k8s.io/v1beta1 — cluster-scoped
+        "clustertrustbundles" => ("/apis/certificates.k8s.io/v1beta1", false),
         // apiextensions.k8s.io/v1 — cluster-scoped
         "customresourcedefinitions" => ("/apis/apiextensions.k8s.io/v1", false),
         // apiregistration.k8s.io/v1 — cluster-scoped
@@ -654,6 +656,19 @@ impl Storage for ApiStorage {
         T: Serialize + DeserializeOwned + Send + Sync,
     {
         self.update_subresource(key, "status", value).await
+    }
+
+    async fn patch_strategic_merge<T>(&self, key: &str, patch: &Value) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        let path = self.object_path(key).await?;
+        let patched: Value = self
+            .client
+            .patch(&path, patch, "application/strategic-merge-patch+json")
+            .await
+            .map_err(map_write_err)?;
+        serde_json::from_value(patched).map_err(Error::Serialization)
     }
 
     async fn update_raw(&self, key: &str, value: &Value) -> Result<()> {
@@ -1419,5 +1434,66 @@ mod tests {
                 && request_line.contains("/api/v1/namespaces/conformance/finalize"),
             "namespace finalization must target /finalize, got: {request_line}"
         );
+    }
+
+    /// `Storage::patch_strategic_merge` must reach the api-server as a real
+    /// PATCH with the strategic-merge content type, not a GET + PUT
+    /// (upstream `nodeutil.PatchNodeCIDRs`,
+    /// `component-helpers/node/util/cidr.go:54`: `Nodes().Patch(ctx, name,
+    /// types.StrategicMergePatchType, patchBytes, ...)`).
+    #[tokio::test]
+    async fn patch_strategic_merge_sends_a_strategic_merge_patch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(h) = text.find("\r\n\r\n") {
+                    let len = text[..h]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= h + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"apiVersion":"v1","kind":"Node","metadata":{"name":"n1"},"spec":{"podCIDR":"10.0.0.0/24","podCIDRs":["10.0.0.0/24"]}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&buf).to_string()
+        });
+        let client = Arc::new(ApiClient::new(&format!("http://{addr}"), false, None).unwrap());
+        let storage = ApiStorage::new(client);
+        let patch =
+            serde_json::json!({"spec": {"podCIDR": "10.0.0.0/24", "podCIDRs": ["10.0.0.0/24"]}});
+        let out: Value = storage
+            .patch_strategic_merge("/registry/nodes/n1", &patch)
+            .await
+            .unwrap();
+        assert_eq!(out["spec"]["podCIDR"], "10.0.0.0/24");
+        let req = server.await.unwrap();
+        let first = req.lines().next().unwrap();
+        assert_eq!(first, "PATCH /api/v1/nodes/n1 HTTP/1.1", "{req}");
+        assert!(
+            req.to_ascii_lowercase()
+                .contains("content-type: application/strategic-merge-patch+json"),
+            "{req}"
+        );
+        assert!(req.contains(r#""podCIDRs":["10.0.0.0/24"]"#), "{req}");
     }
 }

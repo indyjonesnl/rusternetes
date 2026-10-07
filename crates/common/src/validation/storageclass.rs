@@ -125,10 +125,14 @@ pub fn validate_storage_class(sc: &StorageClass) -> ErrorList {
     if let Some(rp) = &sc.reclaim_policy {
         match rp {
             PersistentVolumeReclaimPolicy::Delete | PersistentVolumeReclaimPolicy::Retain => {}
-            PersistentVolumeReclaimPolicy::Recycle => {
+            PersistentVolumeReclaimPolicy::Recycle | PersistentVolumeReclaimPolicy::Unknown => {
                 errs.push(Error::not_supported(
                     &Path::new("reclaimPolicy"),
-                    "Recycle",
+                    if *rp == PersistentVolumeReclaimPolicy::Recycle {
+                        "Recycle"
+                    } else {
+                        "Unknown"
+                    },
                     &["Delete", "Retain"],
                 ));
             }

@@ -2471,15 +2471,21 @@ pub async fn generate_name_middleware(req: Request, next: Next) -> Response {
 // issued directly and the 60-90s the `[sig-api-machinery] Namespaces [Serial]`
 // conformance specs allow. See #1846.
 //
-// Two upstream mechanisms are deliberately NOT ported. `forceLiveLookupCache`
-// and `missingNamespaceWait` (`admission.go:128-152`) both exist to paper over
-// a stale informer cache; we read the namespace live from storage on each
-// request, so there is no stale view to correct. Their absence is a
-// consequence of not having an informer, not an oversight.
+// `forceLiveLookupCache` and `missingNamespaceWait` (`admission.go:128-152`)
+// are deliberately NOT ported: both paper over a stale informer cache, and we
+// read the namespace live from storage on each request, so there is no stale
+// view to correct. The invariant the cache protects (a create right after the
+// namespace DELETE sees Terminating) holds trivially here.
 //
-// Upstream's companion behaviour — rejecting operations against a namespace
-// that does not exist — is also out of scope here: it is a much broader change
-// than the Terminating gate #1846 needs.
+// Also ported (#2533): NotFound for a create/update in a namespace that does
+// not exist (`admission.go:129-166`), and the immortal-namespace delete
+// refusal (`admission.go:31`, `:68-70`; default set from `Register`,
+// `admission.go:57`).
+//
+// Deliberate narrowing: upstream also runs the existence check for
+// subresource updates; we gate PUT/PATCH of a named object only. A subresource
+// update in a missing namespace still reaches its handler, which answers
+// NotFound for the object.
 
 /// The namespace a CREATE should be gated against, or `None` when upstream's
 /// early returns say to allow the request outright.
@@ -2532,6 +2538,62 @@ fn gated_namespace(path: &str) -> Option<&str> {
     }
 
     Some(rest.swap_remove(idx + 1))
+}
+
+/// The namespace an UPDATE (PUT/PATCH of a named object) should be existence-
+/// checked against. Same exemptions as [`gated_namespace`], but the path is
+/// `.../namespaces/{ns}/{resource}/{name}`.
+fn updated_namespace(path: &str) -> Option<&str> {
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    match segments.next()? {
+        "api" | "apis" => {}
+        _ => return None,
+    }
+    let mut rest: Vec<&str> = segments.collect();
+    if rest.first() == Some(&"authorization.k8s.io") {
+        return None;
+    }
+    let idx = rest.iter().position(|s| *s == "namespaces")?;
+    if rest.len() != idx + 4 {
+        return None;
+    }
+    Some(rest.swap_remove(idx + 1))
+}
+
+/// `NewLifecycle(sets.NewString(metav1.NamespaceDefault,
+/// metav1.NamespaceSystem, metav1.NamespacePublic))`, `admission.go:57`.
+const IMMORTAL_NAMESPACES: [&str; 3] = ["default", "kube-system", "kube-public"];
+
+/// The immortal namespace a `DELETE /api/v1/namespaces/{name}` targets
+/// (`admission.go:68-70`).
+fn immortal_namespace_delete(path: &str) -> Option<&str> {
+    let name = path.strip_prefix("/api/v1/namespaces/")?;
+    IMMORTAL_NAMESPACES.contains(&name).then_some(name)
+}
+
+/// `errors.NewForbidden(gr, name, fmt.Errorf("this namespace may not be
+/// deleted"))` (`admission.go:69`).
+fn namespace_immortal_forbidden(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "Status", "apiVersion": "v1", "metadata": {},
+        "status": "Failure",
+        "message": format!("namespaces \"{name}\" is forbidden: this namespace may not be deleted"),
+        "reason": "Forbidden",
+        "details": {"name": name, "kind": "namespaces"},
+        "code": 403,
+    })
+}
+
+/// `errors.NewNotFound` for the namespace (`admission.go:161`).
+fn namespace_not_found(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "Status", "apiVersion": "v1", "metadata": {},
+        "status": "Failure",
+        "message": format!("namespaces \"{name}\" not found"),
+        "reason": "NotFound",
+        "details": {"name": name, "kind": "namespaces"},
+        "code": 404,
+    })
 }
 
 /// Whether a namespace's `status.phase` blocks creates.
@@ -2589,29 +2651,71 @@ pub async fn namespace_lifecycle_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    if request.method() != axum::http::Method::POST {
+    let path = request.uri().path().to_string();
+    let method = request.method().clone();
+
+    // Delete of an immortal namespace (`admission.go:68-70`).
+    if method == axum::http::Method::DELETE {
+        if let Some(name) = immortal_namespace_delete(&path) {
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(namespace_immortal_forbidden(name)),
+            )
+                .into_response();
+        }
         return next.run(request).await;
     }
 
-    let path = request.uri().path().to_string();
-    let Some(namespace) = gated_namespace(&path).map(str::to_string) else {
+    let is_create = method == axum::http::Method::POST;
+    let is_update = method == axum::http::Method::PUT || method == axum::http::Method::PATCH;
+    let target = if is_create {
+        gated_namespace(&path)
+    } else if is_update {
+        updated_namespace(&path)
+    } else {
+        None
+    };
+    let Some(namespace) = target.map(str::to_string) else {
         return next.run(request).await;
     };
-    // Upstream's message names the resource being created; for a collection
-    // POST that is the final path segment.
     let resource = path.rsplit('/').next().unwrap_or("resource").to_string();
 
     let key = build_key("namespaces", None, &namespace);
-    if let Ok(ns) = storage.get::<serde_json::Value>(&key).await {
-        let phase = ns.pointer("/status/phase").and_then(|p| p.as_str());
-        if phase_blocks_create(phase) {
-            debug!(
-                "NamespaceLifecycle: rejecting create of {} in terminating namespace {}",
-                resource, namespace
-            );
+    match storage.get::<serde_json::Value>(&key).await {
+        Ok(ns) => {
+            let phase = ns.pointer("/status/phase").and_then(|p| p.as_str());
+            if is_create && phase_blocks_create(phase) {
+                debug!(
+                    "NamespaceLifecycle: rejecting create of {} in terminating namespace {}",
+                    resource, namespace
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    axum::Json(namespace_terminating_forbidden(&namespace, &resource)),
+                )
+                    .into_response();
+            }
+        }
+        // `admission.go:129-166`: a missing namespace is NotFound.
+        Err(rusternetes_common::Error::NotFound(_)) => {
             return (
-                StatusCode::FORBIDDEN,
-                axum::Json(namespace_terminating_forbidden(&namespace, &resource)),
+                StatusCode::NOT_FOUND,
+                axum::Json(namespace_not_found(&namespace)),
+            )
+                .into_response();
+        }
+        // `errors.NewInternalError(err)` (`admission.go:134`, `:162`).
+        Err(e) => {
+            warn!("NamespaceLifecycle: reading namespace {namespace}: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "kind": "Status", "apiVersion": "v1", "metadata": {},
+                    "status": "Failure",
+                    "message": format!("Internal error occurred: {e}"),
+                    "reason": "InternalError", "code": 500,
+                    "details": {"causes": [{"message": e.to_string()}]},
+                })),
             )
                 .into_response();
         }
@@ -3329,6 +3433,36 @@ mod tests {
     /// Only a `Terminating` phase blocks. An Active namespace, and a namespace
     /// with no phase recorded, must both pass — upstream returns nil for any
     /// phase that is not `NamespaceTerminating` (`admission.go:170-172`).
+    #[test]
+    fn lifecycle_update_and_immortal_targets() {
+        // admission_test.go:124 — updates are existence-checked too.
+        assert_eq!(
+            updated_namespace("/api/v1/namespaces/ns-1/pods/p"),
+            Some("ns-1")
+        );
+        assert_eq!(updated_namespace("/api/v1/namespaces/ns-1/pods"), None);
+        assert_eq!(
+            updated_namespace("/api/v1/namespaces/ns-1/pods/p/status"),
+            None
+        );
+        assert_eq!(updated_namespace("/api/v1/namespaces/ns-1"), None);
+        assert_eq!(updated_namespace("/api/v1/nodes/n1"), None);
+        // admission_test.go:186 — immortal set is default/kube-system/kube-public.
+        assert_eq!(
+            immortal_namespace_delete("/api/v1/namespaces/default"),
+            Some("default")
+        );
+        assert_eq!(
+            immortal_namespace_delete("/api/v1/namespaces/kube-public"),
+            Some("kube-public")
+        );
+        assert_eq!(immortal_namespace_delete("/api/v1/namespaces/other"), None);
+        assert_eq!(
+            immortal_namespace_delete("/api/v1/namespaces/default/pods/p"),
+            None
+        );
+    }
+
     #[test]
     fn only_terminating_phase_blocks_creates() {
         assert!(!phase_blocks_create(Some("Active")));

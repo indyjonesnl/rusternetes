@@ -1,12 +1,13 @@
 use anyhow::Result;
 use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::volume::{
-    NodeSelectorTerm, PersistentVolumeClaimPhase, PersistentVolumeMode, PersistentVolumePhase,
-    PersistentVolumeReclaimPolicy, VolumeNodeAffinity,
+    get_default_class, NodeSelectorTerm, PersistentVolumeClaimPhase, PersistentVolumeMode,
+    PersistentVolumePhase, PersistentVolumeReclaimPolicy, StorageClass, VolumeBindingMode,
+    VolumeNodeAffinity,
 };
 use rusternetes_common::resources::{
     EventSource, EventType, Node, PersistentVolume, PersistentVolumeClaim,
-    PersistentVolumeClaimSpec, PersistentVolumeSpec, PersistentVolumeStatus,
+    PersistentVolumeClaimSpec, PersistentVolumeSpec, PersistentVolumeStatus, Pod,
 };
 use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
 use std::sync::Arc;
@@ -97,6 +98,36 @@ fn quantity_eq(a: &str, b: &str) -> bool {
         (Some(x), Some(y)) => x == y,
         _ => a == b,
     }
+}
+
+/// `AnnSelectedNode` (component-helpers `pv_helpers.go:51`).
+const ANN_SELECTED_NODE: &str = "volume.kubernetes.io/selected-node";
+/// `v1.BetaStorageClassAnnotation`.
+const ANN_BETA_STORAGE_CLASS: &str = "volume.beta.kubernetes.io/storage-class";
+
+/// `util.IsPodTerminated` (`pkg/volume/util/util.go:303-310`).
+fn is_pod_terminated(pod: &Pod) -> bool {
+    use rusternetes_common::resources::pod::{ContainerState, ContainerStatus};
+    use rusternetes_common::types::Phase;
+    let Some(status) = pod.status.as_ref() else {
+        return false;
+    };
+    if matches!(status.phase, Some(Phase::Failed) | Some(Phase::Succeeded)) {
+        return true;
+    }
+    // `notRunning` (util.go:312-319): every status is Terminated or Waiting.
+    let not_running = |s: &Option<Vec<ContainerStatus>>| {
+        s.iter().flatten().all(|c| {
+            matches!(
+                c.state,
+                Some(ContainerState::Terminated { .. }) | Some(ContainerState::Waiting { .. })
+            )
+        })
+    };
+    pod.metadata.deletion_timestamp.is_some()
+        && not_running(&status.init_container_statuses)
+        && not_running(&status.container_statuses)
+        && not_running(&status.ephemeral_container_statuses)
 }
 
 /// `FindRecyclablePluginBySpec` (`pkg/volume/plugins.go:751`): the in-tree
@@ -332,6 +363,11 @@ impl<S: Storage + 'static> PVBinderController<S> {
     /// `updateVolumeMigrationAnnotationsAndFinalizers` (`:565`; in-tree to CSI
     /// migration, which Rusternetes has no plugins for).
     async fn sync_volume(&self, pv: PersistentVolume, claim_queue: &WorkQueue) -> Result<()> {
+        // "Set correct "migrated-to" annotations and modify finalizers on PV and
+        // update in API server if necessary" (`pv_controller.go:565-573`).
+        let pv = self
+            .update_volume_migration_annotations_and_finalizers(pv)
+            .await?;
         // `volume.Spec.ClaimRef == nil` and `claimRef.UID == ""`: unused, or
         // reserved for a claim that has not yet bound (`:576-596`).
         let claim_ref = match pv.spec.claim_ref.clone() {
@@ -501,6 +537,25 @@ impl<S: Storage + 'static> PVBinderController<S> {
         }
     }
 
+    /// `updateVolumeMigrationAnnotationsAndFinalizers`
+    /// (`pv_controller_base.go:361-381`): one `Update` when either the
+    /// `migrated-to` annotation or the deletion finalizers need fixing.
+    async fn update_volume_migration_annotations_and_finalizers(
+        &self,
+        mut pv: PersistentVolume,
+    ) -> Result<PersistentVolume> {
+        let ann_modified = update_migration_annotations(pv.metadata.annotations.as_mut());
+        let (finalizers, finalizers_modified) = modify_deletion_finalizers(&pv);
+        if !ann_modified && !finalizers_modified {
+            return Ok(pv);
+        }
+        if finalizers_modified {
+            pv.metadata.finalizers = finalizers;
+        }
+        let pv_key = build_key("persistentvolumes", None, &pv.metadata.name);
+        Ok(self.storage.update(&pv_key, &pv).await?)
+    }
+
     /// `reclaimVolume` (`pv_controller.go:1180-1230`). `Retain` does nothing;
     /// `Delete` removes the PV. `Recycle` on a volume with no recycler
     /// plugin fails it (`recycleVolumeOperation`, `:1279-1286`); the hostPath/NFS
@@ -529,6 +584,18 @@ impl<S: Storage + 'static> PVBinderController<S> {
                 PersistentVolumePhase::Failed,
                 "VolumeFailedRecycle",
                 "No recycler plugin found for the volume!",
+            )
+            .await?;
+            return Ok(());
+        }
+        if pv.spec.persistent_volume_reclaim_policy == Some(PersistentVolumeReclaimPolicy::Unknown)
+        {
+            // `default:` branch of reclaimVolume (`pv_controller.go:1217-1222`).
+            self.update_volume_phase_with_event(
+                pv.clone(),
+                PersistentVolumePhase::Failed,
+                "VolumeUnknownReclaimPolicy",
+                "Volume has unrecognized PersistentVolumeReclaimPolicy",
             )
             .await?;
             return Ok(());
@@ -590,13 +657,28 @@ impl<S: Storage + 'static> PVBinderController<S> {
         }
     }
 
+    /// `eventRecorder.Event(obj, v1.EventTypeNormal, reason, message)`.
+    async fn event(&self, involved: ObjectReference, reason: &str, message: &str) {
+        let source = EventSource {
+            component: "persistentvolume-controller".to_string(),
+            host: None,
+        };
+        if let Err(e) = self
+            .recorder
+            .event(&involved, &source, EventType::Normal, reason, message)
+            .await
+        {
+            tracing::warn!("Failed to record {} event: {}", reason, e);
+        }
+    }
+
     /// Port of upstream `syncClaim` dispatch (`pv_controller.go:251-255`): a
     /// claim without `pv.kubernetes.io/bind-completed` goes to
     /// `syncUnboundClaim`, one with it to `syncBoundClaim`.
     ///
-    /// Not ported here (tracked separately): `assignDefaultStorageClass`,
-    /// `provisionClaim`/delay-binding handling in the `volumeName == ""`
-    /// branch, and `unbindClaim`.
+    /// Not ported here (tracked separately): the `provisionClaim` call in the
+    /// `volumeName == ""` branch (done by the dynamic-provisioner controller)
+    /// and `unbindClaim`.
     async fn bind_pvc(&self, pvc: &mut PersistentVolumeClaim) -> Result<()> {
         // "Set correct "migrated-to" annotations on PVC and update in API
         // server if necessary" (`syncClaim`, pv_controller.go:240-249).
@@ -1082,7 +1164,161 @@ impl<S: Storage + 'static> PVBinderController<S> {
         }
 
         debug!("No matching PV found for PVC {}/{}", namespace, pvc_name);
+        self.sync_unbound_claim_without_volume(pvc).await
+    }
+
+    /// The `volume == nil` arm of `syncUnboundClaim`
+    /// (`pv_controller.go:345-390`): try `assignDefaultStorageClass`, then
+    /// either explain why a delay-binding claim waits, hand a classed claim to
+    /// provisioning, or report that nothing can serve a classless claim.
+    ///
+    /// Deviation: `provisionClaim` (`:372`) is not called here; provisioning is
+    /// done by the separate dynamic-provisioner controller, so a claim with a
+    /// class simply returns (as upstream does after `provisionClaim`).
+    async fn sync_unbound_claim_without_volume(
+        &self,
+        pvc: &mut PersistentVolumeClaim,
+    ) -> Result<()> {
+        if self.assign_default_storage_class(pvc).await? {
+            // "PersistentVolumeClaim update successful, restarting claim sync"
+            return Ok(());
+        }
+        let class = class_of(
+            pvc.spec.storage_class_name.as_deref(),
+            pvc.metadata.annotations.as_ref(),
+        )
+        .to_string();
+        let selected_node = pvc
+            .metadata
+            .annotations
+            .as_ref()
+            .is_some_and(|a| a.contains_key(ANN_SELECTED_NODE));
+        if self.is_delay_binding_mode(&class).await? && !selected_node {
+            // Scheduler does not observe any pod using this claim.
+            self.emit_event_for_unbound_delay_binding_claim(pvc).await?;
+        } else if !class.is_empty() {
+            return Ok(());
+        } else {
+            self.event(
+                object_ref_for_pvc(pvc),
+                "FailedBinding",
+                "no persistent volumes available for this claim and no storage class is set",
+            )
+            .await;
+        }
+        // Mark the claim as Pending and try to find a match in the next
+        // periodic syncClaim.
+        self.update_claim_status(pvc, PersistentVolumeClaimPhase::Pending, None)
+            .await
+    }
+
+    /// `storagehelpers.IsDelayBindingMode` (component-helpers
+    /// `pv_helpers.go:96-115`): no class or a missing class is not delay
+    /// binding; a class without `volumeBindingMode` is an error.
+    async fn is_delay_binding_mode(&self, class_name: &str) -> Result<bool> {
+        if class_name.is_empty() {
+            return Ok(false);
+        }
+        let class: StorageClass = match self
+            .storage
+            .get(&build_key("storageclasses", None, class_name))
+            .await
+        {
+            Ok(c) => c,
+            Err(rusternetes_common::Error::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        match class.volume_binding_mode {
+            None => anyhow::bail!(
+                "VolumeBindingMode not set for StorageClass {:?}",
+                class_name
+            ),
+            Some(m) => Ok(m == VolumeBindingMode::WaitForFirstConsumer),
+        }
+    }
+
+    /// `assignDefaultStorageClass` (`pv_controller.go:967-994`): a claim that
+    /// asks for no class gets the default one, written to the API server.
+    /// Returns whether the claim was updated.
+    async fn assign_default_storage_class(&self, pvc: &mut PersistentVolumeClaim) -> Result<bool> {
+        // `PersistentVolumeClaimHasClass` (component-helpers helpers.go:28-39).
+        let has_class = pvc.spec.storage_class_name.is_some()
+            || pvc
+                .metadata
+                .annotations
+                .as_ref()
+                .is_some_and(|a| a.contains_key(ANN_BETA_STORAGE_CLASS));
+        if has_class {
+            return Ok(false);
+        }
+        let classes: Vec<StorageClass> = self.storage.list("/registry/storageclasses/").await?;
+        let Some(class) = get_default_class(classes) else {
+            return Ok(false);
+        };
+        pvc.spec.storage_class_name = Some(class.metadata.name);
+        let key = build_key(
+            "persistentvolumeclaims",
+            pvc.metadata.namespace.as_deref(),
+            &pvc.metadata.name,
+        );
+        self.storage.update(&key, &*pvc).await?;
+        Ok(true)
+    }
+
+    /// `emitEventForUnboundDelayBindingClaim` (`pv_controller.go:306-326`).
+    async fn emit_event_for_unbound_delay_binding_claim(
+        &self,
+        pvc: &PersistentVolumeClaim,
+    ) -> Result<()> {
+        let mut reason = "WaitForFirstConsumer";
+        let mut message = "waiting for first consumer to be created before binding".to_string();
+        let pod_names = self.find_non_scheduled_pods_by_pvc(pvc).await?;
+        if !pod_names.is_empty() {
+            reason = "WaitForPodScheduled";
+            message = if pod_names.len() > 1 {
+                format!("waiting for pods {} to be scheduled", pod_names.join(","))
+            } else {
+                format!("waiting for pod {} to be scheduled", pod_names[0])
+            };
+        }
+        self.event(object_ref_for_pvc(pvc), reason, &message).await;
         Ok(())
+    }
+
+    /// `findNonScheduledPodsByPVC` (`pv_controller.go:1477-1493`) over
+    /// `PodPVCIndexFunc` (`pkg/controller/volume/common/common.go:35-55`).
+    async fn find_non_scheduled_pods_by_pvc(
+        &self,
+        pvc: &PersistentVolumeClaim,
+    ) -> Result<Vec<String>> {
+        let namespace = pvc.metadata.namespace.as_deref().unwrap_or("");
+        let pods: Vec<Pod> = self
+            .storage
+            .list(&format!("/registry/pods/{}/", namespace))
+            .await?;
+        let mut names = Vec::new();
+        for pod in pods {
+            let Some(spec) = pod.spec.as_ref() else {
+                continue;
+            };
+            let uses_claim = spec.volumes.iter().flatten().any(|v| {
+                if let Some(src) = v.persistent_volume_claim.as_ref() {
+                    src.claim_name == pvc.metadata.name
+                } else if v.ephemeral.is_some() {
+                    // `ephemeral.VolumeClaimName`: `<pod>-<volume>`.
+                    format!("{}-{}", pod.metadata.name, v.name) == pvc.metadata.name
+                } else {
+                    false
+                }
+            });
+            if !uses_claim || is_pod_terminated(&pod) {
+                continue;
+            }
+            if spec.node_name.as_deref().unwrap_or("").is_empty() {
+                names.push(pod.metadata.name.clone());
+            }
+        }
+        Ok(names)
     }
 
     /// Complete a PVC↔PV binding: pin the PV's `claimRef` to this PVC, mark both
@@ -1256,6 +1492,74 @@ impl<S: Storage + 'static> PVBinderController<S> {
 /// `pv.kubernetes.io/bind-completed: "yes"` unless already present
 /// (`:1064-1068`), which is what `syncClaim` (`:251`) and the scheduler's
 /// `isPVCBound` (`volumebinding/binder.go:776`) key on.
+/// `storagehelpers.PVDeletionInTreeProtectionFinalizer`
+/// (component-helpers pv_helpers.go:82).
+const IN_TREE_PV_DELETION_PROTECTION_FINALIZER: &str = "kubernetes.io/pv-controller";
+/// `storagehelpers.PVDeletionProtectionFinalizer` (pv_helpers.go:79).
+const EXTERNAL_PV_DELETION_PROTECTION_FINALIZER: &str =
+    "external-provisioner.volume.kubernetes.io/finalizer";
+
+/// `updateMigrationAnnotations` (`pv_controller_base.go:445-496`) for a volume
+/// (`claim == false`). Deviation: Rusternetes has no CSI-migrated in-tree
+/// plugins, so `IsMigrationEnabledForPlugin` is always false and only the
+/// rollback branch ("Migration annotation exists but the driver isn't migrated
+/// currently") applies.
+fn update_migration_annotations(
+    ann: Option<&mut std::collections::HashMap<String, String>>,
+) -> bool {
+    let Some(ann) = ann else { return false };
+    if !ann.contains_key(ANN_DYNAMICALLY_PROVISIONED) {
+        // Volume statically provisioned.
+        return false;
+    }
+    ann.get(ANN_MIGRATED_TO).is_some_and(|v| !v.is_empty()) && ann.remove(ANN_MIGRATED_TO).is_some()
+}
+
+/// `modifyDeletionFinalizers` (`pv_controller_base.go:398-443`) with CSI
+/// migration disabled for every plugin (see `update_migration_annotations`);
+/// `HonorPVReclaimPolicy` is GA and locked on in 1.35. Returns the new
+/// finalizers and whether they changed.
+fn modify_deletion_finalizers(pv: &PersistentVolume) -> (Option<Vec<String>>, bool) {
+    let unchanged = || (pv.metadata.finalizers.clone(), false);
+    let Some(provisioner) = pv
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(ANN_DYNAMICALLY_PROVISIONED))
+    else {
+        // Supported only for dynamically provisioned volumes.
+        return unchanged();
+    };
+    if !provisioner.starts_with("kubernetes.io/") {
+        return unchanged();
+    }
+    let mut out = pv.metadata.finalizers.clone().unwrap_or_default();
+    let mut modified = false;
+    let has = |out: &[String], f: &str| out.iter().any(|x| x == f);
+    let policy = pv.spec.persistent_volume_reclaim_policy.as_ref();
+    if policy == Some(&PersistentVolumeReclaimPolicy::Delete)
+        && !has(&out, IN_TREE_PV_DELETION_PROTECTION_FINALIZER)
+    {
+        out.push(IN_TREE_PV_DELETION_PROTECTION_FINALIZER.to_string());
+        modified = true;
+    } else if matches!(
+        policy,
+        Some(PersistentVolumeReclaimPolicy::Retain | PersistentVolumeReclaimPolicy::Recycle)
+    ) && has(&out, IN_TREE_PV_DELETION_PROTECTION_FINALIZER)
+    {
+        out.retain(|f| f != IN_TREE_PV_DELETION_PROTECTION_FINALIZER);
+        modified = true;
+    }
+    if has(&out, EXTERNAL_PV_DELETION_PROTECTION_FINALIZER) {
+        out.retain(|f| f != EXTERNAL_PV_DELETION_PROTECTION_FINALIZER);
+        modified = true;
+    }
+    if !modified {
+        return unchanged();
+    }
+    (if out.is_empty() { None } else { Some(out) }, true)
+}
+
 fn bind_claim_to_volume(pvc: &mut PersistentVolumeClaim, volume_name: &str) {
     if pvc.spec.volume_name.as_deref() != Some(volume_name) {
         pvc.spec.volume_name = Some(volume_name.to_string());
@@ -1832,6 +2136,140 @@ mod tests {
         c.sync_volumes(&WorkQueue::new()).await.unwrap();
         let got = get_pv(&storage, "pv").await.unwrap();
         assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Failed);
+    }
+
+    fn dynamic_pv(
+        name: &str,
+        policy: PersistentVolumeReclaimPolicy,
+        finalizers: &[&str],
+    ) -> PersistentVolume {
+        let mut pv = pv_with(name, None, Some(PersistentVolumePhase::Available));
+        pv.spec.persistent_volume_reclaim_policy = Some(policy);
+        pv.metadata.annotations = Some(
+            [(
+                ANN_DYNAMICALLY_PROVISIONED.to_string(),
+                "kubernetes.io/rbd".to_string(),
+            )]
+            .into(),
+        );
+        pv.metadata.finalizers = if finalizers.is_empty() {
+            None
+        } else {
+            Some(finalizers.iter().map(|s| s.to_string()).collect())
+        };
+        pv
+    }
+
+    /// pv_controller_test.go "5-9" + TestModifyDeletionFinalizers 13-3..13-6,
+    /// 13-12..13-14 (CSI migration disabled): `syncVolume` first runs
+    /// `updateVolumeMigrationAnnotationsAndFinalizers`
+    /// (pv_controller.go:565, pv_controller_base.go:361-381).
+    #[tokio::test]
+    async fn sync_volume_adds_in_tree_finalizer_and_drops_external_one() {
+        use PersistentVolumeReclaimPolicy::*;
+        let cases: Vec<(&str, PersistentVolume, Option<Vec<&str>>)> = vec![
+            // 13-4: Delete, no finalizers -> in-tree finalizer added.
+            (
+                "a",
+                dynamic_pv("a", Delete, &[]),
+                Some(vec![IN_TREE_PV_DELETION_PROTECTION_FINALIZER]),
+            ),
+            // 13-6: external finalizer removed, custom kept, in-tree added.
+            (
+                "b",
+                dynamic_pv(
+                    "b",
+                    Delete,
+                    &[EXTERNAL_PV_DELETION_PROTECTION_FINALIZER, "custom"],
+                ),
+                Some(vec!["custom", IN_TREE_PV_DELETION_PROTECTION_FINALIZER]),
+            ),
+            // 13-12: Retain, nothing to add.
+            ("c", dynamic_pv("c", Retain, &[]), None),
+            // 13-14: Retain removes the in-tree finalizer.
+            (
+                "d",
+                dynamic_pv("d", Retain, &[IN_TREE_PV_DELETION_PROTECTION_FINALIZER]),
+                None,
+            ),
+        ];
+        for (name, pv, want) in cases {
+            let storage = Arc::new(MemoryStorage::new());
+            let c = PVBinderController::new(storage.clone());
+            put_pv(&storage, &pv).await;
+            c.sync_volumes(&WorkQueue::new()).await.unwrap();
+            let got = get_pv(&storage, name).await.unwrap();
+            let want = want.map(|v| v.into_iter().map(String::from).collect::<Vec<_>>());
+            assert_eq!(got.metadata.finalizers, want, "case {name}");
+        }
+    }
+
+    /// 13-11 / 13-15 / 13-10: statically provisioned or unannotated volumes
+    /// are never touched, even when they carry the external finalizer.
+    #[tokio::test]
+    async fn sync_volume_leaves_static_volume_finalizers_alone() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let mut pv = pv_with("s", None, Some(PersistentVolumePhase::Available));
+        pv.spec.persistent_volume_reclaim_policy = Some(PersistentVolumeReclaimPolicy::Delete);
+        pv.metadata.finalizers = Some(vec![EXTERNAL_PV_DELETION_PROTECTION_FINALIZER.into()]);
+        put_pv(&storage, &pv).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let got = get_pv(&storage, "s").await.unwrap();
+        assert_eq!(
+            got.metadata.finalizers,
+            Some(vec![EXTERNAL_PV_DELETION_PROTECTION_FINALIZER.to_string()])
+        );
+    }
+
+    /// TestControllerSync 5-9 / updateMigrationAnnotations: the migrated-to
+    /// annotation is removed when migration is off for the plugin.
+    #[tokio::test]
+    async fn sync_volume_removes_stale_migrated_to_annotation() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let mut pv = dynamic_pv("m", PersistentVolumeReclaimPolicy::Retain, &[]);
+        pv.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(ANN_MIGRATED_TO.into(), "pd.csi.storage.gke.io".into());
+        put_pv(&storage, &pv).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let got = get_pv(&storage, "m").await.unwrap();
+        assert!(!got
+            .metadata
+            .annotations
+            .unwrap_or_default()
+            .contains_key(ANN_MIGRATED_TO));
+    }
+
+    /// pv_controller.go:1217-1222: an unrecognised reclaim policy fails the
+    /// volume with a `VolumeUnknownReclaimPolicy` Warning event.
+    #[tokio::test]
+    async fn unknown_reclaim_policy_fails_volume() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let mut raw = serde_json::to_value(bound_pv("u")).unwrap();
+        raw["spec"]["persistentVolumeReclaimPolicy"] = serde_json::json!("Bogus");
+        let pv: PersistentVolume = serde_json::from_value(raw).expect("lenient decode");
+        put_pv(&storage, &pv).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let status = get_pv(&storage, "u").await.unwrap().status.unwrap();
+        assert_eq!(status.phase, PersistentVolumePhase::Failed);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("Volume has unrecognized PersistentVolumeReclaimPolicy")
+        );
+        let events: Vec<rusternetes_common::resources::Event> =
+            storage.list("/registry/events/").await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.reason == "VolumeUnknownReclaimPolicy")
+                .count(),
+            1
+        );
     }
 
     /// binder_test.go "4-6": volume and claim bound to each other -> Bound.
@@ -2629,5 +3067,207 @@ mod tests {
                 .map(String::as_str),
             Some("x.csi")
         );
+    }
+
+    // ---- syncUnboundClaim volumeName == "" branch with no match
+    // (pv_controller.go:331-409) ----
+
+    async fn put_class(storage: &Arc<MemoryStorage>, name: &str, default: bool, mode: &str) {
+        let mut sc: serde_json::Value = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": {"name": name},
+            "provisioner": "example.com/none",
+            "volumeBindingMode": mode,
+        });
+        if default {
+            sc["metadata"]["annotations"] =
+                serde_json::json!({"storageclass.kubernetes.io/is-default-class": "true"});
+        }
+        let sc: rusternetes_common::resources::StorageClass = serde_json::from_value(sc).unwrap();
+        storage
+            .create(&build_key("storageclasses", None, name), &sc)
+            .await
+            .unwrap();
+    }
+
+    async fn put_pod(storage: &Arc<MemoryStorage>, name: &str, node: Option<&str>, claim: &str) {
+        let pod: rusternetes_common::resources::Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": name, "namespace": "sstest"},
+            "spec": {
+                "nodeName": node,
+                "containers": [{"name": "c", "image": "i"}],
+                "volumes": [{"name": "v", "persistentVolumeClaim": {"claimName": claim}}]
+            }
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("pods", Some("sstest"), name), &pod)
+            .await
+            .unwrap();
+    }
+
+    fn classless_claim() -> PersistentVolumeClaim {
+        let mut pvc = make_pvc("c", "u");
+        pvc.spec.storage_class_name = None;
+        pvc
+    }
+
+    /// `assignDefaultStorageClass` (pv_controller.go:967-994): the claim gets
+    /// the default class written back and the sync stops there.
+    #[tokio::test]
+    async fn unbound_claim_without_class_gets_the_default_class() {
+        let storage = Arc::new(MemoryStorage::new());
+        put_class(&storage, "old", true, "Immediate").await;
+        let (r, got) = sync_claim(&storage, classless_claim()).await;
+        r.unwrap();
+        assert_eq!(got.spec.storage_class_name.as_deref(), Some("old"));
+        assert!(events_with_reason(&storage, "FailedBinding")
+            .await
+            .is_empty());
+    }
+
+    /// A claim that asks for a class (even via the beta annotation) is left alone.
+    #[tokio::test]
+    async fn unbound_claim_with_beta_class_annotation_is_not_defaulted() {
+        let storage = Arc::new(MemoryStorage::new());
+        put_class(&storage, "dflt", true, "Immediate").await;
+        let mut pvc = classless_claim();
+        pvc.metadata.annotations = Some(
+            [(
+                "volume.beta.kubernetes.io/storage-class".to_string(),
+                "gold".to_string(),
+            )]
+            .into(),
+        );
+        let (r, got) = sync_claim(&storage, pvc).await;
+        r.unwrap();
+        assert_eq!(got.spec.storage_class_name, None);
+    }
+
+    /// pv_controller.go:371-373: no class, no default, no volume.
+    #[tokio::test]
+    async fn unbound_claim_without_any_class_emits_failed_binding_and_is_pending() {
+        let storage = Arc::new(MemoryStorage::new());
+        let (r, got) = sync_claim(&storage, classless_claim()).await;
+        r.unwrap();
+        assert_eq!(phase_of(&got), PersistentVolumeClaimPhase::Pending);
+        let ev = events_with_reason(&storage, "FailedBinding").await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(
+            ev[0].message,
+            "no persistent volumes available for this claim and no storage class is set"
+        );
+        assert_eq!(
+            ev[0].event_type,
+            rusternetes_common::resources::EventType::Normal
+        );
+    }
+
+    /// emitEventForUnboundDelayBindingClaim (:306-326), no pod yet.
+    #[tokio::test]
+    async fn delay_binding_claim_without_pod_waits_for_first_consumer() {
+        let storage = Arc::new(MemoryStorage::new());
+        put_class(&storage, "wffc", false, "WaitForFirstConsumer").await;
+        let mut pvc = classless_claim();
+        pvc.spec.storage_class_name = Some("wffc".into());
+        let (r, got) = sync_claim(&storage, pvc).await;
+        r.unwrap();
+        assert_eq!(phase_of(&got), PersistentVolumeClaimPhase::Pending);
+        let ev = events_with_reason(&storage, "WaitForFirstConsumer").await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(
+            ev[0].message,
+            "waiting for first consumer to be created before binding"
+        );
+    }
+
+    /// One unscheduled pod uses the claim; scheduled and terminated pods are
+    /// not counted (findNonScheduledPodsByPVC, :1477-1493).
+    #[tokio::test]
+    async fn delay_binding_claim_names_the_unscheduled_pods() {
+        let storage = Arc::new(MemoryStorage::new());
+        put_class(&storage, "wffc", false, "WaitForFirstConsumer").await;
+        put_pod(&storage, "p1", None, "c").await;
+        put_pod(&storage, "p-sched", Some("node-1"), "c").await;
+        put_pod(&storage, "p-other", None, "other-claim").await;
+        let mut pvc = classless_claim();
+        pvc.spec.storage_class_name = Some("wffc".into());
+        let (r, _) = sync_claim(&storage, pvc.clone()).await;
+        r.unwrap();
+        let ev = events_with_reason(&storage, "WaitForPodScheduled").await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].message, "waiting for pod p1 to be scheduled");
+    }
+
+    #[tokio::test]
+    async fn delay_binding_claim_names_all_unscheduled_pods() {
+        let storage = Arc::new(MemoryStorage::new());
+        put_class(&storage, "wffc", false, "WaitForFirstConsumer").await;
+        put_pod(&storage, "p1", None, "c").await;
+        put_pod(&storage, "p2", None, "c").await;
+        let mut pvc = classless_claim();
+        pvc.spec.storage_class_name = Some("wffc".into());
+        let (r, _) = sync_claim(&storage, pvc).await;
+        r.unwrap();
+        let ev = events_with_reason(&storage, "WaitForPodScheduled").await;
+        assert_eq!(ev.len(), 1);
+        assert!(
+            ev[0].message == "waiting for pods p1,p2 to be scheduled"
+                || ev[0].message == "waiting for pods p2,p1 to be scheduled"
+        );
+    }
+
+    /// `IsDelayBindingProvisioning`: the scheduler has chosen a node, so the
+    /// claim is provisioned instead of waiting (:361-364 falls through).
+    #[tokio::test]
+    async fn delay_binding_claim_with_selected_node_does_not_wait() {
+        let storage = Arc::new(MemoryStorage::new());
+        put_class(&storage, "wffc", false, "WaitForFirstConsumer").await;
+        let mut pvc = classless_claim();
+        pvc.spec.storage_class_name = Some("wffc".into());
+        pvc.metadata.annotations = Some(
+            [(
+                "volume.kubernetes.io/selected-node".to_string(),
+                "node-1".to_string(),
+            )]
+            .into(),
+        );
+        let (r, _) = sync_claim(&storage, pvc).await;
+        r.unwrap();
+        assert!(events_with_reason(&storage, "WaitForFirstConsumer")
+            .await
+            .is_empty());
+        assert!(events_with_reason(&storage, "FailedBinding")
+            .await
+            .is_empty());
+    }
+
+    /// An Immediate class with no volume is provisioned by the dynamic
+    /// provisioner (provisionClaim, :366-374): no event from this branch.
+    #[tokio::test]
+    async fn immediate_class_claim_without_volume_emits_nothing() {
+        let storage = Arc::new(MemoryStorage::new());
+        put_class(&storage, "standard", false, "Immediate").await;
+        let (r, _) = sync_claim(&storage, classless_claim().with_class("standard")).await;
+        r.unwrap();
+        assert!(events_with_reason(&storage, "FailedBinding")
+            .await
+            .is_empty());
+        assert!(events_with_reason(&storage, "WaitForFirstConsumer")
+            .await
+            .is_empty());
+    }
+
+    trait WithClass {
+        fn with_class(self, c: &str) -> Self;
+    }
+    impl WithClass for PersistentVolumeClaim {
+        fn with_class(mut self, c: &str) -> Self {
+            self.spec.storage_class_name = Some(c.into());
+            self
+        }
     }
 }

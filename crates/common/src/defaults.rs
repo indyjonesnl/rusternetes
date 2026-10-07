@@ -315,4 +315,152 @@ mod tests {
         default_pod_requests_from_limits(&mut spec);
         assert_eq!(spec.containers[0].resources, once.containers[0].resources);
     }
+
+    // ---- Pod-level resources: ports of upstream `TestPodResourcesDefaults`
+    // (`pkg/apis/core/v1/defaults_test.go:378`). Upstream's loop only compares
+    // quantities present in the actual object; these assert the exact map so an
+    // extra or missing key also fails.
+
+    use crate::feature_gates::{with_feature, Feature};
+    use serial_test::serial;
+
+    fn map(kv: &[(&str, &str)]) -> HashMap<String, String> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn rr(
+        limits: Option<&[(&str, &str)]>,
+        requests: Option<&[(&str, &str)]>,
+    ) -> ResourceRequirements {
+        ResourceRequirements {
+            limits: limits.map(map),
+            requests: requests.map(map),
+            claims: None,
+        }
+    }
+
+    fn pod_spec(containers: Vec<Container>, pod: Option<ResourceRequirements>) -> PodSpec {
+        PodSpec {
+            containers,
+            resources: pod,
+            ..Default::default()
+        }
+    }
+
+    fn pod_requests(spec: &PodSpec) -> Option<HashMap<String, String>> {
+        spec.resources.as_ref().and_then(|r| r.requests.clone())
+    }
+
+    /// "pod requests=unset limits=set, container resources=unset"
+    #[test]
+    #[serial]
+    fn pod_limits_only_default_pod_requests_to_limits() {
+        let _g = with_feature(Feature::PodLevelResources, true);
+        let mut spec = pod_spec(
+            vec![container("a", None, None)],
+            Some(rr(Some(&[("cpu", "2m"), ("memory", "1Mi")]), None)),
+        );
+        default_pod_requests_from_limits(&mut spec);
+        assert_eq!(
+            pod_requests(&spec),
+            Some(map(&[("cpu", "2m"), ("memory", "1Mi")]))
+        );
+    }
+
+    /// "pod limits=nil" / "pod limits=empty map": `len(Limits) == 0` returns
+    /// early, so no pod-level requests appear; containers still default.
+    #[test]
+    #[serial]
+    fn pod_without_limits_gets_no_pod_requests() {
+        let _g = with_feature(Feature::PodLevelResources, true);
+        for pod_res in [rr(None, None), rr(Some(&[]), None)] {
+            let mut spec = pod_spec(
+                vec![container(
+                    "a",
+                    Some(&[("cpu", "2m"), ("memory", "1Mi")]),
+                    None,
+                )],
+                Some(pod_res),
+            );
+            default_pod_requests_from_limits(&mut spec);
+            assert_eq!(pod_requests(&spec).unwrap_or_default(), HashMap::new());
+            assert_eq!(
+                get(&spec.containers[0], "requests", "cpu").map(String::as_str),
+                Some("2m")
+            );
+        }
+    }
+
+    /// "pod requests=empty map limits=set, container requests=unset limits=set":
+    /// pod requests default to the aggregated container requests (2m+1m,
+    /// 1Mi+5Mi), not to the pod limits (5m, 7Mi).
+    #[test]
+    #[serial]
+    fn pod_requests_default_to_aggregated_container_requests() {
+        let _g = with_feature(Feature::PodLevelResources, true);
+        let mut spec = pod_spec(
+            vec![
+                container("a", Some(&[("cpu", "2m"), ("memory", "1Mi")]), None),
+                container("b", Some(&[("cpu", "1m"), ("memory", "5Mi")]), None),
+            ],
+            Some(rr(Some(&[("cpu", "5m"), ("memory", "7Mi")]), Some(&[]))),
+        );
+        default_pod_requests_from_limits(&mut spec);
+        assert_eq!(
+            pod_requests(&spec),
+            Some(map(&[("cpu", "3m"), ("memory", "6Mi")]))
+        );
+        assert_eq!(
+            spec.resources.as_ref().unwrap().limits,
+            Some(map(&[("cpu", "5m"), ("memory", "7Mi")])),
+            "pod limits are never rewritten"
+        );
+    }
+
+    /// "pod hugepages requests=unset limits=set, container hugepages ... different
+    /// hugepagesizes between pod and container level".
+    #[test]
+    #[serial]
+    fn hugepages_of_a_different_size_default_pod_limits_and_requests() {
+        let _g = with_feature(Feature::PodLevelResources, true);
+        let mut spec = pod_spec(
+            vec![
+                container("a", Some(&[("cpu", "2m"), ("hugepages-1Gi", "1Gi")]), None),
+                container("b", Some(&[("cpu", "1m"), ("hugepages-2Mi", "2Mi")]), None),
+            ],
+            Some(rr(Some(&[("cpu", "5m"), ("hugepages-2Mi", "10Mi")]), None)),
+        );
+        default_pod_requests_from_limits(&mut spec);
+        assert_eq!(
+            pod_requests(&spec),
+            Some(map(&[
+                ("cpu", "3m"),
+                ("hugepages-2Mi", "10Mi"),
+                ("hugepages-1Gi", "1Gi")
+            ]))
+        );
+        assert_eq!(
+            spec.resources.as_ref().unwrap().limits,
+            Some(map(&[
+                ("cpu", "5m"),
+                ("hugepages-2Mi", "10Mi"),
+                ("hugepages-1Gi", "1Gi")
+            ]))
+        );
+    }
+
+    /// Gate off (`podLevelResourcesEnabled` false in the upstream table).
+    #[test]
+    #[serial]
+    fn pod_level_defaulting_is_gated() {
+        let _g = with_feature(Feature::PodLevelResources, false);
+        let mut spec = pod_spec(
+            vec![container("a", None, None)],
+            Some(rr(Some(&[("cpu", "2m")]), None)),
+        );
+        default_pod_requests_from_limits(&mut spec);
+        assert_eq!(pod_requests(&spec), None);
+    }
 }

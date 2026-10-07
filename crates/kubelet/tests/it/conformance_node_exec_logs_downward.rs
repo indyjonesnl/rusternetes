@@ -466,8 +466,8 @@ fn downward_api_volume_renders_labels_in_canonical_format() {
 
     let rendered = resolve_pod_field(&pod, "metadata.labels").unwrap();
     // K8s renders labels sorted by key, one per line, double-quoted value,
-    // with a trailing newline.
-    assert_eq!(rendered, "key1=\"value1\"\nkey2=\"value2\"\n");
+    // `fieldpath.FormatMap` trims the final newline (fieldpath.go:40).
+    assert_eq!(rendered, "key1=\"value1\"\nkey2=\"value2\"");
 }
 
 /// [sig-storage] Downward API volume should update annotations on modification
@@ -483,7 +483,7 @@ fn downward_api_volume_renders_annotations_in_canonical_format() {
     pod.metadata.annotations = Some(anns);
 
     let rendered = resolve_pod_field(&pod, "metadata.annotations").unwrap();
-    assert_eq!(rendered, "a.example/one=\"1\"\na.example/two=\"2\"\n");
+    assert_eq!(rendered, "a.example/one=\"1\"\na.example/two=\"2\"");
 }
 
 /// [sig-storage] Downward API volume should provide container's cpu limit

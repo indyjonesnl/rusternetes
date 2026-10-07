@@ -91,7 +91,7 @@ fn classify_medium(medium: Option<&str>) -> Result<Medium> {
 /// `setupDir` (`empty_dir.go:447-486`): MkdirAll, Lstat, chmod to `perm` when
 /// the mode differs (umask), and return every error. The old helper swallowed
 /// them.
-fn setup_dir(dir: &str) -> Result<()> {
+pub(crate) fn setup_dir(dir: &str) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {

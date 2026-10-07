@@ -133,11 +133,9 @@ impl<B: Backend> RhinoStorage<B> {
     /// Used by `StorageBackend::watch_backend` to keep external HTTP clients on
     /// the globally-RV-ordered feed.
     pub async fn watch_native(&self, prefix: &str) -> Result<WatchStream> {
-        let current_rev = self
-            .backend
-            .current_revision()
+        let current_rev = retry_busy(RetryPolicy::default(), || self.backend.current_revision())
             .await
-            .map_err(|e| Error::Storage(format!("Failed to get current revision: {}", e)))?;
+            .map_err(|e| map_backend_error(prefix, "watch", "get current revision", &e))?;
         self.watch_from_revision(prefix, current_rev + 1).await
     }
 
@@ -146,11 +144,11 @@ impl<B: Backend> RhinoStorage<B> {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        let (_rev, kvs) = self
-            .backend
-            .list(prefix, "", 0, revision, false)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to list resources: {}", e)))?;
+        let (_rev, kvs) = retry_busy(RetryPolicy::default(), || {
+            self.backend.list(prefix, "", 0, revision, false)
+        })
+        .await
+        .map_err(|e| map_backend_error(prefix, "list", "list resources", &e))?;
 
         let mut results = Vec::with_capacity(kvs.len());
         for kv in kvs {
@@ -218,11 +216,11 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
     where
         T: DeserializeOwned + Send + Sync,
     {
-        let (_rev, kv) = self
-            .backend
-            .get(key, "", 1, 0, false)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to get resource: {}", e)))?;
+        let (_rev, kv) = retry_busy(RetryPolicy::default(), || {
+            self.backend.get(key, "", 1, 0, false)
+        })
+        .await
+        .map_err(|e| map_backend_error(key, "get", "get resource", &e))?;
 
         match kv {
             Some(kv) => {
@@ -291,11 +289,11 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
         } else {
             // No resourceVersion provided — check key exists, then update
             // Use the current revision from a get to perform the update
-            let (_rev, existing_kv) = self
-                .backend
-                .get(key, "", 1, 0, false)
-                .await
-                .map_err(|e| Error::Storage(format!("Failed to check resource: {}", e)))?;
+            let (_rev, existing_kv) = retry_busy(RetryPolicy::default(), || {
+                self.backend.get(key, "", 1, 0, false)
+            })
+            .await
+            .map_err(|e| map_backend_error(key, "update", "check resource", &e))?;
 
             let existing_kv = existing_kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
 
@@ -308,10 +306,11 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
 
             if !succeeded {
                 // Concurrent modification — retry once by re-reading
-                let (_rev, latest_kv) =
-                    self.backend.get(key, "", 1, 0, false).await.map_err(|e| {
-                        Error::Storage(format!("Failed to re-read resource: {}", e))
-                    })?;
+                let (_rev, latest_kv) = retry_busy(RetryPolicy::default(), || {
+                    self.backend.get(key, "", 1, 0, false)
+                })
+                .await
+                .map_err(|e| map_backend_error(key, "update", "re-read resource", &e))?;
 
                 let latest_kv = latest_kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
 
@@ -482,10 +481,9 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
     }
 
     async fn current_revision(&self) -> Result<i64> {
-        self.backend
-            .current_revision()
+        retry_busy(RetryPolicy::default(), || self.backend.current_revision())
             .await
-            .map_err(|e| Error::Storage(format!("Failed to get current revision: {}", e)))
+            .map_err(|e| map_backend_error("", "get", "get current revision", &e))
     }
 
     async fn is_revision_compacted(&self, revision: i64) -> Result<bool> {
@@ -573,5 +571,167 @@ impl<B: Backend + Send + Sync + 'static> AuthzStorage for RhinoStorage<B> {
         };
 
         Storage::list(self, &prefix).await
+    }
+}
+
+#[cfg(test)]
+mod busy_read_tests {
+    //! Reads must ride out SQLite lock contention like writes do (#2344,
+    //! follow-up to #1621). A backend whose reads fail `database is locked`
+    //! a set number of times stands in for a writer holding BEGIN IMMEDIATE.
+    use super::*;
+    use rhino::backend::{Backend, BackendError, KeyValue, Result as BResult, WatchResult};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct Flaky {
+        /// Reads fail with "database is locked" while this is > 0.
+        locked_reads: AtomicU32,
+        calls: AtomicU32,
+    }
+
+    impl Flaky {
+        fn new(locked_reads: u32) -> Self {
+            Self {
+                locked_reads: AtomicU32::new(locked_reads),
+                calls: AtomicU32::new(0),
+            }
+        }
+        fn gate(&self) -> BResult<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let left = self.locked_reads.load(Ordering::SeqCst);
+            if left > 0 {
+                self.locked_reads.store(left - 1, Ordering::SeqCst);
+                return Err(BackendError::Internal("database is locked".into()));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Backend for Flaky {
+        async fn start(&self) -> BResult<()> {
+            Ok(())
+        }
+        async fn get(
+            &self,
+            key: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+            _: bool,
+        ) -> BResult<(i64, Option<KeyValue>)> {
+            self.gate()?;
+            Ok((
+                7,
+                Some(KeyValue {
+                    key: key.to_string(),
+                    value: br#"{"a":1}"#.to_vec(),
+                    version: 1,
+                    create_revision: 7,
+                    mod_revision: 7,
+                    lease: 0,
+                }),
+            ))
+        }
+        async fn create(&self, _: &str, _: &[u8], _: i64) -> BResult<i64> {
+            unimplemented!()
+        }
+        async fn delete(&self, _: &str, _: i64) -> BResult<(i64, Option<KeyValue>, bool)> {
+            unimplemented!()
+        }
+        async fn delete_prefix(&self, _: &str) -> BResult<(i64, i64, Vec<KeyValue>)> {
+            unimplemented!()
+        }
+        async fn list(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+            _: bool,
+        ) -> BResult<(i64, Vec<KeyValue>)> {
+            self.gate()?;
+            Ok((7, vec![]))
+        }
+        async fn count(&self, _: &str, _: &str, _: i64) -> BResult<(i64, i64)> {
+            unimplemented!()
+        }
+        async fn update(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: i64,
+            _: i64,
+        ) -> BResult<(i64, Option<KeyValue>, bool)> {
+            unimplemented!()
+        }
+        async fn watch(&self, _: &str, _: i64) -> BResult<WatchResult> {
+            unimplemented!()
+        }
+        async fn db_size(&self) -> BResult<i64> {
+            Ok(0)
+        }
+        async fn current_revision(&self) -> BResult<i64> {
+            self.gate()?;
+            Ok(7)
+        }
+        async fn wait_for_sync_to(&self, _: i64) {}
+        async fn compact(&self, r: i64) -> BResult<i64> {
+            Ok(r)
+        }
+    }
+
+    fn store(locked: u32) -> RhinoStorage<Flaky> {
+        RhinoStorage {
+            backend: Arc::new(Flaky::new(locked)),
+            bus: None,
+        }
+    }
+
+    fn assert_server_timeout(e: Error) {
+        let Error::Status(s) = e else {
+            panic!("want ServerTimeout Status, got {e:?}")
+        };
+        assert_eq!(s.reason.as_deref(), Some("ServerTimeout"));
+    }
+
+    #[tokio::test]
+    async fn get_retries_through_lock() {
+        let s = store(2);
+        let v: serde_json::Value = Storage::get(&s, "/registry/pods/ns/p").await.unwrap();
+        assert_eq!(v["a"], 1);
+        assert_eq!(s.backend.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn get_exhausted_lock_is_server_timeout() {
+        let s = store(1000);
+        let e = Storage::get::<serde_json::Value>(&s, "/registry/pods/ns/p")
+            .await
+            .unwrap_err();
+        assert_server_timeout(e);
+    }
+
+    #[tokio::test]
+    async fn list_retries_through_lock() {
+        let s = store(2);
+        let v: Vec<serde_json::Value> = Storage::list(&s, "/registry/pods/").await.unwrap();
+        assert!(v.is_empty());
+        assert_eq!(s.backend.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn list_exhausted_lock_is_server_timeout() {
+        let s = store(1000);
+        let e = Storage::list::<serde_json::Value>(&s, "/registry/pods/")
+            .await
+            .unwrap_err();
+        assert_server_timeout(e);
+    }
+
+    #[tokio::test]
+    async fn current_revision_retries_through_lock() {
+        let s = store(2);
+        assert_eq!(s.current_revision().await.unwrap(), 7);
     }
 }
