@@ -273,6 +273,7 @@ mod service_handler_test;
 mod service_ipv6_primary_test;
 mod service_list_watch_default_on_read_test;
 mod service_node_port_allocation_test;
+mod service_storage_allocation_test;
 mod service_store_test;
 mod service_test;
 mod service_update_ip_families_test;

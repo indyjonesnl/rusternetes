@@ -252,7 +252,7 @@ async fn update_ip_families_matches_upstream_tables() {
         // tokio coop budget instead of the one the previous section spent.
         tokio::task::yield_now().await;
         let api = TestApiServer::builder()
-            .service_cluster_ip_range(&range_for(fams))
+            .service_cluster_ip_range(range_for(fams))
             .build();
         for case in sec["cases"].as_array().unwrap() {
             ran += 1;
