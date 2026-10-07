@@ -24,6 +24,7 @@ service Node {
   rpc NodePublishVolume (NodePublishVolumeRequest) returns (NodePublishVolumeResponse) {}
   rpc NodeUnpublishVolume (NodeUnpublishVolumeRequest) returns (NodeUnpublishVolumeResponse) {}
   rpc NodeGetCapabilities (NodeGetCapabilitiesRequest) returns (NodeGetCapabilitiesResponse) {}
+  rpc NodeExpandVolume (NodeExpandVolumeRequest) returns (NodeExpandVolumeResponse) {}
 }
 
 message VolumeCapability {
@@ -126,4 +127,22 @@ message NodeServiceCapability {
   oneof type {
     RPC rpc = 1;
   }
+}
+
+message CapacityRange {
+  int64 required_bytes = 1;
+  int64 limit_bytes = 2;
+}
+
+message NodeExpandVolumeRequest {
+  string volume_id = 1;
+  string volume_path = 2;
+  CapacityRange capacity_range = 3;
+  string staging_target_path = 4;
+  VolumeCapability volume_capability = 5;
+  map<string, string> secrets = 6;
+}
+
+message NodeExpandVolumeResponse {
+  int64 capacity_bytes = 1;
 }

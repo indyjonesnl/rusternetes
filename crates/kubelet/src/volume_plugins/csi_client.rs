@@ -9,6 +9,7 @@
 
 use super::csi_drivers_store::csi_drivers;
 use hyper_util::rt::TokioIo;
+use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::PersistentVolumeAccessMode;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -27,8 +28,8 @@ use proto::node_service_capability::rpc::Type as NodeRpcType;
 use proto::volume_capability::access_mode::Mode as AccessModeKind;
 use proto::volume_capability::{AccessMode, AccessType, BlockVolume, MountVolume};
 use proto::{
-    NodeGetCapabilitiesRequest, NodePublishVolumeRequest, NodeStageVolumeRequest,
-    NodeUnpublishVolumeRequest, NodeUnstageVolumeRequest, VolumeCapability,
+    CapacityRange, NodeExpandVolumeRequest, NodeGetCapabilitiesRequest, NodePublishVolumeRequest,
+    NodeStageVolumeRequest, NodeUnpublishVolumeRequest, NodeUnstageVolumeRequest, VolumeCapability,
 };
 
 /// `csiTimeout` (`pkg/volume/csi/csi_plugin.go:55`): the deadline every CSI
@@ -64,6 +65,40 @@ impl CsiError {
     pub fn is_operation_finished(&self) -> bool {
         matches!(self, CsiError::Failed(_))
     }
+}
+
+/// Port of `csiResizeOptions` (`csi_client.go:116-125`).
+#[derive(Clone, Debug)]
+pub struct CsiResizeOptions {
+    pub volume_id: String,
+    pub volume_path: String,
+    pub staging_target_path: String,
+    pub fs_type: String,
+    pub access_mode: PersistentVolumeAccessMode,
+    pub new_size: Quantity,
+    pub mount_options: Vec<String>,
+    pub secrets: HashMap<String, String>,
+}
+
+/// What `NodeExpandVolume` (`csi_client.go:289-358`) can return.
+///
+/// Unlike [`CsiError`] this keeps the gRPC status of a final failure: the
+/// caller (`csiPlugin.nodeExpandWithClient`, `expander.go:116-128`) classifies
+/// it with `inUseError` / `isInfeasibleError`, both of which read the code via
+/// `status.FromError`.
+#[derive(Debug, thiserror::Error)]
+pub enum NodeExpandError {
+    /// `volumetypes.NewUncertainProgressError` (`csi_client.go:349`): a
+    /// non-final gRPC error. Upstream wraps only the message, so the code is
+    /// not recoverable from it, and `status.FromError` on it is `ok == false`.
+    #[error("{0}")]
+    UncertainProgress(String),
+    /// A final gRPC error, returned as-is (`csi_client.go:351`).
+    #[error("{}", .0.message())]
+    Grpc(Box<tonic::Status>),
+    /// A non-gRPC error: argument validation, or the access-mode lookup.
+    #[error("{0}")]
+    Failed(String),
 }
 
 /// Port of `isFinalError` (`csi_client.go:711-733`).
@@ -197,6 +232,12 @@ impl CsiDriverClient {
             .await
     }
 
+    /// `NodeSupportsNodeExpand` (`csi_client.go:482-484`).
+    pub async fn node_supports_node_expand(&self) -> Result<bool, CsiError> {
+        self.node_supports_capability(NodeRpcType::ExpandVolume)
+            .await
+    }
+
     /// `NodeSupportsVolumeMountGroup` (`csi_client.go:670`).
     pub async fn node_supports_volume_mount_group(&self) -> Result<bool, CsiError> {
         self.node_supports_capability(NodeRpcType::VolumeMountGroup)
@@ -321,6 +362,57 @@ impl CsiDriverClient {
         .map_err(|s| CsiError::Failed(s.to_string()))
     }
 
+    /// Port of `NodeExpandVolume` (`csi_client.go:289-358`): returns the
+    /// capacity the driver reports (`resp.CapacityBytes`).
+    pub async fn node_expand_volume(
+        &self,
+        opts: &CsiResizeOptions,
+    ) -> Result<Quantity, NodeExpandError> {
+        if opts.volume_id.is_empty() {
+            return Err(NodeExpandError::Failed("missing volume id".into()));
+        }
+        if opts.volume_path.is_empty() {
+            return Err(NodeExpandError::Failed("missing volume path".into()));
+        }
+        // `opts.newSize.Value() < 0`
+        if opts.new_size.is_negative() {
+            return Err(NodeExpandError::Failed(
+                "size can not be less than 0".into(),
+            ));
+        }
+        let mode = self
+            .access_mode_for(&opts.access_mode)
+            .await
+            .map_err(|e| NodeExpandError::Failed(e.to_string()))?;
+        let mut c = self
+            .node_client()
+            .map_err(|e| NodeExpandError::Failed(e.to_string()))?;
+        let req = NodeExpandVolumeRequest {
+            volume_id: opts.volume_id.clone(),
+            volume_path: opts.volume_path.clone(),
+            capacity_range: Some(CapacityRange {
+                // `opts.newSize.Value()`: int64, rounded up.
+                required_bytes: i64::try_from(opts.new_size.value()).unwrap_or(i64::MAX),
+                limit_bytes: 0,
+            }),
+            // Not all CSI drivers support NodeStageUnstage, so the
+            // StagingTargetPath is only set when available (empty otherwise).
+            staging_target_path: opts.staging_target_path.clone(),
+            volume_capability: Some(Self::volume_capability(
+                mode,
+                &opts.fs_type,
+                &opts.mount_options,
+                None,
+            )),
+            secrets: opts.secrets.clone(),
+        };
+        match self.call(c.node_expand_volume(req)).await {
+            Ok(resp) => Ok(Quantity::from_value(resp.capacity_bytes, Format::BinarySI)),
+            Err(s) if !is_final_error(&s) => Err(NodeExpandError::UncertainProgress(s.to_string())),
+            Err(s) => Err(NodeExpandError::Grpc(Box::new(s))),
+        }
+    }
+
     /// Port of `NodeStageVolume` (`csi_client.go:386-454`).
     #[allow(clippy::too_many_arguments)]
     pub async fn node_stage_volume(
@@ -416,6 +508,7 @@ pub(crate) mod fake {
         pub unstage: Vec<NodeUnstageVolumeRequest>,
         pub publish: Vec<NodePublishVolumeRequest>,
         pub unpublish: Vec<NodeUnpublishVolumeRequest>,
+        pub expand: Vec<NodeExpandVolumeRequest>,
         pub capability_calls: usize,
     }
 
@@ -425,6 +518,8 @@ pub(crate) mod fake {
         pub capabilities: Arc<Mutex<Vec<i32>>>,
         /// When set, `NodePublishVolume` fails with this code.
         pub publish_error: Arc<Mutex<Option<tonic::Code>>>,
+        /// When set, `NodeExpandVolume` fails with this code.
+        pub expand_error: Arc<Mutex<Option<tonic::Code>>>,
     }
 
     impl FakeDriver {
@@ -472,6 +567,21 @@ pub(crate) mod fake {
             self.calls.lock().unwrap().unpublish.push(r.into_inner());
             Ok(Response::new(NodeUnpublishVolumeResponse {}))
         }
+        /// `fake.NodeClient.NodeExpandVolume` (`pkg/volume/csi/fake/fake_client.go:319-343`).
+        async fn node_expand_volume(
+            &self,
+            r: Request<NodeExpandVolumeRequest>,
+        ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
+            let req = r.into_inner();
+            if let Some(code) = *self.expand_error.lock().unwrap() {
+                return Err(Status::new(code, "fake expand failure"));
+            }
+            let required = req.capacity_range.as_ref().map_or(0, |c| c.required_bytes);
+            self.calls.lock().unwrap().expand.push(req);
+            Ok(Response::new(NodeExpandVolumeResponse {
+                capacity_bytes: required,
+            }))
+        }
         async fn node_get_capabilities(
             &self,
             _r: Request<NodeGetCapabilitiesRequest>,
@@ -510,6 +620,7 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::*;
     use super::*;
+    use rusternetes_common::quantity::Format;
 
     fn caps(c: &[NodeRpcType]) -> FakeDriver {
         FakeDriver::with_capabilities(c)
@@ -766,6 +877,144 @@ mod tests {
         );
         assert_eq!(calls.unstage[0].staging_target_path, "/stage");
         assert_eq!(calls.unpublish[0].target_path, "/target");
+    }
+
+    fn resize_opts() -> CsiResizeOptions {
+        CsiResizeOptions {
+            volume_id: "vol-abcde".into(),
+            volume_path: "/foo/bar".into(),
+            staging_target_path: String::new(),
+            fs_type: "ext4".into(),
+            access_mode: PersistentVolumeAccessMode::ReadWriteOnce,
+            new_size: Quantity::parse("10Gi").unwrap(),
+            mount_options: vec!["noatime".into()],
+            secrets: HashMap::new(),
+        }
+    }
+
+    /// `TestClientNodeSupportsNodeExpand` (`csi_client_test.go:712`):
+    /// `NodeSupportsNodeExpand` is the `EXPAND_VOLUME` capability.
+    #[tokio::test]
+    async fn node_supports_node_expand_follows_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("csi.sock");
+        let _srv = serve(caps(&[NodeRpcType::StageUnstageVolume]), &sock);
+        let c = CsiDriverClient::with_endpoint("drv", &sock);
+        assert!(!c.node_supports_node_expand().await.unwrap());
+
+        let sock2 = dir.path().join("csi2.sock");
+        let _srv2 = serve(caps(&[NodeRpcType::ExpandVolume]), &sock2);
+        let c2 = CsiDriverClient::with_endpoint("drv", &sock2);
+        assert!(c2.node_supports_node_expand().await.unwrap());
+    }
+
+    /// `TestNodeExpandVolume` (`csi_client_test.go:776`) "with all correct
+    /// values", plus the request shape `NodeExpandVolume` builds
+    /// (`csi_client.go:316-345`).
+    #[tokio::test]
+    async fn node_expand_volume_builds_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("csi.sock");
+        let d = caps(&[]);
+        let _srv = serve(d.clone(), &sock);
+        let c = CsiDriverClient::with_endpoint("drv", &sock);
+
+        let mut o = resize_opts();
+        o.staging_target_path = "/stage".into();
+        o.secrets = HashMap::from([("k".into(), "v".into())]);
+        let got = c.node_expand_volume(&o).await.unwrap();
+        // The returned quantity is the driver's `CapacityBytes`.
+        assert_eq!(got.value(), 10 * 1024 * 1024 * 1024);
+
+        let calls = d.calls.lock().unwrap();
+        let r = &calls.expand[0];
+        assert_eq!(r.volume_id, "vol-abcde");
+        assert_eq!(r.volume_path, "/foo/bar");
+        assert_eq!(r.staging_target_path, "/stage");
+        assert_eq!(r.capacity_range.as_ref().unwrap().required_bytes, 10 << 30);
+        assert_eq!(r.secrets["k"], "v");
+        let cap = r.volume_capability.as_ref().unwrap();
+        assert_eq!(
+            cap.access_mode.as_ref().unwrap().mode,
+            AccessModeKind::SingleNodeWriter as i32
+        );
+        match cap.access_type.as_ref().unwrap() {
+            AccessType::Mount(m) => {
+                assert_eq!(m.fs_type, "ext4");
+                assert_eq!(m.mount_flags, vec!["noatime".to_string()]);
+            }
+            other => panic!("expected mount access type, got {other:?}"),
+        }
+    }
+
+    /// `fsType == "block"` selects the block access type
+    /// (`csi_client.go:333-343`), and an unset staging path stays unset
+    /// (`csi_client.go:326-330`).
+    #[tokio::test]
+    async fn node_expand_volume_block_access_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("csi.sock");
+        let d = caps(&[]);
+        let _srv = serve(d.clone(), &sock);
+        let c = CsiDriverClient::with_endpoint("drv", &sock);
+        let mut o = resize_opts();
+        o.fs_type = FS_TYPE_BLOCK_NAME.into();
+        c.node_expand_volume(&o).await.unwrap();
+        let calls = d.calls.lock().unwrap();
+        let r = &calls.expand[0];
+        assert!(r.staging_target_path.is_empty());
+        assert!(matches!(
+            r.volume_capability.as_ref().unwrap().access_type,
+            Some(AccessType::Block(_))
+        ));
+    }
+
+    /// `TestNodeExpandVolume` failing rows: missing volume id, missing volume
+    /// path, negative size. None reaches the driver.
+    #[tokio::test]
+    async fn node_expand_volume_validates_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("csi.sock");
+        let d = caps(&[]);
+        let _srv = serve(d.clone(), &sock);
+        let c = CsiDriverClient::with_endpoint("drv", &sock);
+
+        let mut o = resize_opts();
+        o.volume_id.clear();
+        assert!(matches!(c.node_expand_volume(&o).await,
+            Err(NodeExpandError::Failed(m)) if m == "missing volume id"));
+        let mut o = resize_opts();
+        o.volume_path.clear();
+        assert!(matches!(c.node_expand_volume(&o).await,
+            Err(NodeExpandError::Failed(m)) if m == "missing volume path"));
+        let mut o = resize_opts();
+        o.new_size = Quantity::from_value(-10, Format::DecimalSI);
+        assert!(matches!(c.node_expand_volume(&o).await,
+            Err(NodeExpandError::Failed(m)) if m == "size can not be less than 0"));
+        assert!(d.calls.lock().unwrap().expand.is_empty());
+    }
+
+    /// `NodeExpandVolume`'s error branch (`csi_client.go:347-353`): a final
+    /// gRPC error is returned as-is (so `inUseError`/`isInfeasibleError` can
+    /// read its code); a non-final one is uncertain progress.
+    #[tokio::test]
+    async fn node_expand_volume_error_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("csi.sock");
+        let d = caps(&[]);
+        let _srv = serve(d.clone(), &sock);
+        let c = CsiDriverClient::with_endpoint("drv", &sock);
+
+        *d.expand_error.lock().unwrap() = Some(tonic::Code::InvalidArgument);
+        match c.node_expand_volume(&resize_opts()).await {
+            Err(NodeExpandError::Grpc(s)) => assert_eq!(s.code(), tonic::Code::InvalidArgument),
+            other => panic!("expected a final gRPC error, got {other:?}"),
+        }
+        *d.expand_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+        assert!(matches!(
+            c.node_expand_volume(&resize_opts()).await,
+            Err(NodeExpandError::UncertainProgress(_))
+        ));
     }
 
     /// `newCsiDriverClient` (`csi_client.go:153-170`) for an unregistered driver.
