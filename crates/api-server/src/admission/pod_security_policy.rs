@@ -7,13 +7,6 @@
 //! `EvaluatePod`), `helpers.go`, `visitor.go` and every `check_*.go`. The
 //! tests port `registry_test.go`, `checks_test.go` and the `check_*_test.go`
 //! cases.
-//!
-//! One deliberate gap: the typed [`Volume`] and [`EphemeralContainer`] carry
-//! only a subset of the upstream fields, so a volume source the type does not
-//! model (`gcePersistentDisk`, ...) deserialises to a volume with no source
-//! and is reported by `restrictedVolumes` as type `unknown` (the upstream
-//! `default:` arm) rather than by its real type; and ephemeral containers
-//! have no ports, probes or lifecycle for the checks that read them.
 
 use super::pod_security_api::{Level, LevelVersion, Version};
 use rusternetes_common::resources::pod::{
@@ -420,8 +413,7 @@ fn relax_policy_for_user_namespace_pod(spec: &PodSpec) -> bool {
 }
 
 /// One container as `visitContainers` hands it to a visitor. An
-/// `EphemeralContainerCommon` carries the same fields as a `Container`; the
-/// typed [`EphemeralContainer`] models only some of them.
+/// `EphemeralContainerCommon` carries the same fields as a `Container`.
 struct ContainerView<'a> {
     name: &'a str,
     security_context: Option<&'a SecurityContext>,
@@ -448,9 +440,13 @@ fn ephemeral_view(c: &EphemeralContainer) -> ContainerView<'_> {
     ContainerView {
         name: c.name.as_str(),
         security_context: c.security_context.as_ref(),
-        ports: &[],
-        probes: [None, None, None],
-        lifecycle: None,
+        ports: c.ports.as_deref().unwrap_or(&[]),
+        probes: [
+            c.liveness_probe.as_ref(),
+            c.readiness_probe.as_ref(),
+            c.startup_probe.as_ref(),
+        ],
+        lifecycle: c.lifecycle.as_ref(),
     }
 }
 
@@ -1027,15 +1023,34 @@ fn restricted_volumes_1_0(_: &ObjectMeta, spec: &PodSpec) -> CheckResult {
             continue;
         }
         bad_volumes.push(v.name.clone());
-        let ty = if v.host_path.is_some() {
-            "hostPath"
-        } else if v.nfs.is_some() {
-            "nfs"
-        } else if v.iscsi.is_some() {
-            "iscsi"
-        } else {
-            "unknown"
-        };
+        let l = &v.legacy_sources;
+        // The switch order of check_restrictedVolumes.go:108-150.
+        let ty = [
+            (v.host_path.is_some(), "hostPath"),
+            (l.gce_persistent_disk.is_some(), "gcePersistentDisk"),
+            (l.aws_elastic_block_store.is_some(), "awsElasticBlockStore"),
+            (l.git_repo.is_some(), "gitRepo"),
+            (v.nfs.is_some(), "nfs"),
+            (v.iscsi.is_some(), "iscsi"),
+            (l.glusterfs.is_some(), "glusterfs"),
+            (l.rbd.is_some(), "rbd"),
+            (l.flex_volume.is_some(), "flexVolume"),
+            (l.cinder.is_some(), "cinder"),
+            (l.cephfs.is_some(), "cephfs"),
+            (l.flocker.is_some(), "flocker"),
+            (l.fc.is_some(), "fc"),
+            (l.azure_file.is_some(), "azureFile"),
+            (l.vsphere_volume.is_some(), "vsphereVolume"),
+            (l.quobyte.is_some(), "quobyte"),
+            (l.azure_disk.is_some(), "azureDisk"),
+            (l.photon_persistent_disk.is_some(), "photonPersistentDisk"),
+            (l.portworx_volume.is_some(), "portworxVolume"),
+            (l.scale_io.is_some(), "scaleIO"),
+            (l.storageos.is_some(), "storageos"),
+        ]
+        .into_iter()
+        .find(|(set, _)| *set)
+        .map_or("unknown", |(_, name)| name);
         bad_types.insert(ty.to_string());
     }
     if bad_volumes.is_empty() {
@@ -2474,6 +2489,59 @@ mod tests {
             run(restricted_volumes_1_0, &p),
             "restricted volume types",
             r#"volumes "a", "c", "e" use restricted volume types "hostPath", "nfs", "unknown""#,
+        );
+    }
+
+    /// check_restrictedVolumes.go:108-153: every deprecated in-tree source is
+    /// named by its own type; only a source-less volume is "unknown".
+    #[test]
+    fn restricted_volumes_names_every_legacy_type() {
+        let cases = [
+            "gcePersistentDisk",
+            "awsElasticBlockStore",
+            "gitRepo",
+            "glusterfs",
+            "rbd",
+            "flexVolume",
+            "cinder",
+            "cephfs",
+            "flocker",
+            "fc",
+            "azureFile",
+            "vsphereVolume",
+            "quobyte",
+            "azureDisk",
+            "photonPersistentDisk",
+            "portworxVolume",
+            "scaleIO",
+            "storageos",
+        ];
+        for ty in cases {
+            let p = pod(serde_json::json!({"containers": [], "volumes": [
+                {"name": "v", ty: {}},
+            ]}));
+            let want = format!(r#"volume "v" uses restricted volume type "{ty}""#);
+            expect(
+                run(restricted_volumes_1_0, &p),
+                "restricted volume types",
+                &want,
+            );
+        }
+    }
+
+    /// visitor.go:30-40 visits ephemeral containers, so a hostPort on one is
+    /// seen by hostPorts.
+    #[test]
+    fn host_ports_sees_ephemeral_container_ports() {
+        let p = pod(
+            serde_json::json!({"containers": [], "ephemeralContainers": [
+                {"name": "dbg", "image": "x", "ports": [{"containerPort": 80, "hostPort": 80}]},
+            ]}),
+        );
+        expect(
+            run(host_ports_1_0, &p),
+            "hostPort",
+            r#"container "dbg" uses hostPort 80"#,
         );
     }
 

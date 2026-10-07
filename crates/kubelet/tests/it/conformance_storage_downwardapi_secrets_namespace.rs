@@ -564,6 +564,7 @@ fn downwardapi_volume_multiple_items_in_one_volume() {
 #[test]
 fn downwardapi_volume_source_round_trips_through_serde() {
     let vol = Volume {
+        legacy_sources: Default::default(),
         name: "dapi-vol".to_string(),
         downward_api: Some(DownwardAPIVolumeSource {
             items: Some(vec![DownwardAPIVolumeFile {

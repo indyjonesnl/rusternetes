@@ -112,6 +112,7 @@ fn env_from_secret_ref_with_optional_flag_round_trips() {
 #[test]
 fn secret_volume_source_uses_camel_case_keys() {
     let vol = Volume {
+        legacy_sources: Default::default(),
         name: "creds".to_string(),
         secret: Some(SecretVolumeSource {
             secret_name: Some("db-creds".to_string()),
