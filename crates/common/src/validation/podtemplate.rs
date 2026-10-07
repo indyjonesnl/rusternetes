@@ -11,16 +11,16 @@
 
 use std::collections::HashMap;
 
-use crate::resources::pod::{PodSpec, Toleration};
+use crate::resources::pod::PodSpec;
 use crate::resources::workloads::{PodTemplate, PodTemplateSpec};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::validate_labels;
 use crate::validation::objectmeta::{
     name_is_dns_subdomain, validate_annotations, validate_object_meta, validate_object_meta_update,
 };
-use crate::validation::pod::{
-    allow_taint_toleration_comparison_operators, validate_local_descending_path, validate_pod_spec,
-    validate_tolerations_with_options,
+use crate::validation::pod::{allow_taint_toleration_comparison_operators, validate_pod_spec};
+use crate::validation::pod_status::{
+    get_deletion_cost_from_pod_annotations, validate_pod_specific_annotations,
 };
 
 /// Upstream `ValidatePodTemplate` (validation.go:6543-6547). The name is
@@ -48,13 +48,15 @@ pub fn validate_pod_template_update(pt: &PodTemplate, old: &PodTemplate) -> Erro
     // `GetValidationOptionsFromPodTemplate(&template.Template, &oldTemplate.Template)`
     // (pkg/api/pod/util.go:489-492): an already-invalid old deletion cost is
     // tolerated on update.
-    let allow_invalid_deletion_cost = old
-        .template
-        .metadata
-        .as_ref()
-        .and_then(|m| m.annotations.as_ref())
-        .and_then(|a| a.get(POD_DELETION_COST))
-        .is_some_and(|v| !is_valid_deletion_cost(v));
+    let empty = HashMap::new();
+    let allow_invalid_deletion_cost = get_deletion_cost_from_pod_annotations(
+        old.template
+            .metadata
+            .as_ref()
+            .and_then(|m| m.annotations.as_ref())
+            .unwrap_or(&empty),
+    )
+    .is_err();
     errs.extend(validate_pod_template_spec_opts(
         &pt.template,
         &Path::new("template"),
@@ -108,11 +110,14 @@ fn validate_pod_template_spec_opts(
         }
     }
 
+    // ONE implementation, shared with the Pod path (#2464).
+    let empty = HashMap::new();
     errs.extend(validate_pod_specific_annotations(
         template
             .metadata
             .as_ref()
-            .and_then(|m| m.annotations.as_ref()),
+            .and_then(|m| m.annotations.as_ref())
+            .unwrap_or(&empty),
         &template.spec,
         &fld_path.child("annotations"),
         allow_invalid_pod_deletion_cost,
@@ -130,195 +135,19 @@ fn validate_pod_template_spec_opts(
     errs
 }
 
-/// `ValidatePodSpecificAnnotations`
-/// (`pkg/apis/core/validation/validation.go:193-216`), run on a template's
-/// annotations by `ValidatePodTemplateSpec` (`:7070`) and
-/// `ValidatePodTemplateSpecForStatefulSet`
-/// (`pkg/apis/apps/validation/validation.go:76`).
-///
-/// `allow_invalid_pod_deletion_cost` is `opts.AllowInvalidPodDeletionCost`:
-/// `false` on create (`PodDeletionCost` is beta and on by default in 1.35,
-/// `pkg/api/pod/util.go:414`), and on a PodTemplate update `true` when the old
-/// template's cost was already invalid (`:488-492`). Map iteration is sorted for a deterministic error order.
-pub fn validate_pod_specific_annotations(
-    annotations: Option<&HashMap<String, String>>,
-    spec: &PodSpec,
-    fld_path: &Path,
-    allow_invalid_pod_deletion_cost: bool,
-) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
-    let Some(annotations) = annotations else {
-        return errs;
-    };
-
-    if let Some(value) = annotations.get(MIRROR_POD_ANNOTATION_KEY) {
-        if spec.node_name.as_deref().unwrap_or("").is_empty() {
-            errs.push(Error::invalid(
-                &fld_path.key(MIRROR_POD_ANNOTATION_KEY),
-                value.clone(),
-                "must set spec.nodeName if mirror pod annotation is set",
-            ));
-        }
-    }
-
-    if annotations
-        .get(TOLERATIONS_ANNOTATION_KEY)
-        .is_some_and(|v| !v.is_empty())
-    {
-        errs.extend(validate_tolerations_in_pod_annotations(
-            annotations,
-            fld_path,
-        ));
-    }
-
-    if let Some(value) = annotations.get(POD_DELETION_COST) {
-        if !allow_invalid_pod_deletion_cost && !is_valid_deletion_cost(value) {
-            errs.push(Error::invalid(
-                &fld_path.key(POD_DELETION_COST),
-                value.clone(),
-                "must be a 32bit integer",
-            ));
-        }
-    }
-
-    let mut keys: Vec<&String> = annotations.keys().collect();
-    keys.sort();
-
-    // ValidateSeccompPodAnnotations (validation.go:5281-5293).
-    if let Some(p) = annotations.get(SECCOMP_POD_ANNOTATION_KEY) {
-        errs.extend(validate_seccomp_annotation_profile(
-            p,
-            &fld_path.child(SECCOMP_POD_ANNOTATION_KEY),
-        ));
-    }
-    for k in &keys {
-        if k.starts_with(SECCOMP_CONTAINER_ANNOTATION_KEY_PREFIX) {
-            errs.extend(validate_seccomp_annotation_profile(
-                &annotations[*k],
-                &fld_path.child(k.as_str()),
-            ));
-        }
-    }
-
-    // ValidateAppArmorPodAnnotations (validation.go:5349-5367).
-    for k in &keys {
-        let Some(container_name) = k.strip_prefix(APPARMOR_BETA_CONTAINER_ANNOTATION_KEY_PREFIX)
-        else {
-            continue;
-        };
-        let p = &annotations[*k];
-        if !pod_spec_has_container(spec, container_name) {
-            errs.push(Error::invalid(
-                &fld_path.key(k.as_str()),
-                container_name.to_string(),
-                "container not found",
-            ));
-        }
-        if !(p.is_empty()
-            || p == "runtime/default"
-            || p == "unconfined"
-            || p.starts_with("localhost/"))
-        {
-            errs.push(Error::invalid(
-                &fld_path.key(k.as_str()),
-                p.clone(),
-                format!("invalid AppArmor profile name: {p:?}"),
-            ));
-        }
-    }
-
-    errs
-}
-
-/// `core.MirrorPodAnnotationKey`, `TolerationsAnnotationKey`,
-/// `SeccompPodAnnotationKey`, `SeccompContainerAnnotationKeyPrefix`,
-/// `PodDeletionCost` (`pkg/apis/core/annotation_key_constants.go:27,31,40,45,136`)
-/// and `v1.DeprecatedAppArmorBetaContainerAnnotationKeyPrefix`
-/// (`staging/src/k8s.io/api/core/v1/annotation_key_constants.go:59`).
-const MIRROR_POD_ANNOTATION_KEY: &str = "kubernetes.io/config.mirror";
-const TOLERATIONS_ANNOTATION_KEY: &str = "scheduler.alpha.kubernetes.io/tolerations";
-const SECCOMP_POD_ANNOTATION_KEY: &str = "seccomp.security.alpha.kubernetes.io/pod";
-const SECCOMP_CONTAINER_ANNOTATION_KEY_PREFIX: &str =
-    "container.seccomp.security.alpha.kubernetes.io/";
-const POD_DELETION_COST: &str = "controller.kubernetes.io/pod-deletion-cost";
-const APPARMOR_BETA_CONTAINER_ANNOTATION_KEY_PREFIX: &str =
-    "container.apparmor.security.beta.kubernetes.io/";
-
-/// `ValidateTolerationsInPodAnnotations` (validation.go:219-233) over
-/// `GetTolerationsFromPodAnnotations` (helpers.go:398-407).
-fn validate_tolerations_in_pod_annotations(
-    annotations: &HashMap<String, String>,
-    fld_path: &Path,
-) -> ErrorList {
-    let raw = &annotations[TOLERATIONS_ANNOTATION_KEY];
-    match serde_json::from_str::<Vec<Toleration>>(raw) {
-        Err(e) => vec![Error::invalid(
-            fld_path,
-            TOLERATIONS_ANNOTATION_KEY.to_string(),
-            e.to_string(),
-        )],
-        Ok(t) if t.is_empty() => Vec::new(),
-        Ok(t) => validate_tolerations_with_options(
-            &t,
-            &fld_path.child(TOLERATIONS_ANNOTATION_KEY),
-            allow_taint_toleration_comparison_operators(None),
-        ),
-    }
-}
-
-/// `GetDeletionCostFromPodAnnotations` (helpers.go:491-513): the first byte
-/// must be `-`, a lone `0`, or `1-9`, and the value an `int32`.
-fn is_valid_deletion_cost(value: &str) -> bool {
-    let first_ok = match value.as_bytes().first() {
-        None => false,
-        Some(b'-') => true,
-        Some(b'0') => value == "0",
-        Some(c) => (b'1'..=b'9').contains(c),
-    };
-    first_ok && value.parse::<i32>().is_ok()
-}
-
-/// `ValidateSeccompProfile` (validation.go:5268-5279).
-fn validate_seccomp_annotation_profile(p: &str, fld_path: &Path) -> ErrorList {
-    if p == "runtime/default" || p == "docker/default" || p == "unconfined" {
-        return Vec::new();
-    }
-    if let Some(rest) = p.strip_prefix("localhost/") {
-        return validate_local_descending_path(rest, fld_path);
-    }
-    vec![Error::invalid(
-        fld_path,
-        p.to_string(),
-        "must be a valid seccomp profile",
-    )]
-}
-
-/// `podSpecHasContainer` (validation.go:5430-5440): `VisitContainersWithPath`
-/// visits init, regular and ephemeral containers.
-fn pod_spec_has_container(spec: &PodSpec, name: &str) -> bool {
-    spec.containers.iter().any(|c| c.name == name)
-        || spec
-            .init_containers
-            .iter()
-            .flatten()
-            .any(|c| c.name == name)
-        || spec
-            .ephemeral_containers
-            .iter()
-            .flatten()
-            .any(|c| c.name == name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validation::pod_status::{
+        MIRROR_POD_ANNOTATION_KEY, POD_DELETION_COST, TOLERATIONS_ANNOTATION_KEY,
+    };
 
     fn run(a: &[(&str, &str)], s: &PodSpec) -> Vec<String> {
         let m: HashMap<String, String> = a
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        validate_pod_specific_annotations(Some(&m), s, &Path::new("a"), false)
+        validate_pod_specific_annotations(&m, s, &Path::new("a"), false)
             .iter()
             .map(|e| e.error_body())
             .collect()
@@ -327,6 +156,115 @@ mod tests {
     fn web() -> PodSpec {
         serde_json::from_value(serde_json::json!({"containers":[{"name":"web","image":"x"}]}))
             .unwrap()
+    }
+
+    /// The call site, not just the helper: the template path reaches the one
+    /// shared `validate_pod_specific_annotations` (#2464).
+    fn tpl_errs(a: &[(&str, &str)], spec: serde_json::Value) -> Vec<String> {
+        let t: PodTemplateSpec = serde_json::from_value(serde_json::json!({
+            "metadata": {"annotations": a.iter().cloned().collect::<HashMap<_, _>>()},
+            "spec": spec,
+        }))
+        .unwrap();
+        validate_pod_template_spec(&t, &Path::new("template"), false)
+            .iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
+    fn ctr_spec() -> serde_json::Value {
+        serde_json::json!({"containers":[{"name":"ctr","image":"x"}],
+            "initContainers":[{"name":"init-ctr","image":"x"}]})
+    }
+
+    /// `json.Unmarshal` of `null` into a slice is not an error
+    /// (`GetTolerationsFromPodAnnotations`, helpers.go:398-407).
+    #[test]
+    fn null_tolerations_annotation_is_valid() {
+        let errs = tpl_errs(&[(TOLERATIONS_ANNOTATION_KEY, "null")], ctr_spec());
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    /// validation_test.go:12978-12993 (`invalid pod-deletion-cost` cases).
+    #[test]
+    fn upstream_deletion_cost_cases() {
+        for bad in ["text", "008", "+10"] {
+            let errs = tpl_errs(&[(POD_DELETION_COST, bad)], ctr_spec());
+            let want = format!(
+                "template.annotations[controller.kubernetes.io/pod-deletion-cost]: Invalid value: \"{bad}\": must be a 32bit integer"
+            );
+            assert!(errs.iter().any(|e| e.contains(&want)), "{bad}: {errs:?}");
+        }
+        for ok in ["-100", "100"] {
+            assert!(tpl_errs(&[(POD_DELETION_COST, ok)], ctr_spec()).is_empty());
+        }
+    }
+
+    /// validation_test.go:12337-12364 (AppArmor annotation cases).
+    #[test]
+    fn upstream_apparmor_annotation_cases() {
+        let p = "container.apparmor.security.beta.kubernetes.io/";
+        let errs = tpl_errs(
+            &[
+                (&format!("{p}ctr"), "runtime/default"),
+                (&format!("{p}init-ctr"), "runtime/default"),
+                (&format!("{p}fake-ctr"), "runtime/default"),
+            ],
+            ctr_spec(),
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains(
+            "template.annotations[container.apparmor.security.beta.kubernetes.io/fake-ctr]"
+        ));
+        for bad in ["bad-name", "runtime/foo"] {
+            let errs = tpl_errs(&[(&format!("{p}ctr"), bad)], ctr_spec());
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("invalid AppArmor profile name")),
+                "{bad}: {errs:?}"
+            );
+        }
+    }
+
+    /// `TestValidateAppArmorProfileFormat` (validation_test.go:26775-26798).
+    #[test]
+    fn upstream_apparmor_profile_format_cases() {
+        let k = "container.apparmor.security.beta.kubernetes.io/ctr";
+        for (profile, valid) in [
+            ("", true),
+            ("runtime/default", true),
+            ("unconfined", true),
+            ("baz", false),
+            ("localhost//usr/sbin/ntpd", true),
+            ("localhost/foo-bar", true),
+        ] {
+            let errs = tpl_errs(&[(k, profile)], ctr_spec());
+            assert_eq!(errs.is_empty(), valid, "{profile:?}: {errs:?}");
+        }
+    }
+
+    /// validation_test.go:12600-12611: presence is enough, even with "".
+    #[test]
+    fn upstream_mirror_cases() {
+        for v in ["", "foo"] {
+            let errs = tpl_errs(&[(MIRROR_POD_ANNOTATION_KEY, v)], ctr_spec());
+            assert!(errs.iter().any(|e| e.contains("mirror")), "{v:?}: {errs:?}");
+        }
+    }
+
+    /// The error order is deterministic (sorted keys), unlike Go's map walk.
+    #[test]
+    fn container_annotation_errors_are_ordered() {
+        let p = "container.apparmor.security.beta.kubernetes.io/";
+        let pairs: Vec<(String, &str)> = ["d", "b", "c", "a"]
+            .iter()
+            .map(|n| (format!("{p}{n}"), "bad"))
+            .collect();
+        let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let first = tpl_errs(&refs, ctr_spec());
+        for _ in 0..20 {
+            assert_eq!(first, tpl_errs(&refs, ctr_spec()));
+        }
     }
 
     #[test]
