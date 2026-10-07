@@ -406,6 +406,20 @@ impl CriContainerRuntime {
         Ok(cri.runtime_status(false).await?)
     }
 
+    /// Apply `KubeletConfiguration.runtimeRequestTimeout` to every CRI call
+    /// (upstream `NewRemoteRuntimeService(endpoint, kubeCfg.RuntimeRequestTimeout...)`,
+    /// pkg/kubelet/kubelet.go:408/411). Unset/zero keeps the 2m default.
+    #[must_use]
+    pub fn with_runtime_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.cri = self.cri.with_request_timeout(timeout);
+        self
+    }
+
+    /// The per-request CRI timeout currently in effect.
+    pub fn runtime_request_timeout(&self) -> std::time::Duration {
+        self.cri.request_timeout()
+    }
+
     /// Set the `kubernetes` Service host:port injected as KUBERNETES_SERVICE_*
     /// env into pods (defaults to 10.96.0.1:443).
     #[must_use]

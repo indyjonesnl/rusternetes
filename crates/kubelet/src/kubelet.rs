@@ -736,6 +736,26 @@ impl Kubelet {
         self
     }
 
+    /// Apply `KubeletConfiguration.runtimeRequestTimeout` (2m when unset/zero,
+    /// v1beta1/defaults.go:188-189) to the CRI client. Must be called right
+    /// after construction, before the runtime handle is shared.
+    pub fn with_runtime_request_timeout(mut self, d: Option<Duration>) -> Self {
+        let d = d
+            .filter(|d| !d.is_zero())
+            .unwrap_or(rusternetes_cri::DEFAULT_RUNTIME_REQUEST_TIMEOUT);
+        let rt = Arc::get_mut(&mut self.runtime)
+            .expect("runtime handle is unshared at construction time");
+        let updated = rt.clone().with_runtime_request_timeout(d);
+        *rt = updated;
+        self
+    }
+
+    /// The CRI per-request timeout in effect (test/diagnostic accessor).
+    #[cfg(test)]
+    pub(crate) fn runtime_request_timeout(&self) -> Duration {
+        self.runtime.runtime_request_timeout()
+    }
+
     /// Interval of the dedicated NodeStatus heartbeat in `run`.
     pub(crate) fn node_status_heartbeat_interval(&self) -> Duration {
         self.node_status_update_frequency
@@ -6082,6 +6102,49 @@ mod tests {
             .await
             .with_node_status_update_frequency(Some(Duration::ZERO));
         assert_eq!(z.node_status_heartbeat_interval(), Duration::from_secs(10));
+    }
+
+    /// `runtimeRequestTimeout` reaches the CRI client (upstream passes
+    /// `kubeCfg.RuntimeRequestTimeout.Duration` into
+    /// `NewRemoteRuntimeService`, pkg/kubelet/kubelet.go:408); unset or zero
+    /// takes the 2m default (v1beta1/defaults.go:188-189).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn runtime_request_timeout_reaches_cri_client() {
+        use rusternetes_storage::StorageBackend;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let mk = || async {
+            Kubelet::new(
+                "node-rrt".into(),
+                std::sync::Arc::new(StorageBackend::new_memory()),
+                10,
+                dir.path().join("vols").display().to_string(),
+                "10.96.0.10".into(),
+                "cluster.local".into(),
+                "bridge".into(),
+                String::new(),
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            mk().await.runtime_request_timeout(),
+            Duration::from_secs(120)
+        );
+        let c = mk()
+            .await
+            .with_runtime_request_timeout(Some(Duration::from_secs(7)));
+        assert_eq!(c.runtime_request_timeout(), Duration::from_secs(7));
+        let z = mk()
+            .await
+            .with_runtime_request_timeout(Some(Duration::ZERO));
+        assert_eq!(z.runtime_request_timeout(), Duration::from_secs(120));
     }
 
     /// #1929: a kubelet whose CRI endpoint is an absent socket must report

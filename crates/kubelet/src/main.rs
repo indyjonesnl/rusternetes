@@ -70,7 +70,6 @@ use clap::Parser;
 use config::{KubeletConfiguration, RuntimeConfig};
 use eviction::{
     build_thresholds, parse_duration, parse_eviction_flag, EvictionManager, EvictionSignal,
-    DEFAULT_TRANSITION_PERIOD,
 };
 use kubelet::Kubelet;
 use rusternetes_common::observability::MetricsRegistry;
@@ -250,13 +249,16 @@ fn parse_soft_grace_periods(raw: Option<&str>) -> Result<HashMap<EvictionSignal,
 }
 
 /// Build the eviction manager from CLI flags (or upstream defaults).
-fn build_eviction_manager(args: &Args) -> Result<EvictionManager> {
-    let transition_period = match args.eviction_pressure_transition_period.as_deref() {
-        Some(raw) => parse_duration(raw).ok_or_else(|| {
-            anyhow::anyhow!("invalid --eviction-pressure-transition-period: '{}'", raw)
-        })?,
-        None => DEFAULT_TRANSITION_PERIOD,
-    };
+fn build_eviction_manager(
+    args: &Args,
+    config_file: Option<&KubeletConfiguration>,
+) -> Result<EvictionManager> {
+    // Config-file `evictionPressureTransitionPeriod` (default 5m); the flag wins
+    // (server.go kubeletConfigFlagPrecedence). See eviction.rs.
+    let transition_period = eviction::resolve_transition_period(
+        args.eviction_pressure_transition_period.as_deref(),
+        config_file,
+    )?;
 
     // If the user did NOT pass --eviction-hard at all, we use upstream defaults.
     // If they passed an empty string, eviction is disabled.
@@ -318,6 +320,9 @@ async fn main() -> Result<()> {
         .as_ref()
         .and_then(|c| c.node_status_update_frequency);
 
+    // runtimeRequestTimeout from the config file (None => upstream default 2m).
+    let runtime_request_timeout = config_file.as_ref().and_then(|c| c.runtime_request_timeout);
+
     // Parse etcd endpoints
     let etcd_endpoints: Vec<String> = args
         .etcd_servers
@@ -327,7 +332,7 @@ async fn main() -> Result<()> {
 
     // Build eviction manager from CLI flags BEFORE consuming `args` into
     // RuntimeConfig::build — that call moves out several String fields.
-    let eviction_manager = build_eviction_manager(&args)?;
+    let eviction_manager = build_eviction_manager(&args, config_file.as_ref())?;
 
     // Build runtime configuration with proper precedence
     let runtime_config = RuntimeConfig::build(
@@ -505,7 +510,8 @@ async fn main() -> Result<()> {
         )
         .await?
         .with_pod_manifest_path(args.pod_manifest_path.clone())
-        .with_node_status_update_frequency(node_status_update_frequency),
+        .with_node_status_update_frequency(node_status_update_frequency)
+        .with_runtime_request_timeout(runtime_request_timeout),
     );
 
     // Plugin manager (`pkg/kubelet/pluginmanager`): watch
