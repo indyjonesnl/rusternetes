@@ -94,6 +94,33 @@ async fn a_scheduled_pod_is_deleted_gracefully() {
     assert_eq!(stored["metadata"]["deletionGracePeriodSeconds"], 45);
 }
 
+/// #2386: a plain DELETE of a scheduled pod that never named a grace period
+/// still gives it the defaulted 30s (`terminationGracePeriodSeconds`), so the
+/// kubelet SIGTERMs and waits rather than killing at once. Like upstream's
+/// `rest.BeforeDelete` (pkg/api/rest/delete.go), `deletionTimestamp` is the
+/// moment the grace period ENDS, i.e. now + 30s.
+#[tokio::test]
+async fn a_default_delete_gives_the_pod_its_defaulted_grace_period() {
+    let api = TestApiServer::new();
+    create(&api, &scheduled_pod("p-default")).await;
+    let (s, deleted) = api.delete(&format!("{PODS}/p-default")).await;
+    assert_eq!(s, StatusCode::OK, "{deleted}");
+    let (s, stored) = api.get(&format!("{PODS}/p-default")).await;
+    assert_eq!(s, StatusCode::OK, "{stored}");
+    assert_eq!(stored["metadata"]["deletionGracePeriodSeconds"], 30);
+    let ts = chrono::DateTime::parse_from_rfc3339(
+        stored["metadata"]["deletionTimestamp"]
+            .as_str()
+            .expect("deletionTimestamp"),
+    )
+    .unwrap();
+    let ahead = (ts.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
+    assert!(
+        (25..=31).contains(&ahead),
+        "deletionTimestamp should be ~now+30s, was {ahead}s ahead"
+    );
+}
+
 /// A pod that already terminated is deleted immediately (strategy.go:186-189).
 #[tokio::test]
 async fn a_terminated_pod_is_deleted_immediately() {
@@ -450,5 +477,68 @@ async fn default_tolerations_are_added() {
     assert!(
         keys.contains(&"node.kubernetes.io/unreachable"),
         "{created}"
+    );
+}
+
+/// Kubelet-shaped status PATCH (`PatchPodStatus`, pkg/util/pod/pod.go:34-65;
+/// the diff comes from `strategicpatch.CreateTwoWayMergePatch`). A container
+/// going Waiting -> Running sends `state.running` and `state.waiting: null`;
+/// the merge must drop `waiting` and the pod must stay decodable (#2453).
+async fn seed_waiting_pod(api: &TestApiServer) {
+    create(api, &scheduled_pod("p1")).await;
+    let key = build_key("pods", Some("default"), "p1");
+    let mut stored: Value = api.storage.get(&key).await.unwrap();
+    stored["status"]["containerStatuses"] = json!([{
+        "name": "c", "image": "busybox", "imageID": "", "ready": false, "restartCount": 0,
+        "state": {"waiting": {"reason": "ContainerCreating"}}
+    }]);
+    api.storage.update(&key, &stored).await.unwrap();
+}
+
+async fn patch_status(api: &TestApiServer, patch: &Value) -> (StatusCode, Value) {
+    api.send(
+        "PATCH",
+        &format!("{PODS}/p1/status"),
+        Some("application/strategic-merge-patch+json"),
+        Some(patch),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn kubelet_status_patch_waiting_to_running_with_null() {
+    let api = TestApiServer::new();
+    seed_waiting_pod(&api).await;
+    let patch = json!({"status": {
+        "$setElementOrder/containerStatuses": [{"name": "c"}],
+        "containerStatuses": [{"name": "c", "ready": true,
+            "state": {"running": {"startedAt": "2026-10-07T00:00:00Z"}, "waiting": null}}]}});
+    let (s, body) = patch_status(&api, &patch).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let st = &body["status"]["containerStatuses"][0]["state"];
+    assert!(
+        st.get("running").is_some() && st.get("waiting").is_none(),
+        "{body}"
+    );
+}
+
+/// Go's `ContainerState` is a struct of three optional pointers and upstream
+/// validation never requires exactly one (`ValidateContainerStateTransition`,
+/// validation.go:5841 only checks Terminated transitions), so a patch lacking
+/// `waiting: null` is accepted (Go stores both keys; see below).
+#[tokio::test]
+async fn kubelet_status_patch_tolerates_running_and_waiting_both_set() {
+    let api = TestApiServer::new();
+    seed_waiting_pod(&api).await;
+    let patch = json!({"status": {"containerStatuses": [{"name": "c",
+        "state": {"running": {"startedAt": "2026-10-07T00:00:00Z"}}}]}});
+    let (s, body) = patch_status(&api, &patch).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let st = &body["status"]["containerStatuses"][0]["state"];
+    // Deliberate deviation: our `ContainerState` holds one state, so the
+    // stored pod keeps the more final one (Running over Waiting).
+    assert!(
+        st.get("running").is_some() && st.get("waiting").is_none(),
+        "{body}"
     );
 }
