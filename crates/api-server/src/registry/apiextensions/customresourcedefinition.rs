@@ -405,6 +405,8 @@ impl UpdatedObjectInfo<CustomResourceDefinition> for ControllerUpdate<'_> {
 pub struct CrdRest {
     store: Store<CustomResourceDefinition, StorageBackend>,
     status_store: Store<CustomResourceDefinition, StorageBackend>,
+    /// The nonstructuralschema and apiapproval controllers' memos.
+    conditions: super::condition_controllers::ConditionControllers,
 }
 
 impl CrdRest {
@@ -491,7 +493,41 @@ impl CrdRest {
             controllers::sync_establishing(old).unwrap_or_else(|| old.clone())
         })
         .await?;
+        self.sync_conditions(name).await?;
         Ok(names_changed)
+    }
+
+    /// The nonstructuralschema and apiapproval controllers' `sync`
+    /// (condition_controllers.rs), each a status write of its own.
+    async fn sync_conditions(&self, name: &str) -> Result<()> {
+        let Some(crd) = self.get_crd(name).await? else {
+            return Ok(());
+        };
+        if self.conditions.sync_non_structural(&crd).is_some() {
+            let written = self
+                .update_status(name, &|old| {
+                    self.conditions
+                        .sync_non_structural(old)
+                        .unwrap_or_else(|| old.clone())
+                })
+                .await?;
+            if let Some(out) = written {
+                self.conditions.record_non_structural(&out);
+            }
+        }
+        if self.conditions.sync_api_approval(&crd).is_some() {
+            let written = self
+                .update_status(name, &|old| {
+                    self.conditions
+                        .sync_api_approval(old)
+                        .unwrap_or_else(|| old.clone())
+                })
+                .await?;
+            if let Some(out) = written {
+                self.conditions.record_api_approval(&out);
+            }
+        }
+        Ok(())
     }
 
     /// `requeueAllOtherGroupCRDs` (naming_controller.go:76-103): a CRD that
@@ -534,7 +570,11 @@ impl CrdRest {
         if self.sync_one(name).await? {
             self.sync_group_except(&crd.spec.group, name).await?;
         }
-        self.finalize(name).await
+        self.finalize(name).await?;
+        if self.get_crd(name).await?.is_none() {
+            self.conditions.forget(name);
+        }
+        Ok(())
     }
 
     /// The names of every CRD, as the informer's initial list and its
@@ -857,6 +897,9 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
                 if let Err(e) = self.finalize(name).await {
                     warn!("customresourcedefinition {name}: finalizer failed: {e}");
                 }
+                if self.get_crd(name).await?.is_none() {
+                    self.conditions.forget(name);
+                }
                 let _ = self.sync_group_except(&out.spec.group, name).await;
             }
             return Ok((Deleted::Object(out), false));
@@ -869,6 +912,7 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
                 warn!("customresourcedefinition {name}: finalizer failed: {e}");
             }
             if self.get_crd(name).await?.is_none() {
+                self.conditions.forget(name);
                 let _ = self.sync_group_except(&crd.spec.group, name).await;
                 return Ok((Deleted::Object(crd), false));
             }
@@ -896,6 +940,7 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
         let dry_run = options.dry_run.as_ref().is_some_and(|d| !d.is_empty());
         if !dry_run {
             for crd in &deleted {
+                self.conditions.forget(&crd.metadata.name);
                 let _ = self
                     .sync_group_except(&crd.spec.group, &crd.metadata.name)
                     .await;
@@ -1168,6 +1213,7 @@ pub fn new_rest(storage: Arc<StorageBackend>) -> CrdRest {
     CrdRest {
         store: new_store(storage.clone()),
         status_store: new_status_store(storage),
+        conditions: Default::default(),
     }
 }
 
