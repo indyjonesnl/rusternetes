@@ -700,6 +700,159 @@ pub fn decode_apply_body(content_type: &str, body: &[u8]) -> Result<Value, Apply
     }
 }
 
+/// The 1-based line of the second `key:` of the mapping that starts at
+/// `from_line`: the first line at or after it that spells `key` fixes the
+/// indentation, the next one at that indentation is the repeat.
+fn duplicate_key_line(body: &[u8], from_line: usize, key: &str) -> Option<usize> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut indent: Option<usize> = None;
+    for (i, line) in text.lines().enumerate().skip(from_line.saturating_sub(1)) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let at = line.len() - trimmed.len();
+        let trimmed = trimmed
+            .strip_prefix("- ")
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+        let is_key = trimmed
+            .strip_prefix(key)
+            .or_else(|| trimmed.strip_prefix(&format!("\"{key}\"")))
+            .or_else(|| trimmed.strip_prefix(&format!("'{key}'")))
+            .is_some_and(|rest| rest.trim_start().starts_with(':'));
+        match indent {
+            None if is_key => indent = Some(at),
+            Some(first) if at < first => return None,
+            Some(first) if at == first && is_key => return Some(i + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `applyPatcher`'s `unmarshalStrictFn(p.patch, &map[string]interface{}{})`
+/// (patch.go:517-527): the apply body decoded strictly, which refuses a
+/// mapping that repeats a key. yaml.v2's strict mode reports
+/// `line N: key "k" already set in map`, which sigs.k8s.io/yaml wraps as
+/// `error converting YAML to JSON: yaml: unmarshal errors:\n  <that>`.
+/// Returns that message on a duplicate.
+pub fn strict_decode_apply_body(body: &[u8]) -> Result<(), String> {
+    use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+    use std::collections::HashSet;
+    use std::fmt;
+
+    struct Walk;
+    struct Key(String);
+
+    impl<'de> Deserialize<'de> for Key {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct KeyVisitor;
+            impl Visitor<'_> for KeyVisitor {
+                type Value = Key;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a scalar key")
+                }
+                fn visit_str<E>(self, v: &str) -> Result<Key, E> {
+                    Ok(Key(v.to_string()))
+                }
+                fn visit_bool<E>(self, v: bool) -> Result<Key, E> {
+                    Ok(Key(v.to_string()))
+                }
+                fn visit_i64<E>(self, v: i64) -> Result<Key, E> {
+                    Ok(Key(v.to_string()))
+                }
+                fn visit_u64<E>(self, v: u64) -> Result<Key, E> {
+                    Ok(Key(v.to_string()))
+                }
+                fn visit_f64<E>(self, v: f64) -> Result<Key, E> {
+                    Ok(Key(v.to_string()))
+                }
+                fn visit_unit<E>(self) -> Result<Key, E> {
+                    Ok(Key("null".to_string()))
+                }
+            }
+            d.deserialize_any(KeyVisitor)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Walk {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Walk;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("any YAML value")
+                }
+                fn visit_bool<E>(self, _: bool) -> Result<Walk, E> {
+                    Ok(Walk)
+                }
+                fn visit_i64<E>(self, _: i64) -> Result<Walk, E> {
+                    Ok(Walk)
+                }
+                fn visit_u64<E>(self, _: u64) -> Result<Walk, E> {
+                    Ok(Walk)
+                }
+                fn visit_f64<E>(self, _: f64) -> Result<Walk, E> {
+                    Ok(Walk)
+                }
+                fn visit_str<E>(self, _: &str) -> Result<Walk, E> {
+                    Ok(Walk)
+                }
+                fn visit_unit<E>(self) -> Result<Walk, E> {
+                    Ok(Walk)
+                }
+                fn visit_none<E>(self) -> Result<Walk, E> {
+                    Ok(Walk)
+                }
+                fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Walk, D2::Error> {
+                    Walk::deserialize(d)
+                }
+                fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Walk, A::Error> {
+                    while a.next_element::<Walk>()?.is_some() {}
+                    Ok(Walk)
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Walk, A::Error> {
+                    let mut seen = HashSet::new();
+                    while let Some(Key(k)) = a.next_key::<Key>()? {
+                        if !seen.insert(k.clone()) {
+                            return Err(serde::de::Error::custom(format!(
+                                "key {k:?} already set in map"
+                            )));
+                        }
+                        a.next_value::<Walk>()?;
+                    }
+                    Ok(Walk)
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+
+    match serde_yaml::from_slice::<Walk>(body) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            // serde_yaml locates the error at the mapping's first event, not
+            // at the repeated key, so the key's own line is found by
+            // scanning from there (yaml.v2 reports the second key's line).
+            let key = msg
+                .find("key \"")
+                .zip(msg.find("\" already set in map"))
+                .map(|(s, t)| msg[s + 5..t].to_string());
+            match (key, e.location()) {
+                (Some(key), Some(loc)) => {
+                    let line = duplicate_key_line(body, loc.line(), &key).unwrap_or(loc.line());
+                    Err(format!(
+                        "error converting YAML to JSON: yaml: unmarshal errors:\n  line {line}: key {key:?} already set in map"
+                    ))
+                }
+                _ => Err(format!("error converting YAML to JSON: yaml: {msg}")),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
