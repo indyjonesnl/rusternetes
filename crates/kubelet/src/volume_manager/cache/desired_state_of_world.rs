@@ -1044,6 +1044,22 @@ mod tests {
         async fn new_mounter(&self, _spec: &Spec<'_>, _pod: &Pod) -> Result<Box<dyn Mounter>> {
             Err(anyhow!("DSW tests never mount"))
         }
+
+        fn new_unmounter(
+            &self,
+            _vol_name: &str,
+            _pod_uid: &str,
+        ) -> Result<Box<dyn crate::volume_plugins::Unmounter>> {
+            unimplemented!("test plugin never unmounts")
+        }
+
+        fn construct_volume_spec(
+            &self,
+            _vol_name: &str,
+            _mount_path: &str,
+        ) -> Result<crate::volume_plugins::ReconstructedVolume> {
+            unimplemented!("test plugin never reconstructs")
+        }
     }
 
     /// Port of `volumetesting.GetTestKubeletVolumePluginMgr`

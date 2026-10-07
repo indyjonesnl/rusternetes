@@ -251,7 +251,7 @@ async fn test_success_criteria_met_alone_prevents_status_overwrite() {
     }
 
     let controller = JobController::new(storage.clone());
-    controller.reconcile_all().await.unwrap();
+    crate::kubelet_double::job_reconcile_all_settled(&controller, &storage).await;
 
     let after: Job = storage.get(job_key).await.unwrap();
     let status = after.status.as_ref().expect("status must be present");
@@ -322,7 +322,7 @@ async fn test_both_conditions_preserve_completed_status_across_reconciles() {
     let controller = JobController::new(storage.clone());
 
     // First reconcile — successPolicy is met, both conditions written
-    controller.reconcile_all().await.unwrap();
+    crate::kubelet_double::job_reconcile_all_settled(&controller, &storage).await;
 
     let after_first: Job = storage.get(job_key).await.unwrap();
     let status_first = after_first

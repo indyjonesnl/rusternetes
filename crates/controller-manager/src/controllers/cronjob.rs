@@ -338,12 +338,52 @@ impl<S: Storage + 'static> CronJobController<S> {
         .await;
     }
 
+    /// `addJob` / `updateJob` / `deleteJob`
+    /// (cronjob_controllerv2.go:279-362): resolve the Job's controllerRef to
+    /// its CronJob and return that CronJob's queue key, or None when nothing
+    /// should be enqueued.
+    ///
+    /// `addJob` (:281-285) routes a Job already pending deletion through
+    /// `deleteJob`; all three then do the same thing (get the controllerRef,
+    /// `resolveControllerRef`, `enqueueController`), so one function serves
+    /// every event. A `Deleted` event carries the previous value, which stands
+    /// in for `DeletedFinalStateUnknown` (:339-350).
+    ///
+    /// Deviation: `updateJob` (:317-321) also wakes the OLD controller when the
+    /// controllerRef changed. A storage watch event carries no old object, so
+    /// only the current controller is woken.
+    async fn job_event_cronjob_key(&self, ev: &rusternetes_storage::WatchEvent) -> Option<String> {
+        use rusternetes_storage::WatchEvent;
+        let body = match ev {
+            WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) | WatchEvent::Deleted(_, v) => v,
+        };
+        let job: Job = serde_json::from_str(body).ok()?;
+        // metav1.GetControllerOf: the ref with controller=true.
+        let controller_ref = job
+            .metadata
+            .owner_references
+            .as_ref()?
+            .iter()
+            .find(|r| r.controller == Some(true))?;
+        // resolveControllerRef (:240-256): Kind, then Get by name, then UID.
+        if controller_ref.kind != "CronJob" {
+            return None;
+        }
+        let ns = job.metadata.namespace.as_deref()?;
+        let cronjob = self
+            .storage
+            .get::<CronJob>(&build_key("cronjobs", Some(ns), &controller_ref.name))
+            .await
+            .ok()?;
+        if cronjob.metadata.uid != controller_ref.uid {
+            return None;
+        }
+        Some(format!("cronjobs/{}/{}", ns, controller_ref.name))
+    }
+
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting CronJobController (watch-based)");
         let retry_interval = Duration::from_secs(5);
-        // CronJobs need frequent resync to check cron schedules, even without
-        // watch events — a cron trigger is time-based, not change-based.
-        let resync_secs = 10;
 
         let queue = WorkQueue::new();
 
@@ -374,10 +414,20 @@ impl<S: Storage + 'static> CronJobController<S> {
                 }
             };
 
-            // CronJobs use a shorter resync interval (10s) because cron
-            // schedules are time-triggered and must be checked frequently.
-            let mut resync = tokio::time::interval(Duration::from_secs(resync_secs));
-            resync.tick().await; // consume first immediate tick
+            // Job informer (cronjob_controllerv2.go:110-114): Job events wake
+            // the owning CronJob. Time triggers need no periodic resync:
+            // `sync` returns requeueAfter and the worker AddAfter's it.
+            let mut job_watch = match self.storage.watch("/registry/jobs/").await {
+                Ok(w) => w,
+                Err(e) => {
+                    error!(
+                        "Failed to establish job watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
+                    time::sleep(retry_interval).await;
+                    continue;
+                }
+            };
 
             let mut watch_broken = false;
             while !watch_broken {
@@ -398,8 +448,22 @@ impl<S: Storage + 'static> CronJobController<S> {
                             }
                         }
                     }
-                    _ = resync.tick() => {
-                        self.enqueue_all(&queue).await;
+                    event = job_watch.next() => {
+                        match event {
+                            Some(Ok(ev)) => {
+                                if let Some(key) = self.job_event_cronjob_key(&ev).await {
+                                    queue.add(key).await;
+                                }
+                            }
+                            Some(Err(e)) => {
+                                warn!("Job watch error: {}, reconnecting", e);
+                                watch_broken = true;
+                            }
+                            None => {
+                                warn!("Job watch stream ended, reconnecting");
+                                watch_broken = true;
+                            }
+                        }
                     }
                 }
             }
@@ -1678,6 +1742,75 @@ mod tests {
             storage.get("/registry/cronjobs/default/cj").await.unwrap();
         assert!(got.status.map(|s| s.active.is_empty()).unwrap_or(true));
         assert_eq!(reasons(&storage).await, vec!["UnexpectedJob"]);
+    }
+
+    // ---- Job event handlers (#2556) -------------------------------------
+
+    /// `addJob` / `updateJob` / `deleteJob`
+    /// (cronjob_controllerv2.go:279-362): a Job's controllerRef is resolved to
+    /// its CronJob (:240-256, Kind + name + UID) and that CronJob is enqueued.
+    #[tokio::test]
+    async fn job_events_enqueue_the_owning_cronjob() {
+        use rusternetes_storage::WatchEvent;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let job = job_json("j1", "j1-uid", true, None);
+        seed(
+            &storage,
+            &cj_json("* * * * *", "Allow", serde_json::json!({})),
+            std::slice::from_ref(&job),
+        )
+        .await;
+        let body = serde_json::to_string(&job).unwrap();
+        let k = "/registry/jobs/default/j1".to_string();
+        for ev in [
+            WatchEvent::Added(k.clone(), body.clone()),
+            WatchEvent::Modified(k.clone(), body.clone()),
+            WatchEvent::Deleted(k.clone(), body.clone()),
+        ] {
+            assert_eq!(
+                ctrl.job_event_cronjob_key(&ev).await.as_deref(),
+                Some("cronjobs/default/cj"),
+                "{ev:?}"
+            );
+        }
+    }
+
+    /// :357-361 / :240-256: orphans, a non-CronJob controller, a missing
+    /// CronJob and a UID mismatch all enqueue nothing.
+    #[tokio::test]
+    async fn job_events_ignore_unresolvable_controller_refs() {
+        use rusternetes_storage::WatchEvent;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        seed(
+            &storage,
+            &cj_json("* * * * *", "Allow", serde_json::json!({})),
+            &[],
+        )
+        .await;
+        let ev = |j: &rusternetes_common::resources::Job| {
+            WatchEvent::Added(
+                "/registry/jobs/default/j".into(),
+                serde_json::to_string(j).unwrap(),
+            )
+        };
+        let orphan = job_json("j", "u", false, None);
+        assert_eq!(ctrl.job_event_cronjob_key(&ev(&orphan)).await, None);
+        let mut wrong_kind = job_json("j", "u", true, None);
+        wrong_kind.metadata.owner_references.as_mut().unwrap()[0].kind = "Deployment".into();
+        assert_eq!(ctrl.job_event_cronjob_key(&ev(&wrong_kind)).await, None);
+        let mut wrong_uid = job_json("j", "u", true, None);
+        wrong_uid.metadata.owner_references.as_mut().unwrap()[0].uid = "other".into();
+        assert_eq!(ctrl.job_event_cronjob_key(&ev(&wrong_uid)).await, None);
+        let mut missing = job_json("j", "u", true, None);
+        missing.metadata.owner_references.as_mut().unwrap()[0].name = "gone".into();
+        assert_eq!(ctrl.job_event_cronjob_key(&ev(&missing)).await, None);
+        let mut not_ctrl = job_json("j", "u", true, None);
+        not_ctrl.metadata.owner_references.as_mut().unwrap()[0].controller = Some(false);
+        assert_eq!(ctrl.job_event_cronjob_key(&ev(&not_ctrl)).await, None);
     }
 
     // ---- requeueAfter (#2398) -------------------------------------------
