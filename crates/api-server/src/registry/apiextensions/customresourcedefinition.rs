@@ -562,14 +562,19 @@ impl CrdRest {
                 return Vec::new();
             }
         };
-        let mut failed = Vec::new();
-        for name in names {
-            if let Err(e) = self.resync_one(&name).await {
-                warn!("customresourcedefinition {name}: resync failed: {e}");
-                failed.push(name);
+        run_workers(names, CRD_FINALIZER_WORKERS, |name| async move {
+            match self.resync_one(&name).await {
+                Ok(()) => None,
+                Err(e) => {
+                    warn!("customresourcedefinition {name}: resync failed: {e}");
+                    Some(name)
+                }
             }
-        }
-        failed
+        })
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// `deleteInstances` (crd_finalizer.go:181-): the stored instances of the
@@ -901,6 +906,25 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
 }
 
 /// `NewSharedInformerFactory(crdClient, 5*time.Minute)` (apiserver.go:170).
+/// `go finalizingController.Run(5, hookContext.Done())` (apiserver.go:249):
+/// `RunWithContext` starts `workers` goroutines on one queue
+/// (crd_finalizer.go:280-282).
+pub const CRD_FINALIZER_WORKERS: usize = 5;
+
+/// Run `f` over `items` with at most `workers` in flight, as the finalizer's
+/// worker goroutines drain its queue.
+async fn run_workers<T, R, F, Fut>(items: Vec<T>, workers: usize, f: F) -> Vec<R>
+where
+    F: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = R>,
+{
+    use futures::StreamExt;
+    futures::stream::iter(items.into_iter().map(f))
+        .buffer_unordered(workers)
+        .collect()
+        .await
+}
+
 pub const CRD_RESYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// `workqueue.TypedItemExponentialFailureRateLimiter`
@@ -1079,8 +1103,16 @@ fn spawn_resync_loop(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()
                         .filter(|(_, at)| **at <= now)
                         .map(|(n, _)| n.clone())
                         .collect();
-                    for name in due {
-                        match rest.resync_one(&name).await {
+                    let results = run_workers(due, CRD_FINALIZER_WORKERS, |name| {
+                        let rest = &rest;
+                        async move {
+                            let r = rest.resync_one(&name).await;
+                            (name, r)
+                        }
+                    })
+                    .await;
+                    for (name, r) in results {
+                        match r {
                             Ok(()) => {
                                 failing.remove(&name);
                                 limiter.forget(&name);
@@ -1109,6 +1141,30 @@ pub fn new_rest(storage: Arc<StorageBackend>) -> CrdRest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `go finalizingController.Run(5, ...)` (apiserver.go:249): five workers
+    /// drain the queue at once, so one slow CRD does not hold up the rest.
+    #[tokio::test]
+    async fn crd_finalizer_runs_five_workers_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        assert_eq!(CRD_FINALIZER_WORKERS, 5);
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let names: Vec<String> = (0..12).map(|i| format!("crd{i}")).collect();
+        let (r, p) = (running.clone(), peak.clone());
+        let out = run_workers(names, CRD_FINALIZER_WORKERS, move |_| {
+            let (r, p) = (r.clone(), p.clone());
+            async move {
+                let now = r.fetch_add(1, Ordering::SeqCst) + 1;
+                p.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                r.fetch_sub(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert_eq!(out.len(), 12);
+        assert_eq!(peak.load(Ordering::SeqCst), 5);
+    }
 
     fn crd(extra: serde_json::Value) -> CustomResourceDefinition {
         let mut body = serde_json::json!({
