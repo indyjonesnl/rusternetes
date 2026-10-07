@@ -112,7 +112,7 @@ async fn live_modified_and_deleted_already_in_the_snapshot_are_dropped() {
 /// reordered; the first event after the snapshot is delivered.
 #[tokio::test]
 async fn gap_events_between_subscribe_and_list_are_not_duplicated() {
-    use rusternetes_api_server::handlers::watch::list_snapshot;
+    use rusternetes_api_server::handlers::watch::watch_snapshot;
     use rusternetes_api_server::state::ApiServerState;
     use rusternetes_common::{
         auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
@@ -141,7 +141,7 @@ async fn gap_events_between_subscribe_and_list_are_not_duplicated() {
     backend.delete(&key("b")).await.unwrap(); // DELETED in the gap
     backend.create(&key("c"), &pod("c")).await.unwrap(); // ADDED in the gap
 
-    let (snapshot, cutoff) = list_snapshot(&state, "/registry/pods/ns/").await.unwrap();
+    let (snapshot, cutoff) = watch_snapshot(&state, "/registry/pods/ns/").await.unwrap();
     let mut listed: Vec<String> = snapshot
         .iter()
         .map(|v| v["metadata"]["name"].as_str().unwrap().to_string())

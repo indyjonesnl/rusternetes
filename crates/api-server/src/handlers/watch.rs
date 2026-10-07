@@ -380,6 +380,10 @@ pub fn snapshot_resource_version(snapshot: &[serde_json::Value]) -> Option<u64> 
         .max()
 }
 
+/// (Named `watch_snapshot`, not `list_*`: this is the WATCH path, whose start
+/// revision legitimately IS the store revision -- see
+/// `list_resource_version_floor_guard_test`.)
+///
 /// List `prefix` as a snapshot stamped with the revision it was read at, and
 /// return that revision as the cutoff for the live stream (#2223).
 ///
@@ -391,7 +395,7 @@ pub fn snapshot_resource_version(snapshot: &[serde_json::Value]) -> Option<u64> 
 /// state at `rev` and every live event with `rv <= rev` is already in it.
 /// Falls back to a plain list + highest listed rv when the backend has no
 /// usable revision.
-pub async fn list_snapshot(
+pub async fn watch_snapshot(
     state: &ApiServerState,
     prefix: &str,
 ) -> Result<(Vec<serde_json::Value>, Option<u64>)> {
@@ -578,7 +582,7 @@ where
     // object (e.g. a Deployment missing `spec`) does not abort the entire
     // watch with HTTP 400. Upstream Kubernetes skips bad objects and
     // continues streaming valid ones.
-    let (raw_existing, snapshot_rv) = list_snapshot(&state, &prefix).await?;
+    let (raw_existing, snapshot_rv) = watch_snapshot(&state, &prefix).await?;
     // Convert each stored object to the requested version before it becomes an
     // initial ADDED event, so field-selector filtering sees the requested-version
     // layout (mirrors the LIST path). No-op when `converter` is None.
@@ -1137,7 +1141,7 @@ where
     // object (e.g. a Deployment missing `spec`) does not abort the entire
     // watch with HTTP 400. Upstream Kubernetes skips bad objects and
     // continues streaming valid ones.
-    let (raw_existing, snapshot_rv) = list_snapshot(&state, &prefix).await?;
+    let (raw_existing, snapshot_rv) = watch_snapshot(&state, &prefix).await?;
     // Convert each stored object to the requested version before it becomes an
     // initial ADDED event, so field-selector filtering sees the requested-version
     // layout (mirrors the LIST path). No-op when `converter` is None.
@@ -2921,7 +2925,7 @@ pub async fn watch_cluster_scoped_json(
         Ok(stream) => stream,
         Err(expired) => return Ok(expired),
     };
-    let (existing_resources, snapshot_rv) = list_snapshot(&state, &prefix).await?;
+    let (existing_resources, snapshot_rv) = watch_snapshot(&state, &prefix).await?;
 
     let current_rev = state.storage.current_revision().await.unwrap_or(1);
     let current_rev_str = current_rev.to_string();
@@ -3149,7 +3153,7 @@ pub async fn watch_namespaced_json(
         Ok(stream) => stream,
         Err(expired) => return Ok(expired),
     };
-    let (existing_resources, snapshot_rv) = list_snapshot(&state, &prefix).await?;
+    let (existing_resources, snapshot_rv) = watch_snapshot(&state, &prefix).await?;
     let current_rev = state.storage.current_revision().await.unwrap_or(1);
     let current_rev_str = current_rev.to_string();
 
