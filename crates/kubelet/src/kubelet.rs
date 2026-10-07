@@ -1035,6 +1035,20 @@ impl Kubelet {
         // immediately to speed up startup", file.go:96), then every
         // fileCheckFrequency.
         let mut static_pod_timer = tokio::time::interval(self.static_pod_poll_interval());
+        // File source watch (`startWatch`, file.go:116): inotify events on the
+        // manifest dir trigger an immediate pass; the timer above stays as the
+        // resync / fallback.
+        let (static_pod_watch_tx, mut static_pod_watch_rx) =
+            tokio::sync::mpsc::channel(crate::static_pod_watch::EVENT_BUFFER_LEN);
+        if let Some(dir) = &self.pod_manifest_path {
+            // NewSourceFile: "requires a path without trailing /"
+            let dir = std::path::PathBuf::from(dir.to_string_lossy().trim_end_matches('/'));
+            tokio::spawn(crate::static_pod_watch::start_watch(
+                dir,
+                static_pod_watch_tx.clone(),
+            ));
+        }
+        drop(static_pod_watch_tx);
 
         // Lease-based heartbeat in a SEPARATE task.
         // K8s kubelet uses Lease objects (coordination.k8s.io/v1) for heartbeats
@@ -1241,6 +1255,16 @@ impl Kubelet {
                         if let Err(e) = self.sync_loop().await {
                             error!("Error in static pod sync: {}", e);
                         }
+                    }
+                }
+                Some(ev) = static_pod_watch_rx.recv() => {
+                    // consumeWatchEvent (file.go): coalesce a burst, then
+                    // re-list (see static_pod_watch module docs).
+                    tracing::debug!(file = %ev.file_name.display(), kind = ?ev.event_type, "static pod manifest event");
+                    while static_pod_watch_rx.try_recv().is_ok() {}
+                    self.poll_static_pods().await;
+                    if let Err(e) = self.sync_loop().await {
+                        error!("Error in static pod sync: {}", e);
                     }
                 }
                 // Periodic full sync as safety net

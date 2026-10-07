@@ -21,6 +21,7 @@ pub mod runtime;
 pub mod runtime_state;
 pub mod server;
 pub mod serving_tls;
+pub mod static_pod_watch;
 pub mod static_pods;
 pub mod sync_locks;
 pub mod sysctl;
