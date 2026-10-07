@@ -55,6 +55,13 @@ pub struct MemoryStorage {
     /// and every test running on this backend was blind to that whole class of
     /// bug (#1942).
     revision: Arc<std::sync::atomic::AtomicI64>,
+    /// The TTL "lease" each expiring key currently holds, as a generation
+    /// number. A key has at most one: a write that sets a new TTL, clears it,
+    /// or deletes the key replaces or removes the entry, which orphans the
+    /// timer armed under the old generation (it checks before it deletes).
+    /// Stands in for the etcd lease a `clientv3.WithLease` put attaches.
+    expiries: Arc<Mutex<HashMap<String, u64>>>,
+    expiry_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MemoryStorage {
@@ -76,7 +83,46 @@ impl MemoryStorage {
             compacted_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             // etcd's first revision is 1; 0 means "unset" on the wire.
             revision: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+            expiries: Arc::new(Mutex::new(HashMap::new())),
+            expiry_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Replace `key`'s TTL: `0` detaches it (a write without a lease), a
+    /// positive number arms a timer that deletes the key, and emits the
+    /// `Deleted` watch event, when it fires -- what an expiring etcd lease
+    /// does -- unless the TTL was replaced or the key deleted first.
+    fn set_ttl(&self, key: &str, ttl: u64) {
+        if ttl == 0 {
+            self.expiries.lock().unwrap().remove(key);
+            return;
+        }
+        let generation = self
+            .expiry_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.expiries
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), generation);
+        let this = self.clone();
+        let key = key.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(ttl)).await;
+            let still_leased = {
+                let mut expiries = this.expiries.lock().unwrap();
+                if expiries.get(&key) == Some(&generation) {
+                    expiries.remove(&key);
+                    true
+                } else {
+                    false
+                }
+            };
+            if still_leased {
+                // Already gone is fine: the lease outlived nothing.
+                let _ = Storage::delete(&this, &key).await;
+            }
+        });
     }
 
     /// Bump the write counter and stamp the new revision on
@@ -162,6 +208,13 @@ impl Storage for MemoryStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
+        self.create_with_ttl(key, value, 0).await
+    }
+
+    async fn create_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
         let mut value_json: serde_json::Value = serde_json::to_value(value)?;
 
         // Generate UID if not already set or empty
@@ -213,6 +266,7 @@ impl Storage for MemoryStorage {
 
         data.insert(key.to_string(), serialized.clone());
         drop(data); // Release lock before sending event
+        self.set_ttl(key, ttl);
 
         // Emit watch event
         self.emit(
@@ -236,6 +290,13 @@ impl Storage for MemoryStorage {
     }
 
     async fn update<T>(&self, key: &str, value: &T) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        self.update_with_ttl(key, value, 0).await
+    }
+
+    async fn update_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
@@ -308,6 +369,7 @@ impl Storage for MemoryStorage {
         let serialized = serde_json::to_string(&value_json)?;
         data.insert(key.to_string(), serialized.clone());
         drop(data); // Release lock before sending event
+        self.set_ttl(key, ttl);
 
         // Emit watch event
         self.emit(
@@ -348,6 +410,7 @@ impl Storage for MemoryStorage {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
+        self.expiries.lock().unwrap().remove(key);
         let mut data = self.data.write().unwrap();
         let previous_value = data
             .remove(key)
