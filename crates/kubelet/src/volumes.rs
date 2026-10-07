@@ -2325,9 +2325,10 @@ mod projected_mode_tests {
             "file mode must come from the item's own mode when set"
         );
 
-        // da_dir_mode = defaultMode | 0o111 (volumes.rs's moved body)
+        // The wrapped emptyDir's setupDir leaves the root at 0777
+        // (empty_dir.go:447-486); downwardapi.go never chmods it (#2323).
         let dir_mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(dir_mode & 0o777, 0o640 | 0o111);
+        assert_eq!(dir_mode & 0o777, 0o777);
     }
 
     /// Characterization test for the projected volume plugin's `set_up` body,
