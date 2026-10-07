@@ -519,6 +519,20 @@ pub fn pod_status_equal(a: &Pod, b: &Pod) -> bool {
     serde_json::to_value(&a.status).ok() == serde_json::to_value(&b.status).ok()
 }
 
+/// Whether a terminating pod's grace period has run out. Since the api-server
+/// follows `rest.BeforeDelete`, `deletionTimestamp` is the *deadline*
+/// (`now + gracePeriod`), so the grace has elapsed once `now >= deletionTimestamp`.
+/// Upstream: staging/src/k8s.io/apiserver/pkg/registry/rest/delete.go:163
+/// (`requestedDeletionTimestamp := metav1.NewTime(metav1Now().Add(time.Second *
+/// time.Duration(*options.GracePeriodSeconds)))`). The kill grace itself is
+/// `pod.DeletionGracePeriodSeconds` (kuberuntime_container.go:1411).
+pub(crate) fn terminating_grace_elapsed(
+    deletion_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    deletion_timestamp.map(|dt| now >= dt).unwrap_or(true)
+}
+
 /// Decide whether a pod that has reached `TerminatedPod` should be removed
 /// from storage, and remove it if so. Returns `Ok(true)` when the object was
 /// deleted, `Ok(false)` when it was intentionally retained.
@@ -2527,11 +2541,8 @@ impl Kubelet {
                             .and_then(|s| s.termination_grace_period_seconds)
                     })
                     .unwrap_or(30);
-                let grace_elapsed = pod
-                    .metadata
-                    .deletion_timestamp
-                    .map(|dt| (chrono::Utc::now() - dt).num_seconds() >= grace)
-                    .unwrap_or(true);
+                let grace_elapsed =
+                    terminating_grace_elapsed(pod.metadata.deletion_timestamp, chrono::Utc::now());
                 let containers_running = self.runtime.is_pod_running(pod).await.unwrap_or(false);
                 if containers_running && !grace_elapsed {
                     debug!(
@@ -6016,6 +6027,21 @@ mod taint_eviction_tests {
 #[cfg(test)]
 mod tests {
     use super::Kubelet;
+
+    /// #2459: deletionTimestamp is the deadline (now+grace), so at the deadline
+    /// the grace has elapsed; before it, it has not.
+    #[test]
+    fn terminating_grace_elapsed_treats_deletion_timestamp_as_deadline() {
+        let now = chrono::Utc::now();
+        let dl = now + chrono::Duration::seconds(30);
+        assert!(!super::terminating_grace_elapsed(Some(dl), now));
+        assert!(super::terminating_grace_elapsed(Some(dl), dl));
+        assert!(super::terminating_grace_elapsed(
+            Some(now - chrono::Duration::seconds(1)),
+            now
+        ));
+        assert!(super::terminating_grace_elapsed(None, now));
+    }
 
     /// `nodeStatusUpdateFrequency` drives the heartbeat interval; default 10s
     /// when unset/zero (upstream `defaults.go`; consumer
