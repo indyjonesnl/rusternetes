@@ -63,6 +63,7 @@ mod validation_objectmeta;
 mod validation_pdb;
 mod validation_persistentvolume;
 mod validation_pod_create;
+mod validation_podcertificaterequest;
 mod validation_podtemplate;
 mod validation_priorityclass;
 mod validation_prioritylevelconfiguration;

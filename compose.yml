@@ -124,7 +124,7 @@ services:
         rhino: ./rhino
     image: rusternetes-controller-manager:latest
 
-  # Shared CRI runtime: containerd (CRI plugin) + Youki. The kubelets talk to
+  # Shared CRI runtime: containerd (CRI plugin) + crun. The kubelets talk to
   # this over CRI v1 instead of a Docker/Podman socket; pods run as containers
   # inside this service. The CRI socket is shared with the kubelets via the
   # `containerd-run` volume, and KUBELET_VOLUMES_PATH is bind-mounted at the same

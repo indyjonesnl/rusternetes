@@ -23,8 +23,9 @@ fn job_name_for(cronjob_name: &str, scheduled_time: chrono::DateTime<chrono::Utc
 const NEXT_SCHEDULE_DELTA: chrono::Duration = chrono::Duration::milliseconds(100);
 
 /// Parse a Kubernetes schedule (5 fields or an `@descriptor`) into the `cron`
-/// crate's 7-field form.
-fn parse_standard_schedule(schedule: &str) -> Result<cron::Schedule, cron::error::Error> {
+/// crate's 7-field form. The error is the parser's message, which
+/// `UnparseableSchedule` / `InvalidSchedule` events carry.
+fn parse_standard_schedule(schedule: &str) -> Result<cron::Schedule, String> {
     // Handle special schedules (Kubernetes 5-field format)
     let cron_schedule = match schedule {
         "@yearly" | "@annually" => "0 0 1 1 *",
@@ -42,7 +43,7 @@ fn parse_standard_schedule(schedule: &str) -> Result<cron::Schedule, cron::error
     // The `cron` crate expects 7 fields (sec min hour dom month dow year),
     // but Kubernetes uses 5 fields (min hour dom month dow).
     // Convert by prepending "0" for seconds and appending "*" for year.
-    let cron_schedule = numeric_dow_to_names(&cron_schedule);
+    let cron_schedule = numeric_dow_to_names(&cron_schedule)?;
     let field_count = cron_schedule.split_whitespace().count();
     let cron_schedule = if field_count == 5 {
         format!("0 {} *", cron_schedule)
@@ -51,118 +52,222 @@ fn parse_standard_schedule(schedule: &str) -> Result<cron::Schedule, cron::error
     } else {
         cron_schedule.to_string()
     };
-    cron::Schedule::try_from(cron_schedule.as_str())
+    cron::Schedule::try_from(cron_schedule.as_str()).map_err(|e| e.to_string())
 }
 
-/// robfig/cron numbers the day of week 0-6 from Sunday (7 is also accepted:
-/// vendor/github.com/robfig/cron/v3/parser.go `dow` bounds {0, 6, dow names}),
-/// but the `cron` crate numbers it 1-7 from Sunday, so a numeric `4` (Thursday
-/// upstream) would mean Wednesday. Rewrite numeric days in the day-of-week
-/// field (the last of 5 or 6 fields) to names, which both crates agree on.
-/// Steps (`/n`) stay numeric.
-fn numeric_dow_to_names(schedule: &str) -> String {
+/// robfig/cron numbers the day of week 0-6 from Sunday, and 7 is NOT accepted:
+/// vendor/github.com/robfig/cron/v3/spec.go:40 `dow = bounds{0, 6, names}`, so
+/// `getRange` (parser.go:252-322) rejects an end above 6 (parser.go:307) and a
+/// start beyond the end (parser.go:310) -- the `n-7` and `n-0` edges. The
+/// `cron` crate numbers the day 1-7 from Sunday, so a numeric `4` (Thursday
+/// upstream) would mean Wednesday. Validate the numeric days per `getRange`
+/// (same messages), then rewrite them to names, which both crates agree on.
+/// `N/step` means `N-6/step` (parser.go:291-293).
+fn numeric_dow_to_names(schedule: &str) -> Result<String, String> {
     const NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+    const MAX: u32 = 6;
     let mut fields: Vec<String> = schedule.split_whitespace().map(str::to_string).collect();
     let dow_idx = match fields.len() {
         5 => 4,
         6 => 5,
-        _ => return schedule.to_string(),
+        _ => return Ok(schedule.to_string()),
     };
-    let name = |n: &str| -> Option<&'static str> {
-        n.parse::<usize>()
-            .ok()
-            .filter(|d| *d <= 7)
-            .map(|d| NAMES[d % 7])
-    };
-    let rewritten: Vec<String> = fields[dow_idx]
-        .split(',')
-        .map(|item| {
-            let (range, step) = match item.split_once('/') {
-                Some((r, s)) => (r, Some(s)),
-                None => (item, None),
-            };
-            let range = match range.split_once('-') {
-                // `n-7` runs to Sunday, which is also day 0: SAT then SUN.
-                Some((a, "7")) if name(a).is_some() && a != "0" && a != "7" => {
-                    format!("{}-SAT,SUN", name(a).unwrap())
-                }
-                Some((a, b)) => match (name(a), name(b)) {
-                    (Some(a), Some(b)) => format!("{a}-{b}"),
-                    _ => range.to_string(),
-                },
-                None => name(range).map(str::to_string).unwrap_or(range.to_string()),
-            };
-            match step {
-                Some(s) => format!("{range}/{s}"),
-                None => range,
-            }
+    // parseIntOrName (parser.go:326-331): a number or a day name.
+    let value = |x: &str| -> Option<u32> {
+        x.parse::<u32>().ok().or_else(|| {
+            NAMES
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(x))
+                .map(|i| i as u32)
         })
-        .collect();
+    };
+    let mut rewritten: Vec<String> = Vec::new();
+    for item in fields[dow_idx].split(',') {
+        let parts: Vec<&str> = item.split('/').collect();
+        if parts.len() > 2 {
+            return Err(format!("too many slashes: {item}"));
+        }
+        let low_high: Vec<&str> = parts[0].split('-').collect();
+        if low_high[0] == "*" || low_high.len() > 2 {
+            // `*` needs no bounds check; a stray hyphen is left to the parser.
+            rewritten.push(item.to_string());
+            continue;
+        }
+        let step = parts.get(1).copied();
+        let Some(start) = value(low_high[0]) else {
+            rewritten.push(item.to_string());
+            continue;
+        };
+        let end = match (low_high.get(1), step) {
+            (Some(h), _) => match value(h) {
+                Some(e) => e,
+                None => {
+                    rewritten.push(item.to_string());
+                    continue;
+                }
+            },
+            (None, Some(_)) => MAX,
+            (None, None) => start,
+        };
+        if end > MAX {
+            return Err(format!(
+                "end of range ({end}) above maximum ({MAX}): {item}"
+            ));
+        }
+        if start > end {
+            return Err(format!(
+                "beginning of range ({start}) beyond end of range ({end}): {item}"
+            ));
+        }
+        let range = if low_high.len() == 1 && step.is_none() {
+            NAMES[start as usize].to_string()
+        } else {
+            format!("{}-{}", NAMES[start as usize], NAMES[end as usize])
+        };
+        rewritten.push(match step {
+            Some(s) => format!("{range}/{s}"),
+            None => range,
+        });
+    }
     fields[dow_idx] = rewritten.join(",");
-    fields.join(" ")
+    Ok(fields.join(" "))
 }
 
-/// `nextScheduleTimeDuration` (pkg/controller/cronjob/utils.go:186-205): the
+/// `missedSchedulesType` (pkg/controller/cronjob/utils.go:83-89).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissedSchedules {
+    None,
+    Few,
+    Many,
+}
+
+/// `mostRecentScheduleTime`'s result: earliest time, most recent slot, missed.
+type MostRecent = (
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    MissedSchedules,
+);
+
+/// `schedule.Next(t)` of robfig/cron: the first slot strictly after `t`, in
+/// `tz`; `None` is Go's zero time (a schedule that never fires).
+fn schedule_next(
+    schedule: &cron::Schedule,
+    tz: chrono_tz::Tz,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    schedule
+        .after(&t.with_timezone(&tz))
+        .next()
+        .map(|n| n.with_timezone(&chrono::Utc))
+}
+
+/// `mostRecentScheduleTime` (pkg/controller/cronjob/utils.go:100-176): returns
+/// the earliest time (last schedule time or creation time, raised to
+/// `now - startingDeadlineSeconds` when `include_sds`), the most recent slot
+/// not after `now` (or None), and how many starts were missed. The error is
+/// the "less than 1 second" one for a schedule that never fires (:129-131).
+fn most_recent_schedule_time(
+    cj: &CronJob,
+    now: chrono::DateTime<chrono::Utc>,
+    schedule: &cron::Schedule,
+    tz: chrono_tz::Tz,
+    include_sds: bool,
+) -> Result<MostRecent, String> {
+    // :101-104. A CronJob without a creationTimestamp never reaches the
+    // controller upstream; fall back to one minute ago.
+    let mut earliest = cj
+        .status
+        .as_ref()
+        .and_then(|s| s.last_schedule_time)
+        .or(cj.metadata.creation_timestamp)
+        .unwrap_or(now - chrono::Duration::minutes(1));
+    let mut missed = MissedSchedules::None;
+    // :106-113: the controller schedules nothing below this point.
+    if include_sds {
+        if let Some(sds) = cj.spec.starting_deadline_seconds {
+            let scheduling_deadline = now - chrono::Duration::seconds(sds);
+            if scheduling_deadline > earliest {
+                earliest = scheduling_deadline;
+            }
+        }
+    }
+
+    let t1 = schedule_next(schedule, tz, earliest);
+    let t2 = t1.and_then(|t| schedule_next(schedule, tz, t));
+    // :115-123: `now.Before(zero)` is false, so a never-firing schedule falls
+    // through to the error below.
+    if let Some(t1) = t1 {
+        if now < t1 {
+            return Ok((earliest, None, missed));
+        }
+        if t2.is_some_and(|t2| now < t2) {
+            return Ok((earliest, Some(t1), missed));
+        }
+    }
+    // :129-131
+    let (Some(t1), Some(t2)) = (t1, t2) else {
+        return Err("time difference between two schedules is less than 1 second".to_string());
+    };
+    let between = (t2 - t1).num_seconds();
+    if between < 1 {
+        return Err("time difference between two schedules is less than 1 second".to_string());
+    }
+    // :134-136: a rough count of the schedules missed since t1.
+    let elapsed = (now - t1).num_seconds();
+    let number_of_missed = (elapsed / between) + 1;
+    // :138-152: start the walk one interval before the estimate so `@every`
+    // and irregular schedules land on a real slot.
+    let potential_earliest = t1 + chrono::Duration::seconds((number_of_missed - 1 - 1) * between);
+    let mut most_recent = None;
+    let mut t = schedule_next(schedule, tz, potential_earliest);
+    while let Some(slot) = t.filter(|slot| *slot <= now) {
+        most_recent = Some(slot);
+        t = schedule_next(schedule, tz, slot);
+    }
+    // :154-176: more than 100 is "many" (the controller would otherwise try
+    // to list every start of a clock-skewed CronJob).
+    if number_of_missed > 100 {
+        missed = MissedSchedules::Many;
+    } else if number_of_missed > 0 {
+        missed = MissedSchedules::Few;
+    }
+    Ok((earliest, most_recent, missed))
+}
+
+/// `nextScheduleTimeDuration` (pkg/controller/cronjob/utils.go:188-205): the
 /// delay until the next schedule slot, plus `NEXT_SCHEDULE_DELTA`.
-///
-/// `mostRecentScheduleTime(.., includeStartingDeadlineSeconds=false)` supplies
-/// the base: `earliestTime` (lastScheduleTime, else creationTimestamp) when
-/// `now` is before the first slot `t1`; otherwise the latest slot not after
-/// `now` -- or `now` itself when the schedule is degenerate (utils.go:128-131).
-/// The result is `schedule.Next(base)`; that is always the first slot after
-/// `now`, so the walk upstream does to find `mostRecentTime` is not repeated.
 fn next_schedule_duration(
     schedule: &cron::Schedule,
     tz: chrono_tz::Tz,
     cj: &CronJob,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<Duration> {
-    let earliest = cj
-        .status
-        .as_ref()
-        .and_then(|s| s.last_schedule_time)
-        .or(cj.metadata.creation_timestamp)
-        .unwrap_or(now)
-        .with_timezone(&tz);
-    let now_tz = now.with_timezone(&tz);
-    let t1 = schedule.after(&earliest).next()?;
-    let next = if now_tz < t1 {
-        t1
-    } else {
-        schedule.after(&now_tz).next()?
+    let base = match most_recent_schedule_time(cj, now, schedule, tz, false) {
+        // :189-191: still requeue; aim for the next slot from now.
+        Err(_) => now,
+        Ok((earliest, None, MissedSchedules::None)) => earliest,
+        // :193-199: missed schedules since earliestTime, always use now.
+        Ok((_, None, _)) => now,
+        Ok((_, Some(recent), _)) => recent,
     };
-    (next.with_timezone(&chrono::Utc) - now + NEXT_SCHEDULE_DELTA)
-        .to_std()
-        .ok()
+    let next = schedule_next(schedule, tz, base)?;
+    (next - now + NEXT_SCHEDULE_DELTA).to_std().ok()
 }
 
-/// The most recent scheduled time in `(earliest, now]`, or None when nothing
-/// is due (mostRecentScheduleTime, pkg/controller/cronjob/utils.go:100-155).
-fn most_recent_schedule_time(
+/// `nextScheduleTime` (pkg/controller/cronjob/utils.go:210-224): the slot to
+/// start (None when nothing is due) and how many were missed. The caller
+/// records `TooManyMissedTimes` (:217-219) when that is `Many`.
+fn next_schedule_time(
+    cj: &CronJob,
+    now: chrono::DateTime<chrono::Utc>,
     schedule: &cron::Schedule,
     tz: chrono_tz::Tz,
-    now: chrono::DateTime<chrono::Utc>,
-    cronjob: &CronJob,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    let now_tz = now.with_timezone(&tz);
-    // utils.go:101-105: earliestTime is the CronJob's creationTimestamp,
-    // replaced by status.lastScheduleTime.
-    let last_schedule = cronjob.status.as_ref().and_then(|s| s.last_schedule_time);
-    let start = match last_schedule.or(cronjob.metadata.creation_timestamp) {
-        Some(t) => t.with_timezone(&tz),
-        None => (now - chrono::Duration::minutes(1)).with_timezone(&tz),
-    };
-    // Walk every scheduled time in (start, now]; the latest wins. Capped
-    // like upstream's "too many missed start times" guard (utils.go).
-    let latest = schedule
-        .after(&start)
-        .take(10_000)
-        .take_while(|t| *t <= now_tz)
-        .last();
-    if let Some(t) = latest {
-        info!("CronJob due: scheduled={}, current={}", t, now);
+) -> Result<(Option<chrono::DateTime<chrono::Utc>>, MissedSchedules), String> {
+    let (_, most_recent, missed) = most_recent_schedule_time(cj, now, schedule, tz, true)?;
+    match most_recent {
+        Some(t) if t <= now => Ok((Some(t), missed)),
+        _ => Ok((None, missed)),
     }
-    latest.map(|t| t.with_timezone(&chrono::Utc))
 }
 
 /// Upstream `ConcurrentCronJobSyncs` default, workers launched by `Run`
@@ -233,12 +338,52 @@ impl<S: Storage + 'static> CronJobController<S> {
         .await;
     }
 
+    /// `addJob` / `updateJob` / `deleteJob`
+    /// (cronjob_controllerv2.go:279-362): resolve the Job's controllerRef to
+    /// its CronJob and return that CronJob's queue key, or None when nothing
+    /// should be enqueued.
+    ///
+    /// `addJob` (:281-285) routes a Job already pending deletion through
+    /// `deleteJob`; all three then do the same thing (get the controllerRef,
+    /// `resolveControllerRef`, `enqueueController`), so one function serves
+    /// every event. A `Deleted` event carries the previous value, which stands
+    /// in for `DeletedFinalStateUnknown` (:339-350).
+    ///
+    /// Deviation: `updateJob` (:317-321) also wakes the OLD controller when the
+    /// controllerRef changed. A storage watch event carries no old object, so
+    /// only the current controller is woken.
+    async fn job_event_cronjob_key(&self, ev: &rusternetes_storage::WatchEvent) -> Option<String> {
+        use rusternetes_storage::WatchEvent;
+        let body = match ev {
+            WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) | WatchEvent::Deleted(_, v) => v,
+        };
+        let job: Job = serde_json::from_str(body).ok()?;
+        // metav1.GetControllerOf: the ref with controller=true.
+        let controller_ref = job
+            .metadata
+            .owner_references
+            .as_ref()?
+            .iter()
+            .find(|r| r.controller == Some(true))?;
+        // resolveControllerRef (:240-256): Kind, then Get by name, then UID.
+        if controller_ref.kind != "CronJob" {
+            return None;
+        }
+        let ns = job.metadata.namespace.as_deref()?;
+        let cronjob = self
+            .storage
+            .get::<CronJob>(&build_key("cronjobs", Some(ns), &controller_ref.name))
+            .await
+            .ok()?;
+        if cronjob.metadata.uid != controller_ref.uid {
+            return None;
+        }
+        Some(format!("cronjobs/{}/{}", ns, controller_ref.name))
+    }
+
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting CronJobController (watch-based)");
         let retry_interval = Duration::from_secs(5);
-        // CronJobs need frequent resync to check cron schedules, even without
-        // watch events — a cron trigger is time-based, not change-based.
-        let resync_secs = 10;
 
         let queue = WorkQueue::new();
 
@@ -269,10 +414,20 @@ impl<S: Storage + 'static> CronJobController<S> {
                 }
             };
 
-            // CronJobs use a shorter resync interval (10s) because cron
-            // schedules are time-triggered and must be checked frequently.
-            let mut resync = tokio::time::interval(Duration::from_secs(resync_secs));
-            resync.tick().await; // consume first immediate tick
+            // Job informer (cronjob_controllerv2.go:110-114): Job events wake
+            // the owning CronJob. Time triggers need no periodic resync:
+            // `sync` returns requeueAfter and the worker AddAfter's it.
+            let mut job_watch = match self.storage.watch("/registry/jobs/").await {
+                Ok(w) => w,
+                Err(e) => {
+                    error!(
+                        "Failed to establish job watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
+                    time::sleep(retry_interval).await;
+                    continue;
+                }
+            };
 
             let mut watch_broken = false;
             while !watch_broken {
@@ -293,8 +448,22 @@ impl<S: Storage + 'static> CronJobController<S> {
                             }
                         }
                     }
-                    _ = resync.tick() => {
-                        self.enqueue_all(&queue).await;
+                    event = job_watch.next() => {
+                        match event {
+                            Some(Ok(ev)) => {
+                                if let Some(key) = self.job_event_cronjob_key(&ev).await {
+                                    queue.add(key).await;
+                                }
+                            }
+                            Some(Err(e)) => {
+                                warn!("Job watch error: {}, reconnecting", e);
+                                watch_broken = true;
+                            }
+                            None => {
+                                warn!("Job watch stream ended, reconnecting");
+                                watch_broken = true;
+                            }
+                        }
                     }
                 }
             }
@@ -547,11 +716,51 @@ impl<S: Storage + 'static> CronJobController<S> {
         // `nextScheduleTimeDuration` (utils.go:188), evaluated against the
         // CronJob as it stands at each of upstream's requeue returns.
         let requeue = |cj: &CronJob| next_schedule_duration(&sched, tz, cj, now);
-        let Some(scheduled_time) = most_recent_schedule_time(&sched, tz, now, cronjob) else {
+        // :528-535: nextScheduleTime; an error is a user error in the spec, so
+        // record InvalidSchedule and do not reconcile until the spec changes.
+        let (scheduled_time, missed) = match next_schedule_time(cronjob, now, &sched, tz) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Invalid schedule {schedule:?} for {namespace}/{name}: {e}");
+                self.record_warning(
+                    cronjob,
+                    "InvalidSchedule",
+                    &format!("invalid schedule: {schedule} : {e}"),
+                )
+                .await;
+                return Ok(None);
+            }
+        };
+        let Some(scheduled_time) = scheduled_time else {
             // :536-543
             debug!("No unmet start times for {}/{}", namespace, name);
             return Ok(requeue(cronjob));
         };
+        // nextScheduleTime (utils.go:217-219).
+        if missed == MissedSchedules::Many {
+            self.record_warning(
+                cronjob,
+                "TooManyMissedTimes",
+                "too many missed start times. Set or decrease .spec.startingDeadlineSeconds or check clock skew",
+            )
+            .await;
+        }
+        // :546-563: past the starting deadline, skip this start.
+        if let Some(sds) = cronjob.spec.starting_deadline_seconds {
+            if scheduled_time + chrono::Duration::seconds(sds) < now {
+                self.record_warning(
+                    cronjob,
+                    "MissSchedule",
+                    &format!(
+                        "Missed scheduled time to start a job: {}",
+                        // time.RFC1123Z in UTC.
+                        scheduled_time.format("%a, %d %b %Y %H:%M:%S +0000")
+                    ),
+                )
+                .await;
+                return Ok(requeue(cronjob));
+            }
+        }
         // getJobName (:676): the Job is named from the SCHEDULED time.
         let scheduled_job_name = job_name_for(&name, scheduled_time);
         info!("CronJob {}/{} triggered at {}", namespace, name, now);
@@ -679,7 +888,9 @@ impl<S: Storage + 'static> CronJobController<S> {
         cronjob: &CronJob,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
         Ok(match self.parse_schedule(schedule, cronjob).await? {
-            Some((sched, tz)) => most_recent_schedule_time(&sched, tz, now, cronjob),
+            Some((sched, tz)) => next_schedule_time(cronjob, now, &sched, tz)
+                .ok()
+                .and_then(|(t, _)| t),
             None => None,
         })
     }
@@ -1533,6 +1744,75 @@ mod tests {
         assert_eq!(reasons(&storage).await, vec!["UnexpectedJob"]);
     }
 
+    // ---- Job event handlers (#2556) -------------------------------------
+
+    /// `addJob` / `updateJob` / `deleteJob`
+    /// (cronjob_controllerv2.go:279-362): a Job's controllerRef is resolved to
+    /// its CronJob (:240-256, Kind + name + UID) and that CronJob is enqueued.
+    #[tokio::test]
+    async fn job_events_enqueue_the_owning_cronjob() {
+        use rusternetes_storage::WatchEvent;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let job = job_json("j1", "j1-uid", true, None);
+        seed(
+            &storage,
+            &cj_json("* * * * *", "Allow", serde_json::json!({})),
+            std::slice::from_ref(&job),
+        )
+        .await;
+        let body = serde_json::to_string(&job).unwrap();
+        let k = "/registry/jobs/default/j1".to_string();
+        for ev in [
+            WatchEvent::Added(k.clone(), body.clone()),
+            WatchEvent::Modified(k.clone(), body.clone()),
+            WatchEvent::Deleted(k.clone(), body.clone()),
+        ] {
+            assert_eq!(
+                ctrl.job_event_cronjob_key(&ev).await.as_deref(),
+                Some("cronjobs/default/cj"),
+                "{ev:?}"
+            );
+        }
+    }
+
+    /// :357-361 / :240-256: orphans, a non-CronJob controller, a missing
+    /// CronJob and a UID mismatch all enqueue nothing.
+    #[tokio::test]
+    async fn job_events_ignore_unresolvable_controller_refs() {
+        use rusternetes_storage::WatchEvent;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        seed(
+            &storage,
+            &cj_json("* * * * *", "Allow", serde_json::json!({})),
+            &[],
+        )
+        .await;
+        let ev = |j: &rusternetes_common::resources::Job| {
+            WatchEvent::Added(
+                "/registry/jobs/default/j".into(),
+                serde_json::to_string(j).unwrap(),
+            )
+        };
+        let orphan = job_json("j", "u", false, None);
+        assert_eq!(ctrl.job_event_cronjob_key(&ev(&orphan)).await, None);
+        let mut wrong_kind = job_json("j", "u", true, None);
+        wrong_kind.metadata.owner_references.as_mut().unwrap()[0].kind = "Deployment".into();
+        assert_eq!(ctrl.job_event_cronjob_key(&ev(&wrong_kind)).await, None);
+        let mut wrong_uid = job_json("j", "u", true, None);
+        wrong_uid.metadata.owner_references.as_mut().unwrap()[0].uid = "other".into();
+        assert_eq!(ctrl.job_event_cronjob_key(&ev(&wrong_uid)).await, None);
+        let mut missing = job_json("j", "u", true, None);
+        missing.metadata.owner_references.as_mut().unwrap()[0].name = "gone".into();
+        assert_eq!(ctrl.job_event_cronjob_key(&ev(&missing)).await, None);
+        let mut not_ctrl = job_json("j", "u", true, None);
+        not_ctrl.metadata.owner_references.as_mut().unwrap()[0].controller = Some(false);
+        assert_eq!(ctrl.job_event_cronjob_key(&ev(&not_ctrl)).await, None);
+    }
+
     // ---- requeueAfter (#2398) -------------------------------------------
     // Ported from TestNextScheduleTimeDuration
     // (pkg/controller/cronjob/utils_test.go:614-702).
@@ -1643,6 +1923,390 @@ mod tests {
         let mut cj = seed(&storage, &cj, &[]).await;
         let after = ctrl.reconcile(&mut cj).await.unwrap().unwrap();
         assert!(after <= std::time::Duration::from_secs(61), "{after:?}");
+    }
+
+    // ---- startingDeadlineSeconds / missed schedules (#2557) -------------
+    // Ported from TestMostRecentScheduleTime (utils_test.go:348-612) and
+    // TestNextScheduleTime (utils_test.go:150-283). The `@every 1h` case is
+    // not ported: the `cron` crate has no `@every` descriptor.
+
+    fn cj_sds(
+        schedule: &str,
+        created: chrono::Duration,
+        last: Option<chrono::Duration>,
+        sds: Option<i64>,
+    ) -> rusternetes_common::resources::CronJob {
+        let mut cj = cj_fixture(serde_json::json!({"schedule": schedule}));
+        cj.metadata.creation_timestamp = Some(at(created));
+        cj.spec.starting_deadline_seconds = sds;
+        if let Some(l) = last {
+            cj.status = Some(Default::default());
+            cj.status.as_mut().unwrap().last_schedule_time = Some(at(l));
+        }
+        cj
+    }
+
+    #[test]
+    fn most_recent_schedule_time_matches_upstream_table() {
+        use super::MissedSchedules::{Few, Many, None as NoneMissed};
+        use chrono::Duration as D;
+        let z = D::zero();
+        let m = D::minutes;
+        let h = D::hours;
+        // (name, schedule, created, last, sds, includeSDS, now, earliest, recent, missed)
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(
+            &str,
+            &str,
+            D,
+            Option<D>,
+            Option<i64>,
+            bool,
+            D,
+            D,
+            Option<D>,
+            super::MissedSchedules,
+        )> = vec![
+            (
+                "now before next schedule",
+                "0 * * * *",
+                z,
+                None,
+                None,
+                false,
+                D::seconds(30),
+                z,
+                None,
+                NoneMissed,
+            ),
+            (
+                "now just after next schedule",
+                "0 * * * *",
+                z,
+                None,
+                None,
+                false,
+                m(61),
+                z,
+                Some(m(60)),
+                NoneMissed,
+            ),
+            (
+                "missed 5 schedules",
+                "0 * * * *",
+                D::seconds(10),
+                None,
+                None,
+                false,
+                m(301),
+                D::seconds(10),
+                Some(m(300)),
+                Few,
+            ),
+            (
+                "complex schedule",
+                "30 6-16/4 * * 1-5",
+                z,
+                Some(m(30)),
+                None,
+                false,
+                h(24) + m(31),
+                m(30),
+                Some(h(24) + m(30)),
+                Few,
+            ),
+            (
+                "another complex schedule",
+                "30 10,11,12 * * 1-5",
+                z,
+                Some(m(30)),
+                None,
+                false,
+                h(30) + m(30),
+                m(30),
+                None,
+                Few,
+            ),
+            (
+                "longer diff between executions",
+                "30 6-16/4 * * 1-5",
+                z,
+                Some(m(30)),
+                None,
+                false,
+                h(96) + m(31),
+                m(30),
+                Some(h(96) + m(30)),
+                Few,
+            ),
+            (
+                "shorter diff between executions",
+                "30 6-16/4 * * 1-5",
+                z,
+                None,
+                None,
+                false,
+                h(24) + m(31),
+                z,
+                Some(h(24) + m(30)),
+                Few,
+            ),
+            (
+                "earliestTime being CreationTimestamp and LastScheduleTime",
+                "0 * * * *",
+                z,
+                Some(z),
+                None,
+                false,
+                D::seconds(30),
+                z,
+                None,
+                NoneMissed,
+            ),
+            (
+                "earliestTime being LastScheduleTime",
+                "*/5 * * * *",
+                z,
+                Some(m(30)),
+                None,
+                false,
+                m(31),
+                m(30),
+                None,
+                NoneMissed,
+            ),
+            (
+                "earliestTime being LastScheduleTime (within StartingDeadlineSeconds)",
+                "*/5 * * * *",
+                z,
+                Some(m(30)),
+                Some(60),
+                false,
+                m(31),
+                m(30),
+                None,
+                NoneMissed,
+            ),
+            (
+                "earliestTime being LastScheduleTime (outside StartingDeadlineSeconds)",
+                "*/5 * * * *",
+                z,
+                Some(m(30)),
+                Some(60),
+                true,
+                m(32),
+                m(31),
+                None,
+                NoneMissed,
+            ),
+            // The deadline raises earliestTime (utils.go:106-113), so no
+            // backlog is counted: the next slot is after `now`.
+            (
+                "deadline bounds the missed count",
+                "0 * * * *",
+                z,
+                Some(m(1)),
+                Some(10),
+                true,
+                D::days(7) + m(5),
+                D::days(7) + m(5) - D::seconds(10),
+                None,
+                NoneMissed,
+            ),
+        ];
+        for (name, sched, created, last, sds, include, now, earliest, recent, missed) in cases {
+            let cj = cj_sds(sched, created, last, sds);
+            let (e, r, mm) = super::most_recent_schedule_time(
+                &cj,
+                at(now),
+                &std_schedule(sched),
+                chrono_tz::UTC,
+                include,
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(e, at(earliest), "{name}: earliest");
+            assert_eq!(r, recent.map(at), "{name}: recent");
+            assert_eq!(mm, missed, "{name}: missed");
+        }
+        // > 100 missed schedules and no deadline: manyMissed (utils.go:147-148).
+        let cj = cj_sds("0 * * * *", z, None, None);
+        let (_, r, mm) = super::most_recent_schedule_time(
+            &cj,
+            at(D::days(7)),
+            &std_schedule("0 * * * *"),
+            chrono_tz::UTC,
+            true,
+        )
+        .unwrap();
+        assert_eq!(r, Some(at(D::days(7))));
+        assert_eq!(mm, Many);
+    }
+
+    /// "rogue cronjob" (utils_test.go:496-510): a grammatically valid schedule
+    /// that never fires errors (utils.go:118-121).
+    #[test]
+    fn rogue_schedule_errors() {
+        let cj = cj_sds("59 23 31 2 *", chrono::Duration::seconds(10), None, None);
+        let err = super::most_recent_schedule_time(
+            &cj,
+            at(chrono::Duration::hours(1)),
+            &std_schedule("59 23 31 2 *"),
+            chrono_tz::UTC,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "time difference between two schedules is less than 1 second"
+        );
+    }
+
+    #[test]
+    fn next_schedule_time_matches_upstream_cases() {
+        use chrono::Duration as D;
+        let s = "0 * * * *";
+        let sch = std_schedule(s);
+        let next = |cj: &rusternetes_common::resources::CronJob, now: D| {
+            super::next_schedule_time(cj, at(now), &sch, chrono_tz::UTC)
+        };
+        // Case 1: nothing due yet.
+        let cj = cj_sds(s, D::minutes(-10), None, None);
+        assert_eq!(next(&cj, D::minutes(-7)).unwrap().0, None);
+        // Case 2: one needed.
+        assert_eq!(next(&cj, D::seconds(2)).unwrap().0, Some(at(D::zero())));
+        // Case 3: known LastScheduleTime, no start needed.
+        let cj = cj_sds(s, D::minutes(-10), Some(D::zero()), None);
+        assert_eq!(next(&cj, D::minutes(2)).unwrap().0, None);
+        // Case 4: known LastScheduleTime, a start needed.
+        assert_eq!(
+            next(&cj, D::hours(1) + D::minutes(5)).unwrap().0,
+            Some(at(D::hours(1)))
+        );
+        // Case 5.
+        let cj = cj_sds(s, D::hours(-2), Some(D::hours(-1)), None);
+        assert_eq!(
+            next(&cj, D::hours(1) + D::minutes(5)).unwrap().0,
+            Some(at(D::hours(1)))
+        );
+        // Case 6: way ahead, no deadline.
+        let now = D::hours(1) + D::days(10);
+        assert!(next(&cj, now).unwrap().0.is_some());
+        // Case 7: way ahead, short deadline.
+        let cj = cj_sds(s, D::hours(-2), Some(D::hours(-1)), Some(7200));
+        assert_eq!(next(&cj, now).unwrap().0, Some(at(now)));
+        // Case 8: the error is propagated.
+        let cj = cj_sds("59 23 31 2 *", D::seconds(10), None, None);
+        let rogue = std_schedule("59 23 31 2 *");
+        assert!(super::next_schedule_time(&cj, at(D::hours(1)), &rogue, chrono_tz::UTC).is_err());
+    }
+
+    /// TooManyMissedTimes (utils.go:170-173), recorded as a Warning when more
+    /// than 100 starts were missed and there is no deadline.
+    #[tokio::test]
+    async fn too_many_missed_times_records_warning() {
+        use rusternetes_common::resources::Event;
+        use rusternetes_storage::Storage;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let mut cj = cj_json("* * * * *", "Allow", serde_json::json!({}));
+        cj.metadata.creation_timestamp = Some(chrono::Utc::now() - chrono::Duration::hours(10));
+        let mut cj = seed(&storage, &cj, &[]).await;
+        ctrl.reconcile(&mut cj).await.unwrap();
+        let evs = storage
+            .list::<Event>("/registry/events/default/")
+            .await
+            .unwrap();
+        let ev = evs
+            .iter()
+            .find(|e| e.reason == "TooManyMissedTimes")
+            .unwrap_or_else(|| panic!("no TooManyMissedTimes in {evs:?}"));
+        assert_eq!(
+            ev.message,
+            "too many missed start times. Set or decrease .spec.startingDeadlineSeconds or check clock skew"
+        );
+    }
+
+    /// With a deadline the same backlog is not "many" and records nothing.
+    #[tokio::test]
+    async fn deadline_suppresses_too_many_missed_times() {
+        use rusternetes_common::resources::Event;
+        use rusternetes_storage::Storage;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let mut cj = cj_json("* * * * *", "Allow", serde_json::json!({}));
+        cj.metadata.creation_timestamp = Some(chrono::Utc::now() - chrono::Duration::hours(10));
+        cj.spec.starting_deadline_seconds = Some(120);
+        let mut cj = seed(&storage, &cj, &[]).await;
+        ctrl.reconcile(&mut cj).await.unwrap();
+        let evs = storage
+            .list::<Event>("/registry/events/default/")
+            .await
+            .unwrap();
+        assert!(
+            evs.iter().all(|e| e.reason != "TooManyMissedTimes"),
+            "{evs:?}"
+        );
+    }
+
+    /// InvalidSchedule (cronjob_controllerv2.go:528-535):
+    /// `invalid schedule: %s : %s`, and nothing is requeued.
+    #[tokio::test]
+    async fn invalid_schedule_records_event_and_does_not_requeue() {
+        use rusternetes_common::resources::Event;
+        use rusternetes_storage::Storage;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let mut cj = cj_json("59 23 31 2 *", "Allow", serde_json::json!({}));
+        cj.metadata.creation_timestamp = Some(chrono::Utc::now() - chrono::Duration::hours(2));
+        let mut cj = seed(&storage, &cj, &[]).await;
+        assert!(ctrl.reconcile(&mut cj).await.unwrap().is_none());
+        let evs = storage
+            .list::<Event>("/registry/events/default/")
+            .await
+            .unwrap();
+        let ev = evs.iter().find(|e| e.reason == "InvalidSchedule").unwrap();
+        assert_eq!(
+            ev.message,
+            "invalid schedule: 59 23 31 2 * : time difference between two schedules is less than 1 second"
+        );
+    }
+
+    /// robfig/cron v3 dow bounds are {0, 6} (vendor/github.com/robfig/cron/v3/
+    /// spec.go:40), so 7 and reversed ranges are parse errors
+    /// (parser.go:304-309), including the `n-0` and `n-7` edges.
+    #[test]
+    fn day_of_week_bounds_match_robfig() {
+        let err = |s: &str| super::parse_standard_schedule(s).unwrap_err();
+        assert_eq!(err("0 0 * * 7"), "end of range (7) above maximum (6): 7");
+        assert_eq!(
+            err("0 0 * * 1-7"),
+            "end of range (7) above maximum (6): 1-7"
+        );
+        assert_eq!(
+            err("0 0 * * 0-7"),
+            "end of range (7) above maximum (6): 0-7"
+        );
+        assert_eq!(
+            err("0 0 * * 5-0"),
+            "beginning of range (5) beyond end of range (0): 5-0"
+        );
+        assert_eq!(
+            err("0 0 * * 1,6-2"),
+            "beginning of range (6) beyond end of range (2): 6-2"
+        );
+        // Valid forms still parse, `N/step` meaning `N-6/step`.
+        for ok in [
+            "0 0 * * 0-6",
+            "0 0 * * 4",
+            "0 0 * * 1-5",
+            "0 0 * * 4/2",
+            "0 0 * * SUN-SAT",
+        ] {
+            assert!(super::parse_standard_schedule(ok).is_ok(), "{ok}");
+        }
     }
 
     // ---- NamespaceTerminatingCause on create (#2398) --------------------

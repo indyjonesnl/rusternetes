@@ -27,6 +27,11 @@ const UPDATE_BACKOFF_STEPS: u32 = 4;
 const UPDATE_BACKOFF_DURATION: std::time::Duration = std::time::Duration::from_millis(10);
 const UPDATE_BACKOFF_FACTOR: u32 = 5;
 
+/// `initBackoff` (`csi_plugin.go:388-393`): 6 steps, 30ms, factor 8.
+const INIT_BACKOFF_STEPS: u32 = 6;
+const INIT_BACKOFF_DURATION: std::time::Duration = std::time::Duration::from_millis(30);
+const INIT_BACKOFF_FACTOR: u32 = 8;
+
 /// The `Interface` subset the registration handler needs
 /// (`nodeinfomanager.go:75-91`): record / remove a driver's node info.
 #[async_trait]
@@ -127,6 +132,73 @@ impl<S: Storage> NodeInfoManager<S> {
             }
         })
         .await
+    }
+
+    /// `initializeCSINode`'s goroutine (`csi_plugin.go:374-415`): keep the
+    /// kubelet NotReady (`SetKubeletError`) until the CSINode exists and is
+    /// owned by the Node. First waits forever for the API server
+    /// (`waitForAPIServerForever`, `csi_plugin.go:972-1000`), then retries
+    /// `InitializeCSINodeWithAnnotation` over `initBackoff` (6 steps, 30ms,
+    /// factor 8 -- ~140s). `Err` after the steps run out is upstream's
+    /// `klog.Fatalf` (the kubelet restarts to retry).
+    pub async fn initialize_csi_node_gating_ready(
+        &self,
+        set_kubelet_error: impl Fn(Option<String>),
+    ) -> Result<(), String> {
+        self.initialize_csi_node_gating_ready_with(
+            set_kubelet_error,
+            INIT_BACKOFF_STEPS,
+            INIT_BACKOFF_DURATION,
+        )
+        .await
+    }
+
+    async fn initialize_csi_node_gating_ready_with(
+        &self,
+        set_kubelet_error: impl Fn(Option<String>),
+        steps: u32,
+        duration: std::time::Duration,
+    ) -> Result<(), String> {
+        // `kvh.SetKubeletError(errors.New("CSINode is not yet initialized"))`
+        // (csi_plugin.go:374).
+        set_kubelet_error(Some("CSINode is not yet initialized".into()));
+        // `wait.PollImmediateInfinite(time.Second, ...)`: any answer but a
+        // transport/permission error (success or NotFound) proves the API
+        // server is reachable.
+        loop {
+            match self.storage.get::<CSINode>(&self.csinode_key()).await {
+                Ok(_) | Err(rusternetes_common::Error::NotFound(_)) => break,
+                Err(e) => {
+                    tracing::debug!(
+                        "Failed to contact API server when waiting for CSINode publishing: {e}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+        let mut delay = duration;
+        let mut last = String::new();
+        for step in 0..steps {
+            match self.initialize_csi_node().await {
+                Ok(()) => {
+                    // Allow the kubelet to post Ready (csi_plugin.go:404).
+                    set_kubelet_error(None);
+                    return Ok(());
+                }
+                Err(e) => {
+                    set_kubelet_error(Some(format!("failed to initialize CSINode: {e}")));
+                    tracing::error!("Failed to initialize CSINode: {e}");
+                    last = e;
+                }
+            }
+            if step + 1 < steps {
+                tokio::time::sleep(delay).await;
+                delay *= INIT_BACKOFF_FACTOR;
+            }
+        }
+        Err(format!(
+            "Failed to initialize CSINode after retrying: {last}"
+        ))
     }
 
     /// `CreateCSINode` (`nodeinfomanager.go:505-532`), minus the migration
@@ -643,6 +715,52 @@ mod tests {
         }
         let nim = NodeInfoManager::new("node1", st.clone());
         (st, nim)
+    }
+
+    type ErrLog = Arc<std::sync::Mutex<Vec<Option<String>>>>;
+
+    fn recorder() -> (ErrLog, impl Fn(Option<String>)) {
+        let log: ErrLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let l = log.clone();
+        (log, move |e| l.lock().unwrap().push(e))
+    }
+
+    /// csi_plugin.go:374,404: NotReady first, cleared only once the CSINode
+    /// is installed and owned by the Node.
+    #[tokio::test]
+    async fn gate_sets_error_then_clears_once_csinode_initialized() {
+        let (st, nim) = setup(node(vec![], vec![], vec![]), None).await;
+        let (log, set) = recorder();
+        nim.initialize_csi_node_gating_ready(set).await.unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![Some("CSINode is not yet initialized".to_string()), None]
+        );
+        assert!(got(&st).await.1.is_some());
+    }
+
+    /// csi_plugin.go:398,413: failures keep the kubelet NotReady with the
+    /// cause and give up (upstream `klog.Fatalf`) after the backoff.
+    #[tokio::test]
+    async fn gate_stays_not_ready_and_errors_after_backoff() {
+        let st = Arc::new(MemoryStorage::new()); // no Node: init always fails
+        let nim = NodeInfoManager::new("node1", st);
+        let (log, set) = recorder();
+        let err = nim
+            .initialize_csi_node_gating_ready_with(set, 2, std::time::Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(
+            err.starts_with("Failed to initialize CSINode after retrying"),
+            "{err}"
+        );
+        let log = log.lock().unwrap();
+        assert_eq!(log[0].as_deref(), Some("CSINode is not yet initialized"));
+        assert!(log[1]
+            .as_ref()
+            .unwrap()
+            .starts_with("failed to initialize CSINode: "));
+        assert!(log.last().unwrap().is_some(), "never cleared");
     }
 
     async fn got(st: &MemoryStorage) -> (Node, Option<CSINode>) {

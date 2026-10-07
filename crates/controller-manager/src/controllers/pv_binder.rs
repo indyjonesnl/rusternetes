@@ -75,22 +75,6 @@ fn parse_quantity_nano(q: &str) -> Option<i128> {
     Some(sign * digits.checked_mul(nano)? / scale)
 }
 
-/// `updateMigrationAnnotations(..., claim=true)`
-/// (`pv_controller_base.go:445-496`) with CSI migration disabled for every
-/// plugin: a claim carrying a provisioner annotation (`AnnStorageProvisioner`,
-/// else the beta one; `:455-470`) loses a non-empty `migrated-to` annotation
-/// (`:486-490`). Returns whether the map changed.
-fn update_claim_migration_annotations_map(
-    ann: Option<&mut std::collections::HashMap<String, String>>,
-) -> bool {
-    let Some(ann) = ann else { return false };
-    if !ann.contains_key(ANN_STORAGE_PROVISIONER) && !ann.contains_key(ANN_BETA_STORAGE_PROVISIONER)
-    {
-        return false;
-    }
-    ann.get(ANN_MIGRATED_TO).is_some_and(|v| !v.is_empty()) && ann.remove(ANN_MIGRATED_TO).is_some()
-}
-
 /// `volumeCap.Cmp(claimCap) == 0` (`pv_controller.go:835`); unparsable
 /// quantities compare by their text.
 fn quantity_eq(a: &str, b: &str) -> bool {
@@ -359,9 +343,6 @@ impl<S: Storage + 'static> PVBinderController<S> {
     /// * claim bound elsewhere: a dynamically provisioned `Delete` volume is
     ///   released and reclaimed; otherwise `unbindVolume` (`:737-770`).
     ///
-    /// Not ported (see issue #2185 follow-up):
-    /// `updateVolumeMigrationAnnotationsAndFinalizers` (`:565`; in-tree to CSI
-    /// migration, which Rusternetes has no plugins for).
     async fn sync_volume(&self, pv: PersistentVolume, claim_queue: &WorkQueue) -> Result<()> {
         // "Set correct "migrated-to" annotations and modify finalizers on PV and
         // update in API server if necessary" (`pv_controller.go:565-573`).
@@ -544,7 +525,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
         &self,
         mut pv: PersistentVolume,
     ) -> Result<PersistentVolume> {
-        let ann_modified = update_migration_annotations(pv.metadata.annotations.as_mut());
+        let ann_modified = update_migration_annotations(pv.metadata.annotations.as_mut(), false);
         let (finalizers, finalizers_modified) = modify_deletion_finalizers(&pv);
         if !ann_modified && !finalizers_modified {
             return Ok(pv);
@@ -707,16 +688,13 @@ impl<S: Storage + 'static> PVBinderController<S> {
     /// `updateClaimMigrationAnnotations` (`pv_controller_base.go:336-359`):
     /// when the claim's provisioner annotation says it is (no longer)
     /// CSI-migrated, anneal `pv.kubernetes.io/migrated-to` and `Update` the
-    /// claim. Deviation: Rusternetes has no CSI-migrated in-tree plugins, so
-    /// `IsMigrationEnabledForPlugin` is always false and only the rollback
-    /// branch of `updateMigrationAnnotations` (`:482-490`, "Migration
-    /// annotation exists but the driver isn't migrated currently") applies.
+    /// claim.
     async fn update_claim_migration_annotations(
         &self,
         pvc: &mut PersistentVolumeClaim,
     ) -> Result<()> {
         let mut annotated = pvc.clone();
-        if !update_claim_migration_annotations_map(annotated.metadata.annotations.as_mut()) {
+        if !update_migration_annotations(annotated.metadata.annotations.as_mut(), true) {
             return Ok(());
         }
         let key = build_key(
@@ -1499,24 +1477,75 @@ const IN_TREE_PV_DELETION_PROTECTION_FINALIZER: &str = "kubernetes.io/pv-control
 const EXTERNAL_PV_DELETION_PROTECTION_FINALIZER: &str =
     "external-provisioner.volume.kubernetes.io/finalizer";
 
-/// `updateMigrationAnnotations` (`pv_controller_base.go:445-496`) for a volume
-/// (`claim == false`). Deviation: Rusternetes has no CSI-migrated in-tree
-/// plugins, so `IsMigrationEnabledForPlugin` is always false and only the
-/// rollback branch ("Migration annotation exists but the driver isn't migrated
-/// currently") applies.
+/// `csilibplugins.*InTreePluginName` -> `*DriverName`, the entries of
+/// `inTreePlugins` in `csi-translation-lib/translate.go:30-38` (names from
+/// `plugins/{aws_ebs,gce_pd,azure_file,azure_disk,openstack_cinder,
+/// vsphere_volume,portworx}.go`). Only the name mapping is ported; Rusternetes
+/// has no volume-source translation.
+const IN_TREE_TO_CSI_DRIVER: &[(&str, &str)] = &[
+    ("kubernetes.io/gce-pd", "pd.csi.storage.gke.io"),
+    ("kubernetes.io/aws-ebs", "ebs.csi.aws.com"),
+    ("kubernetes.io/cinder", "cinder.csi.openstack.org"),
+    ("kubernetes.io/azure-disk", "disk.csi.azure.com"),
+    ("kubernetes.io/azure-file", "file.csi.azure.com"),
+    ("kubernetes.io/vsphere-volume", "csi.vsphere.vmware.com"),
+    ("kubernetes.io/portworx-volume", "pxd.portworx.com"),
+];
+
+/// `CSITranslator.GetCSINameFromInTreeName` (`translate.go:168-175`).
+fn csi_name_from_in_tree_name(plugin: &str) -> Option<&'static str> {
+    IN_TREE_TO_CSI_DRIVER
+        .iter()
+        .find(|(p, _)| *p == plugin)
+        .map(|(_, d)| *d)
+}
+
+/// `PluginManager.IsMigrationEnabledForPlugin`
+/// (`pkg/volume/csimigration/plugin_manager.go:85-107`). In 1.35 every
+/// per-plugin gate is GA and locked on (`CSIMigrationPortworx`:
+/// `kube_features.go:1178`), so each translator plugin is migrated.
+fn is_migration_enabled_for_plugin(plugin: &str) -> bool {
+    csi_name_from_in_tree_name(plugin).is_some()
+}
+
+/// `updateMigrationAnnotations` (`pv_controller_base.go:445-496`): the one
+/// helper for volumes (`claim == false`, provisioner key
+/// `AnnDynamicallyProvisioned`) and claims (`claim == true`, key
+/// `AnnStorageProvisioner`, else the beta key; `:455-470`). Adds
+/// `migrated-to` for a migrated plugin (`:477-485`) and removes it when
+/// migration is off (`:486-490`). Returns whether the map changed.
 fn update_migration_annotations(
     ann: Option<&mut std::collections::HashMap<String, String>>,
+    claim: bool,
 ) -> bool {
     let Some(ann) = ann else { return false };
-    if !ann.contains_key(ANN_DYNAMICALLY_PROVISIONED) {
-        // Volume statically provisioned.
+    let provisioner = if claim {
+        ann.get(ANN_STORAGE_PROVISIONER)
+            .or_else(|| ann.get(ANN_BETA_STORAGE_PROVISIONER))
+    } else {
+        ann.get(ANN_DYNAMICALLY_PROVISIONED)
+    };
+    let Some(provisioner) = provisioner.cloned() else {
         return false;
+    };
+    let migrated_to = ann.get(ANN_MIGRATED_TO).cloned().unwrap_or_default();
+    if is_migration_enabled_for_plugin(&provisioner) {
+        let Some(driver) = csi_name_from_in_tree_name(&provisioner) else {
+            return false;
+        };
+        if migrated_to != driver {
+            ann.insert(ANN_MIGRATED_TO.to_string(), driver.to_string());
+            return true;
+        }
+    } else if !migrated_to.is_empty() {
+        ann.remove(ANN_MIGRATED_TO);
+        return true;
     }
-    ann.get(ANN_MIGRATED_TO).is_some_and(|v| !v.is_empty()) && ann.remove(ANN_MIGRATED_TO).is_some()
+    false
 }
 
 /// `modifyDeletionFinalizers` (`pv_controller_base.go:398-443`) with CSI
-/// migration disabled for every plugin (see `update_migration_annotations`);
+/// migration per `is_migration_enabled_for_plugin`;
 /// `HonorPVReclaimPolicy` is GA and locked on in 1.35. Returns the new
 /// finalizers and whether they changed.
 fn modify_deletion_finalizers(pv: &PersistentVolume) -> (Option<Vec<String>>, bool) {
@@ -1530,12 +1559,27 @@ fn modify_deletion_finalizers(pv: &PersistentVolume) -> (Option<Vec<String>>, bo
         // Supported only for dynamically provisioned volumes.
         return unchanged();
     };
-    if !provisioner.starts_with("kubernetes.io/") {
-        return unchanged();
-    }
     let mut out = pv.metadata.finalizers.clone().unwrap_or_default();
     let mut modified = false;
     let has = |out: &[String], f: &str| out.iter().any(|x| x == f);
+    if is_migration_enabled_for_plugin(provisioner) {
+        // `:411-420`: remove the in-tree delete finalizer, migration is on.
+        if has(&out, IN_TREE_PV_DELETION_PROTECTION_FINALIZER) {
+            out.retain(|f| f != IN_TREE_PV_DELETION_PROTECTION_FINALIZER);
+            modified = true;
+        }
+        return (
+            if modified {
+                Some(out).filter(|o| !o.is_empty())
+            } else {
+                pv.metadata.finalizers.clone()
+            },
+            modified,
+        );
+    }
+    if !provisioner.starts_with("kubernetes.io/") {
+        return unchanged();
+    }
     let policy = pv.spec.persistent_volume_reclaim_policy.as_ref();
     if policy == Some(&PersistentVolumeReclaimPolicy::Delete)
         && !has(&out, IN_TREE_PV_DELETION_PROTECTION_FINALIZER)
@@ -1739,6 +1783,146 @@ mod tests {
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
     use rusternetes_storage::memory::MemoryStorage;
     use std::collections::HashMap;
+
+    fn ann_map(kv: &[(&str, &str)]) -> HashMap<String, String> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// pv_controller_test.go TestAnnealMigrationAnnotations: every case, run
+    /// through the one `updateMigrationAnnotations(..., claim)` helper
+    /// (`pv_controller_base.go:445-496`). Migrated plugin = gce-pd
+    /// (`IsMigrationEnabledForPlugin`, plugin_manager.go:85-107); non-migrated
+    /// = rbd; `non-migrated-plugin` = unknown.
+    #[test]
+    fn anneal_migration_annotations_table() {
+        const GCE: &str = "kubernetes.io/gce-pd";
+        const GCE_DRIVER: &str = "pd.csi.storage.gke.io";
+        const RBD: &str = "kubernetes.io/rbd";
+        const RBD_DRIVER: &str = "rbd.csi.ceph.com";
+        let vol = ANN_DYNAMICALLY_PROVISIONED;
+        let claim = ANN_STORAGE_PROVISIONER;
+        let beta = ANN_BETA_STORAGE_PROVISIONER;
+        // (key, in, expected, is_claim)
+        type Kv<'a> = Vec<(&'a str, &'a str)>;
+        let cases: Vec<(&str, Kv, Kv, bool)> = vec![
+            (
+                "vol on",
+                vec![(vol, GCE)],
+                vec![(vol, GCE), (ANN_MIGRATED_TO, GCE_DRIVER)],
+                false,
+            ),
+            (
+                "claim on",
+                vec![(claim, GCE)],
+                vec![(claim, GCE), (ANN_MIGRATED_TO, GCE_DRIVER)],
+                true,
+            ),
+            (
+                "claim on beta",
+                vec![(beta, GCE)],
+                vec![(beta, GCE), (ANN_MIGRATED_TO, GCE_DRIVER)],
+                true,
+            ),
+            ("vol off", vec![(vol, RBD)], vec![(vol, RBD)], false),
+            ("claim off", vec![(claim, RBD)], vec![(claim, RBD)], true),
+            (
+                "vol rollback",
+                vec![(vol, RBD), (ANN_MIGRATED_TO, RBD_DRIVER)],
+                vec![(vol, RBD)],
+                false,
+            ),
+            (
+                "claim rollback",
+                vec![(claim, RBD), (ANN_MIGRATED_TO, RBD_DRIVER)],
+                vec![(claim, RBD)],
+                true,
+            ),
+            (
+                "claim rollback beta",
+                vec![(beta, RBD), (ANN_MIGRATED_TO, RBD_DRIVER)],
+                vec![(beta, RBD)],
+                true,
+            ),
+            (
+                "vol other",
+                vec![(vol, "non-migrated-plugin")],
+                vec![(vol, "non-migrated-plugin")],
+                false,
+            ),
+            ("not provisioned", vec![], vec![], false),
+            (
+                "wrong key for kind",
+                vec![(claim, GCE)],
+                vec![(claim, GCE)],
+                false,
+            ),
+            (
+                "vol stale driver",
+                vec![(vol, GCE), (ANN_MIGRATED_TO, "old")],
+                vec![(vol, GCE), (ANN_MIGRATED_TO, GCE_DRIVER)],
+                false,
+            ),
+        ];
+        for (name, input, want, is_claim) in cases {
+            let mut ann = ann_map(&input);
+            let changed = update_migration_annotations(Some(&mut ann), is_claim);
+            assert_eq!(ann, ann_map(&want), "{name}");
+            assert_eq!(
+                changed,
+                input.iter().collect::<std::collections::BTreeSet<_>>() != want.iter().collect(),
+                "{name}: changed flag"
+            );
+        }
+        assert!(!update_migration_annotations(None, true));
+    }
+
+    /// `IsMigrationEnabledForPlugin` (plugin_manager.go:85-107) with the
+    /// 1.35 GA-locked gates: all seven translator plugins are migrated.
+    #[test]
+    fn migration_enabled_plugins_match_upstream() {
+        for (plugin, driver) in [
+            ("kubernetes.io/aws-ebs", "ebs.csi.aws.com"),
+            ("kubernetes.io/gce-pd", "pd.csi.storage.gke.io"),
+            ("kubernetes.io/azure-file", "file.csi.azure.com"),
+            ("kubernetes.io/azure-disk", "disk.csi.azure.com"),
+            ("kubernetes.io/cinder", "cinder.csi.openstack.org"),
+            ("kubernetes.io/vsphere-volume", "csi.vsphere.vmware.com"),
+            ("kubernetes.io/portworx-volume", "pxd.portworx.com"),
+        ] {
+            assert!(is_migration_enabled_for_plugin(plugin), "{plugin}");
+            assert_eq!(csi_name_from_in_tree_name(plugin), Some(driver));
+        }
+        assert!(!is_migration_enabled_for_plugin("kubernetes.io/rbd"));
+        assert_eq!(csi_name_from_in_tree_name("kubernetes.io/rbd"), None);
+    }
+
+    /// TestModifyDeletionFinalizers migration-on branch
+    /// (`pv_controller_base.go:411-420`): the in-tree delete finalizer is
+    /// removed for a migrated plugin and nothing else is touched.
+    #[test]
+    fn modify_deletion_finalizers_migration_on_removes_in_tree_finalizer() {
+        let mut pv = pv_with("m", None, Some(PersistentVolumePhase::Available));
+        pv.metadata.annotations = Some(ann_map(&[(
+            ANN_DYNAMICALLY_PROVISIONED,
+            "kubernetes.io/gce-pd",
+        )]));
+        pv.spec.persistent_volume_reclaim_policy = Some(PersistentVolumeReclaimPolicy::Delete);
+        pv.metadata.finalizers = Some(vec![
+            IN_TREE_PV_DELETION_PROTECTION_FINALIZER.into(),
+            EXTERNAL_PV_DELETION_PROTECTION_FINALIZER.into(),
+        ]);
+        let (out, modified) = modify_deletion_finalizers(&pv);
+        assert!(modified);
+        assert_eq!(
+            out,
+            Some(vec![EXTERNAL_PV_DELETION_PROTECTION_FINALIZER.to_string()])
+        );
+        // migrated plugin without the in-tree finalizer: unchanged (no add).
+        pv.metadata.finalizers = None;
+        assert!(!modify_deletion_finalizers(&pv).1);
+    }
 
     #[test]
     fn test_storage_comparison() {

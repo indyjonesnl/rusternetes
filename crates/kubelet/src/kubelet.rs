@@ -134,8 +134,9 @@ pub enum PodWorkerState {
 /// The first restart after a crash is immediate. Matches upstream
 /// `pkg/kubelet/kubelet.go` `backOffPeriod = 10s`.
 const CRASHLOOP_BACKOFF_INITIAL: Duration = Duration::from_secs(10);
-/// Maximum CrashLoopBackOff delay. Matches upstream `MaxCrashLoopBackOff` (5m).
-const CRASHLOOP_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// Default maximum CrashLoopBackOff delay: upstream `MaxCrashLoopBackOff` (5m),
+/// overridable by `crashLoopBackOff.maxContainerRestartPeriod`.
+const CRASHLOOP_BACKOFF_MAX: Duration = crate::config::MAX_CONTAINER_BACKOFF;
 
 /// Defensive backoff for a terminal pod whose `finalize_terminated_pod_storage`
 /// reported removal but left the object in storage (#1157). The per-pod worker
@@ -451,6 +452,8 @@ pub struct Kubelet {
     /// ticked recently. Mirrors upstream `pkg/kubelet/kubelet.go`'s
     /// `syncLoopMonitor`. 0 = no successful sync yet.
     last_sync: AtomicU64,
+    /// Effective `crashLoopBackOff.maxContainerRestartPeriod` (default 5m).
+    crash_loop_backoff_max: Duration,
     /// Port the kubelet API server listens on (the `--metrics-port` flag).
     /// Advertised in the node's `status.daemonEndpoints.kubeletEndpoint.Port`
     /// so the api-server proxies log/exec/metrics requests to the right port.
@@ -661,7 +664,7 @@ impl Kubelet {
         metrics_port: u16,
         allowed_unsafe_sysctls: Vec<String>,
     ) -> Result<Self> {
-        // CRI runtime backend (containerd + Youki). The endpoint and runtime
+        // CRI runtime backend (containerd + crun). The endpoint and runtime
         // handler come from the standard kubelet env vars; pod networking is
         // owned entirely by containerd's CNI plugin (CNI is the only
         // pod-networking path). `allowed_unsafe_sysctls` IS wired: it builds
@@ -739,6 +742,7 @@ impl Kubelet {
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
             pod_workers: Arc::new(Mutex::new(HashMap::new())),
             last_sync: AtomicU64::new(0),
+            crash_loop_backoff_max: CRASHLOOP_BACKOFF_MAX,
             metrics_port,
             pod_manifest_path: None,
             node_status_update_frequency: Duration::from_secs(10),
@@ -796,6 +800,22 @@ impl Kubelet {
             .iter()
             .map(|p| (p.metadata.name.clone(), p.clone()))
             .collect();
+    }
+
+    /// Apply `crashLoopBackOff.maxContainerRestartPeriod` (already validated to
+    /// [1s, 300s]; `None` keeps the 300s default). Ported from
+    /// `newCrashLoopBackOff` (pkg/kubelet/kubelet.go:345-358).
+    pub fn with_crash_loop_backoff_max(mut self, d: Option<Duration>) -> Self {
+        if let Some(d) = d {
+            self.crash_loop_backoff_max = d;
+        }
+        self
+    }
+
+    /// Initial backoff: 10s, clamped to the max (`if boMax < boInitial { boInitial = boMax }`,
+    /// kubelet.go:356-358).
+    pub(crate) fn crash_loop_backoff_initial(&self) -> Duration {
+        CRASHLOOP_BACKOFF_INITIAL.min(self.crash_loop_backoff_max)
     }
 
     /// Apply `KubeletConfiguration.runtimeRequestTimeout` (2m when unset/zero,
@@ -1263,11 +1283,18 @@ impl Kubelet {
         self.runtime_state.update_from_status(status);
     }
 
+    /// `kubeletVolumeHost.SetKubeletError` (pkg/kubelet/volume_host.go:122):
+    /// the CSI plugin's way to keep the node NotReady until it is initialized.
+    pub fn set_kubelet_error(&self, err: Option<String>) {
+        self.runtime_state.set_storage_state(err);
+    }
+
     /// Errors gating NodeReady (setters.go:491 runtime + network + storage).
     fn ready_errors(&self) -> Vec<String> {
         [
             self.runtime_state.runtime_errors(),
             self.runtime_state.network_errors(),
+            self.runtime_state.storage_errors(),
         ]
         .into_iter()
         .flatten()
@@ -1997,7 +2024,7 @@ impl Kubelet {
             .map(|p| p.metadata.uid.clone())
             .filter(|uid| !uid.is_empty())
             .collect();
-        // Unpublish CSI volumes first: upstream's reconciler unmounts before
+        // Unmount volumes first: upstream's reconciler unmounts before
         // cleanupOrphanedPodDirs, which refuses to remove a mounted volume.
         // Pods that are deleted (not in the live set) and pods that are
         // terminated but still in the API both no longer want their volumes.
@@ -2009,7 +2036,7 @@ impl Kubelet {
             .filter(|uid| !uid.is_empty())
             .collect();
         self.runtime
-            .unmount_csi_volumes(&live_pod_uids, &terminated_pod_uids)
+            .unmount_orphaned_volumes(&live_pod_uids, &terminated_pod_uids)
             .await;
         // ...then release the staged devices nothing holds or wants any more
         // (reconciler unmountDetachDevices, reconciler_common.go:273): after
@@ -3187,7 +3214,7 @@ impl Kubelet {
                                                 RestartBackoff {
                                                     restart_count: 1,
                                                     last_restart: now,
-                                                    backoff: CRASHLOOP_BACKOFF_INITIAL,
+                                                    backoff: self.crash_loop_backoff_initial(),
                                                 },
                                             );
                                             (true, 1)
@@ -3198,8 +3225,8 @@ impl Kubelet {
                                             {
                                                 entry.restart_count += 1;
                                                 entry.last_restart = now;
-                                                entry.backoff =
-                                                    (entry.backoff * 2).min(CRASHLOOP_BACKOFF_MAX);
+                                                entry.backoff = (entry.backoff * 2)
+                                                    .min(self.crash_loop_backoff_max);
                                                 (true, entry.restart_count)
                                             } else {
                                                 (false, entry.restart_count)
@@ -5105,7 +5132,7 @@ impl Kubelet {
                             RestartBackoff {
                                 restart_count: 1,
                                 last_restart: now,
-                                backoff: CRASHLOOP_BACKOFF_INITIAL,
+                                backoff: self.crash_loop_backoff_initial(),
                             },
                         );
                         true
@@ -5114,7 +5141,7 @@ impl Kubelet {
                         if now.duration_since(entry.last_restart) >= entry.backoff {
                             entry.restart_count += 1;
                             entry.last_restart = now;
-                            entry.backoff = (entry.backoff * 2).min(CRASHLOOP_BACKOFF_MAX);
+                            entry.backoff = (entry.backoff * 2).min(self.crash_loop_backoff_max);
                             true
                         } else {
                             false // still within the backoff window
@@ -6296,6 +6323,47 @@ mod tests {
         assert_eq!(z.runtime_request_timeout(), Duration::from_secs(120));
     }
 
+    /// `crashLoopBackOff.maxContainerRestartPeriod` caps the restart backoff and
+    /// clamps the initial delay (kubelet.go:345-358).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn crash_loop_backoff_max_applies() {
+        use rusternetes_storage::StorageBackend;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let mk = || async {
+            Kubelet::new(
+                "node-clb".into(),
+                std::sync::Arc::new(StorageBackend::new_memory()),
+                10,
+                dir.path().join("vols").display().to_string(),
+                "10.96.0.10".into(),
+                "cluster.local".into(),
+                "bridge".into(),
+                String::new(),
+            )
+            .await
+            .unwrap()
+        };
+        let d = mk().await;
+        assert_eq!(d.crash_loop_backoff_max, Duration::from_secs(300));
+        assert_eq!(d.crash_loop_backoff_initial(), Duration::from_secs(10));
+        let c = mk()
+            .await
+            .with_crash_loop_backoff_max(Some(Duration::from_secs(60)));
+        assert_eq!(c.crash_loop_backoff_max, Duration::from_secs(60));
+        assert_eq!(c.crash_loop_backoff_initial(), Duration::from_secs(10));
+        let t = mk()
+            .await
+            .with_crash_loop_backoff_max(Some(Duration::from_secs(3)));
+        assert_eq!(t.crash_loop_backoff_initial(), Duration::from_secs(3));
+    }
+
     /// #1929: a kubelet whose CRI endpoint is an absent socket must report
     /// `Ready=False`/`KubeletNotReady`, both at registration and on every
     /// heartbeat (upstream `nodestatus.ReadyCondition`,
@@ -6352,6 +6420,80 @@ mod tests {
         k.update_node_status().await.unwrap();
         let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
         assert_eq!(ready(&node).status, "False");
+    }
+
+    /// #2591: the CSI plugin's `SetKubeletError` must surface in the node's
+    /// Ready condition at the kubelet level, ordered runtime, network, storage
+    /// (`errs := []error{runtimeErrorsFunc(), networkErrorsFunc(),
+    /// storageErrorsFunc(), ...}`, pkg/kubelet/nodestatus/setters.go:491) and
+    /// joined by `utilerrors.NewAggregate` (setters.go:505-513). The CRI
+    /// socket is absent so the runtime error is the first aggregate member;
+    /// the CSINode error must follow it and vanish once cleared.
+    /// Regression guard: the behaviour already exists (#2590).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn csinode_storage_error_gates_ready_condition() {
+        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = Kubelet::new(
+            "node-csi".into(),
+            storage.clone(),
+            10,
+            dir.path().join("vols").display().to_string(),
+            "10.96.0.10".into(),
+            "cluster.local".into(),
+            "bridge".into(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+        k.update_runtime_up().await;
+        k.set_kubelet_error(Some("CSINode is not yet initialized".into()));
+        let errs = k.ready_errors();
+        assert_eq!(
+            errs.last().map(String::as_str),
+            Some("CSINode is not yet initialized"),
+            "storage error is last: {errs:?}"
+        );
+        assert!(errs.len() >= 2, "runtime error precedes storage: {errs:?}");
+
+        k.register_node().await.unwrap();
+        let key = build_key("nodes", None, "node-csi");
+        let ready = |n: &rusternetes_common::resources::Node| {
+            n.status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|c| c.condition_type == "Ready")
+                .cloned()
+                .unwrap()
+        };
+        let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        let c = ready(&node);
+        assert_eq!(c.status, "False");
+        assert_eq!(c.reason.as_deref(), Some("KubeletNotReady"));
+        let msg = c.message.unwrap();
+        assert!(msg.contains("CSINode is not yet initialized"), "{msg}");
+        assert!(
+            msg.find("container runtime").unwrap() < msg.find("CSINode").unwrap(),
+            "runtime before storage: {msg}"
+        );
+
+        // Cleared (CSINode initialised): the heartbeat drops the message.
+        k.set_kubelet_error(None);
+        k.update_node_status().await.unwrap();
+        let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        let c = ready(&node);
+        assert!(!c.message.unwrap().contains("CSINode"));
     }
 
     fn resources(pairs: &[(&str, &str)]) -> Option<std::collections::HashMap<String, String>> {

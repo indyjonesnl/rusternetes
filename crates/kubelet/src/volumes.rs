@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 // shared with non-volume code paths there). Imported so the moved bodies keep
 // calling them by their bare names, verbatim.
 use crate::atomic_writer::FileProjection;
+use crate::volume_plugins::VolumePlugin;
 
 /// Build the projection payload (relative user-visible path -> bytes) for a
 /// ConfigMap volume, honoring `items` (specific keys → mapped paths) or, when
@@ -187,9 +188,9 @@ pub struct VolumeManager {
     /// `CriContainerRuntime` clones it per attach — and `VolumePluginMgr`'s
     /// `Vec<Box<dyn VolumePlugin>>` cannot itself derive `Clone`.
     pub plugin_mgr: Arc<crate::volume_plugins::VolumePluginMgr>,
-    /// A CSI plugin over the same host, used to build unmounters
-    /// (`NewUnmounter`) for volumes found on disk. `plugin_mgr` holds the
-    /// plugin as a `dyn VolumePlugin`, which has no unmounter method yet.
+    /// A CSI plugin over the same host, for the CSI-specific device methods
+    /// (`unmount_device`, `list_staged_devices`) that are not part of
+    /// `VolumePlugin`. `plugin_mgr` holds the plugin as a `dyn VolumePlugin`.
     pub(crate) csi_plugin: Arc<crate::volume_plugins::csi::CsiPlugin>,
 }
 
@@ -380,30 +381,40 @@ impl VolumeManager {
         errors
     }
 
-    /// NodeUnpublish the CSI volumes of pods that are gone.
+    /// Tear down every volume of the pods that are gone.
     ///
-    /// Drives `csiMountMgr.TearDownAt` (`pkg/volume/csi/csi_mounter.go:432-466`)
-    /// the way upstream's volume manager does: the reconciler's
-    /// `unmountVolumes` (`pkg/kubelet/volumemanager/reconciler/reconciler.go`)
-    /// runs `UnmountVolume` -> `plugin.NewUnmounter(volName, podUID)`
-    /// (`csi_plugin.go:540-567`) -> `TearDown`, for every volume of a pod that
-    /// no longer wants it. Without a desired/actual state of world, the volumes
-    /// are found the way upstream's post-restart reconstruction finds them: by
-    /// walking `<pod>/volumes/kubernetes.io~csi/*` on disk.
+    /// Drives `Unmounter.TearDown` the way upstream's volume manager does: the
+    /// reconciler's `unmountVolumes`
+    /// (`pkg/kubelet/volumemanager/reconciler/reconciler_common.go:148`) runs
+    /// `UnmountVolume` -> `plugin.NewUnmounter(volName, podUID)` -> `TearDown`
+    /// (`pkg/volume/util/operationexecutor/operation_generator.go:729-757`) for every
+    /// volume of a pod that no longer wants it. This is what releases a
+    /// `medium: Memory` emptyDir's tmpfs, removes a configMap/secret/
+    /// downwardAPI/projected volume's files, and NodeUnpublishes a CSI volume
+    /// (`csiMountMgr.TearDownAt`, `csi_mounter.go:432-466`).
+    ///
+    /// Without a desired/actual state of world, the volumes are found the way
+    /// upstream's post-restart reconstruction finds them: by walking
+    /// `<pod>/volumes/<plugin>/<volume>` on disk (`getVolumesFromPodDir`,
+    /// `reconstruct_common.go:191-240`) and looking the plugin up by the
+    /// directory's name (`FindPluginByName`, `reconstruct_common.go:261`
+    /// `reconstructVolume`).
     ///
     /// Runs before [`Self::cleanup_orphaned_pod_dirs`], which refuses to touch a
     /// still-mounted volume. A failure (including the transient "driver not
     /// registered" error) is logged and left for the next sync, as the
-    /// reconciler retries a failed operation.
+    /// reconciler retries a failed operation. A directory no registered plugin
+    /// owns (the `rusternetes.io/unsupported` placeholder) is left to the
+    /// orphan sweep's `rmdir`.
     ///
     /// `terminated_pod_uids` are pods still present in the API whose runtime
     /// is gone (Succeeded/Failed): upstream's populator drops their volumes
     /// from the desired state once `ShouldPodRuntimeBeRemoved`
     /// (`pod_workers.go:698`) holds (`findAndRemoveDeletedPods`,
     /// `desired_state_of_world_populator.go:200-247`), so the reconciler
-    /// unmounts them as for a deleted pod. The staged device is released by
+    /// unmounts them as for a deleted pod. The staged CSI device is released by
     /// [`Self::unmount_unused_csi_devices`], after this.
-    pub async fn unmount_csi_volumes(
+    pub async fn unmount_orphaned_volumes(
         &self,
         live_pod_uids: &std::collections::HashSet<String>,
         terminated_pod_uids: &std::collections::HashSet<String>,
@@ -420,24 +431,34 @@ impl VolumeManager {
             if live_pod_uids.contains(&uid) && !terminated_pod_uids.contains(&uid) {
                 continue;
             }
-            let csi_dir = crate::pod_dirs::get_pod_volumes_dir(root, &uid).join(
-                crate::pod_dirs::escape_qualified_name(crate::pod_dirs::plugin::CSI),
-            );
-            let Ok(entries) = std::fs::read_dir(&csi_dir) else {
-                continue;
+            let volumes = match crate::pod_dirs::get_volumes_from_pod_dir(root, &uid) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Orphaned pod {uid}: could not list its volumes: {e}");
+                    continue;
+                }
             };
-            for entry in entries.flatten() {
-                // The directory name is the escaped spec name.
-                let spec_name = entry.file_name().to_string_lossy().replace('~', "/");
-                let unmounter = match self.csi_plugin.new_unmounter(&spec_name, &uid) {
+            for volume in volumes {
+                let plugin = match self.plugin_mgr.find_plugin_by_name(&volume.plugin_name) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        debug!(
+                            "Orphaned pod {uid}: no plugin to unmount {}: {e}",
+                            volume.volume_path.display()
+                        );
+                        continue;
+                    }
+                };
+                let name = &volume.volume_spec_name;
+                let unmounter = match plugin.new_unmounter(name, &uid) {
                     Ok(u) => u,
                     Err(e) => {
-                        warn!("Orphaned pod {uid}: cannot unmount CSI volume {spec_name}: {e:#}");
+                        warn!("Orphaned pod {uid}: cannot unmount volume {name}: {e:#}");
                         continue;
                     }
                 };
                 if let Err(e) = unmounter.tear_down().await {
-                    warn!("Orphaned pod {uid}: CSI TearDown of {spec_name} failed: {e:#}");
+                    warn!("Orphaned pod {uid}: TearDown of volume {name} failed: {e:#}");
                 }
             }
         }
@@ -461,7 +482,10 @@ impl VolumeManager {
                 continue;
             };
             for entry in entries.flatten() {
-                if let Ok(rec) = self.csi_plugin.construct_volume_spec(&entry.path()) {
+                if let Ok(rec) = self.csi_plugin.construct_volume_spec(
+                    &entry.file_name().to_string_lossy(),
+                    &entry.path().to_string_lossy(),
+                ) {
                     if let Some(csi) = rec.persistent_volume.and_then(|pv| pv.spec.csi) {
                         held.insert((csi.driver, csi.volume_handle.unwrap_or_default()));
                     }
@@ -511,7 +535,7 @@ impl VolumeManager {
     /// (`pkg/kubelet/volumemanager/reconciler/reconciler_common.go:273-315`):
     /// a device is unmounted when it is not mounted for any pod
     /// (`GetUnmountedVolumes`: no pod dir still holds it, so this must run
-    /// after [`Self::unmount_csi_volumes`], which gives upstream's
+    /// after [`Self::unmount_orphaned_volumes`], which gives upstream's
     /// unpublish-before-unstage order) and the desired state does not want it
     /// (`!DesiredStateOfWorld.VolumeExists`: `desired_pods`' PVCs). Several pods
     /// sharing one staged volume therefore refcount it by presence. Failures are
@@ -738,22 +762,30 @@ impl VolumeManager {
             .and_then(|s| s.security_context.as_ref())
             .and_then(|sc| sc.fs_group)
         {
-            // A projected volume re-owns itself inside its own SetUp
-            // (`projected.go:200-214`, `setPerms` -> `volume_ownership`, with
+            // configMap, secret, downwardAPI and projected volumes re-own
+            // themselves inside their own SetUp (`configmap.go:246-252`,
+            // `secret.go:242-248`, `downwardapi.go:217-223`,
+            // `projected.go:200-214`: `setPerms` -> `volume_ownership`, with
             // upstream's `mode | roMask`); the owner->group mirror below would
-            // turn its 0600 token into 0660 instead of 0640 (#2333).
-            let projected: std::collections::HashSet<&str> = pod
+            // turn a 0644 file into 0664 and a 0600 token into 0660 (#2333,
+            // #2540).
+            let self_owning: std::collections::HashSet<&str> = pod
                 .spec
                 .as_ref()
                 .and_then(|s| s.volumes.as_ref())
                 .into_iter()
                 .flatten()
-                .filter(|v| v.projected.is_some())
+                .filter(|v| {
+                    v.projected.is_some()
+                        || v.secret.is_some()
+                        || v.config_map.is_some()
+                        || v.downward_api.is_some()
+                })
                 .map(|v| v.name.as_str())
                 .collect();
             let paths: Vec<std::path::PathBuf> = volume_paths
                 .iter()
-                .filter(|(name, _)| !projected.contains(name.as_str()))
+                .filter(|(name, _)| !self_owning.contains(name.as_str()))
                 .map(|(_, p)| std::path::PathBuf::from(p))
                 .collect();
             let n = paths.len();
@@ -875,6 +907,7 @@ impl VolumeManager {
                 &volume.name,
                 secret_source,
                 fetched.secret(secret_name),
+                crate::volume_plugins::util::fs_group_from(pod),
             );
         }
         // Resync configmap volumes. Re-project through the AtomicWriter
@@ -896,9 +929,11 @@ impl VolumeManager {
                         mode,
                     ) {
                         Ok(payload) => {
-                            let _ = crate::atomic_writer::write_projected_payload(
+                            let _ = crate::volume_ownership::write_payload_with_ownership(
                                 std::path::Path::new(&volume_dir),
                                 &payload,
+                                crate::volume_plugins::util::fs_group_from(pod),
+                                true,
                             );
                         }
                         Err(e) => warn!("ConfigMap {} resync: {}", cm_name, e),
@@ -951,9 +986,11 @@ impl VolumeManager {
                 mode,
             ) {
                 Ok(payload) => {
-                    let _ = crate::atomic_writer::write_projected_payload(
+                    let _ = crate::volume_ownership::write_payload_with_ownership(
                         std::path::Path::new(&volume_dir),
                         &payload,
+                        crate::volume_plugins::util::fs_group_from(pod),
+                        true,
                     );
                 }
                 Err(e) => warn!("downwardAPI volume {} resync: {}", volume.name, e),
@@ -982,6 +1019,7 @@ impl VolumeManager {
         volume_name: &str,
         source: &rusternetes_common::resources::SecretVolumeSource,
         fetched: Option<&rusternetes_common::resources::Secret>,
+        fs_group: Option<i64>,
     ) {
         let Some(secret_name) = source.secret_name.as_ref() else {
             return;
@@ -1042,9 +1080,11 @@ impl VolumeManager {
             }
         }
 
-        if let Err(e) = crate::atomic_writer::write_projected_payload(
+        if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
             std::path::Path::new(volume_dir),
             &payload,
+            fs_group,
+            true,
         ) {
             warn!("Secret {} resync: {:#}", secret_name, e);
         }
@@ -1350,6 +1390,7 @@ impl VolumeManager {
                     &volume.name,
                     secret_source,
                     fetched.secret(secret_name),
+                    crate::volume_plugins::util::fs_group_from(pod),
                 );
             }
 
@@ -1379,9 +1420,11 @@ impl VolumeManager {
                             mode,
                         ) {
                             Ok(payload) => {
-                                let _ = crate::atomic_writer::write_projected_payload(
+                                let _ = crate::volume_ownership::write_payload_with_ownership(
                                     std::path::Path::new(&volume_dir),
                                     &payload,
+                                    crate::volume_plugins::util::fs_group_from(pod),
+                                    true,
                                 );
                             }
                             Err(e) => warn!("ConfigMap {} refresh: {}", cm_name, e),
@@ -2609,6 +2652,75 @@ mod projected_mode_tests {
         assert_eq!(meta.permissions().mode() & 0o777, 0o640);
         assert_eq!(meta.gid(), gid);
     }
+
+    /// configMap, secret and downwardAPI volumes with a pod `fsGroup` get
+    /// `chmod(mode | roMask)` (`volume_linux.go:171-175`; each reports
+    /// `ReadOnly: true`, `configmap.go:160`, `secret.go:166`,
+    /// `downwardapi.go:156`), run from their own AtomicWriter `setPerms`
+    /// (`configmap.go:246-252`, `secret.go:242-248`, `downwardapi.go:217-223`).
+    /// A 0644 file stays 0644 (the owner->group mirror made it 0664) and a 0600
+    /// file becomes 0640 (#2540).
+    #[tokio::test]
+    async fn create_pod_volumes_fs_group_is_ro_mask_for_cm_secret_downward_api() {
+        use rusternetes_common::resources::ConfigMap;
+        use std::os::unix::fs::MetadataExt;
+        let storage = Arc::new(StorageBackend::new_memory());
+        let secret = Secret::new("sec", "default")
+            .with_data(HashMap::from([("k".to_string(), b"v".to_vec())]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("secrets", Some("default"), "sec"),
+            &secret,
+        )
+        .await
+        .unwrap();
+        let cm: ConfigMap = serde_json::from_value(json!({
+            "metadata": {"name": "cm", "namespace": "default"},
+            "data": {"k": "v"}
+        }))
+        .unwrap();
+        Storage::create(
+            storage.as_ref(),
+            &build_key("configmaps", Some("default"), "cm"),
+            &cm,
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let probe = tmp.path().join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        let gid = std::fs::metadata(&probe).unwrap().gid();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1",
+                         "labels": {"a": "b"}},
+            "spec": {
+                "securityContext": {"fsGroup": gid},
+                "containers": [],
+                "volumes": [
+                    {"name": "cm", "configMap": {"name": "cm"}},
+                    {"name": "sec", "secret": {"secretName": "sec", "defaultMode": 384}},
+                    {"name": "da", "downwardAPI": {"items": [
+                        {"path": "labels", "fieldRef": {"fieldPath": "metadata.labels"}}
+                    ]}}
+                ]
+            }
+        }))
+        .unwrap();
+        let paths = vm.create_pod_volumes(&pod).await.unwrap();
+        let check = |vol: &str, file: &str, want: u32| {
+            let meta = std::fs::metadata(std::path::Path::new(&paths[vol]).join(file)).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, want, "{vol}/{file}");
+            assert_eq!(meta.gid(), gid, "{vol}/{file} gid");
+        };
+        check("cm", "k", 0o644);
+        check("da", "labels", 0o644);
+        check("sec", "k", 0o640);
+    }
 }
 
 /// Orphaned pod directory sweep — port of `cleanupOrphanedPodDirs`
@@ -2644,6 +2756,98 @@ mod orphan_sweep_tests {
         );
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Lay down a non-empty volume of `plugin`, as a running pod leaves it.
+    fn seed_filled_volume(root: &str, uid: &str, plugin: &str, volume: &str) -> std::path::PathBuf {
+        let dir = crate::pod_dirs::get_pod_volume_dir(root, uid, plugin, volume);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/data"), "x").unwrap();
+        dir
+    }
+
+    /// The gap this slice closes: `removeOrphanedPodVolumeDirs` `rmdir`s each
+    /// volume (`kubelet_volumes.go:119-165`), which fails on a volume that
+    /// still holds files, so a pod whose emptyDir was written to leaked its
+    /// directory forever — upstream relies on the reconciler's `TearDown`
+    /// having emptied it first.
+    #[test]
+    fn the_sweep_alone_cannot_remove_a_volume_that_holds_files() {
+        let root = tmp("filled-sweep-only");
+        seed_filled_volume(
+            &root,
+            "uid-gone",
+            crate::pod_dirs::plugin::EMPTY_DIR,
+            "scratch",
+        );
+
+        vm(&root).cleanup_orphaned_pod_dirs(&HashSet::new());
+
+        assert!(crate::pod_dirs::get_pod_dir(&root, "uid-gone").exists());
+    }
+
+    /// `unmountVolumes` -> `NewUnmounter` -> `TearDown`, then the sweep.
+    #[tokio::test]
+    async fn teardown_then_sweep_reaps_every_non_csi_volume_kind() {
+        let root = tmp("filled-teardown");
+        use crate::pod_dirs::plugin;
+        for (p, v) in [
+            (plugin::EMPTY_DIR, "scratch"),
+            (plugin::CONFIG_MAP, "cfg"),
+            (plugin::SECRET, "sec"),
+            (plugin::DOWNWARD_API, "dapi"),
+            (plugin::PROJECTED, "proj"),
+        ] {
+            seed_filled_volume(&root, "uid-gone", p, v);
+        }
+        // A live pod's identical volumes must not be touched.
+        let live_dir = seed_filled_volume(&root, "uid-live", plugin::EMPTY_DIR, "scratch");
+        let live: HashSet<String> = ["uid-live".to_string()].into_iter().collect();
+
+        let vm = vm(&root);
+        vm.unmount_orphaned_volumes(&live, &HashSet::new()).await;
+        vm.cleanup_orphaned_pod_dirs(&live);
+
+        assert!(
+            !crate::pod_dirs::get_pod_dir(&root, "uid-gone").exists(),
+            "the orphan's directory must be reaped once its volumes are torn down"
+        );
+        assert!(live_dir.join("sub/data").exists(), "live pod untouched");
+    }
+
+    /// A pod still in the API but terminated no longer wants its volumes
+    /// (`ShouldPodRuntimeBeRemoved`), so they are torn down as for a deleted
+    /// pod.
+    #[tokio::test]
+    async fn a_terminated_pods_volumes_are_torn_down() {
+        let root = tmp("filled-terminated");
+        let dir = seed_filled_volume(
+            &root,
+            "uid-done",
+            crate::pod_dirs::plugin::EMPTY_DIR,
+            "scratch",
+        );
+        let uids: HashSet<String> = ["uid-done".to_string()].into_iter().collect();
+
+        vm(&root).unmount_orphaned_volumes(&uids, &uids).await;
+
+        assert!(!dir.exists());
+    }
+
+    /// A hostPath volume's `TearDown` does nothing (`host_path.go:272-274`),
+    /// and a directory no plugin owns is left for the sweep.
+    #[tokio::test]
+    async fn host_path_and_unowned_dirs_are_left_alone_by_teardown() {
+        let root = tmp("hostpath-unowned");
+        let hp = seed_filled_volume(&root, "uid-gone", crate::pod_dirs::plugin::HOST_PATH, "hp");
+        let other = seed_filled_volume(&root, "uid-gone", crate::pod_dirs::UNSUPPORTED_PLUGIN, "x");
+
+        vm(&root)
+            .unmount_orphaned_volumes(&HashSet::new(), &HashSet::new())
+            .await;
+
+        assert!(hp.join("sub/data").exists());
+        assert!(other.join("sub/data").exists());
     }
 
     #[test]

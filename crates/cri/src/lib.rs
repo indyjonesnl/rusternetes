@@ -3,7 +3,7 @@
 //! This crate is the kubelet's southbound runtime backend: it speaks the
 //! Kubernetes Container Runtime Interface (`runtime.v1`, gRPC) to a
 //! CRI-conformant runtime such as containerd (which in turn drives an OCI
-//! runtime like Youki). It replaces the Docker-API (bollard) coupling that tied
+//! runtime like crun). It replaces the Docker-API (bollard) coupling that tied
 //! the kubelet to Podman/Docker.
 //!
 //! The generated gRPC types live under [`v1`]. Consumers should prefer the
@@ -210,7 +210,7 @@ impl CriClient {
 
     /// Pull an image, returning the runtime's canonical image reference.
     ///
-    /// `runtime_handler` selects a runtime class (e.g. the Youki handler) for
+    /// `runtime_handler` selects a runtime class (e.g. the crun handler) for
     /// runtime-handler-scoped image stores; pass `None` for the default. The
     /// optional `sandbox_config` lets the runtime resolve registry settings from
     /// the owning sandbox — supplied when pulling on behalf of a specific pod.
@@ -265,7 +265,7 @@ impl CriClient {
     /// Create and start a pod sandbox, returning its sandbox id.
     ///
     /// `runtime_handler` names the runtime class (e.g. the containerd handler
-    /// wired to Youki); empty string selects the runtime default.
+    /// wired to crun); empty string selects the runtime default.
     pub async fn run_pod_sandbox(
         &mut self,
         config: v1::PodSandboxConfig,
