@@ -14,11 +14,11 @@
 //!
 //! Where this differs from upstream: `resolver.ResourceResolver`
 //! (`resolver/resolver.go:30-61`) asks the discovery client for the resource
-//! serving a kind. Rusternetes has no discovery client for its own API, so
-//! [`resolve_resource`] reads the CustomResourceDefinitions in storage and a
-//! static table of the built-in kinds (the same approach as the garbage
-//! collector's `kind_to_plural`). A kind it cannot resolve is authorized on
-//! resource `*`, which is what upstream does when `Resolve` fails.
+//! serving a kind. [`resolve_resource`] asks the same discovery documents the
+//! api-server serves (`rusternetes_discovery::resolve_kind_to_resource`) for
+//! the built-in kinds and reads the CustomResourceDefinitions in storage for
+//! the rest. A kind it cannot resolve is authorized on resource `*`, which is
+//! what upstream does when `Resolve` fails.
 
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
@@ -83,37 +83,6 @@ fn parse_group_version(api_version: &str) -> std::result::Result<(String, String
     }
 }
 
-/// The resource a built-in kind is served as.
-fn builtin_resource(group: &str, version: &str, kind: &str) -> Option<&'static str> {
-    Some(match (group, version, kind) {
-        ("", "v1", "Pod") => "pods",
-        ("", "v1", "Service") => "services",
-        ("", "v1", "Endpoints") => "endpoints",
-        ("", "v1", "Namespace") => "namespaces",
-        ("", "v1", "Node") => "nodes",
-        ("", "v1", "ConfigMap") => "configmaps",
-        ("", "v1", "Secret") => "secrets",
-        ("", "v1", "ServiceAccount") => "serviceaccounts",
-        ("", "v1", "PersistentVolumeClaim") => "persistentvolumeclaims",
-        ("", "v1", "PersistentVolume") => "persistentvolumes",
-        ("", "v1", "ResourceQuota") => "resourcequotas",
-        ("", "v1", "LimitRange") => "limitranges",
-        ("", "v1", "ReplicationController") => "replicationcontrollers",
-        ("apps", "v1", "Deployment") => "deployments",
-        ("apps", "v1", "ReplicaSet") => "replicasets",
-        ("apps", "v1", "StatefulSet") => "statefulsets",
-        ("apps", "v1", "DaemonSet") => "daemonsets",
-        ("batch", "v1", "Job") => "jobs",
-        ("batch", "v1", "CronJob") => "cronjobs",
-        ("networking.k8s.io", "v1", "Ingress") => "ingresses",
-        ("networking.k8s.io", "v1", "NetworkPolicy") => "networkpolicies",
-        ("storage.k8s.io", "v1", "StorageClass") => "storageclasses",
-        ("policy", "v1", "PodDisruptionBudget") => "poddisruptionbudgets",
-        ("autoscaling", "v2", "HorizontalPodAutoscaler") => "horizontalpodautoscalers",
-        _ => return None,
-    })
-}
-
 /// `ResourceResolver.Resolve(gv.WithKind(kind))` (resolver/resolver.go:36-60);
 /// see the module docs for how it differs.
 async fn resolve_resource(
@@ -122,8 +91,8 @@ async fn resolve_resource(
     version: &str,
     kind: &str,
 ) -> Option<String> {
-    if let Some(resource) = builtin_resource(group, version, kind) {
-        return Some(resource.to_string());
+    if let Some(resource) = rusternetes_discovery::resolve_kind_to_resource(group, version, kind) {
+        return Some(resource);
     }
     let prefix = build_prefix("customresourcedefinitions", None);
     let crds: Vec<CustomResourceDefinition> = storage.list(&prefix).await.ok()?;

@@ -123,6 +123,8 @@ pub fn as_csi_access_mode(am: &PersistentVolumeAccessMode) -> AccessModeKind {
         PersistentVolumeAccessMode::ReadWriteMany => AccessModeKind::MultiNodeMultiWriter,
         // Lets drivers that lack SINGLE_NODE_MULTI_WRITER serve ReadWriteOncePod.
         PersistentVolumeAccessMode::ReadWriteOncePod => AccessModeKind::SingleNodeWriter,
+        // `asCSIAccessModeV1` falls through to `..._UNKNOWN` (csi_client.go:513).
+        PersistentVolumeAccessMode::Unknown(_) => AccessModeKind::Unknown,
     }
 }
 
@@ -136,6 +138,7 @@ pub fn as_single_node_multi_writer_capable_csi_access_mode(
         PersistentVolumeAccessMode::ReadOnlyMany => AccessModeKind::MultiNodeReaderOnly,
         PersistentVolumeAccessMode::ReadWriteMany => AccessModeKind::MultiNodeMultiWriter,
         PersistentVolumeAccessMode::ReadWriteOncePod => AccessModeKind::SingleNodeSingleWriter,
+        PersistentVolumeAccessMode::Unknown(_) => AccessModeKind::Unknown,
     }
 }
 
@@ -539,6 +542,8 @@ pub(crate) mod fake {
         pub unpublish: Vec<NodeUnpublishVolumeRequest>,
         pub expand: Vec<NodeExpandVolumeRequest>,
         pub capability_calls: usize,
+        /// Stage/publish call order, for NodeStage-before-NodePublish checks.
+        pub order: Vec<&'static str>,
         pub node_get_info_calls: usize,
     }
 
@@ -546,6 +551,8 @@ pub(crate) mod fake {
     pub struct FakeDriver {
         pub calls: Arc<Mutex<Calls>>,
         pub capabilities: Arc<Mutex<Vec<i32>>>,
+        /// When set, `NodeStageVolume` fails with this code.
+        pub stage_error: Arc<Mutex<Option<tonic::Code>>>,
         /// When set, `NodePublishVolume` fails with this code.
         pub publish_error: Arc<Mutex<Option<tonic::Code>>>,
         /// When set, `NodeExpandVolume` fails with this code.
@@ -568,7 +575,14 @@ pub(crate) mod fake {
             &self,
             r: Request<NodeStageVolumeRequest>,
         ) -> Result<Response<NodeStageVolumeResponse>, Status> {
-            self.calls.lock().unwrap().stage.push(r.into_inner());
+            {
+                let mut calls = self.calls.lock().unwrap();
+                calls.stage.push(r.into_inner());
+                calls.order.push("stage");
+            }
+            if let Some(code) = *self.stage_error.lock().unwrap() {
+                return Err(Status::new(code, "fake stage failure"));
+            }
             Ok(Response::new(NodeStageVolumeResponse {}))
         }
         async fn node_unstage_volume(
@@ -586,7 +600,11 @@ pub(crate) mod fake {
             // A conformant driver creates the target path; do the same so the
             // kubelet-side post-publish steps see a directory.
             let _ = std::fs::create_dir_all(&req.target_path);
-            self.calls.lock().unwrap().publish.push(req);
+            {
+                let mut calls = self.calls.lock().unwrap();
+                calls.publish.push(req);
+                calls.order.push("publish");
+            }
             if let Some(code) = *self.publish_error.lock().unwrap() {
                 return Err(Status::new(code, "fake publish failure"));
             }

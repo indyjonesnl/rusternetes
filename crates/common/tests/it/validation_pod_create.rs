@@ -960,6 +960,7 @@ fn test_validate_pod_spec_volumes_success_unique_names() {
         containers: vec![minimal_container("c", "nginx")],
         volumes: Some(vec![
             Volume {
+                legacy_sources: Default::default(),
                 name: "vol-a".to_string(),
                 empty_dir: Some(EmptyDirVolumeSource {
                     medium: None,
@@ -978,6 +979,7 @@ fn test_validate_pod_spec_volumes_success_unique_names() {
                 image: None,
             },
             Volume {
+                legacy_sources: Default::default(),
                 name: "vol-b".to_string(),
                 empty_dir: Some(EmptyDirVolumeSource {
                     medium: None,
@@ -1008,6 +1010,7 @@ fn test_validate_pod_spec_volumes_error_duplicate_names() {
         containers: vec![minimal_container("c", "nginx")],
         volumes: Some(vec![
             Volume {
+                legacy_sources: Default::default(),
                 name: "vol-a".to_string(),
                 empty_dir: Some(EmptyDirVolumeSource {
                     medium: None,
@@ -1026,6 +1029,7 @@ fn test_validate_pod_spec_volumes_error_duplicate_names() {
                 image: None,
             },
             Volume {
+                legacy_sources: Default::default(),
                 name: "vol-a".to_string(),
                 empty_dir: Some(EmptyDirVolumeSource {
                     medium: None,
@@ -1370,4 +1374,126 @@ fn update_with_comparison_operator_follows_the_old_spec_when_the_gate_is_off() {
     let old = spec(vec![tol("Lt", "5")]);
     let errs = validate_pod_spec_update(&old, &spec(vec![tol("Lt", "5"), tol("Gt", "7")]), false);
     assert!(errs.is_empty(), "{errs:?}");
+}
+
+// ValidatePodUpdate container updates, activeDeadlineSeconds range, and the
+// munged-spec fence message (validation.go:5579-5598, :5683-5689, :5695-5836).
+mod pod_update_fidelity {
+    use super::*;
+    use rusternetes_common::validation::pod::validate_pod_spec_update;
+
+    fn spec(image: &str) -> PodSpec {
+        PodSpec {
+            containers: vec![minimal_container("c", image)],
+            ..PodSpec::default()
+        }
+    }
+
+    // validation.go:4675-4679 via ValidatePodUpdate's validatePodMetadataAndSpec.
+    #[test]
+    fn active_deadline_zero_on_update_is_forbidden() {
+        let mut old = spec("nginx");
+        old.active_deadline_seconds = Some(30);
+        let mut new = old.clone();
+        new.active_deadline_seconds = Some(0);
+        let errs = validate_pod_spec_update(&old, &new, false);
+        assert!(
+            errs.iter().any(|e| e.field == "spec.activeDeadlineSeconds"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn init_container_count_change_is_forbidden() {
+        let old = spec("nginx");
+        let mut new = spec("nginx");
+        new.init_containers = Some(vec![minimal_container("i", "busybox")]);
+        let errs = validate_pod_spec_update(&old, &new, false);
+        assert!(
+            errs.iter().any(|e| e.field == "spec.initContainers"
+                && e.detail == "pod updates may not add or remove containers"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn empty_image_is_required() {
+        let errs = validate_pod_spec_update(&spec("nginx"), &spec(""), false);
+        assert!(
+            errs.iter().any(|e| e.field == "spec.containers[0].image"
+                && e.error_type == rusternetes_common::validation::field::ErrorType::Required),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn image_with_whitespace_is_invalid() {
+        let errs = validate_pod_spec_update(&spec("nginx"), &spec("nginx "), false);
+        assert!(
+            errs.iter().any(|e| e.field == "spec.containers[0].image"
+                && e.detail == "must not have leading or trailing whitespace"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn active_deadline_zero_is_in_range_and_negative_uses_inclusive_range_text() {
+        let mut new = spec("nginx");
+        new.active_deadline_seconds = Some(0);
+        // The update range [0, MaxInt32] admits zero; the create-time rule
+        // (validation.go:4675-4679, run by ValidatePodUpdate) is what refuses it.
+        let errs = validate_pod_spec_update(&spec("nginx"), &new, false);
+        assert!(
+            errs.iter()
+                .all(|e| e.detail == "must be between 1 and 2147483647, inclusive"),
+            "{errs:?}"
+        );
+        new.active_deadline_seconds = Some(-1);
+        let errs = validate_pod_spec_update(&spec("nginx"), &new, false);
+        assert!(
+            errs.iter()
+                .any(|e| e.detail == "must be between 0 and 2147483647, inclusive"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn forbidden_change_lists_updatable_fields_and_a_diff() {
+        let mut new = spec("nginx");
+        new.hostname = Some("h".to_string());
+        let errs = validate_pod_spec_update(&spec("nginx"), &new, false);
+        let e = errs
+            .iter()
+            .find(|e| e.field == "spec")
+            .expect("fence error");
+        assert!(
+            e.detail.starts_with(
+                "pod updates may not change fields other than `spec.containers[*].image`,\
+`spec.initContainers[*].image`,`spec.activeDeadlineSeconds`,\
+`spec.tolerations` (only additions to existing tolerations),\
+`spec.terminationGracePeriodSeconds` (allow it to be set to 1 if it was previously negative)\n"
+            ),
+            "{}",
+            e.detail
+        );
+        assert!(e.detail.contains("hostname"), "{}", e.detail);
+    }
+
+    #[test]
+    fn termination_grace_negative_to_one_allowed_other_change_forbidden() {
+        let mut old = spec("nginx");
+        old.termination_grace_period_seconds = Some(-5);
+        let mut new = spec("nginx");
+        new.termination_grace_period_seconds = Some(1);
+        assert!(validate_pod_spec_update(&old, &new, false).is_empty());
+        let mut old = spec("nginx");
+        old.termination_grace_period_seconds = Some(30);
+        new.termination_grace_period_seconds = Some(60);
+        let errs = validate_pod_spec_update(&old, &new, false);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "spec" && e.detail.starts_with("pod updates may not change")),
+            "{errs:?}"
+        );
+    }
 }

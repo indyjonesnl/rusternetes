@@ -3,14 +3,14 @@
 // These tests use in-memory storage and don't require a running etcd instance.
 // The admission controllers are tested through the functions which:
 // 1. apply_limit_range() - applies defaults and validates constraints
-// 2. check_resource_quota() - ensures pod doesn't exceed quota
+// 2. resourcequota::evaluate() with the pod evaluator - ensures pod doesn't exceed quota
 //
 // Full E2E testing happens through the workflow tests that test the pod creation handler.
 
-use rusternetes_api_server::admission::{
-    apply_limit_range, check_resource_quota as quota_verdict,
-    check_resource_quota_with_old as quota_verdict_with_old,
-};
+use rusternetes_api_server::admission::apply_limit_range;
+use rusternetes_api_server::admission::resourcequota::evaluator::PodEvaluator;
+use rusternetes_api_server::admission::resourcequota::{evaluate, Attributes, QuotaError};
+use rusternetes_common::admission::Operation;
 use rusternetes_common::resources::{
     Container, LimitRange, LimitRangeItem, LimitRangeSpec, Pod, PodSpec, ResourceQuota,
     ResourceQuotaSpec,
@@ -194,12 +194,8 @@ async fn test_quota_rejects_when_exceeding_pod_count() {
     let storage = Arc::new(MemoryStorage::new());
 
     // A synced quota: status.hard and status.used are set.
-    put_quota(&storage, "test-quota", &[("pods", "1")]).await;
-
-    // Create an existing pod
-    let existing_pod = create_minimal_pod("existing-pod", "test-namespace");
-    let pod_key = build_key("pods", Some("test-namespace"), "existing-pod");
-    storage.create(&pod_key, &existing_pod).await.unwrap();
+    // One pod is already counted in status.used.
+    put_quota_used(&storage, "test-quota", &[("pods", "1")], &[("pods", "1")]).await;
 
     // Try to create a second pod (should exceed quota)
     let new_pod = create_minimal_pod("new-pod", "test-namespace");
@@ -658,6 +654,45 @@ async fn limitrange_pod_level_aggregates_across_containers() {
 // ===== ResourceQuota accounting on Quantity (#1714) =====
 
 /// `create_minimal_pod` with `requests` set on its single container.
+/// The pod ResourceQuota evaluator on the generic quota path
+/// (`resourcequota::evaluate`): `None` admits, `Some(msg)` is the refusal.
+async fn quota_verdict_op(
+    storage: &Arc<MemoryStorage>,
+    namespace: &str,
+    pod: &Pod,
+    old: Option<&Pod>,
+) -> anyhow::Result<Option<String>> {
+    let object = serde_json::to_value(pod)?;
+    let old_object = old.map(serde_json::to_value).transpose()?;
+    let attrs = Attributes {
+        operation: if old.is_some() {
+            Operation::Update
+        } else {
+            Operation::Create
+        },
+        namespace,
+        // An update reaches the pod evaluator through `resize`, or when the
+        // Terminating scope flips (pods.go:179-199).
+        subresource: old.map(|_| "resize"),
+        object: &object,
+        old_object: old_object.as_ref(),
+        dry_run: false,
+    };
+    match evaluate(&**storage, &PodEvaluator, &attrs).await {
+        Ok(()) => Ok(None),
+        Err(QuotaError::Forbidden(msg)) => Ok(Some(msg)),
+        Err(QuotaError::Other(msg)) => Err(anyhow::anyhow!(msg)),
+    }
+}
+
+async fn quota_verdict(
+    storage: &Arc<MemoryStorage>,
+    namespace: &str,
+    pod: &Pod,
+) -> anyhow::Result<Option<String>> {
+    quota_verdict_op(storage, namespace, pod, None).await
+}
+
 /// Whether the pod is admitted; the refusal text is asserted where it matters.
 async fn check_resource_quota(
     storage: &Arc<MemoryStorage>,
@@ -673,7 +708,7 @@ async fn check_resource_quota_with_old(
     pod: &Pod,
     old: Option<&Pod>,
 ) -> anyhow::Result<bool> {
-    Ok(quota_verdict_with_old(storage, namespace, pod, old)
+    Ok(quota_verdict_op(storage, namespace, pod, old)
         .await?
         .is_none())
 }
@@ -694,6 +729,17 @@ fn pod_with_requests(name: &str, namespace: &str, requests: &[(&str, &str)]) -> 
 }
 
 async fn put_quota(storage: &Arc<MemoryStorage>, name: &str, hard: &[(&str, &str)]) {
+    put_quota_used(storage, name, hard, &[]).await
+}
+
+/// A synced quota whose `status.used` already holds `used` (every other hard
+/// key at zero), the figure the quota controller recorded.
+async fn put_quota_used(
+    storage: &Arc<MemoryStorage>,
+    name: &str,
+    hard: &[(&str, &str)],
+    used: &[(&str, &str)],
+) {
     let hard: HashMap<String, String> = hard
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -709,7 +755,10 @@ async fn put_quota(storage: &Arc<MemoryStorage>, name: &str, hard: &[(&str, &str
     );
     // The quota controller has synced: status.hard mirrors spec.hard and
     // status.used carries a figure for every hard key (`hasUsageStats`).
-    let used: HashMap<String, String> = hard.keys().map(|k| (k.clone(), "0".to_string())).collect();
+    let mut recorded: HashMap<String, String> =
+        hard.keys().map(|k| (k.clone(), "0".to_string())).collect();
+    recorded.extend(used.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    let used = recorded;
     quota.status = Some(rusternetes_common::resources::ResourceQuotaStatus {
         hard: Some(hard),
         used: Some(used),
@@ -767,15 +816,7 @@ async fn quota_enforces_fractional_memory_limit() {
         "1Gi fits in a 1.5Gi quota"
     );
 
-    let existing = pod_with_requests("existing", "test-namespace", &[("memory", "1Gi")]);
-    storage
-        .create(
-            &build_key("pods", Some("test-namespace"), "existing"),
-            &existing,
-        )
-        .await
-        .unwrap();
-
+    // Admitting `fits` recorded its 1Gi in status.used.
     let second = pod_with_requests("second", "test-namespace", &[("memory", "1Gi")]);
     assert!(
         !check_resource_quota(&storage, "test-namespace", &second)
@@ -858,23 +899,21 @@ async fn quota_status_used_is_canonical_and_masked() {
 #[tokio::test]
 async fn quota_ignores_dimensions_the_pod_does_not_request() {
     let storage = Arc::new(MemoryStorage::new());
-    put_quota(
+    put_quota_used(
         &storage,
         "mem",
         &[("requests.memory", "1Gi"), ("pods", "10")],
+        &[("requests.memory", "1Gi"), ("pods", "1")],
     )
     .await;
 
-    let existing = pod_with_requests("existing", "test-namespace", &[("memory", "1Gi")]);
-    storage
-        .create(
-            &build_key("pods", Some("test-namespace"), "existing"),
-            &existing,
-        )
-        .await
-        .unwrap();
-
-    let no_memory = pod_with_requests("cpu-only", "test-namespace", &[("cpu", "100m")]);
+    // `Constraints` still wants an explicit memory request; a zero one
+    // charges nothing.
+    let no_memory = pod_with_requests(
+        "cpu-only",
+        "test-namespace",
+        &[("cpu", "100m"), ("memory", "0")],
+    );
     assert!(
         check_resource_quota(&storage, "test-namespace", &no_memory)
             .await
@@ -890,18 +929,18 @@ async fn quota_ignores_dimensions_the_pod_does_not_request() {
 #[tokio::test]
 async fn quota_admits_update_with_zero_delta_at_the_limit() {
     let storage = Arc::new(MemoryStorage::new());
-    put_quota(
+    put_quota_used(
         &storage,
         "mem",
+        &[("requests.memory", "1Gi"), ("pods", "1")],
         &[("requests.memory", "1Gi"), ("pods", "1")],
     )
     .await;
 
-    let pod = pod_with_requests("p", "test-namespace", &[("memory", "1Gi")]);
-    storage
-        .create(&build_key("pods", Some("test-namespace"), "p"), &pod)
-        .await
-        .unwrap();
+    // The stored pod has a resourceVersion, so the update is charged the
+    // delta (controller.go:566-568), not the full footprint.
+    let mut pod = pod_with_requests("p", "test-namespace", &[("memory", "1Gi")]);
+    pod.metadata.resource_version = Some("7".to_string());
 
     // Same resources, so nothing new is charged.
     let mut updated = pod.clone();
@@ -919,7 +958,8 @@ async fn quota_admits_update_with_zero_delta_at_the_limit() {
     );
 
     // Raising the request past the ceiling still fails.
-    let bigger = pod_with_requests("p", "test-namespace", &[("memory", "2Gi")]);
+    let mut bigger = pod_with_requests("p", "test-namespace", &[("memory", "2Gi")]);
+    bigger.metadata.resource_version = Some("7".to_string());
     assert!(
         !check_resource_quota_with_old(&storage, "test-namespace", &bigger, Some(&pod))
             .await
@@ -934,13 +974,11 @@ async fn quota_admits_update_with_zero_delta_at_the_limit() {
 /// namespace is nowhere near the ceiling.
 #[tokio::test]
 async fn quota_constraints_reject_container_omitting_quotad_cpu() {
-    use rusternetes_api_server::admission::check_pod_quota_constraints;
-
     let storage = Arc::new(MemoryStorage::new());
     put_quota(&storage, "cpu", &[("requests.cpu", "1")]).await;
 
     let none = create_minimal_pod("p", "test-namespace");
-    let msg = check_pod_quota_constraints(&storage, "test-namespace", &none)
+    let msg = quota_verdict(&storage, "test-namespace", &none)
         .await
         .unwrap();
     assert_eq!(
@@ -950,7 +988,7 @@ async fn quota_constraints_reject_container_omitting_quotad_cpu() {
 
     let with_cpu = pod_with_requests("p", "test-namespace", &[("cpu", "100m")]);
     assert_eq!(
-        check_pod_quota_constraints(&storage, "test-namespace", &with_cpu)
+        quota_verdict(&storage, "test-namespace", &with_cpu)
             .await
             .unwrap(),
         None
@@ -963,7 +1001,7 @@ async fn quota_constraints_reject_container_omitting_quotad_cpu() {
     ic.resources = None;
     init.spec.as_mut().unwrap().init_containers = Some(vec![ic]);
     assert_eq!(
-        check_pod_quota_constraints(&storage, "test-namespace", &init)
+        quota_verdict(&storage, "test-namespace", &init)
             .await
             .unwrap()
             .as_deref(),
@@ -975,13 +1013,11 @@ async fn quota_constraints_reject_container_omitting_quotad_cpu() {
 /// (`validationSet`, `pods.go:97-110`).
 #[tokio::test]
 async fn quota_constraints_pods_only_quota_imposes_nothing() {
-    use rusternetes_api_server::admission::check_pod_quota_constraints;
-
     let storage = Arc::new(MemoryStorage::new());
     put_quota(&storage, "count", &[("pods", "10")]).await;
     let none = create_minimal_pod("p", "test-namespace");
     assert_eq!(
-        check_pod_quota_constraints(&storage, "test-namespace", &none)
+        quota_verdict(&storage, "test-namespace", &none)
             .await
             .unwrap(),
         None
@@ -994,7 +1030,6 @@ async fn quota_constraints_pods_only_quota_imposes_nothing() {
 /// and a synced one constrains what its status says.
 #[tokio::test]
 async fn quota_constraints_read_status_hard_not_spec_hard() {
-    use rusternetes_api_server::admission::check_pod_quota_constraints;
     use rusternetes_common::resources::ResourceQuotaStatus;
 
     let storage = Arc::new(MemoryStorage::new());
@@ -1022,7 +1057,7 @@ async fn quota_constraints_read_status_hard_not_spec_hard() {
         .await
         .unwrap();
     assert_eq!(
-        check_pod_quota_constraints(&storage, "test-namespace", &none)
+        quota_verdict(&storage, "test-namespace", &none)
             .await
             .unwrap(),
         None,
@@ -1054,7 +1089,7 @@ async fn quota_constraints_read_status_hard_not_spec_hard() {
         .await
         .unwrap();
     assert_eq!(
-        check_pod_quota_constraints(&storage, "test-namespace", &none)
+        quota_verdict(&storage, "test-namespace", &none)
             .await
             .unwrap()
             .as_deref(),

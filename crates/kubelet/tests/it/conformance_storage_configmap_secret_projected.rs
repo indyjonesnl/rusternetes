@@ -1358,6 +1358,7 @@ fn pod_volume_with_configmap_source_round_trips_through_serde() {
         "p",
         "ns",
         vec![Volume {
+            legacy_sources: Default::default(),
             name: "cm-vol".to_string(),
             config_map: Some(ConfigMapVolumeSource {
                 name: Some("my-cm".to_string()),
@@ -1394,6 +1395,7 @@ fn pod_volume_with_secret_source_uses_secret_name_field() {
         "p",
         "ns",
         vec![Volume {
+            legacy_sources: Default::default(),
             name: "s-vol".to_string(),
             secret: Some(SecretVolumeSource {
                 secret_name: Some("my-s".to_string()),
@@ -1427,6 +1429,7 @@ fn pod_volume_with_projected_source_preserves_sources_list() {
         "p",
         "ns",
         vec![Volume {
+            legacy_sources: Default::default(),
             name: "proj-vol".to_string(),
             projected: Some(ProjectedVolumeSource {
                 sources: Some(vec![

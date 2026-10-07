@@ -32,9 +32,11 @@
 //!   are resolved by loading the api-server's discovery once and caching it. A
 //!   plural that is neither built-in nor present in discovery (e.g. a CRD whose
 //!   controller runs but whose CRD is not registered) errors via [`unmapped`].
-//! - **`current_revision`/`is_revision_compacted`** are best-effort (0 / false):
-//!   no controller in this crate calls them, and `list_paginated` is a handler
-//!   concern, not a controller one.
+//! - **`current_revision`/`is_revision_compacted`** are answered by the
+//!   api-server (a one-item LIST's `metadata.resourceVersion`, and a
+//!   `resourceVersionMatch=Exact` LIST's `Expired` status), the way a
+//!   client-go reflector learns both. `watch_from_revision` still ignores its
+//!   revision (see `watch_inner`).
 
 use crate::{Storage, WatchEvent, WatchStream};
 use async_trait::async_trait;
@@ -807,17 +809,60 @@ impl Storage for ApiStorage {
         self.watch_inner(prefix, Some(revision.to_string())).await
     }
 
+    /// The api-server's current revision, read the way a client-go reflector
+    /// reads it: `resourceVersion = listMetaInterface.GetResourceVersion()` of
+    /// a LIST response (`client-go/tools/cache/reflector.go:677`, release-1.35).
+    /// `limit=1` keeps the page to one item; the list's `resourceVersion` is
+    /// the store revision regardless of page size. The api-server owns
+    /// revisions, so this asks it rather than answering a constant.
     async fn current_revision(&self) -> Result<i64> {
-        // Unused by controllers; the api-server owns revisions.
-        Ok(0)
+        let path = self.namespaces_collection().await?;
+        let list: KubernetesList<Value> = self
+            .client
+            .get(&format!("{path}?limit=1"))
+            .await
+            .map_err(map_get_err)?;
+        let rv = list
+            .metadata
+            .and_then(|m| m.resource_version)
+            .ok_or_else(|| Error::Storage("list response carries no resourceVersion".into()))?;
+        rv.parse::<i64>()
+            .map_err(|e| Error::Storage(format!("list resourceVersion {rv:?} is not numeric: {e}")))
     }
 
-    async fn is_revision_compacted(&self, _revision: i64) -> Result<bool> {
-        Ok(false)
+    /// Whether the api-server can no longer serve `revision`. A client learns
+    /// this from an `Expired` / `Gone` status, never by a flag, so ask for the
+    /// revision exactly and classify the error with the reflector's
+    /// `isExpiredError` (`reflector.go:1051-1058`: `IsResourceExpired(err) ||
+    /// IsGone(err)`). Any other failure is not evidence of compaction and is
+    /// surfaced rather than folded into `false`.
+    async fn is_revision_compacted(&self, revision: i64) -> Result<bool> {
+        let path = self.namespaces_collection().await?;
+        let url = format!("{path}?limit=1&resourceVersion={revision}&resourceVersionMatch=Exact");
+        match self.client.get::<KubernetesList<Value>>(&url).await {
+            Ok(_) => Ok(false),
+            Err(GetError::Other(e)) if is_expired_error(&e) => Ok(true),
+            Err(e) => Err(map_get_err(e)),
+        }
     }
 }
 
+/// `isExpiredError` (client-go `reflector.go:1051-1058`): the server said the
+/// revision is gone. `format_status_error` renders a `Status` as
+/// `Error from server (<reason>): <message>`.
+fn is_expired_error(e: &anyhow::Error) -> bool {
+    let m = e.to_string();
+    m.starts_with("Error from server (Expired)") || m.starts_with("Error from server (Gone)")
+}
+
 impl ApiStorage {
+    /// Collection path of `namespaces`: cluster-scoped and always served, so a
+    /// revision probe has exactly one path and no namespace to choose.
+    async fn namespaces_collection(&self) -> Result<String> {
+        let (root, namespaced) = self.resolve("namespaces").await?;
+        build_collection_for_prefix(&root, namespaced, "namespaces", &[])
+    }
+
     /// Subscribe to a shared upstream `?watch=true` stream for `prefix`'s
     /// collection. The first subscriber for a path spawns one upstream task
     /// (re-keying events into `/registry/...` form and broadcasting them);
@@ -1573,5 +1618,99 @@ mod tests {
                 .contains("content-type: application/strategic-merge-patch+json"),
             "{req}"
         );
+    }
+
+    /// A server answering every request with `body` at `status`, recording each
+    /// request line.
+    async fn spawn_fixed_server(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let req = read_request(&mut stream).await;
+                log.lock()
+                    .await
+                    .push(req.lines().next().unwrap_or("").to_string());
+                respond(&mut stream, status, body).await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// `current_revision` was a constant 0: a caller resuming from it would
+    /// start at the beginning of time. It must be the api-server's list
+    /// `resourceVersion` (`reflector.go:677`).
+    #[tokio::test]
+    async fn current_revision_is_the_servers_list_resource_version() {
+        let (base, seen) = spawn_fixed_server(
+            "200 OK",
+            r#"{"apiVersion":"v1","kind":"NamespaceList","metadata":{"resourceVersion":"4242"},"items":[]}"#,
+        )
+        .await;
+        let storage = ApiStorage::new(Arc::new(ApiClient::new(&base, true, None).unwrap()));
+        assert_eq!(storage.current_revision().await.unwrap(), 4242);
+        let line = seen.lock().await[0].clone();
+        assert!(
+            line.starts_with("GET /api/v1/namespaces?limit=1 "),
+            "{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_revision_errors_when_the_list_has_no_resource_version() {
+        let (base, _) = spawn_fixed_server(
+            "200 OK",
+            r#"{"apiVersion":"v1","kind":"NamespaceList","metadata":{},"items":[]}"#,
+        )
+        .await;
+        let storage = ApiStorage::new(Arc::new(ApiClient::new(&base, true, None).unwrap()));
+        assert!(storage.current_revision().await.is_err());
+    }
+
+    /// `is_revision_compacted` was a constant false. An `Expired` 410 for the
+    /// exact revision means compacted (`isExpiredError`, `reflector.go:1051`).
+    #[tokio::test]
+    async fn is_revision_compacted_true_on_expired_410() {
+        let (base, seen) = spawn_fixed_server(
+            "410 Gone",
+            r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Expired","code":410,"message":"too old resource version: 5 (100)"}"#,
+        )
+        .await;
+        let storage = ApiStorage::new(Arc::new(ApiClient::new(&base, true, None).unwrap()));
+        assert!(storage.is_revision_compacted(5).await.unwrap());
+        let line = seen.lock().await[0].clone();
+        assert!(
+            line.contains("resourceVersion=5") && line.contains("resourceVersionMatch=Exact"),
+            "{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_revision_compacted_false_when_the_revision_is_served() {
+        let (base, _) = spawn_fixed_server(
+            "200 OK",
+            r#"{"apiVersion":"v1","kind":"NamespaceList","metadata":{"resourceVersion":"5"},"items":[]}"#,
+        )
+        .await;
+        let storage = ApiStorage::new(Arc::new(ApiClient::new(&base, true, None).unwrap()));
+        assert!(!storage.is_revision_compacted(5).await.unwrap());
+    }
+
+    /// A 500 is not evidence of compaction: surface it rather than answering
+    /// `false`, which would let a caller trust a revision it could not verify.
+    #[tokio::test]
+    async fn is_revision_compacted_surfaces_other_failures() {
+        let (base, _) = spawn_fixed_server(
+            "500 Internal Server Error",
+            r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"InternalError","code":500,"message":"boom"}"#,
+        )
+        .await;
+        let storage = ApiStorage::new(Arc::new(ApiClient::new(&base, true, None).unwrap()));
+        assert!(storage.is_revision_compacted(5).await.is_err());
     }
 }

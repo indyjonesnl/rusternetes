@@ -367,9 +367,146 @@ pub fn read_log_file(path: &Path, opts: &LogReadOptions) -> anyhow::Result<Vec<u
     Ok(out)
 }
 
+/// Port-forward ports parsed from a kubelet `/portForward` request.
+///
+/// Port of `portforward.NewV4Options`
+/// (`staging/src/k8s.io/kubelet/pkg/cri/streaming/portforward/websocket.go:56-86`).
+/// Error strings are upstream's verbatim, including Go's `strconv.ParseUint`
+/// wording. A non-WebSocket (SPDY) request carries its ports in the stream
+/// headers, which the runtime's stream server reads itself, so it yields no
+/// ports here (`websocket.go:57-59`).
+pub fn parse_port_forward_ports(query: &str, is_websocket: bool) -> Result<Vec<i32>, String> {
+    if !is_websocket {
+        return Ok(Vec::new());
+    }
+    let port_strings: Vec<String> = url::form_urlencoded::parse(query.as_bytes())
+        .filter(|(k, _)| k == "port")
+        .map(|(_, v)| v.into_owned())
+        .collect();
+    if port_strings.is_empty() {
+        return Err("query parameter \"port\" is required".to_string());
+    }
+    let mut ports = Vec::with_capacity(port_strings.len());
+    for port_string in &port_strings {
+        if port_string.is_empty() {
+            return Err("query parameter \"port\" cannot be empty".to_string());
+        }
+        for p in port_string.split(',') {
+            let port = parse_uint16(p).map_err(|e| {
+                format!(
+                    "unable to parse {port_string:?} as a port: \
+                     strconv.ParseUint: parsing {p:?}: {e}"
+                )
+            })?;
+            if port < 1 {
+                return Err(format!("port {port_string:?} must be > 0"));
+            }
+            ports.push(i32::from(port));
+        }
+    }
+    Ok(ports)
+}
+
+/// `strconv.ParseUint(s, 10, 16)` error text: `invalid syntax` for anything that
+/// is not all ASCII digits (a sign is invalid syntax too), `value out of range`
+/// past 65535.
+fn parse_uint16(s: &str) -> Result<u16, &'static str> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("invalid syntax");
+    }
+    s.parse::<u16>().map_err(|_| "value out of range")
+}
+
+/// Resolve the newest CRI pod sandbox id for a pod.
+///
+/// Port of `getSandboxIDByPodUID`
+/// (`pkg/kubelet/kuberuntime/kuberuntime_sandbox.go:339-367`): list sandboxes by
+/// the pod-uid label, newest first. When the request carries no uid (the
+/// 3-segment kubelet route) fall back to the namespace + name labels, as
+/// [`resolve_container_id`] does.
+pub async fn resolve_sandbox_id(cri: &mut CriClient, pod: &Pod) -> anyhow::Result<Option<String>> {
+    let mut label_selector = HashMap::new();
+    if !pod.metadata.uid.is_empty() {
+        label_selector.insert(labels::POD_UID.to_string(), pod.metadata.uid.clone());
+    } else {
+        label_selector.insert(labels::POD_NAME.to_string(), pod.metadata.name.clone());
+        if let Some(ns) = pod.metadata.namespace.as_deref() {
+            label_selector.insert(labels::POD_NAMESPACE.to_string(), ns.to_string());
+        }
+    }
+    let filter = v1::PodSandboxFilter {
+        label_selector,
+        ..Default::default()
+    };
+    let mut sandboxes = cri.list_pod_sandbox(Some(filter)).await?;
+    sandboxes.sort_by_key(|s| std::cmp::Reverse(s.created_at));
+    Ok(sandboxes.into_iter().next().map(|s| s.id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Port of upstream TestV4Options
+    // (staging/src/k8s.io/kubelet/pkg/cri/streaming/portforward/websocket_test.go:25-101).
+    #[test]
+    fn port_forward_ports_match_upstream_v4_options() {
+        type Case = (
+            &'static str,
+            &'static str,
+            bool,
+            Result<Vec<i32>, &'static str>,
+        );
+        let cases: Vec<Case> = vec![
+            ("non-ws request", "", false, Ok(vec![])),
+            (
+                "missing port",
+                "",
+                true,
+                Err("query parameter \"port\" is required"),
+            ),
+            (
+                "unable to parse port",
+                "port=abc",
+                true,
+                Err("unable to parse \"abc\" as a port: strconv.ParseUint: parsing \"abc\": invalid syntax"),
+            ),
+            (
+                "negative port",
+                "port=-1",
+                true,
+                Err("unable to parse \"-1\" as a port: strconv.ParseUint: parsing \"-1\": invalid syntax"),
+            ),
+            ("one port", "port=80", true, Ok(vec![80])),
+            (
+                "multiple ports",
+                "port=80,90,100",
+                true,
+                Ok(vec![80, 90, 100]),
+            ),
+            ("multiple port", "port=80&port=90", true, Ok(vec![80, 90])),
+            (
+                "empty port",
+                "port=",
+                true,
+                Err("query parameter \"port\" cannot be empty"),
+            ),
+            ("zero port", "port=0", true, Err("port \"0\" must be > 0")),
+            (
+                "out of range",
+                "port=65536",
+                true,
+                Err("unable to parse \"65536\" as a port: strconv.ParseUint: parsing \"65536\": value out of range"),
+            ),
+        ];
+        for (name, query, ws, want) in cases {
+            let got = parse_port_forward_ports(query, ws);
+            match want {
+                Ok(v) => assert_eq!(got.as_ref().ok(), Some(&v), "{name}: {got:?}"),
+                Err(e) => assert_eq!(got.as_ref().err().map(String::as_str), Some(e), "{name}"),
+            }
+        }
+    }
 
     #[test]
     fn rewrite_stream_url_replaces_host_port_keeping_path_and_query() {

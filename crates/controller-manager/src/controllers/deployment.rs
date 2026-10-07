@@ -43,6 +43,14 @@ const CONCURRENT_DEPLOYMENT_SYNCS: usize = 5;
 pub struct DeploymentController<S: Storage> {
     storage: Arc<S>,
     interval: Duration,
+    /// The Deployment as this sync's own metadata write left it, by key.
+    /// Upstream threads the object `Update` returns into the later
+    /// `UpdateStatus` (`getNewReplicaSet` reassigns `d`,
+    /// pkg/controller/deployment/sync.go:289-299) so a sync's own write never
+    /// makes its status write stale (#2160). Our helpers are separate methods,
+    /// so the returned object is parked here and taken by
+    /// `update_deployment_status`.
+    own_writes: std::sync::Mutex<std::collections::HashMap<String, Deployment>>,
 }
 
 impl<S: Storage + 'static> DeploymentController<S> {
@@ -50,7 +58,18 @@ impl<S: Storage + 'static> DeploymentController<S> {
         Self {
             storage,
             interval: Duration::from_secs(interval_secs),
+            own_writes: Default::default(),
         }
+    }
+
+    fn remember_own_write(&self, key: &str, written: Deployment) {
+        if let Ok(mut m) = self.own_writes.lock() {
+            m.insert(key.to_string(), written);
+        }
+    }
+
+    fn take_own_write(&self, key: &str) -> Option<Deployment> {
+        self.own_writes.lock().ok()?.remove(key)
     }
 
     pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
@@ -284,6 +303,12 @@ impl<S: Storage + 'static> DeploymentController<S> {
             "Reconciling deployment: {}/{}",
             namespace, deployment.metadata.name
         );
+        // A write parked by an earlier, abandoned sync is not this sync's.
+        let _ = self.take_own_write(&build_key(
+            "deployments",
+            Some(namespace),
+            &deployment.metadata.name,
+        ));
 
         // Get all ReplicaSets and claim/adopt matching ones (K8s ClaimReplicaSets pattern)
         let rs_prefix = build_prefix("replicasets", Some(namespace));
@@ -458,7 +483,9 @@ impl<S: Storage + 'static> DeploymentController<S> {
                         revision_str,
                     );
                 let key = build_key("deployments", Some(namespace), &deployment.metadata.name);
-                let _ = self.storage.update(&key, &updated).await;
+                if let Ok(written) = self.storage.update(&key, &updated).await {
+                    self.remember_own_write(&key, written);
+                }
             }
         }
 
@@ -1265,7 +1292,10 @@ impl<S: Storage + 'static> DeploymentController<S> {
                                 new_rev.clone(),
                             );
                         match self.storage.update(&dep_key, &dep).await {
-                            Ok(_) => break,
+                            Ok(written) => {
+                                self.remember_own_write(&dep_key, written);
+                                break;
+                            }
                             Err(e) => {
                                 debug!("CAS retry updating deployment revision: {}", e);
                                 continue;
@@ -1864,35 +1894,41 @@ impl<S: Storage + 'static> DeploymentController<S> {
         // Only write if status or revision annotation actually changed
         if status_changed || revision_changed {
             let key = build_key("deployments", Some(namespace), &deployment.metadata.name);
-            // Re-read from storage for fresh resourceVersion to avoid CAS conflicts
-            // with concurrent test PATCH operations
-            let mut updated_deployment: Deployment = match self.storage.get(&key).await {
-                Ok(d) => d,
-                Err(_) => deployment.clone(),
-            };
-            updated_deployment.status = Some(new_status);
-
-            if let Some(rev) = max_revision {
-                updated_deployment
-                    .metadata
-                    .annotations
-                    .get_or_insert_with(std::collections::HashMap::new)
-                    .insert(
-                        "deployment.kubernetes.io/revision".to_string(),
-                        rev.to_string(),
-                    );
-            }
+            // Upstream writes status on the object this sync read, never on a
+            // re-read: `syncRolloutStatus` does `newDeployment := d;
+            // newDeployment.Status = newStatus; dc.client.AppsV1().
+            // Deployments(d.Namespace).UpdateStatus(ctx, newDeployment, ...)`
+            // (pkg/controller/deployment/progress.go:113-116, sync.go:487-490) and the registry's
+            // Update enforces the resourceVersion, so a Deployment changed
+            // since the read is a Conflict that the workqueue retries
+            // (#2160). A re-read here would clobber that change with a status
+            // computed from the stale one.
+            let mut updated_deployment: Deployment = self
+                .take_own_write(&key)
+                .unwrap_or_else(|| deployment.clone());
 
             // The revision annotation is metadata (a normal PUT); the replica
             // counts/conditions are status (the /status subresource — a full PUT
             // strips `.status` through the api-server). Write each to its own
-            // path so both persist in API mode.
-            if revision_changed {
-                self.storage.update(&key, &updated_deployment).await?;
+            // path so both persist in API mode. The status write carries the
+            // object the metadata write returned: our own first write must not
+            // make the status write's resourceVersion stale.
+            if let Some(rev) = max_revision {
+                let rev = rev.to_string();
+                let annotations = updated_deployment
+                    .metadata
+                    .annotations
+                    .get_or_insert_with(std::collections::HashMap::new);
+                // This sync may already have written it (own_writes).
+                if annotations.get("deployment.kubernetes.io/revision") != Some(&rev) {
+                    annotations.insert("deployment.kubernetes.io/revision".to_string(), rev);
+                    updated_deployment = self.storage.update(&key, &updated_deployment).await?;
+                }
             }
             if status_changed {
+                updated_deployment.status = Some(new_status);
                 self.storage
-                    .update_status(&key, &updated_deployment)
+                    .update_status_cas(&key, &updated_deployment)
                     .await?;
             }
         }

@@ -22,14 +22,14 @@ use crate::validation::objectmeta::{
 use crate::validation::service::{is_valid_ip_for_legacy_field, parse_ip_sloppy};
 
 /// `api.MirrorPodAnnotationKey`.
-const MIRROR_POD_ANNOTATION_KEY: &str = "kubernetes.io/config.mirror";
+pub(crate) const MIRROR_POD_ANNOTATION_KEY: &str = "kubernetes.io/config.mirror";
 /// `v1.DeprecatedAppArmorBetaContainerAnnotationKeyPrefix`.
 const APP_ARMOR_ANNOTATION_PREFIX: &str = "container.apparmor.security.beta.kubernetes.io/";
 
 /// `core.TolerationsAnnotationKey`.
-const TOLERATIONS_ANNOTATION_KEY: &str = "scheduler.alpha.kubernetes.io/tolerations";
+pub(crate) const TOLERATIONS_ANNOTATION_KEY: &str = "scheduler.alpha.kubernetes.io/tolerations";
 /// `core.PodDeletionCost`.
-const POD_DELETION_COST: &str = "controller.kubernetes.io/pod-deletion-cost";
+pub(crate) const POD_DELETION_COST: &str = "controller.kubernetes.io/pod-deletion-cost";
 /// `core.SeccompPodAnnotationKey`.
 const SECCOMP_POD_ANNOTATION_KEY: &str = "seccomp.security.alpha.kubernetes.io/pod";
 /// `core.SeccompContainerAnnotationKeyPrefix`.
@@ -307,7 +307,7 @@ pub fn validate_pod_metadata_annotations(pod: &Pod, old: Option<&Pod>) -> ErrorL
 /// `ValidatePodSpecificAnnotations` (validation.go:193-217). The options
 /// are `AllowInvalidPodDeletionCost`; the tolerations annotation is checked
 /// with `AllowTaintTolerationComparisonOperators` from the spec itself.
-pub(crate) fn validate_pod_specific_annotations(
+pub fn validate_pod_specific_annotations(
     annotations: &HashMap<String, String>,
     spec: &PodSpec,
     fld_path: &Path,
@@ -391,7 +391,7 @@ fn validate_tolerations_in_pod_annotations(
 
 /// `helper.GetDeletionCostFromPodAnnotations` (helper/helpers.go:491-513):
 /// a value that starts with a plus sign or a leading zero is not valid.
-fn get_deletion_cost_from_pod_annotations(
+pub(crate) fn get_deletion_cost_from_pod_annotations(
     annotations: &HashMap<String, String>,
 ) -> Result<i32, String> {
     let Some(value) = annotations.get(POD_DELETION_COST) else {
@@ -424,6 +424,13 @@ fn validate_seccomp_profile(p: &str, fld_path: &Path) -> ErrorList {
     )]
 }
 
+/// Go ranges a map in random order; sort so the error order is deterministic.
+fn sorted_entries(annotations: &HashMap<String, String>) -> Vec<(&String, &String)> {
+    let mut v: Vec<_> = annotations.iter().collect();
+    v.sort();
+    v
+}
+
 /// `ValidateSeccompPodAnnotations` (validation.go:5281-5293).
 fn validate_seccomp_pod_annotations(
     annotations: &HashMap<String, String>,
@@ -436,7 +443,7 @@ fn validate_seccomp_pod_annotations(
             &fld_path.child(SECCOMP_POD_ANNOTATION_KEY),
         ));
     }
-    for (k, p) in annotations {
+    for (k, p) in sorted_entries(annotations) {
         if k.starts_with(SECCOMP_CONTAINER_ANNOTATION_KEY_PREFIX) {
             errs.extend(validate_seccomp_profile(p, &fld_path.child(k)));
         }
@@ -452,7 +459,7 @@ fn validate_app_armor_pod_annotations(
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs = Vec::new();
-    for (k, p) in annotations {
+    for (k, p) in sorted_entries(annotations) {
         let Some(container_name) = k.strip_prefix(APP_ARMOR_ANNOTATION_PREFIX) else {
             continue;
         };
@@ -1243,6 +1250,32 @@ mod tests {
         )]));
         let errs = validate_pod_specific_annotation_updates(&new, &old, &Path::new("a"));
         assert!(messages(&errs).contains("may not add mirror pod annotation"));
+    }
+
+    /// validation_test.go:13630-13654: add (even ""), remove and change of the
+    /// mirror annotation are all refused, keyed on the annotation path.
+    #[test]
+    fn upstream_mirror_annotation_update_cases() {
+        let with = |v: Option<&str>| {
+            let mut p = pod(
+                serde_json::json!({"nodeName": "foo"}),
+                serde_json::json!({}),
+            );
+            p.metadata.annotations = v.map(|v| ann(&[(MIRROR_POD_ANNOTATION_KEY, v)]));
+            p
+        };
+        let cases = [
+            (with(Some("")), with(None)),
+            (with(None), with(Some(""))),
+            (with(Some("foo")), with(Some("bar"))),
+        ];
+        for (new, old) in cases {
+            let errs = validate_pod_specific_annotation_updates(&new, &old, &annotations_path());
+            assert!(
+                messages(&errs).contains("metadata.annotations[kubernetes.io/config.mirror]"),
+                "{errs:?}"
+            );
+        }
     }
 
     #[test]

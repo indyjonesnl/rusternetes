@@ -23,5 +23,8 @@ pub mod secret;
 pub mod util;
 
 pub use host::{KubeletVolumeHost, VolumeHost};
-pub use plugin::{Mounter, OwnedSpec, ReconstructedVolume, Spec, Unmounter, VolumePlugin};
+pub use plugin::{
+    DeviceMounter, DeviceMounterArgs, Mounter, OwnedSpec, ReconstructedVolume, Spec, Unmounter,
+    VolumePlugin,
+};
 pub use registry::{PluginLookupError, VolumePluginMgr};

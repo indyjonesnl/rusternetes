@@ -8,11 +8,13 @@ use rusternetes_common::resources::{Pod, PodStatus};
 use rusternetes_common::types::{OwnerReference, Phase};
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 
+use super::expectations::ControllerExpectations;
 use super::job_tracking::{
     clean_uncounted_pods_without_finalizers, has_job_tracking_finalizer, push_uncounted_failed,
     push_uncounted_succeeded, remove_tracking_finalizer, uncounted_has_failed,
     uncounted_has_succeeded, FinalizerExpectations, JOB_TRACKING_FINALIZER,
 };
+use super::replicationcontroller::slow_start_batches_capped;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,8 +28,23 @@ use tracing::{debug, error, info, warn};
 /// here and is unchanged.
 const CONCURRENT_JOB_SYNCS: usize = 5;
 
+/// `MaxPodCreateDeletePerSync` (`job_controller.go:79`): "the maximum number of
+/// pods that can be created or deleted in a single sync call". Without it
+/// slow-start batches double unbounded; this is the cap that makes batching
+/// safe, applied to both creations (`:1735-1737`) and deletions (`:1700-1702`).
+const MAX_POD_CREATE_DELETE_PER_SYNC: usize = 500;
+
+/// `controller.SlowStartInitialBatchSize` (`controller_utils.go:87`).
+const SLOW_START_INITIAL_BATCH_SIZE: usize = 1;
+
 pub struct JobController<S: Storage> {
     storage: Arc<S>,
+    /// Per-Job ("ns/name") expectations of in-flight pod creates and deletes.
+    /// Upstream `jm.expectations` (`job_controller.go:100`,
+    /// `controller.NewControllerExpectations()`); shared implementation in
+    /// [`super::expectations`]. Read BEFORE listing pods in `reconcile`
+    /// (`:905`) and gating `manageJob` (`:1016`).
+    expectations: Arc<ControllerExpectations>,
     /// Pod UIDs whose tracking-finalizer removal has been issued but not yet
     /// observed. Upstream's `uidTrackingExpectations`
     /// (`pkg/controller/job/tracking_utils.go:48`) — the brake that stops a
@@ -261,9 +278,123 @@ impl<S: Storage + 'static> JobController<S> {
     pub fn new(storage: Arc<S>) -> Self {
         Self {
             storage,
+            expectations: Arc::new(ControllerExpectations::new()),
             finalizer_expectations: FinalizerExpectations::new(),
             requeue_delays: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// `addPod` / `updatePod` / `deletePod` expectation bookkeeping
+    /// (`job_controller.go:339`, `:370-378`, `:480`): a pod ADDED for a Job
+    /// observes one creation (`CreationObserved`); a pod that is deleted, or
+    /// just stamped with a deletionTimestamp (`updatePod` routes those to
+    /// `deletePod(final=false)`), observes one deletion (`DeletionObserved`).
+    ///
+    /// Deviation: upstream's expectations are the plain counter and lower on
+    /// every event; here each pod is tracked by key (see
+    /// [`ControllerExpectations::creation_observed_of`] /
+    /// [`ControllerExpectations::deletion_observed_of`]) so the several
+    /// MODIFIED events and the final DELETED of one pod count once.
+    fn observe_pod_event(&self, event: &rusternetes_storage::WatchEvent) {
+        let (json, is_added, is_deleted) = match event {
+            rusternetes_storage::WatchEvent::Added(_, v) => (v, true, false),
+            rusternetes_storage::WatchEvent::Modified(_, v) => (v, false, false),
+            rusternetes_storage::WatchEvent::Deleted(_, v) => (v, false, true),
+        };
+        let Ok(pod) = serde_json::from_str::<Pod>(json) else {
+            return;
+        };
+        let Some(owner) = pod.metadata.owner_references.as_ref().and_then(|refs| {
+            refs.iter()
+                .find(|r| r.kind == "Job" && r.controller.unwrap_or(true))
+        }) else {
+            return;
+        };
+        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let exp_key = format!("{}/{}", ns, owner.name);
+        let pod_key = format!("{}/{}", ns, pod.metadata.name);
+        let deleting = is_deleted || pod.metadata.deletion_timestamp.is_some();
+        if deleting {
+            self.expectations.deletion_observed_of(&exp_key, &pod_key);
+        } else if is_added {
+            self.expectations.creation_observed_of(&exp_key, &pod_key);
+        }
+    }
+
+    /// Port of `deleteJobPods` (`job_controller.go:1160-1196`), including the
+    /// caller's `ExpectDeletions` (`:1666`, `:1707`). Returns
+    /// `(deleted ready pods, successful deletions, first error)`.
+    ///
+    /// Each pod first loses its tracking finalizer (`removeTrackingFinalizerPatch`
+    /// and `PatchPod`, `:1181-1186`) so it is never counted as a success or
+    /// failure; then it is deleted gracefully (`podControl.DeletePod`,
+    /// `controller_utils.go:618`). `failDelete` (`:1167`) lowers the deletion
+    /// expectation because the informer will never see it, and a NotFound is
+    /// benign (neither reduces the success count nor surfaces an error).
+    async fn delete_job_pods(
+        &self,
+        exp_key: &str,
+        namespace: &str,
+        pods: &[&Pod],
+    ) -> (i32, i32, Option<anyhow::Error>) {
+        if pods.is_empty() {
+            return (0, 0, None);
+        }
+        let pod_keys: Vec<String> = pods
+            .iter()
+            .map(|p| format!("{}/{}", namespace, p.metadata.name))
+            .collect();
+        self.expectations.expect_deletions_of(exp_key, &pod_keys);
+
+        let results = futures::future::join_all(pods.iter().zip(&pod_keys).map(
+            |(pod, observed)| async move {
+                let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
+                let fail = |e: rusternetes_common::Error| {
+                    self.expectations.deletion_observed_of(exp_key, observed);
+                    e
+                };
+                if has_job_tracking_finalizer(pod) {
+                    let patched = match self.storage.get::<Pod>(&pod_key).await {
+                        Ok(mut fresh) => {
+                            if remove_tracking_finalizer(&mut fresh) {
+                                self.storage.update(&pod_key, &fresh).await.map(|_| ())
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = patched {
+                        return (false, Some(fail(e)));
+                    }
+                }
+                let err = self
+                    .storage
+                    .delete_gracefully(&pod_key)
+                    .await
+                    .err()
+                    .map(fail);
+                (true, err)
+            },
+        ))
+        .await;
+
+        let mut ready = 0;
+        let mut removed = pods.len() as i32;
+        let mut first_err: Option<anyhow::Error> = None;
+        for (pod, (reached_delete, err)) in pods.iter().zip(results) {
+            if reached_delete && is_pod_ready(pod) {
+                ready += 1;
+            }
+            if let Some(e) = err {
+                if !matches!(e, rusternetes_common::Error::NotFound(_)) {
+                    warn!("Failed to delete Job pod {}: {}", pod.metadata.name, e);
+                    removed -= 1;
+                    first_err.get_or_insert(e.into());
+                }
+            }
+        }
+        (ready, removed, first_err)
     }
 
     /// Record a delayed re-sync for a Job, keeping the earliest request.
@@ -620,51 +751,40 @@ impl<S: Storage + 'static> JobController<S> {
         Ok(())
     }
 
-    /// Persist `job.status`, retrying a CAS conflict, and skipping the write
-    /// entirely when nothing changed (a redundant write wakes every watcher).
+    /// Persist `job.status` conditionally on the resourceVersion of the Job
+    /// this sync read, skipping the write when nothing changed (a redundant
+    /// write wakes every watcher).
+    ///
+    /// Upstream's `updateStatusHandler` is `Jobs(ns).UpdateStatus(ctx, job)`
+    /// on the object the sync was handed (`pkg/controller/job/
+    /// job_controller.go:1891-1893`); the registry enforces the
+    /// resourceVersion, a lost race is a Conflict, `syncJob` returns it and the
+    /// workqueue retries with a fresh read. So: no in-place retry and no write
+    /// built from a re-read; a status computed from a stale read must never
+    /// overwrite a newer one (#2160). The worker already requeues on Err.
     async fn write_status(&self, key: &str, job: &mut Job) -> Result<()> {
-        let status_to_save = job.status.clone();
-        for attempt in 0..3 {
-            match self.storage.get::<Job>(key).await {
-                Ok(mut fresh_job) => {
-                    // Counters must not go backwards against what is already
-                    // persisted, or the api-server refuses this and every later
-                    // write (#1955).
-                    let mut next_status = status_to_save.clone();
-                    if let Some(next) = next_status.as_mut() {
-                        clamp_counters_monotonic(next, fresh_job.status.as_ref());
-                    }
-                    if fresh_job.status == next_status {
-                        job.status = next_status;
-                        return Ok(());
-                    }
-                    fresh_job.status = next_status.clone();
-                    // Status subresource write (#1723).
-                    match self.storage.update_status(key, &fresh_job).await {
-                        Ok(_) => {
-                            job.status = next_status;
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Job status update CAS conflict on {} (attempt {}): {}",
-                                key,
-                                attempt + 1,
-                                e
-                            );
-                            if attempt == 2 {
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    // The Job was deleted between the list and this write.
-                    debug!("Job {} no longer exists: {}", key, e);
-                    return Ok(());
-                }
+        let persisted = match self.storage.get::<Job>(key).await {
+            Ok(j) => j,
+            Err(e) => {
+                // The Job was deleted between the list and this write.
+                debug!("Job {} no longer exists: {}", key, e);
+                return Ok(());
             }
+        };
+        // Counters must not go backwards against what is already persisted, or
+        // the api-server refuses this and every later write (#1955).
+        if let Some(next) = job.status.as_mut() {
+            clamp_counters_monotonic(next, persisted.status.as_ref());
         }
+        let stale = job.metadata.resource_version.is_some()
+            && persisted.metadata.resource_version != job.metadata.resource_version;
+        if !stale && persisted.status == job.status {
+            return Ok(());
+        }
+        // update_status_cas refuses (Conflict) when `job` is older than the
+        // stored object; the error goes to the worker for requeue.
+        let written = self.storage.update_status_cas(key, &*job).await?;
+        job.metadata.resource_version = written.metadata.resource_version;
         Ok(())
     }
 
@@ -796,7 +916,12 @@ impl<S: Storage + 'static> JobController<S> {
                     }
                 }
                 Err(_) => {
-                    // Resource was deleted — nothing to reconcile
+                    // Resource was deleted — nothing to reconcile. Drop its
+                    // expectations so a Job recreated under the same name
+                    // starts clean (`DeleteExpectations`,
+                    // job_controller.go:839).
+                    self.expectations
+                        .delete_expectations(&format!("{}/{}", ns, name));
                     queue.forget(&key).await;
                 }
             }
@@ -824,6 +949,9 @@ impl<S: Storage + 'static> JobController<S> {
     /// When a pod changes, check its ownerReferences for a Job owner
     /// and enqueue that Job for reconciliation.
     async fn enqueue_owner_job(&self, queue: &WorkQueue, event: &rusternetes_storage::WatchEvent) {
+        // `addPod` / `updatePod` / `deletePod`: observe the expectation from
+        // the event itself — a DELETED pod can no longer be read back.
+        self.observe_pod_event(event);
         let pod_key = extract_key(event);
         let parts: Vec<&str> = pod_key.splitn(3, '/').collect();
         let ns = match parts.get(1) {
@@ -1126,8 +1254,9 @@ impl<S: Storage + 'static> JobController<S> {
                                 if let Some(ref mut s) = fresh_job.status {
                                     s.terminating = Some(terminating);
                                 }
-                                // Status subresource write (#1723).
-                                let _ = self.storage.update_status(&key, &fresh_job).await;
+                                // Status subresource write (#1723), conditional
+                                // on the fresh read's resourceVersion (#2160).
+                                let _ = self.storage.update_status_cas(&key, &fresh_job).await;
                             }
                         }
                     }
@@ -1140,9 +1269,45 @@ impl<S: Storage + 'static> JobController<S> {
         let parallelism = job.spec.parallelism.unwrap_or(1);
         let backoff_limit = job.spec.backoff_limit.unwrap_or(6);
 
+        // Expectations are read BEFORE listing pods: "otherwise a new pod can
+        // sneak in and update the expectations after we've retrieved active
+        // pods from the store" (job_controller.go:902-905); upstream's
+        // `TestRSSyncExpectations` pins the same ordering.
+        let exp_key = format!("{}/{}", namespace, name);
+        let mut satisfied_expectations = self.expectations.satisfied(&exp_key);
+        // First error from the manage phase; upstream returns it only after
+        // the status has been written (`manageJobErr`, job_controller.go:1090).
+        let mut manage_err: Option<anyhow::Error> = None;
+
         // Get current pods for this Job
         let pod_prefix = format!("/registry/pods/{}/", namespace);
         let all_pods: Vec<Pod> = self.storage.list(&pod_prefix).await?;
+
+        // Rusternetes deviation (no upstream equivalent; same intent as the
+        // DaemonSet/ReplicaSet settle-from-observation step): a pod this Job
+        // is still waiting to see created that the fresh listing already
+        // shows, or deleted that it shows gone or terminating, HAS been
+        // observed, so settle it now rather than block on a watch event.
+        if !satisfied_expectations {
+            for pending in self.expectations.pending_creations(&exp_key) {
+                if all_pods
+                    .iter()
+                    .any(|p| format!("{}/{}", namespace, p.metadata.name) == pending)
+                {
+                    self.expectations.creation_observed_of(&exp_key, &pending);
+                }
+            }
+            for pending in self.expectations.pending_deletions(&exp_key) {
+                let still_live = all_pods.iter().any(|p| {
+                    p.metadata.deletion_timestamp.is_none()
+                        && format!("{}/{}", namespace, p.metadata.name) == pending
+                });
+                if !still_live {
+                    self.expectations.deletion_observed_of(&exp_key, &pending);
+                }
+            }
+            satisfied_expectations = self.expectations.satisfied(&exp_key);
+        }
 
         // Find pods owned by this Job via ownerReferences (authoritative),
         // or matching selector labels (for orphan adoption).
@@ -1580,28 +1745,32 @@ impl<S: Storage + 'static> JobController<S> {
             }
         }
 
-        // Handle suspended jobs: delete all active pods and set active to 0
+        // Handle suspended jobs: delete all active pods (`manageJob`,
+        // job_controller.go:1663-1673): `activePodsForRemoval(.., active)`,
+        // `ExpectDeletions`, `deleteJobPods`; only when expectations are
+        // satisfied (`:1016`).
         if job.spec.suspend.unwrap_or(false) {
-            if active > 0 {
-                for pod in job_pods.iter().filter(|p| is_pod_active(p)) {
-                    let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
-                    if matches!(phase, Some(Phase::Running) | Some(Phase::Pending)) {
-                        let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-                        // `deleteActivePods` -> `podControl.DeletePod`
-                        // (job_controller.go:1122-1140; controller_utils.go:618).
-                        let _ = self.storage.delete_gracefully(&pod_key).await;
-                        info!(
-                            "Suspended job {}/{}: deleted active pod {}",
-                            namespace, name, pod.metadata.name
-                        );
-                    }
-                }
+            let mut removed = 0;
+            let mut removed_ready = 0;
+            if satisfied_expectations && active > 0 {
+                let active_pods = active_job_pods(job_pods.iter());
+                let to_delete = active_pods_for_removal(job, &active_pods, active as usize);
+                let (rr, r, err) = self.delete_job_pods(&exp_key, namespace, &to_delete).await;
+                removed_ready = rr;
+                removed = r;
+                manage_err = err;
+                info!(
+                    "Suspended job {}/{}: deleted {} active pods",
+                    namespace, name, removed
+                );
             }
+            let active = active - removed;
+            let ready = ready - removed_ready;
             // Preserve existing start_time
             let existing_start_time = job.status.as_ref().and_then(|s| s.start_time);
             let existing_conditions = job.status.as_ref().and_then(|s| s.conditions.clone());
             job.status = Some(JobStatus {
-                active: Some(0),
+                active: Some(active),
                 succeeded: status_succeeded,
                 failed: status_failed,
                 conditions: existing_conditions,
@@ -1624,7 +1793,10 @@ impl<S: Storage + 'static> JobController<S> {
                 &job_pods,
             )
             .await?;
-            return Ok(());
+            return match manage_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            };
         }
 
         // Handle activeDeadlineSeconds — fail the job if it has been active too long
@@ -1962,24 +2134,53 @@ impl<S: Storage + 'static> JobController<S> {
                 })
                 .collect();
 
-            let mut fresh_active = 0i32;
-            let mut fresh_succeeded = 0i32;
-            for pod in fresh_job_pods.iter() {
-                if let Some(status) = &pod.status {
-                    match &status.phase {
-                        Some(Phase::Running) | Some(Phase::Pending) if !is_pod_active(pod) => {}
-                        Some(Phase::Running) | Some(Phase::Pending) => fresh_active += 1,
-                        Some(Phase::Succeeded) => fresh_succeeded += 1,
-                        _ => {}
-                    }
+            let fresh_active_pods = active_job_pods(fresh_job_pods.iter().copied());
+            let fresh_active = fresh_active_pods.len() as i32;
+
+            // `manageJob` (job_controller.go:1653-1830), run only while
+            // expectations are satisfied (`:1016`).
+            let mut pods_needed = 0i32;
+            if satisfied_expectations {
+                // `wantActive` (`:1677-1696`).
+                let want_active = match job.spec.completions {
+                    // No completions: "number active should be equal to
+                    // parallelism, unless the job has seen at least once
+                    // success, in which leave whatever is running, running."
+                    None if succeeded > 0 => fresh_active,
+                    None => parallelism,
+                    Some(c) => (c - succeeded).clamp(0, parallelism.max(0)),
+                };
+                let rm_at_least = (fresh_active - want_active).max(0) as usize;
+                let mut to_delete = active_pods_for_removal(job, &fresh_active_pods, rm_at_least);
+                to_delete.truncate(MAX_POD_CREATE_DELETE_PER_SYNC);
+                if !to_delete.is_empty() {
+                    // "restrict ourselves to either just pod deletion or pod
+                    // creation in any given sync cycle. Of these two, pod
+                    // deletion takes precedence." (`:1717-1720`)
+                    info!(
+                        "Too many pods running for job {}/{}: deleting {} (target {})",
+                        namespace,
+                        name,
+                        to_delete.len(),
+                        want_active
+                    );
+                    let (rr, r, err) = self.delete_job_pods(&exp_key, namespace, &to_delete).await;
+                    active = fresh_active - r;
+                    ready -= rr;
+                    manage_err = err;
+                } else {
+                    // `diff := wantActive - terminating - active` (`:1722-1728`):
+                    // with podReplacementPolicy=Failed a terminating pod is
+                    // not replaced until it has failed.
+                    let terminating = if only_replace_failed_pods {
+                        count_terminating_pods(fresh_job_pods.iter().copied())
+                    } else {
+                        0
+                    };
+                    pods_needed = (want_active - terminating - fresh_active)
+                        .min(MAX_POD_CREATE_DELETE_PER_SYNC as i32);
                 }
             }
-
-            // Calculate how many new pods to create using fresh counts
-            let pods_needed = std::cmp::min(
-                parallelism - fresh_active,
-                completions - fresh_succeeded - fresh_active,
-            );
 
             if pods_needed > 0 {
                 // For Indexed mode, find which indexes still need pods
@@ -2059,76 +2260,89 @@ impl<S: Storage + 'static> JobController<S> {
                     (0..pods_needed).collect()
                 };
 
-                for (i, idx) in indexes_to_create.iter().enumerate() {
-                    // `addIndexFailureCountAnnotation` (`indexed_job_utils.go:350`)
-                    let failure_counts = if is_indexed && backoff_limit_per_index.is_some() {
-                        let replaced = delayed_deletion.get(idx);
-                        Some(new_index_failure_counts(
-                            replaced,
-                            replaced.is_some_and(|p| ignored_pods.contains(&p.metadata.name)),
-                        ))
-                    } else {
-                        None
-                    };
-                    match self
-                        .create_pod(job, namespace, *idx, is_indexed, failure_counts)
-                        .await
-                    {
-                        Ok(_) => {
-                            info!(
-                                "Created pod for Job {}/{} ({}/{})",
-                                namespace,
-                                name,
-                                fresh_job_pods.len() + i + 1,
-                                completions
-                            );
+                // `ExpectCreations(diff)` BEFORE any create (`:1755`), so a
+                // sync re-entered by our own creates' watch events finds the
+                // record unmet and does nothing until they are observed.
+                let diff = indexes_to_create.len();
+                if diff > 0 {
+                    self.expectations.expect_creations(&exp_key, diff as i64);
+                    self.expectations.clear_created(&exp_key);
+                }
+                active = fresh_active + diff as i32;
+
+                // Slow-start batches (`:1771-1827`): sizes start at
+                // `SlowStartInitialBatchSize` and double after each fully
+                // successful batch, so a failure that would hit every create
+                // (quota, admission) costs one create, not `diff`.
+                let mut attempted = 0usize;
+                for batch in
+                    slow_start_batches_capped(diff, SLOW_START_INITIAL_BATCH_SIZE, usize::MAX)
+                {
+                    let todo = &indexes_to_create[attempted..attempted + batch];
+                    attempted += batch;
+                    let results = futures::future::join_all(todo.iter().map(|idx| {
+                        // `addIndexFailureCountAnnotation` (`indexed_job_utils.go:350`)
+                        let failure_counts = if is_indexed && backoff_limit_per_index.is_some() {
+                            let replaced = delayed_deletion.get(idx);
+                            Some(new_index_failure_counts(
+                                replaced,
+                                replaced.is_some_and(|p| ignored_pods.contains(&p.metadata.name)),
+                            ))
+                        } else {
+                            None
+                        };
+                        let job_ref: &Job = job;
+                        async move {
+                            self.create_pod(job_ref, namespace, *idx, is_indexed, failure_counts)
+                                .await
                         }
-                        Err(e) => {
-                            let err_str = format!("{}", e);
-                            if err_str.contains("already exists")
-                                || err_str.contains("AlreadyExists")
-                            {
-                                debug!(
-                                    "Pod already exists for Job {}/{}, skipping",
-                                    namespace, name
+                    }))
+                    .await;
+                    let mut batch_failed = false;
+                    for result in results {
+                        match result {
+                            Ok(pod_name) => {
+                                self.expectations.record_created(
+                                    &exp_key,
+                                    &format!("{}/{}", namespace, pod_name),
                                 );
-                            } else {
-                                return Err(e);
+                            }
+                            Err(e) => {
+                                // "Decrement the expected number of creates
+                                // because the informer won't observe this pod"
+                                // (`:1810-1812`). Upstream skips this for a
+                                // NamespaceTerminating cause (`:1796-1801`);
+                                // lowering for every failure is the safe
+                                // superset, so the record never waits out its
+                                // TTL.
+                                self.expectations.creation_observed(&exp_key);
+                                active -= 1;
+                                let err_str = format!("{}", e);
+                                if err_str.contains("already exists")
+                                    || err_str.contains("AlreadyExists")
+                                {
+                                    debug!(
+                                        "Pod already exists for Job {}/{}, skipping",
+                                        namespace, name
+                                    );
+                                    continue;
+                                }
+                                warn!("Failed to create pod for Job {}/{}: {}", namespace, name, e);
+                                batch_failed = true;
+                                manage_err.get_or_insert(e);
                             }
                         }
                     }
+                    // "any skipped pods that we never attempted to start
+                    // shouldn't be expected" (`:1818-1830`).
+                    let skipped = diff - attempted;
+                    if batch_failed && skipped > 0 {
+                        self.expectations
+                            .lower_expectations(&exp_key, skipped as i64, 0);
+                        active -= skipped as i32;
+                        break;
+                    }
                 }
-
-                // Re-count pods after creation to get accurate status
-                let all_pods_after: Vec<Pod> = self.storage.list(&pod_prefix).await?;
-                let job_pods_after: Vec<Pod> = all_pods_after
-                    .into_iter()
-                    .filter(|pod| {
-                        pod.metadata
-                            .labels
-                            .as_ref()
-                            .and_then(|labels| labels.get("job-name"))
-                            .map(|j| j == name)
-                            .unwrap_or(false)
-                    })
-                    .collect();
-
-                // Only `active` is re-derived here. `succeeded` and `failed`
-                // are cumulative counters owned by the tracking protocol — a
-                // pod contributes to them exactly once, when its UID is claimed
-                // — so recounting them from this list would count every
-                // already-counted pod a second time. The pods just created are
-                // Pending, which is precisely what `active` measures.
-                active = job_pods_after
-                    .iter()
-                    .filter(|pod| {
-                        is_pod_active(pod)
-                            && matches!(
-                                pod.status.as_ref().and_then(|s| s.phase.as_ref()),
-                                Some(Phase::Running) | Some(Phase::Pending)
-                            )
-                    })
-                    .count() as i32;
             }
 
             // Update status — but preserve conditions and completion_time if job
@@ -2205,9 +2419,15 @@ impl<S: Storage + 'static> JobController<S> {
         )
         .await?;
 
-        Ok(())
+        // `manageJobErr` surfaces only after the status write
+        // (job_controller.go:1090).
+        match manage_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
+    /// Create one pod from the Job's template; returns its generated name.
     async fn create_pod(
         &self,
         job: &Job,
@@ -2215,7 +2435,7 @@ impl<S: Storage + 'static> JobController<S> {
         index: i32,
         is_indexed: bool,
         index_failure_counts: Option<(i32, i32)>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let job_name = &job.metadata.name;
         let pod_name = format!(
             "{}-{}",
@@ -2364,8 +2584,232 @@ impl<S: Storage + 'static> JobController<S> {
         let key = format!("/registry/pods/{}/{}", namespace, pod_name);
         self.storage.create(&key, &pod).await?;
 
-        Ok(())
+        Ok(pod_name)
     }
+}
+
+/// `podutil.IsPodReady`: the Ready condition is True.
+fn is_pod_ready(pod: &Pod) -> bool {
+    pod_ready_condition(pod).is_some()
+}
+
+fn pod_ready_condition(pod: &Pod) -> Option<&rusternetes_common::resources::pod::PodCondition> {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|cs| {
+            cs.iter()
+                .find(|c| c.condition_type == "Ready" && c.status == "True")
+        })
+}
+
+/// `controller.CountTerminatingPods` (`controller_utils.go:1021`): not yet
+/// terminal, with a deletionTimestamp.
+fn count_terminating_pods<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> i32 {
+    pods.into_iter()
+        .filter(|p| {
+            p.metadata.deletion_timestamp.is_some()
+                && !matches!(
+                    p.status.as_ref().and_then(|s| s.phase.as_ref()),
+                    Some(Phase::Succeeded) | Some(Phase::Failed)
+                )
+        })
+        .count() as i32
+}
+
+/// `(regularRestarts, sidecarRestarts)` — `maxContainerRestarts`
+/// (`controller_utils.go:948`).
+fn max_container_restarts(pod: &Pod) -> (u32, u32) {
+    let regular = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .map_or(0, |cs| {
+            cs.iter().map(|c| c.restart_count).max().unwrap_or(0)
+        });
+    let sidecars: HashSet<&str> = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.init_containers.as_ref())
+        .map(|ics| {
+            ics.iter()
+                .filter(|c| c.restart_policy.as_deref() == Some("Always"))
+                .map(|c| c.name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let sidecar = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.init_container_statuses.as_ref())
+        .map_or(0, |cs| {
+            cs.iter()
+                .filter(|c| sidecars.contains(c.name.as_str()))
+                .map(|c| c.restart_count)
+                .max()
+                .unwrap_or(0)
+        });
+    (regular, sidecar)
+}
+
+/// `afterOrZero` (`controller_utils.go:913`).
+fn after_or_zero(
+    t1: Option<chrono::DateTime<chrono::Utc>>,
+    t2: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    match (t1, t2) {
+        (Some(a), Some(b)) => a > b,
+        (a, _) => a.is_none(),
+    }
+}
+
+/// `controller.ActivePods.Less` (`controller_utils.go:741-776`): true when
+/// `a` should be deleted before `b`.
+fn active_pods_less(a: &Pod, b: &Pod) -> bool {
+    // 1. Unassigned < assigned.
+    let node = |p: &Pod| {
+        p.spec
+            .as_ref()
+            .and_then(|s| s.node_name.clone())
+            .unwrap_or_default()
+    };
+    let (na, nb) = (node(a), node(b));
+    if na != nb && (na.is_empty() || nb.is_empty()) {
+        return na.is_empty();
+    }
+    // 2. PodPending < PodUnknown < PodRunning (`podPhaseToOrdinal`).
+    let ordinal = |p: &Pod| match p.status.as_ref().and_then(|s| s.phase.as_ref()) {
+        Some(Phase::Unknown) => 1,
+        Some(Phase::Running) => 2,
+        _ => 0,
+    };
+    if ordinal(a) != ordinal(b) {
+        return ordinal(a) < ordinal(b);
+    }
+    // 3. Not ready < ready.
+    if is_pod_ready(a) != is_pod_ready(b) {
+        return !is_pod_ready(a);
+    }
+    // 4. Ready for less time < ready for more time.
+    if let (Some(ca), Some(cb)) = (pod_ready_condition(a), pod_ready_condition(b)) {
+        if ca.last_transition_time != cb.last_transition_time {
+            return after_or_zero(ca.last_transition_time, cb.last_transition_time);
+        }
+    }
+    // 5. More restarts < fewer restarts (`compareMaxContainerRestarts`).
+    let (ra, rb) = (max_container_restarts(a), max_container_restarts(b));
+    if ra.0 != rb.0 {
+        return ra.0 > rb.0;
+    }
+    if ra.1 != rb.1 {
+        return ra.1 > rb.1;
+    }
+    // 6. Newer < older.
+    if a.metadata.creation_timestamp != b.metadata.creation_timestamp {
+        return after_or_zero(a.metadata.creation_timestamp, b.metadata.creation_timestamp);
+    }
+    false
+}
+
+fn sort_active_pods(pods: &mut [&Pod]) {
+    pods.sort_by(|a, b| {
+        if active_pods_less(a, b) {
+            std::cmp::Ordering::Less
+        } else if active_pods_less(b, a) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+}
+
+/// `getCompletionIndex` (`indexed_job_utils.go:394`): the annotation only,
+/// `-1` (`unknownCompletionIndex`) when absent or invalid.
+fn completion_index_annotation(pod: &Pod) -> i32 {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get("batch.kubernetes.io/job-completion-index"))
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|i| *i >= 0)
+        .unwrap_or(-1)
+}
+
+/// `activePodsForRemoval` (`job_controller.go:1872`) with
+/// `appendDuplicatedIndexPodsForRemoval` /
+/// `appendPodsWithSameIndexForRemovalAndRemaining`
+/// (`indexed_job_utils.go:295`, `:379`): for an Indexed Job, pods without a
+/// valid index, with an out-of-range index, or duplicating an index (all but
+/// the best-ranked) are removed regardless of `rm_at_least`; the remainder is
+/// ranked by `ActivePods` and trimmed to reach `rm_at_least`.
+fn active_pods_for_removal<'a>(job: &Job, pods: &[&'a Pod], rm_at_least: usize) -> Vec<&'a Pod> {
+    fn flush<'a>(
+        group: &mut Vec<&'a Pod>,
+        index: i32,
+        rm: &mut Vec<&'a Pod>,
+        left: &mut Vec<&'a Pod>,
+    ) {
+        if index == -1 {
+            rm.append(group);
+        } else if group.len() == 1 {
+            left.append(group);
+        } else if !group.is_empty() {
+            sort_active_pods(group);
+            let keep = group.pop().unwrap();
+            rm.append(group);
+            left.push(keep);
+        }
+    }
+
+    let mut rm: Vec<&Pod> = Vec::new();
+    let mut left: Vec<&Pod>;
+    if job.spec.completion_mode.as_deref() == Some("Indexed") {
+        let completions = job.spec.completions.unwrap_or(1);
+        left = Vec::new();
+        let mut sorted: Vec<&Pod> = pods.to_vec();
+        sorted.sort_by_key(|p| completion_index_annotation(p)); // stable: byCompletionIndex
+        let mut group: Vec<&Pod> = Vec::new();
+        let mut group_index = -1;
+        let mut cut_off = false;
+        for (i, p) in sorted.iter().enumerate() {
+            let ix = completion_index_annotation(p);
+            if ix >= completions {
+                flush(&mut group, group_index, &mut rm, &mut left);
+                rm.extend_from_slice(&sorted[i..]);
+                cut_off = true;
+                break;
+            }
+            if ix != group_index {
+                flush(&mut group, group_index, &mut rm, &mut left);
+                group_index = ix;
+            }
+            group.push(p);
+        }
+        if !cut_off {
+            flush(&mut group, group_index, &mut rm, &mut left);
+        }
+    } else {
+        left = pods.to_vec();
+    }
+    if rm.len() < rm_at_least {
+        sort_active_pods(&mut left);
+        rm.extend(left.into_iter().take(rm_at_least - rm.len()));
+    }
+    rm
+}
+
+/// Pods a Job counts as active: `FilterActivePods` restricted to
+/// Running|Pending (as the rest of this controller does).
+fn active_job_pods<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> Vec<&'a Pod> {
+    pods.into_iter()
+        .filter(|p| {
+            is_pod_active(p)
+                && matches!(
+                    p.status.as_ref().and_then(|s| s.phase.as_ref()),
+                    Some(Phase::Running) | Some(Phase::Pending)
+                )
+        })
+        .collect()
 }
 
 /// Extract the completion index from a pod owned by an Indexed Job.
@@ -5617,5 +6061,252 @@ mod tests {
             .filter(|p| p.metadata.deletion_timestamp.is_none())
             .count();
         assert_eq!(live, 1, "a replacement for the terminating pod is created");
+    }
+
+    // ---- #2553: manageJob — excess deletion, cap, expectations ----
+
+    async fn live_pods(storage: &Arc<MemoryStorage>) -> Vec<Pod> {
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        pods.into_iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_none())
+            .collect()
+    }
+
+    /// `manageJob` (job_controller.go:1692-1716): `rmAtLeast = active -
+    /// wantActive`; the excess pods are deleted and, deletion taking
+    /// precedence, nothing is created in the same sync.
+    #[tokio::test]
+    async fn test_manage_job_deletes_excess_active_pods() {
+        let storage = Arc::new(MemoryStorage::new());
+        let job = make_job("ex", "default", 5, 1);
+        storage
+            .create("/registry/jobs/default/ex", &job)
+            .await
+            .unwrap();
+        for n in ["p1", "p2", "p3"] {
+            let pod = make_pod(n, "default", Phase::Running, "ex", "job-uid-1");
+            storage
+                .create(&format!("/registry/pods/default/{n}"), &pod)
+                .await
+                .unwrap();
+        }
+        let controller = JobController::new(storage.clone());
+        let mut job: Job = storage.get("/registry/jobs/default/ex").await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+
+        let all: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(all.len(), 3, "no replacement created in a delete sync");
+        assert_eq!(live_pods(&storage).await.len(), 1, "2 excess deleted");
+        let st: Job = storage.get("/registry/jobs/default/ex").await.unwrap();
+        assert_eq!(st.status.unwrap().active, Some(1));
+    }
+
+    /// A pod removed as excess must not later be counted as a failure or
+    /// success: `deleteJobPods` strips the tracking finalizer first
+    /// (`removeTrackingFinalizerPatch`, job_controller.go:1181-1186).
+    #[tokio::test]
+    async fn test_delete_job_pods_strips_tracking_finalizer() {
+        let storage = Arc::new(MemoryStorage::new());
+        let job = make_job("fin", "default", 5, 1);
+        storage
+            .create("/registry/jobs/default/fin", &job)
+            .await
+            .unwrap();
+        for n in ["p1", "p2"] {
+            let pod = make_pod(n, "default", Phase::Running, "fin", "job-uid-1");
+            storage
+                .create(&format!("/registry/pods/default/{n}"), &pod)
+                .await
+                .unwrap();
+        }
+        let controller = JobController::new(storage.clone());
+        let mut job: Job = storage.get("/registry/jobs/default/fin").await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+        let all: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        let deleted: Vec<&Pod> = all
+            .iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_some())
+            .collect();
+        assert_eq!(deleted.len(), 1);
+        assert!(!has_job_tracking_finalizer(deleted[0]));
+    }
+
+    /// `MaxPodCreateDeletePerSync = 500` (job_controller.go:79) caps one
+    /// sync's creations (`:1735-1737`); the rest wait for the next sync.
+    #[tokio::test]
+    async fn test_manage_job_caps_creations_per_sync() {
+        let storage = Arc::new(MemoryStorage::new());
+        let job = make_job("cap", "default", 600, 600);
+        storage
+            .create("/registry/jobs/default/cap", &job)
+            .await
+            .unwrap();
+        let controller = JobController::new(storage.clone());
+        let mut job: Job = storage.get("/registry/jobs/default/cap").await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+        let all: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(all.len(), 500);
+    }
+
+    /// `diff := wantActive - terminating - active` for
+    /// podReplacementPolicy=Failed (job_controller.go:1722-1728): a pod that
+    /// is still terminating is not replaced yet.
+    #[tokio::test]
+    async fn test_pod_replacement_policy_failed_waits_for_terminating() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("prf", "default", 1, 1);
+        job.spec.pod_replacement_policy = Some("Failed".to_string());
+        storage
+            .create("/registry/jobs/default/prf", &job)
+            .await
+            .unwrap();
+        let mut pod = make_pod("p1", "default", Phase::Running, "prf", "job-uid-1");
+        pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        storage
+            .create("/registry/pods/default/p1", &pod)
+            .await
+            .unwrap();
+        let controller = JobController::new(storage.clone());
+        let mut job: Job = storage.get("/registry/jobs/default/prf").await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+        let all: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(all.len(), 1, "no replacement while the pod is terminating");
+    }
+
+    /// The brake: while creations are unobserved the sync only updates
+    /// status (job_controller.go:1016 `if satisfiedExpectations`).
+    #[tokio::test]
+    async fn test_unmet_creation_expectations_gate_manage_job() {
+        let storage = Arc::new(MemoryStorage::new());
+        let job = make_job("gate", "default", 3, 3);
+        storage
+            .create("/registry/jobs/default/gate", &job)
+            .await
+            .unwrap();
+        let controller = JobController::new(storage.clone());
+        controller.expectations.expect_creations("default/gate", 2);
+        let mut job: Job = storage.get("/registry/jobs/default/gate").await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+        assert!(live_pods(&storage).await.is_empty());
+
+        controller.expectations.creation_observed("default/gate");
+        controller.expectations.creation_observed("default/gate");
+        let mut job: Job = storage.get("/registry/jobs/default/gate").await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+        assert_eq!(live_pods(&storage).await.len(), 3);
+    }
+
+    /// `ExpectCreations` is recorded before the creates, and an `Added` pod
+    /// event observes each creation exactly once (`addPod`, :339).
+    #[tokio::test]
+    async fn test_created_pods_are_expected_then_observed_once() {
+        let storage = Arc::new(MemoryStorage::new());
+        let job = make_job("obs", "default", 2, 2);
+        storage
+            .create("/registry/jobs/default/obs", &job)
+            .await
+            .unwrap();
+        let controller = JobController::new(storage.clone());
+        let mut job: Job = storage.get("/registry/jobs/default/obs").await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+        assert_eq!(
+            controller.expectations.get_expectations("default/obs"),
+            Some((2, 0))
+        );
+        let pods = live_pods(&storage).await;
+        for pod in &pods {
+            let ev = rusternetes_storage::WatchEvent::Added(
+                format!("pods/default/{}", pod.metadata.name),
+                serde_json::to_string(pod).unwrap(),
+            );
+            controller.observe_pod_event(&ev);
+            controller.observe_pod_event(&ev); // duplicate: not double counted
+        }
+        assert_eq!(
+            controller.expectations.get_expectations("default/obs"),
+            Some((0, 0))
+        );
+        assert!(controller.expectations.satisfied("default/obs"));
+    }
+
+    /// Suspend deletes through `deleteJobPods` with `ExpectDeletions`
+    /// (job_controller.go:1666-1668), and the terminating-pod event
+    /// observes it.
+    #[tokio::test]
+    async fn test_suspend_expects_deletions_and_observes_them() {
+        let mut job = make_job("sus2", "default", 1, 1);
+        job.spec.suspend = Some(true);
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create("/registry/jobs/default/sus2", &job)
+            .await
+            .unwrap();
+        let pod = make_pod("p1", "default", Phase::Running, "sus2", "job-uid-1");
+        storage
+            .create("/registry/pods/default/p1", &pod)
+            .await
+            .unwrap();
+        let controller = JobController::new(storage.clone());
+        let mut job: Job = storage.get("/registry/jobs/default/sus2").await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+        assert!(!controller.expectations.satisfied("default/sus2"));
+        let gone: Pod = storage.get("/registry/pods/default/p1").await.unwrap();
+        let ev = rusternetes_storage::WatchEvent::Modified(
+            "pods/default/p1".to_string(),
+            serde_json::to_string(&gone).unwrap(),
+        );
+        controller.observe_pod_event(&ev);
+        assert!(controller.expectations.satisfied("default/sus2"));
+    }
+
+    fn pod_for_ordering(name: &str, phase: Phase, node: Option<&str>, ready: bool) -> Pod {
+        let mut p = make_pod(name, "default", phase, "j", "job-uid-1");
+        p.spec.as_mut().unwrap().node_name = node.map(str::to_string);
+        if ready {
+            p.status.as_mut().unwrap().conditions =
+                Some(vec![rusternetes_common::resources::pod::PodCondition {
+                    condition_type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: None,
+                    message: None,
+                    last_probe_time: None,
+                    last_transition_time: None,
+                    observed_generation: None,
+                }]);
+        }
+        p
+    }
+
+    /// `controller.ActivePods` (controller_utils.go:741): unassigned <
+    /// assigned, Pending < Running, not-ready < ready — the first are
+    /// removed first.
+    #[test]
+    fn test_active_pods_for_removal_prefers_least_progressed() {
+        let job = make_job("j", "default", 5, 1);
+        let ready_running = pod_for_ordering("a", Phase::Running, Some("n1"), true);
+        let pending_assigned = pod_for_ordering("b", Phase::Pending, Some("n1"), false);
+        let unassigned = pod_for_ordering("c", Phase::Pending, None, false);
+        let pods = vec![&ready_running, &pending_assigned, &unassigned];
+        let rm = active_pods_for_removal(&job, &pods, 2);
+        let names: Vec<&str> = rm.iter().map(|p| p.metadata.name.as_str()).collect();
+        assert_eq!(names, vec!["c", "b"]);
+    }
+
+    /// `appendDuplicatedIndexPodsForRemoval` (indexed_job_utils.go:295): for
+    /// an Indexed Job, duplicates of an index and out-of-range indexes are
+    /// removed even beyond `rmAtLeast`.
+    #[test]
+    fn test_active_pods_for_removal_indexed_duplicates() {
+        let mut job = make_job("j", "default", 3, 3);
+        job.spec.completion_mode = Some("Indexed".to_string());
+        let a0 = make_indexed_pod("a0", "default", Phase::Running, "j", "job-uid-1", 0);
+        let b0 = make_indexed_pod("b0", "default", Phase::Pending, "j", "job-uid-1", 0);
+        let a1 = make_indexed_pod("a1", "default", Phase::Running, "j", "job-uid-1", 1);
+        let a7 = make_indexed_pod("a7", "default", Phase::Running, "j", "job-uid-1", 7);
+        let pods = vec![&a0, &b0, &a1, &a7];
+        let rm = active_pods_for_removal(&job, &pods, 0);
+        let mut names: Vec<&str> = rm.iter().map(|p| p.metadata.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a7", "b0"]);
     }
 }

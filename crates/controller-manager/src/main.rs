@@ -19,6 +19,7 @@ use controllers::{
     dynamic_provisioner::DynamicProvisionerController,
     endpoints::EndpointsController,
     endpointslice::EndpointSliceController,
+    ephemeral_volume::EphemeralVolumeController,
     events::EventsController,
     garbage_collector::GarbageCollector,
     hpa::HorizontalPodAutoscalerController,
@@ -645,6 +646,17 @@ async fn main() -> Result<()> {
         async move {
             if let Err(e) = controller.run().await {
                 tracing::error!("PVC protection controller error: {}", e);
+            }
+        }
+    });
+
+    // Start generic ephemeral volume controller (ephemeral.NewController)
+    let ephemeral_volume_controller = Arc::new(EphemeralVolumeController::new(storage.clone()));
+    spawn_controller!("Ephemeral volume controller", leader_elector, {
+        let controller = ephemeral_volume_controller.clone();
+        async move {
+            if let Err(e) = controller.run().await {
+                tracing::error!("Ephemeral volume controller error: {}", e);
             }
         }
     });

@@ -33,9 +33,12 @@ fn check_volume_mode_filesystem(spec: &Spec<'_>) -> Result<bool> {
     let Some(pv) = spec.persistent_volume else {
         return Ok(true);
     };
-    match pv.spec.volume_mode {
+    match &pv.spec.volume_mode {
         Some(PersistentVolumeMode::Block) => Ok(false),
-        Some(PersistentVolumeMode::Filesystem) => Ok(true),
+        // An unrecognised mode is rejected at admission; like upstream's
+        // `CheckVolumeModeFilesystem` (only Block is non-filesystem) treat it
+        // as a filesystem volume.
+        Some(PersistentVolumeMode::Filesystem | PersistentVolumeMode::Unknown(_)) => Ok(true),
         None => Err(anyhow!("cannot get volumeMode for volume: {}", spec.name())),
     }
 }
@@ -90,34 +93,6 @@ impl NodeExpandableVolumePlugin for CsiPlugin {
 }
 
 impl CsiPlugin {
-    /// Port of `getCredentialsFromSecret` (`csi_util.go:45-57`) against the
-    /// host's kube client, as `csiPlugin.host.GetKubeClient()` does upstream
-    /// (`expander.go:83`). Same body as the mounter's copy in `csi.rs`.
-    async fn get_credentials_from_secret(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<HashMap<String, String>> {
-        let storage = self
-            .host
-            .get_kube_client()
-            .context("failed to get a kubernetes client")?;
-        let secret: Secret = storage
-            .get(&build_key("secrets", Some(namespace), name))
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "kubernetes.io/csi: failed to find the secret {name} in the namespace {namespace} with error: {e}"
-                )
-            })?;
-        Ok(secret
-            .data
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| (k, String::from_utf8_lossy(&v).to_string()))
-            .collect())
-    }
-
     /// `nodeExpandWithClient` (`expander.go:59-130`).
     async fn node_expand_with_client(
         &self,
@@ -150,7 +125,7 @@ impl CsiPlugin {
             let ns = r.namespace.clone().unwrap_or_default();
             let name = r.name.clone().unwrap_or_default();
             node_expand_secrets =
-                self.get_credentials_from_secret(&ns, &name)
+                get_credentials_from_secret(self.host.get_kube_client(), &ns, &name)
                     .await
                     .map_err(|e| {
                         anyhow!(

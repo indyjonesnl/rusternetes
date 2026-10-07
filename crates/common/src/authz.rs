@@ -882,6 +882,70 @@ impl Authorizer for UnionAuthorizer {
     }
 }
 
+/// `user.SystemPrivilegedGroup`
+/// (`staging/src/k8s.io/apiserver/pkg/authentication/user/user.go:71`).
+pub const SYSTEM_PRIVILEGED_GROUP: &str = "system:masters";
+
+/// Port of `privilegedGroupAuthorizer`
+/// (`staging/src/k8s.io/apiserver/pkg/authorization/authorizerfactory/builtin.go:68-96`):
+/// allows any request whose user is in one of the configured groups. Upstream
+/// returns `DecisionNoOpinion` otherwise; our [`Decision`] has no `NoOpinion`,
+/// and [`UnionAuthorizer`] already treats `Deny` as "fall through", so `Deny`
+/// is the equivalent. Like upstream it is not a rule resolver (it is not
+/// appended to `ruleResolvers` in `reload.go`), so it reports no rules.
+pub struct PrivilegedGroupAuthorizer {
+    groups: Vec<String>,
+}
+
+impl PrivilegedGroupAuthorizer {
+    /// `NewPrivilegedGroups`.
+    pub fn new(groups: &[&str]) -> Self {
+        Self {
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl Authorizer for PrivilegedGroupAuthorizer {
+    async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
+        if attrs
+            .user
+            .groups
+            .iter()
+            .any(|g| self.groups.iter().any(|p| p == g))
+        {
+            return Ok(Decision::Allow);
+        }
+        Ok(Decision::Deny(String::new()))
+    }
+
+    async fn get_user_rules(
+        &self,
+        _user: &UserInfo,
+        _namespace: &str,
+    ) -> Result<(
+        Vec<crate::resources::ResourceRule>,
+        Vec<crate::resources::NonResourceRule>,
+    )> {
+        Ok((vec![], vec![]))
+    }
+}
+
+/// `newForConfig` (`pkg/kubeapiserver/authorizer/reload.go:97-99`): the
+/// `system:masters` superuser authorizer is always first in the chain, ahead of
+/// the configured modes (Node, RBAC, ...). This is in addition to the
+/// `cluster-admin` -> `system:masters` binding the bootstrap seeds, exactly as
+/// upstream has both.
+pub fn superuser_then(rest: Vec<Arc<dyn Authorizer>>) -> UnionAuthorizer {
+    let mut authorizers: Vec<Arc<dyn Authorizer>> =
+        vec![Arc::new(PrivilegedGroupAuthorizer::new(&[
+            SYSTEM_PRIVILEGED_GROUP,
+        ]))];
+    authorizers.extend(rest);
+    UnionAuthorizer::new(authorizers)
+}
+
 /// Webhook Authorizer with full HTTP integration
 pub struct WebhookAuthorizer {
     webhook_url: String,
@@ -1284,6 +1348,49 @@ mod tests {
         let denied = RequestAttributes::new(mk_user("mallory"), "get", "nodes").with_name("n1");
         assert!(matches!(
             node_union.authorize(&denied).await.unwrap(),
+            Decision::Deny(_)
+        ));
+    }
+
+    /// Port of `TestPrivilegedGroupAuthorizer`
+    /// (`staging/src/k8s.io/apiserver/pkg/authorization/authorizerfactory/builtin_test.go:41-55`):
+    /// a user in a privileged group is allowed, one outside it is not, and the
+    /// authorizer holds regardless of what any RBAC object says (#1576).
+    #[tokio::test]
+    async fn privileged_group_authorizer() {
+        let auth = PrivilegedGroupAuthorizer::new(&["allow-01", "allow-01"]);
+        let mut yes = mk_user("alice");
+        yes.groups = vec!["no".into(), "allow-01".into()];
+        let mut no = mk_user("bob");
+        no.groups = vec!["no".into(), "deny-01".into()];
+        let a = RequestAttributes::new(yes, "delete", "nodes");
+        assert!(matches!(auth.authorize(&a).await.unwrap(), Decision::Allow));
+        let b = RequestAttributes::new(no, "delete", "nodes");
+        assert!(matches!(
+            auth.authorize(&b).await.unwrap(),
+            Decision::Deny(_)
+        ));
+    }
+
+    /// `system:masters` is the superuser group (`user.SystemPrivilegedGroup`,
+    /// `k8s.io/apiserver/pkg/authentication/user/user.go:71`) and the union
+    /// built by `superuser_then` puts it first, as `newForConfig` does
+    /// (`pkg/kubeapiserver/authorizer/reload.go:97-99`): it is allowed against an
+    /// empty RBAC store, a non-member is not.
+    #[tokio::test]
+    async fn system_masters_is_superuser_over_empty_rbac() {
+        let union = superuser_then(vec![Arc::new(AlwaysDenyAuthorizer)]);
+        let mut admin = mk_user("kubernetes-admin");
+        admin.groups = vec![SYSTEM_PRIVILEGED_GROUP.to_string()];
+        let a = RequestAttributes::new(admin, "create", "clusterroles")
+            .with_api_group("rbac.authorization.k8s.io");
+        assert!(matches!(
+            union.authorize(&a).await.unwrap(),
+            Decision::Allow
+        ));
+        let m = RequestAttributes::new(mk_user("mallory"), "create", "clusterroles");
+        assert!(matches!(
+            union.authorize(&m).await.unwrap(),
             Decision::Deny(_)
         ));
     }
