@@ -472,7 +472,7 @@ async fn test_job_suspend_deletes_active_pods() {
     storage.update(&key, &fresh_job).await.unwrap();
 
     // Reconcile — should delete all active pods
-    controller.reconcile_all().await.unwrap();
+    crate::kubelet_double::job_reconcile_all_settled(&controller, &storage).await;
 
     let pods_after: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
     assert_eq!(pods_after.len(), 0, "Suspended job should have no pods");
@@ -509,7 +509,7 @@ async fn test_job_active_deadline_seconds() {
     storage.update(&key, &fresh_job).await.unwrap();
 
     // Reconcile again — should detect deadline exceeded
-    controller.reconcile_all().await.unwrap();
+    crate::kubelet_double::job_reconcile_all_settled(&controller, &storage).await;
 
     let updated_job: Job = storage.get(&key).await.unwrap();
     let status = updated_job.status.unwrap();

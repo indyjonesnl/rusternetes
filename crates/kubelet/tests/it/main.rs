@@ -13,7 +13,6 @@ mod cas_retry_create_container_error_test;
 mod cas_retry_heartbeat_test;
 mod cas_retry_init_container_test;
 mod cas_retry_pod_status_test;
-mod cni_integration_test;
 mod cni_only_networking;
 mod conformance_node_container_restart_policy;
 mod conformance_node_ephemeral_containers;

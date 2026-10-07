@@ -226,6 +226,65 @@ pub fn get_pod_volume_subpath_list_from_disk(
     Ok(subpaths)
 }
 
+/// A volume found under a pod directory: upstream's `podVolume`
+/// (`reconstruct_common.go:44-50`), minus the `volumeMode` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodVolume {
+    pub pod_uid: String,
+    /// The directory name under the plugin directory: the volume's name as per
+    /// the `v1.Volume` spec (`volumeSpecName`).
+    pub volume_spec_name: String,
+    /// `<pod>/volumes/<escaped plugin>/<volume>` (`volumePath`).
+    pub volume_path: PathBuf,
+    /// The unescaped plugin name, e.g. `kubernetes.io/empty-dir`.
+    pub plugin_name: String,
+}
+
+/// The volumes a pod directory holds on disk.
+///
+/// Port of `getVolumesFromPodDir` (`pkg/kubelet/volumemanager/reconciler/
+/// reconstruct_common.go:191-240`) for one pod: the `volumes` half of its
+/// `<pod>/volumes/{escapeQualifiedPluginName}/{volumeName}` walk. Upstream
+/// scans every pod under the pods dir in one call and also walks
+/// `volumeDevices` (block volumes); the per-pod split is because the only
+/// caller asks about one orphaned pod at a time, and block volumes are not
+/// supported by this kubelet yet. A pod without a volumes dir has none, as
+/// upstream's `continue` on a failed `ReadDir` says.
+pub fn get_volumes_from_pod_dir(root: &str, pod_uid: &str) -> std::io::Result<Vec<PodVolume>> {
+    let volumes_dir = get_pod_volumes_dir(root, pod_uid);
+    let plugin_dirs = match std::fs::read_dir(&volumes_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut volumes = Vec::new();
+    for plugin_dir in plugin_dirs.flatten() {
+        let escaped = plugin_dir.file_name().to_string_lossy().into_owned();
+        let plugin_path = volumes_dir.join(&escaped);
+        let volume_dirs = match std::fs::read_dir(&plugin_path) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!(
+                    "Could not read volume plugin directory {}: {}",
+                    plugin_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let plugin_name = unescape_qualified_name(&escaped);
+        for volume_dir in volume_dirs.flatten() {
+            let volume_spec_name = volume_dir.file_name().to_string_lossy().into_owned();
+            volumes.push(PodVolume {
+                pod_uid: pod_uid.to_string(),
+                volume_path: plugin_path.join(&volume_spec_name),
+                volume_spec_name,
+                plugin_name: plugin_name.clone(),
+            });
+        }
+    }
+    Ok(volumes)
+}
+
 /// Inverse of [`escape_qualified_name`].
 ///
 /// Port of `k8s.io/utils/strings/escape.go::UnescapeQualifiedName`.
@@ -283,5 +342,54 @@ mod tests {
             get_pod_volumes_dir("/root", "u"),
             Path::new("/root/pods/u/volumes")
         );
+    }
+}
+
+#[cfg(test)]
+mod volumes_from_pod_dir_tests {
+    use super::*;
+
+    /// `getVolumesFromPodDir` (`reconstruct_common.go:191-240`): one entry per
+    /// `<pod>/volumes/<escaped plugin>/<volume>`, plugin name unescaped; a pod
+    /// without a volumes dir has none.
+    #[test]
+    fn lists_every_volume_with_its_unescaped_plugin() {
+        let root = std::env::temp_dir().join(format!("vfpd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let root_s = root.to_string_lossy().into_owned();
+        for (plugin, vol) in [
+            (plugin::EMPTY_DIR, "a"),
+            (plugin::EMPTY_DIR, "b"),
+            (plugin::CSI, "pvc-1"),
+        ] {
+            std::fs::create_dir_all(get_pod_volume_dir(&root_s, "u1", plugin, vol)).unwrap();
+        }
+        std::fs::create_dir_all(get_pod_dir(&root_s, "u2")).unwrap();
+
+        let mut got = get_volumes_from_pod_dir(&root_s, "u1").unwrap();
+        got.sort_by(|a, b| a.volume_path.cmp(&b.volume_path));
+
+        let names: Vec<_> = got
+            .iter()
+            .map(|v| (v.plugin_name.as_str(), v.volume_spec_name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                (plugin::CSI, "pvc-1"),
+                (plugin::EMPTY_DIR, "a"),
+                (plugin::EMPTY_DIR, "b")
+            ]
+        );
+        assert!(got.iter().all(|v| v.pod_uid == "u1"));
+        assert_eq!(
+            got[1].volume_path,
+            get_pod_volume_dir(&root_s, "u1", plugin::EMPTY_DIR, "a")
+        );
+        assert!(get_volumes_from_pod_dir(&root_s, "u2").unwrap().is_empty());
+        assert!(get_volumes_from_pod_dir(&root_s, "nope")
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

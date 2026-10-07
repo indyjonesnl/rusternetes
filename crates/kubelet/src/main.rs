@@ -6,7 +6,6 @@
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[allow(dead_code, unused_imports)]
-mod cni;
 mod config;
 #[allow(dead_code, unused_imports)]
 mod cri_runtime;
@@ -537,24 +536,27 @@ async fn main() -> Result<()> {
     // CSINode (`nodeinfomanager.InstallCSIDriver`). Upstream sets `nim.nodeID`
     // (the Node's UID) in `csiPlugin.Init` -> `initializeCSINode`, before any
     // plugin can register, and keeps the kubelet NotReady until it succeeds
-    // (`csi_plugin.go:281-355`); here the plugin manager is started once the
-    // Node exists and the CSINode is initialized (retried every second, like
-    // `waitForAPIServerForever`'s poll). The NotReady gate is not ported.
+    // (`csi_plugin.go:374-415`, `SetKubeletError`); the same gate is applied
+    // here and the plugin manager starts once it clears. As upstream
+    // (`klog.Fatalf`, csi_plugin.go:413), exhausting the retries exits.
     {
         let registry_dir = pluginmanager::plugins_registry_dir(&runtime_config.root_dir);
         let nim = Arc::new(volume_plugins::nodeinfomanager::NodeInfoManager::new(
             runtime_config.node_name.clone(),
             storage.clone(),
         ));
+        let klet = kubelet.clone();
+        // Set before the task spawns (csi_plugin.go:374) so the first Ready
+        // post cannot race ahead of the gate.
+        klet.set_kubelet_error(Some("CSINode is not yet initialized".into()));
         tokio::spawn(async move {
-            loop {
-                match nim.initialize_csi_node().await {
-                    Ok(()) => break,
-                    Err(e) => {
-                        info!("Waiting to initialize the CSINode: {e}");
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                }
+            let k = klet.clone();
+            if let Err(e) = nim
+                .initialize_csi_node_gating_ready(move |err| k.set_kubelet_error(err))
+                .await
+            {
+                tracing::error!("{e}");
+                std::process::exit(1);
             }
             let plugin_manager = pluginmanager::PluginManager::new(registry_dir);
             plugin_manager.add_handler(

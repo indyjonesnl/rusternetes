@@ -161,6 +161,12 @@ pub enum ServiceType {
     NodePort,
     LoadBalancer,
     ExternalName,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string` (staging/src/k8s.io/api/core/v1/types.go), so any string
+    /// decodes and validation answers `Unsupported value` (422), not a 400
+    /// decode failure (#2469).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// ServiceStatus represents the current status of a service
@@ -231,6 +237,12 @@ pub struct ClientIPConfig {
 pub enum IPFamily {
     IPv4,
     IPv6,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string` (staging/src/k8s.io/api/core/v1/types.go), so any string
+    /// decodes and validation answers `Unsupported value` (422), not a 400
+    /// decode failure (#2469).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// IPFamilyPolicy represents the dual-stack-ness requested or required by a Service
@@ -280,6 +292,12 @@ pub enum ServiceExternalTrafficPolicy {
     Cluster,
     /// Local routes traffic only to node-local endpoints, preserving client source IP and avoiding second hop
     Local,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string` (staging/src/k8s.io/api/core/v1/types.go), so any string
+    /// decodes and validation answers `Unsupported value` (422), not a 400
+    /// decode failure (#2469).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[cfg(test)]
@@ -505,10 +523,17 @@ mod tests {
     }
 
     #[test]
-    fn service_spec_rejects_genuinely_bogus_enum_strings() {
+    fn service_spec_keeps_unknown_enum_strings_for_validation() {
+        // Upstream's fields are plain strings, so decode succeeds and
+        // validation answers 422 Unsupported value (#2469).
         let json = r#"{ "externalTrafficPolicy": "NotARealPolicy" }"#;
-        let r: Result<ServiceSpec, _> = serde_json::from_str(json);
-        assert!(r.is_err(), "unknown non-empty variant must still error");
+        let spec: ServiceSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            spec.external_traffic_policy,
+            Some(ServiceExternalTrafficPolicy::Unknown(
+                "NotARealPolicy".to_string()
+            ))
+        );
     }
 
     /// The e2e payload that triggered the bug, captured verbatim from the
