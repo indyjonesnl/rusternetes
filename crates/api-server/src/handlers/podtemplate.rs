@@ -229,6 +229,9 @@ pub async fn list_podtemplates(
         }
     }
 
+    // ValidateListOptions + the resourceVersion floor (#2224).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let prefix = build_prefix("podtemplates", Some(&namespace));
     let mut podtemplates: Vec<PodTemplate> = state.storage.list(&prefix).await?;
 
@@ -337,6 +340,9 @@ pub async fn list_all_podtemplates(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+
+    // ValidateListOptions + the resourceVersion floor (#2224).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("podtemplates", None);
     let mut podtemplates: Vec<PodTemplate> = state.storage.list(&prefix).await?;
