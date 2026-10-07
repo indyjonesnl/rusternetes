@@ -199,6 +199,35 @@ impl Admission<'_> {
                 ctx.add_warning(w);
             }
         }
+        // PodSecurity `ValidatePodController` (admission.go:393-453): the
+        // warn/audit evaluation of a controller's pod template. The plugin
+        // runs it for resources with `HasPodSpec` (podsecurity/admission.go:195).
+        if let (Operation::Create | Operation::Update, Some(obj), Some(namespace)) =
+            (op, obj, self.namespace)
+        {
+            let r = &self.resource;
+            if !(r.group.is_empty() && r.resource == "pods")
+                && crate::admission::pod_security_controller::has_pod_spec(&r.group, &r.resource)
+            {
+                let value = serde_json::to_value(obj)
+                    .map_err(|e| Error::Internal(format!("failed to encode object: {e}")))?;
+                for w in crate::admission::PodSecurityAdmission::new()
+                    .validate_pod_controller(
+                        &self.state.storage,
+                        namespace,
+                        self.subresource,
+                        &r.group,
+                        &r.resource,
+                        &value,
+                        &self.user.username,
+                    )
+                    .await
+                    .warnings
+                {
+                    ctx.add_warning(w);
+                }
+            }
+        }
         if self.is_core("pods") || self.is_pod_resize() || self.is_pod_ephemeralcontainers() {
             let obj: Option<Pod> = obj.map(recast).transpose()?;
             let old: Option<Pod> = old.map(recast).transpose()?;
