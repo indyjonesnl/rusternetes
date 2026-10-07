@@ -300,6 +300,10 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     // CRD controllers' resync (upstream post-start hook, apiextensions-apiserver
     // pkg/apiserver/apiserver.go:244-252): retries a CRD left Terminating.
     registry::apiextensions::customresourcedefinition::spawn_resync(storage.clone());
+    // crd-informer-synced (apiserver.go:263): not ready until the CRDs are readable.
+    registry::apiextensions::customresourcedefinition::spawn_crd_informer_synced_hook(
+        storage.clone(),
+    );
 
     // The `kubernetes` ServiceCIDR, owned by the apiserver-side
     // default-ServiceCIDR controller (upstream
