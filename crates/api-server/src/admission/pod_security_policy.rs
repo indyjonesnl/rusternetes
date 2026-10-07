@@ -1617,6 +1617,10 @@ fn windows_host_process_1_0(_: &ObjectMeta, spec: &PodSpec) -> CheckResult {
 }
 
 #[cfg(test)]
+#[path = "pod_security_policy_cases.rs"]
+mod cases;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rusternetes_common::resources::pod::Pod;
@@ -2058,6 +2062,140 @@ mod tests {
         };
         assert!(results("v1.33").allowed);
         assert!(!results("v1.34").allowed);
+    }
+
+    /// check_hostProbesAndhostLifecycle_test.go
+    /// `TestHostProbesAndHostLifecycleEmulation`: the host check only
+    /// exists from 1.34, and an emulation version below that removes it
+    /// even for `latest`/`1.34` evaluations.
+    #[test]
+    fn host_probes_and_lifecycle_emulation() {
+        let p = pod(serde_json::json!({"containers": [
+            {"name": "", "startupProbe": {"httpGet": {"port": 80, "host": "localhost"}}},
+        ]}));
+        // (emulate, hostCheckActive)
+        for (emulate, active) in [
+            (None, true),
+            (Some(Version::major_minor(1, 34)), true),
+            (Some(Version::major_minor(1, 33)), false),
+        ] {
+            let reg = CheckRegistry::new(default_checks(), emulate).unwrap();
+            let allowed = |v: &str| {
+                aggregate_check_results(&reg.evaluate_pod(
+                    lv(Level::Baseline, v),
+                    &p.metadata,
+                    p.spec.as_ref().unwrap(),
+                ))
+                .allowed
+            };
+            assert_eq!(allowed("latest"), !active, "latest, emulate {emulate:?}");
+            assert_eq!(allowed("v1.34"), !active, "1.34, emulate {emulate:?}");
+            assert!(allowed("v1.33"), "1.33, emulate {emulate:?}");
+        }
+    }
+
+    /// check_hostProbesAndhostLifecycle_test.go `TestHostProbesAndHostLifecycle`
+    /// table, verbatim names and details.
+    #[test]
+    fn host_probes_and_lifecycle_upstream_table() {
+        use serde_json::json;
+        let http = |h: &str| json!({"httpGet": {"port": 80, "host": h}});
+        let tcp = |h: &str| json!({"tcpSocket": {"port": 80, "host": h}});
+        let ctr = |name: &str, extra: serde_json::Value| {
+            let mut m = json!({"name": name, "image": "i"});
+            m.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            m
+        };
+        let cases: Vec<(&str, serde_json::Value, Option<&str>)> = vec![
+            (
+                "valid pod with unset hosts",
+                json!({"containers": [ctr("a", json!({
+                    "livenessProbe": {"httpGet": {"port": 80}},
+                    "readinessProbe": {"tcpSocket": {"port": 80}},
+                    "lifecycle": {"postStart": {"httpGet": {"port": 80}}},
+                }))]}),
+                None,
+            ),
+            (
+                "invalid pod with local host IP as probe host",
+                json!({"containers": [ctr("a", json!({
+                    "livenessProbe": http("127.0.0.1"),
+                    "readinessProbe": tcp("::1"),
+                    "startupProbe": http("localhost"),
+                }))]}),
+                Some(
+                    r#"container "a" uses probe or lifecycle hosts "127.0.0.1", "::1", "localhost""#,
+                ),
+            ),
+            (
+                "invalid httpget host in liveness probe",
+                json!({"containers": [ctr("a", json!({"livenessProbe": http("invalid.host")}))]}),
+                Some(r#"container "a" uses probe or lifecycle host "invalid.host""#),
+            ),
+            (
+                "invalid tcpsocket host in readiness probe",
+                json!({"containers": [ctr("b", json!({"readinessProbe": tcp("invalid.host")}))]}),
+                Some(r#"container "b" uses probe or lifecycle host "invalid.host""#),
+            ),
+            (
+                "invalid httpget host in startup probe",
+                json!({"containers": [ctr("c", json!({"startupProbe": http("invalid.host")}))]}),
+                Some(r#"container "c" uses probe or lifecycle host "invalid.host""#),
+            ),
+            (
+                "invalid poststart tcpsocket host",
+                json!({"containers": [ctr("d", json!({"lifecycle": {"postStart": tcp("invalid.host")}}))]}),
+                Some(r#"container "d" uses probe or lifecycle host "invalid.host""#),
+            ),
+            (
+                "invalid prestop httpget host",
+                json!({"containers": [ctr("e", json!({"lifecycle": {"preStop": http("another.invalid.host")}}))]}),
+                Some(r#"container "e" uses probe or lifecycle host "another.invalid.host""#),
+            ),
+            (
+                "multiple containers with multiple invalid hosts",
+                json!({"containers": [
+                    ctr("valid", json!({})),
+                    ctr("invalid1", json!({"livenessProbe": http("a.com")})),
+                    ctr("invalid2", json!({
+                        "lifecycle": {"preStop": tcp("b.com")},
+                        "startupProbe": http("a.com"),
+                    })),
+                ]}),
+                Some(
+                    r#"containers "invalid1", "invalid2" use probe or lifecycle hosts "a.com", "b.com""#,
+                ),
+            ),
+            (
+                "invalid ipv4 host in probe",
+                json!({"containers": [ctr("a", json!({"livenessProbe": http("8.8.8.8")}))]}),
+                Some(r#"container "a" uses probe or lifecycle host "8.8.8.8""#),
+            ),
+            (
+                "invalid ipv6 host in probe",
+                json!({"containers": [ctr("a", json!({"livenessProbe": tcp("2001:4860:4860::8888")}))]}),
+                Some(r#"container "a" uses probe or lifecycle host "2001:4860:4860::8888""#),
+            ),
+            (
+                "invalid host in initcontainer",
+                json!({"containers": [], "initContainers": [
+                    ctr("init", json!({"livenessProbe": http("invalid.init.host")}))]}),
+                Some(r#"container "init" uses probe or lifecycle host "invalid.init.host""#),
+            ),
+        ];
+        for (name, spec, detail) in cases {
+            let r = run(host_probes_and_host_lifecycle_1_34, &pod(spec));
+            match detail {
+                None => assert!(r.allowed, "{name}: expected allowed, got {r:?}"),
+                Some(d) => {
+                    assert!(!r.allowed, "{name}: expected forbidden");
+                    assert_eq!(r.forbidden_reason, "probe or lifecycle host", "{name}");
+                    assert_eq!(r.forbidden_detail, d, "{name}");
+                }
+            }
+        }
     }
 
     /// check_capabilities_baseline_test.go.

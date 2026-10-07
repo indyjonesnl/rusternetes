@@ -1071,3 +1071,217 @@ async fn terminated_live_pod_csi_volume_is_unpublished() {
     vm.unmount_orphaned_volumes(&live, &live).await;
     assert_eq!(f.fake.calls.lock().unwrap().unpublish.len(), 1);
 }
+
+// ---- fsGroup (`csi_mounter.go:126-129`, `:250-260`, `:333-352`, `:469-527`) ----
+
+mod fs_group {
+    use super::*;
+    use rusternetes_common::resources::PersistentVolumeAccessMode as Am;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn fs_group_pod(gid: i64, policy: Option<&str>) -> Pod {
+        let mut sc = json!({"fsGroup": gid});
+        if let Some(p) = policy {
+            sc["fsGroupChangePolicy"] = json!(p);
+        }
+        serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "ns1", "uid": "uid-1"},
+            "spec": {"containers": [], "nodeName": "node-1", "securityContext": sc}
+        }))
+        .unwrap()
+    }
+
+    /// The test process's own gid: chowning to it needs no privilege.
+    fn own_gid(f: &Fx) -> i64 {
+        std::fs::metadata(f._dir.path()).unwrap().gid() as i64
+    }
+
+    fn mode(p: &std::path::Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// Mount a PV with a 0600 file already in the mount dir (what the driver's
+    /// NodePublish would have populated) and return that file.
+    async fn mount(
+        f: &Fx,
+        csi: serde_json::Value,
+        modes: Vec<Am>,
+        policy: Option<&str>,
+        root_mode: Option<u32>,
+    ) -> std::path::PathBuf {
+        let mut p = pv(&f.driver, csi);
+        p.spec.access_modes = modes;
+        let v = claim_volume();
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: Some(&p),
+        };
+        let m = f
+            .plugin
+            .new_mounter(&spec, &fs_group_pod(own_gid(f), policy))
+            .await
+            .unwrap();
+        let dir = std::path::PathBuf::from(m.get_path());
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(rm) = root_mode {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(rm)).unwrap();
+        }
+        let file = dir.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        m.set_up().await.unwrap();
+        file
+    }
+
+    fn driver_spec() -> Option<serde_json::Value> {
+        Some(json!({"attachRequired": false}))
+    }
+
+    /// Default policy, an RWO PV with an fsType: the kubelet applies fsGroup
+    /// with `mode | rwMask` and setgid on the root, and does not ask the driver.
+    #[tokio::test]
+    async fn kubelet_applies_fs_group_for_an_rwo_volume_with_fs_type() {
+        let f = fx("fsg-apply", &[], driver_spec()).await;
+        let file = mount(
+            &f,
+            json!({"fsType": "ext4"}),
+            vec![Am::ReadWriteOnce],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(mode(&file), 0o660);
+        assert_eq!(mode(file.parent().unwrap()) & 0o2000, 0o2000);
+        let calls = f.fake.calls.lock().unwrap();
+        match calls.publish[0]
+            .volume_capability
+            .as_ref()
+            .unwrap()
+            .access_type
+            .as_ref()
+            .unwrap()
+        {
+            AccessType::Mount(m) => assert_eq!(m.volume_mount_group, ""),
+            other => panic!("expected mount, got {other:?}"),
+        }
+    }
+
+    /// `ReadWriteOnceWithFSType` (the default) skips a ReadWriteMany volume
+    /// and a volume with no fsType (`csi_mounter.go:478-497`).
+    #[tokio::test]
+    async fn default_policy_skips_rwx_and_missing_fs_type() {
+        let f = fx("fsg-skip", &[], driver_spec()).await;
+        let file = mount(
+            &f,
+            json!({"fsType": "ext4"}),
+            vec![Am::ReadWriteMany],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(mode(&file), 0o600, "RWX is skipped");
+        let f = fx("fsg-skip2", &[], driver_spec()).await;
+        let file = mount(&f, json!({}), vec![Am::ReadWriteOnce], None, None).await;
+        assert_eq!(mode(&file), 0o600, "no fsType is skipped");
+    }
+
+    /// `fsGroupPolicy: File` applies regardless of fsType / access mode
+    /// (`csi_mounter.go:474-476`).
+    #[tokio::test]
+    async fn file_policy_applies_without_fs_type_or_rwo() {
+        let f = fx(
+            "fsg-file",
+            &[],
+            Some(json!({"attachRequired": false, "fsGroupPolicy": "File"})),
+        )
+        .await;
+        let file = mount(&f, json!({}), vec![Am::ReadWriteMany], None, None).await;
+        assert_eq!(mode(&file), 0o660);
+    }
+
+    /// `fsGroupPolicy: None` never applies (`csi_mounter.go:470`).
+    #[tokio::test]
+    async fn none_policy_never_applies() {
+        let f = fx(
+            "fsg-none",
+            &[],
+            Some(json!({"attachRequired": false, "fsGroupPolicy": "None"})),
+        )
+        .await;
+        let file = mount(
+            &f,
+            json!({"fsType": "ext4"}),
+            vec![Am::ReadWriteOnce],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(mode(&file), 0o600);
+    }
+
+    /// A driver with VOLUME_MOUNT_GROUP gets the fsGroup in NodePublish and the
+    /// kubelet leaves the tree alone (`csi_mounter.go:257-260`, `:333`).
+    #[tokio::test]
+    async fn volume_mount_group_driver_receives_fs_group_and_kubelet_skips() {
+        let f = fx("fsg-vmg", &[Cap::VolumeMountGroup], driver_spec()).await;
+        let file = mount(
+            &f,
+            json!({"fsType": "ext4"}),
+            vec![Am::ReadWriteOnce],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(mode(&file), 0o600, "the driver owns it, kubelet must not");
+        let calls = f.fake.calls.lock().unwrap();
+        match calls.publish[0]
+            .volume_capability
+            .as_ref()
+            .unwrap()
+            .access_type
+            .as_ref()
+            .unwrap()
+        {
+            AccessType::Mount(m) => assert_eq!(m.volume_mount_group, own_gid(&f).to_string()),
+            other => panic!("expected mount, got {other:?}"),
+        }
+    }
+
+    /// `fsGroupChangePolicy` reaches the ownership walk: `OnRootMismatch` with
+    /// a conforming root leaves the children alone (`csi_mounter.go:339`).
+    #[tokio::test]
+    async fn fs_group_change_policy_is_passed_to_the_ownership_change() {
+        let f = fx("fsg-orm", &[], driver_spec()).await;
+        let file = mount(
+            &f,
+            json!({"fsType": "ext4"}),
+            vec![Am::ReadWriteOnce],
+            Some("OnRootMismatch"),
+            Some(0o2770),
+        )
+        .await;
+        assert_eq!(mode(&file), 0o600);
+    }
+
+    /// An empty `fsGroupPolicy` string is an error, as upstream
+    /// (`csi_mounter.go:523-525`): transient, and nothing is published.
+    #[tokio::test]
+    async fn empty_fs_group_policy_is_a_transient_error() {
+        let f = fx(
+            "fsg-empty",
+            &[],
+            Some(json!({"attachRequired": false, "fsGroupPolicy": ""})),
+        )
+        .await;
+        let p = pv(&f.driver, json!({"fsType": "ext4"}));
+        let v = claim_volume();
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: Some(&p),
+        };
+        let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+        let e = m.set_up().await.unwrap_err();
+        assert!(e.to_string().contains("fsGroup policy"), "{e}");
+        assert!(f.fake.calls.lock().unwrap().publish.is_empty());
+    }
+}
