@@ -334,3 +334,4 @@ mod workload_template_decodes_when_absent_test;
 
 mod metrics_label_selector_test;
 mod networking_store_test;
+mod pod_status_proto_state_test;
