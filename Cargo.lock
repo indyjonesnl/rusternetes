@@ -4290,6 +4290,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "chrono-tz",
@@ -4301,6 +4302,7 @@ dependencies = [
  "jsonwebtoken",
  "mimalloc",
  "pem",
+ "prometheus",
  "rand 0.9.4",
  "rcgen",
  "reqwest",
