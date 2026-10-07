@@ -125,25 +125,34 @@ pub fn validate_storage_class(sc: &StorageClass) -> ErrorList {
     if let Some(rp) = &sc.reclaim_policy {
         match rp {
             PersistentVolumeReclaimPolicy::Delete | PersistentVolumeReclaimPolicy::Retain => {}
-            PersistentVolumeReclaimPolicy::Recycle | PersistentVolumeReclaimPolicy::Unknown => {
+            PersistentVolumeReclaimPolicy::Recycle => {
                 errs.push(Error::not_supported(
                     &Path::new("reclaimPolicy"),
-                    if *rp == PersistentVolumeReclaimPolicy::Recycle {
-                        "Recycle"
-                    } else {
-                        "Unknown"
-                    },
+                    "Recycle",
+                    &["Delete", "Retain"],
+                ));
+            }
+            // storage/validation/validation.go:133-135.
+            PersistentVolumeReclaimPolicy::Unknown(v) => {
+                errs.push(Error::not_supported(
+                    &Path::new("reclaimPolicy"),
+                    v.clone(),
                     &["Delete", "Retain"],
                 ));
             }
         }
     }
 
-    // volumeBindingMode is required (defaulted to Immediate upstream). The Rust
-    // enum only admits the two valid variants, so the sole check is presence.
+    // volumeBindingMode is required (defaulted to Immediate upstream), then must
+    // be supported (storage/validation/validation.go:268-273).
     match &sc.volume_binding_mode {
         None => errs.push(Error::required(&Path::new("volumeBindingMode"), "")),
         Some(VolumeBindingMode::Immediate | VolumeBindingMode::WaitForFirstConsumer) => {}
+        Some(VolumeBindingMode::Unknown(v)) => errs.push(Error::not_supported(
+            &Path::new("volumeBindingMode"),
+            v.clone(),
+            &["Immediate", "WaitForFirstConsumer"],
+        )),
     }
 
     // allowedTopologies: validate each term, and reject duplicate terms

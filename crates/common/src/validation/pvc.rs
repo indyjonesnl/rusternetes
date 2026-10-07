@@ -231,14 +231,27 @@ pub fn validate_persistent_volume_claim_spec_with_opts(
     }
 
     // ReadWriteOncePod may not be combined with any other access mode.
+    // validation.go:2475-2486: an unsupported mode is NotSupported and is not
+    // counted as "another" mode next to ReadWriteOncePod.
+    for mode in &spec.access_modes {
+        if let PersistentVolumeAccessMode::Unknown(v) = mode {
+            errs.push(Error::not_supported(
+                &fld_path.child("accessModes"),
+                v.clone(),
+                crate::validation::persistentvolume::SUPPORTED_ACCESS_MODES,
+            ));
+        }
+    }
     let has_rwop = spec
         .access_modes
         .iter()
         .any(|m| matches!(m, PersistentVolumeAccessMode::ReadWriteOncePod));
-    let has_other = spec
-        .access_modes
-        .iter()
-        .any(|m| !matches!(m, PersistentVolumeAccessMode::ReadWriteOncePod));
+    let has_other = spec.access_modes.iter().any(|m| {
+        !matches!(
+            m,
+            PersistentVolumeAccessMode::ReadWriteOncePod | PersistentVolumeAccessMode::Unknown(_)
+        )
+    });
     if has_rwop && has_other {
         errs.push(Error::forbidden(
             &fld_path.child("accessModes"),
@@ -290,8 +303,14 @@ pub fn validate_persistent_volume_claim_spec_with_opts(
         }
     }
 
-    // volumeMode validity is enforced at deserialization (closed Rust enum,
-    // upstream's `supportedVolumeModes` NotSupported check).
+    // validation.go:2504-2506 (`supportedVolumeModes`, sorted).
+    if let Some(crate::resources::volume::PersistentVolumeMode::Unknown(v)) = &spec.volume_mode {
+        errs.push(Error::not_supported(
+            &fld_path.child("volumeMode"),
+            v.clone(),
+            &["Block", "Filesystem"],
+        ));
+    }
 
     // dataSource / dataSourceRef field-level validation.
     if let Some(ds) = &spec.data_source {
