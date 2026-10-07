@@ -11,14 +11,13 @@
 
 use std::collections::HashMap;
 
-use crate::resources::pod::PodSpec;
 use crate::resources::workloads::{PodTemplate, PodTemplateSpec};
-use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::field::{ErrorList, Path};
 use crate::validation::metav1::validate_labels;
 use crate::validation::objectmeta::{
     name_is_dns_subdomain, validate_annotations, validate_object_meta, validate_object_meta_update,
 };
-use crate::validation::pod::{allow_taint_toleration_comparison_operators, validate_pod_spec};
+use crate::validation::pod::validate_pod_spec;
 use crate::validation::pod_status::{
     get_deletion_cost_from_pod_annotations, validate_pod_specific_annotations,
 };
@@ -138,6 +137,7 @@ fn validate_pod_template_spec_opts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resources::pod::PodSpec;
     use crate::validation::pod_status::{
         MIRROR_POD_ANNOTATION_KEY, POD_DELETION_COST, TOLERATIONS_ANNOTATION_KEY,
     };
