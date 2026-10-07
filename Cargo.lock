@@ -4344,6 +4344,7 @@ name = "rusternetes-discovery"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "rusternetes-common",
  "rusternetes-storage",
  "serde",
  "serde_json",

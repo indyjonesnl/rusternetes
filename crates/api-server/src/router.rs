@@ -936,6 +936,10 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             get(handlers::discovery::get_certificates_v1_resources),
         )
         .route(
+            "/apis/certificates.k8s.io/v1beta1",
+            get(handlers::discovery::get_certificates_v1beta1_resources),
+        )
+        .route(
             "/apis/snapshot.storage.k8s.io/v1",
             get(handlers::discovery::get_snapshot_v1_resources),
         )
@@ -1952,6 +1956,25 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             get(handlers::certificates::get_certificate_signing_request_approval)
                 .put(handlers::certificates::approve_certificate_signing_request)
                 .patch(handlers::certificates::patch_certificate_signing_request_approval),
+        )
+        // Certificates v1beta1 API - ClusterTrustBundles (cluster-scoped;
+        // 404 unless the ClusterTrustBundle feature gate is on)
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/clustertrustbundles",
+            get(handlers::clustertrustbundle::list_clustertrustbundles)
+                .post(handlers::clustertrustbundle::create_clustertrustbundle)
+                .delete(handlers::clustertrustbundle::deletecollection_clustertrustbundles),
+        )
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/clustertrustbundles/:name",
+            get(handlers::clustertrustbundle::get_clustertrustbundle)
+                .put(handlers::clustertrustbundle::update_clustertrustbundle)
+                .patch(handlers::clustertrustbundle::patch_clustertrustbundle)
+                .delete(handlers::clustertrustbundle::delete_clustertrustbundle),
+        )
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/watch/clustertrustbundles",
+            get(handlers::watch::watch_clustertrustbundles),
         )
         // Discovery API - EndpointSlices (namespace-scoped)
         .route(
