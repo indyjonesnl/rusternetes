@@ -114,6 +114,13 @@ pub enum HostPathType {
     Socket,
     CharDevice,
     BlockDevice,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475). The PV controller
+    /// also reaches `reclaimVolume`'s default branch for it
+    /// (`pv_controller.go:1217-1222`).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +218,13 @@ pub enum PersistentVolumeAccessMode {
     ReadOnlyMany,
     ReadWriteMany,
     ReadWriteOncePod,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475). The PV controller
+    /// also reaches `reclaimVolume`'s default branch for it
+    /// (`pv_controller.go:1217-1222`).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -218,18 +232,26 @@ pub enum PersistentVolumeReclaimPolicy {
     Retain,
     Recycle,
     Delete,
-    /// Any value this server does not recognise. Decoding leniently lets the
-    /// PV controller reach `reclaimVolume`'s default branch and fail the
-    /// volume (`pv_controller.go:1217-1222`) instead of the PV becoming
-    /// undecodable. Validation still rejects it on write.
-    #[serde(other)]
-    Unknown,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475). The PV controller
+    /// also reaches `reclaimVolume`'s default branch for it
+    /// (`pv_controller.go:1217-1222`).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PersistentVolumeMode {
     Filesystem,
     Block,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475). The PV controller
+    /// also reaches `reclaimVolume`'s default branch for it
+    /// (`pv_controller.go:1217-1222`).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -588,6 +610,13 @@ pub fn get_default_class(classes: Vec<StorageClass>) -> Option<StorageClass> {
 pub enum VolumeBindingMode {
     Immediate,
     WaitForFirstConsumer,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475). The PV controller
+    /// also reaches `reclaimVolume`'s default branch for it
+    /// (`pv_controller.go:1217-1222`).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -9,7 +9,9 @@
 //! shipped missing from the other (#2490). Add new hooks HERE only; the
 //! `startup_hooks_single_path` test enforces it.
 
-use crate::{bootstrap, legacy_token_tracking, registry, storage_readiness_hook};
+use crate::{
+    apiserver_identity, bootstrap, legacy_token_tracking, registry, storage_readiness_hook,
+};
 use rusternetes_storage::{Storage, StorageBackend};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -69,6 +71,8 @@ pub async fn register_post_start_hooks(
 
     // start-legacy-token-tracking-controller (server.go:319-322).
     legacy_token_tracking::spawn_legacy_token_tracking_controller(storage.clone());
+    // start-kube-apiserver-identity-lease-{controller,garbage-collector} (server.go:295,:304).
+    apiserver_identity::spawn_identity_hooks(storage.clone());
 
     // The `kubernetes` ServiceCIDR, owned by the apiserver-side
     // default-ServiceCIDR controller (upstream
@@ -137,6 +141,7 @@ mod startup_hooks_single_path {
         "spawn_resync(",
         "spawn_crd_informer_synced_hook(",
         "spawn_legacy_token_tracking_controller(",
+        "spawn_identity_hooks(",
         "storage_readiness_hook::spawn_for_backend(",
     ];
 

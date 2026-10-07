@@ -403,7 +403,11 @@ async fn test_update_tgps_arbitrary_change_rejected() {
         .unwrap()
         .termination_grace_period_seconds = Some(60);
     let (status, body) = put_pod(state, &new_pod).await;
-    assert_rejected(status, &body, "field is immutable");
+    assert_rejected(
+        status,
+        &body,
+        "pod updates may not change fields other than",
+    );
 }
 
 // ---------------------------------------------------------------------------

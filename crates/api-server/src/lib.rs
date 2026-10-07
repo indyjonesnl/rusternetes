@@ -1,5 +1,7 @@
 pub mod admission;
+pub mod audit;
 pub use rusternetes_admission_webhook as admission_webhook;
+pub mod apiserver_identity;
 pub mod bootstrap;
 pub mod legacy_token_tracking;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
@@ -27,7 +29,6 @@ pub mod router;
 pub mod spdy;
 pub mod spdy3;
 #[allow(dead_code)]
-pub mod spdy_handlers;
 pub mod ssa;
 pub mod startup;
 pub mod state;
@@ -153,6 +154,9 @@ pub fn ca_cert_pem_for_config(config: &ApiServerConfig) -> anyhow::Result<Option
 pub struct ApiServerConfig {
     pub bind_address: String,
     pub jwt_secret: String,
+    /// `--service-account-key-file` / `--service-account-signing-key-file` /
+    /// `--service-account-issuer` / `--api-audiences` (#1575).
+    pub service_account: rusternetes_common::auth::ServiceAccountOptions,
     pub tls: bool,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
@@ -192,6 +196,7 @@ impl Default for ApiServerConfig {
         Self {
             bind_address: "0.0.0.0:6443".to_string(),
             jwt_secret: "rusternetes-secret-change-in-production".to_string(),
+            service_account: Default::default(),
             tls: false,
             tls_cert_file: None,
             tls_key_file: None,
@@ -223,14 +228,21 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         registry::core::service::ipranges::ServiceIpRanges::parse(&config.service_cluster_ip_range)
             .map_err(|e| anyhow::anyhow!(e))?;
 
-    let token_manager = Arc::new(TokenManager::new_auto(config.jwt_secret.as_bytes()));
+    let token_manager = Arc::new(
+        TokenManager::new_auto(config.jwt_secret.as_bytes())
+            .with_service_account_options(&config.service_account)?,
+    );
 
     let authorizer: Arc<dyn rusternetes_common::authz::Authorizer> = if config.skip_auth {
         warn!("Authentication and authorization disabled - insecure mode");
         Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer)
     } else {
         info!("Initializing RBAC Authorizer");
-        Arc::new(RBACAuthorizer::new(storage.clone()))
+        // `system:masters` superuser first, as `newForConfig`
+        // (`pkg/kubeapiserver/authorizer/reload.go:97-99`) does (#1576).
+        let rbac: Arc<dyn rusternetes_common::authz::Authorizer> =
+            Arc::new(RBACAuthorizer::new(storage.clone()));
+        Arc::new(rusternetes_common::authz::superuser_then(vec![rbac]))
     };
 
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);

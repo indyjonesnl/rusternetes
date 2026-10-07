@@ -435,6 +435,118 @@ async fn attach_proxy(
     rusternetes_streamproxy::proxy_upgrade(target, req).await
 }
 
+/// Path parameters for the portForward routes (2-segment variant: no uid).
+#[derive(serde::Deserialize, Debug)]
+pub struct PortForwardPath2 {
+    pub namespace: String,
+    pub pod: String,
+}
+
+/// Path parameters for the portForward routes (3-segment variant: with uid).
+#[derive(serde::Deserialize, Debug)]
+pub struct PortForwardPath3 {
+    pub namespace: String,
+    pub pod: String,
+    pub uid: String,
+}
+
+/// `wsstream.IsWebSocketRequest`
+/// (`staging/src/k8s.io/apimachinery/pkg/util/httpstream/wsstream/conn.go`):
+/// `Upgrade: websocket` plus a `Connection` header containing `upgrade`.
+fn is_websocket_request(headers: &axum::http::HeaderMap) -> bool {
+    let has_token = |name: &str, token: &str| {
+        headers
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|t| t.trim().eq_ignore_ascii_case(token))
+    };
+    has_token("upgrade", "websocket") && has_token("connection", "upgrade")
+}
+
+/// Parse options, resolve the pod sandbox, call CRI `PortForward`, then
+/// upgrade-proxy to the runtime stream URL.
+///
+/// Port of `Server.getPortForward` (`pkg/kubelet/server/server.go:1026-1049`):
+/// `NewV4Options` -> `GetPortForward` (`kubelet_pods.go:2746`, which calls
+/// `kuberuntime_sandbox.go:370-387` = CRI `PortForward` on the newest sandbox of
+/// the pod) -> `proxyStream`. Non-WebSocket (SPDY) requests carry their ports in
+/// the stream headers, so the CRI request gets no ports for them.
+async fn portforward_proxy(
+    namespace: &str,
+    pod_name: &str,
+    uid: &str,
+    req: axum::extract::Request,
+) -> Response {
+    let query = req.uri().query().unwrap_or("").to_string();
+    let ports = match rusternetes_cri::stream::parse_port_forward_ports(
+        &query,
+        is_websocket_request(req.headers()),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("portforward_proxy: bad options: {e}");
+            return (StatusCode::BAD_REQUEST, e).into_response();
+        }
+    };
+
+    let mut cri = match rusternetes_cri::stream::connect().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("portforward_proxy: CRI connect failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    let pod = pod_for_resolve(namespace, pod_name, uid);
+    let sandbox_id = match rusternetes_cri::stream::resolve_sandbox_id(&mut cri, &pod).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            warn!("portforward_proxy: no sandbox for ns={namespace} pod={pod_name}");
+            return (
+                StatusCode::NOT_FOUND,
+                format!("pod not found ({pod_name:?}_{namespace:?})"),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            warn!("portforward_proxy: resolve_sandbox_id failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    let stream_url = match cri.port_forward(&sandbox_id, &ports).await {
+        Ok(url) => url,
+        Err(e) => {
+            warn!("portforward_proxy: CRI PortForward failed for {sandbox_id}: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    let (host, port) = rusternetes_cri::stream::stream_target();
+    let rewritten = match rusternetes_cri::stream::rewrite_stream_url(&stream_url, &host, port) {
+        Ok(u) => u,
+        Err(e) => {
+            warn!("portforward_proxy: rewrite_stream_url failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+    info!(
+        "portforward_proxy: ns={namespace} pod={pod_name} sandbox={sandbox_id} target={rewritten}"
+    );
+
+    let target: http::Uri = match rewritten.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            warn!("portforward_proxy: failed to parse rewritten URI {rewritten:?}: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    rusternetes_streamproxy::proxy_upgrade(target, req).await
+}
+
 // ---------------------------------------------------------------------------
 // Axum route handlers
 // ---------------------------------------------------------------------------
@@ -465,6 +577,22 @@ pub async fn handle_attach_uid(Path(p): Path<ExecPath4>, req: axum::extract::Req
     let query = req.uri().query().unwrap_or("").to_string();
     let params = ExecParams::from_query(&query);
     attach_proxy(&p.namespace, &p.pod, &p.uid, &p.container, &params, req).await
+}
+
+/// `GET|POST /portForward/:namespace/:pod`
+pub async fn handle_portforward(
+    Path(p): Path<PortForwardPath2>,
+    req: axum::extract::Request,
+) -> Response {
+    portforward_proxy(&p.namespace, &p.pod, "", req).await
+}
+
+/// `GET|POST /portForward/:namespace/:pod/:uid`
+pub async fn handle_portforward_uid(
+    Path(p): Path<PortForwardPath3>,
+    req: axum::extract::Request,
+) -> Response {
+    portforward_proxy(&p.namespace, &p.pod, &p.uid, req).await
 }
 
 /// `GET /containerLogs/:namespace/:pod/:container`
@@ -786,6 +914,57 @@ fn cri_container_gone(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_request_detection_matches_wsstream() {
+        let mk = |pairs: &[(&str, &str)]| {
+            let mut h = axum::http::HeaderMap::new();
+            for (k, v) in pairs {
+                h.append(
+                    axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            h
+        };
+        assert!(is_websocket_request(&mk(&[
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket")
+        ])));
+        assert!(is_websocket_request(&mk(&[
+            ("connection", "keep-alive, Upgrade"),
+            ("upgrade", "WebSocket")
+        ])));
+        // SPDY upgrade is not a WebSocket request.
+        assert!(!is_websocket_request(&mk(&[
+            ("connection", "Upgrade"),
+            ("upgrade", "SPDY/3.1")
+        ])));
+        assert!(!is_websocket_request(&mk(&[])));
+    }
+
+    // Upstream `getPortForward` rejects bad options with 400 BEFORE touching the
+    // runtime (server.go:1029-1034), so this needs no CRI endpoint.
+    #[tokio::test]
+    async fn portforward_without_port_over_websocket_is_a_400() {
+        use tower::ServiceExt;
+        let app = axum::Router::new().route(
+            "/portForward/:namespace/:pod",
+            axum::routing::get(handle_portforward),
+        );
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/portForward/ns/pod")
+                    .header("connection", "Upgrade")
+                    .header("upgrade", "websocket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn log_params_parse_tail_and_follow() {

@@ -1034,6 +1034,75 @@ pub struct VolumeMount {
     pub recursive_read_only: Option<String>,
 }
 
+/// The deprecated in-tree volume sources of core/v1 `VolumeSource`
+/// (`staging/src/k8s.io/api/core/v1/types.go`, `VolumeSource`). Rusternetes
+/// does not implement these plugins, but the API must still round-trip them
+/// losslessly and PodSecurity `restrictedVolumes` names the type of the
+/// offending source (`check_restrictedVolumes.go:108-153`). Each source is
+/// kept as opaque JSON; only its presence is interpreted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LegacyVolumeSources {
+    #[serde(rename = "gcePersistentDisk", skip_serializing_if = "Option::is_none")]
+    pub gce_persistent_disk: Option<serde_json::Value>,
+
+    #[serde(
+        rename = "awsElasticBlockStore",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aws_elastic_block_store: Option<serde_json::Value>,
+
+    #[serde(rename = "gitRepo", skip_serializing_if = "Option::is_none")]
+    pub git_repo: Option<serde_json::Value>,
+
+    #[serde(rename = "glusterfs", skip_serializing_if = "Option::is_none")]
+    pub glusterfs: Option<serde_json::Value>,
+
+    #[serde(rename = "rbd", skip_serializing_if = "Option::is_none")]
+    pub rbd: Option<serde_json::Value>,
+
+    #[serde(rename = "flexVolume", skip_serializing_if = "Option::is_none")]
+    pub flex_volume: Option<serde_json::Value>,
+
+    #[serde(rename = "cinder", skip_serializing_if = "Option::is_none")]
+    pub cinder: Option<serde_json::Value>,
+
+    #[serde(rename = "cephfs", skip_serializing_if = "Option::is_none")]
+    pub cephfs: Option<serde_json::Value>,
+
+    #[serde(rename = "flocker", skip_serializing_if = "Option::is_none")]
+    pub flocker: Option<serde_json::Value>,
+
+    #[serde(rename = "fc", skip_serializing_if = "Option::is_none")]
+    pub fc: Option<serde_json::Value>,
+
+    #[serde(rename = "azureFile", skip_serializing_if = "Option::is_none")]
+    pub azure_file: Option<serde_json::Value>,
+
+    #[serde(rename = "vsphereVolume", skip_serializing_if = "Option::is_none")]
+    pub vsphere_volume: Option<serde_json::Value>,
+
+    #[serde(rename = "quobyte", skip_serializing_if = "Option::is_none")]
+    pub quobyte: Option<serde_json::Value>,
+
+    #[serde(rename = "azureDisk", skip_serializing_if = "Option::is_none")]
+    pub azure_disk: Option<serde_json::Value>,
+
+    #[serde(
+        rename = "photonPersistentDisk",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub photon_persistent_disk: Option<serde_json::Value>,
+
+    #[serde(rename = "portworxVolume", skip_serializing_if = "Option::is_none")]
+    pub portworx_volume: Option<serde_json::Value>,
+
+    #[serde(rename = "scaleIO", skip_serializing_if = "Option::is_none")]
+    pub scale_io: Option<serde_json::Value>,
+
+    #[serde(rename = "storageos", skip_serializing_if = "Option::is_none")]
+    pub storageos: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Volume {
@@ -1086,6 +1155,11 @@ pub struct Volume {
     /// Image represents an OCI object (container image or artifact) pulled and mounted on the host
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageVolumeSource>,
+
+    /// Deprecated in-tree sources (gcePersistentDisk, ...), kept for lossless
+    /// round-trip and PodSecurity type naming.
+    #[serde(flatten)]
+    pub legacy_sources: LegacyVolumeSources,
 }
 
 /// ProjectedVolumeSource represents a projected volume
@@ -3276,5 +3350,20 @@ mod tests {
             serialized.get("lastProbeTime").is_none(),
             "absent lastProbeTime must not be serialized"
         );
+    }
+
+    /// A deprecated in-tree source survives decode/encode untouched (#2534).
+    #[test]
+    fn volume_legacy_sources_round_trip_losslessly() {
+        let src = serde_json::json!({
+            "name": "v",
+            "gcePersistentDisk": {"pdName": "d", "fsType": "ext4", "partition": 2},
+            "storageos": {"volumeName": "s"},
+        });
+        let v: Volume = serde_json::from_value(src.clone()).unwrap();
+        assert!(v.legacy_sources.gce_persistent_disk.is_some());
+        assert!(v.legacy_sources.storageos.is_some());
+        assert!(v.legacy_sources.rbd.is_none());
+        assert_eq!(serde_json::to_value(&v).unwrap(), src);
     }
 }

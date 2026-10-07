@@ -120,11 +120,16 @@ fn validate_validating_admission_policy_spec(
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
-    // failurePolicy is required (defaulting fills it) — an unsupported value
-    // cannot reach here, because the closed Rust enum rejects it in the decoder
-    // where upstream answers `NotSupported`.
-    if spec.failure_policy.is_none() {
-        errs.push(Error::required(&fld_path.child("failurePolicy"), ""));
+    // validation.go:782-786: required (defaulting fills it), then supported.
+    match &spec.failure_policy {
+        None => errs.push(Error::required(&fld_path.child("failurePolicy"), "")),
+        Some(crate::resources::validating_admission_policy::FailurePolicy::Unknown(v)) => errs
+            .push(Error::not_supported(
+                &fld_path.child("failurePolicy"),
+                v.clone(),
+                &["Fail", "Ignore"],
+            )),
+        Some(_) => {}
     }
 
     if let Some(param_kind) = &spec.param_kind {
@@ -273,8 +278,15 @@ fn validate_param_kind(param_kind: &ParamKind, fld_path: &Path) -> ErrorList {
 fn validate_match_resources(match_resources: &MatchResources, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
-    if match_resources.match_policy.is_none() {
-        errs.push(Error::required(&fld_path.child("matchPolicy"), ""));
+    // validation.go:891-895.
+    match &match_resources.match_policy {
+        None => errs.push(Error::required(&fld_path.child("matchPolicy"), "")),
+        Some(MatchPolicyType::Unknown(v)) => errs.push(Error::not_supported(
+            &fld_path.child("matchPolicy"),
+            v.clone(),
+            &["Equivalent", "Exact"],
+        )),
+        Some(_) => {}
     }
     match &match_resources.namespace_selector {
         None => errs.push(Error::required(&fld_path.child("namespaceSelector"), "")),
@@ -375,6 +387,7 @@ fn operation_str(op: &crate::resources::validating_admission_policy::OperationTy
         Op::Delete => "DELETE",
         Op::Connect => "CONNECT",
         Op::All => "*",
+        Op::Unknown(v) => v,
     }
     .to_string()
 }
@@ -503,9 +516,28 @@ fn validate_validation(validation: &Validation, fld_path: &Path) -> ErrorList {
         }
     }
 
-    // `reason` is a closed enum here, so an unsupported value is rejected by
-    // the decoder where upstream answers `NotSupported` (`:1058`).
+    // validation.go:1058-1060 (`supportedValidationPolicyReason`): only these
+    // three of metav1's StatusReasons are admitted.
+    if let Some(reason) = &validation.reason {
+        use crate::resources::validating_admission_policy::StatusReason as R;
+        if !matches!(reason, R::Forbidden | R::Invalid | R::RequestEntityTooLarge) {
+            errs.push(Error::not_supported(
+                &fld_path.child("reason"),
+                status_reason_str(reason),
+                &["Forbidden", "Invalid", "RequestEntityTooLarge"],
+            ));
+        }
+    }
     errs
+}
+
+fn status_reason_str(
+    reason: &crate::resources::validating_admission_policy::StatusReason,
+) -> String {
+    serde_json::to_value(reason)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 /// `validateAuditAnnotation` (`validation.go:1128-1162`), minus the CEL
@@ -620,25 +652,41 @@ fn validate_param_ref(param_ref: &ParamRef, fld_path: &Path) -> ErrorList {
 
     // Upstream has no defaulting for this field, so it really is required
     // whenever a paramRef is present (`validation.go:1227-1231`).
-    if param_ref.parameter_not_found_action.is_none() {
-        errs.push(Error::required(
+    match &param_ref.parameter_not_found_action {
+        None => errs.push(Error::required(
             &fld_path.child("parameterNotFoundAction"),
             "",
-        ));
+        )),
+        // `:1229-1231`: the supported list is in declaration order, not sorted.
+        Some(crate::resources::validating_admission_policy::ParameterNotFoundAction::Unknown(
+            v,
+        )) => errs.push(Error::not_supported(
+            &fld_path.child("parameterNotFoundAction"),
+            v.clone(),
+            &["Deny", "Allow"],
+        )),
+        Some(_) => {}
     }
     errs
 }
 
-/// `validateValidationActions` (`validation.go:926-945`). An unsupported action
-/// is rejected by the decoder here, where upstream answers `NotSupported`.
+/// `validateValidationActions` (`validation.go:926-945`).
 fn validate_validation_actions(actions: &[ValidationAction], fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
-    let mut seen: HashSet<&'static str> = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     for (i, action) in actions.iter().enumerate() {
         let name = match action {
             ValidationAction::Deny => "Deny",
             ValidationAction::Warn => "Warn",
             ValidationAction::Audit => "Audit",
+            ValidationAction::Unknown(v) => {
+                errs.push(Error::not_supported(
+                    &fld_path.index(i),
+                    v.clone(),
+                    &["Audit", "Deny", "Warn"],
+                ));
+                v.as_str()
+            }
         };
         if !seen.insert(name) {
             errs.push(Error::duplicate(&fld_path.index(i), name.to_string()));

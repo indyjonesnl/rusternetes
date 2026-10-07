@@ -64,6 +64,44 @@ const GET_BLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3)
 /// `resourceVersionTooHighRetrySeconds` (storage/cacher/watch_cache.go).
 const RESOURCE_VERSION_TOO_HIGH_RETRY_SECONDS: i32 = 1;
 
+/// The freshness wait shared by `Store::get` and the list handlers: see
+/// [`Store::wait_until_fresh`] for the upstream citations.
+pub async fn wait_until_resource_version<S: Storage + ?Sized>(
+    storage: &S,
+    resource_version: &str,
+) -> Result<()> {
+    // `APIObjectVersioner.ParseResourceVersion`
+    // (storage/api_object_versioner.go:90-103).
+    let want: u64 = match resource_version {
+        "" | "0" => return Ok(()),
+        rv => rv.parse().map_err(|e: std::num::ParseIntError| {
+            Error::Invalid(vec![FieldError::invalid(
+                &Path::new("resourceVersion"),
+                rv,
+                format!(
+                    "strconv.ParseUint: parsing {rv:?}: {}",
+                    parse_uint_reason(&e)
+                ),
+            )])
+        })?,
+    };
+    let start = tokio::time::Instant::now();
+    loop {
+        let current = storage.current_revision().await?.max(0) as u64;
+        if current >= want {
+            return Ok(());
+        }
+        if start.elapsed() >= GET_BLOCK_TIMEOUT {
+            return Err(too_large_resource_version(
+                want,
+                current,
+                RESOURCE_VERSION_TOO_HIGH_RETRY_SECONDS,
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// The parts of `metav1.UpdateOptions` the Store consults.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateOptions {
@@ -459,36 +497,7 @@ impl<T: Object, S: Storage> Store<T, S> {
     /// up to `blockTimeout` for the storage to reach the version, then fails
     /// with `NewTooLargeResourceVersionError` (storage/errors.go:229-242).
     async fn wait_until_fresh(&self, resource_version: &str) -> Result<()> {
-        // `APIObjectVersioner.ParseResourceVersion`
-        // (storage/api_object_versioner.go:90-103).
-        let want: u64 = match resource_version {
-            "" | "0" => return Ok(()),
-            rv => rv.parse().map_err(|e: std::num::ParseIntError| {
-                Error::Invalid(vec![FieldError::invalid(
-                    &Path::new("resourceVersion"),
-                    rv,
-                    format!(
-                        "strconv.ParseUint: parsing {rv:?}: {}",
-                        parse_uint_reason(&e)
-                    ),
-                )])
-            })?,
-        };
-        let start = tokio::time::Instant::now();
-        loop {
-            let current = self.storage.current_revision().await?.max(0) as u64;
-            if current >= want {
-                return Ok(());
-            }
-            if start.elapsed() >= GET_BLOCK_TIMEOUT {
-                return Err(too_large_resource_version(
-                    want,
-                    current,
-                    RESOURCE_VERSION_TOO_HIGH_RETRY_SECONDS,
-                ));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_until_resource_version(&*self.storage, resource_version).await
     }
 
     /// `InterpretGetError` (storage/errors/storage.go:44-57).
@@ -1710,6 +1719,29 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
             .map(|obj| self.decoded(obj))
             .collect();
         crate::handlers::filtering::apply_selectors(&mut items, list_options)?;
+
+        // `ListOptions.Limit` (store.go:1298-1301, :1343-1346): a request that
+        // sets it deletes and returns only that first page, "finish after
+        // running it"; one that does not sets `deleteCollectionPageSize` and
+        // pages through everything, which is the whole list here. Storage
+        // filters by selector while paging, so the page is the first `limit`
+        // matches in key order. A non-numeric limit is a decode failure,
+        // `NewBadRequest` (endpoints/handlers/delete.go:232-236).
+        let limit = match list_options.get("limit") {
+            None => 0,
+            Some(v) => v.parse::<i64>().map_err(|_| {
+                Error::BadRequest(format!(
+                    "failed to decode query parameter limit: strconv.ParseInt: parsing {v:?}: invalid syntax"
+                ))
+            })?,
+        };
+        if limit > 0 {
+            items.sort_by(|a, b| {
+                let (a, b) = (a.metadata(), b.metadata());
+                (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name))
+            });
+            items.truncate(limit as usize);
+        }
         Store::delete_collection(self, ctx, items, delete_validation, options).await
     }
 }

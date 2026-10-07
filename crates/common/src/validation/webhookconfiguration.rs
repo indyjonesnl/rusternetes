@@ -32,6 +32,9 @@ use std::collections::HashSet;
 /// upstream `AcceptedAdmissionReviewVersions`.
 const ACCEPTED_ADMISSION_REVIEW_VERSIONS: &[&str] = &["v1", "v1beta1"];
 
+/// `supportedOperations` (validation.go:496-502), as `sets.String.List()` sorts.
+const SUPPORTED_OPERATIONS: &[&str] = &["*", "CONNECT", "CREATE", "DELETE", "UPDATE"];
+
 const VALID_SCOPES: &[&str] = &["Cluster", "Namespaced", "*"];
 
 /// Upstream `IsFullyQualifiedName`: required, a valid DNS1123 subdomain, with at
@@ -133,6 +136,16 @@ pub(crate) fn validate_rule_parts(
             "if '*' is present, must not specify other operations",
         ));
     }
+    // validation.go:546-548 (`supportedOperations`, sorted by `List()`).
+    for (i, op) in operations.iter().enumerate() {
+        if !SUPPORTED_OPERATIONS.contains(&op.as_str()) {
+            errs.push(Error::not_supported(
+                &path.child("operations").index(i),
+                op.clone(),
+                SUPPORTED_OPERATIONS,
+            ));
+        }
+    }
 
     if api_groups.is_empty() {
         errs.push(Error::required(&path.child("apiGroups"), ""));
@@ -188,6 +201,7 @@ fn validate_rule_with_operations(rule: &RuleWithOperations, path: &Path) -> Erro
         .iter()
         .map(|o| match o {
             crate::resources::admission_webhook::OperationType::All => "*".to_string(),
+            crate::resources::admission_webhook::OperationType::Unknown(v) => v.clone(),
             other => serde_json::to_value(other)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
@@ -205,7 +219,7 @@ fn validate_rule_with_operations(rule: &RuleWithOperations, path: &Path) -> Erro
     )
 }
 
-fn side_effect_str(s: &SideEffectClass) -> &'static str {
+fn side_effect_str(s: &SideEffectClass) -> &str {
     match s {
         // Go's zero value for the field, i.e. an absent `sideEffects`; upstream
         // renders it in the error as the empty string it is.
@@ -214,6 +228,7 @@ fn side_effect_str(s: &SideEffectClass) -> &'static str {
         SideEffectClass::None => "None",
         SideEffectClass::Some => "Some",
         SideEffectClass::NoneOnDryRun => "NoneOnDryRun",
+        SideEffectClass::Unrecognized(v) => v,
     }
 }
 
@@ -675,6 +690,21 @@ fn validate_validating_webhook(
             &path.child("rules").index(i),
         ));
     }
+    // validation.go:371-376 / :427-432.
+    if let Some(FailurePolicy::Unknown(v)) = &hook.failure_policy {
+        errs.push(Error::not_supported(
+            &path.child("failurePolicy"),
+            v.clone(),
+            &["Fail", "Ignore"],
+        ));
+    }
+    if let Some(MatchPolicy::Unknown(v)) = &hook.match_policy {
+        errs.push(Error::not_supported(
+            &path.child("matchPolicy"),
+            v.clone(),
+            &["Equivalent", "Exact"],
+        ));
+    }
     if let Some(e) = validate_no_side_effects(&hook.side_effects, &path.child("sideEffects")) {
         errs.push(e);
     }
@@ -714,6 +744,21 @@ fn validate_mutating_webhook(
             &path.child("rules").index(i),
         ));
     }
+    // validation.go:371-376 / :427-432.
+    if let Some(FailurePolicy::Unknown(v)) = &hook.failure_policy {
+        errs.push(Error::not_supported(
+            &path.child("failurePolicy"),
+            v.clone(),
+            &["Fail", "Ignore"],
+        ));
+    }
+    if let Some(MatchPolicy::Unknown(v)) = &hook.match_policy {
+        errs.push(Error::not_supported(
+            &path.child("matchPolicy"),
+            v.clone(),
+            &["Equivalent", "Exact"],
+        ));
+    }
     if let Some(e) = validate_no_side_effects(&hook.side_effects, &path.child("sideEffects")) {
         errs.push(e);
     }
@@ -736,6 +781,14 @@ fn validate_mutating_webhook(
         errs.extend(validate_match_conditions(
             hook.match_conditions.as_deref().unwrap_or_default(),
             &path.child("matchConditions"),
+        ));
+    }
+    // validation.go:453-455.
+    if let Some(ReinvocationPolicy::Unknown(v)) = &hook.reinvocation_policy {
+        errs.push(Error::not_supported(
+            &path.child("reinvocationPolicy"),
+            v.clone(),
+            &["IfNeeded", "Never"],
         ));
     }
     errs

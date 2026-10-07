@@ -9,7 +9,9 @@ use rusternetes_common::resources::{ResourceQuota, ResourceQuotaStatus};
 use rusternetes_storage::{build_key, MemoryStorage, Storage};
 use serde_json::{json, Value};
 
-use super::evaluator::{evaluator_for, ObjectCountEvaluator, ServiceEvaluator};
+use super::evaluator::{
+    evaluator_for, Evaluator, ObjectCountEvaluator, PodEvaluator, ServiceEvaluator,
+};
 use super::{check_request, evaluate, Attributes, QuotaError};
 use crate::registry::rest::GroupResource;
 
@@ -315,10 +317,15 @@ fn scoped_quotas_do_not_match() {
     check_request(&[q], &attrs(Operation::Create, &cm, None), &*ev).unwrap();
 }
 
-/// `NewEvaluators`: pods have their own evaluator, which is not on this path.
+/// `NewEvaluators` (registry.go:41-70): pods have their own evaluator,
+/// which tracks the pod resources and not the other kinds' names.
 #[test]
-fn registry_skips_unported_evaluators() {
-    assert!(evaluator_for(&GroupResource::new("", "pods")).is_none());
+fn registry_has_a_pod_evaluator() {
+    let pods = evaluator_for(&GroupResource::new("", "pods")).unwrap();
+    assert_eq!(
+        pods.matching_resources(&["requests.cpu".to_string(), "services".to_string()]),
+        ["requests.cpu"]
+    );
     assert!(evaluator_for(&GroupResource::new("", "persistentvolumeclaims")).is_some());
 }
 
@@ -768,4 +775,250 @@ fn pvc_evaluator_matching_scopes_and_uncovered() {
         .matching_scopes(&cm, &[sel("Exists", &[])])
         .unwrap()
         .is_empty());
+}
+
+// ---- the pod evaluator: pkg/quota/v1/evaluator/core/pods_test.go ----
+
+fn pod(rv: &str, spec: Value) -> Value {
+    json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "pod", "namespace": "test", "resourceVersion": rv},
+        "spec": spec,
+    })
+}
+
+fn container(requests: Value) -> Value {
+    json!({"name": "c", "image": "i", "resources": {"requests": requests, "limits": requests}})
+}
+
+/// `TestPodEvaluatorHandles`.
+#[test]
+fn pod_evaluator_handles() {
+    let plain = pod("1", json!({"containers": []}));
+    let deadline = pod("1", json!({"containers": [], "activeDeadlineSeconds": 1}));
+    let other_deadline = pod("1", json!({"containers": [], "activeDeadlineSeconds": 2}));
+    let h = |op: Operation, sub: Option<&str>, obj: Option<&Value>, old: Option<&Value>| {
+        let empty = Value::Null;
+        let a = Attributes {
+            operation: op,
+            namespace: "test",
+            subresource: sub,
+            // An absent object is one that does not decode as a pod.
+            object: obj.unwrap_or(&empty),
+            old_object: old,
+            dry_run: false,
+        };
+        PodEvaluator.handles(&a)
+    };
+    assert!(h(Operation::Create, None, None, None));
+    // activeDeadlineSeconds to nil and from nil: the Terminating scope flips.
+    assert!(h(Operation::Update, None, Some(&plain), Some(&deadline)));
+    assert!(h(Operation::Update, None, Some(&deadline), Some(&plain)));
+    assert!(!h(
+        Operation::Update,
+        None,
+        Some(&deadline),
+        Some(&other_deadline)
+    ));
+    // An update with no decodable pods, deletes and connects are not handled.
+    assert!(!h(Operation::Update, None, None, None));
+    assert!(!h(Operation::Delete, None, None, None));
+    assert!(!h(Operation::Connect, None, None, None));
+    assert!(!h(Operation::Create, Some("subresource"), None, None));
+    assert!(!h(Operation::Update, Some("subresource"), None, None));
+    assert!(h(Operation::Update, Some("resize"), None, None));
+}
+
+/// `MatchingResources` (pods.go:208-222): `podResources`, hugepages, and
+/// `requests.<extended>`.
+#[test]
+fn pod_evaluator_matching_resources() {
+    let names = [
+        "pods",
+        "count/pods",
+        "requests.cpu",
+        "limits.memory",
+        "hugepages-2Mi",
+        "requests.hugepages-2Mi",
+        "requests.example.com/dongle",
+        "limits.example.com/dongle",
+        "requests.storage",
+        "services",
+    ]
+    .map(String::from);
+    assert_eq!(
+        PodEvaluator.matching_resources(&names),
+        [
+            "count/pods",
+            "hugepages-2Mi",
+            "limits.memory",
+            "pods",
+            "requests.cpu",
+            "requests.example.com/dongle",
+            "requests.hugepages-2Mi",
+        ]
+    );
+}
+
+/// `TestPodEvaluatorMatchingScopes`, a representative slice.
+#[test]
+fn pod_evaluator_matching_scopes() {
+    use rusternetes_common::resources::ScopedResourceSelectorRequirement as S;
+    let sel = |name: &str, op: &str, values: Option<Vec<&str>>| S {
+        scope_name: name.to_string(),
+        operator: op.to_string(),
+        values: values.map(|v| v.into_iter().map(String::from).collect()),
+    };
+    let all = vec![
+        sel("Terminating", "", None),
+        sel("NotTerminating", "", None),
+        sel("BestEffort", "", None),
+        sel("NotBestEffort", "", None),
+        sel("PriorityClass", "In", Some(vec!["class1"])),
+        sel("CrossNamespacePodAffinity", "", None),
+    ];
+    let names = |p: &Value| -> Vec<String> {
+        PodEvaluator
+            .matching_scopes(p, &all)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.scope_name)
+            .collect()
+    };
+    assert_eq!(
+        names(&pod("1", json!({"containers": []}))),
+        ["NotTerminating", "BestEffort"]
+    );
+    assert_eq!(
+        names(&pod(
+            "1",
+            json!({"containers": [], "priorityClassName": "class1"})
+        )),
+        ["NotTerminating", "BestEffort", "PriorityClass"]
+    );
+    assert_eq!(
+        names(&pod(
+            "1",
+            json!({"containers": [], "activeDeadlineSeconds": 30,
+                   "affinity": {"podAffinity": {"requiredDuringSchedulingIgnoredDuringExecution":
+                       [{"labelSelector": {}, "namespaces": ["ns1"], "topologyKey": "k"}]}}})
+        )),
+        ["Terminating", "BestEffort", "CrossNamespacePodAffinity"]
+    );
+}
+
+/// A pod create is charged `pods` and its requests, and recorded.
+#[tokio::test]
+async fn pod_create_is_charged_and_recorded() {
+    let storage = MemoryStorage::new();
+    stored(
+        &storage,
+        &quota(
+            &[("pods", "2"), ("requests.cpu", "1")],
+            &[("pods", "1"), ("requests.cpu", "250m")],
+        ),
+    )
+    .await;
+    let p = pod(
+        "",
+        json!({"containers": [container(json!({"cpu": "250m"}))]}),
+    );
+    evaluate(&storage, &PodEvaluator, &attrs(Operation::Create, &p, None))
+        .await
+        .unwrap();
+    let u = used(&storage).await;
+    assert_eq!(u["pods"], "2");
+    assert_eq!(u["requests.cpu"], "500m");
+
+    // The second pod would exceed `pods`.
+    let err = evaluate(&storage, &PodEvaluator, &attrs(Operation::Create, &p, None))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        QuotaError::Forbidden(
+            "exceeded quota: quota, requested: pods=1, used: pods=2, limited: pods=2".to_string()
+        )
+    );
+}
+
+/// `Constraints` runs from `CheckRequest` (controller.go:470-472), before
+/// `hasUsageStats`: a container omitting a quota'd cpu is refused even when
+/// the quota has no `status.used` yet.
+#[test]
+fn pod_constraints_fail_before_usage_stats() {
+    let mut q = quota(&[("requests.cpu", "1")], &[]);
+    q.metadata.name = "cpu".to_string();
+    let p = pod("", json!({"containers": [{"name": "c", "image": "i"}]}));
+    let err = check_request(&[q], &attrs(Operation::Create, &p, None), &PodEvaluator).unwrap_err();
+    assert_eq!(
+        err,
+        QuotaError::Forbidden("failed quota: cpu: must specify requests.cpu for: c".to_string())
+    );
+}
+
+/// `generic.Matches`: a scoped quota only covers the pods its scopes match.
+#[tokio::test]
+async fn scoped_pod_quota_only_charges_matching_pods() {
+    let storage = MemoryStorage::new();
+    let mut q = quota(&[("pods", "1")], &[("pods", "1")]);
+    q.spec.scopes = Some(vec!["Terminating".to_string()]);
+    stored(&storage, &q).await;
+    // A NotTerminating pod is not covered by the Terminating-scoped quota.
+    let plain = pod("", json!({"containers": []}));
+    evaluate(
+        &storage,
+        &PodEvaluator,
+        &attrs(Operation::Create, &plain, None),
+    )
+    .await
+    .unwrap();
+    // A Terminating one is, and the quota is full.
+    let terminating = pod("", json!({"containers": [], "activeDeadlineSeconds": 10}));
+    let err = evaluate(
+        &storage,
+        &PodEvaluator,
+        &attrs(Operation::Create, &terminating, None),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, QuotaError::Forbidden(m) if m.starts_with("exceeded quota: quota")));
+}
+
+/// An update moving a pod into a quota's scope is charged the whole
+/// footprint: the quota did not match the old object, so the delta is not
+/// substituted (controller.go:572-586).
+#[test]
+fn update_into_scope_charges_full_usage() {
+    let mut q = quota(&[("pods", "5")], &[("pods", "1")]);
+    q.spec.scopes = Some(vec!["Terminating".to_string()]);
+    let old = pod("3", json!({"containers": []}));
+    let new = pod("3", json!({"containers": [], "activeDeadlineSeconds": 10}));
+    let out = check_request(
+        &[q],
+        &attrs(Operation::Update, &new, Some(&old)),
+        &PodEvaluator,
+    )
+    .unwrap();
+    assert_eq!(
+        out[0].status.as_ref().unwrap().used.as_ref().unwrap()["pods"],
+        "2"
+    );
+}
+
+/// A plain pod update (no scope flip) is not handled: nothing is charged.
+#[tokio::test]
+async fn plain_pod_update_is_ignored() {
+    let storage = MemoryStorage::new();
+    stored(&storage, &quota(&[("pods", "1")], &[("pods", "1")])).await;
+    let old = pod("3", json!({"containers": []}));
+    let new = pod("3", json!({"containers": [], "priorityClassName": "x"}));
+    evaluate(
+        &storage,
+        &PodEvaluator,
+        &attrs(Operation::Update, &new, Some(&old)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(used(&storage).await["pods"], "1");
 }

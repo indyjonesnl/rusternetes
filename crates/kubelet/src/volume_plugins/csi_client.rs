@@ -123,6 +123,8 @@ pub fn as_csi_access_mode(am: &PersistentVolumeAccessMode) -> AccessModeKind {
         PersistentVolumeAccessMode::ReadWriteMany => AccessModeKind::MultiNodeMultiWriter,
         // Lets drivers that lack SINGLE_NODE_MULTI_WRITER serve ReadWriteOncePod.
         PersistentVolumeAccessMode::ReadWriteOncePod => AccessModeKind::SingleNodeWriter,
+        // `asCSIAccessModeV1` falls through to `..._UNKNOWN` (csi_client.go:513).
+        PersistentVolumeAccessMode::Unknown(_) => AccessModeKind::Unknown,
     }
 }
 
@@ -136,6 +138,7 @@ pub fn as_single_node_multi_writer_capable_csi_access_mode(
         PersistentVolumeAccessMode::ReadOnlyMany => AccessModeKind::MultiNodeReaderOnly,
         PersistentVolumeAccessMode::ReadWriteMany => AccessModeKind::MultiNodeMultiWriter,
         PersistentVolumeAccessMode::ReadWriteOncePod => AccessModeKind::SingleNodeSingleWriter,
+        PersistentVolumeAccessMode::Unknown(_) => AccessModeKind::Unknown,
     }
 }
 

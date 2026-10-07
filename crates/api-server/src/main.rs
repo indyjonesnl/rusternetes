@@ -6,6 +6,7 @@
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admission;
+mod audit;
 pub use rusternetes_admission_webhook as admission_webhook;
 #[allow(dead_code)]
 mod bootstrap;
@@ -41,7 +42,6 @@ mod spdy;
 #[allow(dead_code)]
 mod spdy3;
 #[allow(dead_code)]
-mod spdy_handlers;
 mod ssa;
 mod state;
 #[allow(dead_code)]
@@ -87,6 +87,38 @@ struct Args {
     /// JWT secret for service account tokens
     #[arg(long, default_value = "rusternetes-secret-change-in-production")]
     jwt_secret: String,
+
+    /// File containing PEM-encoded x509 RSA or ECDSA private or public keys,
+    /// used to verify ServiceAccount tokens. The specified file can contain
+    /// multiple keys, and the flag can be specified multiple times with
+    /// different files. Must be specified when
+    /// --service-account-signing-key-file is provided
+    /// (pkg/kubeapiserver/options/authentication.go:432-437).
+    #[arg(long = "service-account-key-file")]
+    service_account_key_file: Vec<String>,
+
+    /// Path to the file that contains the current private key of the service
+    /// account token issuer. The issuer will sign issued ID tokens with this
+    /// private key (pkg/controlplane/apiserver/options/options.go:207).
+    #[arg(long = "service-account-signing-key-file")]
+    service_account_signing_key_file: Option<String>,
+
+    /// Identifier of the service account token issuer. The issuer will assert
+    /// this identifier in "iss" claim of issued tokens. When this flag is
+    /// specified multiple times, the first is used to generate tokens and all
+    /// are used to determine which issuers are accepted
+    /// (pkg/kubeapiserver/options/authentication.go:442-452).
+    #[arg(long = "service-account-issuer")]
+    service_account_issuer: Vec<String>,
+
+    /// Identifiers of the API. The service account token authenticator will
+    /// validate that tokens used against the API are bound to at least one of
+    /// these audiences. If the --service-account-issuer flag is configured and
+    /// this flag is not, this field defaults to a single element list
+    /// containing the issuer URL
+    /// (pkg/kubeapiserver/options/authentication.go:352).
+    #[arg(long = "api-audiences", value_delimiter = ',')]
+    api_audiences: Vec<String>,
 
     /// Enable TLS/HTTPS
     #[arg(long)]
@@ -152,6 +184,55 @@ struct Args {
         value_parser = registry::core::event::parse_event_ttl
     )]
     event_ttl: u64,
+
+    /// Path to the file that defines the audit policy configuration
+    /// (`--audit-policy-file`, pkg/server/options/audit.go:258).
+    #[arg(long)]
+    audit_policy_file: Option<String>,
+
+    /// Path of the file audit events are written to; `-` is stdout
+    /// (`--audit-log-path`, options/audit.go:436).
+    #[arg(long)]
+    audit_log_path: Option<String>,
+
+    /// Format of saved audits (`--audit-log-format`, options/audit.go:444);
+    /// only `json` is supported.
+    #[arg(long, default_value = "json")]
+    audit_log_format: String,
+}
+
+/// `--audit-policy-file` + `--audit-log-path` build the audit pipeline.
+/// Like `WithAudit` (filters/audit.go:42), a missing policy or sink leaves
+/// auditing off.
+async fn install_audit_from_flags(args: &Args) -> Result<()> {
+    if args.audit_log_format != "json" {
+        anyhow::bail!(
+            "invalid audit log format {:?}: only \"json\" is supported",
+            args.audit_log_format
+        );
+    }
+    let (Some(policy_file), Some(log_path)) = (&args.audit_policy_file, &args.audit_log_path)
+    else {
+        if args.audit_policy_file.is_some() || args.audit_log_path.is_some() {
+            warn!("auditing needs both --audit-policy-file and --audit-log-path; it is off");
+        }
+        return Ok(());
+    };
+    let yaml = std::fs::read_to_string(policy_file)
+        .with_context(|| format!("reading --audit-policy-file {policy_file}"))?;
+    let policy = audit::Policy::from_yaml(&yaml)
+        .map_err(|e| anyhow::anyhow!("{e}: from file {policy_file}"))?;
+    let sink: std::sync::Arc<dyn rusternetes_common::audit::AuditBackend> = if log_path == "-" {
+        std::sync::Arc::new(audit::StdoutAuditBackend)
+    } else {
+        std::sync::Arc::new(
+            rusternetes_common::audit::FileAuditBackend::new(log_path.clone())
+                .await
+                .with_context(|| format!("opening --audit-log-path {log_path}"))?,
+        )
+    };
+    audit::install_audit(audit::AuditConfig { policy, sink });
+    Ok(())
 }
 
 #[tokio::main]
@@ -172,6 +253,8 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
         admission::install_pod_security_exemptions(exemptions);
     }
+
+    install_audit_from_flags(&args).await?;
 
     info!(
         "Starting Rusternetes API Server {}",
@@ -204,7 +287,16 @@ async fn main() -> Result<()> {
     // Initialize TokenManager — prefer RSA keys for RS256 (K8s OIDC compatible),
     // fall back to HMAC HS256 if no RSA keys found.
     info!("Initializing TokenManager");
-    let token_manager = Arc::new(TokenManager::new_auto(args.jwt_secret.as_bytes()));
+    let service_account = rusternetes_common::auth::ServiceAccountOptions {
+        key_files: args.service_account_key_file.clone(),
+        signing_key_file: args.service_account_signing_key_file.clone(),
+        issuers: args.service_account_issuer.clone(),
+        api_audiences: args.api_audiences.clone(),
+    };
+    let token_manager = Arc::new(
+        TokenManager::new_auto(args.jwt_secret.as_bytes())
+            .with_service_account_options(&service_account)?,
+    );
 
     // Initialize Authorizer (RBAC or AlwaysAllow based on skip_auth)
     let authorizer: Arc<dyn rusternetes_common::authz::Authorizer> = if args.skip_auth {
@@ -223,9 +315,9 @@ async fn main() -> Result<()> {
             Arc::new(rusternetes_common::authz::NodeAuthorizer);
         let rbac: Arc<dyn rusternetes_common::authz::Authorizer> =
             Arc::new(RBACAuthorizer::new(storage.clone()));
-        Arc::new(rusternetes_common::authz::UnionAuthorizer::new(vec![
-            node, rbac,
-        ]))
+        // `system:masters` superuser first, as `newForConfig`
+        // (`pkg/kubeapiserver/authorizer/reload.go:97-99`) does (#1576).
+        Arc::new(rusternetes_common::authz::superuser_then(vec![node, rbac]))
     };
 
     // Initialize Metrics Registry
@@ -242,6 +334,7 @@ async fn main() -> Result<()> {
         skip_auth: args.skip_auth,
         client_ca_file: args.client_ca_file.clone(),
         service_node_port_range: args.service_node_port_range,
+        service_account,
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;

@@ -231,6 +231,11 @@ pub enum OperationType {
     Connect,
     #[serde(rename = "*")]
     All,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// FailurePolicy defines how unrecognized errors from the webhook are handled
@@ -240,6 +245,11 @@ pub enum FailurePolicy {
     Ignore,
     /// Fail means the API request is rejected
     Fail,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// MatchPolicy defines how the rules are applied when the request matches multiple rules
@@ -249,6 +259,11 @@ pub enum MatchPolicy {
     Exact,
     /// Equivalent means the request matches equivalent rules
     Equivalent,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// SideEffectClass denotes the level of side effects a webhook may have
@@ -272,6 +287,12 @@ pub enum SideEffectClass {
     Some,
     /// NoneOnDryRun means the webhook has no side effects when run in dry-run mode
     NoneOnDryRun,
+    /// A value outside (named `Unrecognized` because `Unknown` is itself a
+    /// valid upstream value) the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475).
+    #[serde(untagged)]
+    Unrecognized(String),
 }
 
 /// ReinvocationPolicy indicates whether a webhook should be called multiple times
@@ -281,6 +302,11 @@ pub enum ReinvocationPolicy {
     Never,
     /// IfNeeded means the webhook may be called again as part of the admission evaluation
     IfNeeded,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// LabelSelector is used to select resources by labels

@@ -169,6 +169,12 @@ pub enum Feature {
     /// Upstream gate `StorageVersionMigrator` (1.35 Beta, still off; `pkg/features/kube_features.go:1829-1832`).
     StorageVersionMigrator,
 
+    /// Upstream gate `KubeletCrashLoopBackOffMax` (1.32 Alpha off, 1.35 Beta on; `pkg/features/kube_features.go:1429-1432`).
+    KubeletCrashLoopBackOffMax,
+
+    /// Upstream gate `ReduceDefaultCrashLoopBackOffDecay` (1.33 Alpha, off; `pkg/features/kube_features.go:1692-1694`).
+    ReduceDefaultCrashLoopBackOffDecay,
+
     /// Upstream gate `WatchCacheInitializationPostStartHook` (1.31 Beta, still off; `staging/src/k8s.io/apiserver/pkg/features/kube_features.go:494-496`).
     WatchCacheInitializationPostStartHook,
 }
@@ -209,7 +215,9 @@ impl Feature {
             Feature::StorageVersionAPI => 29,
             Feature::APIServerIdentity => 30,
             Feature::StorageVersionMigrator => 31,
-            Feature::WatchCacheInitializationPostStartHook => 32,
+            Feature::KubeletCrashLoopBackOffMax => 32,
+            Feature::ReduceDefaultCrashLoopBackOffDecay => 33,
+            Feature::WatchCacheInitializationPostStartHook => 34,
         }
     }
 
@@ -280,6 +288,8 @@ impl Feature {
             Feature::APIServerIdentity => true,
             // 1.35 Beta, still off (pkg/features/kube_features.go:1829-1832)
             Feature::StorageVersionMigrator => false,
+            Feature::KubeletCrashLoopBackOffMax => true,
+            Feature::ReduceDefaultCrashLoopBackOffDecay => false,
             // 1.31 Beta, no `Default: true` (apiserver kube_features.go:494-496)
             Feature::WatchCacheInitializationPostStartHook => false,
         }
@@ -330,6 +340,8 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::StorageVersionAPI,
     Feature::APIServerIdentity,
     Feature::StorageVersionMigrator,
+    Feature::KubeletCrashLoopBackOffMax,
+    Feature::ReduceDefaultCrashLoopBackOffDecay,
     Feature::WatchCacheInitializationPostStartHook,
 ];
 
@@ -377,6 +389,8 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::StorageVersionAPI.default_enabled()),
     AtomicBool::new(Feature::APIServerIdentity.default_enabled()),
     AtomicBool::new(Feature::StorageVersionMigrator.default_enabled()),
+    AtomicBool::new(Feature::KubeletCrashLoopBackOffMax.default_enabled()),
+    AtomicBool::new(Feature::ReduceDefaultCrashLoopBackOffDecay.default_enabled()),
     AtomicBool::new(Feature::WatchCacheInitializationPostStartHook.default_enabled()),
 ];
 

@@ -34,6 +34,7 @@ pub fn ensure_service_account_name(spec: &mut PodSpec) -> String {
 /// namespace), matching upstream `TokenVolumeSource()`.
 fn sa_token_volume() -> Volume {
     Volume {
+        legacy_sources: Default::default(),
         name: SA_TOKEN_VOLUME_NAME.to_string(),
         empty_dir: None,
         host_path: None,
