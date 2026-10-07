@@ -371,3 +371,60 @@ async fn a_self_subject_rules_review_with_no_namespace_is_a_bad_request() {
         "{body}"
     );
 }
+
+/// `apierrors.NewInvalid(authorizationapi.Kind(kind), "", errs)`
+/// (`apimachinery/pkg/api/errors/errors.go:284-312`): the message is
+/// `<Kind>.<group> "" is invalid: ...`, `details` carry group/kind/name, and
+/// each cause message is `ErrorBody()` -- without the `field: ` prefix (#2392).
+fn assert_new_invalid(body: &Value, kind: &str) {
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.starts_with(&format!("{kind}.authorization.k8s.io \"\" is invalid: ")),
+        "message must carry the NewInvalid prefix: {body}"
+    );
+    assert_eq!(body["details"]["kind"], json!(kind), "{body}");
+    assert_eq!(body["details"]["group"], json!("authorization.k8s.io"));
+    assert_eq!(body["details"]["name"].as_str().unwrap_or(""), "", "{body}");
+    for c in body["details"]["causes"].as_array().unwrap() {
+        let field = c["field"].as_str().unwrap_or_default();
+        let m = c["message"].as_str().unwrap_or_default();
+        assert!(
+            !m.starts_with(&format!("{field}: ")),
+            "cause message must be ErrorBody(), not prefixed: {c}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sar_invalid_status_is_new_invalid_shaped() {
+    let api = TestApiServer::new();
+    for (path, kind) in [
+        (
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            "SubjectAccessReview",
+        ),
+        (
+            "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+            "SelfSubjectAccessReview",
+        ),
+        (
+            "/apis/authorization.k8s.io/v1/namespaces/ns-a/localsubjectaccessreviews",
+            "LocalSubjectAccessReview",
+        ),
+    ] {
+        let (status, body) = api
+            .send(
+                "POST",
+                path,
+                Some("application/json"),
+                Some(&json!({
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": kind,
+                    "metadata": {},
+                })),
+            )
+            .await;
+        assert_eq!(status.as_u16(), 422, "{kind}: {body}");
+        assert_new_invalid(&body, kind);
+    }
+}
