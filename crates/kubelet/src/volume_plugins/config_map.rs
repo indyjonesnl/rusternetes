@@ -83,7 +83,38 @@ impl VolumePlugin for ConfigMapPlugin {
                 .clone()
                 .expect("checked by can_support"),
             storage: self.host.get_kube_client().cloned(),
+            fs_group: crate::volume_plugins::util::fs_group_from(pod),
         }))
+    }
+
+    /// `NewUnmounter` (`configmap.go:108-130`): the wrapper plugins share one unmounter that
+    /// delegates `TearDownAt` to emptyDir (`volumeutil.UnmountViaEmptyDir`).
+    fn new_unmounter(
+        &self,
+        vol_name: &str,
+        pod_uid: &str,
+    ) -> Result<Box<dyn crate::volume_plugins::Unmounter>> {
+        Ok(Box::new(
+            crate::volume_plugins::util::WrappedEmptyDirUnmounter {
+                host: self.host.clone(),
+                plugin_name: self.name(),
+                vol_name: vol_name.to_string(),
+                pod_uid: pod_uid.to_string(),
+            },
+        ))
+    }
+
+    /// `ConstructVolumeSpec` (`configmap.go:108-130`): a bare `ConfigMapVolumeSource{}`
+    /// named after the volume.
+    fn construct_volume_spec(
+        &self,
+        vol_name: &str,
+        _mount_path: &str,
+    ) -> Result<crate::volume_plugins::ReconstructedVolume> {
+        crate::volume_plugins::util::reconstructed_volume(
+            vol_name,
+            serde_json::json!({"configMap": {"name": ""}}),
+        )
     }
 }
 
@@ -101,6 +132,8 @@ struct ConfigMapMounter {
     namespace: String,
     config_map: ConfigMapVolumeSource,
     storage: Option<Arc<StorageBackend>>,
+    /// `mounterArgs.FsGroup` (`volume.go:132`).
+    fs_group: Option<i64>,
 }
 
 #[async_trait]
@@ -178,9 +211,11 @@ impl Mounter for ConfigMapMounter {
         // `defer` at `configmap.go:222-237`: if the AtomicWriter fails after
         // the wrapped emptyDir SetUpAt, `unmounter.TearDown()` runs, and
         // emptyDir `TearDownAt` removes the volume directory.
-        if let Err(e) = crate::atomic_writer::write_projected_payload(
+        if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
             std::path::Path::new(volume_dir),
             &payload,
+            self.fs_group,
+            true,
         ) {
             if let Err(td) = std::fs::remove_dir_all(volume_dir) {
                 tracing::error!("Error tearing down volume {}: {}", self.volume_name, td);
@@ -306,6 +341,7 @@ mod tests {
             storage: Some(Arc::new(StorageBackend::Memory(Arc::new(
                 rusternetes_storage::MemoryStorage::new(),
             )))),
+            fs_group: None,
         }
     }
 

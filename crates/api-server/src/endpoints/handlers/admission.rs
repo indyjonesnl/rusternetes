@@ -27,8 +27,9 @@ use rusternetes_common::admission::{
     self, AdmissionResponse, GroupVersionKind, GroupVersionResource, Operation,
 };
 use rusternetes_common::auth::UserInfo;
+use rusternetes_common::resources::podcertificaterequest::PodCertificateRequest;
 use rusternetes_common::resources::{
-    CertificateSigningRequest, PersistentVolumeClaim, Pod, PriorityClass,
+    CertificateSigningRequest, ClusterTrustBundle, PersistentVolumeClaim, Pod, PriorityClass,
 };
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::Storage;
@@ -170,9 +171,33 @@ impl Admission<'_> {
     ) -> Result<()> {
         if let (Operation::Update, Some(obj), Some(old)) = (op, obj, old) {
             self.validate_csr_signer(obj, old).await?;
+            self.validate_pcr_signer(obj, old).await?;
         }
         if let (Operation::Create, Some(obj)) = (op, obj) {
             self.validate_csr_subject(obj)?;
+        }
+        if let (Operation::Create | Operation::Update, Some(obj)) = (op, obj) {
+            self.validate_ctb_attest(obj, old).await?;
+        }
+        // PodSecurity `ValidateNamespace` (pod-security-admission/admission/
+        // admission.go:229-327): label validation, and the existing pods
+        // checked against a tightened enforce level.
+        if let (Operation::Create | Operation::Update, Some(obj), true) =
+            (op, obj, self.is_core("namespaces"))
+        {
+            let ns: rusternetes_common::resources::Namespace = recast(obj)?;
+            let old_ns: Option<rusternetes_common::resources::Namespace> =
+                if *op == Operation::Update {
+                    old.map(recast).transpose()?
+                } else {
+                    None
+                };
+            for w in crate::admission::PodSecurityAdmission::new()
+                .validate_namespace(&self.state.storage, &ns, old_ns.as_ref())
+                .await?
+            {
+                ctx.add_warning(w);
+            }
         }
         if self.is_core("pods") || self.is_pod_resize() || self.is_pod_ephemeralcontainers() {
             let obj: Option<Pod> = obj.map(recast).transpose()?;
@@ -218,6 +243,52 @@ impl Admission<'_> {
             self.subresource,
             &new,
             &old,
+        )
+        .await
+        {
+            Some(err) => Err(self.forbidden(&old.metadata.name, err)),
+            None => Ok(()),
+        }
+    }
+
+    /// The `certificates/ctbattest` plugin (`ClusterTrustBundleAttest`), for
+    /// CREATE and UPDATE of a ClusterTrustBundle
+    /// ([`crate::admission::certificates::validate_cluster_trust_bundle_attest`]).
+    async fn validate_ctb_attest<T: Object>(&self, obj: &T, old: Option<&T>) -> Result<()> {
+        if self.resource.group != "certificates.k8s.io"
+            || self.resource.resource != "clustertrustbundles"
+            || self.subresource.is_some()
+        {
+            return Ok(());
+        }
+        let new: ClusterTrustBundle = recast(obj)?;
+        let old: Option<ClusterTrustBundle> = old.map(recast).transpose()?;
+        match crate::admission::certificates::validate_cluster_trust_bundle_attest(
+            self.state,
+            self.user,
+            &new,
+            old.as_ref(),
+        )
+        .await
+        {
+            Some(err) => Err(self.forbidden(&new.metadata.name, err)),
+            None => Ok(()),
+        }
+    }
+
+    /// The `"sign"` authorization of a PodCertificateRequest `/status` update
+    /// ([`crate::admission::certificates::validate_pod_certificate_request_sign`]).
+    async fn validate_pcr_signer<T: Object>(&self, obj: &T, old: &T) -> Result<()> {
+        if self.resource.group != "certificates.k8s.io"
+            || self.resource.resource != "podcertificaterequests"
+            || self.subresource != Some("status")
+        {
+            return Ok(());
+        }
+        let new: PodCertificateRequest = recast(obj)?;
+        let old: PodCertificateRequest = recast(old)?;
+        match crate::admission::certificates::validate_pod_certificate_request_sign(
+            self.state, self.user, &new, &old,
         )
         .await
         {

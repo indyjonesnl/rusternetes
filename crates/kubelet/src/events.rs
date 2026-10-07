@@ -40,6 +40,14 @@ pub const CONTAINER_UNHEALTHY: &str = "Unhealthy";
 /// A probe succeeded with warning (`ContainerProbeWarning`).
 pub const CONTAINER_PROBE_WARNING: &str = "ProbeWarning";
 
+/// A node filesystem resize failed (`FileSystemResizeFailed`,
+/// `pkg/kubelet/events/event.go:67`).
+pub const FILE_SYSTEM_RESIZE_FAILED: &str = "FileSystemResizeFailed";
+/// A node filesystem resize succeeded (`FileSystemResizeSuccess`,
+/// `pkg/kubelet/events/event.go:69`; the reason string is
+/// `FileSystemResizeSuccessful`).
+pub const FILE_SYSTEM_RESIZE_SUCCESS: &str = "FileSystemResizeSuccessful";
+
 /// The component name the kubelet stamps on every event it sources.
 pub const KUBELET_COMPONENT: &str = "kubelet";
 

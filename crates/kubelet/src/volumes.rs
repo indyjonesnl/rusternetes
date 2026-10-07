@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 // shared with non-volume code paths there). Imported so the moved bodies keep
 // calling them by their bare names, verbatim.
 use crate::atomic_writer::FileProjection;
+use crate::volume_plugins::VolumePlugin;
 
 /// Build the projection payload (relative user-visible path -> bytes) for a
 /// ConfigMap volume, honoring `items` (specific keys → mapped paths) or, when
@@ -49,6 +50,7 @@ pub(crate) fn build_configmap_payload(
                 payload.insert(
                     item.path.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: v.clone().into_bytes(),
                         mode,
                     },
@@ -61,6 +63,7 @@ pub(crate) fn build_configmap_payload(
                 payload.insert(
                     item.path.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: v.clone(),
                         mode,
                     },
@@ -77,6 +80,7 @@ pub(crate) fn build_configmap_payload(
                 payload.insert(
                     k.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: v.clone().into_bytes(),
                         mode: default_mode,
                     },
@@ -88,6 +92,7 @@ pub(crate) fn build_configmap_payload(
                 payload.insert(
                     k.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: v.clone(),
                         mode: default_mode,
                     },
@@ -183,9 +188,9 @@ pub struct VolumeManager {
     /// `CriContainerRuntime` clones it per attach — and `VolumePluginMgr`'s
     /// `Vec<Box<dyn VolumePlugin>>` cannot itself derive `Clone`.
     pub plugin_mgr: Arc<crate::volume_plugins::VolumePluginMgr>,
-    /// A CSI plugin over the same host, used to build unmounters
-    /// (`NewUnmounter`) for volumes found on disk. `plugin_mgr` holds the
-    /// plugin as a `dyn VolumePlugin`, which has no unmounter method yet.
+    /// A CSI plugin over the same host, for the CSI-specific device methods
+    /// (`unmount_device`, `list_staged_devices`) that are not part of
+    /// `VolumePlugin`. `plugin_mgr` holds the plugin as a `dyn VolumePlugin`.
     pub(crate) csi_plugin: Arc<crate::volume_plugins::csi::CsiPlugin>,
 }
 
@@ -376,30 +381,40 @@ impl VolumeManager {
         errors
     }
 
-    /// NodeUnpublish the CSI volumes of pods that are gone.
+    /// Tear down every volume of the pods that are gone.
     ///
-    /// Drives `csiMountMgr.TearDownAt` (`pkg/volume/csi/csi_mounter.go:432-466`)
-    /// the way upstream's volume manager does: the reconciler's
-    /// `unmountVolumes` (`pkg/kubelet/volumemanager/reconciler/reconciler.go`)
-    /// runs `UnmountVolume` -> `plugin.NewUnmounter(volName, podUID)`
-    /// (`csi_plugin.go:540-567`) -> `TearDown`, for every volume of a pod that
-    /// no longer wants it. Without a desired/actual state of world, the volumes
-    /// are found the way upstream's post-restart reconstruction finds them: by
-    /// walking `<pod>/volumes/kubernetes.io~csi/*` on disk.
+    /// Drives `Unmounter.TearDown` the way upstream's volume manager does: the
+    /// reconciler's `unmountVolumes`
+    /// (`pkg/kubelet/volumemanager/reconciler/reconciler_common.go:148`) runs
+    /// `UnmountVolume` -> `plugin.NewUnmounter(volName, podUID)` -> `TearDown`
+    /// (`pkg/volume/util/operationexecutor/operation_generator.go:729-757`) for every
+    /// volume of a pod that no longer wants it. This is what releases a
+    /// `medium: Memory` emptyDir's tmpfs, removes a configMap/secret/
+    /// downwardAPI/projected volume's files, and NodeUnpublishes a CSI volume
+    /// (`csiMountMgr.TearDownAt`, `csi_mounter.go:432-466`).
+    ///
+    /// Without a desired/actual state of world, the volumes are found the way
+    /// upstream's post-restart reconstruction finds them: by walking
+    /// `<pod>/volumes/<plugin>/<volume>` on disk (`getVolumesFromPodDir`,
+    /// `reconstruct_common.go:191-240`) and looking the plugin up by the
+    /// directory's name (`FindPluginByName`, `reconstruct_common.go:261`
+    /// `reconstructVolume`).
     ///
     /// Runs before [`Self::cleanup_orphaned_pod_dirs`], which refuses to touch a
     /// still-mounted volume. A failure (including the transient "driver not
     /// registered" error) is logged and left for the next sync, as the
-    /// reconciler retries a failed operation.
+    /// reconciler retries a failed operation. A directory no registered plugin
+    /// owns (the `rusternetes.io/unsupported` placeholder) is left to the
+    /// orphan sweep's `rmdir`.
     ///
     /// `terminated_pod_uids` are pods still present in the API whose runtime
     /// is gone (Succeeded/Failed): upstream's populator drops their volumes
     /// from the desired state once `ShouldPodRuntimeBeRemoved`
     /// (`pod_workers.go:698`) holds (`findAndRemoveDeletedPods`,
     /// `desired_state_of_world_populator.go:200-247`), so the reconciler
-    /// unmounts them as for a deleted pod. The staged device is released by
+    /// unmounts them as for a deleted pod. The staged CSI device is released by
     /// [`Self::unmount_unused_csi_devices`], after this.
-    pub async fn unmount_csi_volumes(
+    pub async fn unmount_orphaned_volumes(
         &self,
         live_pod_uids: &std::collections::HashSet<String>,
         terminated_pod_uids: &std::collections::HashSet<String>,
@@ -416,24 +431,34 @@ impl VolumeManager {
             if live_pod_uids.contains(&uid) && !terminated_pod_uids.contains(&uid) {
                 continue;
             }
-            let csi_dir = crate::pod_dirs::get_pod_volumes_dir(root, &uid).join(
-                crate::pod_dirs::escape_qualified_name(crate::pod_dirs::plugin::CSI),
-            );
-            let Ok(entries) = std::fs::read_dir(&csi_dir) else {
-                continue;
+            let volumes = match crate::pod_dirs::get_volumes_from_pod_dir(root, &uid) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Orphaned pod {uid}: could not list its volumes: {e}");
+                    continue;
+                }
             };
-            for entry in entries.flatten() {
-                // The directory name is the escaped spec name.
-                let spec_name = entry.file_name().to_string_lossy().replace('~', "/");
-                let unmounter = match self.csi_plugin.new_unmounter(&spec_name, &uid) {
+            for volume in volumes {
+                let plugin = match self.plugin_mgr.find_plugin_by_name(&volume.plugin_name) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        debug!(
+                            "Orphaned pod {uid}: no plugin to unmount {}: {e}",
+                            volume.volume_path.display()
+                        );
+                        continue;
+                    }
+                };
+                let name = &volume.volume_spec_name;
+                let unmounter = match plugin.new_unmounter(name, &uid) {
                     Ok(u) => u,
                     Err(e) => {
-                        warn!("Orphaned pod {uid}: cannot unmount CSI volume {spec_name}: {e:#}");
+                        warn!("Orphaned pod {uid}: cannot unmount volume {name}: {e:#}");
                         continue;
                     }
                 };
                 if let Err(e) = unmounter.tear_down().await {
-                    warn!("Orphaned pod {uid}: CSI TearDown of {spec_name} failed: {e:#}");
+                    warn!("Orphaned pod {uid}: TearDown of volume {name} failed: {e:#}");
                 }
             }
         }
@@ -457,7 +482,10 @@ impl VolumeManager {
                 continue;
             };
             for entry in entries.flatten() {
-                if let Ok(rec) = self.csi_plugin.construct_volume_spec(&entry.path()) {
+                if let Ok(rec) = self.csi_plugin.construct_volume_spec(
+                    &entry.file_name().to_string_lossy(),
+                    &entry.path().to_string_lossy(),
+                ) {
                     if let Some(csi) = rec.persistent_volume.and_then(|pv| pv.spec.csi) {
                         held.insert((csi.driver, csi.volume_handle.unwrap_or_default()));
                     }
@@ -507,7 +535,7 @@ impl VolumeManager {
     /// (`pkg/kubelet/volumemanager/reconciler/reconciler_common.go:273-315`):
     /// a device is unmounted when it is not mounted for any pod
     /// (`GetUnmountedVolumes`: no pod dir still holds it, so this must run
-    /// after [`Self::unmount_csi_volumes`], which gives upstream's
+    /// after [`Self::unmount_orphaned_volumes`], which gives upstream's
     /// unpublish-before-unstage order) and the desired state does not want it
     /// (`!DesiredStateOfWorld.VolumeExists`: `desired_pods`' PVCs). Several pods
     /// sharing one staged volume therefore refcount it by presence. Failures are
@@ -734,9 +762,31 @@ impl VolumeManager {
             .and_then(|s| s.security_context.as_ref())
             .and_then(|sc| sc.fs_group)
         {
+            // configMap, secret, downwardAPI and projected volumes re-own
+            // themselves inside their own SetUp (`configmap.go:246-252`,
+            // `secret.go:242-248`, `downwardapi.go:217-223`,
+            // `projected.go:200-214`: `setPerms` -> `volume_ownership`, with
+            // upstream's `mode | roMask`); the owner->group mirror below would
+            // turn a 0644 file into 0664 and a 0600 token into 0660 (#2333,
+            // #2540).
+            let self_owning: std::collections::HashSet<&str> = pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.volumes.as_ref())
+                .into_iter()
+                .flatten()
+                .filter(|v| {
+                    v.projected.is_some()
+                        || v.secret.is_some()
+                        || v.config_map.is_some()
+                        || v.downward_api.is_some()
+                })
+                .map(|v| v.name.as_str())
+                .collect();
             let paths: Vec<std::path::PathBuf> = volume_paths
-                .values()
-                .map(std::path::PathBuf::from)
+                .iter()
+                .filter(|(name, _)| !self_owning.contains(name.as_str()))
+                .map(|(_, p)| std::path::PathBuf::from(p))
                 .collect();
             let n = paths.len();
             // Blocking recursive lchown syscalls run off the async worker so
@@ -857,6 +907,7 @@ impl VolumeManager {
                 &volume.name,
                 secret_source,
                 fetched.secret(secret_name),
+                crate::volume_plugins::util::fs_group_from(pod),
             );
         }
         // Resync configmap volumes. Re-project through the AtomicWriter
@@ -878,9 +929,11 @@ impl VolumeManager {
                         mode,
                     ) {
                         Ok(payload) => {
-                            let _ = crate::atomic_writer::write_projected_payload(
+                            let _ = crate::volume_ownership::write_payload_with_ownership(
                                 std::path::Path::new(&volume_dir),
                                 &payload,
+                                crate::volume_plugins::util::fs_group_from(pod),
+                                true,
                             );
                         }
                         Err(e) => warn!("ConfigMap {} resync: {}", cm_name, e),
@@ -888,179 +941,35 @@ impl VolumeManager {
                 }
             }
         }
-        // Resync projected volumes (may contain configmap/secret projections)
+        // Resync projected volumes: re-run the projected plugin's SetUp
+        // (`projected.go:136-224` `SetUpAt`: `collectData` then
+        // `AtomicWriter.Write`), never an in-place rewrite through the
+        // `..data` symlinks (#1656, #2390). An unchanged payload is a no-op, a
+        // changed one swaps `..data`, and a removed key is pruned by the
+        // writer. A source that cannot be collected leaves the volume
+        // untouched, as upstream's failed `SetUpAt` writes nothing.
         if let Some(projected) = &volume.projected {
-            if let Some(sources) = &projected.sources {
-                let volume_dir = self.pod_volume_dir(pod, volume);
-                // Track expected files so we can delete stale ones
-                let mut expected_files: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-
-                // Per-file permissions must survive a resync rewrite, matching
-                // the initial-mount path and upstream's atomic writer (which
-                // re-applies each file's mode on every update). A plain
-                // `fs::write` of a *new* key (added after pod start) would
-                // otherwise leave it at the umask default instead of the
-                // item's `mode` / the projection `defaultMode` (#1050).
-                let proj_default_mode = projected.default_mode.unwrap_or(0o644);
-                let apply_mode = |path: &str, mode: i32| {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            path,
-                            std::fs::Permissions::from_mode(mode as u32),
-                        );
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = (path, mode);
-                    }
-                };
-
-                for source in sources {
-                    if let Some(cm_proj) = &source.config_map {
-                        if let Some(cm_name) = &cm_proj.name {
-                            if let Some(cm) = fetched.config_map(cm_name) {
-                                if let Some(items) = &cm_proj.items {
-                                    // Selective projection — only mount specified keys
-                                    for item in items {
-                                        let file_path = format!("{}/{}", volume_dir, item.path);
-                                        expected_files.insert(file_path.clone());
-                                        if let Some(value) =
-                                            cm.data.as_ref().and_then(|d| d.get(&item.key))
-                                        {
-                                            if let Ok(existing) =
-                                                std::fs::read_to_string(&file_path)
-                                            {
-                                                if existing == *value {
-                                                    continue;
-                                                }
-                                            }
-                                            if let Some(parent) =
-                                                std::path::Path::new(&file_path).parent()
-                                            {
-                                                let _ = std::fs::create_dir_all(parent);
-                                            }
-                                            if std::fs::write(&file_path, value).is_ok() {
-                                                apply_mode(
-                                                    &file_path,
-                                                    item.mode.unwrap_or(proj_default_mode),
-                                                );
-                                            }
-                                        }
-                                    }
-                                } else if let Some(data) = &cm.data {
-                                    // Mount all keys
-                                    for (k, v) in data {
-                                        let file_path = format!("{}/{}", volume_dir, k);
-                                        expected_files.insert(file_path.clone());
-                                        if let Ok(existing) = std::fs::read_to_string(&file_path) {
-                                            if existing == *v {
-                                                continue;
-                                            }
-                                        }
-                                        if std::fs::write(&file_path, v).is_ok() {
-                                            apply_mode(&file_path, proj_default_mode);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(sec_proj) = &source.secret {
-                        if let Some(sec_name) = &sec_proj.name {
-                            if let Some(secret) = fetched.secret(sec_name) {
-                                if let Some(data) = &secret.data {
-                                    if let Some(items) = &sec_proj.items {
-                                        for item in items {
-                                            let file_path = format!("{}/{}", volume_dir, item.path);
-                                            expected_files.insert(file_path.clone());
-                                            if let Some(v) = data.get(&item.key) {
-                                                if let Ok(existing) = std::fs::read(&file_path) {
-                                                    if existing == *v {
-                                                        apply_mode(
-                                                            &file_path,
-                                                            item.mode.unwrap_or(proj_default_mode),
-                                                        );
-                                                        continue;
-                                                    }
-                                                }
-                                                if let Some(parent) =
-                                                    std::path::Path::new(&file_path).parent()
-                                                {
-                                                    let _ = std::fs::create_dir_all(parent);
-                                                }
-                                                if std::fs::write(&file_path, v).is_ok() {
-                                                    apply_mode(
-                                                        &file_path,
-                                                        item.mode.unwrap_or(proj_default_mode),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        for (k, v) in data {
-                                            let file_path = format!("{}/{}", volume_dir, k);
-                                            expected_files.insert(file_path.clone());
-                                            if let Ok(existing) = std::fs::read(&file_path) {
-                                                if existing == *v {
-                                                    apply_mode(&file_path, proj_default_mode);
-                                                    continue;
-                                                }
-                                            }
-                                            if std::fs::write(&file_path, v).is_ok() {
-                                                apply_mode(&file_path, proj_default_mode);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // ServiceAccountToken projection resync — preserve the token file
-                    if let Some(sa_token) = &source.service_account_token {
-                        let file_path = format!("{}/{}", volume_dir, sa_token.path);
-                        expected_files.insert(file_path);
-                    }
-                    // DownwardAPI projection resync
-                    if let Some(downward_api) = &source.downward_api {
-                        if let Some(items) = &downward_api.items {
-                            for item in items {
-                                let file_path = format!("{}/{}", volume_dir, item.path);
-                                expected_files.insert(file_path.clone());
-                                let value = if let Some(ref field_ref) = item.field_ref {
-                                    self.get_pod_field_value(pod, &field_ref.field_path)
-                                        .unwrap_or_default()
-                                } else if let Some(ref resource_ref) = item.resource_field_ref {
-                                    self.get_container_resource_value(pod, resource_ref)
-                                        .unwrap_or_default()
-                                } else {
-                                    String::new()
-                                };
-                                if let Ok(existing) = std::fs::read_to_string(&file_path) {
-                                    if existing == value {
-                                        continue;
-                                    }
-                                }
-                                let _ = std::fs::write(&file_path, &value);
-                            }
-                        }
+            let volume_dir = self.pod_volume_dir(pod, volume);
+            let dir = std::path::Path::new(&volume_dir);
+            match crate::volume_plugins::projected::resync_payload(
+                projected,
+                pod,
+                &self.node_allocatable,
+                dir,
+                |n| fetched.secret(n),
+                |n| fetched.config_map(n),
+                |i| fetched.trust_anchors(i),
+            ) {
+                Ok(payload) => {
+                    if let Err(e) = crate::volume_plugins::projected::write_payload(
+                        dir,
+                        &payload,
+                        crate::volume_plugins::util::fs_group_from(pod),
+                    ) {
+                        warn!("projected volume {} resync: {}", volume.name, e);
                     }
                 }
-
-                // Delete stale files that are no longer in any projection source
-                if let Ok(entries) = std::fs::read_dir(&volume_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file() {
-                            let path_str = path.to_string_lossy().to_string();
-                            if !expected_files.contains(&path_str) {
-                                let _ = std::fs::remove_file(&path);
-                            }
-                        }
-                    }
-                }
+                Err(e) => warn!("projected volume {} resync: {}", volume.name, e),
             }
         }
         // Resync standalone downwardAPI volumes: re-project through the
@@ -1077,9 +986,11 @@ impl VolumeManager {
                 mode,
             ) {
                 Ok(payload) => {
-                    let _ = crate::atomic_writer::write_projected_payload(
+                    let _ = crate::volume_ownership::write_payload_with_ownership(
                         std::path::Path::new(&volume_dir),
                         &payload,
+                        crate::volume_plugins::util::fs_group_from(pod),
+                        true,
                     );
                 }
                 Err(e) => warn!("downwardAPI volume {} resync: {}", volume.name, e),
@@ -1108,6 +1019,7 @@ impl VolumeManager {
         volume_name: &str,
         source: &rusternetes_common::resources::SecretVolumeSource,
         fetched: Option<&rusternetes_common::resources::Secret>,
+        fs_group: Option<i64>,
     ) {
         let Some(secret_name) = source.secret_name.as_ref() else {
             return;
@@ -1159,6 +1071,7 @@ impl VolumeManager {
                     payload.insert(
                         "ca.crt".to_string(),
                         FileProjection {
+                            fs_user: None,
                             data: existing,
                             mode,
                         },
@@ -1167,9 +1080,11 @@ impl VolumeManager {
             }
         }
 
-        if let Err(e) = crate::atomic_writer::write_projected_payload(
+        if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
             std::path::Path::new(volume_dir),
             &payload,
+            fs_group,
+            true,
         ) {
             warn!("Secret {} resync: {:#}", secret_name, e);
         }
@@ -1475,6 +1390,7 @@ impl VolumeManager {
                     &volume.name,
                     secret_source,
                     fetched.secret(secret_name),
+                    crate::volume_plugins::util::fs_group_from(pod),
                 );
             }
 
@@ -1504,9 +1420,11 @@ impl VolumeManager {
                             mode,
                         ) {
                             Ok(payload) => {
-                                let _ = crate::atomic_writer::write_projected_payload(
+                                let _ = crate::volume_ownership::write_payload_with_ownership(
                                     std::path::Path::new(&volume_dir),
                                     &payload,
+                                    crate::volume_plugins::util::fs_group_from(pod),
+                                    true,
                                 );
                             }
                             Err(e) => warn!("ConfigMap {} refresh: {}", cm_name, e),
@@ -1528,48 +1446,6 @@ impl VolumeManager {
         }
         Ok(())
     }
-
-    /// Get a pod field value for DownwardAPI
-    /// Resolve a downwardAPI/projected volume item's `fieldRef` to the string
-    /// written into the volume file.
-    ///
-    /// Delegates to [`crate::downward_api::resolve_pod_field`] so the volume and
-    /// env-var paths render `metadata.labels['x']`, `status.podIP` and friends
-    /// identically. The hand-rolled copy this replaced was a near-duplicate that
-    /// had drifted: it hardcoded the bracket-key offsets (`&path[17..]`, so only
-    /// single quotes parsed) where the shared helper accepts the double-quoted
-    /// and unquoted forms the API allows too.
-    pub(crate) fn get_pod_field_value(&self, pod: &Pod, field_path: &str) -> Result<String> {
-        crate::downward_api::resolve_pod_field(pod, field_path).map_err(|e| anyhow::anyhow!("{e}"))
-    }
-
-    /// Resolve a downwardAPI/projected volume item's `resourceFieldRef` to the
-    /// string written into the volume file.
-    ///
-    /// Delegates to [`crate::downward_api::resolve_container_resource`], the port
-    /// of upstream `ExtractResourceValueByContainerNameAndNodeAllocatable`, which
-    /// is exactly what `pkg/volume/downwardapi/downwardapi.go:266` calls. The env
-    /// var path ([`crate::cri_runtime::translate`]) resolves the same selectors
-    /// through the same function, so a `resourceFieldRef` cannot render one value
-    /// as a file and a different one as an environment variable.
-    ///
-    /// This used to be a second, hand-rolled copy that (a) fell back to a
-    /// hardcoded 4 cores / 8 GiB instead of consulting the node's allocatable —
-    /// which reported `limits.ephemeral-storage` as 8 GiB on a node advertising
-    /// 100 GiB — (b) never searched init containers, and (c) had no
-    /// requests-default-to-limits fallback.
-    pub(crate) fn get_container_resource_value(
-        &self,
-        pod: &Pod,
-        resource_ref: &rusternetes_common::resources::ResourceFieldSelector,
-    ) -> Result<String> {
-        crate::downward_api::resolve_container_resource(
-            pod,
-            resource_ref,
-            Some(&self.node_allocatable),
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))
-    }
 }
 
 /// Secrets and ConfigMaps a volume references, read from storage on the async
@@ -1581,6 +1457,9 @@ impl VolumeManager {
 struct FetchedSources {
     secrets: HashMap<String, rusternetes_common::resources::Secret>,
     config_maps: HashMap<String, ConfigMap>,
+    /// Trust anchors of each projected `clusterTrustBundle` source, keyed by
+    /// the source's index in `projected.sources` (`projected.go:320-355`).
+    trust_anchors: HashMap<usize, std::result::Result<Vec<u8>, String>>,
 }
 
 impl FetchedSources {
@@ -1599,7 +1478,13 @@ impl FetchedSources {
             cms.push(n);
         }
         if let Some(sources) = volume.projected.as_ref().and_then(|p| p.sources.as_ref()) {
-            for source in sources {
+            for (index, source) in sources.iter().enumerate() {
+                if let Some(ctb) = &source.cluster_trust_bundle {
+                    let anchors = crate::volume_plugins::projected::trust_anchors_for(storage, ctb)
+                        .await
+                        .map_err(|e| e.to_string());
+                    out.trust_anchors.insert(index, anchors);
+                }
                 if let Some(n) = source.secret.as_ref().and_then(|s| s.name.as_ref()) {
                     secrets.push(n);
                 }
@@ -1632,6 +1517,10 @@ impl FetchedSources {
 
     fn config_map(&self, name: &str) -> Option<&ConfigMap> {
         self.config_maps.get(name)
+    }
+
+    fn trust_anchors(&self, index: usize) -> Option<&std::result::Result<Vec<u8>, String>> {
+        self.trust_anchors.get(&index)
     }
 }
 
@@ -1989,6 +1878,129 @@ mod projected_mode_tests {
             "hunter2",
         )
         .await;
+    }
+
+    /// #2390: the projected branch of `resync_volumes` must re-project through
+    /// the AtomicWriter like the initial mount (`projected.go:208-221`) --
+    /// never write through the `..data` symlinks. Unchanged => zero fs changes
+    /// (ctime of every real file and the `..data` target untouched, bound SA
+    /// token kept); a changed source swaps `..data`; a removed key is pruned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reproject_unchanged_projected_is_a_noop() {
+        use std::os::unix::fs::MetadataExt;
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-proj"},
+            "spec": {"containers": [], "volumes": [{
+                "name": "proj",
+                "projected": {"defaultMode": 420, "sources": [
+                    {"configMap": {"name": "cfg"}},
+                    {"secret": {"name": "sec", "items": [{"key": "password", "path": "pw", "mode": 256}]}},
+                    {"downwardAPI": {"items": [{"path": "podname", "fieldRef": {"fieldPath": "metadata.name"}}]}},
+                    {"serviceAccountToken": {"path": "token", "expirationSeconds": 3600}}
+                ]}
+            }]}
+        }))
+        .unwrap();
+        let tmp = std::env::temp_dir().join(format!("rn-proj-noop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let storage = Arc::new(StorageBackend::new_memory());
+        let cm = ConfigMap::new("cfg", "default").with_data(HashMap::from([
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("configmaps", Some("default"), "cfg"),
+            &cm,
+        )
+        .await
+        .unwrap();
+        let secret = Secret::new("sec", "default").with_data(HashMap::from([(
+            "password".to_string(),
+            b"hunter2".to_vec(),
+        )]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("secrets", Some("default"), "sec"),
+            &secret,
+        )
+        .await
+        .unwrap();
+        let vm = VolumeManager::new(
+            tmp.to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        vm.create_pod_volumes(&pod).await.unwrap();
+        let dir = crate::pod_dirs::get_pod_volume_dir(
+            &tmp.to_string_lossy(),
+            "uid-proj",
+            crate::pod_dirs::plugin::PROJECTED,
+            "proj",
+        );
+        let files = ["a", "b", "pw", "podname", "token"];
+        let snapshot = |dir: &std::path::Path| -> Vec<(i64, i64, u32)> {
+            files
+                .iter()
+                .map(|f| {
+                    let real = std::fs::canonicalize(dir.join(f)).unwrap();
+                    let m = std::fs::metadata(&real).unwrap();
+                    (m.ctime(), m.ctime_nsec(), m.permissions().mode() & 0o777)
+                })
+                .collect()
+        };
+        for f in files {
+            assert!(
+                std::fs::symlink_metadata(dir.join(f))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{f} must be an AtomicWriter symlink after the initial mount"
+            );
+        }
+        let before = snapshot(&dir);
+        let link_before = std::fs::read_link(dir.join("..data")).unwrap();
+        let token_before = std::fs::read(dir.join("token")).unwrap();
+        for _ in 0..3 {
+            vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        }
+        assert_eq!(
+            before,
+            snapshot(&dir),
+            "unchanged resync must not touch any file"
+        );
+        assert_eq!(link_before, std::fs::read_link(dir.join("..data")).unwrap());
+        assert_eq!(std::fs::read(dir.join("token")).unwrap(), token_before);
+        assert_eq!(
+            std::fs::metadata(dir.join("pw"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400,
+            "items[].mode is kept"
+        );
+
+        // A changed ConfigMap key swaps `..data`; the removed key `b` is
+        // pruned; the bound token and the other sources survive.
+        let cm2 = ConfigMap::new("cfg", "default")
+            .with_data(HashMap::from([("a".to_string(), "changed".to_string())]));
+        Storage::update(
+            storage.as_ref(),
+            &build_key("configmaps", Some("default"), "cfg"),
+            &cm2,
+        )
+        .await
+        .unwrap();
+        vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        assert_ne!(link_before, std::fs::read_link(dir.join("..data")).unwrap());
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "changed");
+        assert!(std::fs::symlink_metadata(dir.join("b")).is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("pw")).unwrap(), "hunter2");
+        assert_eq!(std::fs::read_to_string(dir.join("podname")).unwrap(), "p");
+        assert_eq!(std::fs::read(dir.join("token")).unwrap(), token_before);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// #1656: a service-account-token Secret volume must not have its bound
@@ -2589,6 +2601,126 @@ mod projected_mode_tests {
             "timestamp dir is 0755 (atomic_writer.go:399-408)"
         );
     }
+
+    /// With a pod `fsGroup`, a projected file written 0600 ends up 0640
+    /// (`volume_linux.go:171-175`: `mode | roMask` for the projected volume's
+    /// `GetAttributes().ReadOnly`) -- NOT 0660, which the generic owner->group
+    /// mirror in `create_pod_volumes` would produce. The projected plugin owns
+    /// its ownership step (`projected.go:200-214`), so the post-pass must skip
+    /// it (#2333).
+    #[tokio::test]
+    async fn create_pod_volumes_projected_fs_group_is_ro_mask_not_mirror() {
+        use std::os::unix::fs::MetadataExt;
+        let storage = Arc::new(StorageBackend::new_memory());
+        let secret = Secret::new("sec", "default").with_data(HashMap::from([(
+            "password".to_string(),
+            b"hunter2".to_vec(),
+        )]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("secrets", Some("default"), "sec"),
+            &secret,
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let probe = tmp.path().join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        let gid = std::fs::metadata(&probe).unwrap().gid();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {
+                "securityContext": {"fsGroup": gid},
+                "containers": [],
+                "volumes": [{
+                    "name": "proj",
+                    "projected": {"defaultMode": 384, "sources": [
+                        {"secret": {"name": "sec"}}
+                    ]}
+                }]
+            }
+        }))
+        .unwrap();
+        let paths = vm.create_pod_volumes(&pod).await.unwrap();
+        let file = std::path::Path::new(&paths["proj"]).join("password");
+        let meta = std::fs::metadata(&file).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o640);
+        assert_eq!(meta.gid(), gid);
+    }
+
+    /// configMap, secret and downwardAPI volumes with a pod `fsGroup` get
+    /// `chmod(mode | roMask)` (`volume_linux.go:171-175`; each reports
+    /// `ReadOnly: true`, `configmap.go:160`, `secret.go:166`,
+    /// `downwardapi.go:156`), run from their own AtomicWriter `setPerms`
+    /// (`configmap.go:246-252`, `secret.go:242-248`, `downwardapi.go:217-223`).
+    /// A 0644 file stays 0644 (the owner->group mirror made it 0664) and a 0600
+    /// file becomes 0640 (#2540).
+    #[tokio::test]
+    async fn create_pod_volumes_fs_group_is_ro_mask_for_cm_secret_downward_api() {
+        use rusternetes_common::resources::ConfigMap;
+        use std::os::unix::fs::MetadataExt;
+        let storage = Arc::new(StorageBackend::new_memory());
+        let secret = Secret::new("sec", "default")
+            .with_data(HashMap::from([("k".to_string(), b"v".to_vec())]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("secrets", Some("default"), "sec"),
+            &secret,
+        )
+        .await
+        .unwrap();
+        let cm: ConfigMap = serde_json::from_value(json!({
+            "metadata": {"name": "cm", "namespace": "default"},
+            "data": {"k": "v"}
+        }))
+        .unwrap();
+        Storage::create(
+            storage.as_ref(),
+            &build_key("configmaps", Some("default"), "cm"),
+            &cm,
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let probe = tmp.path().join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        let gid = std::fs::metadata(&probe).unwrap().gid();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1",
+                         "labels": {"a": "b"}},
+            "spec": {
+                "securityContext": {"fsGroup": gid},
+                "containers": [],
+                "volumes": [
+                    {"name": "cm", "configMap": {"name": "cm"}},
+                    {"name": "sec", "secret": {"secretName": "sec", "defaultMode": 384}},
+                    {"name": "da", "downwardAPI": {"items": [
+                        {"path": "labels", "fieldRef": {"fieldPath": "metadata.labels"}}
+                    ]}}
+                ]
+            }
+        }))
+        .unwrap();
+        let paths = vm.create_pod_volumes(&pod).await.unwrap();
+        let check = |vol: &str, file: &str, want: u32| {
+            let meta = std::fs::metadata(std::path::Path::new(&paths[vol]).join(file)).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, want, "{vol}/{file}");
+            assert_eq!(meta.gid(), gid, "{vol}/{file} gid");
+        };
+        check("cm", "k", 0o644);
+        check("da", "labels", 0o644);
+        check("sec", "k", 0o640);
+    }
 }
 
 /// Orphaned pod directory sweep — port of `cleanupOrphanedPodDirs`
@@ -2624,6 +2756,98 @@ mod orphan_sweep_tests {
         );
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Lay down a non-empty volume of `plugin`, as a running pod leaves it.
+    fn seed_filled_volume(root: &str, uid: &str, plugin: &str, volume: &str) -> std::path::PathBuf {
+        let dir = crate::pod_dirs::get_pod_volume_dir(root, uid, plugin, volume);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/data"), "x").unwrap();
+        dir
+    }
+
+    /// The gap this slice closes: `removeOrphanedPodVolumeDirs` `rmdir`s each
+    /// volume (`kubelet_volumes.go:119-165`), which fails on a volume that
+    /// still holds files, so a pod whose emptyDir was written to leaked its
+    /// directory forever — upstream relies on the reconciler's `TearDown`
+    /// having emptied it first.
+    #[test]
+    fn the_sweep_alone_cannot_remove_a_volume_that_holds_files() {
+        let root = tmp("filled-sweep-only");
+        seed_filled_volume(
+            &root,
+            "uid-gone",
+            crate::pod_dirs::plugin::EMPTY_DIR,
+            "scratch",
+        );
+
+        vm(&root).cleanup_orphaned_pod_dirs(&HashSet::new());
+
+        assert!(crate::pod_dirs::get_pod_dir(&root, "uid-gone").exists());
+    }
+
+    /// `unmountVolumes` -> `NewUnmounter` -> `TearDown`, then the sweep.
+    #[tokio::test]
+    async fn teardown_then_sweep_reaps_every_non_csi_volume_kind() {
+        let root = tmp("filled-teardown");
+        use crate::pod_dirs::plugin;
+        for (p, v) in [
+            (plugin::EMPTY_DIR, "scratch"),
+            (plugin::CONFIG_MAP, "cfg"),
+            (plugin::SECRET, "sec"),
+            (plugin::DOWNWARD_API, "dapi"),
+            (plugin::PROJECTED, "proj"),
+        ] {
+            seed_filled_volume(&root, "uid-gone", p, v);
+        }
+        // A live pod's identical volumes must not be touched.
+        let live_dir = seed_filled_volume(&root, "uid-live", plugin::EMPTY_DIR, "scratch");
+        let live: HashSet<String> = ["uid-live".to_string()].into_iter().collect();
+
+        let vm = vm(&root);
+        vm.unmount_orphaned_volumes(&live, &HashSet::new()).await;
+        vm.cleanup_orphaned_pod_dirs(&live);
+
+        assert!(
+            !crate::pod_dirs::get_pod_dir(&root, "uid-gone").exists(),
+            "the orphan's directory must be reaped once its volumes are torn down"
+        );
+        assert!(live_dir.join("sub/data").exists(), "live pod untouched");
+    }
+
+    /// A pod still in the API but terminated no longer wants its volumes
+    /// (`ShouldPodRuntimeBeRemoved`), so they are torn down as for a deleted
+    /// pod.
+    #[tokio::test]
+    async fn a_terminated_pods_volumes_are_torn_down() {
+        let root = tmp("filled-terminated");
+        let dir = seed_filled_volume(
+            &root,
+            "uid-done",
+            crate::pod_dirs::plugin::EMPTY_DIR,
+            "scratch",
+        );
+        let uids: HashSet<String> = ["uid-done".to_string()].into_iter().collect();
+
+        vm(&root).unmount_orphaned_volumes(&uids, &uids).await;
+
+        assert!(!dir.exists());
+    }
+
+    /// A hostPath volume's `TearDown` does nothing (`host_path.go:272-274`),
+    /// and a directory no plugin owns is left for the sweep.
+    #[tokio::test]
+    async fn host_path_and_unowned_dirs_are_left_alone_by_teardown() {
+        let root = tmp("hostpath-unowned");
+        let hp = seed_filled_volume(&root, "uid-gone", crate::pod_dirs::plugin::HOST_PATH, "hp");
+        let other = seed_filled_volume(&root, "uid-gone", crate::pod_dirs::UNSUPPORTED_PLUGIN, "x");
+
+        vm(&root)
+            .unmount_orphaned_volumes(&HashSet::new(), &HashSet::new())
+            .await;
+
+        assert!(hp.join("sub/data").exists());
+        assert!(other.join("sub/data").exists());
     }
 
     #[test]

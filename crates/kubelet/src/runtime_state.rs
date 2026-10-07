@@ -7,8 +7,12 @@
 //! `NetworkReady` conditions (kuberuntime_manager.go:424-433,
 //! `toKubeRuntimeStatus` in kuberuntime/helpers.go:231).
 //!
-//! Deliberately not ported: storageError (nothing sets it upstream outside
-//! tests), health checks (`addHealthCheck`, used only by the PLEG), the
+//! `storageError` (runtime.go:35,99-103,148-157) is set through
+//! [`RuntimeState::set_storage_state`] by the CSI plugin's `initializeCSINode`
+//! (pkg/volume/csi/csi_plugin.go:374,398,404 via `kubeletVolumeHost.SetKubeletError`,
+//! pkg/kubelet/volume_host.go:122).
+//!
+//! Deliberately not ported: health checks (`addHealthCheck`, used only by the PLEG), the
 //! container-manager soft requirements and shutdown-manager errors.
 
 use std::sync::Mutex;
@@ -34,6 +38,7 @@ struct Inner {
     base_runtime_sync_threshold: Duration,
     network_error: Option<String>,
     runtime_error: Option<String>,
+    storage_error: Option<String>,
 }
 
 /// Mirrors upstream `runtimeState`.
@@ -47,6 +52,7 @@ impl RuntimeState {
             base_runtime_sync_threshold: threshold,
             network_error: Some(ERR_NETWORK_UNKNOWN.to_string()),
             runtime_error: None,
+            storage_error: None,
         }))
     }
 
@@ -74,6 +80,24 @@ impl RuntimeState {
                 .lock()
                 .unwrap()
                 .network_error
+                .iter()
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// `setStorageState` (runtime.go:99-103).
+    pub fn set_storage_state(&self, err: Option<String>) {
+        self.0.lock().unwrap().storage_error = err;
+    }
+
+    /// `storageErrors` (runtime.go:148-157).
+    pub fn storage_errors(&self) -> Option<String> {
+        aggregate(
+            self.0
+                .lock()
+                .unwrap()
+                .storage_error
                 .iter()
                 .cloned()
                 .collect(),
@@ -271,6 +295,21 @@ mod tests {
             s.network_errors().as_deref(),
             Some("container runtime network not ready: NetworkReady=false reason:NetworkPluginNotReady message:no cni config")
         );
+    }
+
+    /// `kubeletVolumeHost.SetKubeletError` -> `setStorageState`
+    /// (volume_host.go:122): a set error is reported, `nil` clears it.
+    #[test]
+    fn storage_state_sets_and_clears() {
+        let s = RuntimeState::new(MAX_WAIT_FOR_CONTAINER_RUNTIME);
+        assert_eq!(s.storage_errors(), None);
+        s.set_storage_state(Some("CSINode is not yet initialized".into()));
+        assert_eq!(
+            s.storage_errors().as_deref(),
+            Some("CSINode is not yet initialized")
+        );
+        s.set_storage_state(None);
+        assert_eq!(s.storage_errors(), None);
     }
 
     #[test]

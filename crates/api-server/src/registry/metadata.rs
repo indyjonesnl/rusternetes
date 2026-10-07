@@ -390,6 +390,26 @@ impl HasMetadata for rusternetes_common::resources::ValidatingAdmissionPolicyBin
     }
 }
 
+impl HasMetadata for rusternetes_common::resources::ClusterTrustBundle {
+    fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+        &mut self.metadata
+    }
+}
+
+impl HasMetadata for rusternetes_common::resources::podcertificaterequest::PodCertificateRequest {
+    fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+        &mut self.metadata
+    }
+}
+
 impl HasMetadata for rusternetes_common::resources::CertificateSigningRequest {
     fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
         &self.metadata

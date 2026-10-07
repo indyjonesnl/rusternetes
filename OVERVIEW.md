@@ -58,7 +58,7 @@ native Rust binaries:
 | **API server** | `api-server` | Axum HTTPS server: the full REST + Watch API, RBAC, admission webhooks, CRDs, Server-Side Apply, and the embedded web console |
 | **Scheduler** | `scheduler` | Filter/score plugin scheduling: affinity, taints/tolerations, priority/preemption, topology spread |
 | **Controller manager** | `controller-manager` | 31 reconciliation control loops (Deployment, ReplicaSet, Job, Endpoints, PV binding, HPA, GC, …) |
-| **Kubelet** | `kubelet` | Pod lifecycle via CRI (CRI v1 gRPC → containerd → Youki): probes, volumes, init/sidecar containers, exec/attach |
+| **Kubelet** | `kubelet` | Pod lifecycle via CRI (CRI v1 gRPC → containerd → crun): probes, volumes, init/sidecar containers, exec/attach |
 | **Kube-proxy** | `kube-proxy` | iptables service routing (ClusterIP / NodePort / LoadBalancer) in host-network mode |
 | **DNS** | `dns` | Cluster DNS for Services and Pods |
 | **kubectl** | `kubectl` | A from-scratch `kubectl` CLI |

@@ -77,7 +77,7 @@ rusternetes/
     storage/               # Storage trait, etcd/SQLite/Redis (rhino) + in-memory backends
     controller-manager/    # 31 controllers in src/controllers/
     scheduler/             # Filter/Score plugin architecture
-    kubelet/               # Node agent, CRI runtime (containerd + Youki), CNI framework
+    kubelet/               # Node agent, CRI runtime (containerd + crun), CNI framework
     kube-proxy/            # iptables service routing, host network mode
     kubectl/               # CLI tool (get, create, apply, delete, logs, exec, ...)
     cloud-providers/       # AWS/GCP/Azure integrations
@@ -237,7 +237,7 @@ pub struct FooController<S: Storage> {
 
 ### kubelet
 
-Node agent managing the full pod lifecycle via the Container Runtime Interface (CRI v1, gRPC) to containerd, which runs containers with Youki (a Rust OCI runtime). The CRI endpoint comes from `CONTAINER_RUNTIME_ENDPOINT` (default `unix:///run/containerd/containerd.sock`).
+Node agent managing the full pod lifecycle via the Container Runtime Interface (CRI v1, gRPC) to containerd, which runs containers with crun (a C OCI runtime). The CRI endpoint comes from `CONTAINER_RUNTIME_ENDPOINT` (default `unix:///run/containerd/containerd.sock`).
 
 **Container model:** Each pod starts a pause container first. Application
 containers join the pause container's network namespace via `container:pause`

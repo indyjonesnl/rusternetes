@@ -1,6 +1,6 @@
 pub mod atomic_writer;
+pub mod clustertrustbundle;
 #[allow(dead_code)]
-pub mod cni;
 pub mod config;
 pub mod cri_runtime;
 pub mod downward_api;
@@ -25,6 +25,7 @@ pub mod static_pods;
 pub mod sync_locks;
 pub mod sysctl;
 pub mod volume_manager;
+pub mod volume_ownership;
 pub mod volume_plugins;
 pub mod volumes;
 

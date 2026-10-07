@@ -25,16 +25,26 @@ const NEW_DATA_DIR: &str = "..data_tmp";
 
 /// One projected file: its bytes and **its own** mode.
 ///
-/// Port of upstream `FileProjection` (`pkg/volume/util/atomic_writer.go:64-68`,
-/// minus `FsUser`, which we do not plumb yet). The mode is per file because a
+/// Port of upstream `FileProjection` (`pkg/volume/util/atomic_writer.go:64-68`).
+/// The mode is per file because a
 /// ConfigMap/Secret volume may set `items[].mode` on individual keys while the
 /// rest of the volume keeps `defaultMode` — collapsing it to one mode for the
 /// whole volume makes `items[].mode` unrepresentable.
+///
+/// `fs_user` is upstream's `FsUser *int64` (`:67`): when set, the file is
+/// chowned to it after the chmod (`:444-450`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileProjection {
     pub data: Vec<u8>,
     pub mode: u32,
+    pub fs_user: Option<i64>,
 }
+
+/// Upstream's `setPerms func(subPath string) error` argument to
+/// `AtomicWriter.Write` (`atomic_writer.go:155`). It receives the volume's
+/// target dir (the projected plugin's callback re-owns the whole volume, not
+/// only the new timestamp dir — `projected.go:200-206`).
+pub type SetPerms<'a> = &'a dyn Fn(&Path) -> io::Result<()>;
 
 /// Project `payload` (relative user-visible path -> [`FileProjection`]) into
 /// `target_dir`, atomically and idempotently, applying each entry's own mode.
@@ -46,9 +56,22 @@ pub struct FileProjection {
 /// No-op (no writes, no chmod, no symlink swap) when the on-disk `..data`
 /// payload already equals `payload` — the property that keeps kube-proxy and
 /// other config-file watchers stable across the kubelet's periodic re-SetUp.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn write_projected_payload(
     target_dir: &Path,
     payload: &BTreeMap<String, FileProjection>,
+) -> io::Result<()> {
+    write_projected_payload_with(target_dir, payload, None)
+}
+
+/// [`write_projected_payload`] with upstream's `setPerms` hook
+/// (`atomic_writer.go:100-125` step 7, `:196-201`): called after the payload is
+/// written to the new timestamp dir and before `..data` is swapped to it, only
+/// when a write happens; its error aborts the write.
+pub fn write_projected_payload_with(
+    target_dir: &Path,
+    payload: &BTreeMap<String, FileProjection>,
+    set_perms: Option<SetPerms<'_>>,
 ) -> io::Result<()> {
     std::fs::create_dir_all(target_dir)?;
     let data_link = target_dir.join(DATA_DIR);
@@ -80,6 +103,22 @@ pub fn write_projected_payload(
             // Per-file mode: `items[].mode` when the volume set one for this
             // key, else the volume's defaultMode (upstream FileProjection.Mode).
             std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(projection.mode))?;
+            // `FsUser` (`atomic_writer.go:444-450`): chown(fsUser, -1).
+            if let Some(uid) = projection.fs_user {
+                rustix::fs::chownat(
+                    rustix::fs::CWD,
+                    &dest,
+                    Some(rustix::fs::Uid::from_raw(uid as u32)),
+                    None,
+                    rustix::fs::AtFlags::empty(),
+                )
+                .map_err(io::Error::from)?;
+            }
+        }
+
+        // (7) `setPerms` (`atomic_writer.go:196-201`).
+        if let Some(set_perms) = set_perms {
+            set_perms(target_dir)?;
         }
 
         // Atomically point `..data` at the new ts dir: create `..data_tmp`
@@ -191,6 +230,7 @@ mod tests {
                 (
                     k.to_string(),
                     FileProjection {
+                        fs_user: None,
                         data: v.to_vec(),
                         mode: 0o644,
                     },
@@ -225,6 +265,7 @@ mod tests {
         projections.insert(
             "path/to/data-2".to_string(),
             FileProjection {
+                fs_user: None,
                 data: b"value-2\n".to_vec(),
                 mode: 0o400,
             },
@@ -232,6 +273,7 @@ mod tests {
         projections.insert(
             "plain".to_string(),
             FileProjection {
+                fs_user: None,
                 data: b"value-1\n".to_vec(),
                 mode: 0o644,
             },
@@ -378,6 +420,71 @@ mod tests {
         assert_eq!(std::fs::read(&visible).unwrap(), b"hello=changed\n");
         assert_ne!(std::fs::read_link(dir.join("..data")).unwrap(), data_link2);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `AtomicWriter.Write(payload, setPerms)` step (7)
+    /// (`pkg/volume/util/atomic_writer.go:100-125`, `:196-201`): `setPerms` runs
+    /// after the payload is written and BEFORE `..data` is swapped to it, and
+    /// only when a write actually happens — an unchanged re-projection does not
+    /// call it (so the ownership walk never touches an inert volume, #2390).
+    #[test]
+    fn set_perms_runs_before_data_swap_and_only_on_write() {
+        let dir = std::env::temp_dir().join(format!("aw-setperms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = payload(&[("a", b"1")]);
+        let calls = std::cell::Cell::new(0);
+        let saw_data = std::cell::Cell::new(true);
+        let hook = |target: &Path| -> io::Result<()> {
+            calls.set(calls.get() + 1);
+            saw_data.set(target.join("..data").exists());
+            Ok(())
+        };
+        write_projected_payload_with(&dir, &p, Some(&hook)).unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(!saw_data.get(), "setPerms runs before ..data exists");
+        write_projected_payload_with(&dir, &p, Some(&hook)).unwrap();
+        assert_eq!(
+            calls.get(),
+            1,
+            "an unchanged payload must not call setPerms"
+        );
+        let p2 = payload(&[("a", b"2")]);
+        write_projected_payload_with(&dir, &p2, Some(&hook)).unwrap();
+        assert_eq!(calls.get(), 2);
+        // A setPerms error aborts the write (`atomic_writer.go:197-200`).
+        let p3 = payload(&[("a", b"3")]);
+        let failing = |_: &Path| -> io::Result<()> { Err(io::Error::other("boom")) };
+        assert!(write_projected_payload_with(&dir, &p3, Some(&failing)).is_err());
+        assert_eq!(std::fs::read(dir.join("a")).unwrap(), b"2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `FileProjection.FsUser` (`atomic_writer.go:67`, applied `:444-450`): the
+    /// file is chowned to FsUser after the chmod. Chowning to the process's own
+    /// uid is permitted without root, so the syscall path is exercised
+    /// hermetically.
+    #[test]
+    fn fs_user_chowns_the_projected_file() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("aw-fsuser-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let uid = std::fs::metadata(&dir).unwrap().uid();
+        let mut p = payload(&[("a", b"1")]);
+        p.get_mut("a").unwrap().fs_user = Some(uid as i64);
+        write_projected_payload(&dir, &p).unwrap();
+        assert_eq!(std::fs::metadata(dir.join("a")).unwrap().uid(), uid);
+        // A chown that cannot succeed is an error, not swallowed
+        // (`atomic_writer.go:448-451`); only assertable when not root.
+        if uid != 0 {
+            let mut bad = payload(&[("b", b"1")]);
+            bad.get_mut("b").unwrap().fs_user = Some(0);
+            let dir2 = std::env::temp_dir().join(format!("aw-fsuser2-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir2);
+            assert!(write_projected_payload(&dir2, &bad).is_err());
+            let _ = std::fs::remove_dir_all(&dir2);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

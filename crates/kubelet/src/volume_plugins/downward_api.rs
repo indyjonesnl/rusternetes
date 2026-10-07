@@ -70,7 +70,38 @@ impl VolumePlugin for DownwardApiPlugin {
             // only plugin that calls it, since only a `resourceFieldRef` needs
             // the node's allocatable to default an unset limit.
             node_allocatable: self.host.get_node_allocatable().clone(),
+            fs_group: crate::volume_plugins::util::fs_group_from(pod),
         }))
+    }
+
+    /// `NewUnmounter` (`downwardapi.go:110-131`): the wrapper plugins share one unmounter that
+    /// delegates `TearDownAt` to emptyDir (`volumeutil.UnmountViaEmptyDir`).
+    fn new_unmounter(
+        &self,
+        vol_name: &str,
+        pod_uid: &str,
+    ) -> Result<Box<dyn crate::volume_plugins::Unmounter>> {
+        Ok(Box::new(
+            crate::volume_plugins::util::WrappedEmptyDirUnmounter {
+                host: self.host.clone(),
+                plugin_name: self.name(),
+                vol_name: vol_name.to_string(),
+                pod_uid: pod_uid.to_string(),
+            },
+        ))
+    }
+
+    /// `ConstructVolumeSpec` (`downwardapi.go:110-131`): a bare `DownwardAPIVolumeSource{}`
+    /// named after the volume.
+    fn construct_volume_spec(
+        &self,
+        vol_name: &str,
+        _mount_path: &str,
+    ) -> Result<crate::volume_plugins::ReconstructedVolume> {
+        crate::volume_plugins::util::reconstructed_volume(
+            vol_name,
+            serde_json::json!({"downwardAPI": {}}),
+        )
     }
 }
 
@@ -79,6 +110,8 @@ struct DownwardApiMounter {
     volume: Volume,
     pod: Pod,
     node_allocatable: HashMap<String, String>,
+    /// `mounterArgs.FsGroup` (`volume.go:132`).
+    fs_group: Option<i64>,
 }
 
 #[async_trait]
@@ -114,17 +147,19 @@ impl Mounter for DownwardApiMounter {
         // content is unchanged, so periodic re-SetUp is inert.
         //
         // `wrapped.SetUpAt` (downwardapi.go:186): the wrapped emptyDir's
-        // `setupDir` creates the root at 0777. Its fsGroup `setPerms`
-        // (`:217-222`) is not ported (#2323 follow-up).
+        // `setupDir` creates the root at 0777. Its fsGroup ownership
+        // runs in the AtomicWriter's `setPerms` (`:217-222`) below.
         crate::volume_plugins::empty_dir::setup_dir(volume_dir)
             .context("Failed to create DownwardAPI volume directory")?;
 
         // `defer` at downwardapi.go:195-208: when the AtomicWriter fails after
         // the wrapped SetUpAt, `unmounter.TearDown()` runs and emptyDir
         // `TearDownAt` removes the volume directory (same as configMap).
-        if let Err(e) = crate::atomic_writer::write_projected_payload(
+        if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
             std::path::Path::new(volume_dir),
             &payload,
+            self.fs_group,
+            true,
         ) {
             if let Err(td) = std::fs::remove_dir_all(volume_dir) {
                 tracing::error!("Error tearing down volume {}: {}", self.volume.name, td);
@@ -186,7 +221,11 @@ pub(crate) fn collect_data(
         }
         data.insert(
             clean_path(&item.path),
-            crate::atomic_writer::FileProjection { data: bytes, mode },
+            crate::atomic_writer::FileProjection {
+                fs_user: None,
+                data: bytes,
+                mode,
+            },
         );
     }
     if errlist.is_empty() {
@@ -291,6 +330,7 @@ mod tests {
             .unwrap(),
             pod: test_pod(),
             node_allocatable: HashMap::new(),
+            fs_group: None,
         }
     }
 

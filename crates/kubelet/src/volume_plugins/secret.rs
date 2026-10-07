@@ -84,7 +84,38 @@ impl VolumePlugin for SecretPlugin {
             storage: self.host.get_kube_client().cloned(),
             volumes_base_path: self.host.get_volumes_base_path().to_string(),
             token_manager: self.host.get_service_account_token_func().clone(),
+            fs_group: crate::volume_plugins::util::fs_group_from(pod),
         }))
+    }
+
+    /// `NewUnmounter` (`secret.go:112-136`): the wrapper plugins share one unmounter that
+    /// delegates `TearDownAt` to emptyDir (`volumeutil.UnmountViaEmptyDir`).
+    fn new_unmounter(
+        &self,
+        vol_name: &str,
+        pod_uid: &str,
+    ) -> Result<Box<dyn crate::volume_plugins::Unmounter>> {
+        Ok(Box::new(
+            crate::volume_plugins::util::WrappedEmptyDirUnmounter {
+                host: self.host.clone(),
+                plugin_name: self.name(),
+                vol_name: vol_name.to_string(),
+                pod_uid: pod_uid.to_string(),
+            },
+        ))
+    }
+
+    /// `ConstructVolumeSpec` (`secret.go:112-136`): a bare `SecretVolumeSource{SecretName: volName}`
+    /// named after the volume.
+    fn construct_volume_spec(
+        &self,
+        vol_name: &str,
+        _mount_path: &str,
+    ) -> Result<crate::volume_plugins::ReconstructedVolume> {
+        crate::volume_plugins::util::reconstructed_volume(
+            vol_name,
+            serde_json::json!({"secret": {"secretName": vol_name}}),
+        )
     }
 }
 
@@ -109,6 +140,7 @@ pub(crate) fn make_payload(
                 payload.insert(
                     name.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: bytes.clone(),
                         mode: default_mode,
                     },
@@ -126,6 +158,7 @@ pub(crate) fn make_payload(
                 payload.insert(
                     ktp.path.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: content.clone(),
                         mode: ktp.mode.map(|m| m as u32).unwrap_or(default_mode),
                     },
@@ -150,6 +183,8 @@ struct SecretMounter {
     storage: Option<Arc<StorageBackend>>,
     volumes_base_path: String,
     token_manager: rusternetes_common::auth::TokenManager,
+    /// `mounterArgs.FsGroup` (`volume.go:132`).
+    fs_group: Option<i64>,
 }
 
 #[async_trait]
@@ -337,6 +372,7 @@ impl Mounter for SecretMounter {
                     payload.insert(
                         "ca.crt".to_string(),
                         FileProjection {
+                            fs_user: None,
                             data: ca_content,
                             mode: secret_default_mode as u32,
                         },
@@ -358,7 +394,7 @@ impl Mounter for SecretMounter {
         // and `MakePayload` (:166-177), so a missing Secret or bad item leaves
         // no volume behind (`TestInvalidPathSecret`, secret_test.go:365). The
         // wrapped emptyDir's `setupDir` creates the root at 0777. Its fsGroup
-        // `setPerms` (:187-193) is not ported (#2540/#2541).
+        // ownership runs in the AtomicWriter's `setPerms` (:242-247) below.
         crate::volume_plugins::empty_dir::setup_dir(volume_dir)
             .context("Failed to create Secret volume directory")?;
 
@@ -367,9 +403,11 @@ impl Mounter for SecretMounter {
         // `defer` at secret.go:183-200 runs `unmounter.TearDown()` when the
         // write fails; emptyDir `TearDownAt` removes the volume directory
         // (same as configMap/downwardAPI).
-        if let Err(e) = crate::atomic_writer::write_projected_payload(
+        if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
             std::path::Path::new(volume_dir),
             &payload,
+            self.fs_group,
+            true,
         ) {
             if let Err(td) = std::fs::remove_dir_all(volume_dir) {
                 tracing::error!("Error tearing down volume {}: {}", self.volume_name, td);

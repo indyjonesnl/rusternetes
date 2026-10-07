@@ -936,6 +936,10 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             get(handlers::discovery::get_certificates_v1_resources),
         )
         .route(
+            "/apis/certificates.k8s.io/v1beta1",
+            get(handlers::discovery::get_certificates_v1beta1_resources),
+        )
+        .route(
             "/apis/snapshot.storage.k8s.io/v1",
             get(handlers::discovery::get_snapshot_v1_resources),
         )
@@ -1870,6 +1874,31 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 .patch(handlers::admission_webhook::patch_mutating_webhook)
                 .delete(handlers::admission_webhook::delete_mutating_webhook),
         )
+        // Certificates v1beta1 API - PodCertificateRequests (namespace-scoped;
+        // 404 unless the PodCertificateRequest feature gate is on)
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/namespaces/:namespace/podcertificaterequests",
+            get(handlers::podcertificaterequest::list)
+                .post(handlers::podcertificaterequest::create)
+                .delete(handlers::podcertificaterequest::deletecollection),
+        )
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/namespaces/:namespace/podcertificaterequests/:name",
+            get(handlers::podcertificaterequest::get)
+                .put(handlers::podcertificaterequest::update)
+                .patch(handlers::podcertificaterequest::patch)
+                .delete(handlers::podcertificaterequest::delete),
+        )
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/namespaces/:namespace/podcertificaterequests/:name/status",
+            get(handlers::podcertificaterequest::get_status)
+                .put(handlers::podcertificaterequest::update_status)
+                .patch(handlers::podcertificaterequest::patch_status),
+        )
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/podcertificaterequests",
+            get(handlers::podcertificaterequest::list_all),
+        )
         // Coordination v1 API - Leases (namespace-scoped)
         .route(
             "/apis/coordination.k8s.io/v1/namespaces/:namespace/leases",
@@ -1952,6 +1981,25 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             get(handlers::certificates::get_certificate_signing_request_approval)
                 .put(handlers::certificates::approve_certificate_signing_request)
                 .patch(handlers::certificates::patch_certificate_signing_request_approval),
+        )
+        // Certificates v1beta1 API - ClusterTrustBundles (cluster-scoped;
+        // 404 unless the ClusterTrustBundle feature gate is on)
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/clustertrustbundles",
+            get(handlers::clustertrustbundle::list_clustertrustbundles)
+                .post(handlers::clustertrustbundle::create_clustertrustbundle)
+                .delete(handlers::clustertrustbundle::deletecollection_clustertrustbundles),
+        )
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/clustertrustbundles/:name",
+            get(handlers::clustertrustbundle::get_clustertrustbundle)
+                .put(handlers::clustertrustbundle::update_clustertrustbundle)
+                .patch(handlers::clustertrustbundle::patch_clustertrustbundle)
+                .delete(handlers::clustertrustbundle::delete_clustertrustbundle),
+        )
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/watch/clustertrustbundles",
+            get(handlers::watch::watch_clustertrustbundles),
         )
         // Discovery API - EndpointSlices (namespace-scoped)
         .route(

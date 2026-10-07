@@ -139,6 +139,31 @@ fn is_pod_failed(pod: &Pod, only_replace_failed_pods: bool) -> bool {
     pod.metadata.deletion_timestamp.is_some() && !matches!(phase, Some(Phase::Succeeded))
 }
 
+/// Port of `controller.IsPodActive` (pkg/controller/controller_utils.go:1085):
+/// `v1.PodSucceeded != p.Status.Phase && v1.PodFailed != p.Status.Phase &&
+/// p.DeletionTimestamp == nil`. Callers additionally match Running|Pending.
+fn is_pod_active(pod: &Pod) -> bool {
+    let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
+    !matches!(phase, Some(Phase::Succeeded) | Some(Phase::Failed))
+        && pod.metadata.deletion_timestamp.is_none()
+}
+
+/// Pods that are still Running/Pending in storage - active ones this sync just
+/// deleted gracefully plus ones already terminating. Upstream's
+/// `CountTerminatingPods` (controller_utils.go:1021) is `IsPodTerminating`
+/// (:1091): not terminal and `DeletionTimestamp != nil`; here it is taken
+/// from the pre-delete listing, so pods just stamped by this sync count too.
+fn count_unfinished_pods(pods: &[Pod]) -> i32 {
+    pods.iter()
+        .filter(|p| {
+            matches!(
+                p.status.as_ref().and_then(|s| s.phase.as_ref()),
+                Some(Phase::Running) | Some(Phase::Pending)
+            )
+        })
+        .count() as i32
+}
+
 /// Has this Job reached a terminal condition?
 fn job_is_finished(job: &Job) -> bool {
     job.status
@@ -1534,6 +1559,12 @@ impl<S: Storage + 'static> JobController<S> {
         let mut ready = 0i32;
         for pod in job_pods.iter() {
             if let Some(status) = &pod.status {
+                // `FilterActivePods` (controller_utils.go:1001): a pod with a
+                // deletionTimestamp is not active, and not counted ready either
+                // (`ready: countReadyPods(activePods)`, job_controller.go:912).
+                if !is_pod_active(pod) {
+                    continue;
+                }
                 if matches!(&status.phase, Some(Phase::Running) | Some(Phase::Pending)) {
                     active += 1;
                 }
@@ -1552,11 +1583,13 @@ impl<S: Storage + 'static> JobController<S> {
         // Handle suspended jobs: delete all active pods and set active to 0
         if job.spec.suspend.unwrap_or(false) {
             if active > 0 {
-                for pod in job_pods.iter() {
+                for pod in job_pods.iter().filter(|p| is_pod_active(p)) {
                     let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
                     if matches!(phase, Some(Phase::Running) | Some(Phase::Pending)) {
                         let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-                        let _ = self.storage.delete(&pod_key).await;
+                        // `deleteActivePods` -> `podControl.DeletePod`
+                        // (job_controller.go:1122-1140; controller_utils.go:618).
+                        let _ = self.storage.delete_gracefully(&pod_key).await;
                         info!(
                             "Suspended job {}/{}: deleted active pod {}",
                             namespace, name, pod.metadata.name
@@ -1606,31 +1639,45 @@ impl<S: Storage + 'static> JobController<S> {
                         namespace, name, elapsed, deadline
                     );
                     // Delete all active pods
-                    for pod in job_pods.iter() {
+                    for pod in job_pods.iter().filter(|p| is_pod_active(p)) {
                         let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
                         if matches!(phase, Some(Phase::Running) | Some(Phase::Pending)) {
                             let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-                            let _ = self.storage.delete(&pod_key).await;
+                            // `deleteActivePods` -> `podControl.DeletePod`
+                            // (job_controller.go:1122-1140).
+                            let _ = self.storage.delete_gracefully(&pod_key).await;
                         }
+                    }
+                    // `enactJobFinished` (job_controller.go:1520-1524): hold the
+                    // terminal Failed condition back while terminating pods
+                    // remain; only FailureTarget is published meanwhile.
+                    let terminating = count_unfinished_pods(&job_pods);
+                    let mut conditions = failed_job_conditions(
+                        "DeadlineExceeded".to_string(),
+                        format!(
+                            "Job was active longer than specified deadline of {} seconds",
+                            deadline
+                        ),
+                    );
+                    if terminating > 0 {
+                        conditions.pop(); // drop Failed, keep FailureTarget
                     }
                     job.status = Some(JobStatus {
                         active: Some(0),
                         succeeded: status_succeeded,
                         failed: status_failed,
-                        conditions: Some(failed_job_conditions(
-                            "DeadlineExceeded".to_string(),
-                            format!(
-                                "Job was active longer than specified deadline of {} seconds",
-                                deadline
-                            ),
-                        )),
+                        conditions: Some(conditions),
                         start_time: job.status.as_ref().and_then(|s| s.start_time),
                         // completionTime is valid ONLY on a Complete job
                         // (validation.go:505-513: "cannot set completionTime
                         // when there is no Complete=True condition").
                         completion_time: None,
                         ready: Some(ready),
-                        terminating: None,
+                        terminating: if terminating > 0 {
+                            Some(terminating)
+                        } else {
+                            None
+                        },
                         completed_indexes: completed_indexes.clone(),
                         failed_indexes: None,
                         uncounted_terminated_pods: uncounted_status.clone(),
@@ -1772,35 +1819,42 @@ impl<S: Storage + 'static> JobController<S> {
         if success_policy_met {
             info!("Job {}/{} met success policy criteria", namespace, name);
 
-            // Delete remaining active pods. K8s's job controller issues a real
-            // pod delete on completion (DeletePod + finalizer removal), so the
-            // pods are gone — not left lingering with a deletionTimestamp. We
-            // delete them outright so status.terminating settles at 0 on the
-            // next sync (the conformance test asserts Terminating == 0); the
-            // kubelet GCs the container once the pod disappears from the API.
-            for pod in job_pods.iter() {
+            // Delete remaining active pods through `deleteActivePods` ->
+            // `podControl.DeletePod` (job_controller.go:1002, :1122-1140;
+            // controller_utils.go:618): a GRACEFUL delete, the pod lingers with
+            // a deletionTimestamp until the kubelet and the tracking-finalizer
+            // removal reap it.
+            for pod in job_pods.iter().filter(|p| is_pod_active(p)) {
                 let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
                 if matches!(phase, Some(Phase::Running) | Some(Phase::Pending)) {
                     let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-                    let _ = self.storage.delete(&pod_key).await;
+                    let _ = self.storage.delete_gracefully(&pod_key).await;
                 }
+            }
+
+            // `enactJobFinished` (job_controller.go:1520-1524): the terminal
+            // condition is delayed while terminating pods remain, so that
+            // status.terminating == 0 holds whenever Complete is set (the
+            // conformance spec asserts it). Meanwhile only the interim
+            // SuccessCriteriaMet condition is published.
+            let terminating = count_unfinished_pods(&job_pods);
+            let mut conditions = complete_job_conditions(
+                "SuccessPolicy".to_string(),
+                "Matched rules in the SuccessPolicy".to_string(),
+            );
+            if terminating > 0 {
+                conditions.pop(); // drop Complete, keep SuccessCriteriaMet
             }
 
             job.status = Some(JobStatus {
                 active: Some(0),
                 succeeded: status_succeeded,
                 failed: status_failed,
-                conditions: Some(complete_job_conditions(
-                    "SuccessPolicy".to_string(),
-                    "Matched rules in the SuccessPolicy".to_string(),
-                )),
+                conditions: Some(conditions),
                 start_time,
-                completion_time: Some(chrono::Utc::now()),
+                completion_time: (terminating == 0).then(chrono::Utc::now),
                 ready: Some(0), // Job is complete, no ready pods
-                // K8s sets terminating to 0 when the job completes, even if pods
-                // are still being cleaned up. The job status should reflect the
-                // final state, not the transitional state.
-                terminating: Some(0),
+                terminating: Some(terminating),
                 completed_indexes: completed_indexes.clone(),
                 failed_indexes: failed_indexes.clone(),
                 uncounted_terminated_pods: uncounted_status.clone(),
@@ -1913,6 +1967,7 @@ impl<S: Storage + 'static> JobController<S> {
             for pod in fresh_job_pods.iter() {
                 if let Some(status) = &pod.status {
                     match &status.phase {
+                        Some(Phase::Running) | Some(Phase::Pending) if !is_pod_active(pod) => {}
                         Some(Phase::Running) | Some(Phase::Pending) => fresh_active += 1,
                         Some(Phase::Succeeded) => fresh_succeeded += 1,
                         _ => {}
@@ -1933,10 +1988,10 @@ impl<S: Storage + 'static> JobController<S> {
                     let mut active_or_succeeded_indexes: HashSet<i32> = HashSet::new();
                     for pod in fresh_job_pods.iter() {
                         let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
-                        if matches!(
-                            phase,
-                            Some(Phase::Running) | Some(Phase::Pending) | Some(Phase::Succeeded)
-                        ) {
+                        if (is_pod_active(pod)
+                            && matches!(phase, Some(Phase::Running) | Some(Phase::Pending)))
+                            || matches!(phase, Some(Phase::Succeeded))
+                        {
                             if let Some(idx) = get_pod_index(pod) {
                                 active_or_succeeded_indexes.insert(idx);
                             }
@@ -2067,10 +2122,11 @@ impl<S: Storage + 'static> JobController<S> {
                 active = job_pods_after
                     .iter()
                     .filter(|pod| {
-                        matches!(
-                            pod.status.as_ref().and_then(|s| s.phase.as_ref()),
-                            Some(Phase::Running) | Some(Phase::Pending)
-                        )
+                        is_pod_active(pod)
+                            && matches!(
+                                pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+                                Some(Phase::Running) | Some(Phase::Pending)
+                            )
                     })
                     .count() as i32;
             }
@@ -3679,8 +3735,7 @@ mod tests {
             .unwrap();
 
         let controller = JobController::new(storage.clone());
-        let mut job: Job = storage.get(job_key).await.unwrap();
-        controller.reconcile(&mut job).await.unwrap();
+        reconcile_settled(&controller, &storage, job_key).await;
 
         let updated_job: Job = storage.get(job_key).await.unwrap();
         let status = updated_job.status.unwrap();
@@ -3774,8 +3829,7 @@ mod tests {
         // terminating pod is still present in storage (kubelet hasn't removed
         // it yet) — status must stay settled at 0s.
         for _ in 0..2 {
-            let mut job: Job = storage.get(job_key).await.unwrap();
-            controller.reconcile(&mut job).await.unwrap();
+            reconcile_settled(&controller, &storage, job_key).await;
         }
 
         let status: JobStatus = storage.get::<Job>(job_key).await.unwrap().status.unwrap();
@@ -3858,8 +3912,7 @@ mod tests {
             .unwrap();
 
         let controller = JobController::new(storage.clone());
-        let mut job: Job = storage.get(job_key).await.unwrap();
-        controller.reconcile(&mut job).await.unwrap();
+        reconcile_settled(&controller, &storage, job_key).await;
 
         let updated_job: Job = storage.get(job_key).await.unwrap();
         let status = updated_job.status.unwrap();
@@ -4474,8 +4527,7 @@ mod tests {
         }
 
         let controller = JobController::new(storage.clone());
-        let mut job: Job = storage.get(job_key).await.unwrap();
-        controller.reconcile(&mut job).await.unwrap();
+        reconcile_settled(&controller, &storage, job_key).await;
 
         let updated_job: Job = storage.get(job_key).await.unwrap();
         let status = updated_job.status.unwrap();
@@ -4566,8 +4618,7 @@ mod tests {
         }
 
         let controller = JobController::new(storage.clone());
-        let mut job: Job = storage.get(job_key).await.unwrap();
-        controller.reconcile(&mut job).await.unwrap();
+        reconcile_settled(&controller, &storage, job_key).await;
 
         let updated_job: Job = storage.get(job_key).await.unwrap();
         let status = updated_job.status.unwrap();
@@ -4639,6 +4690,8 @@ mod tests {
             .unwrap();
 
         let controller = JobController::new(storage.clone());
+        controller.reconcile_all().await.unwrap();
+        reap_terminating(&storage).await;
         controller.reconcile_all().await.unwrap();
 
         let updated_job: Job = storage.get("/registry/jobs/default/sp-job").await.unwrap();
@@ -5360,5 +5413,209 @@ mod tests {
         for w in storage.job_writes.lock().unwrap().iter() {
             assert!(!(has_terminal(w) && uncounted_len_of(w) > 0), "{w:?}");
         }
+    }
+
+    // ---- #2465: deleteActivePods is a graceful DeletePod ----
+
+    /// Replay the kubelet: physically remove pods whose deletionTimestamp the
+    /// controller stamped with its graceful delete.
+    async fn reap_terminating(storage: &Arc<MemoryStorage>) {
+        let pods: Vec<Pod> = storage.list("/registry/pods/").await.unwrap();
+        for pod in pods
+            .iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_some())
+        {
+            let key = format!(
+                "/registry/pods/{}/{}",
+                pod.metadata.namespace.as_deref().unwrap_or("default"),
+                pod.metadata.name
+            );
+            let _ = storage.delete(&key).await;
+        }
+    }
+
+    /// Reconcile, let the kubelet reap the pods the sync deleted gracefully,
+    /// reconcile again: the terminal condition is delayed while pods are
+    /// terminating (`enactJobFinished`, job_controller.go:1520-1524).
+    async fn reconcile_settled(
+        controller: &JobController<MemoryStorage>,
+        storage: &Arc<MemoryStorage>,
+        job_key: &str,
+    ) {
+        let mut job: Job = storage.get(job_key).await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+        reap_terminating(storage).await;
+        let mut job: Job = storage.get(job_key).await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+    }
+
+    /// While a pod is still terminating the Job publishes only the interim
+    /// SuccessCriteriaMet condition and a non-zero `terminating`; Complete
+    /// follows once the pod is gone (job_controller.go:1520-1524).
+    #[tokio::test]
+    async fn test_success_policy_complete_is_delayed_while_pods_terminate() {
+        let mut job = make_job("dly", "default", 5, 2);
+        job.spec.completion_mode = Some("Indexed".to_string());
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [{ "succeededIndexes": "0" }]
+            }))
+            .unwrap(),
+        );
+        let storage = Arc::new(MemoryStorage::new());
+        let job_key = "/registry/jobs/default/dly";
+        storage.create(job_key, &job).await.unwrap();
+        for (n, phase, idx) in [("p0", Phase::Succeeded, 0), ("p2", Phase::Running, 2)] {
+            let pod = make_indexed_pod(n, "default", phase, "dly", "job-uid-1", idx);
+            storage
+                .create(&format!("/registry/pods/default/{n}"), &pod)
+                .await
+                .unwrap();
+        }
+        let controller = JobController::new(storage.clone());
+        let mut j: Job = storage.get(job_key).await.unwrap();
+        controller.reconcile(&mut j).await.unwrap();
+
+        let st = storage.get::<Job>(job_key).await.unwrap().status.unwrap();
+        let conds = st.conditions.unwrap_or_default();
+        assert!(conds
+            .iter()
+            .any(|c| c.condition_type == "SuccessCriteriaMet"));
+        assert!(
+            !conds.iter().any(|c| c.condition_type == "Complete"),
+            "Complete must wait for the terminating pod"
+        );
+        assert_eq!(st.terminating, Some(1));
+
+        reap_terminating(&storage).await;
+        let mut j: Job = storage.get(job_key).await.unwrap();
+        controller.reconcile(&mut j).await.unwrap();
+        let st = storage.get::<Job>(job_key).await.unwrap().status.unwrap();
+        assert!(st
+            .conditions
+            .unwrap_or_default()
+            .iter()
+            .any(|c| c.condition_type == "Complete"));
+        assert_eq!(st.terminating, Some(0));
+    }
+
+    /// Create `job` plus one Running pod `p1`; reconcile once; return the
+    /// storage and the pod's key.
+    async fn graceful_fixture(job: Job) -> (Arc<MemoryStorage>, String) {
+        let storage = Arc::new(MemoryStorage::new());
+        let job_key = format!("/registry/jobs/default/{}", job.metadata.name);
+        storage.create(&job_key, &job).await.unwrap();
+        let pod = make_pod(
+            "p1",
+            "default",
+            Phase::Running,
+            &job.metadata.name,
+            "job-uid-1",
+        );
+        storage
+            .create("/registry/pods/default/p1", &pod)
+            .await
+            .unwrap();
+        let controller = JobController::new(storage.clone());
+        let mut job: Job = storage.get(&job_key).await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+        (storage, "/registry/pods/default/p1".to_string())
+    }
+
+    /// Suspending deletes active pods through `deleteActivePods` ->
+    /// `podControl.DeletePod` (job_controller.go:1122-1140;
+    /// controller_utils.go:618): graceful, the pod keeps its finalizer-backed
+    /// object with a deletionTimestamp.
+    #[tokio::test]
+    async fn test_suspend_deletes_active_pods_gracefully() {
+        let mut job = make_job("susp", "default", 1, 1);
+        job.spec.suspend = Some(true);
+        let (storage, pod_key) = graceful_fixture(job).await;
+        let pod: Pod = storage
+            .get(&pod_key)
+            .await
+            .expect("pod must still exist: delete is graceful");
+        assert!(pod.metadata.deletion_timestamp.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_active_deadline_deletes_active_pods_gracefully() {
+        let mut job = make_job("dl", "default", 1, 1);
+        job.spec.active_deadline_seconds = Some(1);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
+            ..Default::default()
+        });
+        let (storage, pod_key) = graceful_fixture(job).await;
+        let pod: Pod = storage
+            .get(&pod_key)
+            .await
+            .expect("pod must still exist: delete is graceful");
+        assert!(pod.metadata.deletion_timestamp.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_success_policy_deletes_active_pods_gracefully() {
+        let mut job = make_job("sp", "default", 5, 2);
+        job.spec.completion_mode = Some("Indexed".to_string());
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [{ "succeededIndexes": "0" }]
+            }))
+            .unwrap(),
+        );
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create("/registry/jobs/default/sp", &job)
+            .await
+            .unwrap();
+        let done = make_indexed_pod("p0", "default", Phase::Succeeded, "sp", "job-uid-1", 0);
+        storage
+            .create("/registry/pods/default/p0", &done)
+            .await
+            .unwrap();
+        let running = make_indexed_pod("p2", "default", Phase::Running, "sp", "job-uid-1", 2);
+        storage
+            .create("/registry/pods/default/p2", &running)
+            .await
+            .unwrap();
+        let controller = JobController::new(storage.clone());
+        let mut job: Job = storage.get("/registry/jobs/default/sp").await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+
+        let pod: Pod = storage
+            .get("/registry/pods/default/p2")
+            .await
+            .expect("pod must still exist: delete is graceful");
+        assert!(pod.metadata.deletion_timestamp.is_some());
+    }
+
+    /// `FilterActivePods` (controller_utils.go:1001, `IsPodActive` :1085)
+    /// excludes pods with a deletionTimestamp, so a terminating Running pod
+    /// is replaced rather than counted against `parallelism`.
+    #[tokio::test]
+    async fn test_terminating_pod_is_not_active() {
+        let storage = Arc::new(MemoryStorage::new());
+        let job = make_job("term", "default", 1, 1);
+        storage
+            .create("/registry/jobs/default/term", &job)
+            .await
+            .unwrap();
+        let mut pod = make_pod("p1", "default", Phase::Running, "term", "job-uid-1");
+        pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        storage
+            .create("/registry/pods/default/p1", &pod)
+            .await
+            .unwrap();
+        let controller = JobController::new(storage.clone());
+        let mut job: Job = storage.get("/registry/jobs/default/term").await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        let live = pods
+            .iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_none())
+            .count();
+        assert_eq!(live, 1, "a replacement for the terminating pod is created");
     }
 }
