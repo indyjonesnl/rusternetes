@@ -45,10 +45,21 @@ pub fn validate_pod_template(pt: &PodTemplate) -> ErrorList {
 /// workload's, a standalone template is mutable.
 pub fn validate_pod_template_update(pt: &PodTemplate, old: &PodTemplate) -> ErrorList {
     let mut errs = validate_object_meta_update(&pt.metadata, &old.metadata, &Path::new("metadata"));
-    errs.extend(validate_pod_template_spec(
+    // `GetValidationOptionsFromPodTemplate(&template.Template, &oldTemplate.Template)`
+    // (pkg/api/pod/util.go:489-492): an already-invalid old deletion cost is
+    // tolerated on update.
+    let allow_invalid_deletion_cost = old
+        .template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.annotations.as_ref())
+        .and_then(|a| a.get(POD_DELETION_COST))
+        .is_some_and(|v| !is_valid_deletion_cost(v));
+    errs.extend(validate_pod_template_spec_opts(
         &pt.template,
         &Path::new("template"),
         false,
+        allow_invalid_deletion_cost,
     ));
     errs
 }
@@ -74,6 +85,15 @@ pub fn validate_pod_template_spec(
     fld_path: &Path,
     allow_relaxed_dns_search: bool,
 ) -> ErrorList {
+    validate_pod_template_spec_opts(template, fld_path, allow_relaxed_dns_search, false)
+}
+
+fn validate_pod_template_spec_opts(
+    template: &PodTemplateSpec,
+    fld_path: &Path,
+    allow_relaxed_dns_search: bool,
+    allow_invalid_pod_deletion_cost: bool,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     if let Some(meta) = &template.metadata {
@@ -95,6 +115,7 @@ pub fn validate_pod_template_spec(
             .and_then(|m| m.annotations.as_ref()),
         &template.spec,
         &fld_path.child("annotations"),
+        allow_invalid_pod_deletion_cost,
     ));
 
     // Pod spec (also forbids ephemeral containers — upstream forbids them in a
@@ -115,14 +136,15 @@ pub fn validate_pod_template_spec(
 /// `ValidatePodTemplateSpecForStatefulSet`
 /// (`pkg/apis/apps/validation/validation.go:76`).
 ///
-/// `opts.AllowInvalidPodDeletionCost` is `false` here: `PodDeletionCost` is
-/// beta and on by default in 1.35 (`pkg/api/pod/util.go:414`). Upstream's
-/// update-time leniency (`:488-491`, an already-invalid old object) is not
-/// ported. Map iteration is sorted for a deterministic error order.
+/// `allow_invalid_pod_deletion_cost` is `opts.AllowInvalidPodDeletionCost`:
+/// `false` on create (`PodDeletionCost` is beta and on by default in 1.35,
+/// `pkg/api/pod/util.go:414`), and on a PodTemplate update `true` when the old
+/// template's cost was already invalid (`:488-492`). Map iteration is sorted for a deterministic error order.
 pub fn validate_pod_specific_annotations(
     annotations: Option<&HashMap<String, String>>,
     spec: &PodSpec,
     fld_path: &Path,
+    allow_invalid_pod_deletion_cost: bool,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let Some(annotations) = annotations else {
@@ -150,7 +172,7 @@ pub fn validate_pod_specific_annotations(
     }
 
     if let Some(value) = annotations.get(POD_DELETION_COST) {
-        if !is_valid_deletion_cost(value) {
+        if !allow_invalid_pod_deletion_cost && !is_valid_deletion_cost(value) {
             errs.push(Error::invalid(
                 &fld_path.key(POD_DELETION_COST),
                 value.clone(),
@@ -296,7 +318,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        validate_pod_specific_annotations(Some(&m), s, &Path::new("a"))
+        validate_pod_specific_annotations(Some(&m), s, &Path::new("a"), false)
             .iter()
             .map(|e| e.error_body())
             .collect()
@@ -393,5 +415,29 @@ mod tests {
                 .any(|e| e.error_body().contains("mirror pod annotation")),
             "{errs:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod update_leniency_tests {
+    use super::*;
+
+    fn tpl(cost: &str) -> PodTemplate {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "t", "namespace": "d", "resourceVersion": "1"},
+            "template": {
+                "metadata": {"annotations": {"controller.kubernetes.io/pod-deletion-cost": cost}},
+                "spec": {"containers": [{"name": "c", "image": "x"}]}
+            }
+        }))
+        .unwrap()
+    }
+
+    /// util.go:489-492 on a PodTemplate update (#2351).
+    #[test]
+    fn update_tolerates_an_already_invalid_deletion_cost() {
+        assert!(!validate_pod_template_update(&tpl("+1"), &tpl("1")).is_empty());
+        assert!(validate_pod_template_update(&tpl("+1"), &tpl("+2")).is_empty());
+        assert!(!validate_pod_template(&tpl("+1")).is_empty());
     }
 }
