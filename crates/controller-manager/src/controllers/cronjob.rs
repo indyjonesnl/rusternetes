@@ -141,6 +141,13 @@ enum MissedSchedules {
     Many,
 }
 
+/// `mostRecentScheduleTime`'s result: earliest time, most recent slot, missed.
+type MostRecent = (
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    MissedSchedules,
+);
+
 /// `schedule.Next(t)` of robfig/cron: the first slot strictly after `t`, in
 /// `tz`; `None` is Go's zero time (a schedule that never fires).
 fn schedule_next(
@@ -165,14 +172,7 @@ fn most_recent_schedule_time(
     schedule: &cron::Schedule,
     tz: chrono_tz::Tz,
     include_sds: bool,
-) -> Result<
-    (
-        chrono::DateTime<chrono::Utc>,
-        Option<chrono::DateTime<chrono::Utc>>,
-        MissedSchedules,
-    ),
-    String,
-> {
+) -> Result<MostRecent, String> {
     // :101-104. A CronJob without a creationTimestamp never reaches the
     // controller upstream; fall back to one minute ago.
     let mut earliest = cj
