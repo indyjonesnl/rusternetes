@@ -262,3 +262,27 @@ async fn status_get_returns_the_object() {
     assert_eq!(out["kind"], "Deployment", "{out}");
     assert_eq!(out["spec"]["replicas"], 1, "{out}");
 }
+
+/// A typed client (client-go's `UpdateStatus`) sends an object whose TypeMeta
+/// is empty, and the response must still name its kind: upstream's encoder
+/// stamps the GVK from the scheme on the way out. #2450.
+#[tokio::test]
+async fn status_put_and_patch_respond_with_kind_and_api_version() {
+    let api = TestApiServer::new();
+    let created = create(&api, "d-gvk").await;
+    let uri = format!("{DEPLOYS}/d-gvk/status");
+
+    let mut body = created.clone();
+    body.as_object_mut().unwrap().remove("kind");
+    body.as_object_mut().unwrap().remove("apiVersion");
+    body["status"] = json!({"replicas": 1, "updatedReplicas": 1, "observedGeneration": 1});
+    let (status, out) = api.put(&uri, &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["kind"], "Deployment", "{out}");
+    assert_eq!(out["apiVersion"], "apps/v1", "{out}");
+
+    let (status, out) = api.patch(&uri, &json!({"status": {"replicas": 1}})).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["kind"], "Deployment", "{out}");
+    assert_eq!(out["apiVersion"], "apps/v1", "{out}");
+}

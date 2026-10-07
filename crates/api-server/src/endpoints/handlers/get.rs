@@ -7,7 +7,7 @@ use axum::response::Response;
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::{Error, Result};
 
-use super::rest::{authorize, respond, RequestScope};
+use super::rest::{authorize, respond_object, RequestScope};
 use crate::registry::generic::GetOptions;
 use crate::registry::rest::{Object, RequestContext};
 use crate::state::ApiServerState;
@@ -55,5 +55,5 @@ pub async fn get_resource<T: Object>(
     let ctx =
         RequestContext::new(namespace).with_group_version(&scope.kind.group, &scope.kind.version);
     let obj = scope.store.get(&ctx, name, &options).await?;
-    Ok(respond(StatusCode::OK, &obj, &ctx))
+    Ok(respond_object(scope, StatusCode::OK, &obj, &ctx))
 }

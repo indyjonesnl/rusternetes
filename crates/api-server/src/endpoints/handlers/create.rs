@@ -11,8 +11,8 @@ use rusternetes_common::{Error, Result};
 
 use super::admission::{Admission, CreateValidation};
 use super::rest::{
-    authorize, decode, dedup_owner_references_and_add_warning, dry_run_param, is_dry_run, respond,
-    RequestScope,
+    authorize, decode, dedup_owner_references_and_add_warning, dry_run_param, is_dry_run,
+    respond_object, RequestScope,
 };
 use crate::registry::generic;
 use crate::registry::rest::{
@@ -100,5 +100,5 @@ pub async fn create_resource<T: Object>(
         )
         .await?;
 
-    Ok(respond(StatusCode::CREATED, &out, &ctx))
+    Ok(respond_object(scope, StatusCode::CREATED, &out, &ctx))
 }

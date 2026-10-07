@@ -11,7 +11,7 @@ use rusternetes_common::{Error, Result};
 use super::admission::{Admission, CreateValidation, MutatingAdmission, UpdateValidation};
 use super::rest::{
     authorize, check_name, decode, dedup_owner_references_and_add_warning, dry_run_param,
-    is_dry_run, respond, RequestScope,
+    is_dry_run, respond_object, RequestScope,
 };
 use crate::registry::generic;
 use crate::registry::rest::{
@@ -116,5 +116,5 @@ pub async fn update_resource<T: Object>(
     } else {
         StatusCode::OK
     };
-    Ok(respond(status, &out, &ctx))
+    Ok(respond_object(scope, status, &out, &ctx))
 }

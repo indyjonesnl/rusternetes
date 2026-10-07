@@ -304,6 +304,40 @@ pub(crate) fn respond<B: Serialize>(
     (status, headers, Json(body)).into_response()
 }
 
+/// [`respond`] for a typed object served by `scope`: the body names the
+/// scope's kind and apiVersion even when the stored object carries none.
+///
+/// Upstream's encoder stamps the GVK from the scheme on every encode
+/// (staging/src/k8s.io/apimachinery/pkg/runtime/serializer/versioning/versioning.go
+/// `codec.doEncode`: `objectKind.SetGroupVersionKind(gvk)`), so a typed
+/// client's `UpdateStatus` (empty TypeMeta on the wire) still gets
+/// `kind`/`apiVersion` back. #2450.
+pub(crate) fn respond_object<T: Object>(
+    scope: &RequestScope<T>,
+    status: StatusCode,
+    obj: &T,
+    ctx: &RequestContext,
+) -> Response {
+    let Ok(mut value) = serde_json::to_value(obj) else {
+        return respond(status, obj, ctx);
+    };
+    if let Some(map) = value.as_object_mut() {
+        for (key, want) in [
+            ("apiVersion", scope.api_version()),
+            ("kind", scope.kind.kind.clone()),
+        ] {
+            let missing = map
+                .get(key)
+                .and_then(|v| v.as_str())
+                .is_none_or(str::is_empty);
+            if missing {
+                map.insert(key.to_string(), serde_json::Value::String(want));
+            }
+        }
+    }
+    respond(status, &value, ctx)
+}
+
 /// The serializer choice of `transformResponseObject`
 /// (endpoints/handlers/response.go): a client that negotiates
 /// `application/vnd.kubernetes.protobuf` gets the object in the protobuf
