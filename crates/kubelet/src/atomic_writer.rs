@@ -104,8 +104,26 @@ pub fn write_projected_payload(
         let seg = rel.split('/').next().unwrap_or(rel.as_str());
         wanted.insert(seg.to_string());
         let link = target_dir.join(seg);
-        if std::fs::symlink_metadata(&link).is_err() {
-            std::os::unix::fs::symlink(PathBuf::from(DATA_DIR).join(seg), &link)?;
+        match std::fs::symlink_metadata(&link) {
+            Ok(md) if md.file_type().is_symlink() => {}
+            Ok(md) => {
+                // Rusternetes-only deviation (#2527): upstream's
+                // `createUserVisibleFiles` (`atomic_writer.go`) only creates
+                // the link when `os.Readlink` reports ENOENT, so a plain file
+                // left by an older kubelet (EINVAL) is skipped. Upstream never
+                // meets one (its secret/configMap/downwardAPI/projected volumes
+                // are tmpfs, wiped on restart); ours persist on disk, so a
+                // stale plain file would shadow `..data` and never update.
+                if md.is_dir() {
+                    std::fs::remove_dir_all(&link)?;
+                } else {
+                    std::fs::remove_file(&link)?;
+                }
+                std::os::unix::fs::symlink(PathBuf::from(DATA_DIR).join(seg), &link)?;
+            }
+            Err(_) => {
+                std::os::unix::fs::symlink(PathBuf::from(DATA_DIR).join(seg), &link)?;
+            }
         }
     }
 
@@ -278,6 +296,36 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(f_mode & 0o777, 0o644);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2527: plain files/dirs left by an older kubelet are converted to the
+    /// `..data` symlink layout on re-SetUp, and then track content changes.
+    #[test]
+    fn plain_files_from_older_kubelet_are_converted_to_symlinks() {
+        let dir = std::env::temp_dir().join(format!("aw-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/inner"), b"old").unwrap();
+        std::fs::write(dir.join("a"), b"old").unwrap();
+
+        let p = payload(&[("a", b"new"), ("nested/inner", b"new")]);
+        write_projected_payload(&dir, &p).unwrap();
+        for v in ["a", "nested"] {
+            assert!(
+                std::fs::symlink_metadata(dir.join(v))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{v} must be a symlink"
+            );
+        }
+        assert_eq!(std::fs::read(dir.join("a")).unwrap(), b"new");
+        assert_eq!(std::fs::read(dir.join("nested/inner")).unwrap(), b"new");
+
+        let p2 = payload(&[("a", b"newer"), ("nested/inner", b"new")]);
+        write_projected_payload(&dir, &p2).unwrap();
+        assert_eq!(std::fs::read(dir.join("a")).unwrap(), b"newer");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
