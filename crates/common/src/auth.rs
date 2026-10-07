@@ -22,9 +22,12 @@ pub struct KubernetesClaims {
 /// Name+UID reference used in kubernetes.io JWT claims
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KubeRef {
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    // `default` so a token minted with an empty uid (skipped on serialize)
+    // decodes again. Upstream pkg/serviceaccount/claims.go:65-68:
+    // `type ref struct { Name string `json:"name,omitempty"`; UID string `json:"uid,omitempty"` }`
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub uid: String,
 }
 
@@ -879,6 +882,20 @@ impl WebhookTokenAuthenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_empty_sa_uid_token_round_trips_2358() {
+        let manager = TokenManager::new(b"test-secret-key");
+        let claims = ServiceAccountClaims::new(
+            "default".to_string(),
+            "default".to_string(),
+            String::new(),
+            24,
+        );
+        let token = manager.generate_token(claims).unwrap();
+        let validated = manager.validate_token(&token).unwrap();
+        assert!(validated.uid.is_empty());
+    }
 
     #[test]
     fn test_token_generation_and_validation() {

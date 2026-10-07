@@ -42,6 +42,22 @@ macro_rules! contract_suite {
             }
 
             #[tokio::test]
+            async fn create_with_ttl() {
+                let Some(fixture) = $setup.await else {
+                    return;
+                };
+                store::run_test_create_with_ttl(&fixture.storage).await;
+            }
+
+            #[tokio::test]
+            async fn update_with_ttl() {
+                let Some(fixture) = $setup.await else {
+                    return;
+                };
+                store::run_test_update_with_ttl(&fixture.storage).await;
+            }
+
+            #[tokio::test]
             async fn create_with_key_exist() {
                 let Some(fixture) = $setup.await else {
                     return;
