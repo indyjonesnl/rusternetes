@@ -241,3 +241,51 @@ fn non_mandatory_flow_schema_spec_is_free() {
     fs.spec.matching_precedence = 9900;
     assert!(validate_flow_schema(&fs).is_empty());
 }
+
+// #2497: closed string-enums decode any string (upstream fields are plain Go
+// strings), and validation answers NotSupported (422), not a decode error.
+fn fs_from_json(spec: serde_json::Value) -> FlowSchema {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": {"name": "fs1"},
+        "spec": spec,
+    }))
+    .expect("an unknown enum string must decode")
+}
+
+#[test]
+fn unknown_subject_kind_is_not_supported() {
+    // validation.go:185-187 `default:` arm of `switch subject.Kind`.
+    let f = fs_from_json(serde_json::json!({
+        "priorityLevelConfiguration": {"name": "workload"},
+        "matchingPrecedence": 1000,
+        "rules": [{"subjects": [{"kind": "Robot"}], "resourceRules": [
+            {"verbs": ["get"], "apiGroups": [""], "resources": ["pods"]}]}],
+    }));
+    let errs = validate_flow_schema(&f);
+    assert!(
+        errs.iter().any(|e| e.error_type == ErrorType::NotSupported
+            && e.field == "spec.rules[0].subjects[0].kind"
+            && format!("{:?}", e.bad_value).contains("Robot")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn unknown_distinguisher_method_is_not_supported() {
+    // validation.go:117-119.
+    let f = fs_from_json(serde_json::json!({
+        "priorityLevelConfiguration": {"name": "workload"},
+        "matchingPrecedence": 1000,
+        "distinguisherMethod": {"type": "ByPlanet"},
+        "rules": [{"subjects": [{"kind": "User", "user": {"name": "a"}}], "resourceRules": [
+            {"verbs": ["get"], "apiGroups": [""], "resources": ["pods"]}]}],
+    }));
+    let errs = validate_flow_schema(&f);
+    assert!(
+        errs.iter().any(|e| e.error_type == ErrorType::NotSupported
+            && e.field == "spec.distinguisherMethod.type"),
+        "{errs:?}"
+    );
+}

@@ -24,6 +24,7 @@ mod cel_vap_end_to_end_test;
 mod chunking_podtemplate_ordering_test;
 mod cluster_authentication_trust_test;
 mod cluster_startup_test;
+mod cluster_trust_bundle_test;
 mod condition_decodes_when_absent_test;
 mod configmap_consumption_test;
 mod configmap_generic_store_test;

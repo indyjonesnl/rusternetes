@@ -134,3 +134,34 @@ fn expiration_seconds_floor() {
     ok["expirationSeconds"] = json!(600);
     assert!(validate_certificate_signing_request_create(&csr(ok)).is_empty());
 }
+
+// #2497: an unknown usage decodes (upstream `KeyUsage` is a plain string) and
+// validation answers NotSupported, not a decode failure.
+#[test]
+fn unknown_usage_not_supported_on_create() {
+    // validation.go:193-198 `allValidUsages`.
+    let mut s = valid_spec();
+    s["usages"] = json!(["client auth", "teleport"]);
+    let errs = validate_certificate_signing_request_create(&csr(s));
+    assert!(
+        errs.iter().any(|e| e.error_type
+            == rusternetes_common::validation::field::ErrorType::NotSupported
+            && e.field == "spec.usages[1]"),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn unknown_usage_tolerated_on_update_when_old_had_it() {
+    // validation.go:439-446 `allowUnknownUsages(oldCSR)`.
+    use rusternetes_common::validation::certificatesigningrequest::validate_certificate_signing_request_update_main;
+    let mut s = valid_spec();
+    s["usages"] = json!(["client auth", "teleport"]);
+    let old = csr(s.clone());
+    let new = csr(s);
+    let errs = validate_certificate_signing_request_update_main(&new, &old);
+    assert!(
+        !errs.iter().any(|e| e.field.starts_with("spec.usages")),
+        "{errs:?}"
+    );
+}

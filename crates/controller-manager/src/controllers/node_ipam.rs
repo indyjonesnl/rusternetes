@@ -22,6 +22,7 @@
 //! `--cluster-cidr`). [`CidrSet`] is IPv4+IPv6; the [`RangeAllocator`]
 //! holds one [`CidrSet`] per `--cluster-cidr` entry (IPv4, IPv6 or both).
 
+use super::cidrset_metrics;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -287,7 +288,7 @@ const CLUSTER_SUBNET_MAX_DIFF: u8 = 16;
 /// (upstream `cidrset/metrics.go`: `cidrset_cidrs_allocations_total`,
 /// `cidrset_cidrs_releases_total`, `cirdset_max_cidrs`, `cidrset_usage_cidrs`,
 /// `cidrset_allocation_tries_per_request`), keyed by the `clusterCIDR` label.
-#[allow(dead_code)] // exposition on /metrics: #2410 (the series are tracked and tested)
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct CidrSetMetrics {
     /// The `clusterCIDR` label.
@@ -356,7 +357,6 @@ pub struct CidrSet {
     node_mask: u8,
     max_cidrs: u64,
     /// Upstream `label` (`clusterCIDR.String()`), identifies the metrics.
-    #[allow(dead_code)] // read by `metrics()`, see above
     label: String,
     inner: Mutex<CidrSetInner>,
 }
@@ -378,6 +378,8 @@ impl CidrSet {
         }
         // getMaxCIDRs
         let max_cidrs = 1u64 << (node_mask - cluster.prefix_len());
+        // `cidrSetMaxCidrs.WithLabelValues(cidrSet.label).Set(...)` (cidr_set.go:98)
+        cidrset_metrics::set_max_cidrs(&cluster.to_string(), max_cidrs);
         Ok(Self {
             width,
             node_mask,
@@ -408,8 +410,9 @@ impl CidrSet {
         self.inner.lock().expect("cidr set poisoned").allocated
     }
 
-    /// The set's metric series (upstream `cidrset/metrics.go`).
-    #[allow(dead_code)] // exposition on /metrics is a follow-up
+    /// The set's metric series (upstream `cidrset/metrics.go`); the live
+    /// series are exposed via [`cidrset_metrics`], this is the test accessor.
+    #[cfg(test)]
     pub fn metrics(&self) -> CidrSetMetrics {
         let s = self.inner.lock().expect("cidr set poisoned");
         CidrSetMetrics {
@@ -481,6 +484,9 @@ impl CidrSet {
         s.allocations += 1;
         s.tries_sum += tries as f64;
         s.tries_count += 1;
+        cidrset_metrics::inc_allocations(&self.label);
+        cidrset_metrics::observe_tries(&self.label, tries);
+        cidrset_metrics::set_usage(&self.label, s.allocated, self.max_cidrs);
         Ok(self.index_to_cidr_block(candidate))
     }
 
@@ -547,8 +553,10 @@ impl CidrSet {
                 s.set_bit(i, false);
                 s.allocated -= 1;
                 s.releases += 1;
+                cidrset_metrics::inc_releases(&self.label);
             }
         }
+        cidrset_metrics::set_usage(&self.label, s.allocated, self.max_cidrs);
         Ok(())
     }
 
@@ -562,8 +570,10 @@ impl CidrSet {
                 s.set_bit(i, true);
                 s.allocated += 1;
                 s.allocations += 1;
+                cidrset_metrics::inc_allocations(&self.label);
             }
         }
+        cidrset_metrics::set_usage(&self.label, s.allocated, self.max_cidrs);
         Ok(())
     }
 }

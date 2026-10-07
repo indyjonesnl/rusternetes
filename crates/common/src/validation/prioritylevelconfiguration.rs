@@ -69,12 +69,18 @@ fn validate_queuing(q: &QueuingConfiguration, fld_path: &Path) -> ErrorList {
 
 fn validate_limit_response(lr: &LimitResponse, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
-    match lr.type_ {
+    match &lr.type_ {
         // Go's zero value, i.e. an absent `type`; upstream's `default` arm
         // (`pkg/apis/flowcontrol/validation/validation.go:477-479`).
         LimitResponseType::Unspecified => errs.push(Error::not_supported(
             &fld_path.child("type"),
             String::new(),
+            &["Queue", "Reject"],
+        )),
+        // `default:` arm for a non-empty unknown type (validation.go:477-479).
+        LimitResponseType::Unknown(t) => errs.push(Error::not_supported(
+            &fld_path.child("type"),
+            t.clone(),
             &["Queue", "Reject"],
         )),
         LimitResponseType::Reject => {
@@ -234,12 +240,16 @@ pub fn validate_priority_level_configuration(plc: &PriorityLevelConfiguration) -
     if is_exempt_name != is_exempt_type {
         errs.push(Error::invalid(
             &spec_path.child("type"),
-            if is_exempt_type { "Exempt" } else { "Limited" },
+            match &spec.type_ {
+                PriorityLevelType::Exempt => "Exempt".to_string(),
+                PriorityLevelType::Limited => "Limited".to_string(),
+                PriorityLevelType::Unknown(t) => t.clone(),
+            },
             "must be 'Exempt' if and only if `name` is 'exempt'",
         ));
     }
 
-    match spec.type_ {
+    match &spec.type_ {
         PriorityLevelType::Exempt => {
             if spec.limited.is_some() {
                 errs.push(Error::forbidden(
@@ -268,6 +278,13 @@ pub fn validate_priority_level_configuration(plc: &PriorityLevelConfiguration) -
                 }
             }
         }
+        // validation.go:418-420 `default:` arm; `supportedPriorityLevelEnablement`
+        // is :68-71.
+        PriorityLevelType::Unknown(t) => errs.push(Error::not_supported(
+            &spec_path.child("type"),
+            t.clone(),
+            &["Exempt", "Limited"],
+        )),
     }
 
     errs.extend(validate_if_mandatory_priority_level_configuration_object(
