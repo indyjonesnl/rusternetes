@@ -265,3 +265,27 @@ async fn cronjob_runs_a_worker_pool() {
     .await;
     assert!(peak > 1, "cronjob run() peaked at {peak}");
 }
+
+#[tokio::test]
+async fn servicecidr_runs_a_worker_pool() {
+    let peak = peak_concurrency(
+        "servicecidrs",
+        12,
+        |i| {
+            json!({
+                "apiVersion": "networking.k8s.io/v1", "kind": "ServiceCIDR",
+                "metadata": meta(i),
+                "spec": {"cidrs": [format!("10.{i}.0.0/16")]}
+            })
+        },
+        |s| async move {
+            let _ = Arc::new(crate::controllers::servicecidr::ServiceCIDRController::new(
+                s,
+            ))
+            .run()
+            .await;
+        },
+    )
+    .await;
+    assert!(peak > 1, "servicecidr run() peaked at {peak}");
+}
