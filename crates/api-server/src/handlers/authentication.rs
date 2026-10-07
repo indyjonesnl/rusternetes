@@ -217,6 +217,7 @@ pub async fn create_token_request(
             },
             pod: None,
             node: None,
+            secret: None,
         }),
         pod_name: None,
         pod_uid: None,

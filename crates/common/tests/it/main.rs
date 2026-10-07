@@ -29,6 +29,7 @@ mod roundtrip_batch;
 mod roundtrip_core_v1;
 mod roundtrip_networking;
 mod roundtrip_rbac_storage;
+mod sa_external_tokens_test;
 mod secret_data_roundtrip_test;
 mod servicecidr_test;
 mod validation_configmap;

@@ -271,6 +271,7 @@ impl Mounter for SecretMounter {
                             name: nn.clone(),
                             uid: node_uid.clone().unwrap_or_default(),
                         }),
+                    secret: None,
                 }),
                 pod_name: Some(self.pod_name.to_string()),
                 pod_uid: Some(self.pod_uid.clone()),
