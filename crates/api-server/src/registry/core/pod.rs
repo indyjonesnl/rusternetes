@@ -364,6 +364,11 @@ impl RestCreateStrategy<Pod> for Strategy {
     fn validate(&self, _ctx: &RequestContext, obj: &Pod) -> ErrorList {
         use rusternetes_common::feature_gates::{enabled, Feature};
         let mut errs = validate_pod_meta(obj);
+        errs.extend(
+            rusternetes_common::validation::pod_status::validate_pod_metadata_annotations(
+                obj, None,
+            ),
+        );
         errs.extend(rusternetes_common::validation::pod::validate_pod_create(
             obj,
             enabled(Feature::RelaxedDNSSearchValidation),
@@ -405,6 +410,12 @@ impl RestUpdateStrategy<Pod> for Strategy {
     fn validate_update(&self, _ctx: &RequestContext, obj: &Pod, old: &Pod) -> ErrorList {
         let mut errs =
             validate_object_meta_update(&obj.metadata, &old.metadata, &Path::new("metadata"));
+        errs.extend(
+            rusternetes_common::validation::pod_status::validate_pod_metadata_annotations(
+                obj,
+                Some(old),
+            ),
+        );
         if let (Some(old_spec), Some(new_spec)) = (old.spec.as_ref(), obj.spec.as_ref()) {
             errs.extend(validate_node_name_immutable(old_spec, new_spec));
             errs.extend(validate_spec_update(old_spec, new_spec, false));
@@ -1927,6 +1938,66 @@ mod tests {
         };
         assert!(Strategy.check_graceful_delete(&ctx(), pod, &mut options));
         options.grace_period_seconds
+    }
+
+    fn annotated(ann: serde_json::Value) -> Pod {
+        let mut p = with_meta(serde_json::json!({}), serde_json::json!({}), ann);
+        p.metadata.resource_version = Some("1".to_string());
+        p
+    }
+
+    /// `validatePodMetadataAndSpec` (validation.go:4505) runs
+    /// `ValidatePodSpecificAnnotations` on create (#2351).
+    #[test]
+    fn create_validates_pod_specific_annotations() {
+        let key = "controller.kubernetes.io/pod-deletion-cost";
+        let errs = Strategy.validate(&ctx(), &annotated(serde_json::json!({ key: "+10" })));
+        assert!(
+            errs.iter()
+                .any(|e| e.error_body().contains("must be a 32bit integer")),
+            "{errs:?}"
+        );
+        let errs = Strategy.validate(
+            &ctx(),
+            &annotated(serde_json::json!({ "kubernetes.io/config.mirror": "h" })),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.error_body().contains("must set spec.nodeName")),
+            "{errs:?}"
+        );
+        assert!(Strategy
+            .validate(&ctx(), &annotated(serde_json::json!({ key: "10" })))
+            .is_empty());
+    }
+
+    /// Update: an invalid deletion cost is rejected only when the old one was
+    /// valid (util.go:488-492); mirror/AppArmor annotation updates are forbidden
+    /// (`ValidatePodSpecificAnnotationUpdates`, validation.go:5699).
+    #[test]
+    fn update_validates_pod_specific_annotations() {
+        let key = "controller.kubernetes.io/pod-deletion-cost";
+        let good = annotated(serde_json::json!({ key: "5" }));
+        let bad = annotated(serde_json::json!({ key: "+5" }));
+        let errs = Strategy.validate_update(&ctx(), &bad, &good);
+        assert!(
+            errs.iter()
+                .any(|e| e.error_body().contains("must be a 32bit integer")),
+            "{errs:?}"
+        );
+        // already-invalid old object: leniency
+        let e = Strategy.validate_update(&ctx(), &bad, &bad);
+        assert!(e.is_empty(), "{e:?}");
+        let plain = annotated(serde_json::json!({}));
+        let apparmor = annotated(
+            serde_json::json!({ "container.apparmor.security.beta.kubernetes.io/c": "unconfined" }),
+        );
+        let errs = Strategy.validate_update(&ctx(), &apparmor, &plain);
+        assert!(
+            errs.iter()
+                .any(|e| e.error_body().contains("may not add AppArmor annotations")),
+            "{errs:?}"
+        );
     }
 
     #[test]
