@@ -323,7 +323,12 @@ impl MetricsRegistry {
     pub fn gather(&self) -> String {
         use prometheus::Encoder;
         let encoder = prometheus::TextEncoder::new();
-        let metric_families = self.registry.gather();
+        let mut metric_families = self.registry.gather();
+        // `prometheus::default_registry()` is this port's `legacyregistry`
+        // (k8s.io/component-base/metrics/legacyregistry): the process-global
+        // registry components such as the kubelet's volume manager register
+        // into (e.g. `registerSELinuxMetrics`) and `/metrics` serves.
+        metric_families.extend(prometheus::default_registry().gather());
         let mut buffer = Vec::new();
         encoder.encode(&metric_families, &mut buffer).unwrap();
         String::from_utf8(buffer).unwrap()
