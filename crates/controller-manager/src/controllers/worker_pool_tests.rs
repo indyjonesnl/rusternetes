@@ -359,3 +359,25 @@ async fn resourceclaim_runs_a_worker_pool() {
     .await;
     assert!(peak > 1, "resourceclaim run() peaked at {peak}");
 }
+
+#[tokio::test]
+async fn node_runs_a_worker_pool() {
+    let peak = peak_concurrency(
+        "nodes",
+        12,
+        |i| {
+            json!({
+                "apiVersion": "v1", "kind": "Node",
+                "metadata": meta(i),
+                "spec": {}
+            })
+        },
+        |s| async move {
+            let _ = Arc::new(crate::controllers::node::NodeController::new(s))
+                .run()
+                .await;
+        },
+    )
+    .await;
+    assert!(peak > 1, "node run() peaked at {peak}");
+}
