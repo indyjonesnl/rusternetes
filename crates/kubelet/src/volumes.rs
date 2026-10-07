@@ -1175,10 +1175,14 @@ impl VolumeManager {
         };
 
         match self.plugin_mgr.find_plugin_by_spec(&spec) {
-            Ok(plugin) => {
-                let mounter = plugin.new_mounter(&spec, pod).await?;
-                mounter.set_up().await?;
-                Ok(mounter.get_path())
+            Ok(_) => {
+                crate::volume_plugins::util::operation_generator::mount_volume(
+                    &self.plugin_mgr,
+                    &spec,
+                    pod,
+                    "",
+                )
+                .await
             }
             Err(crate::volume_plugins::PluginLookupError::NoPluginMatched) if pv.is_some() => {
                 // Preserve the pre-registry message: today only a

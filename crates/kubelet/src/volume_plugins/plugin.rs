@@ -138,6 +138,14 @@ pub trait VolumePlugin: Send + Sync {
     }
 
     /// Rust spelling of the type assertion
+    /// `volumePlugin.(volume.DeviceMountableVolumePlugin)`
+    /// (`plugins.go:836-849`, `FindDeviceMountablePluginBySpec`). `None` is a
+    /// failed assertion — every plugin but CSI, as upstream.
+    fn as_device_mountable_plugin(&self) -> Option<&dyn DeviceMountableVolumePlugin> {
+        None
+    }
+
+    /// Rust spelling of the type assertion
     /// `volumePlugin.(volume.NodeExpandableVolumePlugin)`
     /// (`plugins.go:931`, `:944`), which `FindNodeExpandablePlugin{BySpec,
     /// ByName}` perform. `None` is a failed assertion — every plugin
@@ -184,6 +192,50 @@ pub trait VolumePlugin: Send + Sync {
 pub struct ReconstructedVolume {
     pub volume: Volume,
     pub persistent_volume: Option<PersistentVolume>,
+}
+
+/// Port of `volume.DeviceMounterArgs` (`pkg/volume/volume.go:290-294`).
+///
+/// `SELinuxLabel` is not ported (SELinuxMountReadWriteOncePod is not modelled
+/// for CSI; see #2312).
+///
+/// **Deviation:** `node_name` is not upstream. Upstream's attacher reads it
+/// from `host.GetNodeName()` (`csi_attacher.go:297`); our `VolumeHost` has no
+/// node-name accessor, so the caller passes it here.
+#[derive(Clone, Debug, Default)]
+pub struct DeviceMounterArgs {
+    pub fs_group: Option<i64>,
+    pub node_name: String,
+}
+
+/// Port of `volume.DeviceMounter` (`pkg/volume/volume.go:296-311`): mounts a
+/// device to a global path that individual pods then bind mount. For CSI this
+/// is `NodeStageVolume`.
+///
+/// Errors follow upstream's contract: `TransientOperationFailure`,
+/// `UncertainProgressError`, anything else is final.
+#[async_trait]
+pub trait DeviceMounter: Send + Sync {
+    /// `GetDeviceMountPath` (`volume.go:301`).
+    fn get_device_mount_path(&self, spec: &Spec<'_>) -> Result<String>;
+
+    /// `MountDevice` (`volume.go:310`). `device_path` may be empty when the
+    /// plugin has no attach step.
+    async fn mount_device(
+        &self,
+        spec: &Spec<'_>,
+        device_path: &str,
+        device_mount_path: &str,
+        args: &DeviceMounterArgs,
+    ) -> Result<()>;
+}
+
+/// Port of `volume.DeviceMountableVolumePlugin` (`pkg/volume/plugins.go`):
+/// `NewDeviceMounter` (`CanDeviceMount` stays on [`VolumePlugin`], see
+/// [`VolumePlugin::can_device_mount`]).
+pub trait DeviceMountableVolumePlugin: VolumePlugin {
+    /// `NewDeviceMounter`.
+    fn new_device_mounter(&self) -> Result<Box<dyn DeviceMounter>>;
 }
 
 /// Port of `volume.Unmounter` (`pkg/volume/volume.go:189-198`).
