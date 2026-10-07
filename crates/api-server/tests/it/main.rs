@@ -275,6 +275,7 @@ mod service_list_watch_default_on_read_test;
 mod service_node_port_allocation_test;
 mod service_store_test;
 mod service_test;
+mod service_update_ip_families_test;
 mod serviceaccount_handler_test;
 mod serviceaccount_store_test;
 mod small_api_decode_when_absent_test;

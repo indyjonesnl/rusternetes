@@ -1,0 +1,6566 @@
+[
+ {
+  "test": "TestUpdateIPsFromSingleStack",
+  "name": "singlestack:v4",
+  "clusterFamilies": [
+   "IPv4"
+  ],
+  "cases": [
+   {
+    "name": "single-single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "single-dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "single-dual_policy",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack"
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "single-dual_families",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   }
+  ]
+ },
+ {
+  "test": "TestUpdateIPsFromSingleStack",
+  "name": "dualstack:v4v6",
+  "clusterFamilies": [
+   "IPv4",
+   "IPv6"
+  ],
+  "cases": [
+   {
+    "name": "policy:nil_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:single_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:single_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:single_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:single_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:single_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "single-dual_wrong_order_families",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "single-dual_wrong_order_ips",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "single-dual_ip_in_use",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "preallocate": {
+     "family": "IPv6",
+     "ip": "2000::1"
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   }
+  ]
+ },
+ {
+  "test": "TestUpdateIPsFromSingleStack",
+  "name": "dualstack:v6v4",
+  "clusterFamilies": [
+   "IPv6",
+   "IPv4"
+  ],
+  "cases": [
+   {
+    "name": "policy:nil_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:single_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:single_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:single_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:single_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:single_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "single-dual_wrong_order_families",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "single-dual_wrong_order_ips",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "single-dual_ip_in_use",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "preallocate": {
+     "family": "IPv4",
+     "ip": "10.0.0.1"
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   }
+  ]
+ },
+ {
+  "test": "TestUpdateIPsFromSingleStack",
+  "name": "headless",
+  "clusterFamilies": [
+   "IPv4",
+   "IPv6"
+  ],
+  "cases": [
+   {
+    "name": "policy:nil_families:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2"
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:single_families:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "test": "TestUpdateIPsFromDualStack",
+  "name": "dualstack:v4v6",
+  "clusterFamilies": [
+   "IPv4",
+   "IPv6"
+  ],
+  "cases": [
+   {
+    "name": "policy:nil_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": true,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": true,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": true,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": true,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": true,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:require_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:require_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:require_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:require_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:require_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "dual-single_wrong_order_families",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "families": [
+       "IPv6"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "dual-single_wrong_order_ips",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "10.0.0.1",
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   }
+  ]
+ },
+ {
+  "test": "TestUpdateIPsFromDualStack",
+  "name": "dualstack:v6v4",
+  "clusterFamilies": [
+   "IPv6",
+   "IPv4"
+  ],
+  "cases": [
+   {
+    "name": "policy:nil_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv6"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": true,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": true,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": true,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": true,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": true,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv6"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:nil_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:nil_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:require_families:nil_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:single_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv6"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:require_families:single_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:require_families:single_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv6"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:require_families:dual_ips:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:dual_ips:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:require_families:dual_ips:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv6",
+       "IPv4"
+      ],
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "dual-single_wrong_order_families",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "dual-single_wrong_order_ips",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "2000::1",
+       "10.0.0.1"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": true,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "SingleStack",
+      "clusterIPs": [
+       "10.0.0.1"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   }
+  ]
+ },
+ {
+  "test": "TestUpdateIPsFromDualStack",
+  "name": "headless",
+  "clusterFamilies": [
+   "IPv4",
+   "IPv6"
+  ],
+  "cases": [
+   {
+    "name": "policy:nil_families:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2"
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:nil_families:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:nil_families:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:single_families:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "SingleStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": true,
+     "numFamilies": [
+      1
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:prefer_families:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:prefer_families:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "PreferDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:nil",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack"
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   },
+   {
+    "name": "policy:require_families:single",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4"
+      ]
+     },
+     "expectError": true,
+     "expectClusterIPs": false,
+     "expectHeadless": false,
+     "expectStackDowngrade": false,
+     "numFamilies": []
+    }
+   },
+   {
+    "name": "policy:require_families:dual",
+    "create": {
+     "svc": {
+      "selectorKey": "k",
+      "policy": "RequireDualStack",
+      "clusterIPs": [
+       "None"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    },
+    "update": {
+     "svc": {
+      "selectorKey": "k2",
+      "policy": "RequireDualStack",
+      "families": [
+       "IPv4",
+       "IPv6"
+      ]
+     },
+     "expectError": false,
+     "expectClusterIPs": false,
+     "expectHeadless": true,
+     "expectStackDowngrade": false,
+     "numFamilies": [
+      2
+     ]
+    }
+   }
+  ]
+ }
+]
