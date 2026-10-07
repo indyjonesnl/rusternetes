@@ -38,7 +38,7 @@ impl Lease {
 }
 
 /// LeaseSpec is a specification of a Lease
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LeaseSpec {
     /// holderIdentity contains the identity of the holder of a current lease
