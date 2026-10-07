@@ -86,6 +86,49 @@ pub struct VolumeToMount {
     pub selinux_label: String,
 }
 
+impl VolumeToMount {
+    /// Port of `VolumeToMount.GenerateMsgDetailed`
+    /// (`operation_executor.go:514-521`).
+    pub fn generate_msg_detailed(&self, prefix_msg: &str, suffix_msg: &str) -> String {
+        let details = format!(
+            "(UniqueName: {:?}) pod {:?} (UID: {:?})",
+            self.volume_name.0, self.pod.metadata.name, self.pod.metadata.uid
+        );
+        generate_volume_msg_detailed(prefix_msg, suffix_msg, self.volume_spec.name(), &details)
+    }
+
+    /// Port of `VolumeToMount.GenerateMsg` (`operation_executor.go:524-531`):
+    /// the simple message is for events, the detailed one for logs.
+    pub fn generate_msg(&self, prefix_msg: &str, suffix_msg: &str) -> (String, String) {
+        let simple = format!(
+            "{prefix_msg} for volume {:?} {suffix_msg}",
+            self.volume_spec.name()
+        );
+        (simple, self.generate_msg_detailed(prefix_msg, suffix_msg))
+    }
+
+    /// Port of `VolumeToMount.GenerateErrorDetailed`
+    /// (`operation_executor.go:534-536`).
+    pub fn generate_error_detailed(&self, prefix_msg: &str, err: &anyhow::Error) -> anyhow::Error {
+        anyhow::anyhow!(self.generate_msg_detailed(prefix_msg, &err_suffix(Some(err))))
+    }
+}
+
+/// Port of `errSuffix` (`operation_executor.go:306-312`).
+fn err_suffix(err: Option<&anyhow::Error>) -> String {
+    err.map(|e| format!(": {e}")).unwrap_or_default()
+}
+
+/// Port of `generateVolumeMsgDetailed` (`operation_executor.go:315-317`).
+fn generate_volume_msg_detailed(
+    prefix_msg: &str,
+    suffix_msg: &str,
+    volume_name: &str,
+    details: &str,
+) -> String {
+    format!("{prefix_msg} for volume {volume_name:?} {details} {suffix_msg}")
+}
+
 /// Port of `DeviceMountState` (`operation_executor.go:467-480`):
 ///
 /// ```go

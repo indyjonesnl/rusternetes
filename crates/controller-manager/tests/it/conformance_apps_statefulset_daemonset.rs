@@ -1031,6 +1031,8 @@ async fn daemonset_should_run_and_stop_complex_daemon_with_node_selector() {
     storage.update(&key, &fresh).await.unwrap();
 
     controller.reconcile_all().await.unwrap();
+    // The controller deletes gracefully (#2465); the kubelet reaps the pods.
+    simulate_kubelet_cleanup(&storage, "default").await;
     let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
     assert!(
         pods.is_empty(),
@@ -1132,6 +1134,7 @@ async fn daemonset_should_rolling_update_pods_when_spec_changes() {
     // Drive the rolling update — maxUnavailable=1 means one pod at a time.
     for _ in 0..10 {
         controller.reconcile_all().await.unwrap();
+        simulate_kubelet_cleanup(&storage, ns).await;
         mark_all_pods_ready(&storage, ns).await;
     }
 
@@ -1388,6 +1391,8 @@ async fn daemonset_should_remove_pod_when_node_leaves() {
         .await
         .unwrap();
     controller.reconcile_all().await.unwrap();
+    // The controller deletes gracefully (#2465); the kubelet reaps the pod.
+    simulate_kubelet_cleanup(&storage, "default").await;
 
     let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
     assert_eq!(pods.len(), 2);

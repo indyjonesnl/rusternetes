@@ -14,6 +14,7 @@
 
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Decision, RequestAttributes};
+use rusternetes_common::resources::podcertificaterequest::PodCertificateRequest;
 use rusternetes_common::resources::{
     CertificateSigningRequest, CertificateSigningRequestStatus, ClusterTrustBundle,
 };
@@ -142,6 +143,35 @@ pub async fn validate_cluster_trust_bundle_attest(
     if !is_authorized_for_signer_name(state, user, "attest", signer).await {
         return Some(format!(
             "user not permitted to attest for signerName \"{signer}\""
+        ));
+    }
+    None
+}
+
+/// The `"sign"` check of `StatusStrategy.ValidateUpdate`
+/// (pkg/registry/certificates/podcertificaterequest/strategy.go:153-167): a
+/// caller that changes any `/status` field of a PodCertificateRequest needs
+/// the `sign` verb on the *old* object's signer name.
+///
+/// Deviation: upstream returns `field.Forbidden(spec.signerName, ...)` from the
+/// strategy once status validation has passed; the Rust strategy is
+/// synchronous and cannot call the authorizer, so the check runs here with the
+/// same message, as a Forbidden. Returns the error text.
+pub async fn validate_pod_certificate_request_sign(
+    state: &ApiServerState,
+    user: &UserInfo,
+    new: &PodCertificateRequest,
+    old: &PodCertificateRequest,
+) -> Option<String> {
+    let status = |r: &PodCertificateRequest| serde_json::to_value(&r.status).ok();
+    if status(new) == status(old) {
+        return None;
+    }
+    let signer = &old.spec.signer_name;
+    if !is_authorized_for_signer_name(state, user, "sign", signer).await {
+        return Some(format!(
+            "User \"{}\" is not permitted to \"sign\" for signer \"{signer}\"",
+            user.username
         ));
     }
     None

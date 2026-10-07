@@ -42,6 +42,7 @@ pub mod pdb;
 pub mod persistentvolume;
 pub mod pod;
 pub mod pod_status;
+pub mod podcertificaterequest;
 pub mod podtemplate;
 pub mod priorityclass;
 pub mod prioritylevelconfiguration;
