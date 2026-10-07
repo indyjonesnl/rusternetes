@@ -64,6 +64,16 @@ async-trait = { workspace = true }
 hyper-util = { version = "0.1", features = ["client", "tokio"] }
 tower = { workspace = true }
 inotify = "0.11"
+# PodCertificateManager key generation + proof-of-possession
+# (pkg/kubelet/podcertificate/podcertificatemanager.go generateKeyAndProof):
+# ED25519 / ECDSA P-256,384,521 / RSA-PSS, PKCS#8 private keys, PKIX public keys.
+p256 = "0.13"
+p384 = "0.13"
+p521 = "0.13"
+rsa = { version = "0.9", features = ["sha2"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+rand = "0.9"
 
 [build-dependencies]
 tonic-build = "0.12"
